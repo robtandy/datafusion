@@ -237,3 +237,363 @@ pub fn can_cache(data_type: &DataType) -> bool {
         _ => true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{
+        Array, ArrayRef, AsArray, DictionaryArray, Int64Array, RecordBatch,
+        StringViewArray,
+    };
+    use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Int64Type, Schema};
+    use datafusion::prelude::SessionContext;
+
+    use crate::chunk::SelectionVector;
+    use crate::operators::filter::test_support::*;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8View, true),
+        ]))
+    }
+
+    /// A chunk of the rows `start..start + rows`, with a selection of every
+    /// `step`-th row.
+    fn chunk(start: i64, rows: usize, step: usize) -> DataChunk {
+        let ids = start..start + rows as i64;
+        let batch = RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(ids.clone())),
+                Arc::new(StringViewArray::from_iter(ids.map(|i| {
+                    (i % 3 != 0)
+                        .then(|| format!("a string view longer than 12 bytes {i}"))
+                }))),
+            ],
+        )
+        .unwrap();
+        let selection = (0..rows as u32).step_by(step).collect::<Vec<_>>();
+        DataChunk::from_record_batch(batch)
+            .with_selection(SelectionVector::from(selection))
+            .unwrap()
+    }
+
+    fn caching() -> CachingOperator {
+        CachingOperator::new(source(schema(), vec![]))
+    }
+
+    fn ids(chunks: &[DataChunk]) -> Vec<i64> {
+        chunks
+            .iter()
+            .flat_map(|chunk| {
+                chunk
+                    .compact()
+                    .unwrap()
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coalesces_small_chunks_into_full_chunks() {
+        // 100 chunks of 2048 rows of which 32 are selected.
+        let inputs = (0..100)
+            .map(|i| chunk(i * 2048, 2048, 64))
+            .collect::<Vec<_>>();
+        assert!(inputs.iter().all(|c| c.len() == 32));
+        let (outputs, finished) = drive(&caching(), inputs.clone()).unwrap();
+        assert!(!finished);
+        // 3200 rows: one full chunk, and the rest when the input is exhausted.
+        assert_eq!(
+            outputs.iter().map(DataChunk::len).collect::<Vec<_>>(),
+            vec![DEFAULT_VECTOR_SIZE, 3200 - DEFAULT_VECTOR_SIZE]
+        );
+        assert!(outputs.iter().all(|chunk| chunk.selection().is_none()));
+        assert!(outputs.iter().all(|chunk| chunk.schema() == &schema()));
+        // All rows, in order.
+        assert_eq!(ids(&outputs), ids(&inputs));
+        let expected = inputs
+            .iter()
+            .map(|chunk| chunk.compact().unwrap())
+            .collect::<Vec<_>>();
+        let actual = outputs
+            .iter()
+            .map(|chunk| chunk.compact().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arrow::compute::concat_batches(&schema(), &actual).unwrap(),
+            arrow::compute::concat_batches(&schema(), &expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn large_chunks_pass_through_and_the_order_is_kept() {
+        let small = [chunk(0, 100, 10), chunk(100, 100, 5)];
+        let large = chunk(1000, 2048, 2);
+        let last = chunk(5000, 10, 1);
+        let inputs = [
+            small[0].clone(),
+            small[1].clone(),
+            large.clone(),
+            last.clone(),
+        ];
+        let (outputs, _) = drive(&caching(), inputs.clone()).unwrap();
+        assert_eq!(
+            outputs.iter().map(DataChunk::len).collect::<Vec<_>>(),
+            vec![30, 1024, 10]
+        );
+        assert_eq!(ids(&outputs), ids(&inputs));
+        // The large chunk is passed through as is, selection included.
+        assert_eq!(outputs[1].selection(), large.selection());
+        assert!(Arc::ptr_eq(outputs[1].column(1), large.column(1)));
+
+        // The cached rows are emitted before a large chunk, which is passed
+        // through when the operator is called again with it.
+        let operator = caching();
+        let (gstate, mut lstate) = states(&operator);
+        let ctx = context();
+        let mut output = DataChunk::empty(schema());
+        let result = operator
+            .execute(
+                &ctx,
+                &small[0],
+                &mut output,
+                gstate.as_ref(),
+                lstate.as_mut(),
+            )
+            .unwrap();
+        assert!(matches!(result, OperatorResult::NeedMoreInput));
+        assert!(output.is_empty());
+        let result = operator
+            .execute(&ctx, &large, &mut output, gstate.as_ref(), lstate.as_mut())
+            .unwrap();
+        assert!(matches!(result, OperatorResult::HaveMoreOutput));
+        assert_eq!(output.len(), 10);
+        output.reset();
+        let result = operator
+            .execute(&ctx, &large, &mut output, gstate.as_ref(), lstate.as_mut())
+            .unwrap();
+        assert!(matches!(result, OperatorResult::NeedMoreInput));
+        assert_eq!(output.len(), 1024);
+        output.reset();
+        let result = operator
+            .final_execute(&ctx, &mut output, gstate.as_ref(), lstate.as_mut())
+            .unwrap();
+        assert_eq!(result, OperatorFinalizeResult::Finished);
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn threshold_is_configurable() {
+        let inputs = (0..10)
+            .map(|i| chunk(i * 2048, 2048, 2))
+            .collect::<Vec<_>>();
+        // Chunks of 1024 rows are not cached by default ...
+        let (outputs, _) = drive(&caching(), inputs.clone()).unwrap();
+        assert_eq!(outputs.len(), 10);
+        // ... but with a threshold of 2048.
+        let operator = caching().try_with_threshold(DEFAULT_VECTOR_SIZE).unwrap();
+        assert_eq!(operator.threshold(), DEFAULT_VECTOR_SIZE);
+        let (outputs, _) = drive(&operator, inputs.clone()).unwrap();
+        assert_eq!(
+            outputs.iter().map(DataChunk::len).collect::<Vec<_>>(),
+            vec![2048; 5]
+        );
+        assert_eq!(ids(&outputs), ids(&inputs));
+
+        // A threshold of 0 disables caching.
+        let operator = caching().try_with_threshold(0).unwrap();
+        assert!(!operator.requires_final_execute());
+        let inputs = vec![chunk(0, 100, 10), chunk(100, 100, 10)];
+        let (outputs, _) = drive(&operator, inputs.clone()).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].selection(), inputs[0].selection());
+
+        let err = caching()
+            .try_with_threshold(DEFAULT_VECTOR_SIZE + 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 2048"), "{err}");
+        assert_eq!(caching().description(), "CachingOperator: threshold=256");
+    }
+
+    #[test]
+    fn cached_view_arrays_do_not_keep_the_input_buffers() {
+        let inputs = (0..10)
+            .map(|i| chunk(i * 2048, 2048, 100))
+            .collect::<Vec<_>>();
+        let input_bytes = inputs[0].column(1).as_string_view().data_buffers()[0].len();
+        let (outputs, _) = drive(&caching(), inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let views = outputs[0].column(1).as_string_view();
+        let output_bytes = views.data_buffers().iter().map(|b| b.len()).sum::<usize>();
+        // Only the strings of the 210 cached rows are kept.
+        assert!(
+            output_bytes < input_bytes,
+            "{output_bytes} vs {input_bytes}"
+        );
+    }
+
+    #[test]
+    fn chunks_without_columns_are_cached_as_row_counts() {
+        let schema = Arc::new(Schema::empty());
+        let operator = CachingOperator::new(source(Arc::clone(&schema), vec![]));
+        let inputs = (0..100).map(|_| {
+            DataChunk::try_new_without_columns(Arc::clone(&schema), 30).unwrap()
+        });
+        let (outputs, _) = drive(&operator, inputs).unwrap();
+        assert_eq!(
+            outputs.iter().map(DataChunk::len).collect::<Vec<_>>(),
+            vec![2048, 3000 - 2048]
+        );
+    }
+
+    #[test]
+    fn narrow_dictionaries_are_not_cached() {
+        let dictionary =
+            |key: DataType| DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8));
+        assert!(can_cache(&dictionary(DataType::Int32)));
+        assert!(can_cache(&dictionary(DataType::UInt64)));
+        assert!(!can_cache(&dictionary(DataType::Int8)));
+        assert!(!can_cache(&dictionary(DataType::UInt16)));
+        let nested = DataType::Struct(Fields::from(vec![Field::new(
+            "d",
+            DataType::new_list(dictionary(DataType::Int8), true),
+            true,
+        )]));
+        assert!(!can_cache(&nested));
+        assert!(can_cache(&DataType::new_list(DataType::Utf8View, true)));
+
+        // Chunks of narrow dictionaries are passed through.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary(DataType::Int8),
+            true,
+        )]));
+        let operator = CachingOperator::new(source(Arc::clone(&schema), vec![]));
+        assert!(!operator.caching_supported());
+        assert!(!operator.requires_final_execute());
+        assert_eq!(operator.description(), "CachingOperator: disabled");
+        let inputs = (0..3).map(|b| {
+            let values = (0..100).map(|i| format!("{b}-{i}")).collect::<Vec<_>>();
+            let array: ArrayRef = Arc::new(
+                values
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<DictionaryArray<Int8Type>>(),
+            );
+            DataChunk::from_record_batch(
+                RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap(),
+            )
+        });
+        let (outputs, _) = drive(&operator, inputs).unwrap();
+        assert_eq!(outputs.len(), 3);
+
+        // Wider keys are cached.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            dictionary(DataType::Int32),
+            true,
+        )]));
+        let operator = CachingOperator::new(source(Arc::clone(&schema), vec![]));
+        let inputs = (0..3).map(|b| {
+            let values = (0..100).map(|i| format!("{b}-{i}")).collect::<Vec<_>>();
+            let array: ArrayRef = Arc::new(
+                values
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<DictionaryArray<Int32Type>>(),
+            );
+            DataChunk::from_record_batch(
+                RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap(),
+            )
+        });
+        let (outputs, _) = drive(&operator, inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].len(), 300);
+        assert_eq!(outputs[0].column(0).null_count(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Differential tests
+    // ---------------------------------------------------------------------
+
+    /// 100 000 rows in 2 partitions.
+    fn large_table() -> Vec<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8View, true),
+        ]));
+        let batch = |ids: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids.clone())),
+                    Arc::new(StringViewArray::from_iter(ids.map(|i| {
+                        (i % 7 != 0).then(|| format!("value number {}", i % 5000))
+                    }))),
+                ],
+            )
+            .unwrap()
+        };
+        vec![
+            (0..6)
+                .map(|b| batch(b * 10_000..(b + 1) * 10_000))
+                .collect(),
+            (6..10)
+                .map(|b| batch(b * 10_000..(b + 1) * 10_000))
+                .collect(),
+        ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_small_batch_coalescing() {
+        let setup = async |ctx: &SessionContext| {
+            register_all_tables(ctx)?;
+            register_partitions(ctx, "large", large_table())
+        };
+        for sql in [
+            "SELECT * FROM large WHERE id % 100 = 7",
+            "SELECT id, v FROM large WHERE id % 100 = 7 AND v IS NOT NULL",
+            "SELECT id, upper(v) AS u FROM large WHERE id % 50 = 1",
+            "SELECT v, COUNT(*) FROM large WHERE id % 100 < 3 GROUP BY v",
+            "SELECT id FROM large WHERE id % 100 = 7 ORDER BY id",
+        ] {
+            let run = assert_native_byte_eq_with_setup(sql, &setup).await;
+            assert_eq!(run.operators.caching, run.operators.filters, "{sql}");
+            assert!(
+                run.actual
+                    .batches
+                    .iter()
+                    .all(|batch| batch.num_rows() <= DEFAULT_VECTOR_SIZE),
+                "{sql}"
+            );
+        }
+
+        // The filter emits about 49 chunks of about 20 rows, the caching
+        // operator one or two chunks per thread.
+        let run = assert_native_byte_eq_with_setup(
+            "SELECT * FROM large WHERE id % 100 = 7",
+            &setup,
+        )
+        .await;
+        let metrics = run.root.execution_metrics().unwrap();
+        let chunks = |name: &str| {
+            metrics
+                .iter()
+                .find(|(operator, _)| operator.name() == name)
+                .map(|(_, metrics)| (metrics.output_chunks(), metrics.output_rows()))
+                .unwrap()
+        };
+        let (filter_chunks, filter_rows) = chunks("PhysicalFilter");
+        let (caching_chunks, caching_rows) = chunks("CachingOperator");
+        assert_eq!(filter_rows, 1000);
+        assert_eq!(caching_rows, 1000);
+        assert!(filter_chunks >= 49, "{filter_chunks}");
+        assert!(caching_chunks <= 8, "{caching_chunks}");
+    }
+}

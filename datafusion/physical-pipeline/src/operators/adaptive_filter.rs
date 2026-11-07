@@ -353,3 +353,231 @@ pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<bo
     }
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::{DataType, Field, SchemaRef};
+
+    use crate::operators::filter::test_support::physical_expr;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("e", DataType::Boolean, true),
+        ]))
+    }
+
+    fn adaptive_filter(predicate: &str) -> AdaptiveFilter {
+        let schema = schema();
+        AdaptiveFilter::try_new(&physical_expr(predicate, &schema), &schema).unwrap()
+    }
+
+    fn fallibility(predicate: &str) -> Vec<bool> {
+        adaptive_filter(predicate)
+            .conjuncts()
+            .iter()
+            .map(FilterConjunct::is_fallible)
+            .collect()
+    }
+
+    /// A state whose conjuncts are all infallible unless listed in
+    /// `fallible`, with the given selectivities and costs (nanoseconds per
+    /// row).
+    fn state_of(conjuncts: &[(f64, f64)], fallible: &[usize]) -> AdaptiveFilterState {
+        let mut state = AdaptiveFilterState {
+            permutation: (0..conjuncts.len()).collect(),
+            fallible: (0..conjuncts.len())
+                .map(|c| fallible.contains(&c))
+                .collect(),
+            adaptive: true,
+            stats: vec![ConjunctStats::default(); conjuncts.len()],
+            chunks: 0,
+            next_adaptation: WARMUP_CHUNKS,
+        };
+        for (conjunct, &(selectivity, cost)) in conjuncts.iter().enumerate() {
+            record(&mut state, conjunct, selectivity, cost);
+        }
+        state
+    }
+
+    fn record(
+        state: &mut AdaptiveFilterState,
+        conjunct: usize,
+        selectivity: f64,
+        cost: f64,
+    ) {
+        state.record(
+            conjunct,
+            1000,
+            (selectivity * 1000.0) as usize,
+            Duration::from_nanos((cost * 1000.0) as u64),
+        );
+    }
+
+    #[test]
+    fn splits_nested_conjunctions_in_order() {
+        let filter =
+            adaptive_filter("(b > 1 AND b < 2) AND (s = 'x' AND (e OR a IS NULL))");
+        let conjuncts = filter
+            .conjuncts()
+            .iter()
+            .map(|c| c.expr().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conjuncts,
+            vec!["b@1 > 1", "b@1 < 2", "s@2 = x", "e@3 OR a@0 IS NULL"]
+        );
+        // `OR` is a single conjunct.
+        assert_eq!(adaptive_filter("a > 1 OR b < 2").conjuncts().len(), 1);
+    }
+
+    #[test]
+    fn classifies_fallible_conjuncts() {
+        for (predicate, fallible) in [
+            ("a > 1", false),
+            ("a IS NULL", false),
+            ("a IS NOT NULL", false),
+            ("NOT (a = 1)", false),
+            ("a IN (1, 2, 3)", false),
+            ("a > 1 OR b < 2 OR s IS NULL", false),
+            ("e", false),
+            ("true", false),
+            ("a <> b", false),
+            // A widening cast cannot fail.
+            ("CAST(a AS BIGINT) = b", false),
+            ("a + 1 > 2", true),
+            ("10 / a > 1", true),
+            ("b % 3 = 0", true),
+            ("CAST(s AS INT) > 1", true),
+            ("CAST(b AS INT) > 1", true),
+            ("upper(s) = 'X'", true),
+            ("s LIKE 'x%'", true),
+            ("CASE WHEN a > 0 THEN b > 1 ELSE false END", true),
+            ("a > 1 OR 10 / a > 1", true),
+        ] {
+            assert_eq!(fallibility(predicate), vec![fallible], "{predicate}");
+        }
+        assert_eq!(
+            fallibility("a <> 0 AND 10 / a > 1 AND b < 2"),
+            vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn only_filters_with_reorderable_conjuncts_are_adaptive() {
+        for (predicate, adaptive) in [
+            ("a > 1", false),
+            ("a > 1 AND b < 2", true),
+            // The infallible `b < 2` can move before the division.
+            ("10 / a > 1 AND b < 2", true),
+            // The division must stay after `a <> 0`.
+            ("a <> 0 AND 10 / a > 1", false),
+            ("a + 1 > 2 AND 10 / a > 1 AND b % 2 = 0", false),
+            ("a + 1 > 2 AND 10 / a > 1 AND b < 2", true),
+            // Volatile conjuncts keep the order.
+            ("random() < 0.5 AND b < 2", false),
+            ("b < 2 AND a > 1 AND random() < 0.5", false),
+        ] {
+            let filter = adaptive_filter(predicate);
+            assert_eq!(filter.is_adaptive(), adaptive, "{predicate}");
+            assert_eq!(filter.create_state().is_adaptive(), adaptive, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn orders_conjuncts_by_rank_after_the_warmup() {
+        // Ranks: (1 - 0.9) / 1 = 0.1, (1 - 0.5) / 1 = 0.5, (1 - 0.1) / 3 = 0.3.
+        let mut state = state_of(&[(0.9, 1.0), (0.5, 1.0), (0.1, 3.0)], &[]);
+        let ranks = state
+            .stats()
+            .iter()
+            .map(|stats| stats.rank().unwrap())
+            .collect::<Vec<_>>();
+        for (rank, expected) in ranks.iter().zip([0.1, 0.5, 0.3]) {
+            assert!((rank - expected).abs() < 1e-9, "{ranks:?}");
+        }
+        for _ in 1..WARMUP_CHUNKS {
+            state.end_chunk();
+            assert_eq!(state.permutation(), &[0, 1, 2]);
+        }
+        state.end_chunk();
+        assert_eq!(state.permutation(), &[1, 2, 0]);
+        // The statistics decay.
+        assert_eq!(state.stats()[0].input_rows, 500.0);
+        assert!((state.stats()[0].rank().unwrap() - 0.1).abs() < 1e-9);
+
+        // The order follows the data: `0` becomes the most selective.
+        for _ in 0..3 {
+            record(&mut state, 0, 0.0, 1.0);
+        }
+        for _ in 1..ADAPT_INTERVAL {
+            state.end_chunk();
+            assert_eq!(state.permutation(), &[1, 2, 0]);
+        }
+        state.end_chunk();
+        assert_eq!(state.permutation(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn fallible_conjuncts_stay_after_their_predecessors() {
+        // Conjuncts `0, 2, 4` are infallible, `1` and `3` fallible. Ranks
+        // increase with the index: without constraints, the order would be
+        // reversed.
+        let conjuncts = [(0.9, 1.0), (0.8, 1.0), (0.7, 1.0), (0.6, 1.0), (0.5, 1.0)];
+        let mut state = state_of(&conjuncts, &[1, 3]);
+        state.adapt();
+        // `4` and `2` move first; `1` must follow `0`, and `3` all of
+        // `0, 1, 2`.
+        assert_eq!(state.permutation(), &[4, 2, 0, 1, 3]);
+
+        // The first conjunct can be fallible too: infallible ones may move
+        // before it.
+        let mut state = state_of(&[(0.9, 1.0), (0.1, 1.0), (0.5, 1.0)], &[0]);
+        state.adapt();
+        assert_eq!(state.permutation(), &[1, 2, 0]);
+    }
+
+    #[test]
+    fn unobserved_conjuncts_come_last_and_ties_keep_the_order() {
+        // `0` removes every row, so the others were never evaluated.
+        let mut state = state_of(&[(0.0, 1.0)], &[]);
+        state.stats.extend([ConjunctStats::default(); 2]);
+        state.permutation = vec![2, 1, 0];
+        state.fallible = vec![false; 3];
+        state.adapt();
+        assert_eq!(state.permutation(), &[0, 2, 1]);
+        assert_eq!(state.stats()[1].selectivity(), None);
+        assert_eq!(state.stats()[1].cost(), None);
+
+        // Equal ranks keep the current order.
+        let mut state = state_of(&[(0.5, 1.0), (0.5, 1.0), (1.0, 1.0)], &[]);
+        state.permutation = vec![1, 0, 2];
+        state.adapt();
+        assert_eq!(state.permutation(), &[1, 0, 2]);
+    }
+
+    #[test]
+    fn non_adaptive_states_never_reorder() {
+        let mut state = adaptive_filter("a <> 0 AND 10 / a > 1").create_state();
+        record(&mut state, 1, 0.0, 1.0);
+        for _ in 0..100 {
+            state.end_chunk();
+        }
+        assert_eq!(state.permutation(), &[0, 1]);
+    }
+
+    #[test]
+    fn costs_are_bounded_below() {
+        let mut stats = ConjunctStats::default();
+        assert_eq!(stats.rank(), None);
+        stats.input_rows = 10.0;
+        stats.selected_rows = 5.0;
+        // No measurable time.
+        assert_eq!(stats.cost(), Some(MIN_COST_NANOS));
+        assert!(stats.rank().unwrap().is_finite());
+    }
+}
