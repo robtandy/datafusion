@@ -11,22 +11,25 @@
 //! that replace an aggregation answered from statistics
 //! (`SELECT COUNT(*) FROM t`). It produces one row per output partition.
 //!
-//! [`PhysicalPlaceholderRow`] is the native source for it. Its schema is
-//! almost always empty: it then produces chunks without columns that only
-//! carry a row count, exactly like `PlaceholderRowExec`. For a schema with
-//! fields, `PlaceholderRowExec` emits `NULL` columns of type `Null`, which
-//! do not match its own schema. The chunks of this source always have the
-//! schema of the operator, as the pipeline engine requires: nullable fields
-//! are `NULL`, non-nullable fields hold the default value of their type
-//! (`0`, `''`, ...), so that the rows are valid for the operators above,
-//! which never read them.
+//! [`PhysicalPlaceholderRow`] produces exactly the batches of
+//! `PlaceholderRowExec`, as chunks: one `Null` column named `placeholder_{i}`
+//! per field of its schema, adapted to that schema the way the `MemoryStream`
+//! of `PlaceholderRowExec` adapts them (only if the schema has the same
+//! fields, with more metadata or nullability). For the usual empty schema,
+//! these are chunks without columns that only carry a row count. For a
+//! schema with other fields, the chunks do not have the schema of the
+//! operator, unlike the chunks of other operators: neither do the batches of
+//! `PlaceholderRowExec` (nor the chunks of a
+//! [`BridgeOperator`](crate::bridge::BridgeOperator) executing one). So the
+//! operators above see exactly the columns they see in DataFusion.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{ArrayRef, new_null_array};
-use arrow::datatypes::{Field, SchemaRef};
-use datafusion_common::{Result, ScalarValue};
+use arrow::array::{ArrayRef, NullArray, RecordBatch, RecordBatchOptions};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion_common::Result;
+use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
@@ -36,9 +39,10 @@ use crate::operator::{
     SourceResult, downcast_state,
 };
 
-/// A source that produces `rows` placeholder rows (one by default).
+/// A source that produces `rows` placeholder rows (one by default), like a
+/// `PlaceholderRowExec` with schema `schema` and `rows` partitions.
 ///
-/// See the [module documentation](self) for the values of the rows.
+/// See the [module documentation](self) for the chunks it produces.
 #[derive(Debug)]
 pub struct PhysicalPlaceholderRow {
     schema: SchemaRef,
@@ -47,14 +51,8 @@ pub struct PhysicalPlaceholderRow {
 
 impl PhysicalPlaceholderRow {
     /// A source of a single row with schema `schema`.
-    ///
-    /// Fails if the default value of the type of a non-nullable field cannot
-    /// be created.
-    pub fn try_new(schema: SchemaRef) -> Result<Self> {
-        let source = Self { schema, rows: 1 };
-        // Fail now rather than during the execution.
-        source.chunk(1)?;
-        Ok(source)
+    pub fn new(schema: SchemaRef) -> Self {
+        Self { schema, rows: 1 }
     }
 
     /// Produce `rows` rows instead of one. A `PlaceholderRowExec` with `n`
@@ -65,17 +63,13 @@ impl PhysicalPlaceholderRow {
     }
 
     /// Lower a DataFusion `PlaceholderRowExec` to a source that produces its
-    /// rows, one per output partition. Returns `Ok(None)` for any other node,
-    /// and for a `PlaceholderRowExec` whose rows this source cannot create
-    /// (see [`Self::try_new`]), which can be executed by DataFusion instead.
+    /// rows, one per output partition. Returns `Ok(None)` for any other node.
     pub fn try_lower(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Self>> {
         if !plan.is::<PlaceholderRowExec>() {
             return Ok(None);
         }
         let rows = plan.output_partitioning().partition_count();
-        Ok(Self::try_new(plan.schema())
-            .ok()
-            .map(|source| source.with_rows(rows)))
+        Ok(Some(Self::new(plan.schema()).with_rows(rows)))
     }
 
     /// The number of rows this source produces.
@@ -83,28 +77,32 @@ impl PhysicalPlaceholderRow {
         self.rows
     }
 
-    /// A chunk of `len` placeholder rows.
+    /// A chunk of `len` placeholder rows: the batch of `PlaceholderRowExec`
+    /// (`PlaceholderRowExec::data`), adapted to the schema of the operator
+    /// under the same condition and in the same way as its `MemoryStream`
+    /// adapts it.
     fn chunk(&self, len: usize) -> Result<DataChunk> {
-        if self.schema.fields().is_empty() {
-            return DataChunk::try_new_without_columns(Arc::clone(&self.schema), len);
-        }
-        let columns = self
-            .schema
-            .fields()
+        let fields = (0..self.schema.fields().len())
+            .map(|i| Field::new(format!("placeholder_{i}"), DataType::Null, true))
+            .collect::<Fields>();
+        let columns = fields
             .iter()
-            .map(|field| placeholder_column(field, len))
-            .collect::<Result<Vec<_>>>()?;
-        DataChunk::try_new(Arc::clone(&self.schema), columns, None)
-    }
-}
-
-/// `len` placeholder values for `field`: `NULL`s if it is nullable, the
-/// default value of its type otherwise.
-fn placeholder_column(field: &Field, len: usize) -> Result<ArrayRef> {
-    if field.is_nullable() {
-        Ok(new_null_array(field.data_type(), len))
-    } else {
-        ScalarValue::new_default(field.data_type())?.to_array_of_size(len)
+            .map(|_| Arc::new(NullArray::new(len)) as ArrayRef)
+            .collect();
+        let options = RecordBatchOptions::new().with_row_count(Some(len));
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            columns,
+            &options,
+        )?;
+        let batch = if batch.schema_ref().as_ref() != self.schema.as_ref()
+            && self.schema.contains(batch.schema_ref())
+        {
+            adapt_batch_to_schema(batch, &self.schema)?
+        } else {
+            batch
+        };
+        Ok(DataChunk::from_record_batch(batch))
     }
 }
 
@@ -183,8 +181,9 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use arrow::array::{Array, RecordBatch};
-    use arrow::datatypes::{DataType, Schema, TimeUnit, UnionFields, UnionMode};
+    use arrow::datatypes::{TimeUnit, UnionFields, UnionMode};
+    use datafusion_execution::TaskContext;
+    use datafusion_physical_plan::collect;
     use datafusion_physical_plan::empty::EmptyExec;
 
     use crate::operators::union::test_support::{
@@ -198,7 +197,7 @@ mod tests {
         for rows in [0, 1, 3, 2048, 2049, 5000] {
             for threads in [1, 4] {
                 let source =
-                    PhysicalPlaceholderRow::try_new(Arc::clone(&schema))?.with_rows(rows);
+                    PhysicalPlaceholderRow::new(Arc::clone(&schema)).with_rows(rows);
                 assert_eq!(source.rows(), rows);
                 let output = run(Arc::new(source), threads).await?;
                 assert_eq!(
@@ -215,50 +214,80 @@ mod tests {
         Ok(())
     }
 
+    /// The outcome of executing a `PlaceholderRowExec` with schema `schema`
+    /// with DataFusion, and a [`PhysicalPlaceholderRow`] with that schema
+    /// with the pipeline engine.
+    async fn outcomes(
+        schema: &SchemaRef,
+    ) -> (Result<Vec<RecordBatch>>, Result<Vec<RecordBatch>>) {
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(PlaceholderRowExec::new(Arc::clone(schema)));
+        let datafusion = collect(plan, Arc::new(TaskContext::default())).await;
+        let native =
+            run(Arc::new(PhysicalPlaceholderRow::new(Arc::clone(schema))), 4).await;
+        (datafusion, native)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn placeholder_rows_have_the_schema_of_the_operator() -> Result<()> {
-        let schema = Arc::new(
-            Schema::new(vec![
-                Field::new("nullable", DataType::Int32, true),
-                Field::new("count", DataType::Int64, false),
-                Field::new("s", DataType::Utf8, false),
-                Field::new("view", DataType::Utf8View, true),
-                Field::new("d", DataType::Decimal128(12, 2), false),
-                Field::new(
-                    "ts",
-                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                    false,
-                ),
-                Field::new("flag", DataType::Boolean, false),
-                Field::new_list(
-                    "list",
-                    Field::new_list_field(DataType::Int32, true),
-                    false,
-                ),
-                Field::new_struct(
-                    "struct",
-                    vec![
-                        Field::new("x", DataType::Int32, false),
-                        Field::new("y", DataType::Utf8, true),
-                    ],
-                    false,
-                ),
-                Field::new_dictionary("dict", DataType::Int32, DataType::Utf8, false),
-                Field::new("null", DataType::Null, true),
-            ])
-            .with_metadata(HashMap::from([("key".to_string(), "value".to_string())])),
-        );
-        let source = PhysicalPlaceholderRow::try_new(Arc::clone(&schema))?.with_rows(3);
-        let output = run(Arc::new(source), 4).await?;
-        assert_eq!(output.len(), 1);
-        let batch = &output[0];
-        // A valid batch: the non-nullable columns have no nulls.
-        assert_eq!(batch.schema(), schema);
-        assert_eq!(batch.num_rows(), 3);
-        for (field, column) in schema.fields().iter().zip(batch.columns()) {
-            let nulls = if field.is_nullable() { 3 } else { 0 };
-            assert_eq!(column.logical_null_count(), nulls, "{}", field.name());
+    async fn placeholder_rows_are_the_batches_of_placeholder_row_exec() -> Result<()> {
+        let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
+        let fields = vec![
+            Field::new("nullable", DataType::Int32, true),
+            Field::new("count", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("view", DataType::Utf8View, true),
+            Field::new("d", DataType::Decimal128(12, 2), false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new_list("list", Field::new_list_field(DataType::Int32, true), false),
+            Field::new_struct(
+                "struct",
+                vec![Field::new("x", DataType::Int32, false)],
+                false,
+            ),
+            Field::new_dictionary("dict", DataType::Int32, DataType::Utf8, false),
+            Field::new(
+                "u",
+                DataType::Union(UnionFields::empty(), UnionMode::Sparse),
+                false,
+            ),
+        ];
+        let placeholder = |nullable, metadata: HashMap<String, String>| {
+            Field::new("placeholder_0", DataType::Null, nullable).with_metadata(metadata)
+        };
+        for schema in [
+            Schema::empty(),
+            Schema::new(fields.clone()),
+            Schema::new(fields).with_metadata(metadata.clone()),
+            // Schemas that only add metadata or nullability to the placeholder
+            // fields: the batches are adapted to them.
+            Schema::new(vec![placeholder(true, HashMap::new())]),
+            Schema::new(vec![placeholder(true, metadata.clone())])
+                .with_metadata(metadata.clone()),
+            Schema::new(vec![placeholder(false, HashMap::new())]),
+        ] {
+            let schema = Arc::new(schema);
+            let (expected, actual) = outcomes(&schema).await;
+            let (expected, actual) = (expected?, actual?);
+            assert_eq!(actual, expected, "{schema:?}");
+            assert_eq!(actual[0].num_rows(), 1);
+            assert_eq!(
+                PhysicalPlaceholderRow::new(Arc::clone(&schema)).schema(),
+                schema
+            );
         }
+
+        // DataFusion cannot adapt its batch without columns to an empty schema
+        // with metadata (the adapted batch loses its row count), and neither
+        // can the native source.
+        let schema = Arc::new(Schema::empty().with_metadata(metadata));
+        let (expected, actual) = outcomes(&schema).await;
+        let message = "must either specify a row count or at least one column";
+        assert!(expected.unwrap_err().to_string().contains(message));
+        assert!(actual.unwrap_err().to_string().contains(message));
         Ok(())
     }
 
@@ -287,17 +316,6 @@ mod tests {
 
         let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
         assert!(PhysicalPlaceholderRow::try_lower(&empty)?.is_none());
-
-        // A non-nullable field without a default value: DataFusion executes
-        // the node instead.
-        let no_default = Arc::new(Schema::new(vec![Field::new(
-            "u",
-            DataType::Union(UnionFields::empty(), UnionMode::Sparse),
-            false,
-        )]));
-        assert!(PhysicalPlaceholderRow::try_new(Arc::clone(&no_default)).is_err());
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(no_default));
-        assert!(PhysicalPlaceholderRow::try_lower(&plan)?.is_none());
         Ok(())
     }
 
@@ -326,16 +344,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_placeholder_plans() -> Result<()> {
-        // Placeholder rows that SQL does not produce: one row per partition.
-        for partitions in [1, 3] {
-            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
-                Ok(Arc::new(
-                    PlaceholderRowExec::new(Arc::new(Schema::empty()))
-                        .with_partitions(partitions),
-                ))
-            };
-            let root = assert_native_plan_byte_eq(make, false).await;
-            assert!(root.is::<PhysicalPlaceholderRow>());
+        // Placeholder rows as the result of a plan, which SQL does not
+        // produce: one row per partition, with schemas with fields too (for
+        // an empty schema with metadata, DataFusion fails, see
+        // `placeholder_rows_are_the_batches_of_placeholder_row_exec`).
+        let metadata = HashMap::from([("key".to_string(), "value".to_string())]);
+        let schemas = [
+            Schema::empty(),
+            Schema::new(vec![Field::new("v", DataType::Int32, false)]),
+            Schema::new(vec![
+                Field::new("a", DataType::Utf8, true),
+                Field::new("b", DataType::Float64, false),
+            ])
+            .with_metadata(metadata),
+            // The schema of the placeholder batches of DataFusion.
+            Schema::new(vec![Field::new("placeholder_0", DataType::Null, true)]),
+        ];
+        for schema in schemas {
+            let schema = Arc::new(schema);
+            for partitions in [1, 3] {
+                let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                    Ok(Arc::new(
+                        PlaceholderRowExec::new(Arc::clone(&schema))
+                            .with_partitions(partitions),
+                    ))
+                };
+                let root = assert_native_plan_byte_eq(make, false).await;
+                assert!(root.is::<PhysicalPlaceholderRow>());
+            }
         }
         Ok(())
     }

@@ -1095,17 +1095,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn union_of_inputs_without_columns() -> Result<()> {
-        // Placeholder rows, whose schemas differ only in their metadata.
+        // Inputs without columns, whose schemas differ only in their metadata.
         let with_metadata =
             Arc::new(Schema::empty().with_metadata(metadata(&[("m", "1")])));
+        let empty = Arc::new(Schema::empty());
+        let rows = |schema: &SchemaRef, rows| -> Result<Arc<dyn PhysicalOperator>> {
+            let chunk = DataChunk::try_new_without_columns(Arc::clone(schema), rows)?;
+            Ok(Arc::new(TestSource::with_schema(
+                Arc::clone(schema),
+                vec![chunk],
+            )))
+        };
         let union: Arc<dyn PhysicalOperator> = Arc::new(PhysicalUnion::try_new(vec![
-            Arc::new(PhysicalPlaceholderRow::try_new(Arc::clone(&with_metadata))?),
-            Arc::new(
-                PhysicalPlaceholderRow::try_new(Arc::new(Schema::empty()))?.with_rows(3),
-            ),
+            rows(&with_metadata, 1)?,
+            rows(&empty, 3)?,
         ])?);
         assert_eq!(union.schema(), with_metadata);
-        assert!(union.children()[1].is::<PhysicalPlaceholderRow>());
+        assert!(union.children()[1].is::<TestSource>());
         let output = run(union, 4).await?;
         assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
         // Every chunk keeps the schema (metadata) of its input.
@@ -1119,10 +1125,9 @@ mod tests {
         }
 
         // A union of a single input is that input.
-        let empty = Arc::new(Schema::empty());
         let union: Arc<dyn PhysicalOperator> =
             Arc::new(PhysicalUnion::try_new(vec![Arc::new(
-                PhysicalPlaceholderRow::try_new(Arc::clone(&empty))?.with_rows(2),
+                PhysicalPlaceholderRow::new(empty).with_rows(2),
             )])?);
         assert_eq!(
             format_pipelines(&union)?,
