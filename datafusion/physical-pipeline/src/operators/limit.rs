@@ -587,6 +587,23 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operators_can_be_executed_again() -> Result<()> {
+        // All the state of an execution lives in the states the executor
+        // creates, so an operator tree can be executed any number of times.
+        let union = PhysicalUnion::try_new(vec![
+            source(values_chunks(0, &[10; 10])),
+            source(values_chunks(100, &[50, 100])),
+        ])?
+        .with_preserve_order(true);
+        let root = limit(Arc::new(union), 95, Some(20), true);
+        for _ in 0..3 {
+            let output = run(Arc::clone(&root), 4).await?;
+            assert_eq!(values(&output), (95..115).collect::<Vec<_>>());
+        }
+        Ok(())
+    }
+
     #[test]
     fn limit_properties() {
         let input = source(vec![values_chunk(0..3)]);
