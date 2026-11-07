@@ -346,6 +346,13 @@ limited by `GlobalSourceState::max_threads`, and `1` if the source, the sink
 or any operator of the pipeline is not parallel. Each worker creates its local
 states, runs a `PipelineExecutor`, and finally calls `combine`.
 
+An operator that is not parallel in a role (`parallel_source`,
+`parallel_operator` or `parallel_sink` returns `false`) is never called
+concurrently, even if it is part of several pipelines (the pipelines of the
+inputs of a union share the sink and the operators above the union): the
+executor runs such pipelines one after the other, in an order compatible with
+their dependencies.
+
 Errors of any worker cancel the execution and are returned by the output
 stream; panics are propagated. Dropping the output stream aborts all tasks.
 
@@ -365,8 +372,14 @@ output of stage `k`, and `chunks[n]` is pushed into the sink.
 4. Else, flush the operators that require `final_execute`, in order.
 5. Else, the pipeline is complete for this thread: `combine`.
 
-The loop processes up to 128 steps per poll and then yields, so that a long
-pipeline does not starve other tasks of the runtime.
+Every poll makes at most 128 operator calls (`get_data`, `execute`,
+`final_execute` and `sink`), including the repeated calls of an operator that
+returns `HaveMoreOutput` while the operators downstream discard its output.
+When the budget is exhausted, the position in the pipeline is kept on the
+`in_process_operators` stack (or as a pending sink chunk) and the task yields
+like tokio's cooperative scheduling (`tokio::task::yield_now`), so that a
+pipeline never starves the other tasks of the runtime and is cancelled
+promptly.
 
 ### Results: `CollectorSink` and `PipelineStream`
 
@@ -406,6 +419,12 @@ partition, its equivalence properties (including the output ordering) are
 kept: a single-partition input is executed by a single thread, which
 preserves order. It is a leaf from DataFusion's point of view. `DisplayAs`
 (in `explain.rs`) shows the lowered operator tree.
+
+Because the bridged plans are hidden from DataFusion's plan traversals,
+`PipelineRootExec::reset_state` resets the whole original plan
+(`reset_plan_states`) and lowers it again, so that
+`reset_plan_states(pipeline_root)` makes the plan executable again, as for any
+DataFusion plan.
 
 ### `PipelineQueryPlanner`
 
