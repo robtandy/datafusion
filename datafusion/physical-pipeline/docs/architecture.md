@@ -357,7 +357,7 @@ output of stage `k`, and `chunks[n]` is pushed into the sink.
 
 1. If the sink did not accept the last chunk (blocked), push it again.
 2. Else, if an operator returned `HaveMoreOutput` (its stage is on the
-   `in_process` stack), call the most downstream in-process operator again
+   `in_process_operators` stack), call the most downstream in-process operator again
    with the same input and push its output down.
 3. Else, if the source is not exhausted, get a chunk from the source and
    push it through the operators: an operator with an empty output sends the

@@ -889,8 +889,37 @@ mod tests {
             "SELECT d FROM t1 UNION SELECT name FROM t2",
             "SELECT id FROM t1 EXCEPT SELECT id FROM t1 WHERE a > 0",
             "WITH x AS (SELECT a, COUNT(*) AS n FROM t1 GROUP BY a) SELECT x.a, x.n, t2.name FROM x JOIN t2 ON x.a = t2.k",
+            "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 50) SELECT n FROM nums",
         ])
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_dml_and_partitioning() {
+        let setup = async |ctx: &SessionContext| {
+            register_test_tables(ctx)?;
+            ctx.sql("CREATE TABLE target (id BIGINT, d VARCHAR)")
+                .await?
+                .collect()
+                .await?;
+            Ok(())
+        };
+        assert_byte_eq_with_datafusion_with_setup(
+            "INSERT INTO target SELECT id, d FROM t1 WHERE a > 0",
+            &setup,
+        )
+        .await;
+        for target_partitions in [1, 3, 16] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for sql in [
+                "SELECT * FROM t1",
+                "SELECT d, COUNT(*) FROM t1 GROUP BY d",
+                "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.id, t2.name",
+            ] {
+                assert_byte_eq_with_datafusion_with_config(sql, config.clone(), &setup)
+                    .await;
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

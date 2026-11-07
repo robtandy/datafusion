@@ -61,12 +61,16 @@ pub mod window;
 
 pub use bridge::{BridgeOperator, PipelineRootExec};
 pub use chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
-pub use executor::{CollectorSink, Executor, PipelineExecutor};
-pub use operator::{
-    ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
-    LocalSinkState, LocalSourceState, OperatorFinalizeResult, OperatorMetrics,
-    OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
-    SourceResult, TaskInterrupt,
+pub use executor::{
+    CollectorSink, ExecutionMetrics, Executor, PipelineExecutor, PipelineStream,
 };
-pub use pipeline::{MetaPipeline, MetaPipelineBuilder, Pipeline, PipelineBuilder};
+pub use operator::{
+    EmptyState, ExecutionContext, GlobalOperatorState, GlobalSinkState,
+    GlobalSourceState, LocalSinkState, LocalSourceState, OperatorFinalizeResult,
+    OperatorMetrics, OperatorResult, OperatorState, PhysicalOperator, SinkFinalize,
+    SinkResult, SourceResult, TaskInterrupt,
+};
+pub use pipeline::{
+    MetaPipeline, MetaPipelineBuilder, Pipeline, PipelineBuilder, PipelineGraph,
+};
 pub use planner::PipelineQueryPlanner;

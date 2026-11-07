@@ -90,7 +90,7 @@ enum PushOutcome {
 /// sink.
 ///
 /// When an operator returns [`OperatorResult::HaveMoreOutput`], its stage is
-/// pushed onto the `in_process` stack; before pulling new data from the
+/// pushed onto the `in_process_operators` stack; before pulling new data from the
 /// source, the executor calls the in-process operators again with the same
 /// input, from the most downstream one.
 pub struct PipelineExecutor {
@@ -100,7 +100,7 @@ pub struct PipelineExecutor {
     operator_states: Vec<Box<dyn OperatorState>>,
     sink_state: Box<dyn LocalSinkState>,
     chunks: Vec<DataChunk>,
-    in_process: Vec<usize>,
+    in_process_operators: Vec<usize>,
     /// Stage whose output is currently pushed through the pipeline (`0` for
     /// source chunks, `k + 1` while flushing `operators[k]`).
     push_stage: usize,
@@ -140,7 +140,7 @@ impl PipelineExecutor {
                 operator_states: vec![],
                 sink_state,
                 chunks,
-                in_process: vec![],
+                in_process_operators: vec![],
                 push_stage: 0,
                 pending_sink: false,
                 source_exhausted: true,
@@ -167,7 +167,7 @@ impl PipelineExecutor {
             operator_states,
             sink_state,
             chunks,
-            in_process: vec![],
+            in_process_operators: vec![],
             push_stage: 0,
             pending_sink: false,
             source_exhausted: false,
@@ -237,7 +237,7 @@ impl PipelineExecutor {
             return self.sink_last_chunk();
         }
         // Operators that have more output for their current input.
-        if !self.in_process.is_empty() {
+        if !self.in_process_operators.is_empty() {
             let outcome = self.push(self.push_stage)?;
             return self.handle_push_outcome(outcome);
         }
@@ -293,7 +293,7 @@ impl PipelineExecutor {
     fn push(&mut self, initial: usize) -> Result<PushOutcome> {
         let shared = Arc::clone(&self.shared);
         let n = shared.operators.len();
-        let mut stage = match self.in_process.pop() {
+        let mut stage = match self.in_process_operators.pop() {
             Some(stage) => stage,
             None => initial + 1,
         };
@@ -319,11 +319,11 @@ impl PipelineExecutor {
             metrics.add_elapsed(start.elapsed());
             match result? {
                 OperatorResult::NeedMoreInput => {}
-                OperatorResult::HaveMoreOutput => self.in_process.push(stage),
+                OperatorResult::HaveMoreOutput => self.in_process_operators.push(stage),
                 OperatorResult::Finished => self.finish_at(stage),
                 OperatorResult::Blocked(interrupt) => {
                     output.reset();
-                    self.in_process.push(stage);
+                    self.in_process_operators.push(stage);
                     return Ok(PushOutcome::Blocked(interrupt));
                 }
             }
@@ -332,7 +332,7 @@ impl PipelineExecutor {
             if rows == 0 {
                 // No output: resume the most downstream in-process operator,
                 // or ask for more input.
-                match self.in_process.pop() {
+                match self.in_process_operators.pop() {
                     Some(in_process) => stage = in_process,
                     None => return Ok(PushOutcome::NeedMoreInput),
                 }
@@ -378,7 +378,7 @@ impl PipelineExecutor {
     fn finish_at(&mut self, stage: usize) {
         self.source_exhausted = true;
         // Stages on the stack are all upstream of `stage`.
-        self.in_process.retain(|&s| s > stage);
+        self.in_process_operators.retain(|&s| s > stage);
         if stage > self.flush_index {
             self.flush_index = stage;
             self.flush_current_finished = false;
@@ -445,7 +445,7 @@ impl fmt::Debug for PipelineExecutor {
             .field("operators", &self.shared.operators.len())
             .field("sink", &self.shared.sink.name())
             .field("thread_id", &self.ctx.thread_id)
-            .field("in_process", &self.in_process)
+            .field("in_process_operators", &self.in_process_operators)
             .field("source_exhausted", &self.source_exhausted)
             .finish()
     }
