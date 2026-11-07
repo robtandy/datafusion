@@ -921,19 +921,25 @@ fn pipeline_dependencies(graph: &PipelineGraph) -> PipelineDependencies {
             sink: key(pipeline.sink()),
         })
         .collect();
-    let mut consumers = vec![vec![]; graph.meta_pipelines().len()];
-    for pipeline in graph.pipelines() {
-        for &meta in pipeline.meta_dependencies() {
-            consumers[meta].push(pipeline.id());
-        }
-    }
+    // The consumers of a meta pipeline are the pipelines that read the
+    // result of its sink: those in which the sink is the source (e.g. an
+    // aggregate, or the scan of the unmatched rows of an outer join) or an
+    // operator (e.g. the probe of a hash join).
     let meta_pipelines = graph
         .meta_pipelines()
         .iter()
-        .zip(consumers)
-        .map(|(meta, consumers)| MetaPipelineKeys {
-            sink: key(meta.sink()),
-            consumers,
+        .map(|meta| {
+            let sink = key(meta.sink());
+            let consumers = graph
+                .pipelines()
+                .iter()
+                .filter(|pipeline| {
+                    key(pipeline.source()) == sink
+                        || pipeline.operators().iter().any(|op| key(op) == sink)
+                })
+                .map(Pipeline::id)
+                .collect();
+            MetaPipelineKeys { sink, consumers }
         })
         .collect();
     PipelineDependencies {
@@ -4063,6 +4069,33 @@ mod tests {
         );
         let output = run_with_timeout(union(vec![a(), b(), c(), d()], false), 4).await?;
         assert_eq!(sorted_values(&output), vec![0, 1, 2, 3]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_side_needed_by_a_child_pipeline_is_not_cancelled() -> Result<()> {
+        // A "right outer join" whose probe side cannot produce output: the
+        // probe pipeline is skipped, but the child pipeline that scans the
+        // (slow) build side still needs it.
+        for threads in [1, 4] {
+            let empty = Arc::new(Materialize {
+                no_output_if_empty: true,
+                ..Materialize::new(source(vec![]))
+            });
+            let join: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+                children: vec![
+                    empty,
+                    Arc::new(DelayedSource {
+                        value: 100,
+                        delay: std::time::Duration::from_millis(30),
+                    }),
+                ],
+                no_output_if_empty: false,
+            });
+            let output = run_with_timeout(join, threads).await?;
+            // The build rows and the number of probed rows.
+            assert_eq!(sorted_values(&output), vec![0, 100]);
+        }
         Ok(())
     }
 }

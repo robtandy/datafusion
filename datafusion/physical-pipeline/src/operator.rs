@@ -403,8 +403,8 @@ pub(crate) struct ExecutionRegistry {
 pub(crate) struct PipelineDependencies {
     /// For every pipeline: its source, operators and sink.
     pub(crate) pipelines: Vec<PipelineKeys>,
-    /// For every meta pipeline: its sink, and the pipelines that wait for it
-    /// to be finalized (because they read from its sink).
+    /// For every meta pipeline: its sink, and the pipelines that read the
+    /// result of its sink (as their source or as an operator).
     pub(crate) meta_pipelines: Vec<MetaPipelineKeys>,
 }
 
