@@ -768,14 +768,17 @@ mod tests {
         values
     }
 
-    async fn assert_dropped(dropped: &std::sync::atomic::AtomicBool) {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    async fn assert_dropped(dropped: &std::sync::atomic::AtomicBool, what: &str) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !dropped.load(Ordering::SeqCst) {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
-        .await
-        .expect("the pending partition was not cancelled");
+        .await;
+        assert!(
+            result.is_ok(),
+            "{what}: the idle partition was not cancelled"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -785,20 +788,20 @@ mod tests {
         // plans claim them eagerly.
         for infinite in [true, false] {
             let ctx = task_ctx_with_threads(1);
-            let (pending, dropped) = pending_partition();
+            let (pending, _) = pending_partition();
             let plan = bounded_or_unbounded_plan(
                 vec![pending, batch_partition(42, false)],
                 infinite,
             );
 
-            // Default DataFusion emits 42.
+            // Default DataFusion emits 42. (Its cancellation is not checked:
+            // it may cancel the idle partition before it even executed it.)
             let mut stream = datafusion_physical_plan::execute_stream(
                 Arc::clone(&plan),
                 Arc::clone(&ctx),
             )?;
             assert_eq!(next_values(&mut stream, 1).await, vec![42]);
             drop(stream);
-            assert_dropped(&dropped).await;
 
             let (pending, dropped) = pending_partition();
             let plan = bounded_or_unbounded_plan(
@@ -819,7 +822,7 @@ mod tests {
             );
             // Dropping the stream cancels the idle partition.
             drop(stream);
-            assert_dropped(&dropped).await;
+            assert_dropped(&dropped, "pipeline").await;
         }
         Ok(())
     }
@@ -850,8 +853,8 @@ mod tests {
                 assert_eq!(values, vec![1, 2, 3], "{threads} threads");
                 // Dropping the stream cancels the idle partitions.
                 drop(stream);
-                assert_dropped(&first_dropped).await;
-                assert_dropped(&second_dropped).await;
+                assert_dropped(&first_dropped, "first").await;
+                assert_dropped(&second_dropped, "second").await;
             }
         }
         Ok(())
