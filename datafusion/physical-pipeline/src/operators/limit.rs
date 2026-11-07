@@ -44,6 +44,8 @@ use arrow::datatypes::SchemaRef;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::union::InterleaveExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::chunk::DataChunk;
@@ -190,20 +192,30 @@ impl PhysicalLimit {
 
 /// Whether the rows that a limit selects from `input`, a plan with a single
 /// output partition, depend on its order. They do not if `input` merges
-/// several partitions in the order in which their batches arrive (a
-/// `CoalescePartitionsExec`, possibly below operators that keep the order of
-/// their input): DataFusion's result is arbitrary then.
+/// several partitions in the order in which their batches arrive (see
+/// [`merges_in_arrival_order`]), possibly below operators that keep the order
+/// of their input: DataFusion's result is arbitrary then.
 ///
 /// In all other cases, the order is deterministic (e.g. sorted, or the order
 /// of a single partition), and the limit must see its input in that order.
 /// That costs no parallelism compared to DataFusion, which executes the
 /// single partition on one thread too.
+///
+/// An order-preserving limit is not a parallel operator, so the executor runs
+/// the pipelines of the inputs of a union below it one after the other. That
+/// is how DataFusion reads a single partition with a deterministic order too,
+/// but it reads the inputs of a merge concurrently: a limit over a merge in
+/// arrival order is parallel, so that the pipelines of the inputs run
+/// concurrently and an input that never produces anything does not hold back
+/// the others.
 fn order_matters(input: &Arc<dyn ExecutionPlan>) -> bool {
     let mut plan = input;
     loop {
-        if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
-            && coalesce.input().output_partitioning().partition_count() > 1
-        {
+        // A sorted output has a deterministic order.
+        if plan.output_ordering().is_some() {
+            return true;
+        }
+        if merges_in_arrival_order(plan) {
             return false;
         }
         match plan.children().as_slice() {
@@ -212,6 +224,28 @@ fn order_matters(input: &Arc<dyn ExecutionPlan>) -> bool {
             }
             _ => return true,
         }
+    }
+}
+
+/// Whether `plan` merges several partitions, of one input or of several
+/// inputs, into an output partition in the order in which their batches
+/// arrive: a `CoalescePartitionsExec`, or a `RepartitionExec` that does not
+/// preserve the order, with more input partitions than output partitions,
+/// or an `InterleaveExec` of several inputs.
+fn merges_in_arrival_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let input_partitions = plan
+        .children()
+        .iter()
+        .map(|child| child.output_partitioning().partition_count())
+        .sum::<usize>();
+    let merges_partitions =
+        input_partitions > plan.output_partitioning().partition_count();
+    if plan.is::<CoalescePartitionsExec>() {
+        merges_partitions
+    } else if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
+        merges_partitions && !repartition.preserve_order()
+    } else {
+        plan.is::<InterleaveExec>() && plan.children().len() > 1
     }
 }
 
@@ -316,6 +350,7 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
@@ -325,7 +360,8 @@ mod tests {
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
         TestSource, assert_native_plan_byte_eq, assert_parity, assert_parity_with_config,
-        count, run, sorted_values, values, values_chunk, values_chunks, values_schema,
+        batch_plan, count, pending_plan, run, sorted_values, values, values_chunk,
+        values_chunks, values_schema,
     };
     use crate::test_utils::{test_session_config, test_table_t1};
 
@@ -636,7 +672,48 @@ mod tests {
             ))?,
             (0, Some(7), false)
         );
+        // Partitions and inputs interleaved in arrival order.
+        let interleaved = || -> Result<Arc<dyn ExecutionPlan>> {
+            let by_id = |single_partition| -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = t1_scan(single_partition)?;
+                let id = col("id", &scan.schema())?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    scan,
+                    Partitioning::Hash(vec![id], 1),
+                )?))
+            };
+            Ok(Arc::new(InterleaveExec::try_new(vec![
+                by_id(true)?,
+                by_id(false)?,
+            ])?))
+        };
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(interleaved()?, 0, Some(1))))?,
+            (0, Some(1), false)
+        );
+        let round_robin = Arc::new(RepartitionExec::try_new(
+            t1_scan(false)?,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(round_robin, 2, Some(3))))?,
+            (2, Some(3), false)
+        );
         // A sorted input, or a single partition, has a deterministic order.
+        let sort_preserving = RepartitionExec::try_new(
+            sorted_t1_scan()?,
+            Partitioning::RoundRobinBatch(1),
+        )?
+        .with_preserve_order();
+        assert!(sort_preserving.preserve_order());
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(
+                Arc::new(sort_preserving),
+                0,
+                Some(3)
+            )))?,
+            (0, Some(3), true)
+        );
         assert_eq!(
             lowered(Arc::new(GlobalLimitExec::new(merged()?, 3, None)))?,
             (3, None, true)
@@ -881,6 +958,41 @@ mod tests {
         assert!(
             bridged_plans(&root)[0].is::<datafusion_datasource::source::DataSourceExec>()
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_over_a_merge_of_inputs_does_not_wait_for_idle_inputs() -> Result<()> {
+        // A limit of one row over an `InterleaveExec` with a single partition,
+        // whose first input never produces anything: DataFusion interleaves
+        // the inputs and returns the row of the second one.
+        let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
+            let by_v = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let v = col("v", &input.schema())?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    input,
+                    Partitioning::Hash(vec![v], 1),
+                )?))
+            };
+            Ok(Arc::new(InterleaveExec::try_new(vec![
+                by_v(pending_plan(values_schema())?)?,
+                by_v(batch_plan(values_chunk([42]).into_record_batch()?)?)?,
+            ])?))
+        };
+        type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
+        let limits: [Limit; 3] = [
+            |input| Arc::new(GlobalLimitExec::new(input, 0, Some(1))),
+            |input| Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1))),
+            |input| Arc::new(LocalLimitExec::new(input, 1)),
+        ];
+        for limit in limits {
+            let make = || Ok(limit(interleave()?));
+            let root = assert_native_plan_byte_eq(make, false).await;
+            let lowered = root.downcast_ref::<PhysicalLimit>().expect("a limit");
+            // The inputs of the union below the limit run concurrently.
+            assert!(!lowered.preserve_order());
+            assert_eq!(count::<PhysicalUnion>(&root), 1);
+        }
         Ok(())
     }
 }

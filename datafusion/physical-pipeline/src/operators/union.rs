@@ -313,10 +313,12 @@ pub(crate) mod test_support {
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::Result;
-    use datafusion_execution::TaskContext;
+    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::projection::ProjectionExec;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::{ExecutionPlan, collect};
 
     use super::PhysicalUnion;
@@ -531,7 +533,7 @@ pub(crate) mod test_support {
         let description = datafusion_physical_plan::displayable(expected.as_ref())
             .indent(true)
             .to_string();
-        let batches = collect(Arc::clone(&expected), Arc::clone(&task_ctx))
+        let batches = with_timeout(collect(Arc::clone(&expected), Arc::clone(&task_ctx)))
             .await
             .expect("DataFusion");
         let expected = EngineOutput {
@@ -572,7 +574,7 @@ pub(crate) mod test_support {
     ) -> Result<EngineOutput> {
         let exec: Arc<dyn ExecutionPlan> =
             Arc::new(PipelineRootExec::try_new(root, plan)?);
-        let batches = collect(Arc::clone(&exec), task_ctx).await?;
+        let batches = with_timeout(collect(Arc::clone(&exec), task_ctx)).await?;
         Ok(EngineOutput {
             schema: exec.schema(),
             plan: exec,
@@ -771,12 +773,87 @@ pub(crate) mod test_support {
         root: Arc<dyn PhysicalOperator>,
         threads: usize,
     ) -> Result<Vec<RecordBatch>> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            Executor::collect(root, Arc::new(TaskContext::default()), threads),
-        )
+        with_timeout(Executor::collect(
+            root,
+            Arc::new(TaskContext::default()),
+            threads,
+        ))
         .await
-        .expect("the execution did not complete")
+    }
+
+    /// Await `execution`, failing the test if it does not complete in time.
+    async fn with_timeout<T>(execution: impl Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(30), execution)
+            .await
+            .expect("the execution did not complete")
+    }
+
+    /// A `StreamingTableExec` partition whose stream never produces anything,
+    /// like an idle partition of a streaming source.
+    #[derive(Debug)]
+    struct PendingPartition {
+        schema: SchemaRef,
+    }
+
+    impl PartitionStream for PendingPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::pending(),
+            ))
+        }
+    }
+
+    /// A `StreamingTableExec` partition that produces a single batch.
+    #[derive(Debug)]
+    struct BatchPartition {
+        batch: RecordBatch,
+    }
+
+    impl PartitionStream for BatchPartition {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.batch.schema(),
+                futures::stream::iter([Ok(self.batch.clone())]),
+            ))
+        }
+    }
+
+    /// A plan with a single partition with schema `schema` that never
+    /// produces anything.
+    pub(crate) fn pending_plan(schema: SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
+        let partition = Arc::new(PendingPartition {
+            schema: Arc::clone(&schema),
+        });
+        streaming_plan(schema, partition)
+    }
+
+    /// A plan with a single partition that produces `batch`.
+    pub(crate) fn batch_plan(batch: RecordBatch) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = batch.schema();
+        streaming_plan(schema, Arc::new(BatchPartition { batch }))
+    }
+
+    fn streaming_plan(
+        schema: SchemaRef,
+        partition: Arc<dyn PartitionStream>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(StreamingTableExec::try_new(
+            schema,
+            vec![partition],
+            None,
+            vec![],
+            false,
+            None,
+        )?))
     }
 }
 
