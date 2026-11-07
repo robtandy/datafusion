@@ -17,7 +17,7 @@
 //! Queries are planned by DataFusion as usual; [`PipelineQueryPlanner`]
 //! lowers the resulting [`ExecutionPlan`](datafusion_physical_plan::ExecutionPlan)
 //! into a tree of [`PhysicalOperator`]s, which is decomposed into
-//! [`Pipeline`](pipeline::Pipeline)s and executed by the [`Executor`]:
+//! [`Pipeline`]s and executed by the [`Executor`]:
 //! worker threads pull [`DataChunk`]s from the source of a pipeline and push
 //! them through its operators into its sink.
 //!
@@ -28,7 +28,7 @@
 //! * [`chunk`] - [`DataChunk`] and [`SelectionVector`].
 //! * [`operator`] - the [`PhysicalOperator`] trait and its states.
 //! * [`pipeline`] - decomposition of operator trees into pipelines.
-//! * [`executor`] - [`PipelineExecutor`](executor::PipelineExecutor) and
+//! * [`executor`] - [`PipelineExecutor`] and
 //!   [`Executor`].
 //! * [`bridge`] - [`BridgeOperator`] and [`PipelineRootExec`], the bridges
 //!   between DataFusion `ExecutionPlan`s and the pipeline engine.

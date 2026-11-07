@@ -576,6 +576,10 @@ impl Executor {
     pub async fn execute(&self) -> Result<()> {
         let registry = Arc::new(ExecutionRegistry::new(self.metrics.by_key()));
         let graph = self.graph.as_ref();
+        log::debug!(
+            "Executing pipelines with up to {} threads:\n{graph}",
+            self.num_threads
+        );
         let num_pipelines = graph.pipelines().len();
         let num_events = num_pipelines + graph.meta_pipelines().len();
 
@@ -697,6 +701,15 @@ impl Executor {
         } else {
             self.pipeline_threads(pipeline, source_state.as_ref())
         };
+        log::trace!(
+            "Starting pipeline {} ({pipeline}) on {num_threads} threads{}",
+            pipeline.id(),
+            if skip {
+                ", skipped: no output possible"
+            } else {
+                ""
+            }
+        );
 
         let shared = Arc::new(PipelineShared {
             source: Arc::clone(pipeline.source()),

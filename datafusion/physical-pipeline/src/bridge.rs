@@ -353,3 +353,150 @@ impl ExecutionPlan for PipelineRootExec {
         Some(crate::explain::root_metrics(self))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{AsArray, Int32Array};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_physical_plan::collect;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]))
+    }
+
+    fn batch(values: std::ops::Range<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(Int32Array::from_iter_values(values))],
+        )
+        .unwrap()
+    }
+
+    /// A plan with three skewed partitions: 5000 rows, 10 rows, nothing.
+    fn plan() -> Arc<dyn ExecutionPlan> {
+        MemorySourceConfig::try_new_exec(
+            &[vec![batch(0..5000)], vec![batch(5000..5010)], vec![]],
+            schema(),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn sorted_values(batches: &[RecordBatch]) -> Vec<i32> {
+        let mut values = batches
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int32Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bridge_runs_all_partitions_in_chunks() -> Result<()> {
+        let bridge: Arc<dyn PhysicalOperator> = Arc::new(BridgeOperator::new(plan()));
+        for threads in [1, 2, 8] {
+            let output = Executor::collect(
+                Arc::clone(&bridge),
+                Arc::new(TaskContext::default()),
+                threads,
+            )
+            .await?;
+            assert_eq!(sorted_values(&output), (0..5010).collect::<Vec<_>>());
+            assert!(
+                output
+                    .iter()
+                    .all(|batch| batch.num_rows() <= DEFAULT_VECTOR_SIZE)
+            );
+            assert!(output.iter().all(|batch| batch.schema() == schema()));
+        }
+        assert_eq!(bridged_plans(&bridge).len(), 1);
+        assert!(
+            bridge
+                .description()
+                .starts_with("BridgeOperator: plan=DataSourceExec")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bridge_threads_are_limited_by_partitions() -> Result<()> {
+        let bridge = BridgeOperator::new(plan());
+        let ctx = ExecutionContext::new(Arc::new(TaskContext::default()), 0, 1);
+        assert_eq!(bridge.get_global_source_state(&ctx)?.max_threads(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_root_exec_streams_the_result() -> Result<()> {
+        let input = plan();
+        let root = Arc::new(PipelineRootExec::try_new(
+            Arc::new(BridgeOperator::new(Arc::clone(&input))),
+            Arc::clone(&input),
+        )?);
+        assert_eq!(root.properties().output_partitioning().partition_count(), 1);
+        assert_eq!(root.schema(), input.schema());
+        assert!(root.children().is_empty());
+        assert!(root.execution_metrics().is_none());
+        let err = root
+            .execute(1, Arc::new(TaskContext::default()))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("single partition"), "{err}");
+
+        let output = collect(
+            Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        assert_eq!(sorted_values(&output), (0..5010).collect::<Vec<_>>());
+
+        let metrics = root.metrics().unwrap();
+        assert_eq!(metrics.output_rows(), Some(5010));
+        let execution = root.execution_metrics().unwrap();
+        let (bridge, bridge_metrics) = execution.iter().next().unwrap();
+        assert_eq!(bridge.name(), "BridgeOperator");
+        assert_eq!(bridge_metrics.output_rows(), 5010);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_root_exec_keeps_single_partition_ordering() -> Result<()> {
+        use datafusion_physical_expr::expressions::col;
+        use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("a", &schema())?)])
+                .unwrap();
+        let source = MemorySourceConfig::try_new(&[vec![batch(0..10)]], schema(), None)?
+            .try_with_sort_information(vec![ordering.clone()])?;
+        let input: Arc<dyn ExecutionPlan> =
+            datafusion_datasource::source::DataSourceExec::from_data_source(source);
+        let root = PipelineRootExec::try_new(
+            Arc::new(BridgeOperator::new(Arc::clone(&input))),
+            input,
+        )?;
+        assert_eq!(root.properties().output_ordering(), Some(&ordering));
+
+        // With several input partitions there is no order.
+        let root =
+            PipelineRootExec::try_new(Arc::new(BridgeOperator::new(plan())), plan())?;
+        assert_eq!(root.properties().output_ordering(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_root_exec_rejects_schema_mismatch() {
+        let other = MemorySourceConfig::try_new_exec(
+            &[vec![]],
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)])),
+            None,
+        )
+        .unwrap();
+        let err = PipelineRootExec::try_new(Arc::new(BridgeOperator::new(plan())), other)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+}

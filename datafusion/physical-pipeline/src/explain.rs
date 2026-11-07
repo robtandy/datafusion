@@ -187,3 +187,74 @@ impl PhysicalOperator for ResultSink {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_execution::TaskContext;
+    use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
+
+    use crate::bridge::BridgeOperator;
+
+    fn root() -> Arc<PipelineRootExec> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        Arc::new(
+            PipelineRootExec::try_new(
+                Arc::new(BridgeOperator::new(Arc::clone(&input))),
+                input,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn display_shows_the_operator_tree() {
+        let root = root();
+        let line = displayable(root.as_ref()).one_line().to_string();
+        assert!(
+            line.starts_with(
+                "PipelineRootExec: root=BridgeOperator: plan=DataSourceExec"
+            ),
+            "{line}"
+        );
+        assert_eq!(
+            format_pipelines(root.operator()).unwrap(),
+            "MetaPipeline 0 (sink: ResultSink)\n  Pipeline 0: BridgeOperator -> ResultSink\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_of_an_execution() -> Result<()> {
+        let root = root();
+        let output = collect(
+            Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+            Arc::new(TaskContext::default()),
+        )
+        .await?;
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        let metrics = root_metrics(&root);
+        assert_eq!(metrics.output_rows(), Some(3));
+        assert!(metrics.elapsed_compute().is_some());
+        let rendered = format_execution_metrics(&root.execution_metrics().unwrap());
+        assert!(
+            rendered.starts_with("BridgeOperator: output_rows=3, output_chunks=1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("CollectorSink: output_rows=0, output_chunks=0, sink_rows=3")
+        );
+        Ok(())
+    }
+}

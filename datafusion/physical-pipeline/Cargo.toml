@@ -71,14 +71,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 # tuple data, joins, aggregates, sorts and windows) that are not referenced yet.
 [package.metadata.cargo-machete]
 ignored = [
-    "arrow-buffer",
+    "arrow-array",
     "arrow-ord",
+    "arrow-schema",
     "bytes",
-    "datafusion-datasource",
     "datafusion-datasource-csv",
     "datafusion-datasource-parquet",
     "datafusion-functions-aggregate-common",
-    "datafusion-physical-expr",
     "datafusion-physical-expr-common",
     "datafusion-physical-optimizer",
     "hashbrown",

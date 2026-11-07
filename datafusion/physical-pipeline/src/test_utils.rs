@@ -53,7 +53,6 @@
 //! only uses the public API of the crate and dev-dependencies.
 //!
 //! ```ignore
-//! #[allow(dead_code)]
 //! #[path = "../src/test_utils.rs"]
 //! mod test_utils;
 //! ```

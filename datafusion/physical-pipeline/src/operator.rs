@@ -352,6 +352,11 @@ pub(crate) fn operator_key(operator: &dyn PhysicalOperator) -> usize {
 /// State shared by all tasks of one execution of a pipeline graph.
 #[derive(Default)]
 pub(crate) struct ExecutionRegistry {
+    /// Serializes the creation of global states, so that every state is
+    /// created exactly once even if several pipelines start concurrently.
+    /// Separate from the maps, which operators may read while a state is
+    /// created.
+    creation: Mutex<()>,
     sink_states: Mutex<HashMap<usize, Arc<dyn GlobalSinkState>>>,
     operator_states: Mutex<HashMap<usize, Arc<dyn GlobalOperatorState>>>,
     finalize_results: Mutex<HashMap<usize, SinkFinalize>>,
@@ -373,15 +378,13 @@ impl ExecutionRegistry {
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSinkState>> {
         let key = operator_key(sink);
+        let _creation = self.creation.lock();
         if let Some(state) = self.sink_states.lock().get(&key) {
             return Ok(Arc::clone(state));
         }
-        // Create the state outside of the lock, the operator may call back
-        // into the context.
         let state = sink.get_global_sink_state(ctx)?;
-        Ok(Arc::clone(
-            self.sink_states.lock().entry(key).or_insert(state),
-        ))
+        self.sink_states.lock().insert(key, Arc::clone(&state));
+        Ok(state)
     }
 
     /// Returns the global operator state of `operator`, creating it on first
@@ -393,13 +396,13 @@ impl ExecutionRegistry {
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalOperatorState>> {
         let key = operator_key(operator);
+        let _creation = self.creation.lock();
         if let Some(state) = self.operator_states.lock().get(&key) {
             return Ok(Arc::clone(state));
         }
         let state = operator.get_global_operator_state(ctx)?;
-        Ok(Arc::clone(
-            self.operator_states.lock().entry(key).or_insert(state),
-        ))
+        self.operator_states.lock().insert(key, Arc::clone(&state));
+        Ok(state)
     }
 
     pub(crate) fn sink_state(

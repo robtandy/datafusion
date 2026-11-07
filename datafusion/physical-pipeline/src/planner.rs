@@ -19,18 +19,25 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
+//! # use std::sync::Arc;
 //! use datafusion::execution::SessionStateBuilder;
 //! use datafusion::physical_planner::DefaultPhysicalPlanner;
 //! use datafusion::prelude::*;
-//! use datafusion_physical_pipeline::planner::PipelineQueryPlanner;
+//! use datafusion_physical_pipeline::PipelineQueryPlanner;
 //!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> datafusion::error::Result<()> {
 //! let planner = PipelineQueryPlanner::new(Arc::new(DefaultPhysicalPlanner::default()));
 //! let state = SessionStateBuilder::new()
 //!     .with_default_features()
 //!     .with_query_planner(Arc::new(planner))
 //!     .build();
 //! let ctx = SessionContext::new_with_state(state);
+//! let batches = ctx.sql("SELECT 1 AS one").await?.collect().await?;
+//! assert_eq!(batches[0].num_rows(), 1);
+//! # Ok(())
+//! # }
 //! ```
 
 use std::fmt;
@@ -83,7 +90,8 @@ impl QueryPlanner for PipelineQueryPlanner {
             .physical_planner
             .create_physical_plan(logical_plan, session)
             .await?;
-        Ok(create_pipeline_plan(plan)?)
+        let plan: Arc<dyn ExecutionPlan> = create_pipeline_plan(plan)?;
+        Ok(plan)
     }
 }
 
@@ -105,4 +113,28 @@ pub fn lower_execution_plan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn PhysicalOperator>> {
     Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_datasource::memory::MemorySourceConfig;
+
+    #[test]
+    fn unsupported_plans_are_bridged() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let plan: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
+        let operator = lower_execution_plan(&plan)?;
+        let bridge = operator.downcast_ref::<BridgeOperator>().unwrap();
+        assert!(Arc::ptr_eq(bridge.plan(), &plan));
+
+        let root = create_pipeline_plan(Arc::clone(&plan))?;
+        assert_eq!(root.schema(), schema);
+        assert!(Arc::ptr_eq(root.input(), &plan));
+        assert!(root.operator().is::<BridgeOperator>());
+        Ok(())
+    }
 }
