@@ -28,7 +28,7 @@
 //! state per thread (hence only `Send`).
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::future::Future;
 use std::sync::Arc;
@@ -132,9 +132,14 @@ pub enum OperatorResult {
     /// pushed down the pipeline, the operator is called again with the same
     /// input chunk.
     HaveMoreOutput,
-    /// The operator will not produce any more output. Any rows in `output`
-    /// are still pushed down the pipeline, then the pipeline stops pulling
-    /// data from its source.
+    /// The operator will not produce any more output, on any thread. Any
+    /// rows in `output` are still pushed down the pipeline, and the operators
+    /// after this one are still flushed, but neither this operator nor the
+    /// ones before it are called again: all threads of all pipelines that
+    /// contain the operator stop pulling from their sources (threads blocked
+    /// in their source are woken up, pipelines that did not start yet do not
+    /// run their source). A thread that was already calling the operator
+    /// concurrently may still call it once more.
     Finished,
     /// The operator cannot make progress; it is called again with the same
     /// input once the task is resumed. `output` is ignored.
@@ -156,8 +161,14 @@ pub enum OperatorFinalizeResult {
 pub enum SinkResult {
     /// The sink consumed the chunk and accepts more input.
     NeedMoreInput,
-    /// The sink consumed the chunk and does not need any more input (e.g. a
-    /// `LIMIT` was reached); the pipeline stops pulling from its source.
+    /// The sink consumed the chunk and does not need any more input, from any
+    /// thread (e.g. a `LIMIT` was reached). All threads of all pipelines that
+    /// end in this sink stop: threads blocked in their source are woken up,
+    /// pipelines that did not start yet do not run their source, and
+    /// operators are not flushed. Every thread still calls
+    /// [`PhysicalOperator::combine`], and the sink is finalized once. A
+    /// thread that was already pushing a chunk concurrently may still sink
+    /// it, so the sink should keep returning `Finished`.
     Finished,
     /// The sink could not consume the chunk; it is called again with the
     /// same chunk once the task is resumed.
@@ -361,6 +372,17 @@ pub(crate) struct ExecutionRegistry {
     operator_states: Mutex<HashMap<usize, Arc<dyn GlobalOperatorState>>>,
     finalize_results: Mutex<HashMap<usize, SinkFinalize>>,
     metrics: HashMap<usize, Arc<OperatorMetrics>>,
+    /// Operators that returned `Finished` as a streaming operator.
+    finished_operators: Mutex<HashSet<usize>>,
+    /// Sinks that returned `Finished`.
+    finished_sinks: Mutex<HashSet<usize>>,
+    /// Incremented whenever an operator or a sink finishes, so that threads
+    /// can cheaply detect that they may have to stop.
+    finish_epoch: AtomicUsize,
+    /// Wakers of the threads that are blocked, by thread id, woken when an
+    /// operator or a sink finishes.
+    blocked_threads: Mutex<HashMap<usize, Waker>>,
+    next_thread_id: AtomicUsize,
 }
 
 impl ExecutionRegistry {
@@ -435,6 +457,70 @@ impl ExecutionRegistry {
             .copied()
     }
 
+    /// A unique id for a thread (a `PipelineExecutor`) of the execution.
+    pub(crate) fn next_thread_id(&self) -> usize {
+        self.next_thread_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Changes whenever an operator or a sink finishes.
+    pub(crate) fn finish_epoch(&self) -> usize {
+        self.finish_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Record that `operator` returned `Finished` as a streaming operator
+    /// (`as_sink == false`) or as a sink, and wake all blocked threads, so
+    /// that the threads of the pipelines that contain it stop.
+    pub(crate) fn set_finished(&self, operator: &dyn PhysicalOperator, as_sink: bool) {
+        let key = operator_key(operator);
+        let newly_finished = if as_sink {
+            self.finished_sinks.lock().insert(key)
+        } else {
+            self.finished_operators.lock().insert(key)
+        };
+        if !newly_finished {
+            return;
+        }
+        self.finish_epoch.fetch_add(1, Ordering::SeqCst);
+        let wakers = self
+            .blocked_threads
+            .lock()
+            .drain()
+            .map(|(_, waker)| waker)
+            .collect::<Vec<_>>();
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Whether `operator` returned `Finished` as a streaming operator.
+    pub(crate) fn is_operator_finished(&self, operator: &dyn PhysicalOperator) -> bool {
+        self.finished_operators
+            .lock()
+            .contains(&operator_key(operator))
+    }
+
+    /// Whether `operator` returned `Finished` as a sink.
+    pub(crate) fn is_sink_finished(&self, operator: &dyn PhysicalOperator) -> bool {
+        self.finished_sinks.lock().contains(&operator_key(operator))
+    }
+
+    /// Register the waker of a blocked thread, to be woken when an operator
+    /// or a sink finishes.
+    pub(crate) fn register_blocked(&self, thread: usize, waker: &Waker) {
+        let mut blocked = self.blocked_threads.lock();
+        match blocked.get_mut(&thread) {
+            Some(registered) => registered.clone_from(waker),
+            None => {
+                blocked.insert(thread, waker.clone());
+            }
+        }
+    }
+
+    /// Forget a thread that completed.
+    pub(crate) fn unregister(&self, thread: usize) {
+        self.blocked_threads.lock().remove(&thread);
+    }
+
     pub(crate) fn metrics(
         &self,
         operator: &dyn PhysicalOperator,
@@ -496,6 +582,10 @@ impl ExecutionContext {
     /// [`TaskInterrupt::waker_registered`] while it is pending.
     pub fn waker(&self) -> &Waker {
         &self.waker
+    }
+
+    pub(crate) fn registry(&self) -> &Arc<ExecutionRegistry> {
+        &self.registry
     }
 
     pub(crate) fn set_waker(&mut self, waker: &Waker) {

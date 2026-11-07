@@ -136,6 +136,11 @@ pub struct PipelineExecutor {
     wait: Option<BoxFuture<'static, ()>>,
     /// Operator calls left in the current poll.
     budget: usize,
+    /// Id of this thread in the execution.
+    thread: usize,
+    /// The `finish_epoch` of the registry when this thread last checked
+    /// whether an operator or the sink of the pipeline finished.
+    finish_epoch: usize,
     done: bool,
 }
 
@@ -168,6 +173,8 @@ impl PipelineExecutor {
                 flush_current_finished: false,
                 wait: None,
                 budget: 0,
+                thread: ctx.registry().next_thread_id(),
+                finish_epoch: 0,
                 done: false,
                 shared,
                 ctx,
@@ -196,6 +203,8 @@ impl PipelineExecutor {
             flush_current_finished: false,
             wait: None,
             budget: 0,
+            thread: ctx.registry().next_thread_id(),
+            finish_epoch: 0,
             done: false,
             shared,
             ctx,
@@ -241,9 +250,10 @@ impl PipelineExecutor {
             return Poll::Ready(Ok(Progress::Done));
         }
         self.ctx.set_waker(cx.waker());
+        self.apply_finished();
         if let Some(wait) = self.wait.as_mut() {
             if wait.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
+                return self.suspend(cx);
             }
             self.wait = None;
         }
@@ -256,23 +266,67 @@ impl PipelineExecutor {
                 Ok(Step::Continue) => {}
                 Ok(Step::Done) => {
                     self.done = true;
+                    self.ctx.registry().unregister(self.thread);
                     return Poll::Ready(self.combine().map(|()| Progress::Done));
                 }
                 Ok(Step::Blocked(interrupt)) => match interrupt.into_kind() {
-                    InterruptKind::WakerRegistered => return Poll::Pending,
+                    InterruptKind::WakerRegistered => return self.suspend(cx),
                     InterruptKind::Yield => return Poll::Ready(Ok(Progress::Yield)),
                     InterruptKind::Future(mut future) => {
                         if future.as_mut().poll(cx).is_pending() {
                             self.wait = Some(future);
-                            return Poll::Pending;
+                            return self.suspend(cx);
                         }
                     }
                 },
                 Err(e) => {
                     self.done = true;
+                    self.ctx.registry().unregister(self.thread);
                     return Poll::Ready(Err(e));
                 }
             }
+        }
+    }
+
+    /// Suspend the blocked thread. Besides by what it is blocked on, it is
+    /// woken when an operator or a sink finishes, which may end its work.
+    fn suspend(&mut self, cx: &Context<'_>) -> Poll<Result<Progress>> {
+        let registry = self.ctx.registry();
+        registry.register_blocked(self.thread, cx.waker());
+        if registry.finish_epoch() != self.finish_epoch {
+            // An operator or a sink finished in the meantime: check it first.
+            return Poll::Ready(Ok(Progress::Yield));
+        }
+        Poll::Pending
+    }
+
+    /// Stop the work that is no longer needed because an operator or the
+    /// sink of the pipeline returned `Finished`, on any thread.
+    fn apply_finished(&mut self) {
+        let epoch = self.ctx.registry().finish_epoch();
+        if epoch == self.finish_epoch {
+            return;
+        }
+        self.finish_epoch = epoch;
+        let registry = Arc::clone(self.ctx.registry());
+        let shared = Arc::clone(&self.shared);
+        if registry.is_sink_finished(shared.sink.as_ref()) {
+            // The sink does not need any more input, not even the chunk it
+            // did not accept yet.
+            self.pending_sink = false;
+            self.wait = None;
+            self.finish_at(shared.operators.len());
+            return;
+        }
+        if let Some(index) = shared
+            .operators
+            .iter()
+            .rposition(|operator| registry.is_operator_finished(operator.as_ref()))
+        {
+            // The blocked call may be one that is no longer made: it is
+            // retried right away if it is still needed.
+            self.wait = None;
+            self.finish_at(index + 1);
         }
     }
 
@@ -289,6 +343,7 @@ impl PipelineExecutor {
     /// Make progress. Only called with a non-empty budget, so that every
     /// step makes at least one operator call (or completes the pipeline).
     fn step(&mut self) -> Result<Step> {
+        self.apply_finished();
         // A chunk the sink did not accept yet.
         if self.pending_sink {
             return self.sink_last_chunk();
@@ -386,7 +441,14 @@ impl PipelineExecutor {
             match result? {
                 OperatorResult::NeedMoreInput => {}
                 OperatorResult::HaveMoreOutput => self.in_process_operators.push(stage),
-                OperatorResult::Finished => self.finish_at(stage),
+                OperatorResult::Finished => {
+                    self.finish_at(stage);
+                    // Stop the other threads, of all pipelines with this
+                    // operator, too.
+                    self.ctx
+                        .registry()
+                        .set_finished(shared.operators[index].as_ref(), false);
+                }
                 OperatorResult::Blocked(interrupt) => {
                     output.reset();
                     self.in_process_operators.push(stage);
@@ -434,8 +496,12 @@ impl PipelineExecutor {
                 self.shared.sink_metrics.record_sink(rows);
                 self.pending_sink = false;
                 // The sink does not want more data: stop everything,
-                // including flushing.
+                // including flushing, on all threads of all pipelines that
+                // end in this sink.
                 self.finish_at(self.shared.operators.len());
+                self.ctx
+                    .registry()
+                    .set_finished(self.shared.sink.as_ref(), true);
                 Ok(Step::Continue)
             }
             SinkResult::Blocked(interrupt) => Ok(Step::Blocked(interrupt)),
@@ -725,15 +791,21 @@ impl Executor {
         registry: &Arc<ExecutionRegistry>,
     ) -> Result<()> {
         let ctx = self.context(0, self.num_threads, registry);
-        // An operator that already knows it cannot produce output makes the
-        // whole pipeline a no-op (its sink still combines an empty state).
+        // The pipeline is a no-op (its sink still combines an empty state) if
+        // an operator already knows it cannot produce output, if its sink
+        // does not need more input, or if one of its operators finished.
         let skip = std::iter::once(pipeline.source())
             .chain(pipeline.operators())
             .any(|operator| {
                 operator.is_sink()
                     && registry.finalize_result(operator.as_ref())
                         == Some(SinkFinalize::NoOutputPossible)
-            });
+            })
+            || registry.is_sink_finished(pipeline.sink().as_ref())
+            || pipeline
+                .operators()
+                .iter()
+                .any(|operator| registry.is_operator_finished(operator.as_ref()));
         let sink_state =
             registry.get_or_create_sink_state(pipeline.sink().as_ref(), &ctx)?;
         let operator_states = pipeline
@@ -756,11 +828,7 @@ impl Executor {
         log::trace!(
             "Starting pipeline {} ({pipeline}) on {num_threads} threads{}",
             pipeline.id(),
-            if skip {
-                ", skipped: no output possible"
-            } else {
-                ""
-            }
+            if skip { ", skipped" } else { "" }
         );
 
         let shared = Arc::new(PipelineShared {
@@ -3060,8 +3128,14 @@ mod tests {
             assert!(next.is_err(), "the pipeline should still be running");
             let calls = spin.calls.load(Ordering::SeqCst);
             assert!(calls > 0 && calls < TIMES, "{calls} calls");
-            // The ticker ran while the pipeline was busy.
-            assert!(ticks.load(Ordering::SeqCst) > 10, "{ticks:?}");
+            // The ticker ran while the pipeline was busy, regularly: the
+            // pipeline yields after every `CALLS_PER_POLL` operator calls
+            // (independently of how much CPU time the test gets).
+            let ticks = ticks.load(Ordering::SeqCst);
+            assert!(
+                ticks >= 2 && ticks * CALLS_PER_POLL * 8 >= calls,
+                "{ticks} ticks, {calls} calls"
+            );
 
             // Dropping the stream stops the pipeline promptly.
             drop(stream);
@@ -3073,5 +3147,290 @@ mod tests {
             drop(ticker);
             Ok(())
         })
+    }
+
+    /// A parallel source on which threads `0..idle_threads` (all threads if
+    /// `None`) block forever, as on an idle streaming source, while the other
+    /// threads hand out `batches`.
+    #[derive(Debug)]
+    struct IdleSource {
+        idle_threads: Option<usize>,
+        batches: Vec<RecordBatch>,
+    }
+
+    impl IdleSource {
+        fn new(idle_threads: Option<usize>, batches: Vec<RecordBatch>) -> Self {
+            Self {
+                idle_threads,
+                batches,
+            }
+        }
+    }
+
+    impl PhysicalOperator for IdleSource {
+        fn name(&self) -> &str {
+            "IdleSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(VecSourceGlobal {
+                next: AtomicUsize::new(0),
+                max_threads: usize::MAX,
+            }))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            if self
+                .idle_threads
+                .is_none_or(|idle_threads| ctx.thread_id < idle_threads)
+            {
+                // Nothing will ever wake this thread up.
+                return Ok(SourceResult::Blocked(TaskInterrupt::waker_registered()));
+            }
+            let gstate = gstate.downcast_ref::<VecSourceGlobal>().unwrap();
+            let index = gstate.next.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.batches.get(index) {
+                Some(batch) => {
+                    SourceResult::Chunk(DataChunk::from_record_batch(batch.clone()))
+                }
+                None => SourceResult::Finished,
+            })
+        }
+    }
+
+    /// A parallel sink that returns `Finished` once it accepted `limit`
+    /// chunks over all threads, and emits the number of accepted chunks.
+    /// Threads that were already pushing a chunk when the sink finished may
+    /// still deliver it.
+    #[derive(Debug)]
+    struct FinishAfter {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        limit: usize,
+        local_states: AtomicUsize,
+        combines: AtomicUsize,
+        finalizes: AtomicUsize,
+    }
+
+    impl FinishAfter {
+        fn new(child: Arc<dyn PhysicalOperator>, limit: usize) -> Self {
+            Self {
+                children: vec![child],
+                limit,
+                local_states: AtomicUsize::new(0),
+                combines: AtomicUsize::new(0),
+                finalizes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl PhysicalOperator for FinishAfter {
+        fn name(&self) -> &str {
+            "FinishAfter"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_global_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSinkState>> {
+            Ok(Arc::new(StopAfterGlobal::default()))
+        }
+
+        fn get_local_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSinkState,
+        ) -> Result<Box<dyn LocalSinkState>> {
+            self.local_states.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(EmptyState))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: &DataChunk,
+            gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let gstate = gstate.downcast_ref::<StopAfterGlobal>().unwrap();
+            let chunks = gstate.chunks.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(if chunks >= self.limit {
+                SinkResult::Finished
+            } else {
+                SinkResult::NeedMoreInput
+            })
+        }
+
+        fn combine(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<()> {
+            self.combines.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn finalize(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSinkState,
+        ) -> Result<SinkFinalize> {
+            self.finalizes.fetch_add(1, Ordering::SeqCst);
+            Ok(SinkFinalize::Ready)
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let sink = ctx.global_sink_state(self).unwrap();
+            let sink = sink.downcast_ref::<StopAfterGlobal>().unwrap();
+            let chunks = sink.chunks.swap(0, Ordering::SeqCst);
+            if chunks == 0 {
+                return Ok(SourceResult::Finished);
+            }
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![chunks as i64]))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    async fn run_with_timeout(
+        root: Arc<dyn PhysicalOperator>,
+        threads: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), run(root, threads))
+            .await
+            .expect("the execution does not complete")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_sink_stops_threads_blocked_in_their_source() -> Result<()> {
+        // Thread 0 blocks forever in its source, thread 1 delivers a chunk
+        // and the sink finishes.
+        let sink = Arc::new(FinishAfter::new(
+            Arc::new(IdleSource::new(Some(1), batches(0, 10, 10))),
+            1,
+        ));
+        let output = run_with_timeout(Arc::clone(&sink) as _, 2).await?;
+        assert_eq!(values(&output), vec![1]);
+        assert_eq!(sink.local_states.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.combines.load(Ordering::SeqCst), 2);
+        assert_eq!(sink.finalizes.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_sink_stops_all_pipelines_into_the_sink() -> Result<()> {
+        for (order_matters, threads) in [(true, 1), (false, 1), (false, 4)] {
+            // A ready first input finishes the sink, the second input would
+            // block forever: ordered, it has not started yet; unordered, it
+            // is blocked.
+            let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: vec![
+                    source(batches(0, 5, 10)),
+                    Arc::new(IdleSource::new(None, vec![])),
+                ],
+                order_matters,
+            });
+            let sink = Arc::new(FinishAfter::new(union, 1));
+            let output = run_with_timeout(Arc::clone(&sink) as _, threads).await?;
+            // Threads stop as soon as they see that the sink finished: each
+            // of them delivers at most the chunk it was pushing.
+            let accepted = values(&output);
+            assert_eq!(accepted.len(), 1);
+            assert!((1..=threads as i64).contains(&accepted[0]), "{accepted:?}");
+            // Every thread of both pipelines combines (a pipeline that starts
+            // after the sink finished runs on a single thread), the sink is
+            // finalized once.
+            let combines = sink.combines.load(Ordering::SeqCst);
+            assert_eq!(combines, sink.local_states.load(Ordering::SeqCst));
+            if threads == 1 {
+                assert_eq!(combines, 2);
+            } else {
+                assert!(
+                    (threads + 1..=2 * threads).contains(&combines),
+                    "{combines}"
+                );
+            }
+            assert_eq!(sink.finalizes.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_operator_stops_all_threads_and_pipelines() -> Result<()> {
+        // Thread 0 blocks forever in its source, thread 1 reaches the limit.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Limit {
+            children: vec![Arc::new(IdleSource::new(Some(1), batches(0, 10, 10)))],
+            limit: 5,
+        });
+        let output = run_with_timeout(root, 2).await?;
+        assert_eq!(values(&output), (0..5).collect::<Vec<_>>());
+
+        for (order_matters, threads) in [(true, 1), (false, 1), (false, 4)] {
+            let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: vec![
+                    source(batches(0, 5, 10)),
+                    Arc::new(IdleSource::new(None, vec![])),
+                ],
+                order_matters,
+            });
+            let root: Arc<dyn PhysicalOperator> = Arc::new(Limit {
+                children: vec![union],
+                limit: 5,
+            });
+            let output = run_with_timeout(root, threads).await?;
+            assert_eq!(values(&output).len(), 5);
+        }
+        Ok(())
     }
 }

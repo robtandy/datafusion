@@ -186,10 +186,14 @@ processes a non-empty `input` chunk into `output`:
 - `HaveMoreOutput`: `output` is pushed down, then the operator is called again
   with the **same** `input` (e.g. a join that produces more than 2048 rows for
   one probe chunk keeps its cursor in the local state).
-- `Finished`: the operator will produce no more output. `output` (possibly
-  non-empty) is still pushed down, then the pipeline stops pulling from its
-  source for this thread. Operators upstream of the finished operator are
-  never called again; operators downstream are still flushed.
+- `Finished`: the operator will produce no more output, on any thread.
+  `output` (possibly non-empty) is still pushed down and the operators
+  downstream are still flushed, but the finished operator and the operators
+  upstream of it are not called again: all threads of all pipelines that
+  contain the operator stop pulling from their sources. Threads blocked in
+  their source are woken up, and pipelines that did not start yet skip their
+  source. A thread that was already calling the operator concurrently may
+  call it once more.
 - `Blocked(interrupt)`: the operator is called again with the same input
   once the task is resumed; `output` is ignored.
 
@@ -206,9 +210,14 @@ for example a streaming `LIMIT` counts the rows of all its inputs.
 ### Sink role
 
 - `sink(ctx, input, gstate, lstate) -> Result<SinkResult>` consumes a
-  non-empty chunk: `NeedMoreInput`, `Finished` (no more input needed, e.g. a
-  `LIMIT` is reached: the pipeline stops) or `Blocked` (called again with the
-  same chunk once resumed).
+  non-empty chunk: `NeedMoreInput`, `Finished` or `Blocked` (called again with
+  the same chunk once resumed). `Finished` means that no more input is needed
+  from any thread (e.g. a `LIMIT` is reached): all threads of all pipelines
+  that end in the sink stop, without flushing their operators. Threads blocked
+  in their source are woken up, and pipelines that did not start yet skip
+  their source. Every thread still calls `combine` and the sink is finalized
+  once. A thread that was already pushing a chunk concurrently may still sink
+  it, so the sink should keep returning `Finished`.
 - `combine(ctx, gstate, lstate)` is called once per thread when the thread
   finished its part of the pipeline: merge the thread-local state into the
   global state.
