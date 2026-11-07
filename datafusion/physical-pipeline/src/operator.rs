@@ -453,7 +453,9 @@ pub struct ExecutionContext {
     pub task_ctx: Arc<TaskContext>,
     /// Index of the thread executing the pipeline, in `0..num_threads`.
     pub thread_id: usize,
-    /// Number of threads executing the pipeline.
+    /// Number of threads executing the pipeline. When a global state is
+    /// created or a sink is finalized, the maximum number of threads of any
+    /// pipeline of the execution.
     pub num_threads: usize,
     registry: Arc<ExecutionRegistry>,
     waker: Waker,
