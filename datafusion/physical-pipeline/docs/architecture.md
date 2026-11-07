@@ -284,6 +284,7 @@ Operators with several children or several roles override
 | `build(current, child)`                                 | recurse: `child.build_pipelines(current, meta)`                                            |
 | `set_source(current, op)` / `add_operator(current, op)` | add an operator (operators are added from the sink side to the source side)                |
 | `create_child_meta_pipeline(current, sink)`             | new child meta pipeline with `sink`; `current` depends on it                               |
+| `build_union(current, inputs, order_matters)`           | build the pipelines of a union of any number of inputs                                     |
 | `create_union_pipeline(current, order_matters)`         | new pipeline with the same sink and the operators of `current` so far                      |
 | `create_child_pipeline(current, source, last)`          | new pipeline that reads from `source` after `current` (and pipelines created after `last`) |
 | `add_dependency(pipeline, dependency)`                  | extra ordering between pipelines of the same meta pipeline                                 |
@@ -316,13 +317,21 @@ fn build_pipelines(
 }
 ```
 
-and a union like DuckDB's `PhysicalUnion::BuildPipelines`:
+and a union with `build_union`, which implements DuckDB's
+`PhysicalUnion::BuildPipelines` for any number of inputs:
 
 ```rust
-let mut union_pipeline = meta.create_union_pipeline(current, false)?;
-meta.build(current, &self.children[0])?;
-meta.build(&mut union_pipeline, &self.children[1])
+meta.build_union(current, &self.children, order_matters)
 ```
+
+The first input continues `current`; every other input gets a union pipeline
+that shares the operators above the union and the sink. If the order matters,
+the pipelines of every input only start once all pipelines of the inputs
+before it completed, including the pipelines created for nested unions, so
+that `Union(Union(A, B), C)` emits `A`, `B` and then `C`. (A union with two
+inputs can also use `create_union_pipeline` directly, creating the union
+pipeline before building the first input into `current` and building the
+second input into the union pipeline afterwards.)
 
 For example, `SELECT k, COUNT(*) FROM probe JOIN build USING (k) GROUP BY k`
 decomposes into
@@ -363,6 +372,14 @@ concurrently, even if it is part of several pipelines (the pipelines of the
 inputs of a union share the sink and the operators above the union): the
 executor runs such pipelines one after the other, in an order compatible with
 their dependencies.
+
+Work that is no longer needed is cancelled. When a sink or an operator
+finishes, or a sink is finalized with `NoOutputPossible`, the pipelines that
+did not start yet and contain it skip their work. A child meta pipeline whose
+output only these pipelines would read is then cancelled too, recursively:
+its sink is marked as finished, so that its threads stop (also when blocked in
+an idle source), still combine, and its sink is still finalized once. Child
+meta pipelines that some other pipeline still needs keep running.
 
 Errors of any worker cancel the execution and are returned by the output
 stream; panics are propagated. Dropping the output stream aborts all tasks.

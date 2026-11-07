@@ -174,6 +174,11 @@ pub enum SinkResult {
     /// [`PhysicalOperator::combine`], and the sink is finalized once. A
     /// thread that was already pushing a chunk concurrently may still sink
     /// it, so the sink should keep returning `Finished`.
+    ///
+    /// Pipeline breakers whose output is then no longer needed (all the
+    /// pipelines that read from them skip their work) are cancelled the same
+    /// way, as if their sink had finished: their threads stop, combine and
+    /// they are finalized.
     Finished,
     /// The sink could not consume the chunk; it is called again with the
     /// same chunk once the task is resumed.
@@ -188,7 +193,9 @@ pub enum SinkFinalize {
     /// The sink is finalized and the operator knows that it cannot produce
     /// any output (e.g. an inner join with an empty build side). Pipelines in
     /// which the operator is the source or an operator are skipped (their
-    /// sinks still see a `combine` call, without any input).
+    /// sinks still see a `combine` call, without any input), and the pipeline
+    /// breakers that only these pipelines read from (e.g. on the probe side
+    /// of the join) are cancelled, see [`SinkResult::Finished`].
     NoOutputPossible,
 }
 
@@ -375,12 +382,11 @@ pub(crate) struct ExecutionRegistry {
     creation: Mutex<()>,
     sink_states: Mutex<HashMap<usize, Arc<dyn GlobalSinkState>>>,
     operator_states: Mutex<HashMap<usize, Arc<dyn GlobalOperatorState>>>,
-    finalize_results: Mutex<HashMap<usize, SinkFinalize>>,
     metrics: HashMap<usize, Arc<OperatorMetrics>>,
-    /// Operators that returned `Finished` as a streaming operator.
-    finished_operators: Mutex<HashSet<usize>>,
-    /// Sinks that returned `Finished`.
-    finished_sinks: Mutex<HashSet<usize>>,
+    /// The structure of the pipelines, to find work that is no longer needed.
+    dependencies: PipelineDependencies,
+    /// Operators and sinks that finished, and sinks without output.
+    finished: Mutex<FinishedOperators>,
     /// Incremented whenever an operator or a sink finishes, so that threads
     /// can cheaply detect that they may have to stop.
     finish_epoch: AtomicUsize,
@@ -390,10 +396,92 @@ pub(crate) struct ExecutionRegistry {
     next_thread_id: AtomicUsize,
 }
 
+/// The pipelines of an execution in terms of operator keys (see
+/// `operator_key`), to find the work that is no longer needed once an
+/// operator finished.
+#[derive(Debug, Default)]
+pub(crate) struct PipelineDependencies {
+    /// For every pipeline: its source, operators and sink.
+    pub(crate) pipelines: Vec<PipelineKeys>,
+    /// For every meta pipeline: its sink, and the pipelines that wait for it
+    /// to be finalized (because they read from its sink).
+    pub(crate) meta_pipelines: Vec<MetaPipelineKeys>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PipelineKeys {
+    pub(crate) source: usize,
+    pub(crate) operators: Vec<usize>,
+    pub(crate) sink: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetaPipelineKeys {
+    pub(crate) sink: usize,
+    pub(crate) consumers: Vec<usize>,
+}
+
+#[derive(Debug, Default)]
+struct FinishedOperators {
+    /// Operators that returned `Finished` as a streaming operator.
+    operators: HashSet<usize>,
+    /// Sinks that returned `Finished`, or whose output is not needed.
+    sinks: HashSet<usize>,
+    /// Sinks that were finalized with `SinkFinalize::NoOutputPossible`.
+    no_output: HashSet<usize>,
+}
+
+impl FinishedOperators {
+    /// Whether a pipeline that did not start yet will skip its work: its
+    /// sink or one of its operators finished, or its source or one of its
+    /// operators cannot produce output.
+    fn skips(&self, pipeline: &PipelineKeys) -> bool {
+        self.sinks.contains(&pipeline.sink)
+            || self.no_output.contains(&pipeline.source)
+            || pipeline
+                .operators
+                .iter()
+                .any(|op| self.operators.contains(op) || self.no_output.contains(op))
+    }
+
+    /// Mark the sinks of the meta pipelines whose output is no longer needed
+    /// as finished: those all of whose consumers skip their work, as their
+    /// sink or operators finished. Repeats until nothing changes, as this
+    /// makes the pipelines of these meta pipelines skip their work too.
+    /// Returns `true` if a sink was marked.
+    fn cancel_unused(&mut self, dependencies: &PipelineDependencies) -> bool {
+        let mut changed = false;
+        loop {
+            let mut progress = false;
+            for meta in &dependencies.meta_pipelines {
+                if meta.consumers.is_empty() || self.sinks.contains(&meta.sink) {
+                    continue;
+                }
+                if meta
+                    .consumers
+                    .iter()
+                    .all(|&pipeline| self.skips(&dependencies.pipelines[pipeline]))
+                {
+                    self.sinks.insert(meta.sink);
+                    progress = true;
+                }
+            }
+            if !progress {
+                return changed;
+            }
+            changed = true;
+        }
+    }
+}
+
 impl ExecutionRegistry {
-    pub(crate) fn new(metrics: HashMap<usize, Arc<OperatorMetrics>>) -> Self {
+    pub(crate) fn new(
+        metrics: HashMap<usize, Arc<OperatorMetrics>>,
+        dependencies: PipelineDependencies,
+    ) -> Self {
         Self {
             metrics,
+            dependencies,
             ..Default::default()
         }
     }
@@ -442,24 +530,25 @@ impl ExecutionRegistry {
             .map(Arc::clone)
     }
 
+    /// Record the result of finalizing `sink`. A sink that cannot produce
+    /// output makes the pipelines that read from it skip their work, which
+    /// may make other work unnecessary (see [`Self::set_finished`]).
     pub(crate) fn set_finalize_result(
         &self,
         sink: &dyn PhysicalOperator,
         result: SinkFinalize,
     ) {
-        self.finalize_results
-            .lock()
-            .insert(operator_key(sink), result);
-    }
-
-    pub(crate) fn finalize_result(
-        &self,
-        operator: &dyn PhysicalOperator,
-    ) -> Option<SinkFinalize> {
-        self.finalize_results
-            .lock()
-            .get(&operator_key(operator))
-            .copied()
+        let key = operator_key(sink);
+        if result == SinkFinalize::NoOutputPossible {
+            let cancelled = {
+                let mut finished = self.finished.lock();
+                finished.no_output.insert(key);
+                finished.cancel_unused(&self.dependencies)
+            };
+            if cancelled {
+                self.notify_finished();
+            }
+        }
     }
 
     /// A unique id for a thread (a `PipelineExecutor`) of the execution.
@@ -475,16 +564,29 @@ impl ExecutionRegistry {
     /// Record that `operator` returned `Finished` as a streaming operator
     /// (`as_sink == false`) or as a sink, and wake all blocked threads, so
     /// that the threads of the pipelines that contain it stop.
+    ///
+    /// The meta pipelines whose output is then no longer needed (all the
+    /// pipelines reading from their sink skip their work) are cancelled too:
+    /// their sink is marked as finished, so that their pipelines stop.
     pub(crate) fn set_finished(&self, operator: &dyn PhysicalOperator, as_sink: bool) {
         let key = operator_key(operator);
-        let newly_finished = if as_sink {
-            self.finished_sinks.lock().insert(key)
-        } else {
-            self.finished_operators.lock().insert(key)
-        };
-        if !newly_finished {
-            return;
+        {
+            let mut finished = self.finished.lock();
+            let newly_finished = if as_sink {
+                finished.sinks.insert(key)
+            } else {
+                finished.operators.insert(key)
+            };
+            if !newly_finished {
+                return;
+            }
+            finished.cancel_unused(&self.dependencies);
         }
+        self.notify_finished();
+    }
+
+    /// Wake all blocked threads after an operator or a sink finished.
+    fn notify_finished(&self) {
         self.finish_epoch.fetch_add(1, Ordering::SeqCst);
         let wakers = self
             .blocked_threads
@@ -497,16 +599,28 @@ impl ExecutionRegistry {
         }
     }
 
+    /// Whether the pipeline with id `pipeline` skips its work if it starts
+    /// now: its sink or one of its operators finished, or its source or one
+    /// of its operators cannot produce output.
+    pub(crate) fn skips_pipeline(&self, pipeline: usize) -> bool {
+        self.dependencies
+            .pipelines
+            .get(pipeline)
+            .is_some_and(|keys| self.finished.lock().skips(keys))
+    }
+
     /// Whether `operator` returned `Finished` as a streaming operator.
     pub(crate) fn is_operator_finished(&self, operator: &dyn PhysicalOperator) -> bool {
-        self.finished_operators
+        self.finished
             .lock()
+            .operators
             .contains(&operator_key(operator))
     }
 
-    /// Whether `operator` returned `Finished` as a sink.
+    /// Whether `operator` returned `Finished` as a sink, or its output is not
+    /// needed any more.
     pub(crate) fn is_sink_finished(&self, operator: &dyn PhysicalOperator) -> bool {
-        self.finished_sinks.lock().contains(&operator_key(operator))
+        self.finished.lock().sinks.contains(&operator_key(operator))
     }
 
     /// Register the waker of a blocked thread, to be woken when an operator

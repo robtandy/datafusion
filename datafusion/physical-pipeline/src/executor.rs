@@ -35,9 +35,9 @@ use crate::chunk::DataChunk;
 use crate::operator::{
     EmptyState, ExecutionContext, ExecutionRegistry, GlobalOperatorState,
     GlobalSinkState, GlobalSourceState, InterruptKind, LocalSinkState, LocalSourceState,
-    OperatorFinalizeResult, OperatorMetrics, OperatorResult, OperatorState,
-    PhysicalOperator, SinkFinalize, SinkResult, SourceResult, TaskInterrupt,
-    downcast_state_mut, operator_key,
+    MetaPipelineKeys, OperatorFinalizeResult, OperatorMetrics, OperatorResult,
+    OperatorState, PhysicalOperator, PipelineDependencies, PipelineKeys, SinkResult,
+    SourceResult, TaskInterrupt, downcast_state_mut, operator_key,
 };
 use crate::pipeline::{MetaPipeline, Pipeline, PipelineGraph};
 
@@ -57,8 +57,9 @@ struct PipelineShared {
     source_metrics: Arc<OperatorMetrics>,
     operator_metrics: Vec<Arc<OperatorMetrics>>,
     sink_metrics: Arc<OperatorMetrics>,
-    /// An operator of the pipeline reported [`SinkFinalize::NoOutputPossible`]:
-    /// skip the push loop entirely.
+    /// The pipeline skips its work (see
+    /// [`crate::operator::SinkFinalize::NoOutputPossible`] and
+    /// [`crate::operator::SinkResult::Finished`]): no push loop at all.
     skip: bool,
 }
 
@@ -728,7 +729,10 @@ impl Executor {
 
     /// Run all pipelines to completion.
     pub async fn execute(&self) -> Result<()> {
-        let registry = Arc::new(ExecutionRegistry::new(self.metrics.by_key()));
+        let registry = Arc::new(ExecutionRegistry::new(
+            self.metrics.by_key(),
+            pipeline_dependencies(&self.graph),
+        ));
         let graph = self.graph.as_ref();
         log::debug!(
             "Executing pipelines with up to {} threads:\n{graph}",
@@ -809,18 +813,7 @@ impl Executor {
         // The pipeline is a no-op (its sink still combines an empty state) if
         // an operator already knows it cannot produce output, if its sink
         // does not need more input, or if one of its operators finished.
-        let skip = std::iter::once(pipeline.source())
-            .chain(pipeline.operators())
-            .any(|operator| {
-                operator.is_sink()
-                    && registry.finalize_result(operator.as_ref())
-                        == Some(SinkFinalize::NoOutputPossible)
-            })
-            || registry.is_sink_finished(pipeline.sink().as_ref())
-            || pipeline
-                .operators()
-                .iter()
-                .any(|operator| registry.is_operator_finished(operator.as_ref()));
+        let skip = registry.skips_pipeline(pipeline.id());
         let sink_state =
             registry.get_or_create_sink_state(pipeline.sink().as_ref(), &ctx)?;
         let operator_states = pipeline
@@ -913,6 +906,39 @@ impl Executor {
         registry.metrics(sink.as_ref()).add_elapsed(start.elapsed());
         registry.set_finalize_result(sink.as_ref(), result?);
         Ok(())
+    }
+}
+
+/// The pipelines of `graph` in terms of operator keys.
+fn pipeline_dependencies(graph: &PipelineGraph) -> PipelineDependencies {
+    let key = |operator: &Arc<dyn PhysicalOperator>| operator_key(operator.as_ref());
+    let pipelines = graph
+        .pipelines()
+        .iter()
+        .map(|pipeline| PipelineKeys {
+            source: key(pipeline.source()),
+            operators: pipeline.operators().iter().map(key).collect(),
+            sink: key(pipeline.sink()),
+        })
+        .collect();
+    let mut consumers = vec![vec![]; graph.meta_pipelines().len()];
+    for pipeline in graph.pipelines() {
+        for &meta in pipeline.meta_dependencies() {
+            consumers[meta].push(pipeline.id());
+        }
+    }
+    let meta_pipelines = graph
+        .meta_pipelines()
+        .iter()
+        .zip(consumers)
+        .map(|(meta, consumers)| MetaPipelineKeys {
+            sink: key(meta.sink()),
+            consumers,
+        })
+        .collect();
+    PipelineDependencies {
+        pipelines,
+        meta_pipelines,
     }
 }
 
@@ -1286,7 +1312,7 @@ mod tests {
     use datafusion_common::exec_err;
 
     use crate::chunk::SelectionVector;
-    use crate::operator::{GlobalSinkState, downcast_state};
+    use crate::operator::{GlobalSinkState, SinkFinalize, downcast_state};
     use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 
     // ---------------------------------------------------------------------
@@ -1796,6 +1822,7 @@ mod tests {
     struct Materialize {
         children: Vec<Arc<dyn PhysicalOperator>>,
         no_output_if_empty: bool,
+        local_states: AtomicUsize,
         combines: AtomicUsize,
         finalizes: AtomicUsize,
         get_data_calls: AtomicUsize,
@@ -1806,6 +1833,7 @@ mod tests {
             Self {
                 children: vec![child],
                 no_output_if_empty: false,
+                local_states: AtomicUsize::new(0),
                 combines: AtomicUsize::new(0),
                 finalizes: AtomicUsize::new(0),
                 get_data_calls: AtomicUsize::new(0),
@@ -1868,6 +1896,7 @@ mod tests {
             _ctx: &ExecutionContext,
             _gstate: &dyn GlobalSinkState,
         ) -> Result<Box<dyn LocalSinkState>> {
+            self.local_states.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(MaterializeLocal::default()))
         }
 
@@ -2168,6 +2197,8 @@ mod tests {
     #[derive(Debug)]
     struct ProbeThenScan {
         children: Vec<Arc<dyn PhysicalOperator>>,
+        /// Return `SinkFinalize::NoOutputPossible` for an empty build side.
+        no_output_if_empty: bool,
     }
 
     #[derive(Default)]
@@ -2264,6 +2295,21 @@ mod tests {
             let gstate = gstate.downcast_ref::<ProbeThenScanGlobal>().unwrap();
             gstate.build.lock().push(input.clone());
             Ok(SinkResult::NeedMoreInput)
+        }
+
+        fn finalize(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSinkState,
+        ) -> Result<SinkFinalize> {
+            let gstate = gstate.downcast_ref::<ProbeThenScanGlobal>().unwrap();
+            Ok(
+                if self.no_output_if_empty && gstate.build.lock().is_empty() {
+                    SinkFinalize::NoOutputPossible
+                } else {
+                    SinkFinalize::Ready
+                },
+            )
         }
 
         fn is_source(&self) -> bool {
@@ -2382,6 +2428,7 @@ mod tests {
         });
         let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
             children: vec![Arc::new(ProbeThenScan {
+                no_output_if_empty: false,
                 children: vec![union, source(batches(100, 1, 2))],
             })],
             times: 1,
@@ -2676,6 +2723,7 @@ mod tests {
             order_matters: false,
         });
         let root: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+            no_output_if_empty: false,
             children: vec![union, source(batches(1000, 2, 3))],
         });
         let output = run(root, 4).await?;
@@ -2972,6 +3020,7 @@ mod tests {
             });
             let probe = Arc::new(ConcurrencyProbe::new(
                 Arc::new(ProbeThenScan {
+                    no_output_if_empty: false,
                     children: vec![union, source(batches(1000, 2, 3))],
                 }),
                 false,
@@ -3735,6 +3784,285 @@ mod tests {
                 assert_eq!(sorted_values(&output), expected);
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_sink_cancels_child_meta_pipelines_it_no_longer_needs() -> Result<()>
+    {
+        // The second input of the union reads from a pipeline breaker whose
+        // input never produces anything. Once the sink finished, the breaker
+        // is not needed any more.
+        for (order_matters, threads, nested) in [
+            (true, 1, false),
+            (false, 1, false),
+            (true, 4, false),
+            (false, 4, false),
+            (true, 4, true),
+            (false, 4, true),
+        ] {
+            let breaker =
+                Arc::new(Materialize::new(Arc::new(IdleSource::new(None, vec![]))));
+            // With `nested`, the breaker is read by another breaker, whose
+            // output is not needed either.
+            let input: Arc<dyn PhysicalOperator> = if nested {
+                Arc::new(Materialize::new(Arc::clone(&breaker) as _))
+            } else {
+                Arc::clone(&breaker) as _
+            };
+            let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: vec![source(batches(0, 5, 10)), input],
+                order_matters,
+            });
+            let sink = Arc::new(FinishAfter::new(union, 1));
+            let output = run_with_timeout(Arc::clone(&sink) as _, threads).await?;
+            let accepted = values(&output);
+            assert_eq!(accepted.len(), 1);
+            assert!((1..=threads as i64).contains(&accepted[0]), "{accepted:?}");
+            // Every local sink state is combined, every sink finalized once.
+            assert_eq!(
+                sink.combines.load(Ordering::SeqCst),
+                sink.local_states.load(Ordering::SeqCst)
+            );
+            assert_eq!(sink.finalizes.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                breaker.combines.load(Ordering::SeqCst),
+                breaker.local_states.load(Ordering::SeqCst)
+            );
+            assert_eq!(breaker.finalizes.load(Ordering::SeqCst), 1);
+            // The breaker produced nothing.
+            assert_eq!(breaker.get_data_calls.load(Ordering::SeqCst), 0);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_output_possible_cancels_child_meta_pipelines_it_no_longer_needs()
+    -> Result<()> {
+        // The build side is empty: the probe pipeline is skipped, so the
+        // pipeline breaker on the probe side, whose input never produces
+        // anything, is not needed.
+        for threads in [1, 4] {
+            let breaker =
+                Arc::new(Materialize::new(Arc::new(IdleSource::new(None, vec![]))));
+            let join: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+                children: vec![Arc::clone(&breaker) as _, source(vec![])],
+                no_output_if_empty: true,
+            });
+            let output = run_with_timeout(join, threads).await?;
+            assert!(output.is_empty());
+            assert_eq!(
+                breaker.combines.load(Ordering::SeqCst),
+                breaker.local_states.load(Ordering::SeqCst)
+            );
+            assert_eq!(breaker.finalizes.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    /// A source that emits `value` once, from a single thread, after `delay`.
+    #[derive(Debug)]
+    struct DelayedSource {
+        value: i64,
+        delay: std::time::Duration,
+    }
+
+    impl PhysicalOperator for DelayedSource {
+        fn name(&self) -> &str {
+            "DelayedSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_local_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            Ok(Box::new(StaggeredState::default()))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let state = lstate.downcast_mut::<StaggeredState>().unwrap();
+            if !state.waited {
+                state.waited = true;
+                return Ok(SourceResult::Blocked(TaskInterrupt::wait_for(
+                    tokio::time::sleep(self.delay),
+                )));
+            }
+            if state.emitted {
+                return Ok(SourceResult::Finished);
+            }
+            state.emitted = true;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(
+                batches(self.value, 1, 1).remove(0),
+            )))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_unions_keep_the_order_of_nested_inputs() -> Result<()> {
+        let a = || source(batches(0, 1, 1));
+        let b = || -> Arc<dyn PhysicalOperator> {
+            Arc::new(DelayedSource {
+                value: 1,
+                delay: std::time::Duration::from_millis(30),
+            })
+        };
+        let c = || source(batches(2, 1, 1));
+        let union = |left: Arc<dyn PhysicalOperator>,
+                     right: Arc<dyn PhysicalOperator>| {
+            Arc::new(Union {
+                children: vec![left, right],
+                order_matters: true,
+            }) as Arc<dyn PhysicalOperator>
+        };
+        for root in [union(union(a(), b()), c()), union(a(), union(b(), c()))] {
+            let output = run_with_timeout(root, 4).await?;
+            assert_eq!(values(&output), vec![0, 1, 2]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn work_still_needed_by_other_pipelines_is_not_cancelled() -> Result<()> {
+        // Both probe pipelines of the join (one per input of the union below
+        // it) wait for its (slow) build side. The first one is skipped as its
+        // source cannot produce output; the second one still needs the build
+        // side, which must not be cancelled.
+        let empty = Arc::new(Materialize {
+            no_output_if_empty: true,
+            ..Materialize::new(source(vec![]))
+        });
+        let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+            children: vec![empty, Arc::new(Materialize::new(source(batches(0, 2, 5))))],
+            order_matters: false,
+        });
+        let join: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+            children: vec![
+                union,
+                Arc::new(DelayedSource {
+                    value: 100,
+                    delay: std::time::Duration::from_millis(30),
+                }),
+            ],
+            no_output_if_empty: false,
+        });
+        let output = run_with_timeout(join, 4).await?;
+        // The probe rows, then the build rows and the number of probed rows.
+        let mut expected = (0..10).collect::<Vec<_>>();
+        expected.extend([10, 100]);
+        assert_eq!(sorted_values(&output), expected);
+        Ok(())
+    }
+
+    /// A union of any number of inputs, built with
+    /// `MetaPipelineBuilder::build_union`.
+    #[derive(Debug)]
+    struct UnionAll {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        order_matters: bool,
+    }
+
+    impl PhysicalOperator for UnionAll {
+        fn name(&self) -> &str {
+            "UnionAll"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn build_pipelines(
+            &self,
+            current: &mut PipelineBuilder,
+            meta: &mut MetaPipelineBuilder<'_>,
+        ) -> Result<()> {
+            meta.build_union(current, &self.children, self.order_matters)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_unions_of_many_inputs_keep_their_order() -> Result<()> {
+        let a = || source(batches(0, 1, 1));
+        let b = || -> Arc<dyn PhysicalOperator> {
+            Arc::new(DelayedSource {
+                value: 1,
+                delay: std::time::Duration::from_millis(30),
+            })
+        };
+        let c = || source(batches(2, 1, 1));
+        let d = || -> Arc<dyn PhysicalOperator> {
+            Arc::new(DelayedSource {
+                value: 3,
+                delay: std::time::Duration::from_millis(10),
+            })
+        };
+        let union = |children: Vec<Arc<dyn PhysicalOperator>>, order_matters: bool| {
+            Arc::new(UnionAll {
+                children,
+                order_matters,
+            }) as Arc<dyn PhysicalOperator>
+        };
+
+        // Every input waits for all pipelines of the inputs before it.
+        let pipelines = graph(union(vec![a(), b(), c()], true))?;
+        let dependencies = pipelines
+            .pipelines()
+            .iter()
+            .map(|pipeline| pipeline.dependencies().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(dependencies, vec![vec![], vec![0], vec![0, 1]]);
+
+        for root in [
+            union(vec![a(), b(), c(), d()], true),
+            union(vec![union(vec![a(), b()], true), c(), d()], true),
+            union(vec![a(), union(vec![b(), c()], true), d()], true),
+            // Nested binary and n-ary unions.
+            union(
+                vec![
+                    Arc::new(Union {
+                        children: vec![a(), b()],
+                        order_matters: true,
+                    }),
+                    union(vec![c(), d()], true),
+                ],
+                true,
+            ),
+        ] {
+            let output = run_with_timeout(root, 4).await?;
+            assert_eq!(values(&output), vec![0, 1, 2, 3]);
+        }
+
+        // Without order, the inputs run concurrently.
+        let pipelines = graph(union(vec![a(), b(), c()], false))?;
+        assert!(
+            pipelines
+                .pipelines()
+                .iter()
+                .all(|pipeline| pipeline.dependencies().is_empty())
+        );
+        let output = run_with_timeout(union(vec![a(), b(), c(), d()], false), 4).await?;
+        assert_eq!(sorted_values(&output), vec![0, 1, 2, 3]);
         Ok(())
     }
 }
