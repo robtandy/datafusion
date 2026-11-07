@@ -2548,6 +2548,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-physical-pipeline"
+version = "57.0.0-dev"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-ord",
+ "arrow-row",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "bytes",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-common-runtime",
+ "datafusion-datasource",
+ "datafusion-datasource-csv",
+ "datafusion-datasource-parquet",
+ "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions-aggregate-common",
+ "datafusion-physical-expr",
+ "datafusion-physical-expr-common",
+ "datafusion-physical-optimizer",
+ "datafusion-physical-plan",
+ "datafusion-session",
+ "futures",
+ "hashbrown 0.17.1",
+ "itertools 0.15.0",
+ "log",
+ "object_store",
+ "parking_lot 0.13.0",
+ "parquet",
+ "rand 0.9.4",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "datafusion-physical-plan"
 version = "57.0.0-dev"
 dependencies = [

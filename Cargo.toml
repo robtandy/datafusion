@@ -35,6 +35,7 @@ members = [
     "datafusion/physical-optimizer",
     "datafusion/pruning",
     "datafusion/physical-plan",
+    "datafusion/physical-pipeline",
     "datafusion/proto",
     "datafusion/proto-common",
     "datafusion/proto-common/gen",
@@ -82,6 +83,7 @@ arrow = { version = "60.1.0", features = [
     "prettyprint",
     "chrono-tz",
 ] }
+arrow-array = { version = "60.1.0", default-features = false }
 arrow-avro = { version = "60.1.0", default-features = false, features = [
     "deflate",
     "snappy",
@@ -101,6 +103,7 @@ arrow-ipc = { version = "60.1.0", default-features = false, features = [
     "zstd",
 ] }
 arrow-ord = { version = "60.1.0", default-features = false }
+arrow-row = { version = "60.1.0", default-features = false }
 arrow-schema = { version = "60.1.0", default-features = false }
 arrow-select = { version = "60.1.0", default-features = false }
 async-trait = "0.1.89"
@@ -140,6 +143,7 @@ datafusion-physical-expr = { path = "datafusion/physical-expr", version = "57.0.
 datafusion-physical-expr-adapter = { path = "datafusion/physical-expr-adapter", version = "57.0.0-dev", default-features = false }
 datafusion-physical-expr-common = { path = "datafusion/physical-expr-common", version = "57.0.0-dev", default-features = false }
 datafusion-physical-optimizer = { path = "datafusion/physical-optimizer", version = "57.0.0-dev" }
+datafusion-physical-pipeline = { path = "datafusion/physical-pipeline", version = "57.0.0-dev" }
 datafusion-physical-plan = { path = "datafusion/physical-plan", version = "57.0.0-dev" }
 datafusion-proto = { path = "datafusion/proto", version = "57.0.0-dev", default-features = false }
 datafusion-proto-common = { path = "datafusion/proto-common", version = "57.0.0-dev" }
