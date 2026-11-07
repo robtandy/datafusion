@@ -355,6 +355,8 @@ pub(crate) mod test_support {
     /// * `ProjectionExec`s with a [`TestProjection`], a stand-in for the
     ///   native projection, so that the operators below them are lowered
     ///   too;
+    /// * scans with the native sources of
+    ///   [`try_create_scan_source`](crate::sources::try_create_scan_source);
     /// * every other node is bridged, with its subtree.
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
@@ -381,6 +383,9 @@ pub(crate) mod test_support {
                     .collect(),
                 schema: projection.schema(),
             }));
+        }
+        if let Some(source) = crate::sources::try_create_scan_source(plan)? {
+            return Ok(source);
         }
         Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
     }

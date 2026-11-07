@@ -974,9 +974,8 @@ mod tests {
         };
         let root = assert_native_plan_byte_eq(absorbed, false).await;
         assert_eq!(count::<PhysicalLimit>(&root), 1);
-        assert!(
-            bridged_plans(&root)[0].is::<datafusion_datasource::source::DataSourceExec>()
-        );
+        assert!(root.children()[0].is::<crate::sources::MemoryScanSource>());
+        assert!(bridged_plans(&root).is_empty());
         Ok(())
     }
 
