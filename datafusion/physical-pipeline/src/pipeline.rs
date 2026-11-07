@@ -267,6 +267,14 @@ struct PipelineState {
     operators: Vec<Arc<dyn PhysicalOperator>>,
     dependencies: Vec<PipelineId>,
     meta_dependencies: Vec<MetaPipelineId>,
+    /// Building the pipeline started (it was passed to
+    /// [`MetaPipelineBuilder::build`], or got a source or an operator).
+    started: bool,
+    /// For a union pipeline whose order matters: the pipeline it was created
+    /// from. Once building it starts, it depends on that pipeline and on all
+    /// pipelines created after it that started building, i.e. the pipelines
+    /// of the inputs of the union before it.
+    ordered_after: Option<PipelineId>,
 }
 
 struct MetaPipelineState {
@@ -309,6 +317,8 @@ impl GraphBuilder {
             operators: vec![],
             dependencies: vec![],
             meta_dependencies: vec![],
+            started: false,
+            ordered_after: None,
         });
         self.meta_pipelines[meta].pipelines.push(id);
         PipelineBuilder { id }
@@ -402,6 +412,7 @@ impl MetaPipelineBuilder<'_> {
         operator: &Arc<dyn PhysicalOperator>,
     ) -> Result<()> {
         self.check_pipeline(current)?;
+        self.start_pipeline(current.id);
         self.graph.visiting.push(Arc::clone(operator));
         let result = operator.build_pipelines(current, self);
         self.graph.visiting.pop();
@@ -421,6 +432,7 @@ impl MetaPipelineBuilder<'_> {
                 source.name()
             );
         }
+        self.start_pipeline(current.id);
         let pipeline = &mut self.graph.pipelines[current.id];
         if let Some(existing) = &pipeline.source {
             return internal_err!(
@@ -442,6 +454,7 @@ impl MetaPipelineBuilder<'_> {
         operator: Arc<dyn PhysicalOperator>,
     ) -> Result<()> {
         self.check_pipeline(current)?;
+        self.start_pipeline(current.id);
         let pipeline = &mut self.graph.pipelines[current.id];
         if pipeline.source.is_some() {
             return internal_err!(
@@ -487,13 +500,17 @@ impl MetaPipelineBuilder<'_> {
         ))
     }
 
-    /// Create a pipeline for another input of a union-like operator.
+    /// Create a pipeline for the second input of a union-like operator with
+    /// two inputs (see [`Self::build_union`], which also handles more inputs).
     ///
     /// The new pipeline belongs to this meta pipeline, has the operators
     /// that were added to `current` so far (the operators above the union)
-    /// and inherits all dependencies of `current`. Its source is set by
-    /// building the other input into it. If `order_matters`, the new
-    /// pipeline only starts after `current` completed.
+    /// and inherits all dependencies of `current`. Create it before building
+    /// the first input into `current`, then build the second input into it.
+    ///
+    /// If `order_matters`, the new pipeline only starts after all pipelines
+    /// of the first input completed: `current`, and the pipelines created
+    /// while building the first input (e.g. by a nested union).
     pub fn create_union_pipeline(
         &mut self,
         current: &PipelineBuilder,
@@ -503,16 +520,58 @@ impl MetaPipelineBuilder<'_> {
         let union = self.graph.new_pipeline(self.meta);
         let current_state = &self.graph.pipelines[current.id];
         let operators = current_state.operators.clone();
-        let mut dependencies = current_state.dependencies.clone();
+        let dependencies = current_state.dependencies.clone();
         let meta_dependencies = current_state.meta_dependencies.clone();
-        if order_matters {
-            dependencies.push(current.id);
-        }
         let state = &mut self.graph.pipelines[union.id];
         state.operators = operators;
         state.dependencies = dependencies;
         state.meta_dependencies = meta_dependencies;
+        state.ordered_after = order_matters.then_some(current.id);
         Ok(union)
+    }
+
+    /// Build the pipelines of a union-like operator over `inputs`: the first
+    /// input continues `current`, every other input gets a union pipeline
+    /// (see [`Self::create_union_pipeline`]) that shares the operators above
+    /// the union and the sink.
+    ///
+    /// If `order_matters`, the pipelines of every input only start after all
+    /// pipelines of the inputs before it completed, so that the output of the
+    /// inputs is not interleaved and comes in input order (if the sink and
+    /// the other operators preserve it).
+    pub fn build_union(
+        &mut self,
+        current: &mut PipelineBuilder,
+        inputs: &[Arc<dyn PhysicalOperator>],
+        order_matters: bool,
+    ) -> Result<()> {
+        self.check_pipeline(current)?;
+        let Some((first, others)) = inputs.split_first() else {
+            return internal_err!("A union needs at least one input");
+        };
+        // Create the pipelines of the other inputs while `current` has
+        // exactly the operators above the union.
+        let pipelines = others
+            .iter()
+            .map(|_| self.create_union_pipeline(current, false))
+            .collect::<Result<Vec<_>>>()?;
+        // The pipelines of the inputs built so far.
+        let mut previous = vec![current.id];
+        let created = self.graph.meta_pipelines[self.meta].pipelines.len();
+        self.build(current, first)?;
+        previous.extend(self.pipelines_created_since(created));
+        for (mut pipeline, input) in pipelines.into_iter().zip(others) {
+            if order_matters {
+                for &dependency in &previous {
+                    self.depend_on(pipeline.id, dependency);
+                }
+            }
+            let created = self.graph.meta_pipelines[self.meta].pipelines.len();
+            self.build(&mut pipeline, input)?;
+            previous.push(pipeline.id);
+            previous.extend(self.pipelines_created_since(created));
+        }
+        Ok(())
     }
 
     /// Create a pipeline whose source is `source`, an operator of `current`
@@ -579,6 +638,7 @@ impl MetaPipelineBuilder<'_> {
         state.source = Some(source);
         state.operators = operators;
         state.dependencies = dependencies;
+        state.started = true;
         Ok(child)
     }
 
@@ -594,10 +654,7 @@ impl MetaPipelineBuilder<'_> {
         if pipeline == dependency {
             return internal_err!("Pipeline {} cannot depend on itself", pipeline.id);
         }
-        let dependencies = &mut self.graph.pipelines[pipeline.id].dependencies;
-        if !dependencies.contains(&dependency.id) {
-            dependencies.push(dependency.id);
-        }
+        self.depend_on(pipeline.id, dependency.id);
         Ok(())
     }
 
@@ -658,6 +715,46 @@ impl MetaPipelineBuilder<'_> {
                 operator.name(),
                 operator.children().len()
             )
+        }
+    }
+
+    /// Mark `pipeline` as started. If it is an ordered union pipeline, it
+    /// now depends on the pipelines of the inputs of the union before it.
+    fn start_pipeline(&mut self, pipeline: PipelineId) {
+        let state = &mut self.graph.pipelines[pipeline];
+        if state.started {
+            return;
+        }
+        state.started = true;
+        let Some(created_from) = state.ordered_after.take() else {
+            return;
+        };
+        let siblings = &self.graph.meta_pipelines[self.meta].pipelines;
+        let position = siblings
+            .iter()
+            .position(|&id| id == pipeline)
+            .unwrap_or(siblings.len());
+        let created_after = siblings[position..]
+            .iter()
+            .copied()
+            .filter(|&id| id != pipeline && self.graph.pipelines[id].started)
+            .collect::<Vec<_>>();
+        self.depend_on(pipeline, created_from);
+        for dependency in created_after {
+            self.depend_on(pipeline, dependency);
+        }
+    }
+
+    /// The pipelines of this meta pipeline at positions `start..`.
+    fn pipelines_created_since(&self, start: usize) -> Vec<PipelineId> {
+        self.graph.meta_pipelines[self.meta].pipelines[start..].to_vec()
+    }
+
+    /// Make `pipeline` depend on `dependency` (both of this meta pipeline).
+    fn depend_on(&mut self, pipeline: PipelineId, dependency: PipelineId) {
+        let dependencies = &mut self.graph.pipelines[pipeline].dependencies;
+        if pipeline != dependency && !dependencies.contains(&dependency) {
+            dependencies.push(dependency);
         }
     }
 
