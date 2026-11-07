@@ -74,10 +74,18 @@ enum Progress {
 enum Step {
     /// Progress was made, continue.
     Continue,
-    /// An operator is blocked.
-    Blocked(TaskInterrupt),
+    /// The call at a stage is blocked (`0`: the source, `1..=n`: an
+    /// operator, `n + 1`: the sink).
+    Blocked(usize, TaskInterrupt),
     /// The pipeline is complete for this thread.
     Done,
+}
+
+/// A future to wait for before retrying the blocked call at `stage` (see
+/// [`Step::Blocked`]).
+struct Wait {
+    stage: usize,
+    future: BoxFuture<'static, ()>,
 }
 
 /// Outcome of pushing a chunk through the operators of a pipeline.
@@ -86,8 +94,8 @@ enum PushOutcome {
     Output,
     /// No output for the sink; the operators need more input.
     NeedMoreInput,
-    /// An operator is blocked.
-    Blocked(TaskInterrupt),
+    /// The operator at a stage is blocked.
+    Blocked(usize, TaskInterrupt),
     /// The call budget is exhausted; the push resumes from the
     /// `in_process_operators` stack.
     Yield,
@@ -132,8 +140,8 @@ pub struct PipelineExecutor {
     flush_index: usize,
     /// The operator at `flush_index` returned `Finished` from `final_execute`.
     flush_current_finished: bool,
-    /// Future the task waits for before continuing.
-    wait: Option<BoxFuture<'static, ()>>,
+    /// Future the task waits for before retrying a blocked call.
+    wait: Option<Wait>,
     /// Operator calls left in the current poll.
     budget: usize,
     /// Id of this thread in the execution.
@@ -252,7 +260,7 @@ impl PipelineExecutor {
         self.ctx.set_waker(cx.waker());
         self.apply_finished();
         if let Some(wait) = self.wait.as_mut() {
-            if wait.as_mut().poll(cx).is_pending() {
+            if wait.future.as_mut().poll(cx).is_pending() {
                 return self.suspend(cx);
             }
             self.wait = None;
@@ -269,12 +277,12 @@ impl PipelineExecutor {
                     self.ctx.registry().unregister(self.thread);
                     return Poll::Ready(self.combine().map(|()| Progress::Done));
                 }
-                Ok(Step::Blocked(interrupt)) => match interrupt.into_kind() {
+                Ok(Step::Blocked(stage, interrupt)) => match interrupt.into_kind() {
                     InterruptKind::WakerRegistered => return self.suspend(cx),
                     InterruptKind::Yield => return Poll::Ready(Ok(Progress::Yield)),
                     InterruptKind::Future(mut future) => {
                         if future.as_mut().poll(cx).is_pending() {
-                            self.wait = Some(future);
+                            self.wait = Some(Wait { stage, future });
                             return self.suspend(cx);
                         }
                     }
@@ -312,7 +320,8 @@ impl PipelineExecutor {
         let shared = Arc::clone(&self.shared);
         if registry.is_sink_finished(shared.sink.as_ref()) {
             // The sink does not need any more input, not even the chunk it
-            // did not accept yet.
+            // did not accept yet: all remaining work, including the blocked
+            // call, is skipped.
             self.pending_sink = false;
             self.wait = None;
             self.finish_at(shared.operators.len());
@@ -323,10 +332,14 @@ impl PipelineExecutor {
             .iter()
             .rposition(|operator| registry.is_operator_finished(operator.as_ref()))
         {
-            // The blocked call may be one that is no longer made: it is
-            // retried right away if it is still needed.
-            self.wait = None;
-            self.finish_at(index + 1);
+            let stage = index + 1;
+            // The source and the operators up to the finished one are not
+            // called again: stop waiting for a blocked call among them. A
+            // blocked call downstream is still needed: keep waiting for it.
+            if self.wait.as_ref().is_some_and(|wait| wait.stage <= stage) {
+                self.wait = None;
+            }
+            self.finish_at(stage);
         }
     }
 
@@ -388,7 +401,7 @@ impl PipelineExecutor {
                 self.source_exhausted = true;
                 Ok(Step::Continue)
             }
-            SourceResult::Blocked(interrupt) => Ok(Step::Blocked(interrupt)),
+            SourceResult::Blocked(interrupt) => Ok(Step::Blocked(0, interrupt)),
         }
     }
 
@@ -399,7 +412,7 @@ impl PipelineExecutor {
                 self.sink_last_chunk()
             }
             PushOutcome::NeedMoreInput | PushOutcome::Yield => Ok(Step::Continue),
-            PushOutcome::Blocked(interrupt) => Ok(Step::Blocked(interrupt)),
+            PushOutcome::Blocked(stage, interrupt) => Ok(Step::Blocked(stage, interrupt)),
         }
     }
 
@@ -452,7 +465,7 @@ impl PipelineExecutor {
                 OperatorResult::Blocked(interrupt) => {
                     output.reset();
                     self.in_process_operators.push(stage);
-                    return Ok(PushOutcome::Blocked(interrupt));
+                    return Ok(PushOutcome::Blocked(stage, interrupt));
                 }
             }
 
@@ -504,7 +517,9 @@ impl PipelineExecutor {
                     .set_finished(self.shared.sink.as_ref(), true);
                 Ok(Step::Continue)
             }
-            SinkResult::Blocked(interrupt) => Ok(Step::Blocked(interrupt)),
+            SinkResult::Blocked(interrupt) => {
+                Ok(Step::Blocked(self.shared.operators.len() + 1, interrupt))
+            }
         }
     }
 
@@ -2905,11 +2920,19 @@ mod tests {
         assert_eq!(values(&output), vec![800]);
         assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
 
-        // A parallel sink is called concurrently.
-        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), true, true));
-        let output = run(Arc::clone(&probe) as _, 4).await?;
-        assert_eq!(values(&output), vec![800]);
-        assert!(probe.max_active.load(Ordering::SeqCst) > 1);
+        // A parallel sink is called concurrently (control for the probe;
+        // retried, as concurrency is not guaranteed on a loaded machine).
+        let mut concurrent = false;
+        for _ in 0..10 {
+            let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), true, true));
+            let output = run(Arc::clone(&probe) as _, 4).await?;
+            assert_eq!(values(&output), vec![800]);
+            if probe.max_active.load(Ordering::SeqCst) > 1 {
+                concurrent = true;
+                break;
+            }
+        }
+        assert!(concurrent);
         Ok(())
     }
 
@@ -2922,10 +2945,18 @@ mod tests {
         assert_eq!(sorted_values(&output).len(), 800);
         assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
 
-        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), false, true));
-        let output = run(Arc::clone(&probe) as _, 4).await?;
-        assert_eq!(sorted_values(&output).len(), 800);
-        assert!(probe.max_active.load(Ordering::SeqCst) > 1);
+        // Control: a parallel operator is called concurrently.
+        let mut concurrent = false;
+        for _ in 0..10 {
+            let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), false, true));
+            let output = run(Arc::clone(&probe) as _, 4).await?;
+            assert_eq!(sorted_values(&output).len(), 800);
+            if probe.max_active.load(Ordering::SeqCst) > 1 {
+                concurrent = true;
+                break;
+            }
+        }
+        assert!(concurrent);
         Ok(())
     }
 
@@ -3026,8 +3057,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn non_parallel_sources_are_never_called_concurrently() -> Result<()> {
-        for parallel in [false, true] {
-            // The same source operator is the source of both union pipelines.
+        // The same source operator is the source of both union pipelines.
+        let max_active = |parallel: bool| async move {
             let source = Arc::new(ProbedSource {
                 parallel,
                 chunks: 20,
@@ -3040,13 +3071,18 @@ mod tests {
             });
             let output = run(root, 4).await?;
             assert_eq!(values(&output).len(), 400);
-            let max_active = source.max_active.load(Ordering::SeqCst);
-            if parallel {
-                assert!(max_active > 1, "{max_active}");
-            } else {
-                assert_eq!(max_active, 1);
+            Ok::<_, DataFusionError>(source.max_active.load(Ordering::SeqCst))
+        };
+        assert_eq!(max_active(false).await?, 1);
+        // Control: a parallel source is called concurrently.
+        let mut concurrent = false;
+        for _ in 0..10 {
+            if max_active(true).await? > 1 {
+                concurrent = true;
+                break;
             }
         }
+        assert!(concurrent);
         Ok(())
     }
 
@@ -3430,6 +3466,274 @@ mod tests {
             });
             let output = run_with_timeout(root, threads).await?;
             assert_eq!(values(&output).len(), 5);
+        }
+        Ok(())
+    }
+
+    /// Blocks on every input chunk with a `TaskInterrupt::wait_for` future
+    /// that does work the retry depends on: if the executor called it again
+    /// before the future completed, it would wait forever.
+    #[derive(Debug)]
+    struct AwaitEachChunk {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        delay: std::time::Duration,
+        as_sink: bool,
+        rows: AtomicUsize,
+    }
+
+    impl AwaitEachChunk {
+        fn new(child: Arc<dyn PhysicalOperator>, as_sink: bool) -> Self {
+            Self {
+                children: vec![child],
+                delay: std::time::Duration::from_millis(50),
+                as_sink,
+                rows: AtomicUsize::new(0),
+            }
+        }
+
+        /// `Ok(true)` once the future of the current chunk completed.
+        fn ready(&self, state: &mut AwaitState) -> Result<bool, TaskInterrupt> {
+            match state.done.take() {
+                None => {
+                    let done = Arc::new(AtomicBool::new(false));
+                    state.done = Some(Arc::clone(&done));
+                    let delay = self.delay;
+                    Err(TaskInterrupt::wait_for(async move {
+                        tokio::time::sleep(delay).await;
+                        done.store(true, Ordering::SeqCst);
+                    }))
+                }
+                Some(done) if done.load(Ordering::SeqCst) => Ok(true),
+                Some(done) => {
+                    // Called again before the future completed: the work it
+                    // does is lost, nothing will wake this thread up.
+                    state.done = Some(done);
+                    Err(TaskInterrupt::waker_registered())
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct AwaitState {
+        done: Option<Arc<AtomicBool>>,
+    }
+
+    impl OperatorState for AwaitState {}
+    impl LocalSinkState for AwaitState {}
+
+    impl PhysicalOperator for AwaitEachChunk {
+        fn name(&self) -> &str {
+            "AwaitEachChunk"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalOperatorState,
+        ) -> Result<Box<dyn OperatorState>> {
+            Ok(Box::new(AwaitState::default()))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let state = lstate.downcast_mut::<AwaitState>().unwrap();
+            match self.ready(state) {
+                Ok(_) => {
+                    *output = input.clone();
+                    Ok(OperatorResult::NeedMoreInput)
+                }
+                Err(interrupt) => Ok(OperatorResult::Blocked(interrupt)),
+            }
+        }
+
+        fn is_sink(&self) -> bool {
+            self.as_sink
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_local_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSinkState,
+        ) -> Result<Box<dyn LocalSinkState>> {
+            Ok(Box::new(AwaitState::default()))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            _gstate: &dyn GlobalSinkState,
+            lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let state = lstate.downcast_mut::<AwaitState>().unwrap();
+            match self.ready(state) {
+                Ok(_) => {
+                    self.rows.fetch_add(input.len(), Ordering::SeqCst);
+                    Ok(SinkResult::NeedMoreInput)
+                }
+                Err(interrupt) => Ok(SinkResult::Blocked(interrupt)),
+            }
+        }
+
+        fn is_source(&self) -> bool {
+            self.as_sink
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(ProbeSource::default()))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let gstate = gstate.downcast_ref::<ProbeSource>().unwrap();
+            if gstate.done.swap(true, Ordering::SeqCst) {
+                return Ok(SourceResult::Finished);
+            }
+            let rows = self.rows.load(Ordering::SeqCst) as i64;
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![rows]))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    /// A parallel source: thread 0 emits `0..10` right away, thread 1 emits
+    /// `100..110` after `delay`.
+    #[derive(Debug)]
+    struct StaggeredSource {
+        delay: std::time::Duration,
+    }
+
+    #[derive(Default)]
+    struct StaggeredState {
+        waited: bool,
+        emitted: bool,
+    }
+
+    impl LocalSourceState for StaggeredState {}
+
+    impl PhysicalOperator for StaggeredSource {
+        fn name(&self) -> &str {
+            "StaggeredSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_local_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            Ok(Box::new(StaggeredState::default()))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let state = lstate.downcast_mut::<StaggeredState>().unwrap();
+            if state.emitted || ctx.thread_id > 1 {
+                return Ok(SourceResult::Finished);
+            }
+            if ctx.thread_id == 1 && !state.waited {
+                state.waited = true;
+                return Ok(SourceResult::Blocked(TaskInterrupt::wait_for(
+                    tokio::time::sleep(self.delay),
+                )));
+            }
+            state.emitted = true;
+            let start = ctx.thread_id as i64 * 100;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(
+                batches(start, 1, 10).remove(0),
+            )))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_operator_keeps_the_waits_of_downstream_work() -> Result<()> {
+        // One thread: `Limit` finishes with its last rows, which
+        // `AwaitEachChunk` (an operator, or the sink) downstream blocks on.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(AwaitEachChunk::new(
+            Arc::new(Limit {
+                children: vec![source(batches(0, 3, 10))],
+                limit: 5,
+            }),
+            false,
+        ));
+        let output = run_with_timeout(root, 1).await?;
+        assert_eq!(values(&output), (0..5).collect::<Vec<_>>());
+
+        let sink = Arc::new(AwaitEachChunk::new(
+            Arc::new(Limit {
+                children: vec![source(batches(0, 3, 10))],
+                limit: 5,
+            }),
+            true,
+        ));
+        let output = run_with_timeout(Arc::clone(&sink) as _, 1).await?;
+        assert_eq!(values(&output), vec![5]);
+
+        // Two threads: thread 0 waits in `AwaitEachChunk` (an operator, or
+        // the sink) when `Limit` finishes on thread 1.
+        for as_sink in [false, true] {
+            let delay = std::time::Duration::from_millis(10);
+            let root = Arc::new(AwaitEachChunk::new(
+                Arc::new(Limit {
+                    children: vec![Arc::new(StaggeredSource { delay })],
+                    limit: 15,
+                }),
+                as_sink,
+            ));
+            let output = run_with_timeout(Arc::clone(&root) as _, 2).await?;
+            if as_sink {
+                assert_eq!(values(&output), vec![15]);
+            } else {
+                let expected = (0..10).chain(100..105).collect::<Vec<_>>();
+                assert_eq!(sorted_values(&output), expected);
+            }
         }
         Ok(())
     }

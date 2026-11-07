@@ -246,7 +246,9 @@ operator that has to wait returns a `Blocked(TaskInterrupt)` result:
   task is resumed when the waker is woken. Returning this without registering
   the waker stalls the task forever.
 - `TaskInterrupt::wait_for(future)`: the task is resumed once `future`
-  completes.
+  completes. The executor drives `future` to completion before it retries the
+  blocked call; it drops `future` early only if the call is not needed any
+  more (the sink, or an operator at or after the blocked one, finished).
 - `TaskInterrupt::yield_now()`: the task yields and is resumed immediately.
 
 The executor re-invokes exactly the call that blocked, with the same input.

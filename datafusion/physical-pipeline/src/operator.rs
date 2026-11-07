@@ -87,6 +87,11 @@ impl TaskInterrupt {
     }
 
     /// Resume the task once `future` completes.
+    ///
+    /// The executor drives `future` to completion before it calls the
+    /// blocked method again. It only drops `future` early if the blocked call
+    /// is not needed any more: when the sink of the pipeline, or an operator
+    /// at or after the blocked one, returned `Finished`.
     pub fn wait_for(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
             kind: InterruptKind::Future(Box::pin(future)),
