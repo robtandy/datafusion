@@ -38,6 +38,7 @@ use arrow::datatypes::{
     LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
 };
 use arrow_row::{RowConverter, Rows, SortField};
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{
     Result, exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
     resources_datafusion_err,
@@ -137,9 +138,13 @@ struct TupleDataBlock {
 }
 
 impl TupleDataBlock {
-    /// Add `additional` zeroed rows, growing the row buffer geometrically up
-    /// to the capacity of a full block, so that small collections (e.g. the
-    /// partitions of a thread-local [`PartitionedTupleData`]) stay small.
+    /// Add `additional` zeroed rows.
+    ///
+    /// The row buffer of the first block of a collection grows geometrically
+    /// up to the capacity of a full block, so that small collections (e.g.
+    /// the partitions of a thread-local [`PartitionedTupleData`]) stay small.
+    /// The other blocks are allocated with their full capacity, so that the
+    /// rows of large collections are not copied when a block grows.
     ///
     /// [`PartitionedTupleData`]: super::PartitionedTupleData
     fn grow_rows(
@@ -147,15 +152,16 @@ impl TupleDataBlock {
         additional: usize,
         row_width: usize,
         rows_per_block: usize,
+        first_block: bool,
     ) -> Result<()> {
         let len = (self.count + additional) * row_width;
         if len > self.rows.capacity() {
-            let target = self
-                .rows
-                .capacity()
-                .saturating_mul(2)
-                .min(rows_per_block * row_width)
-                .max(len);
+            let full = rows_per_block * row_width;
+            let target = if first_block {
+                self.rows.capacity().saturating_mul(2).min(full).max(len)
+            } else {
+                full.max(len)
+            };
             self.rows
                 .try_reserve_exact(target - self.rows.len())
                 .map_err(|e| {
@@ -386,7 +392,7 @@ impl TupleDataCollection {
             let n = (rows.len() - appended).min(rows_per_block - block.count);
             let segment = appended..appended + n;
             let start = block.count;
-            block.grow_rows(n, row_width, rows_per_block)?;
+            block.grow_rows(n, row_width, rows_per_block, block_index == 0)?;
             let target = &mut block.rows[start * row_width..];
             let result = scatter_rows(
                 &layout,
@@ -1308,7 +1314,8 @@ fn dictionary_encode(
     let nulls = values.logical_nulls().filter(|n| n.null_count() > 0);
     let converter = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
     let rows = converter.convert_columns(&[Arc::clone(values)])?;
-    let mut keys_of_rows = HashMap::with_capacity(values.len());
+    let mut keys_of_rows =
+        HashMap::with_capacity_and_hasher(values.len(), RandomState::default());
     let mut distinct = Vec::new();
     let keys = (0..values.len())
         .map(|i| {
@@ -1894,6 +1901,120 @@ mod tests {
         // The chunk itself is untouched.
         assert_eq!(chunk.physical_len(), 8);
         assert_eq!(chunk.selection().unwrap().indices(), &[6, 1]);
+    }
+
+    #[test]
+    fn nested_dictionaries_are_restored() {
+        use arrow::array::{
+            FixedSizeListBuilder, LargeListBuilder, MapBuilder, StringBuilder,
+            StringDictionaryBuilder, StructArray,
+        };
+        use arrow::datatypes::{Int8Type, Int16Type, Int32Type};
+
+        let n = 40;
+        let value = |i: usize| format!("value {}", i % 7);
+        let mut fixed_list =
+            FixedSizeListBuilder::new(StringDictionaryBuilder::<Int32Type>::new(), 2);
+        let mut large_list =
+            LargeListBuilder::new(StringDictionaryBuilder::<Int8Type>::new());
+        let mut map = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            StringDictionaryBuilder::<Int16Type>::new(),
+        );
+        for i in 0..n {
+            fixed_list.values().append_value(value(i));
+            fixed_list.values().append_value(value(i + 1));
+            fixed_list.append(i % 5 != 1);
+            for j in 0..i % 3 {
+                large_list.values().append_value(value(i + j));
+                map.keys().append_value(format!("k{j}"));
+                map.values().append_value(value(i * j));
+            }
+            large_list.append(i % 4 != 2);
+            map.append(i % 6 != 3).unwrap();
+        }
+        let dictionary = (0..n)
+            .map(|i| (i % 3 != 0).then(|| value(i)))
+            .collect::<Vec<_>>();
+        let dictionary = dictionary
+            .iter()
+            .map(Option::as_deref)
+            .collect::<arrow::array::DictionaryArray<Int16Type>>();
+        let structs = StructArray::try_from(vec![
+            ("d", Arc::new(dictionary) as ArrayRef),
+            (
+                "i",
+                Arc::new(Int32Array::from_iter_values(0..n as i32)) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("fixed_list", Arc::new(fixed_list.finish()) as ArrayRef),
+            ("large_list", Arc::new(large_list.finish()) as ArrayRef),
+            ("map", Arc::new(map.finish()) as ArrayRef),
+            ("struct", Arc::new(structs) as ArrayRef),
+        ])
+        .unwrap();
+        let mut collection = collection_for(&batch, false);
+        for column in collection.layout().columns() {
+            assert_eq!(column.storage(), ColumnStorage::Encoded);
+            assert!(column.codec().unwrap().needs_cast);
+        }
+        let chunk = chunk_with_selection(&batch, (0..n as u32).rev().collect());
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        assert_identical(
+            &collection.gather(&locations).unwrap(),
+            &chunk.compact().unwrap(),
+        );
+    }
+
+    #[test]
+    fn unions_of_dictionaries_are_not_supported() {
+        let union = DataType::Union(
+            arrow::datatypes::UnionFields::try_new(
+                [0],
+                [Field::new(
+                    "d",
+                    DataType::Dictionary(
+                        Box::new(DataType::Int8),
+                        Box::new(DataType::Utf8),
+                    ),
+                    true,
+                )],
+            )
+            .unwrap(),
+            arrow::datatypes::UnionMode::Sparse,
+        );
+        let err = TupleDataLayout::try_new_from_types([union], false).unwrap_err();
+        assert!(err.to_string().contains("cannot be restored"), "{err}");
+    }
+
+    #[test]
+    fn zero_width_and_wide_fixed_size_binaries() {
+        use arrow::array::FixedSizeBinaryArray;
+
+        let empty = FixedSizeBinaryArray::try_new(
+            0,
+            Buffer::from_vec(Vec::<u8>::new()),
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let wide =
+            FixedSizeBinaryArray::try_from_iter((0..3_u8).map(|i| vec![i; 100_000]))
+                .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("empty", Arc::new(empty) as ArrayRef),
+            ("wide", Arc::new(wide) as ArrayRef),
+        ])
+        .unwrap();
+        let mut collection = collection_for(&batch, false);
+        assert_eq!(collection.layout().rows_per_block(), 2);
+        let locations = collection
+            .append_chunk(&DataChunk::from_record_batch(batch.clone()), None)
+            .unwrap();
+        assert_eq!(collection.num_blocks(), 2);
+        assert_identical(&collection.gather(&locations).unwrap(), &batch);
     }
 
     #[test]
