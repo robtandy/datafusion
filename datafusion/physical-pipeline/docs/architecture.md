@@ -404,11 +404,17 @@ time spent in its methods (`OperatorMetrics`). `PipelineStream::metrics` and
 
 `BridgeOperator` runs an arbitrary `ExecutionPlan` as a parallel source:
 threads claim the plan's output partitions through an atomic counter, execute
-them, and poll the partition streams with the task's waker, returning
-`Blocked(waker_registered)` while a stream is pending. Batches are sliced
-into chunks of at most `DEFAULT_VECTOR_SIZE` rows without copying. The output
-of a bridged plan is byte-identical to DataFusion's, because it _is_
-DataFusion's output.
+them, and poll the partition streams with the task's waker. A thread
+multiplexes the partitions it claimed: it polls their streams round robin,
+keeps the pending ones, and claims another partition (up to its fair share,
+`ceil(partitions / threads)`) when all of them are pending; for unbounded
+plans it claims its fair share right away. It returns
+`Blocked(waker_registered)` only when all of its streams are pending. So, as
+in DataFusion, an idle or never-ending partition does not hold back the
+other partitions, even when there are more partitions than threads. Batches
+are sliced into chunks of at most `DEFAULT_VECTOR_SIZE` rows without copying.
+The output of a bridged plan is byte-identical to DataFusion's, because it
+_is_ DataFusion's output.
 
 ### `PipelineRootExec`
 

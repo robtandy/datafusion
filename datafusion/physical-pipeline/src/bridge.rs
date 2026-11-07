@@ -42,21 +42,35 @@ use crate::operator::{
 /// output as [`DataChunk`]s of at most [`DEFAULT_VECTOR_SIZE`] rows.
 ///
 /// All output partitions of the plan are distributed over the threads of the
-/// pipeline through a shared partition counter: each thread claims the next
-/// unclaimed partition, executes it and drains its stream, slicing every
-/// batch (without copying) into chunks, before it claims the next
-/// partition.
+/// pipeline through a shared partition counter. A thread claims a partition
+/// whenever it has none, and multiplexes the streams of the partitions it
+/// claimed: it polls them round robin, keeps the streams that are pending,
+/// and claims another partition, up to its fair share
+/// (`ceil(partitions / threads)`), when all of them are pending. For
+/// unbounded plans, threads claim their fair share right away, so that a
+/// partition that produces data forever does not starve the others. So, as
+/// in DataFusion, a partition that is idle (e.g. a streaming source without
+/// new data) or never ends does not hold back the other partitions, even if
+/// there are more partitions than threads. Batches are sliced into chunks
+/// without copying.
 #[derive(Debug)]
 pub struct BridgeOperator {
     plan: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+    /// Claim the fair share of partitions right away (unbounded plans).
+    eager: bool,
 }
 
 impl BridgeOperator {
     /// Create a bridge that runs `plan`.
     pub fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
         let schema = plan.schema();
-        Self { plan, schema }
+        let eager = plan.boundedness().is_unbounded();
+        Self {
+            plan,
+            schema,
+            eager,
+        }
     }
 
     /// The bridged plan.
@@ -78,11 +92,14 @@ impl GlobalSourceState for BridgeGlobalState {
     }
 }
 
-/// Local source state of a [`BridgeOperator`]: the stream of the partition
-/// the thread is draining and the remainder of the current batch.
+/// Local source state of a [`BridgeOperator`]: the streams of the
+/// partitions the thread claimed and the remainder of the current batch.
 #[derive(Default)]
 struct BridgeLocalState {
-    stream: Option<SendableRecordBatchStream>,
+    /// The streams of the claimed partitions that are not exhausted yet.
+    streams: Vec<SendableRecordBatchStream>,
+    /// Index of the stream to poll first, for round robin polling.
+    next: usize,
     batch: Option<RecordBatch>,
     offset: usize,
 }
@@ -164,37 +181,92 @@ impl PhysicalOperator for BridgeOperator {
                 lstate.batch = None;
             }
 
-            // Claim the next partition once the current one is drained.
-            if lstate.stream.is_none() {
-                let partition = gstate.next_partition.fetch_add(1, Ordering::Relaxed);
-                if partition >= gstate.num_partitions {
-                    return Ok(SourceResult::Finished);
+            // Claim a partition if this thread has none (and, for unbounded
+            // plans, up to its fair share).
+            let share = gstate.num_partitions.div_ceil(ctx.num_threads.max(1));
+            while lstate.streams.is_empty()
+                || (self.eager && lstate.streams.len() < share)
+            {
+                if !self.claim_partition(ctx, gstate, lstate)? {
+                    break;
                 }
-                lstate.stream =
-                    Some(self.plan.execute(partition, Arc::clone(&ctx.task_ctx))?);
+            }
+            if lstate.streams.is_empty() {
+                return Ok(SourceResult::Finished);
             }
 
-            let stream = lstate.stream.as_mut().expect("stream was just set");
+            // Poll the streams round robin, starting after the stream that
+            // produced the last batch. Every pending stream registers the
+            // waker of this task.
             let mut cx = Context::from_waker(ctx.waker());
-            match stream.poll_next_unpin(&mut cx) {
-                Poll::Ready(Some(batch)) => {
-                    let batch = batch?;
-                    if batch.num_rows() == 0 {
-                        // Return to the executor (which skips empty chunks)
-                        // so that the call counts against its budget.
-                        return Ok(SourceResult::Chunk(DataChunk::from_record_batch(
-                            batch,
-                        )));
+            let num_streams = lstate.streams.len();
+            let first = lstate.next % num_streams;
+            let mut exhausted = None;
+            for i in 0..num_streams {
+                let index = (first + i) % num_streams;
+                match lstate.streams[index].poll_next_unpin(&mut cx) {
+                    Poll::Ready(Some(batch)) => {
+                        let batch = batch?;
+                        lstate.next = index + 1;
+                        if batch.num_rows() == 0 {
+                            // Return to the executor (which skips empty
+                            // chunks) so that the call counts against its
+                            // budget.
+                            return Ok(SourceResult::Chunk(
+                                DataChunk::from_record_batch(batch),
+                            ));
+                        }
+                        lstate.batch = Some(batch);
+                        lstate.offset = 0;
+                        break;
                     }
-                    lstate.batch = Some(batch);
-                    lstate.offset = 0;
-                }
-                Poll::Ready(None) => lstate.stream = None,
-                Poll::Pending => {
-                    return Ok(SourceResult::Blocked(TaskInterrupt::waker_registered()));
+                    Poll::Ready(None) => {
+                        exhausted = Some(index);
+                        break;
+                    }
+                    Poll::Pending => {}
                 }
             }
+            if let Some(index) = exhausted {
+                // Drop the exhausted stream; the next iteration may claim
+                // another partition in its place.
+                drop(lstate.streams.remove(index));
+                lstate.next = index;
+                continue;
+            }
+            if lstate.batch.is_none() {
+                // All streams are pending: claim another partition (up to the
+                // fair share), so that idle partitions do not hold back the
+                // others, and poll it first.
+                if lstate.streams.len() < share
+                    && self.claim_partition(ctx, gstate, lstate)?
+                {
+                    lstate.next = lstate.streams.len() - 1;
+                    continue;
+                }
+                return Ok(SourceResult::Blocked(TaskInterrupt::waker_registered()));
+            }
         }
+    }
+}
+
+impl BridgeOperator {
+    /// Claim the next unclaimed partition and add its stream to `lstate`.
+    /// Returns `false` if all partitions are claimed.
+    fn claim_partition(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &BridgeGlobalState,
+        lstate: &mut BridgeLocalState,
+    ) -> Result<bool> {
+        let partition = gstate.next_partition.fetch_add(1, Ordering::Relaxed);
+        if partition >= gstate.num_partitions {
+            return Ok(false);
+        }
+        lstate
+            .streams
+            .push(self.plan.execute(partition, Arc::clone(&ctx.task_ctx))?);
+        Ok(true)
     }
 }
 
@@ -557,6 +629,247 @@ mod tests {
             plan = reset_plan_states(plan)?;
             assert!(plan.is::<PipelineRootExec>());
         }
+        Ok(())
+    }
+
+    /// A partition whose stream never produces anything (an idle streaming
+    /// source). Records when its stream is dropped.
+    #[derive(Debug)]
+    struct PendingPartition {
+        schema: SchemaRef,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DropGuard(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl datafusion_physical_plan::streaming::PartitionStream for PendingPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let guard = DropGuard(Arc::clone(&self.dropped));
+            let stream =
+                futures::stream::pending::<Result<RecordBatch>>().map(move |batch| {
+                    let _guard = &guard;
+                    batch
+                });
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    stream,
+                ),
+            )
+        }
+    }
+
+    /// A partition that produces `batch` once, or forever.
+    #[derive(Debug)]
+    struct BatchPartition {
+        batch: RecordBatch,
+        forever: bool,
+    }
+
+    impl datafusion_physical_plan::streaming::PartitionStream for BatchPartition {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batch = self.batch.clone();
+            let stream = if self.forever {
+                futures::stream::repeat_with(move || Ok(batch.clone())).boxed()
+            } else {
+                futures::stream::iter([Ok(batch)]).boxed()
+            };
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.batch.schema(),
+                    stream,
+                ),
+            )
+        }
+    }
+
+    fn streaming_plan(
+        partitions: Vec<Arc<dyn datafusion_physical_plan::streaming::PartitionStream>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        bounded_or_unbounded_plan(partitions, true)
+    }
+
+    fn bounded_or_unbounded_plan(
+        partitions: Vec<Arc<dyn datafusion_physical_plan::streaming::PartitionStream>>,
+        infinite: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            datafusion_physical_plan::streaming::StreamingTableExec::try_new(
+                schema(),
+                partitions,
+                None,
+                vec![],
+                infinite,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn pending_partition() -> (
+        Arc<dyn datafusion_physical_plan::streaming::PartitionStream>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let partition = Arc::new(PendingPartition {
+            schema: schema(),
+            dropped: Arc::clone(&dropped),
+        });
+        (partition, dropped)
+    }
+
+    fn batch_partition(
+        value: i32,
+        forever: bool,
+    ) -> Arc<dyn datafusion_physical_plan::streaming::PartitionStream> {
+        Arc::new(BatchPartition {
+            batch: batch(value..value + 1),
+            forever,
+        })
+    }
+
+    fn task_ctx_with_threads(threads: usize) -> Arc<TaskContext> {
+        Arc::new(
+            TaskContext::default().with_session_config(
+                datafusion_execution::config::SessionConfig::new()
+                    .with_target_partitions(threads),
+            ),
+        )
+    }
+
+    async fn next_values(
+        stream: &mut SendableRecordBatchStream,
+        batches: usize,
+    ) -> Vec<i32> {
+        let mut values = vec![];
+        for _ in 0..batches {
+            let batch =
+                tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                    .await
+                    .expect("no progress")
+                    .expect("stream ended")
+                    .unwrap();
+            values.extend(batch.column(0).as_primitive::<Int32Type>().values());
+        }
+        values
+    }
+
+    async fn assert_dropped(dropped: &std::sync::atomic::AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pending partition was not cancelled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_partitions_do_not_block_other_partitions() -> Result<()> {
+        // One thread, two partitions: the first never produces anything.
+        // Bounded plans claim more partitions when all are pending, unbounded
+        // plans claim them eagerly.
+        for infinite in [true, false] {
+            let ctx = task_ctx_with_threads(1);
+            let (pending, dropped) = pending_partition();
+            let plan = bounded_or_unbounded_plan(
+                vec![pending, batch_partition(42, false)],
+                infinite,
+            );
+
+            // Default DataFusion emits 42.
+            let mut stream = datafusion_physical_plan::execute_stream(
+                Arc::clone(&plan),
+                Arc::clone(&ctx),
+            )?;
+            assert_eq!(next_values(&mut stream, 1).await, vec![42]);
+            drop(stream);
+            assert_dropped(&dropped).await;
+
+            let (pending, dropped) = pending_partition();
+            let plan = bounded_or_unbounded_plan(
+                vec![pending, batch_partition(42, false)],
+                infinite,
+            );
+            let root = PipelineRootExec::try_new(
+                Arc::new(BridgeOperator::new(Arc::clone(&plan))),
+                plan,
+            )?;
+            let mut stream = root.execute(0, ctx)?;
+            assert_eq!(next_values(&mut stream, 1).await, vec![42]);
+            // The idle partition keeps the query running.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                    .await
+                    .is_err()
+            );
+            // Dropping the stream cancels the idle partition.
+            drop(stream);
+            assert_dropped(&dropped).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partitions_outnumbering_threads_all_make_progress() -> Result<()> {
+        for infinite in [true, false] {
+            for threads in [1, 2, 3] {
+                let (first, first_dropped) = pending_partition();
+                let (second, second_dropped) = pending_partition();
+                let plan = bounded_or_unbounded_plan(
+                    vec![
+                        first,
+                        batch_partition(1, false),
+                        second,
+                        batch_partition(2, false),
+                        batch_partition(3, false),
+                    ],
+                    infinite,
+                );
+                let root = PipelineRootExec::try_new(
+                    Arc::new(BridgeOperator::new(Arc::clone(&plan))),
+                    plan,
+                )?;
+                let mut stream = root.execute(0, task_ctx_with_threads(threads))?;
+                let mut values = next_values(&mut stream, 3).await;
+                values.sort_unstable();
+                assert_eq!(values, vec![1, 2, 3], "{threads} threads");
+                // Dropping the stream cancels the idle partitions.
+                drop(stream);
+                assert_dropped(&first_dropped).await;
+                assert_dropped(&second_dropped).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn busy_partitions_do_not_starve_other_partitions() -> Result<()> {
+        // One thread, and a partition that produces batches forever.
+        let plan =
+            streaming_plan(vec![batch_partition(7, true), batch_partition(42, false)]);
+        let root = PipelineRootExec::try_new(
+            Arc::new(BridgeOperator::new(Arc::clone(&plan))),
+            plan,
+        )?;
+        let mut stream = root.execute(0, task_ctx_with_threads(1))?;
+        let values = next_values(&mut stream, 10).await;
+        assert!(values.contains(&42), "{values:?}");
+        assert!(values.contains(&7), "{values:?}");
         Ok(())
     }
 }
