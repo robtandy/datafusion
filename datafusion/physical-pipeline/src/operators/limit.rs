@@ -6,7 +6,7 @@
 //!
 //! [`PhysicalLimit`] skips the first `skip` rows of its input and emits at
 //! most `fetch` of the rows after them, like DataFusion's `GlobalLimitExec`
-//! (`LocalLimitExec` is a limit with `skip == 0`).
+//! (a `LocalLimitExec` over a single partition is a limit with `skip == 0`).
 //!
 //! It is a streaming operator, modelled after DuckDB's
 //! `PhysicalStreamingLimit`: no rows are buffered. Every input chunk claims
@@ -96,15 +96,17 @@ impl PhysicalLimit {
     /// Lower a DataFusion limit node to a [`PhysicalLimit`]:
     ///
     /// * `GlobalLimitExec` (its `skip` and `fetch`);
-    /// * `LocalLimitExec` (a `fetch` per input partition). The pipeline
-    ///   engine has no partitions, so it limits its whole input to `fetch`
-    ///   rows. That is equivalent, because DataFusion only plans a
-    ///   `LocalLimitExec` below a node that merges its partitions and keeps
-    ///   at most `fetch` rows of them. It is not lowered (`Ok(None)`) if its
-    ///   input has several sorted partitions, whose rows such a merge may
-    ///   choose by their order within each partition;
+    /// * `LocalLimitExec` over a single partition (a limit of that
+    ///   partition). Over several partitions it limits every partition to
+    ///   `fetch` rows, which a limit of the whole input cannot do: it is not
+    ///   lowered (`Ok(None)`), unless the merge above it makes it redundant
+    ///   (see below);
     /// * `CoalescePartitionsExec` with a `fetch`: the engine merges the
-    ///   partitions of its input anyway, what remains is the limit.
+    ///   partitions of its input anyway, what remains is the limit. If its
+    ///   input is a `LocalLimitExec` that keeps at least `fetch` rows of every
+    ///   partition, that limit does not restrict which rows the merge can
+    ///   return (at most `fetch` rows, which may all come from one
+    ///   partition), and the native limit replaces both.
     ///
     /// The order of the input is preserved (see [`Self::with_preserve_order`])
     /// unless it is arbitrary in DataFusion too: the input merges several
@@ -119,32 +121,29 @@ impl PhysicalLimit {
     where
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
-        let (input, skip, fetch, preserve_order) = if let Some(limit) =
-            plan.downcast_ref::<GlobalLimitExec>()
-        {
-            let input = limit.input();
-            (input, limit.skip(), limit.fetch(), order_matters(input))
-        } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
-            let input = limit.input();
-            let preserve_order = if input.output_partitioning().partition_count() > 1 {
-                if input.output_ordering().is_some() {
+        let (input, skip, fetch, preserve_order) =
+            if let Some(limit) = plan.downcast_ref::<GlobalLimitExec>() {
+                let input = limit.input();
+                (input, limit.skip(), limit.fetch(), order_matters(input))
+            } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
+                let input = limit.input();
+                if input.output_partitioning().partition_count() > 1 {
                     return Ok(None);
                 }
-                false
+                (input, 0, Some(limit.fetch()), order_matters(input))
+            } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
+                && let Some(fetch) = coalesce.fetch()
+            {
+                let input = match coalesce.input().downcast_ref::<LocalLimitExec>() {
+                    Some(local) if local.fetch() >= fetch => local.input(),
+                    _ => coalesce.input(),
+                };
+                let preserve_order = input.output_partitioning().partition_count() <= 1
+                    && order_matters(input);
+                (input, 0, Some(fetch), preserve_order)
             } else {
-                order_matters(input)
+                return Ok(None);
             };
-            (input, 0, Some(limit.fetch()), preserve_order)
-        } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
-            && let Some(fetch) = coalesce.fetch()
-        {
-            let input = coalesce.input();
-            let preserve_order = input.output_partitioning().partition_count() <= 1
-                && order_matters(input);
-            (input, 0, Some(fetch), preserve_order)
-        } else {
-            return Ok(None);
-        };
         let input = lower_input(input)?;
         if input.schema() != plan.schema() {
             return internal_err!(
@@ -320,13 +319,13 @@ mod tests {
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
-    use crate::bridge::BridgeOperator;
+    use crate::bridge::{BridgeOperator, bridged_plans};
     use crate::chunk::SelectionVector;
     use crate::explain::format_pipelines;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
         TestSource, assert_native_plan_byte_eq, assert_parity, assert_parity_with_config,
-        count, run, sorted_values, values, values_chunk, values_chunks,
+        count, run, sorted_values, values, values_chunk, values_chunks, values_schema,
     };
     use crate::test_utils::{test_session_config, test_table_t1};
 
@@ -637,8 +636,6 @@ mod tests {
             ))?,
             (0, Some(7), false)
         );
-        let local = Arc::new(LocalLimitExec::new(t1_scan(false)?, 15));
-        assert_eq!(lowered(local)?, (0, Some(15), false));
         // A sorted input, or a single partition, has a deterministic order.
         assert_eq!(
             lowered(Arc::new(GlobalLimitExec::new(merged()?, 3, None)))?,
@@ -659,10 +656,24 @@ mod tests {
             (0, Some(9), true)
         );
 
-        // A limit per sorted partition cannot be applied to all partitions.
-        assert!(
-            try_lower(Arc::new(LocalLimitExec::new(sorted_t1_scan()?, 4)))?.is_none()
-        );
+        // A limit per partition is not a limit of all partitions...
+        for scan in [t1_scan(false)?, sorted_t1_scan()?] {
+            assert!(try_lower(Arc::new(LocalLimitExec::new(scan, 4)))?.is_none());
+        }
+        // ... unless a merge above it keeps at most as many rows: then the
+        // native limit replaces both.
+        for (local_fetch, absorbed) in [(7, true), (15, true), (6, false)] {
+            let local = Arc::new(LocalLimitExec::new(t1_scan(false)?, local_fetch));
+            let merged = Arc::new(CoalescePartitionsExec::new(local).with_fetch(Some(7)));
+            let limit = try_lower(merged)?.expect("a limit");
+            assert_eq!((limit.skip(), limit.fetch()), (0, Some(7)));
+            let bridged = limit.input().downcast_ref::<BridgeOperator>().unwrap();
+            assert_eq!(
+                bridged.plan().is::<LocalLimitExec>(),
+                !absorbed,
+                "local fetch {local_fetch}"
+            );
+        }
         // Other nodes, including a coalesce without fetch.
         assert!(try_lower(coalesced()?)?.is_none());
         let mut called = false;
@@ -709,8 +720,9 @@ mod tests {
             "SELECT id, c FROM t1 ORDER BY c, id LIMIT 2049 OFFSET 2047",
             "SELECT * FROM t1 ORDER BY id LIMIT 10 OFFSET 4995",
             "SELECT a FROM (SELECT a, id FROM t1 ORDER BY id LIMIT 20) LIMIT 5 OFFSET 2",
-            // A `LocalLimitExec` per partition of an aggregate that has fewer
-            // groups than the limit.
+            // A `LocalLimitExec` per partition of an aggregate (that has fewer
+            // groups than the limit) below a merge with the same fetch: the
+            // native limit replaces both.
             "SELECT DISTINCT d FROM t1 LIMIT 100",
             "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d LIMIT 50",
         ] {
@@ -806,6 +818,69 @@ mod tests {
             Ok(Arc::new(LocalLimitExec::new(t1_scan(true)?, 3000)))
         };
         assert_native_plan_byte_eq(local, true).await;
+        Ok(())
+    }
+
+    /// Two partitions of 10 rows: the values `0..10` and `100..110`, or all
+    /// `7` if `constant`.
+    fn two_partitions(constant: bool) -> Result<Arc<dyn ExecutionPlan>> {
+        let partition = |start: i64| {
+            let values = if constant {
+                values_chunk([7; 10])
+            } else {
+                values_chunk(start..start + 10)
+            };
+            vec![values.into_record_batch().unwrap()]
+        };
+        Ok(MemorySourceConfig::try_new_exec(
+            &[partition(0), partition(100)],
+            values_schema(),
+            None,
+        )?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_local_limits_keep_their_rows_per_partition() -> Result<()> {
+        // A limit per partition: 3 rows of each partition.
+        let local = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(LocalLimitExec::new(two_partitions(false)?, 3)))
+        };
+        let root = assert_native_plan_byte_eq(local, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 0);
+
+        // Below a merge that keeps more rows than the limit of a partition, the
+        // limit per partition decides which rows are merged.
+        let merged = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(false)?, 3));
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(local).with_fetch(Some(6)),
+            ))
+        };
+        let root = assert_native_plan_byte_eq(merged, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 1);
+        assert!(bridged_plans(&root)[0].is::<LocalLimitExec>());
+        let offset = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(true)?, 3));
+            let merged = CoalescePartitionsExec::new(local).with_fetch(Some(5));
+            Ok(Arc::new(GlobalLimitExec::new(Arc::new(merged), 1, Some(4))))
+        };
+        let root = assert_native_plan_byte_eq(offset, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 2);
+        assert!(bridged_plans(&root)[0].is::<LocalLimitExec>());
+
+        // A merge that keeps at most as many rows as the limit of a partition
+        // makes that limit redundant: the native limit replaces both.
+        let absorbed = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(true)?, 3));
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(local).with_fetch(Some(2)),
+            ))
+        };
+        let root = assert_native_plan_byte_eq(absorbed, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 1);
+        assert!(
+            bridged_plans(&root)[0].is::<datafusion_datasource::source::DataSourceExec>()
+        );
         Ok(())
     }
 }
