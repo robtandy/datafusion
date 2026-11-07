@@ -61,8 +61,8 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
-use arrow::compute::{concat_batches, take};
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::compute::{cast, concat_batches, take};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow::util::pretty::pretty_format_batches;
 use arrow_ipc::writer::StreamWriter;
@@ -295,14 +295,19 @@ pub fn canonical_ipc_bytes(
 
 /// Concatenate `batches`, sort the rows unless `ordered`, and normalize the
 /// physical layout of the arrays.
+///
+/// The batches are converted to the row format one by one, and the rows
+/// converted back to arrays together: concatenating the batches first would
+/// merge dictionaries, which can overflow narrow dictionary keys although
+/// every batch is valid.
 pub fn canonical_batch(
     schema: &SchemaRef,
     batches: &[RecordBatch],
     ordered: bool,
 ) -> Result<RecordBatch> {
-    let batch = concat_batches(schema, batches)?;
-    if batch.num_columns() == 0 {
-        return Ok(batch);
+    let num_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    if schema.fields().is_empty() {
+        return Ok(concat_batches(schema, batches)?);
     }
     let sort_fields = schema
         .fields()
@@ -310,10 +315,13 @@ pub fn canonical_batch(
         .map(|field| SortField::new(field.data_type().clone()))
         .collect::<Vec<_>>();
     if !RowConverter::supports_fields(&sort_fields) {
-        return sort_by_display(&batch, ordered);
+        return sort_by_display(schema, batches, ordered);
     }
     let converter = RowConverter::new(sort_fields)?;
-    let rows = converter.convert_columns(batch.columns())?;
+    let mut rows = converter.empty_rows(num_rows, 0);
+    for batch in batches {
+        converter.append(&mut rows, batch.columns())?;
+    }
     let mut indices = (0..rows.num_rows()).collect::<Vec<_>>();
     if !ordered {
         indices.sort_unstable_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
@@ -334,17 +342,58 @@ pub fn canonical_batch(
         })
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
-    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
     Ok(RecordBatch::try_new_with_options(
         schema, columns, &options,
     )?)
 }
 
-/// Fallback for types the row format does not support: sort by the display
-/// representation of the rows.
-fn sort_by_display(batch: &RecordBatch, ordered: bool) -> Result<RecordBatch> {
+/// Fallback for types the row format does not support: decode dictionary
+/// columns (so that concatenating cannot overflow their keys), concatenate,
+/// and sort by the display representation of the rows.
+fn sort_by_display(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    ordered: bool,
+) -> Result<RecordBatch> {
+    let decoded_type = |data_type: &DataType| match data_type {
+        DataType::Dictionary(_, value_type) => value_type.as_ref().clone(),
+        other => other.clone(),
+    };
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Field::new(
+                field.name(),
+                decoded_type(field.data_type()),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone())
+        })
+        .collect::<Vec<_>>();
+    let decoded_schema =
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let decoded = batches
+        .iter()
+        .map(|batch| {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    Ok(cast(column.as_ref(), &decoded_type(column.data_type()))?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RecordBatch::try_new_with_options(
+                Arc::clone(&decoded_schema),
+                columns,
+                &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+            )?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch = concat_batches(&decoded_schema, &decoded)?;
     if ordered {
-        return Ok(batch.clone());
+        return Ok(batch);
     }
     let options = FormatOptions::default().with_null("NULL");
     let formatters = batch
@@ -672,6 +721,108 @@ mod tests {
             bytes(&[dict(vec![0, 1, 0], vec!["x", "y"])], true),
             bytes(&[dict(vec![2, 0, 2], vec!["y", "unused", "x"])], true)
         );
+    }
+
+    /// Two batches of a `Dictionary<Int8, Utf8>` column with 100 distinct
+    /// values each: together they have more values than an `Int8` key can
+    /// address.
+    fn narrow_dictionary_batches() -> Vec<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+        (0..2)
+            .map(|b| {
+                let ids = Int32Array::from_iter_values((0..100).map(|i| b * 100 + i));
+                let strings = (0..100)
+                    .map(|i| format!("value {}", b * 100 + i))
+                    .collect::<Vec<_>>();
+                let values = strings
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<DictionaryArray<arrow::datatypes::Int8Type>>();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(ids), Arc::new(values)],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn canonical_bytes_of_narrow_dictionaries_over_several_batches() {
+        let batches = narrow_dictionary_batches();
+        for ordered in [false, true] {
+            let one = canonical_batch(&batches[0].schema(), &batches, ordered).unwrap();
+            assert_eq!(one.num_rows(), 200);
+            // The same values in other batches and (unordered) another order.
+            let reversed = batches.iter().rev().cloned().collect::<Vec<_>>();
+            let split = batches
+                .iter()
+                .flat_map(|batch| [batch.slice(0, 30), batch.slice(30, 70)])
+                .collect::<Vec<_>>();
+            assert_eq!(bytes(&batches, ordered), bytes(&split, ordered));
+            if ordered {
+                assert_ne!(bytes(&batches, ordered), bytes(&reversed, ordered));
+            } else {
+                assert_eq!(bytes(&batches, ordered), bytes(&reversed, ordered));
+            }
+            assert!(
+                compare_outputs(
+                    &output(batches.clone(), ordered),
+                    &output(split, ordered)
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn display_fallback_decodes_narrow_dictionaries() {
+        let batches = narrow_dictionary_batches();
+        let schema = batches[0].schema();
+        let reversed = batches.iter().rev().cloned().collect::<Vec<_>>();
+        let sorted = sort_by_display(&schema, &reversed, false).unwrap();
+        assert_eq!(sorted.num_rows(), 200);
+        assert_eq!(sorted.column(1).data_type(), &DataType::Utf8);
+        assert_eq!(sorted, sort_by_display(&schema, &batches, false).unwrap());
+        let in_order = sort_by_display(&schema, &reversed, true).unwrap();
+        assert_eq!(
+            in_order
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            100
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_narrow_dictionaries() {
+        let batches = narrow_dictionary_batches();
+        let setup = async |ctx: &SessionContext| {
+            let partitions = batches.iter().map(|batch| vec![batch.clone()]).collect();
+            ctx.register_table(
+                "dict",
+                Arc::new(MemTable::try_new(batches[0].schema(), partitions)?),
+            )?;
+            Ok(())
+        };
+        // (Sorting these batches fails in DataFusion itself, as merging
+        // their dictionaries overflows the keys: the ordered comparison is
+        // tested in `canonical_bytes_of_narrow_dictionaries_over_several_batches`.)
+        for sql in [
+            "SELECT * FROM dict",
+            "SELECT d, id FROM dict WHERE id % 3 = 0",
+        ] {
+            assert_byte_eq_with_datafusion_with_setup(sql, &setup).await;
+        }
     }
 
     #[test]
