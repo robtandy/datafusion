@@ -25,7 +25,7 @@
 //! the columns it references, so it never sees a row that a previous
 //! conjunct removed: `x <> 0 AND 10 / x > 1` never divides by zero. If the
 //! conjunct cannot fail (see
-//! [`is_infallible`](super::adaptive_filter::is_infallible)) and most rows
+//! [`is_infallible`](super::adaptive_filter::is_infallible)) and enough rows
 //! are still selected, it is evaluated on all physical rows instead, which
 //! avoids the copy; its result for the rows that are not selected is ignored.
 //!
@@ -37,8 +37,9 @@ use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
+use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
+use arrow_buffer::BooleanBuffer;
 use datafusion_common::instant::Instant;
 use datafusion_common::{Result, ScalarValue, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
@@ -193,6 +194,12 @@ impl PhysicalFilter {
     }
 }
 
+/// An infallible conjunct is evaluated on all physical rows of a chunk,
+/// instead of only on the selected ones, if more than one in this many rows
+/// are selected: gathering the columns of the selected rows (`take`) costs
+/// more per row than evaluating a cheap conjunct.
+const DENSE_SELECTION: usize = 4;
+
 /// The global state of a [`PhysicalFilter`]: the rows it may still produce.
 #[derive(Debug)]
 struct FilterGlobalState {
@@ -256,8 +263,8 @@ enum Mask {
     All,
     /// No row is `true`.
     Nothing,
-    /// Some rows are `true`.
-    Some(BooleanArray),
+    /// The rows that are `true` (`NULL` is not `true`), and their number.
+    Some(BooleanBuffer, usize),
 }
 
 impl PhysicalOperator for PhysicalFilter {
@@ -404,19 +411,31 @@ impl PhysicalFilter {
             return Ok(match evaluate_mask(expr, &batch)? {
                 Mask::All => None,
                 Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-                Mask::Some(mask) => Some(SelectionVector::from_boolean_mask(&mask)),
+                Mask::Some(mask, count) => {
+                    let mut selected = Vec::with_capacity(count);
+                    selected.extend(mask.set_indices_u32());
+                    Some(SelectionVector::from(selected))
+                }
             });
         };
         let infallible = !self.filter.conjuncts()[conjunct].is_fallible();
-        if infallible && rows.len() * 2 > physical_rows {
-            // Most rows are selected and the conjunct cannot fail on the
+        if infallible && rows.len() * DENSE_SELECTION > physical_rows {
+            // Many rows are selected and the conjunct cannot fail on the
             // other ones: evaluating it on all physical rows is cheaper than
             // gathering its columns.
             let batch = bound.batch(input, None)?;
             return Ok(match evaluate_mask(expr, &batch)? {
                 Mask::All => None,
                 Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-                Mask::Some(mask) => Some(refine(rows, &mask)),
+                Mask::Some(mask, _) => {
+                    let mut selected = Vec::with_capacity(rows.len());
+                    selected.extend(
+                        rows.indices()
+                            .iter()
+                            .filter(|&&row| mask.value(row as usize)),
+                    );
+                    Some(SelectionVector::from(selected))
+                }
             });
         }
         // Only evaluate the conjunct on the selected rows.
@@ -424,8 +443,12 @@ impl PhysicalFilter {
         Ok(match evaluate_mask(expr, &batch)? {
             Mask::All => None,
             Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-            Mask::Some(mask) => {
-                Some(rows.slice_sel(&SelectionVector::from_boolean_mask(&mask))?)
+            Mask::Some(mask, count) => {
+                // `mask` has an entry for every row of `rows`.
+                let rows = rows.indices();
+                let mut selected = Vec::with_capacity(count);
+                selected.extend(mask.set_indices().map(|row| rows[row]));
+                Some(SelectionVector::from(selected))
             }
         })
     }
@@ -483,27 +506,16 @@ fn evaluate_mask(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Ma
             mask.len()
         );
     }
-    Ok(match mask.true_count() {
-        0 => Mask::Nothing,
-        selected if selected == num_rows => Mask::All,
-        _ => Mask::Some(mask.clone()),
-    })
-}
-
-/// The rows of `rows` for which `mask`, which covers all physical rows, is
-/// `true`.
-fn refine(rows: &SelectionVector, mask: &BooleanArray) -> SelectionVector {
+    // `NULL` is not selected.
     let selected = match mask.nulls() {
         Some(nulls) if nulls.null_count() > 0 => mask.values() & nulls.inner(),
         _ => mask.values().clone(),
     };
-    SelectionVector::new(
-        rows.indices()
-            .iter()
-            .copied()
-            .filter(|&row| selected.value(row as usize))
-            .collect::<Vec<_>>(),
-    )
+    Ok(match selected.count_set_bits() {
+        0 => Mask::Nothing,
+        count if count == num_rows => Mask::All,
+        count => Mask::Some(selected, count),
+    })
 }
 
 /// Test support shared by the tests of the native streaming operators.
@@ -1147,8 +1159,8 @@ mod tests {
         // The input already has a selection, e.g. from a previous filter.
         let input = DataChunk::from_record_batch(batch(0, 2000));
         for (incoming, predicate) in [
-            // Dense incoming selections: infallible conjuncts are evaluated
-            // on all physical rows.
+            // Dense incoming selections (more than a quarter of the rows):
+            // infallible conjuncts are evaluated on all physical rows.
             (
                 (0..2000).filter(|i| i % 3 != 0).collect::<Vec<u32>>(),
                 "a > 10 AND s <> 's3'",
@@ -1158,10 +1170,14 @@ mod tests {
                 (0..2000).filter(|i| i % 9 == 0).collect(),
                 "a > 10 AND s <> 's3' AND v LIKE '%1%'",
             ),
-            // Not increasing.
+            // Not increasing, dense and sparse.
             (
                 (0..2000).rev().step_by(3).collect(),
                 "a % 2 = 0 AND b > 100",
+            ),
+            (
+                (0..2000).rev().step_by(9).collect(),
+                "a > 10 AND s <> 's3' AND b > 100",
             ),
             ((500..1500).collect(), "a < 90 OR s IS NULL"),
         ] {
