@@ -32,7 +32,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::metadata::merge_metadata_for_union;
 use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec, can_interleave};
 
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -102,7 +102,9 @@ impl PhysicalUnion {
     ///
     /// `InterleaveExec` combines hash partitioned inputs partition by
     /// partition; the pipeline engine has no partitions, so it is a union of
-    /// its inputs too.
+    /// its inputs too. An `InterleaveExec` whose inputs are not partitioned
+    /// alike (`can_interleave`) fails in DataFusion and is not lowered, so
+    /// that DataFusion executes it.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         lower_input: F,
@@ -112,7 +114,9 @@ impl PhysicalUnion {
     {
         let inputs = if let Some(union) = plan.downcast_ref::<UnionExec>() {
             union.inputs()
-        } else if let Some(interleave) = plan.downcast_ref::<InterleaveExec>() {
+        } else if let Some(interleave) = plan.downcast_ref::<InterleaveExec>()
+            && can_interleave(interleave.inputs().iter())
+        {
             interleave.inputs()
         } else {
             return Ok(None);
@@ -871,7 +875,10 @@ mod tests {
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_plan::empty::EmptyExec;
     use datafusion_physical_plan::repartition::RepartitionExec;
-    use datafusion_physical_plan::{ExecutionPlanProperties, Partitioning};
+    use datafusion_physical_plan::{
+        ChildrenPropertiesMode, ExecutionPlanProperties, Partitioning,
+        ReplaceChildrenOptions,
+    };
 
     use super::test_support::{
         TestSource, assert_native_plan_byte_eq, assert_operator_byte_eq, assert_parity,
@@ -1283,8 +1290,8 @@ mod tests {
         Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
     }
 
-    #[test]
-    fn lowering_of_union_nodes() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lowering_of_union_nodes() -> Result<()> {
         let union = UnionExec::try_new(vec![t2_scan()?, t2_scan()?, t2_scan()?])?;
         let lowered = PhysicalUnion::try_lower(&union, bridge)?.expect("a union");
         assert_eq!(lowered.schema(), union.schema());
@@ -1303,6 +1310,18 @@ mod tests {
         let lowered = PhysicalUnion::try_lower(&interleave, bridge)?.expect("a union");
         assert_eq!(lowered.schema(), interleave.schema());
         assert_eq!(lowered.children().len(), 2);
+        // Inputs that are not partitioned alike, which DataFusion fails to
+        // interleave: DataFusion executes the node.
+        let mismatched = Arc::clone(&interleave).replace_children(
+            vec![t2_scan()?, t2_by_k()?],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        assert!(mismatched.is::<InterleaveExec>());
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let failed =
+            datafusion_physical_plan::collect(Arc::clone(&mismatched), task_ctx).await;
+        assert!(failed.is_err());
+        assert!(PhysicalUnion::try_lower(&mismatched, bridge)?.is_none());
 
         let mut called = false;
         assert!(

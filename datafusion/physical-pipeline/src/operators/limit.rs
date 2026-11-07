@@ -114,6 +114,11 @@ impl PhysicalLimit {
     /// unless it is arbitrary in DataFusion too: the input merges several
     /// partitions in the order in which their batches arrive.
     ///
+    /// Nodes whose execution fails in DataFusion are not lowered either, so
+    /// that DataFusion executes them: a `GlobalLimitExec` whose input does not
+    /// have exactly one partition, and a `CoalescePartitionsExec` whose input
+    /// has none.
+    ///
     /// `lower_input` lowers the input of the node. Returns `Ok(None)` for any
     /// other node.
     pub fn try_lower<F>(
@@ -126,6 +131,9 @@ impl PhysicalLimit {
         let (input, skip, fetch, preserve_order) =
             if let Some(limit) = plan.downcast_ref::<GlobalLimitExec>() {
                 let input = limit.input();
+                if input.output_partitioning().partition_count() != 1 {
+                    return Ok(None);
+                }
                 (input, limit.skip(), limit.fetch(), order_matters(input))
             } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
                 let input = limit.input();
@@ -136,6 +144,9 @@ impl PhysicalLimit {
             } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
                 && let Some(fetch) = coalesce.fetch()
             {
+                if coalesce.input().output_partitioning().partition_count() == 0 {
+                    return Ok(None);
+                }
                 let input = match coalesce.input().downcast_ref::<LocalLimitExec>() {
                     Some(local) if local.fetch() >= fetch => local.input(),
                     _ => coalesce.input(),
@@ -751,6 +762,14 @@ mod tests {
                 "local fetch {local_fetch}"
             );
         }
+        // Nodes that DataFusion fails to execute are left to it.
+        let multi_partition = GlobalLimitExec::new(t1_scan(false)?, 0, Some(1));
+        assert!(try_lower(Arc::new(multi_partition))?.is_none());
+        let no_partitions: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[], values_schema(), None)?;
+        assert_eq!(no_partitions.output_partitioning().partition_count(), 0);
+        let merged = CoalescePartitionsExec::new(no_partitions).with_fetch(Some(1));
+        assert!(try_lower(Arc::new(merged))?.is_none());
         // Other nodes, including a coalesce without fetch.
         assert!(try_lower(coalesced()?)?.is_none());
         let mut called = false;
