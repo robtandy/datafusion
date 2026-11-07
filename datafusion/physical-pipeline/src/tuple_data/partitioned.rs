@@ -22,6 +22,7 @@
 //! 3. in `Sink::finalize` or in the source, every partition is processed
 //!    on its own (e.g. a hash table is built per partition).
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use datafusion_common::{Result, internal_err, resources_datafusion_err};
@@ -149,6 +150,29 @@ impl PartitionedTupleData {
     /// The partitions, by value.
     pub fn into_partitions(self) -> Vec<TupleDataCollection> {
         self.partitions
+    }
+
+    /// Move the rows of all partitions into a single collection, partition
+    /// after partition, with [`TupleDataCollection::combine`] (O(1) per
+    /// block, no row is copied). Also returns the range of blocks of every
+    /// partition in the collection, e.g. to scan the partitions in parallel
+    /// with [`TupleDataScanState::with_block_range`].
+    ///
+    /// This allows building a hash table per partition whose entries refer
+    /// to rows of a single collection, which a [`RowMatcher`] can then
+    /// compare the probe rows of all partitions with.
+    ///
+    /// [`TupleDataScanState::with_block_range`]: super::TupleDataScanState::with_block_range
+    /// [`RowMatcher`]: super::RowMatcher
+    pub fn into_collection(self) -> Result<(TupleDataCollection, Vec<Range<usize>>)> {
+        let mut collection = TupleDataCollection::new(self.layout);
+        let mut blocks = Vec::with_capacity(self.partitions.len());
+        for partition in self.partitions {
+            let start = collection.num_blocks();
+            collection.combine(partition)?;
+            blocks.push(start..collection.num_blocks());
+        }
+        Ok((collection, blocks))
     }
 
     /// The number of rows in all partitions.
@@ -360,6 +384,7 @@ mod tests {
     use arrow::compute::{concat_batches, take_record_batch};
     use datafusion_common::hash_utils::{RandomState, create_hashes};
 
+    use crate::tuple_data::TupleDataScanState;
     use crate::tuple_data::test_data::{
         all_types_batch, assert_identical, chunk_with_selection,
     };
@@ -569,15 +594,38 @@ mod tests {
         let other =
             PartitionedTupleData::try_new(Arc::clone(&layout), radix_bits + 1).unwrap();
         assert!(global.combine(other).is_err());
-        let partitions = global.into_partitions();
-        assert_eq!(partitions.len(), 8);
-        assert_eq!(
-            partitions
-                .iter()
-                .map(TupleDataCollection::len)
-                .sum::<usize>(),
-            3000
-        );
+
+        // All partitions in a single collection, each in a range of blocks.
+        let partition_batches = global
+            .partitions()
+            .iter()
+            .map(partition_batch)
+            .collect::<Vec<_>>();
+        let blocks_per_partition = global
+            .partitions()
+            .iter()
+            .map(TupleDataCollection::num_blocks)
+            .collect::<Vec<_>>();
+        let (collection, blocks) = global.into_collection().unwrap();
+        assert_eq!(collection.len(), 3000);
+        assert_eq!(blocks.len(), 8);
+        assert_eq!(blocks[0].start, 0);
+        assert_eq!(blocks[7].end, collection.num_blocks());
+        for (i, range) in blocks.iter().enumerate() {
+            assert_eq!(range.len(), blocks_per_partition[i]);
+            let mut state = TupleDataScanState::new().with_block_range(range.clone());
+            let mut scanned = vec![];
+            while let Some(chunk) = collection.scan_chunk(&mut state).unwrap() {
+                scanned.push(chunk.into_record_batch().unwrap());
+            }
+            let scanned = concat_batches(&batch.schema(), &scanned).unwrap();
+            assert_identical(&scanned, &partition_batches[i]);
+        }
+
+        let data = PartitionedTupleData::try_new(Arc::clone(&layout), 2).unwrap();
+        let partitions = data.into_partitions();
+        assert_eq!(partitions.len(), 4);
+        assert!(partitions.iter().all(TupleDataCollection::is_empty));
     }
 
     #[test]

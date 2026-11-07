@@ -861,6 +861,162 @@ mod tests {
         }
     }
 
+    /// A hash join built from the parts of this module: the build side is
+    /// scattered into thread-local partitions, which are combined into a
+    /// single collection; a hash table maps hashes to rows; the matcher
+    /// compares the probe rows (with a selection) with their candidates.
+    #[test]
+    fn hash_join_with_partitioned_build() {
+        use std::collections::HashMap;
+
+        use datafusion_common::hash_utils::{RandomState, create_hashes};
+
+        use crate::tuple_data::{PartitionedTupleData, TupleDataScanState};
+
+        let build = all_types_batch(400);
+        let probe = all_types_batch(300);
+        // bool, f64 (with -0.0 and NaNs) and dict_utf8 keys, with nulls and
+        // many duplicates.
+        let key_columns = [0, 11, 41];
+        let random_state = RandomState::with_seed(3);
+        // The hashes of the keys, the first columns of `batch`.
+        let hash = |batch: &RecordBatch| {
+            let keys = batch.columns()[..key_columns.len()].to_vec();
+            let mut hashes = vec![0; batch.num_rows()];
+            create_hashes(&keys, &random_state, &mut hashes).unwrap();
+            hashes
+        };
+        // The layout starts with the keys, followed by the payload.
+        let mut build_columns = key_columns.to_vec();
+        build_columns.extend([34, 3, 48, 44]);
+        let build = build.project(&build_columns).unwrap();
+        let layout = Arc::new(
+            TupleDataLayout::try_new(build.schema(), true)
+                .unwrap()
+                .with_rows_per_block(16)
+                .unwrap(),
+        );
+
+        // Build: three "threads" scatter chunks into their partitions.
+        let build_hashes = hash(&build);
+        let mut global = PartitionedTupleData::try_new(Arc::clone(&layout), 3).unwrap();
+        for thread in 0..3 {
+            let mut local =
+                PartitionedTupleData::try_new(Arc::clone(&layout), 3).unwrap();
+            for offset in (thread * 50..400).step_by(150) {
+                let chunk = DataChunk::from_record_batch(build.slice(offset, 50));
+                local
+                    .append_chunk(&chunk, &build_hashes[offset..offset + 50])
+                    .unwrap();
+            }
+            global.combine(local).unwrap();
+        }
+        let (collection, _) = global.into_collection().unwrap();
+        let mut table: HashMap<u64, Vec<RowLocation>> = HashMap::new();
+        let mut state = TupleDataScanState::new().with_column_ids(vec![]);
+        while collection.scan_chunk(&mut state).unwrap().is_some() {
+            let hashes = collection.gather_hashes(state.locations()).unwrap();
+            for (&hash, &location) in hashes.iter().zip(state.locations()) {
+                table.entry(hash).or_default().push(location);
+            }
+        }
+
+        // Probe the rows of a selection, one candidate per row and round.
+        let selection = (0..300_u32)
+            .filter(|i| i % 4 != 1)
+            .rev()
+            .collect::<Vec<_>>();
+        let probe_keys = probe.project(&key_columns).unwrap();
+        let probe_chunk = chunk_with_selection(&probe_keys, selection.clone());
+        let probe_hashes = hash(&probe_chunk.compact().unwrap());
+        let matcher = RowMatcher::try_new(
+            Arc::clone(&layout),
+            (0..key_columns.len()).collect(),
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap();
+        let empty = vec![];
+        let candidate_lists = probe_hashes
+            .iter()
+            .map(|hash| table.get(hash).unwrap_or(&empty))
+            .collect::<Vec<_>>();
+        let mut pairs = vec![];
+        let mut candidates = vec![RowLocation::default(); selection.len()];
+        for round in 0.. {
+            let mut sel = (0..selection.len() as u32)
+                .filter(|&row| candidate_lists[row as usize].len() > round)
+                .collect::<Vec<_>>();
+            if sel.is_empty() {
+                break;
+            }
+            for &row in &sel {
+                candidates[row as usize] = candidate_lists[row as usize][round];
+            }
+            matcher
+                .match_rows(&probe_chunk, &mut sel, &candidates, &collection, None)
+                .unwrap();
+            pairs.extend(sel.iter().map(|&row| (row, candidates[row as usize])));
+        }
+        assert!(pairs.len() > selection.len(), "1:N matches");
+
+        // The same pairs as a nested loop join with DataFusion's key
+        // comparison.
+        let compacted = probe_chunk.compact().unwrap();
+        let comparator = JoinKeyComparator::new(
+            build.project(&[0, 1, 2]).unwrap().columns(),
+            compacted.columns(),
+            &[SortOptions::default(); 3],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap();
+        let mut expected = vec![];
+        for row in 0..selection.len() {
+            for build_row in 0..400 {
+                if comparator.is_equal(build_row, row) {
+                    expected.push((row as u32, build_row));
+                }
+            }
+        }
+        // Identify the build rows of the matches by their payload.
+        let locations = pairs.iter().map(|&(_, l)| l).collect::<Vec<_>>();
+        let payload = collection
+            .gather_projected(&locations, &[3, 4, 5, 6])
+            .unwrap();
+        let indices = arrow::array::UInt32Array::from(
+            expected.iter().map(|&(_, b)| b as u32).collect::<Vec<_>>(),
+        );
+        let mut actual = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(row, _))| (row, payload.slice(i, 1)))
+            .collect::<Vec<_>>();
+        let expected_payload = arrow::compute::take_record_batch(
+            &build.project(&[3, 4, 5, 6]).unwrap(),
+            &indices,
+        )
+        .unwrap();
+        let mut expected = expected
+            .iter()
+            .enumerate()
+            .map(|(i, &(row, _))| (row, expected_payload.slice(i, 1)))
+            .collect::<Vec<_>>();
+        let key = |(row, batch): &(u32, RecordBatch)| {
+            (
+                *row,
+                arrow::util::pretty::pretty_format_batches(std::slice::from_ref(batch))
+                    .unwrap()
+                    .to_string(),
+            )
+        };
+        actual.sort_by_cached_key(key);
+        expected.sort_by_cached_key(key);
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(&expected) {
+            assert_eq!(a.0, e.0);
+            assert_eq!(a.1, e.1);
+        }
+    }
+
     #[test]
     fn invalid_inputs_are_errors() {
         let build = batch(vec![(
