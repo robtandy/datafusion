@@ -176,3 +176,167 @@ impl PhysicalOperator for PhysicalPlaceholderRow {
         Ok(SourceResult::Chunk(self.chunk(len)?))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::HashMap;
+
+    use arrow::array::{Array, RecordBatch};
+    use arrow::datatypes::{DataType, Schema, TimeUnit, UnionFields, UnionMode};
+    use datafusion_physical_plan::empty::EmptyExec;
+
+    use crate::operators::union::test_support::{
+        assert_native_plan_byte_eq, assert_parity, assert_parity_with_config, count, run,
+    };
+    use crate::test_utils::test_session_config;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placeholder_produces_its_rows() -> Result<()> {
+        let schema = Arc::new(Schema::empty());
+        for rows in [0, 1, 3, 2048, 2049, 5000] {
+            for threads in [1, 4] {
+                let source =
+                    PhysicalPlaceholderRow::try_new(Arc::clone(&schema))?.with_rows(rows);
+                assert_eq!(source.rows(), rows);
+                let output = run(Arc::new(source), threads).await?;
+                assert_eq!(
+                    output.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    rows,
+                    "{rows} rows, {threads} threads"
+                );
+                assert!(output.iter().all(|batch| {
+                    (1..=DEFAULT_VECTOR_SIZE).contains(&batch.num_rows())
+                        && batch.schema() == schema
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn placeholder_rows_have_the_schema_of_the_operator() -> Result<()> {
+        let schema = Arc::new(
+            Schema::new(vec![
+                Field::new("nullable", DataType::Int32, true),
+                Field::new("count", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, false),
+                Field::new("view", DataType::Utf8View, true),
+                Field::new("d", DataType::Decimal128(12, 2), false),
+                Field::new(
+                    "ts",
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new("flag", DataType::Boolean, false),
+                Field::new_list(
+                    "list",
+                    Field::new_list_field(DataType::Int32, true),
+                    false,
+                ),
+                Field::new_struct(
+                    "struct",
+                    vec![
+                        Field::new("x", DataType::Int32, false),
+                        Field::new("y", DataType::Utf8, true),
+                    ],
+                    false,
+                ),
+                Field::new_dictionary("dict", DataType::Int32, DataType::Utf8, false),
+                Field::new("null", DataType::Null, true),
+            ])
+            .with_metadata(HashMap::from([("key".to_string(), "value".to_string())])),
+        );
+        let source = PhysicalPlaceholderRow::try_new(Arc::clone(&schema))?.with_rows(3);
+        let output = run(Arc::new(source), 4).await?;
+        assert_eq!(output.len(), 1);
+        let batch = &output[0];
+        // A valid batch: the non-nullable columns have no nulls.
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(batch.num_rows(), 3);
+        for (field, column) in schema.fields().iter().zip(batch.columns()) {
+            let nulls = if field.is_nullable() { 3 } else { 0 };
+            assert_eq!(column.logical_null_count(), nulls, "{}", field.name());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn lowering_of_placeholder_rows() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count(*)",
+            DataType::Int64,
+            false,
+        )]));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(PlaceholderRowExec::new(Arc::clone(&schema)));
+        let source = PhysicalPlaceholderRow::try_lower(&plan)?.expect("a source");
+        assert_eq!(source.schema(), schema);
+        assert_eq!(source.rows(), 1);
+        assert_eq!(source.description(), "PhysicalPlaceholderRow");
+        assert!(source.is_source() && source.parallel_source());
+        assert!(source.children().is_empty());
+
+        // One row per partition.
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(PlaceholderRowExec::new(Arc::clone(&schema)).with_partitions(3));
+        let source = PhysicalPlaceholderRow::try_lower(&plan)?.expect("a source");
+        assert_eq!(source.rows(), 3);
+        assert_eq!(source.description(), "PhysicalPlaceholderRow: rows=3");
+
+        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        assert!(PhysicalPlaceholderRow::try_lower(&empty)?.is_none());
+
+        // A non-nullable field without a default value: DataFusion executes
+        // the node instead.
+        let no_default = Arc::new(Schema::new(vec![Field::new(
+            "u",
+            DataType::Union(UnionFields::empty(), UnionMode::Sparse),
+            false,
+        )]));
+        assert!(PhysicalPlaceholderRow::try_new(Arc::clone(&no_default)).is_err());
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(no_default));
+        assert!(PhysicalPlaceholderRow::try_lower(&plan)?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_constant_queries() {
+        for sql in [
+            "SELECT 1, 'hello'",
+            "SELECT 1 AS one, 'hello' AS greeting, NULL AS nothing",
+            "SELECT 1 + 2 AS three, CAST(NULL AS INT) AS n, 'x' || 'y' AS xy, \
+             [1, 2] AS l, -0.0 AS z, DATE '2024-02-29' AS d",
+            "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3",
+            // Aggregations answered from statistics: constants above a
+            // placeholder row with the schema of the aggregation.
+            "SELECT COUNT(*) FROM t1",
+            "SELECT COUNT(*) AS n FROM t_empty",
+        ] {
+            let root = assert_parity(sql).await;
+            assert!(count::<PhysicalPlaceholderRow>(&root) > 0, "{sql}");
+            for target_partitions in [1, 16] {
+                let config =
+                    test_session_config().with_target_partitions(target_partitions);
+                assert_parity_with_config(sql, config).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_placeholder_plans() -> Result<()> {
+        // Placeholder rows that SQL does not produce: one row per partition.
+        for partitions in [1, 3] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(
+                    PlaceholderRowExec::new(Arc::new(Schema::empty()))
+                        .with_partitions(partitions),
+                ))
+            };
+            let root = assert_native_plan_byte_eq(make, false).await;
+            assert!(root.is::<PhysicalPlaceholderRow>());
+        }
+        Ok(())
+    }
+}
