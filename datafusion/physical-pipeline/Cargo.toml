@@ -65,7 +65,7 @@ tokio = { workspace = true }
 datafusion = { workspace = true, default-features = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 
 # Dependencies reserved for the native operators of Waves 2-4 (sources,
 # tuple data, joins, aggregates, sorts and windows) that are not referenced yet.

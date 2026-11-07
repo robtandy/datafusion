@@ -1015,3 +1015,1508 @@ impl Drop for PipelineStream {
         self.queue.close();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use arrow::array::{AsArray, BooleanArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use datafusion_common::exec_err;
+
+    use crate::chunk::SelectionVector;
+    use crate::operator::{GlobalSinkState, downcast_state};
+    use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+
+    // ---------------------------------------------------------------------
+    // Test operators
+    // ---------------------------------------------------------------------
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]))
+    }
+
+    /// `num_batches` batches of `rows` rows with the values `start..`.
+    fn batches(start: i64, num_batches: usize, rows: usize) -> Vec<RecordBatch> {
+        (0..num_batches)
+            .map(|b| {
+                let first = start + (b * rows) as i64;
+                RecordBatch::try_new(
+                    schema(),
+                    vec![Arc::new(Int64Array::from_iter_values(
+                        first..first + rows as i64,
+                    ))],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// All values of `batches`, sorted.
+    fn sorted_values(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut values = values(batches);
+        values.sort_unstable();
+        values
+    }
+
+    fn values(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+            .collect()
+    }
+
+    fn task_ctx() -> Arc<TaskContext> {
+        Arc::new(TaskContext::default())
+    }
+
+    async fn run(
+        root: Arc<dyn PhysicalOperator>,
+        threads: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        Executor::collect(root, task_ctx(), threads).await
+    }
+
+    fn graph(root: Arc<dyn PhysicalOperator>) -> Result<PipelineGraph> {
+        let queue = Arc::new(BatchQueue::new(1));
+        PipelineGraph::try_new(Arc::new(CollectorSink::new(root, queue)))
+    }
+
+    /// A parallel source that hands out `batches`, optionally interrupting
+    /// itself with all kinds of [`TaskInterrupt`]s.
+    #[derive(Debug)]
+    struct VecSource {
+        batches: Vec<RecordBatch>,
+        interrupts: bool,
+        max_threads: usize,
+        calls: AtomicUsize,
+    }
+
+    impl VecSource {
+        fn new(batches: Vec<RecordBatch>) -> Self {
+            Self {
+                batches,
+                interrupts: false,
+                max_threads: usize::MAX,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_interrupts(mut self) -> Self {
+            self.interrupts = true;
+            self
+        }
+
+        fn with_max_threads(mut self, max_threads: usize) -> Self {
+            self.max_threads = max_threads;
+            self
+        }
+    }
+
+    struct VecSourceGlobal {
+        next: AtomicUsize,
+        max_threads: usize,
+    }
+
+    impl GlobalSourceState for VecSourceGlobal {
+        fn max_threads(&self) -> usize {
+            self.max_threads
+        }
+    }
+
+    #[derive(Default)]
+    struct VecSourceLocal {
+        calls: usize,
+    }
+
+    impl LocalSourceState for VecSourceLocal {}
+
+    impl PhysicalOperator for VecSource {
+        fn name(&self) -> &str {
+            "VecSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(VecSourceGlobal {
+                next: AtomicUsize::new(0),
+                max_threads: self.max_threads,
+            }))
+        }
+
+        fn get_local_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            Ok(Box::new(VecSourceLocal::default()))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let gstate = downcast_state::<VecSourceGlobal>(gstate.as_any(), self.name())?;
+            let lstate = lstate.downcast_mut::<VecSourceLocal>().unwrap();
+            if self.interrupts {
+                lstate.calls += 1;
+                match lstate.calls % 4 {
+                    1 => return Ok(SourceResult::Blocked(TaskInterrupt::yield_now())),
+                    2 => {
+                        return Ok(SourceResult::Blocked(TaskInterrupt::wait_for(
+                            tokio::task::yield_now(),
+                        )));
+                    }
+                    3 => {
+                        // The resource "becomes ready" right away.
+                        ctx.waker().wake_by_ref();
+                        return Ok(SourceResult::Blocked(
+                            TaskInterrupt::waker_registered(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let index = gstate.next.fetch_add(1, Ordering::Relaxed);
+            Ok(match self.batches.get(index) {
+                Some(batch) => {
+                    SourceResult::Chunk(DataChunk::from_record_batch(batch.clone()))
+                }
+                None => SourceResult::Finished,
+            })
+        }
+    }
+
+    /// Emits every input chunk `times` times, using `HaveMoreOutput`.
+    #[derive(Debug)]
+    struct Repeat {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        times: usize,
+    }
+
+    #[derive(Default)]
+    struct RepeatState {
+        emitted: usize,
+    }
+
+    impl OperatorState for RepeatState {}
+
+    impl PhysicalOperator for Repeat {
+        fn name(&self) -> &str {
+            "Repeat"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalOperatorState,
+        ) -> Result<Box<dyn OperatorState>> {
+            Ok(Box::new(RepeatState::default()))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let state = lstate.downcast_mut::<RepeatState>().unwrap();
+            *output = input.clone();
+            state.emitted += 1;
+            if state.emitted < self.times {
+                Ok(OperatorResult::HaveMoreOutput)
+            } else {
+                state.emitted = 0;
+                Ok(OperatorResult::NeedMoreInput)
+            }
+        }
+    }
+
+    /// Keeps the rows whose value is a multiple of `divisor`, by attaching a
+    /// selection vector.
+    #[derive(Debug)]
+    struct KeepMultiples {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        divisor: i64,
+    }
+
+    impl PhysicalOperator for KeepMultiples {
+        fn name(&self) -> &str {
+            "KeepMultiples"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let column = input.compacted_column(0)?;
+            let mask = BooleanArray::from_iter(
+                column
+                    .as_primitive::<Int64Type>()
+                    .iter()
+                    .map(|v| v.map(|v| v % self.divisor == 0)),
+            );
+            *output = input
+                .clone()
+                .with_selection(SelectionVector::from_boolean_mask(&mask))?;
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    /// Buffers all of its input and emits it from `final_execute`, one
+    /// buffered chunk per call.
+    #[derive(Debug)]
+    struct BufferAll {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+    }
+
+    #[derive(Default)]
+    struct BufferState {
+        chunks: Vec<DataChunk>,
+    }
+
+    impl OperatorState for BufferState {}
+
+    impl PhysicalOperator for BufferAll {
+        fn name(&self) -> &str {
+            "BufferAll"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalOperatorState,
+        ) -> Result<Box<dyn OperatorState>> {
+            Ok(Box::new(BufferState::default()))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            _output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let state = lstate.downcast_mut::<BufferState>().unwrap();
+            state.chunks.push(input.clone());
+            Ok(OperatorResult::NeedMoreInput)
+        }
+
+        fn requires_final_execute(&self) -> bool {
+            true
+        }
+
+        fn final_execute(
+            &self,
+            _ctx: &ExecutionContext,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorFinalizeResult> {
+            let state = lstate.downcast_mut::<BufferState>().unwrap();
+            if let Some(chunk) = state.chunks.pop() {
+                *output = chunk;
+            }
+            Ok(if state.chunks.is_empty() {
+                OperatorFinalizeResult::Finished
+            } else {
+                OperatorFinalizeResult::HaveMoreOutput
+            })
+        }
+    }
+
+    /// Passes through at most `limit` rows in total (over all threads and
+    /// pipelines), then returns `Finished`.
+    #[derive(Debug)]
+    struct Limit {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        limit: usize,
+    }
+
+    struct LimitState {
+        seen: AtomicUsize,
+    }
+
+    impl GlobalOperatorState for LimitState {}
+
+    impl PhysicalOperator for Limit {
+        fn name(&self) -> &str {
+            "Limit"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_global_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalOperatorState>> {
+            Ok(Arc::new(LimitState {
+                seen: AtomicUsize::new(0),
+            }))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let state = gstate.downcast_ref::<LimitState>().unwrap();
+            let seen = state.seen.fetch_add(input.len(), Ordering::Relaxed);
+            if seen >= self.limit {
+                return Ok(OperatorResult::Finished);
+            }
+            let take = input.len().min(self.limit - seen);
+            *output = input.slice(0, take);
+            Ok(if seen + input.len() >= self.limit {
+                OperatorResult::Finished
+            } else {
+                OperatorResult::NeedMoreInput
+            })
+        }
+    }
+
+    /// Returns `Blocked` before letting every chunk through.
+    #[derive(Debug)]
+    struct BlockOnce {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+    }
+
+    #[derive(Default)]
+    struct BlockOnceState {
+        blocked: bool,
+    }
+
+    impl OperatorState for BlockOnceState {}
+
+    impl PhysicalOperator for BlockOnce {
+        fn name(&self) -> &str {
+            "BlockOnce"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalOperatorState,
+        ) -> Result<Box<dyn OperatorState>> {
+            Ok(Box::new(BlockOnceState::default()))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let state = lstate.downcast_mut::<BlockOnceState>().unwrap();
+            state.blocked = !state.blocked;
+            if state.blocked {
+                // Write garbage that must be ignored.
+                *output = input.clone();
+                return Ok(OperatorResult::Blocked(TaskInterrupt::wait_for(
+                    tokio::task::yield_now(),
+                )));
+            }
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    /// Fails on the `fail_at`-th chunk.
+    #[derive(Debug)]
+    struct FailAt {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        fail_at: usize,
+        seen: AtomicUsize,
+    }
+
+    impl PhysicalOperator for FailAt {
+        fn name(&self) -> &str {
+            "FailAt"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            if self.seen.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_at {
+                return exec_err!("FailAt failed as requested");
+            }
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    /// A pipeline breaker: collects its input as a parallel sink and emits it
+    /// again as a parallel source.
+    #[derive(Debug)]
+    struct Materialize {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        no_output_if_empty: bool,
+        combines: AtomicUsize,
+        finalizes: AtomicUsize,
+        get_data_calls: AtomicUsize,
+    }
+
+    impl Materialize {
+        fn new(child: Arc<dyn PhysicalOperator>) -> Self {
+            Self {
+                children: vec![child],
+                no_output_if_empty: false,
+                combines: AtomicUsize::new(0),
+                finalizes: AtomicUsize::new(0),
+                get_data_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct MaterializeGlobal {
+        chunks: Mutex<Vec<DataChunk>>,
+        finalized: AtomicBool,
+    }
+
+    impl GlobalSinkState for MaterializeGlobal {}
+
+    #[derive(Default)]
+    struct MaterializeLocal {
+        chunks: Vec<DataChunk>,
+    }
+
+    impl LocalSinkState for MaterializeLocal {}
+
+    struct MaterializeSource {
+        sink: Arc<MaterializeGlobal>,
+        next: AtomicUsize,
+    }
+
+    impl GlobalSourceState for MaterializeSource {}
+
+    impl PhysicalOperator for Materialize {
+        fn name(&self) -> &str {
+            "Materialize"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_global_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSinkState>> {
+            Ok(Arc::new(MaterializeGlobal::default()))
+        }
+
+        fn get_local_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSinkState,
+        ) -> Result<Box<dyn LocalSinkState>> {
+            Ok(Box::new(MaterializeLocal::default()))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            _gstate: &dyn GlobalSinkState,
+            lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let state = lstate.downcast_mut::<MaterializeLocal>().unwrap();
+            state.chunks.push(input.clone());
+            Ok(SinkResult::NeedMoreInput)
+        }
+
+        fn combine(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSinkState,
+            lstate: &mut dyn LocalSinkState,
+        ) -> Result<()> {
+            self.combines.fetch_add(1, Ordering::Relaxed);
+            let gstate = gstate.downcast_ref::<MaterializeGlobal>().unwrap();
+            let lstate = lstate.downcast_mut::<MaterializeLocal>().unwrap();
+            gstate.chunks.lock().append(&mut lstate.chunks);
+            Ok(())
+        }
+
+        fn finalize(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSinkState,
+        ) -> Result<SinkFinalize> {
+            self.finalizes.fetch_add(1, Ordering::Relaxed);
+            let gstate = gstate.downcast_ref::<MaterializeGlobal>().unwrap();
+            gstate.finalized.store(true, Ordering::Relaxed);
+            if self.no_output_if_empty && gstate.chunks.lock().is_empty() {
+                Ok(SinkFinalize::NoOutputPossible)
+            } else {
+                Ok(SinkFinalize::Ready)
+            }
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            let sink = ctx
+                .global_sink_state(self)
+                .and_then(|state| state.downcast_arc::<MaterializeGlobal>())
+                .expect("the sink state exists");
+            assert!(
+                sink.finalized.load(Ordering::Relaxed),
+                "the source must only run once the sink is finalized"
+            );
+            Ok(Arc::new(MaterializeSource {
+                sink,
+                next: AtomicUsize::new(0),
+            }))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            self.get_data_calls.fetch_add(1, Ordering::Relaxed);
+            let gstate = gstate.downcast_ref::<MaterializeSource>().unwrap();
+            let index = gstate.next.fetch_add(1, Ordering::Relaxed);
+            Ok(match gstate.sink.chunks.lock().get(index) {
+                Some(chunk) => SourceResult::Chunk(chunk.clone()),
+                None => SourceResult::Finished,
+            })
+        }
+    }
+
+    /// A pipeline breaker that counts its input rows and emits the count as
+    /// a single row, from a single-threaded source.
+    #[derive(Debug)]
+    struct Count {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+    }
+
+    #[derive(Default)]
+    struct CountGlobal {
+        rows: AtomicUsize,
+    }
+
+    impl GlobalSinkState for CountGlobal {}
+
+    #[derive(Default)]
+    struct CountSource {
+        done: AtomicBool,
+    }
+
+    impl GlobalSourceState for CountSource {}
+
+    impl PhysicalOperator for Count {
+        fn name(&self) -> &str {
+            "Count"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_global_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSinkState>> {
+            Ok(Arc::new(CountGlobal::default()))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let gstate = gstate.downcast_ref::<CountGlobal>().unwrap();
+            gstate.rows.fetch_add(input.len(), Ordering::Relaxed);
+            Ok(SinkResult::NeedMoreInput)
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(CountSource::default()))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let gstate = gstate.downcast_ref::<CountSource>().unwrap();
+            if gstate.done.swap(true, Ordering::Relaxed) {
+                return Ok(SourceResult::Finished);
+            }
+            let sink = ctx.global_sink_state(self).unwrap();
+            let rows = sink
+                .downcast_ref::<CountGlobal>()
+                .unwrap()
+                .rows
+                .load(Ordering::Relaxed);
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![rows as i64]))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    /// A sink that accepts `limit` chunks and then returns `Finished`; emits
+    /// how many chunks it accepted.
+    #[derive(Debug)]
+    struct StopAfter {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        limit: usize,
+    }
+
+    #[derive(Default)]
+    struct StopAfterGlobal {
+        chunks: AtomicUsize,
+    }
+
+    impl GlobalSinkState for StopAfterGlobal {}
+
+    impl PhysicalOperator for StopAfter {
+        fn name(&self) -> &str {
+            "StopAfter"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn get_global_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSinkState>> {
+            Ok(Arc::new(StopAfterGlobal::default()))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            _input: &DataChunk,
+            gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let gstate = gstate.downcast_ref::<StopAfterGlobal>().unwrap();
+            let chunks = gstate.chunks.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(if chunks >= self.limit {
+                SinkResult::Finished
+            } else {
+                SinkResult::NeedMoreInput
+            })
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let sink = ctx.global_sink_state(self).unwrap();
+            let sink = sink.downcast_ref::<StopAfterGlobal>().unwrap();
+            let chunks = sink.chunks.swap(0, Ordering::Relaxed);
+            if chunks == 0 {
+                return Ok(SourceResult::Finished);
+            }
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![chunks as i64]))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    /// Concatenates the output of its children through a union pipeline.
+    #[derive(Debug)]
+    struct Union {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        order_matters: bool,
+    }
+
+    impl PhysicalOperator for Union {
+        fn name(&self) -> &str {
+            "Union"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn build_pipelines(
+            &self,
+            current: &mut PipelineBuilder,
+            meta: &mut MetaPipelineBuilder<'_>,
+        ) -> Result<()> {
+            let mut union_pipeline =
+                meta.create_union_pipeline(current, self.order_matters)?;
+            meta.build(current, &self.children[0])?;
+            meta.build(&mut union_pipeline, &self.children[1])
+        }
+    }
+
+    /// A "right outer join"-like operator: it collects its build side
+    /// (`children[1]`) as a sink, passes its probe side (`children[0]`)
+    /// through as an operator, and once the probe pipeline completed it emits
+    /// the build rows plus one row with the number of probed rows from a
+    /// child pipeline.
+    #[derive(Debug)]
+    struct ProbeThenScan {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+    }
+
+    #[derive(Default)]
+    struct ProbeThenScanGlobal {
+        build: Mutex<Vec<DataChunk>>,
+        probed: AtomicUsize,
+    }
+
+    impl GlobalSinkState for ProbeThenScanGlobal {}
+
+    #[derive(Default)]
+    struct ProbeThenScanSource {
+        done: AtomicBool,
+    }
+
+    impl GlobalSourceState for ProbeThenScanSource {}
+
+    impl ProbeThenScan {
+        fn sink_state(&self, ctx: &ExecutionContext) -> Arc<ProbeThenScanGlobal> {
+            ctx.global_sink_state(self)
+                .and_then(|state| state.downcast_arc::<ProbeThenScanGlobal>())
+                .unwrap()
+        }
+    }
+
+    impl PhysicalOperator for ProbeThenScan {
+        fn name(&self) -> &str {
+            "ProbeThenScan"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn build_pipelines(
+            &self,
+            current: &mut PipelineBuilder,
+            meta: &mut MetaPipelineBuilder<'_>,
+        ) -> Result<()> {
+            let this = meta.current_operator()?;
+            meta.add_operator(current, Arc::clone(&this))?;
+            let last_pipeline = *meta.pipelines().last().unwrap();
+            {
+                let (mut build_meta, mut build_pipeline) =
+                    meta.create_child_meta_pipeline(current, Arc::clone(&this))?;
+                build_meta.build(&mut build_pipeline, &self.children[1])?;
+            }
+            meta.build(current, &self.children[0])?;
+            meta.create_child_pipeline(current, this, &last_pipeline)?;
+            Ok(())
+        }
+
+        fn execute(
+            &self,
+            ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            self.sink_state(ctx)
+                .probed
+                .fetch_add(input.len(), Ordering::Relaxed);
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_global_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSinkState>> {
+            Ok(Arc::new(ProbeThenScanGlobal::default()))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            let gstate = gstate.downcast_ref::<ProbeThenScanGlobal>().unwrap();
+            gstate.build.lock().push(input.clone());
+            Ok(SinkResult::NeedMoreInput)
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(ProbeThenScanSource::default()))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let gstate = gstate.downcast_ref::<ProbeThenScanSource>().unwrap();
+            if gstate.done.swap(true, Ordering::Relaxed) {
+                return Ok(SourceResult::Finished);
+            }
+            let sink = self.sink_state(ctx);
+            let mut batches = sink
+                .build
+                .lock()
+                .iter()
+                .map(DataChunk::compact)
+                .collect::<Result<Vec<_>>>()?;
+            batches.push(RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![
+                    sink.probed.load(Ordering::Relaxed) as i64,
+                ]))],
+            )?);
+            let batch = arrow::compute::concat_batches(&schema(), &batches)?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    fn source(batches: Vec<RecordBatch>) -> Arc<dyn PhysicalOperator> {
+        Arc::new(VecSource::new(batches))
+    }
+
+    // ---------------------------------------------------------------------
+    // Pipeline construction
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn streaming_operators_form_a_single_pipeline() -> Result<()> {
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
+            children: vec![Arc::new(KeepMultiples {
+                children: vec![source(batches(0, 1, 4))],
+                divisor: 2,
+            })],
+            times: 2,
+        });
+        let graph = graph(root)?;
+        assert_eq!(graph.pipelines().len(), 1);
+        assert_eq!(graph.meta_pipelines().len(), 1);
+        let pipeline = graph.pipeline(0);
+        assert_eq!(pipeline.source().name(), "VecSource");
+        let names = pipeline
+            .operators()
+            .iter()
+            .map(|op| op.name())
+            .collect::<Vec<_>>();
+        // Execution order: from the source to the sink.
+        assert_eq!(names, vec!["KeepMultiples", "Repeat"]);
+        assert_eq!(pipeline.sink().name(), "CollectorSink");
+        assert!(pipeline.dependencies().is_empty());
+        assert!(pipeline.meta_dependencies().is_empty());
+        assert_eq!(
+            graph.to_string(),
+            "MetaPipeline 0 (sink: CollectorSink)\n  Pipeline 0: VecSource -> KeepMultiples -> Repeat -> CollectorSink\n"
+        );
+        assert_eq!(graph.operators().len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_breakers_create_child_meta_pipelines() -> Result<()> {
+        let inner: Arc<dyn PhysicalOperator> =
+            Arc::new(Materialize::new(source(batches(0, 1, 4))));
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
+            children: vec![Arc::new(Count {
+                children: vec![Arc::new(Repeat {
+                    children: vec![inner],
+                    times: 1,
+                })],
+            })],
+            times: 1,
+        });
+        let graph = graph(root)?;
+        assert_eq!(
+            graph.to_string(),
+            "MetaPipeline 0 (sink: CollectorSink) children: [1]\n  \
+             Pipeline 0: Count -> Repeat -> CollectorSink depends on meta pipelines [1]\n\
+             MetaPipeline 1 (sink: Count) children: [2]\n  \
+             Pipeline 1: Materialize -> Repeat -> Count depends on meta pipelines [2]\n\
+             MetaPipeline 2 (sink: Materialize)\n  \
+             Pipeline 2: VecSource -> Materialize\n"
+        );
+        assert_eq!(graph.root().id(), 0);
+        assert_eq!(graph.meta_pipeline(2).parent(), Some(1));
+        assert_eq!(graph.meta_pipeline(1).children(), &[2]);
+        Ok(())
+    }
+
+    #[test]
+    fn union_and_child_pipelines() -> Result<()> {
+        let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+            children: vec![source(batches(0, 1, 2)), source(batches(10, 1, 2))],
+            order_matters: true,
+        });
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
+            children: vec![Arc::new(ProbeThenScan {
+                children: vec![union, source(batches(100, 1, 2))],
+            })],
+            times: 1,
+        });
+        let graph = graph(root)?;
+        assert_eq!(
+            graph.to_string(),
+            "MetaPipeline 0 (sink: CollectorSink) children: [1]\n  \
+             Pipeline 0: VecSource -> ProbeThenScan -> Repeat -> CollectorSink depends on meta pipelines [1]\n  \
+             Pipeline 2: VecSource -> ProbeThenScan -> Repeat -> CollectorSink depends on pipelines [0] depends on meta pipelines [1]\n  \
+             Pipeline 3: ProbeThenScan -> Repeat -> CollectorSink depends on pipelines [0, 2]\n\
+             MetaPipeline 1 (sink: ProbeThenScan)\n  \
+             Pipeline 1: VecSource -> ProbeThenScan\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_operator_trees_are_rejected() {
+        /// A leaf that is not a source.
+        #[derive(Debug)]
+        struct NotASource;
+
+        impl PhysicalOperator for NotASource {
+            fn name(&self) -> &str {
+                "NotASource"
+            }
+
+            fn schema(&self) -> SchemaRef {
+                schema()
+            }
+
+            fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+                &[]
+            }
+        }
+
+        /// An operator with two children that does not build its pipelines.
+        #[derive(Debug)]
+        struct TwoChildren {
+            children: Vec<Arc<dyn PhysicalOperator>>,
+        }
+
+        impl PhysicalOperator for TwoChildren {
+            fn name(&self) -> &str {
+                "TwoChildren"
+            }
+
+            fn schema(&self) -> SchemaRef {
+                schema()
+            }
+
+            fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+                &self.children
+            }
+        }
+
+        let err = graph(Arc::new(NotASource)).unwrap_err();
+        assert!(
+            err.to_string().contains("NotASource cannot be the source"),
+            "{err}"
+        );
+
+        let err = graph(Arc::new(TwoChildren {
+            children: vec![source(vec![]), source(vec![])],
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must implement build_pipelines"),
+            "{err}"
+        );
+
+        let err = PipelineGraph::try_new(source(vec![])).unwrap_err();
+        assert!(err.to_string().contains("must be a sink"), "{err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Execution
+    // ---------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn executes_parallel_pipeline() -> Result<()> {
+        let input = batches(0, 200, 100);
+        for threads in [1, 3, 8] {
+            let output = run(source(input.clone()), threads).await?;
+            assert_eq!(sorted_values(&output), (0..20_000).collect::<Vec<_>>());
+            assert!(output.iter().all(|batch| batch.schema() == schema()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn executes_on_a_current_thread_runtime() -> Result<()> {
+        let output = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(run(source(batches(0, 200, 100)), 4))?;
+        assert_eq!(sorted_values(&output), (0..20_000).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_source_produces_no_output() -> Result<()> {
+        assert!(run(source(vec![]), 4).await?.is_empty());
+        let output = run(
+            Arc::new(Count {
+                children: vec![source(vec![])],
+            }),
+            4,
+        )
+        .await?;
+        assert_eq!(values(&output), vec![0]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_sources_and_operators_resume() -> Result<()> {
+        let root: Arc<dyn PhysicalOperator> = Arc::new(BlockOnce {
+            children: vec![Arc::new(
+                VecSource::new(batches(0, 50, 10)).with_interrupts(),
+            )],
+        });
+        let output = run(root, 4).await?;
+        assert_eq!(sorted_values(&output), (0..500).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn have_more_output_and_selection_vectors() -> Result<()> {
+        // Two selective operators compose their selections, and `Repeat`
+        // returns `HaveMoreOutput` for every chunk.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
+            children: vec![Arc::new(KeepMultiples {
+                children: vec![Arc::new(KeepMultiples {
+                    children: vec![source(batches(0, 10, 100))],
+                    divisor: 2,
+                })],
+                divisor: 3,
+            })],
+            times: 3,
+        });
+        let output = run(root, 2).await?;
+        let expected = (0..1000)
+            .filter(|v| v % 6 == 0)
+            .flat_map(|v| [v, v, v])
+            .collect::<Vec<_>>();
+        assert_eq!(sorted_values(&output), expected);
+        // The collector compacts the selection vectors.
+        assert!(
+            output
+                .iter()
+                .all(|batch| batch.num_rows() == 17 || batch.num_rows() == 16)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_execute_flushes_buffered_chunks() -> Result<()> {
+        // `BufferAll` emits everything from `final_execute`, through
+        // `Repeat`, which returns `HaveMoreOutput` while flushing.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Repeat {
+            children: vec![Arc::new(BufferAll {
+                children: vec![source(batches(0, 30, 7))],
+            })],
+            times: 2,
+        });
+        let output = run(root, 3).await?;
+        let expected = (0..210).flat_map(|v| [v, v]).collect::<Vec<_>>();
+        assert_eq!(sorted_values(&output), expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_operator_stops_the_pipeline() -> Result<()> {
+        let source = Arc::new(VecSource::new(batches(0, 1000, 10)));
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Limit {
+            children: vec![Arc::clone(&source) as _],
+            limit: 25,
+        });
+        let output = run(root, 1).await?;
+        assert_eq!(values(&output), (0..25).collect::<Vec<_>>());
+        // The source was not drained.
+        assert!(source.calls.load(Ordering::Relaxed) <= 4);
+
+        // Operators downstream of a finished operator are still flushed,
+        // operators upstream of it are not.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(BufferAll {
+            children: vec![Arc::new(Limit {
+                children: vec![Arc::new(BufferAll {
+                    children: vec![Arc::new(Limit {
+                        children: vec![source_from(batches(0, 10, 10))],
+                        limit: 1000,
+                    })],
+                })],
+                limit: 15,
+            })],
+        });
+        let output = run(root, 1).await?;
+        assert_eq!(sorted_values(&output).len(), 15);
+
+        // The global operator state is shared by the union pipelines.
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Limit {
+            children: vec![Arc::new(Union {
+                children: vec![
+                    source_from(batches(0, 10, 10)),
+                    source_from(batches(100, 10, 10)),
+                ],
+                order_matters: false,
+            })],
+            limit: 42,
+        });
+        let output = run(root, 4).await?;
+        assert_eq!(values(&output).len(), 42);
+        Ok(())
+    }
+
+    fn source_from(batches: Vec<RecordBatch>) -> Arc<dyn PhysicalOperator> {
+        source(batches)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_sink_stops_the_pipeline() -> Result<()> {
+        let source = Arc::new(VecSource::new(batches(0, 1000, 10)));
+        let root: Arc<dyn PhysicalOperator> = Arc::new(StopAfter {
+            children: vec![Arc::clone(&source) as _],
+            limit: 3,
+        });
+        let output = run(root, 1).await?;
+        assert_eq!(values(&output), vec![3]);
+        assert!(source.calls.load(Ordering::Relaxed) <= 4);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_breakers_finalize_before_their_source_runs() -> Result<()> {
+        let materialize = Arc::new(Materialize::new(source(batches(0, 40, 25))));
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Count {
+            children: vec![Arc::new(Repeat {
+                children: vec![Arc::clone(&materialize) as _],
+                times: 2,
+            })],
+        });
+        let output = run(root, 4).await?;
+        assert_eq!(values(&output), vec![2000]);
+        // One combine per thread, one finalize per execution.
+        assert_eq!(materialize.combines.load(Ordering::Relaxed), 4);
+        assert_eq!(materialize.finalizes.load(Ordering::Relaxed), 1);
+
+        // The number of threads is bounded by `GlobalSourceState::max_threads`.
+        let materialize = Arc::new(Materialize::new(Arc::new(
+            VecSource::new(batches(0, 40, 25)).with_max_threads(2),
+        )));
+        let output = run(Arc::clone(&materialize) as _, 8).await?;
+        assert_eq!(sorted_values(&output), (0..1000).collect::<Vec<_>>());
+        assert_eq!(materialize.combines.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_output_possible_skips_dependent_pipelines() -> Result<()> {
+        let materialize = Arc::new(Materialize {
+            no_output_if_empty: true,
+            ..Materialize::new(source(vec![]))
+        });
+        let root: Arc<dyn PhysicalOperator> = Arc::new(Count {
+            children: vec![Arc::new(Repeat {
+                children: vec![Arc::clone(&materialize) as _],
+                times: 2,
+            })],
+        });
+        let output = run(root, 4).await?;
+        // The pipeline reading from `materialize` is skipped, but `Count`
+        // still produces its (empty) result.
+        assert_eq!(values(&output), vec![0]);
+        assert_eq!(materialize.get_data_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(materialize.finalizes.load(Ordering::Relaxed), 1);
+
+        // With input, the pipeline runs.
+        let materialize = Arc::new(Materialize {
+            no_output_if_empty: true,
+            ..Materialize::new(source(batches(0, 2, 3)))
+        });
+        let output = run(Arc::clone(&materialize) as _, 4).await?;
+        assert_eq!(sorted_values(&output), (0..6).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_and_child_pipelines_execute_in_dependency_order() -> Result<()> {
+        let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+            children: vec![source(batches(0, 5, 10)), source(batches(50, 5, 10))],
+            order_matters: false,
+        });
+        let root: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+            children: vec![union, source(batches(1000, 2, 3))],
+        });
+        let output = run(root, 4).await?;
+        let mut expected = (0..100).chain(1000..1006).collect::<Vec<_>>();
+        // The child pipeline runs after both probe pipelines completed.
+        expected.push(100);
+        expected.sort_unstable();
+        assert_eq!(sorted_values(&output), expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_are_propagated() {
+        let root: Arc<dyn PhysicalOperator> = Arc::new(FailAt {
+            children: vec![source(batches(0, 100, 10))],
+            fail_at: 7,
+            seen: AtomicUsize::new(0),
+        });
+        let err = run(root, 4).await.unwrap_err();
+        assert!(
+            err.to_string().contains("FailAt failed as requested"),
+            "{err}"
+        );
+
+        // Errors of pipelines below a pipeline breaker are propagated too.
+        let root: Arc<dyn PhysicalOperator> =
+            Arc::new(Materialize::new(Arc::new(FailAt {
+                children: vec![source(batches(0, 100, 10))],
+                fail_at: 1,
+                seen: AtomicUsize::new(0),
+            })));
+        let err = run(root, 4).await.unwrap_err();
+        assert!(
+            err.to_string().contains("FailAt failed as requested"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dropping_the_stream_cancels_the_execution() -> Result<()> {
+        let source = Arc::new(VecSource::new(batches(0, 100_000, 10)));
+        let mut stream =
+            Executor::execute_stream(Arc::clone(&source) as _, task_ctx(), 2)?;
+        let first = stream.next().await.unwrap()?;
+        assert_eq!(first.num_rows(), 10);
+        drop(stream);
+        let calls = source.calls.load(Ordering::Relaxed);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let later = source.calls.load(Ordering::Relaxed);
+        assert!(later < 100_000, "the source was drained ({later} calls)");
+        // No more work is done once the stream is gone.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(source.calls.load(Ordering::Relaxed), later, "{calls}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn metrics_are_recorded() -> Result<()> {
+        let source = Arc::new(VecSource::new(batches(0, 10, 10)));
+        let filter: Arc<dyn PhysicalOperator> = Arc::new(KeepMultiples {
+            children: vec![Arc::clone(&source) as _],
+            divisor: 2,
+        });
+        let stream = Executor::execute_stream(Arc::clone(&filter), task_ctx(), 2)?;
+        let metrics = Arc::clone(stream.metrics());
+        let output = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(values(&output).len(), 50);
+
+        let source_metrics = metrics.get(source.as_ref()).unwrap();
+        assert_eq!(source_metrics.output_rows(), 100);
+        assert_eq!(source_metrics.output_chunks(), 10);
+        let filter_metrics = metrics.get(filter.as_ref()).unwrap();
+        assert_eq!(filter_metrics.output_rows(), 50);
+        let (collector, collector_metrics) = metrics.iter().last().unwrap();
+        assert_eq!(collector.name(), "CollectorSink");
+        assert_eq!(collector_metrics.sink_rows(), 50);
+        assert_eq!(collector_metrics.sink_chunks(), 10);
+        assert_eq!(metrics.iter().count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_queue_applies_backpressure() {
+        let queue = BatchQueue::new(1);
+        let batch = batches(0, 1, 1).remove(0);
+        let waker = Waker::noop();
+        assert!(matches!(
+            queue.push(batch.clone(), waker),
+            PushResult::Pushed
+        ));
+        assert!(matches!(
+            queue.push(batch.clone(), waker),
+            PushResult::Full(_)
+        ));
+        assert_eq!(queue.inner.lock().producers.len(), 1);
+        assert!(queue.pop(waker).is_some());
+        assert!(queue.inner.lock().producers.is_empty());
+        assert!(queue.pop(waker).is_none());
+        assert!(queue.inner.lock().consumer.is_some());
+        queue.close();
+        assert!(matches!(queue.push(batch, waker), PushResult::Closed));
+    }
+}
