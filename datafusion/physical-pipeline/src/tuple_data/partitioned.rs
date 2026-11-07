@@ -63,6 +63,8 @@ struct Scratch {
     /// The first entry of every partition in `rows` (and one more entry,
     /// the number of rows).
     starts: Vec<usize>,
+    /// The next free entry of every partition in `rows`.
+    next: Vec<usize>,
     /// The physical rows of the chunk, grouped by partition.
     rows: Vec<u32>,
     /// The hashes of `rows`.
@@ -298,16 +300,16 @@ impl PartitionedTupleData {
         scratch.hashes.resize(n, 0);
         scratch.logical.clear();
         scratch.logical.resize(n, 0);
-        {
-            // The next free entry of every partition.
-            let mut next = scratch.starts[..num_partitions].to_vec();
-            for (logical, &partition) in scratch.partition_of.iter().enumerate() {
-                let entry = &mut next[partition as usize];
-                scratch.rows[*entry] = physical[logical];
-                scratch.hashes[*entry] = hashes[logical];
-                scratch.logical[*entry] = logical as u32;
-                *entry += 1;
-            }
+        scratch.next.clear();
+        scratch
+            .next
+            .extend_from_slice(&scratch.starts[..num_partitions]);
+        for (logical, &partition) in scratch.partition_of.iter().enumerate() {
+            let entry = &mut scratch.next[partition as usize];
+            scratch.rows[*entry] = physical[logical];
+            scratch.hashes[*entry] = hashes[logical];
+            scratch.logical[*entry] = logical as u32;
+            *entry += 1;
         }
 
         for partition in 0..num_partitions {
@@ -368,7 +370,7 @@ impl PartitionedTupleData {
 impl Scratch {
     fn memory_size(&self) -> usize {
         self.partition_of.capacity() * size_of::<u32>()
-            + self.starts.capacity() * size_of::<usize>()
+            + (self.starts.capacity() + self.next.capacity()) * size_of::<usize>()
             + self.rows.capacity() * size_of::<u32>()
             + self.hashes.capacity() * size_of::<u64>()
             + self.logical.capacity() * size_of::<u32>()
