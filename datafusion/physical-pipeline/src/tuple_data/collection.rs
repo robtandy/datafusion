@@ -40,8 +40,8 @@ use arrow::datatypes::{
 use arrow_row::{RowConverter, Rows, SortField};
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{
-    Result, exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
-    resources_datafusion_err,
+    DataFusionError, Result, exec_datafusion_err, exec_err, internal_datafusion_err,
+    internal_err, resources_datafusion_err,
 };
 
 use super::layout::{
@@ -476,30 +476,53 @@ impl TupleDataCollection {
         Ok(())
     }
 
-    /// Resolve `location` to its row.
-    #[inline]
-    pub(crate) fn row_ref(&self, location: RowLocation) -> Result<RowRef<'_>> {
-        let row_width = self.layout.row_width();
-        match self.blocks.get(location.block()) {
-            Some(block) if location.row() < block.count => {
-                let start = location.row() * row_width;
-                Ok(RowRef {
-                    row: &block.rows[start..start + row_width],
-                    heap: &block.heap,
-                })
-            }
-            _ => internal_err!(
-                "Invalid row location (block {}, row {}) for a TupleDataCollection with {} blocks",
-                location.block(),
-                location.row(),
-                self.blocks.len()
-            ),
+    /// Resolve `location` (of a row with `row_width` bytes) to its row, `None`
+    /// if the location is invalid.
+    #[inline(always)]
+    fn try_row_ref(&self, location: RowLocation, row_width: usize) -> Option<RowRef<'_>> {
+        let block = self.blocks.get(location.block())?;
+        if location.row() >= block.count {
+            return None;
         }
+        let start = location.row() * row_width;
+        Some(RowRef {
+            row: block.rows.get(start..start + row_width)?,
+            heap: &block.heap,
+        })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn invalid_location(&self, location: RowLocation) -> DataFusionError {
+        internal_datafusion_err!(
+            "Invalid row location (block {}, row {}) for a TupleDataCollection with {} blocks",
+            location.block(),
+            location.row(),
+            self.blocks.len()
+        )
     }
 
     /// Resolve `locations` to their rows.
     pub(crate) fn row_refs(&self, locations: &[RowLocation]) -> Result<Vec<RowRef<'_>>> {
-        locations.iter().map(|&l| self.row_ref(l)).collect()
+        self.row_refs_of(locations.iter().copied(), locations.len())
+    }
+
+    /// Resolve the `len` locations of `locations` to their rows.
+    #[inline]
+    pub(crate) fn row_refs_of(
+        &self,
+        locations: impl Iterator<Item = RowLocation>,
+        len: usize,
+    ) -> Result<Vec<RowRef<'_>>> {
+        let row_width = self.layout.row_width();
+        let mut rows = Vec::with_capacity(len);
+        for location in locations {
+            match self.try_row_ref(location, row_width) {
+                Some(row) => rows.push(row),
+                None => return Err(self.invalid_location(location)),
+            }
+        }
+        Ok(rows)
     }
 
     /// Gather the values of the columns `column_ids` of the rows at
@@ -556,10 +579,15 @@ impl TupleDataCollection {
         let Some(offset) = self.layout.hash_offset() else {
             return internal_err!("The TupleDataLayout has no hash slot");
         };
-        locations
-            .iter()
-            .map(|&l| Ok(self.row_ref(l)?.hash(offset)))
-            .collect()
+        let row_width = self.layout.row_width();
+        let mut hashes = Vec::with_capacity(locations.len());
+        for &location in locations {
+            match self.try_row_ref(location, row_width) {
+                Some(row) => hashes.push(row.hash(offset)),
+                None => return Err(self.invalid_location(location)),
+            }
+        }
+        Ok(hashes)
     }
 
     /// Return the next chunk of at most [`TupleDataScanState::chunk_size`]
@@ -875,11 +903,17 @@ fn scatter_rows(
     if row_width == 0 {
         return Ok(());
     }
-    let all_valid = layout.all_valid();
-    if !all_valid.is_empty() {
-        for row in target.chunks_exact_mut(row_width) {
-            row[..all_valid.len()].copy_from_slice(all_valid);
-        }
+    // Initialize the validity bytes: all values are valid.
+    match *layout.all_valid() {
+        [] => {}
+        // Avoid a `memcpy` call per row for the common case of up to 8
+        // columns.
+        [all_valid] => target
+            .chunks_exact_mut(row_width)
+            .for_each(|row| row[0] = all_valid),
+        ref all_valid => target
+            .chunks_exact_mut(row_width)
+            .for_each(|row| row[..all_valid.len()].copy_from_slice(all_valid)),
     }
     for (index, (column, source)) in
         layout.columns().iter().zip(&source.columns).enumerate()
