@@ -22,6 +22,7 @@ use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -177,7 +178,15 @@ impl PhysicalOperator for BridgeOperator {
             let mut cx = Context::from_waker(ctx.waker());
             match stream.poll_next_unpin(&mut cx) {
                 Poll::Ready(Some(batch)) => {
-                    lstate.batch = Some(batch?);
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        // Return to the executor (which skips empty chunks)
+                        // so that the call counts against its budget.
+                        return Ok(SourceResult::Chunk(DataChunk::from_record_batch(
+                            batch,
+                        )));
+                    }
+                    lstate.batch = Some(batch);
                     lstate.offset = 0;
                 }
                 Poll::Ready(None) => lstate.stream = None,
@@ -223,6 +232,12 @@ fn collect_bridged_plans(
 /// From DataFusion's point of view this is a leaf node: the lowered plan is
 /// executed by the pipeline engine, not by DataFusion. Its `DisplayAs`
 /// implementation and metrics live in [`crate::explain`].
+///
+/// Because the DataFusion plans executed by [`BridgeOperator`]s are hidden
+/// from DataFusion's plan traversals, [`ExecutionPlan::reset_state`] resets
+/// the whole `input` plan (with [`reset_plan_states`]) and lowers it again
+/// with [`lower_execution_plan`](crate::planner::lower_execution_plan), so
+/// that the plan can be executed again like a regular DataFusion plan.
 #[derive(Debug)]
 pub struct PipelineRootExec {
     root: Arc<dyn PhysicalOperator>,
@@ -329,6 +344,15 @@ impl ExecutionPlan for PipelineRootExec {
             children,
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
         )
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        // `input` is not a child of this node, so the traversal that calls
+        // `reset_state` does not reach it: reset it as a whole here, and
+        // lower it again so that the operators refer to the reset plans.
+        let input = reset_plan_states(Arc::clone(&self.input))?;
+        let plan: Arc<dyn ExecutionPlan> = crate::planner::create_pipeline_plan(input)?;
+        Ok(plan)
     }
 
     fn execute(
@@ -498,5 +522,41 @@ mod tests {
         let err = PipelineRootExec::try_new(Arc::new(BridgeOperator::new(plan())), other)
             .unwrap_err();
         assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reset_plan_states_resets_the_bridged_plans() -> Result<()> {
+        use datafusion_physical_plan::execution_plan::reset_plan_states;
+
+        use crate::test_utils::{
+            canonical_ipc_bytes, datafusion_context, pipeline_context,
+            register_test_tables, test_session_config,
+        };
+
+        let sql = "SELECT a, COUNT(*) FROM t1 GROUP BY a";
+        let expected = {
+            let ctx = datafusion_context(test_session_config());
+            register_test_tables(&ctx)?;
+            ctx.sql(sql).await?.collect().await?
+        };
+        let expected_bytes =
+            canonical_ipc_bytes(&expected[0].schema(), &expected, false)?;
+
+        let ctx = pipeline_context(test_session_config());
+        register_test_tables(&ctx)?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let mut plan = Arc::clone(&plan);
+        for _ in 0..3 {
+            let output = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+            assert_eq!(
+                canonical_ipc_bytes(&expected[0].schema(), &output, false)?,
+                expected_bytes
+            );
+            // Like default DataFusion, the plan can be executed again once
+            // its state is reset.
+            plan = reset_plan_states(plan)?;
+            assert!(plan.is::<PipelineRootExec>());
+        }
+        Ok(())
     }
 }
