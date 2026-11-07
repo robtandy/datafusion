@@ -4075,26 +4075,44 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn build_side_needed_by_a_child_pipeline_is_not_cancelled() -> Result<()> {
         // A "right outer join" whose probe side cannot produce output: the
-        // probe pipeline is skipped, but the child pipeline that scans the
-        // (slow) build side still needs it.
-        for threads in [1, 4] {
-            let empty = Arc::new(Materialize {
+        // probe pipelines are skipped, but the child pipeline that scans the
+        // (slow) build side for unmatched rows still needs it.
+        let empty = || -> Arc<dyn PhysicalOperator> {
+            Arc::new(Materialize {
                 no_output_if_empty: true,
                 ..Materialize::new(source(vec![]))
-            });
-            let join: Arc<dyn PhysicalOperator> = Arc::new(ProbeThenScan {
+            })
+        };
+        let join = |probe: Arc<dyn PhysicalOperator>| -> Arc<dyn PhysicalOperator> {
+            Arc::new(ProbeThenScan {
                 children: vec![
-                    empty,
+                    probe,
                     Arc::new(DelayedSource {
                         value: 100,
                         delay: std::time::Duration::from_millis(30),
                     }),
                 ],
                 no_output_if_empty: false,
-            });
-            let output = run_with_timeout(join, threads).await?;
-            // The build rows and the number of probed rows.
-            assert_eq!(sorted_values(&output), vec![0, 100]);
+            })
+        };
+        for threads in [1, 4] {
+            for root in [
+                join(empty()),
+                // The child pipeline also has the operators above the join.
+                Arc::new(Repeat {
+                    children: vec![join(empty())],
+                    times: 1,
+                }),
+                // Two skipped probe pipelines, one per input of the union.
+                join(Arc::new(Union {
+                    children: vec![empty(), empty()],
+                    order_matters: false,
+                })),
+            ] {
+                let output = run_with_timeout(root, threads).await?;
+                // The build rows and the number of probed rows.
+                assert_eq!(sorted_values(&output), vec![0, 100], "{threads} threads");
+            }
         }
         Ok(())
     }
