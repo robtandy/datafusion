@@ -57,6 +57,7 @@ use arrow::datatypes::{
     DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef, UnionFields,
 };
 use arrow_row::{RowConverter, RowParser, SortField};
+use datafusion_common::float_semantics::has_float_leaf;
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
 
 /// The width in bytes of the slot of a variable-length (or row encoded)
@@ -230,6 +231,9 @@ pub(crate) struct RowCodec {
     /// Whether the decoded values must be cast to the value type of the
     /// column: the row format decodes dictionaries to their values.
     pub(crate) needs_cast: bool,
+    /// Whether the value type contains floats, which compare differently
+    /// in the row format (`-0.0 != +0.0`) than in DataFusion.
+    pub(crate) has_float_leaf: bool,
 }
 
 impl RowCodec {
@@ -254,6 +258,7 @@ impl RowCodec {
             converter,
             parser,
             needs_cast,
+            has_float_leaf: has_float_leaf(value_type),
         })
     }
 }
@@ -607,6 +612,7 @@ mod tests {
         assert_eq!(column.storage(), ColumnStorage::Encoded);
         let codec = column.codec().unwrap();
         assert!(!codec.needs_cast);
+        assert!(!codec.has_float_leaf);
 
         let codec = layout.column(2).codec().unwrap();
         assert!(codec.needs_cast);
@@ -614,6 +620,11 @@ mod tests {
             without_dictionaries(&list_of_dictionaries),
             DataType::new_list(DataType::Utf8, true)
         );
+
+        let floats =
+            DataType::Struct(vec![Field::new("f", DataType::Float32, true)].into());
+        let layout = TupleDataLayout::try_new_from_types([floats], false).unwrap();
+        assert!(layout.column(0).codec().unwrap().has_float_leaf);
     }
 
     #[test]

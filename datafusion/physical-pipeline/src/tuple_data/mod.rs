@@ -41,10 +41,12 @@
 pub mod collection;
 pub mod layout;
 pub mod partitioned;
+pub mod row_matcher;
 
 pub use collection::{RowLocation, TupleDataCollection, TupleDataScanState};
 pub use layout::{ColumnLayout, ColumnStorage, TupleDataLayout};
 pub use partitioned::{PartitionedRowLocation, PartitionedTupleData};
+pub use row_matcher::RowMatcher;
 
 /// Test data shared by the tests of the tuple data modules.
 #[cfg(test)]
