@@ -561,8 +561,8 @@ pub trait PhysicalOperator: Any + Debug + Send + Sync {
     // ---------------------------------------------------------------------
 
     /// Whether several threads may call [`Self::execute`] concurrently (with
-    /// different local states). If any operator of a pipeline returns
-    /// `false`, the pipeline runs on a single thread.
+    /// different local states). If `false`, the pipelines that contain this
+    /// operator run on a single thread, one pipeline at a time.
     fn parallel_operator(&self) -> bool {
         true
     }
@@ -626,7 +626,8 @@ pub trait PhysicalOperator: Any + Debug + Send + Sync {
     }
 
     /// Whether several threads may call [`Self::get_data`] concurrently. If
-    /// `false`, pipelines with this source run on a single thread.
+    /// `false`, pipelines with this source run on a single thread, one
+    /// pipeline at a time.
     fn parallel_source(&self) -> bool {
         false
     }
@@ -669,8 +670,8 @@ pub trait PhysicalOperator: Any + Debug + Send + Sync {
     }
 
     /// Whether several threads may call [`Self::sink`] concurrently (with
-    /// different local states). If `false`, pipelines that end in this sink
-    /// run on a single thread.
+    /// different local states). If `false`, the pipelines that end in this
+    /// sink run on a single thread, one pipeline at a time.
     fn parallel_sink(&self) -> bool {
         false
     }

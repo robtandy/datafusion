@@ -14,7 +14,7 @@
 //! * [`CollectorSink`] is the sink of the root pipeline: it hands the result
 //!   chunks, as [`RecordBatch`]es, to a [`PipelineStream`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -41,9 +41,10 @@ use crate::operator::{
 };
 use crate::pipeline::{MetaPipeline, Pipeline, PipelineGraph};
 
-/// Maximum number of steps (roughly: chunks) a [`PipelineExecutor`] processes
-/// before it yields back to the async runtime.
-const STEPS_PER_POLL: usize = 128;
+/// Maximum number of operator calls (`get_data`, `execute`, `final_execute`
+/// and `sink`) a [`PipelineExecutor`] makes per poll before it yields back to
+/// the async runtime.
+const CALLS_PER_POLL: usize = 128;
 
 /// Everything the threads of one pipeline share.
 struct PipelineShared {
@@ -59,6 +60,14 @@ struct PipelineShared {
     /// An operator of the pipeline reported [`SinkFinalize::NoOutputPossible`]:
     /// skip the push loop entirely.
     skip: bool,
+}
+
+/// What [`PipelineExecutor::poll_run`] achieved.
+enum Progress {
+    /// The pipeline is complete for this thread.
+    Done,
+    /// The task should yield to the scheduler, then continue.
+    Yield,
 }
 
 /// One step of the push loop.
@@ -79,6 +88,9 @@ enum PushOutcome {
     NeedMoreInput,
     /// An operator is blocked.
     Blocked(TaskInterrupt),
+    /// The call budget is exhausted; the push resumes from the
+    /// `in_process_operators` stack.
+    Yield,
 }
 
 /// Executes one thread's share of a [`Pipeline`] (DuckDB's
@@ -92,7 +104,13 @@ enum PushOutcome {
 /// When an operator returns [`OperatorResult::HaveMoreOutput`], its stage is
 /// pushed onto the `in_process_operators` stack; before pulling new data from the
 /// source, the executor calls the in-process operators again with the same
-/// input, from the most downstream one.
+/// input, from the most downstream one. The stack also records where to
+/// resume when an operator is blocked or when the executor yields because
+/// its call budget is exhausted.
+///
+/// At most `CALLS_PER_POLL` operator calls are made per poll, so a pipeline
+/// never monopolizes a thread of the async runtime, even if its operators
+/// produce output that is discarded downstream.
 pub struct PipelineExecutor {
     shared: Arc<PipelineShared>,
     ctx: ExecutionContext,
@@ -116,6 +134,8 @@ pub struct PipelineExecutor {
     flush_current_finished: bool,
     /// Future the task waits for before continuing.
     wait: Option<BoxFuture<'static, ()>>,
+    /// Operator calls left in the current poll.
+    budget: usize,
     done: bool,
 }
 
@@ -147,6 +167,7 @@ impl PipelineExecutor {
                 flush_index: num_operators,
                 flush_current_finished: false,
                 wait: None,
+                budget: 0,
                 done: false,
                 shared,
                 ctx,
@@ -174,6 +195,7 @@ impl PipelineExecutor {
             flush_index: 0,
             flush_current_finished: false,
             wait: None,
+            budget: 0,
             done: false,
             shared,
             ctx,
@@ -184,9 +206,39 @@ impl PipelineExecutor {
     ///
     /// Returns `Poll::Ready` once the source is exhausted, all operators are
     /// flushed and the local sink state was combined into the global one.
+    /// When the call budget of a poll is exhausted, the task is woken and
+    /// `Poll::Pending` is returned. [`Self::execute`] yields more politely,
+    /// like tokio's cooperative scheduling: prefer it.
     pub fn poll_execute(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        match self.poll_run(cx) {
+            Poll::Ready(Ok(Progress::Done)) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Progress::Yield)) => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Run the pipeline to completion.
+    pub async fn execute(mut self) -> Result<()> {
+        loop {
+            match futures::future::poll_fn(|cx| self.poll_run(cx)).await? {
+                Progress::Done => return Ok(()),
+                // Like tokio's cooperative scheduling: run again only after
+                // the other ready tasks (and the I/O and timer drivers) had a
+                // chance to run. All state needed to resume is kept in `self`.
+                Progress::Yield => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    /// Make progress until the pipeline is complete, blocked, or the call
+    /// budget of this poll is exhausted.
+    fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<Progress>> {
         if self.done {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(Progress::Done));
         }
         self.ctx.set_waker(cx.waker());
         if let Some(wait) = self.wait.as_mut() {
@@ -195,19 +247,20 @@ impl PipelineExecutor {
             }
             self.wait = None;
         }
-        for _ in 0..STEPS_PER_POLL {
+        self.budget = CALLS_PER_POLL;
+        loop {
+            if self.budget == 0 {
+                return Poll::Ready(Ok(Progress::Yield));
+            }
             match self.step() {
                 Ok(Step::Continue) => {}
                 Ok(Step::Done) => {
                     self.done = true;
-                    return Poll::Ready(self.combine());
+                    return Poll::Ready(self.combine().map(|()| Progress::Done));
                 }
                 Ok(Step::Blocked(interrupt)) => match interrupt.into_kind() {
                     InterruptKind::WakerRegistered => return Poll::Pending,
-                    InterruptKind::Yield => {
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
+                    InterruptKind::Yield => return Poll::Ready(Ok(Progress::Yield)),
                     InterruptKind::Future(mut future) => {
                         if future.as_mut().poll(cx).is_pending() {
                             self.wait = Some(future);
@@ -221,16 +274,20 @@ impl PipelineExecutor {
                 }
             }
         }
-        // Yield to give other tasks a chance to run.
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
-    /// Run the pipeline to completion.
-    pub async fn execute(mut self) -> Result<()> {
-        futures::future::poll_fn(|cx| self.poll_execute(cx)).await
+    /// Consume one call from the budget of the current poll. Returns `false`
+    /// if the budget is exhausted.
+    fn take_budget(&mut self) -> bool {
+        if self.budget == 0 {
+            return false;
+        }
+        self.budget -= 1;
+        true
     }
 
+    /// Make progress. Only called with a non-empty budget, so that every
+    /// step makes at least one operator call (or completes the pipeline).
     fn step(&mut self) -> Result<Step> {
         // A chunk the sink did not accept yet.
         if self.pending_sink {
@@ -251,6 +308,9 @@ impl PipelineExecutor {
     }
 
     fn fetch_from_source(&mut self) -> Result<Step> {
+        if !self.take_budget() {
+            return Ok(Step::Continue);
+        }
         let start = Instant::now();
         let result = self.shared.source.get_data(
             &self.ctx,
@@ -283,7 +343,7 @@ impl PipelineExecutor {
                 self.pending_sink = true;
                 self.sink_last_chunk()
             }
-            PushOutcome::NeedMoreInput => Ok(Step::Continue),
+            PushOutcome::NeedMoreInput | PushOutcome::Yield => Ok(Step::Continue),
             PushOutcome::Blocked(interrupt) => Ok(Step::Blocked(interrupt)),
         }
     }
@@ -300,6 +360,12 @@ impl PipelineExecutor {
         loop {
             if stage > n {
                 return Ok(PushOutcome::Output);
+            }
+            if !self.take_budget() {
+                // Resume with this operator: all stages on the stack are
+                // upstream of it, so the stack stays ordered.
+                self.in_process_operators.push(stage);
+                return Ok(PushOutcome::Yield);
             }
             let index = stage - 1;
             let (inputs, outputs) = self.chunks.split_at_mut(stage);
@@ -344,6 +410,10 @@ impl PipelineExecutor {
     }
 
     fn sink_last_chunk(&mut self) -> Result<Step> {
+        if !self.take_budget() {
+            // `pending_sink` is set: the chunk is sunk in the next poll.
+            return Ok(Step::Continue);
+        }
         let chunk = self.chunks.last().expect("pipeline has a source chunk");
         let rows = chunk.len();
         let start = Instant::now();
@@ -398,6 +468,9 @@ impl PipelineExecutor {
                 self.flush_current_finished = false;
                 continue;
             }
+            if !self.take_budget() {
+                return Ok(Some(Step::Continue));
+            }
             let output = &mut self.chunks[index + 1];
             output.reset();
             let metrics = &shared.operator_metrics[index];
@@ -414,9 +487,7 @@ impl PipelineExecutor {
             }
             let rows = self.chunks[index + 1].len();
             if rows == 0 {
-                // Respect the step budget even if an operator keeps
-                // returning `HaveMoreOutput` without output.
-                return Ok(Some(Step::Continue));
+                continue;
             }
             metrics.record_output(rows);
             self.push_stage = index + 1;
@@ -496,9 +567,11 @@ impl ExecutionMetrics {
 /// Every pipeline becomes runnable once the pipelines it depends on are
 /// complete and the child meta pipelines it depends on are finalized. A
 /// runnable pipeline is executed by up to `num_threads` [`PipelineExecutor`]
-/// tasks; independent pipelines run concurrently. Once all pipelines of a
-/// meta pipeline completed (and every thread combined its local sink state),
-/// the sink of the meta pipeline is finalized.
+/// tasks; independent pipelines run concurrently, except pipelines that share
+/// a sink, operator or source that does not support parallel execution,
+/// which run one after the other. Once all pipelines of a meta pipeline
+/// completed (and every thread combined its local sink state), the sink of
+/// the meta pipeline is finalized.
 #[derive(Debug)]
 pub struct Executor {
     graph: Arc<PipelineGraph>,
@@ -580,33 +653,12 @@ impl Executor {
             "Executing pipelines with up to {} threads:\n{graph}",
             self.num_threads
         );
-        let num_pipelines = graph.pipelines().len();
-        let num_events = num_pipelines + graph.meta_pipelines().len();
-
-        // Events `0..num_pipelines` run a pipeline, event
-        // `num_pipelines + m` finalizes meta pipeline `m`.
-        let mut dependencies = vec![0usize; num_events];
-        let mut dependents = vec![vec![]; num_events];
-        for pipeline in graph.pipelines() {
-            let event = pipeline.id();
-            let prerequisites = pipeline.dependencies().iter().copied().chain(
-                pipeline
-                    .meta_dependencies()
-                    .iter()
-                    .map(|&meta| num_pipelines + meta),
-            );
-            for prerequisite in prerequisites {
-                dependencies[event] += 1;
-                dependents[prerequisite].push(event);
-            }
-        }
-        for meta in graph.meta_pipelines() {
-            let event = num_pipelines + meta.id();
-            for &pipeline in meta.pipelines() {
-                dependencies[event] += 1;
-                dependents[pipeline].push(event);
-            }
-        }
+        let Events {
+            mut dependencies,
+            dependents,
+            ..
+        } = Events::try_new(graph)?;
+        let num_events = dependencies.len();
 
         let mut running = FuturesUnordered::new();
         for (event, &count) in dependencies.iter().enumerate() {
@@ -778,6 +830,117 @@ impl Executor {
         registry.metrics(sink.as_ref()).add_elapsed(start.elapsed());
         registry.set_finalize_result(sink.as_ref(), result?);
         Ok(())
+    }
+}
+
+/// The events of an execution: event `p` (for `p < #pipelines`) runs pipeline
+/// `p`, event `#pipelines + m` finalizes meta pipeline `m`.
+struct Events {
+    /// For every event, the number of events it waits for.
+    dependencies: Vec<usize>,
+    /// For every event, the events that wait for it.
+    dependents: Vec<Vec<usize>>,
+    /// The `(prerequisite, dependent)` pairs, to avoid duplicates.
+    edges: HashSet<(usize, usize)>,
+}
+
+impl Events {
+    fn try_new(graph: &PipelineGraph) -> Result<Self> {
+        let num_pipelines = graph.pipelines().len();
+        let num_events = num_pipelines + graph.meta_pipelines().len();
+        let mut events = Self {
+            dependencies: vec![0; num_events],
+            dependents: vec![vec![]; num_events],
+            edges: HashSet::new(),
+        };
+        for pipeline in graph.pipelines() {
+            for &dependency in pipeline.dependencies() {
+                events.add(dependency, pipeline.id());
+            }
+            for &meta in pipeline.meta_dependencies() {
+                events.add(num_pipelines + meta, pipeline.id());
+            }
+        }
+        for meta in graph.meta_pipelines() {
+            for &pipeline in meta.pipelines() {
+                events.add(pipeline, num_pipelines + meta.id());
+            }
+        }
+
+        // A sink, operator or source that does not support parallel
+        // execution may be part of several pipelines (e.g. the pipelines of
+        // the inputs of a union share the sink and the operators above the
+        // union). Run these pipelines one after the other, in an order that
+        // is compatible with all dependencies, so that such an operator is
+        // never called concurrently.
+        let order = events.topological_order()?;
+        let mut position = vec![0; num_events];
+        for (index, &event) in order.iter().enumerate() {
+            position[event] = index;
+        }
+        let mut exclusive: HashMap<usize, Vec<usize>> = HashMap::new();
+        for pipeline in graph.pipelines() {
+            let non_parallel = std::iter::once(pipeline.source())
+                .filter(|source| !source.parallel_source())
+                .chain(
+                    pipeline
+                        .operators()
+                        .iter()
+                        .filter(|operator| !operator.parallel_operator()),
+                )
+                .chain(
+                    std::iter::once(pipeline.sink()).filter(|sink| !sink.parallel_sink()),
+                );
+            for operator in non_parallel {
+                exclusive
+                    .entry(operator_key(operator.as_ref()))
+                    .or_default()
+                    .push(pipeline.id());
+            }
+        }
+        for mut pipelines in exclusive.into_values() {
+            pipelines.sort_by_key(|&pipeline| position[pipeline]);
+            pipelines.dedup();
+            for pair in pipelines.windows(2) {
+                events.add(pair[0], pair[1]);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Make `dependent` wait for `prerequisite`.
+    fn add(&mut self, prerequisite: usize, dependent: usize) {
+        if prerequisite != dependent && self.edges.insert((prerequisite, dependent)) {
+            self.dependencies[dependent] += 1;
+            self.dependents[prerequisite].push(dependent);
+        }
+    }
+
+    /// All events, in an order in which every event comes after the events
+    /// it waits for.
+    fn topological_order(&self) -> Result<Vec<usize>> {
+        let mut remaining = self.dependencies.clone();
+        let mut ready = (0..remaining.len())
+            .filter(|&event| remaining[event] == 0)
+            .collect::<VecDeque<_>>();
+        let mut order = Vec::with_capacity(remaining.len());
+        while let Some(event) = ready.pop_front() {
+            order.push(event);
+            for &dependent in &self.dependents[event] {
+                remaining[dependent] -= 1;
+                if remaining[dependent] == 0 {
+                    ready.push_back(dependent);
+                }
+            }
+        }
+        if order.len() != remaining.len() {
+            return internal_err!(
+                "Pipeline dependency cycle: only {} of {} events can run",
+                order.len(),
+                remaining.len()
+            );
+        }
+        Ok(order)
     }
 }
 
@@ -2531,5 +2694,384 @@ mod tests {
         assert!(queue.inner.lock().consumer.is_some());
         queue.close();
         assert!(matches!(queue.push(batch, waker), PushResult::Closed));
+    }
+
+    /// An operator or sink (depending on `as_sink`) that records how many
+    /// threads call it at the same time.
+    #[derive(Debug)]
+    struct ConcurrencyProbe {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        as_sink: bool,
+        parallel: bool,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        rows: AtomicUsize,
+    }
+
+    impl ConcurrencyProbe {
+        fn new(child: Arc<dyn PhysicalOperator>, as_sink: bool, parallel: bool) -> Self {
+            Self {
+                children: vec![child],
+                as_sink,
+                parallel,
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                rows: AtomicUsize::new(0),
+            }
+        }
+
+        /// Simulate work while recording concurrent calls.
+        fn probe(&self, rows: usize) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            self.rows.fetch_add(rows, Ordering::SeqCst);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct ProbeSource {
+        done: AtomicBool,
+    }
+
+    impl GlobalSourceState for ProbeSource {}
+
+    impl PhysicalOperator for ConcurrencyProbe {
+        fn name(&self) -> &str {
+            "ConcurrencyProbe"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn parallel_operator(&self) -> bool {
+            self.parallel
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            self.probe(input.len());
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+
+        fn is_sink(&self) -> bool {
+            self.as_sink
+        }
+
+        fn parallel_sink(&self) -> bool {
+            self.parallel
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            _gstate: &dyn GlobalSinkState,
+            _lstate: &mut dyn LocalSinkState,
+        ) -> Result<SinkResult> {
+            self.probe(input.len());
+            Ok(SinkResult::NeedMoreInput)
+        }
+
+        fn is_source(&self) -> bool {
+            self.as_sink
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(ProbeSource::default()))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let gstate = gstate.downcast_ref::<ProbeSource>().unwrap();
+            if gstate.done.swap(true, Ordering::SeqCst) {
+                return Ok(SourceResult::Finished);
+            }
+            let rows = self.rows.load(Ordering::SeqCst) as i64;
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(vec![rows]))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    fn four_way_union() -> Arc<dyn PhysicalOperator> {
+        let union = |a: Arc<dyn PhysicalOperator>, b: Arc<dyn PhysicalOperator>| {
+            Arc::new(Union {
+                children: vec![a, b],
+                order_matters: false,
+            }) as Arc<dyn PhysicalOperator>
+        };
+        union(
+            union(source(batches(0, 20, 10)), source(batches(200, 20, 10))),
+            union(source(batches(400, 20, 10)), source(batches(600, 20, 10))),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_parallel_sinks_are_never_called_concurrently() -> Result<()> {
+        // Four union pipelines sink into one non-parallel sink.
+        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), true, false));
+        let output = run(Arc::clone(&probe) as _, 4).await?;
+        assert_eq!(values(&output), vec![800]);
+        assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
+
+        // A parallel sink is called concurrently.
+        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), true, true));
+        let output = run(Arc::clone(&probe) as _, 4).await?;
+        assert_eq!(values(&output), vec![800]);
+        assert!(probe.max_active.load(Ordering::SeqCst) > 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_parallel_operators_are_never_called_concurrently() -> Result<()> {
+        // A non-parallel operator above a union is part of all four union
+        // pipelines.
+        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), false, false));
+        let output = run(Arc::clone(&probe) as _, 4).await?;
+        assert_eq!(sorted_values(&output).len(), 800);
+        assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
+
+        let probe = Arc::new(ConcurrencyProbe::new(four_way_union(), false, true));
+        let output = run(Arc::clone(&probe) as _, 4).await?;
+        assert_eq!(sorted_values(&output).len(), 800);
+        assert!(probe.max_active.load(Ordering::SeqCst) > 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn serialized_pipelines_keep_their_dependencies() -> Result<()> {
+        // The non-parallel operator is part of the probe pipeline, the union
+        // pipeline and the child pipeline of `ProbeThenScan`, which already
+        // depend on each other (depending on `order_matters`).
+        for order_matters in [false, true] {
+            let union: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: vec![source(batches(0, 5, 10)), source(batches(50, 5, 10))],
+                order_matters,
+            });
+            let probe = Arc::new(ConcurrencyProbe::new(
+                Arc::new(ProbeThenScan {
+                    children: vec![union, source(batches(1000, 2, 3))],
+                }),
+                false,
+                false,
+            ));
+            let output = run(Arc::clone(&probe) as _, 4).await?;
+            let mut expected = (0..100).chain(1000..1006).collect::<Vec<_>>();
+            expected.push(100);
+            expected.sort_unstable();
+            assert_eq!(sorted_values(&output), expected);
+            assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    /// A source that records how many threads call it at the same time.
+    /// Every pipeline it is the source of reads `chunks` chunks.
+    #[derive(Debug)]
+    struct ProbedSource {
+        parallel: bool,
+        chunks: usize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    struct ProbedSourceState {
+        next: AtomicUsize,
+    }
+
+    impl GlobalSourceState for ProbedSourceState {}
+
+    impl PhysicalOperator for ProbedSource {
+        fn name(&self) -> &str {
+            "ProbedSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            self.parallel
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(ProbedSourceState {
+                next: AtomicUsize::new(0),
+            }))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let gstate = gstate.downcast_ref::<ProbedSourceState>().unwrap();
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let index = gstate.next.fetch_add(1, Ordering::SeqCst);
+            Ok(if index < self.chunks {
+                SourceResult::Chunk(DataChunk::from_record_batch(
+                    batches(index as i64 * 10, 1, 10).remove(0),
+                ))
+            } else {
+                SourceResult::Finished
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn non_parallel_sources_are_never_called_concurrently() -> Result<()> {
+        for parallel in [false, true] {
+            // The same source operator is the source of both union pipelines.
+            let source = Arc::new(ProbedSource {
+                parallel,
+                chunks: 20,
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            });
+            let root: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: vec![Arc::clone(&source) as _, Arc::clone(&source) as _],
+                order_matters: false,
+            });
+            let output = run(root, 4).await?;
+            assert_eq!(values(&output).len(), 400);
+            let max_active = source.max_active.load(Ordering::SeqCst);
+            if parallel {
+                assert!(max_active > 1, "{max_active}");
+            } else {
+                assert_eq!(max_active, 1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits its input `times` times with `HaveMoreOutput`, counting calls.
+    #[derive(Debug)]
+    struct Spin {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        times: usize,
+        calls: AtomicUsize,
+    }
+
+    impl PhysicalOperator for Spin {
+        fn name(&self) -> &str {
+            "Spin"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            let calls = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            *output = input.clone();
+            Ok(if calls < self.times {
+                OperatorResult::HaveMoreOutput
+            } else {
+                OperatorResult::NeedMoreInput
+            })
+        }
+    }
+
+    #[test]
+    fn push_loop_yields_within_the_cooperative_budget() -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            const TIMES: usize = 2_000_000;
+            // `Spin` produces output forever (for practical purposes), which
+            // the filter downstream discards: no output reaches the sink.
+            let spin = Arc::new(Spin {
+                children: vec![source(batches(1, 1, 1))],
+                times: TIMES,
+                calls: AtomicUsize::new(0),
+            });
+            let root: Arc<dyn PhysicalOperator> = Arc::new(KeepMultiples {
+                children: vec![Arc::clone(&spin) as _],
+                divisor: 2,
+            });
+
+            // A task that competes for the single thread of the runtime.
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let ticker = {
+                let ticks = Arc::clone(&ticks);
+                SpawnedTask::spawn(async move {
+                    loop {
+                        ticks.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+
+            let mut stream = Executor::execute_stream(root, task_ctx(), 1)?;
+            let next =
+                tokio::time::timeout(std::time::Duration::from_millis(50), stream.next())
+                    .await;
+            assert!(next.is_err(), "the pipeline should still be running");
+            let calls = spin.calls.load(Ordering::SeqCst);
+            assert!(calls > 0 && calls < TIMES, "{calls} calls");
+            // The ticker ran while the pipeline was busy.
+            assert!(ticks.load(Ordering::SeqCst) > 10, "{ticks:?}");
+
+            // Dropping the stream stops the pipeline promptly.
+            drop(stream);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let after_drop = spin.calls.load(Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert_eq!(spin.calls.load(Ordering::SeqCst), after_drop);
+            assert!(after_drop < TIMES);
+            drop(ticker);
+            Ok(())
+        })
     }
 }
