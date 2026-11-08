@@ -229,41 +229,57 @@ fn advertises_its_input_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
     })
 }
 
-/// Whether the rows that a limit selects from `input`, a plan with a single
-/// output partition, depend on its order. They do not if `input` merges
-/// several partitions in the order in which their batches arrive (see
-/// [`merges_in_arrival_order`]), possibly below operators that keep the order
-/// of their input: DataFusion's result is arbitrary then.
+/// Whether the rows that a limit selects from `plan`, a plan with a single
+/// output partition, depend on its order, i.e. whether its order is
+/// deterministic and reproduced by the native operators that replace it:
 ///
-/// In all other cases, the order is deterministic (e.g. sorted, or the order
-/// of a single partition), and the limit must see its input in that order.
-/// That costs no parallelism compared to DataFusion, which executes the
-/// single partition on one thread too.
+/// * a sorted output has a deterministic order;
+/// * a merge of several partitions in the order in which their batches
+///   arrive (see [`merges_in_arrival_order`]) has an arbitrary order:
+///   DataFusion's result is arbitrary then;
+/// * a source has the order of its partition;
+/// * any other node has the order of the inputs whose order it keeps
+///   ([`ExecutionPlan::maintains_input_order`], e.g. the probe side of a hash
+///   join; a `CoalescePartitionsExec` passes a single partition through),
+///   which must all be deterministic. A node that keeps the order of none of
+///   its inputs (e.g. an aggregation or a nested loop join) produces an order
+///   of its own, which the native operator replacing it does not reproduce:
+///   the order does not matter.
+///
+/// If the order matters, the limit must see its input in that order. That
+/// costs no parallelism compared to DataFusion, which executes the single
+/// partition on one thread too.
 ///
 /// An order-preserving limit is not a parallel operator, so the executor runs
-/// the pipelines of the inputs of a union below it one after the other. That
-/// is how DataFusion reads a single partition with a deterministic order too,
-/// but it reads the inputs of a merge concurrently: a limit over a merge in
-/// arrival order is parallel, so that the pipelines of the inputs run
-/// concurrently and an input that never produces anything does not hold back
-/// the others.
-fn order_matters(input: &Arc<dyn ExecutionPlan>) -> bool {
-    let mut plan = input;
-    loop {
-        // A sorted output has a deterministic order.
-        if plan.output_ordering().is_some() {
-            return true;
-        }
-        if merges_in_arrival_order(plan) {
-            return false;
-        }
-        match plan.children().as_slice() {
-            [child] if plan.maintains_input_order().first() == Some(&true) => {
-                plan = child;
-            }
-            _ => return true,
-        }
+/// the pipelines of the inputs of a union in its pipelines one after the
+/// other. That is how DataFusion reads a single partition with a
+/// deterministic order too, but it reads the inputs of a merge concurrently:
+/// a limit over a merge in arrival order is parallel, so that the pipelines of
+/// the inputs run concurrently and an input that never produces anything does
+/// not hold back the others.
+fn order_matters(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.output_ordering().is_some() {
+        return true;
     }
+    if merges_in_arrival_order(plan) {
+        return false;
+    }
+    let children = plan.children();
+    if children.is_empty() {
+        return true;
+    }
+    let maintained = plan.maintains_input_order();
+    let mut ordered_by = children
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, child)| {
+            maintained.get(i) == Some(&true)
+                || (plan.is::<CoalescePartitionsExec>()
+                    && child.output_partitioning().partition_count() <= 1)
+        })
+        .map(|(_, child)| child)
+        .peekable();
+    ordered_by.peek().is_some() && ordered_by.all(order_matters)
 }
 
 /// Whether `plan` merges several partitions, of one input or of several
@@ -385,11 +401,17 @@ impl PhysicalOperator for PhysicalLimit {
 mod tests {
     use super::*;
 
+    use arrow::array::RecordBatch;
     use arrow::compute::concat_batches;
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use datafusion_common::{JoinType, NullEquality};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::joins::{
+        HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    };
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use datafusion_physical_plan::{
@@ -695,6 +717,24 @@ mod tests {
         )
     }
 
+    /// An `InterleaveExec` with a single partition of two scans of `v` values.
+    fn interleaved_values() -> Result<Arc<dyn ExecutionPlan>> {
+        let by_v = |values: std::ops::Range<i64>| -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = values_chunk(values).into_record_batch()?;
+            let scan =
+                MemorySourceConfig::try_new_exec(&[vec![batch]], values_schema(), None)?;
+            let v = col("v", &scan.schema())?;
+            Ok(Arc::new(RepartitionExec::try_new(
+                scan,
+                Partitioning::Hash(vec![v], 1),
+            )?))
+        };
+        Ok(Arc::new(InterleaveExec::try_new(vec![
+            by_v(0..3)?,
+            by_v(10..13)?,
+        ])?))
+    }
+
     /// Lower `plan` with [`PhysicalLimit::try_lower`], bridging its input.
     fn try_lower(plan: Arc<dyn ExecutionPlan>) -> Result<Option<PhysicalLimit>> {
         PhysicalLimit::try_lower(&plan, |input| {
@@ -792,6 +832,63 @@ mod tests {
                 CoalescePartitionsExec::new(t1_scan(true)?).with_fetch(Some(9))
             ))?,
             (0, Some(9), true)
+        );
+
+        // Through a join, the order of the inputs whose order it keeps: the
+        // probe side of a hash join. A nested loop join keeps none.
+        let keyed = |name: &str, partitions: usize| -> Result<Arc<dyn ExecutionPlan>> {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let batch = |p: i64| {
+                vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(arrow::array::Int64Array::from(vec![p, p + 1]))],
+                    )
+                    .unwrap(),
+                ]
+            };
+            let partitions = (0..partitions as i64).map(batch).collect::<Vec<_>>();
+            Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+        };
+        let hash_join =
+            |probe: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let build: Arc<dyn ExecutionPlan> =
+                    Arc::new(CoalescePartitionsExec::new(keyed("k", 3)?));
+                let on = vec![(col("k", &build.schema())?, col("v", &probe.schema())?)];
+                Ok(Arc::new(HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?))
+            };
+        let limited = |join| -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(GlobalLimitExec::new(join, 1, Some(2))))
+        };
+        assert_eq!(
+            lowered(limited(hash_join(keyed("v", 1)?)?)?)?,
+            (1, Some(2), true)
+        );
+        assert_eq!(
+            lowered(limited(hash_join(interleaved_values()?)?)?)?,
+            (1, Some(2), false)
+        );
+        let nested_loop = NestedLoopJoinExec::try_new(
+            Arc::new(CoalescePartitionsExec::new(keyed("k", 3)?)),
+            keyed("v", 1)?,
+            None,
+            &JoinType::Inner,
+            None,
+        )?;
+        assert_eq!(
+            lowered(limited(Arc::new(nested_loop))?)?,
+            (1, Some(2), false)
         );
 
         // A limit per partition is not a limit of all partitions...
@@ -1057,7 +1154,8 @@ mod tests {
     async fn limit_over_a_merge_of_inputs_does_not_wait_for_idle_inputs() -> Result<()> {
         // A limit of one row over an `InterleaveExec` with a single partition,
         // whose first input never produces anything: DataFusion interleaves
-        // the inputs and returns the row of the second one.
+        // the inputs and returns the row of the second one. Also through a
+        // `CoalescePartitionsExec`, which passes a single partition through.
         let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
             let by_v = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
                 let v = col("v", &input.schema())?;
@@ -1072,17 +1170,32 @@ mod tests {
             ])?))
         };
         type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
-        let limits: [Limit; 3] = [
+        let limits: [Limit; 5] = [
             |input| Arc::new(GlobalLimitExec::new(input, 0, Some(1))),
             |input| Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1))),
             |input| Arc::new(LocalLimitExec::new(input, 1)),
+            |input| {
+                let merged = Arc::new(CoalescePartitionsExec::new(input));
+                Arc::new(GlobalLimitExec::new(merged, 0, Some(1)))
+            },
+            |input| {
+                let merged = CoalescePartitionsExec::new(input).with_fetch(Some(5));
+                Arc::new(GlobalLimitExec::new(Arc::new(merged), 0, Some(1)))
+            },
         ];
+        /// Whether all limits in the tree below `operator` are parallel.
+        fn parallel(operator: &Arc<dyn PhysicalOperator>) -> bool {
+            operator
+                .downcast_ref::<PhysicalLimit>()
+                .is_none_or(|limit| !limit.preserve_order())
+                && operator.children().iter().all(parallel)
+        }
         for limit in limits {
             let make = || Ok(limit(interleave()?));
             let root = assert_native_plan_byte_eq(make, false).await;
-            let lowered = root.downcast_ref::<PhysicalLimit>().expect("a limit");
-            // The inputs of the union below the limit run concurrently.
-            assert!(!lowered.preserve_order());
+            assert!(root.is::<PhysicalLimit>());
+            // The inputs of the union below the limits run concurrently.
+            assert!(parallel(&root));
             assert_eq!(count::<PhysicalUnion>(&root), 1);
         }
         Ok(())
