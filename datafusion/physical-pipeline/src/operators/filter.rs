@@ -2616,6 +2616,9 @@ mod tests {
         assert_all_native_byte_eq(&[
             "SELECT * FROM vd WHERE d32 = 'k3'",
             "SELECT i, d8, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
+            // Patterns that compile cannot fail, after other conjuncts too.
+            "SELECT i, sv FROM vd WHERE i % 3 = 0 AND sv LIKE '%7%'",
+            "SELECT i, sv FROM vd WHERE i % 2 = 0 AND (sv ILIKE 'A%' OR sv ~ '7$')",
             "SELECT i, d32 FROM vd WHERE d32 IN ('k1', 'k2', 'k39') OR d8 IS NULL",
             "SELECT i, sv FROM vd WHERE sv > 'short4' AND i % 3 = 0",
             "SELECT * FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",

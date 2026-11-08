@@ -384,7 +384,7 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
             Divide | Modulo if is_safe_division(binary, schema) => Infallible,
             LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch | RegexMatch
             | RegexIMatch | RegexNotMatch | RegexNotIMatch
-                if binary.right().is::<Literal>() =>
+                if is_constant(binary.right()) =>
             {
                 constant_pattern_fallibility(expr, schema)
             }
@@ -392,7 +392,7 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         };
     }
     if let Some(like) = expr.downcast_ref::<LikeExpr>() {
-        return if like.pattern().is::<Literal>() {
+        return if is_constant(like.pattern()) {
             constant_pattern_fallibility(expr, schema)
         } else {
             PerRow
@@ -460,6 +460,15 @@ fn constant_pattern_fallibility(
     } else {
         Fallibility::Infallible
     }
+}
+
+/// Whether `expr` is a constant: a literal, possibly cast (DataFusion casts
+/// a pattern into the type of the strings it matches, e.g. `Utf8View`).
+fn is_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.is::<Literal>()
+        || expr
+            .downcast_ref::<CastExpr>()
+            .is_some_and(|cast| is_constant(cast.expr()))
 }
 
 /// Whether evaluating `expr` on an empty batch of `schema` fails.
@@ -630,6 +639,7 @@ mod tests {
                 DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
                 true,
             ),
+            Field::new("u", DataType::Utf8View, true),
         ]))
     }
 
@@ -738,6 +748,12 @@ mod tests {
             ("s !~* 'a+b'", Infallible),
             ("s ~ 'a{1000000}'", Uniform),
             ("s ~ 'a+' AND s LIKE 'a%' OR s ~ 'a{1000000}'", Uniform),
+            // The pattern is cast into the type of the strings.
+            ("u LIKE '%x%'", Infallible),
+            ("u ILIKE '%x_'", Infallible),
+            ("u ~ 'a+'", Infallible),
+            ("u ~ 'a{1000000}'", Uniform),
+            ("u LIKE u", PerRow),
             ("s LIKE s", PerRow),
             ("CAST(s AS INT) > 1", PerRow),
             // Unpacking a dictionary cannot fail, nor packing a constant.
@@ -839,6 +855,8 @@ mod tests {
             ("a > 0 AND s LIKE 'x%'", false),
             ("a = 1 OR s LIKE 'x%'", false),
             ("a = 0 OR (b = 0 OR s ~ 'a+')", false),
+            ("a > 0 AND u LIKE '%x%'", false),
+            ("a > 0 AND u ~ 'a{1000000}'", true),
             ("a > 0 AND b % 3 = 0 AND b + 1 > 0", false),
             // `CASE` evaluates its branches on the rows they are for.
             ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
