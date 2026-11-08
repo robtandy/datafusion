@@ -18,14 +18,15 @@
 //! The schema of the union is the schema of `UnionExec`: the field names of
 //! the first input, a field is nullable if it is nullable in any input, and
 //! the field and schema metadata of all inputs are merged. The chunks of an
-//! input whose fields differ from the fields of the union (in their names,
-//! nullability or metadata: the data types must be equal) are relabeled with
-//! the fields of the union by a `UnionCoercion` operator, like the
-//! `ProjectionExec` that `UnionExec` puts above such an input: it casts the
-//! columns whose field differs, which, as the data types are equal, does not
-//! copy any data. Like that projection, it keeps the schema metadata of the
-//! input: the batches of DataFusion's union carry the schema metadata of the
-//! input they come from, not the merged schema metadata of the union.
+//! input whose schema differs from the schema of the union (in the names,
+//! nullability or metadata of its fields, or in its schema metadata: the
+//! data types must be equal) are relabeled with the fields of the union by a
+//! `UnionCoercion` operator, like the `ProjectionExec` that `UnionExec` puts
+//! above such an input: it casts the columns whose field differs, which, as
+//! the data types are equal, does not copy any data. Like that projection,
+//! it keeps the schema metadata of the input: the batches of DataFusion's
+//! union carry the schema metadata of the input they come from, not the
+//! merged schema metadata of the union.
 
 use std::sync::Arc;
 
@@ -48,7 +49,7 @@ use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 /// See the [module documentation](self) for its pipelines and schema.
 #[derive(Debug)]
 pub struct PhysicalUnion {
-    /// The inputs. An input whose fields are not the fields of the union is
+    /// The inputs. An input whose schema is not the schema of the union is
     /// wrapped in a `UnionCoercion`.
     children: Vec<Arc<dyn PhysicalOperator>>,
     schema: SchemaRef,
@@ -220,20 +221,21 @@ fn check_field_count(index: usize, schema: &Schema, expected: usize) -> Result<(
 }
 
 /// `input`, the input at `index` of a union with schema `schema`, wrapped in
-/// a [`UnionCoercion`] if its fields are not the fields of `schema`.
+/// a [`UnionCoercion`] if its schema is not `schema`.
 ///
-/// Like `UnionExec`, an input whose schema differs only in its metadata is
-/// not changed: DataFusion's union passes the batches of its inputs through,
-/// and the projection that coerces the fields of an input (`coerce_schema` in
-/// `datafusion_physical_plan::union`) keeps the schema metadata of the input
-/// too.
+/// Like `UnionExec` (`coerce_schema` in `datafusion_physical_plan::union`),
+/// that includes an input whose schema differs only in its metadata. The
+/// projection that coerces such an input relabels its batches with the fields
+/// of the union and the schema metadata of the input: no change for batches
+/// that have the schema of their input, but one for those that do not, like
+/// the batches of placeholder rows.
 fn coerce_input(
     index: usize,
     input: Arc<dyn PhysicalOperator>,
     schema: &SchemaRef,
 ) -> Result<Arc<dyn PhysicalOperator>> {
     let input_schema = input.schema();
-    if input_schema.fields() == schema.fields() {
+    if &input_schema == schema {
         return Ok(input);
     }
     check_field_count(index, &input_schema, schema.fields().len())?;
@@ -268,9 +270,9 @@ fn coerce_input(
     }))
 }
 
-/// Relabels the chunks of a union input with the fields of the union: same
-/// columns (and selection), but the field names, nullability and metadata of
-/// the union.
+/// Relabels the chunks of a union input with the fields of the union and the
+/// schema metadata of the input: same columns (and selection), but the field
+/// names, nullability and metadata of the union.
 ///
 /// Like the projection that `UnionExec` puts above such an input, it casts
 /// the columns whose field differs from the field of the union to the type of
@@ -278,7 +280,8 @@ fn coerce_input(
 /// the data types of the input and of the union are equal, casting only
 /// relabels a column without copying it, unless the column does not have the
 /// type the schema of its input declares, as the `Null` columns of
-/// placeholder rows.
+/// placeholder rows. A column passed through must have the type of the union,
+/// as in the batches of that projection.
 #[derive(Debug)]
 struct UnionCoercion {
     children: Vec<Arc<dyn PhysicalOperator>>,
@@ -309,8 +312,14 @@ impl PhysicalOperator for UnionCoercion {
         _gstate: &dyn GlobalOperatorState,
         _lstate: &mut dyn OperatorState,
     ) -> Result<OperatorResult> {
-        // The fields of a coerced input differ, so it has columns, and
-        // `input` is not empty.
+        if self.schema.fields().is_empty() {
+            *output = DataChunk::try_new_without_columns(
+                Arc::clone(&self.schema),
+                input.len(),
+            )?;
+            return Ok(OperatorResult::NeedMoreInput);
+        }
+        // `input` is not empty, so it has columns.
         let columns = input
             .columns()
             .iter()
@@ -933,6 +942,7 @@ mod tests {
 
     use arrow::array::{Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field};
+    use datafusion_common::DataFusionError;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_plan::empty::EmptyExec;
@@ -1052,15 +1062,13 @@ mod tests {
                 indices.iter().map(|&i| empty_source(&schemas[i])).collect(),
             )?;
             assert_eq!(union.schema(), expected, "inputs {indices:?}");
-            // The inputs whose fields differ are relabeled; like DataFusion,
-            // all inputs keep their schema metadata.
+            // The inputs whose schema differs are relabeled (as by
+            // `UnionExec`); like DataFusion, all inputs keep their schema
+            // metadata.
             for (&i, child) in indices.iter().zip(union.children()) {
                 assert_eq!(child.schema().fields(), expected.fields());
                 assert_eq!(child.schema().metadata(), schemas[i].metadata());
-                assert_eq!(
-                    child.is::<UnionCoercion>(),
-                    schemas[i].fields() != expected.fields()
-                );
+                assert_eq!(child.is::<UnionCoercion>(), schemas[i] != expected);
             }
         }
         Ok(())
@@ -1128,6 +1136,56 @@ mod tests {
         actual.sort_by_key(by_schema);
         assert_eq!(actual, expected);
         assert_eq!(actual[0].schema(), schema("a"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_coerces_inputs_whose_schema_metadata_differs_like_union_exec()
+    -> Result<()> {
+        // `UnionExec` coerces an input whose schema differs from the schema of
+        // the union in its metadata only, too: its projection relabels the
+        // batches with the fields of the union and the schema metadata of the
+        // input. That changes the batches of placeholder rows, whose columns
+        // are `placeholder_{i}: Null`.
+        let schema = |data_type: &DataType, tag: &str| {
+            Arc::new(
+                Schema::new(vec![Field::new("v", data_type.clone(), true)])
+                    .with_metadata(metadata(&[("tag", tag)])),
+            )
+        };
+        let outcomes = async |data_type: DataType| {
+            let (left, right) = (schema(&data_type, "left"), schema(&data_type, "right"));
+            let expected = UnionExec::try_new(vec![
+                Arc::new(PlaceholderRowExec::new(Arc::clone(&left))),
+                Arc::new(PlaceholderRowExec::new(Arc::clone(&right))),
+            ])?;
+            let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+            let expected = datafusion_physical_plan::collect(expected, task_ctx).await;
+            let union = PhysicalUnion::try_new(vec![
+                Arc::new(PhysicalPlaceholderRow::new(left)),
+                Arc::new(PhysicalPlaceholderRow::new(right)),
+            ])?;
+            let actual = run(Arc::new(union), 4).await;
+            Ok::<_, DataFusionError>((expected, actual))
+        };
+
+        // The batches of both inputs, which have different schemas.
+        let (expected, actual) = outcomes(DataType::Null).await?;
+        let (mut expected, mut actual) = (expected?, actual?);
+        let by_schema = |batch: &RecordBatch| format!("{:?}", batch.schema());
+        expected.sort_by_key(by_schema);
+        actual.sort_by_key(by_schema);
+        assert_eq!(actual, expected);
+        assert!(
+            actual
+                .iter()
+                .any(|batch| batch.schema() == schema(&DataType::Null, "left"))
+        );
+
+        // Relabeled as `Int32`, the `Null` column does not match the schema.
+        let (expected, actual) = outcomes(DataType::Int32).await?;
+        assert!(expected.is_err());
+        assert!(actual.is_err());
         Ok(())
     }
 
@@ -1209,7 +1267,8 @@ mod tests {
             rows(&empty, 3)?,
         ])?);
         assert_eq!(union.schema(), with_metadata);
-        assert!(union.children()[1].is::<TestSource>());
+        // The second input does not have the schema metadata of the union.
+        assert!(union.children()[1].is::<UnionCoercion>());
         let output = run(union, 4).await?;
         assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
         // Every chunk keeps the schema (metadata) of its input.
