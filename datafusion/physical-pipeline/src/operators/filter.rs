@@ -67,9 +67,9 @@
 //! only lowered if its predicate cannot fail at all (and not with a fetch of
 //! 0), and a `FilterExec` whose output has dictionaries with narrow keys,
 //! which it may fail to merge when it coalesces its output batches, is not
-//! lowered. A planner must also keep
-//! the filters whose predicate can fail in DataFusion below a limit that
-//! stops the execution early, see [`PhysicalFilter::supports_filter_exec`].
+//! lowered. A planner must also keep the plans below a limit that stops the
+//! execution early in DataFusion, see
+//! [`PhysicalFilter::supports_filter_exec`].
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -175,11 +175,15 @@ impl PhysicalFilter {
     ///   pipelines skip empty chunks, so the native filter would pull more of
     ///   its input (whose errors it would raise).
     ///
-    /// The predicates of the filters below a limit that stops the execution
-    /// early (e.g. the input of a `GlobalLimitExec` or of a `FilterExec`
-    /// with a fetch) are evaluated on fewer rows when the limit is reached
-    /// for the same reason: a planner should only lower the filters whose
-    /// predicate cannot fail there.
+    /// A planner must also keep the plans below a limit that stops the
+    /// execution early (e.g. the input of a `GlobalLimitExec`, of a node with
+    /// a fetch, or of an aggregation with a soft limit, unless a sort, which
+    /// reads all of its input, is in between) in DataFusion, filters
+    /// included. DataFusion pulls its input lazily, batch by batch, but for
+    /// `FilterExec`, which pulls ahead to coalesce its output, so the rows that
+    /// are evaluated before the limit is reached, and so the errors, depend on
+    /// these pulls, which a pipeline (on several threads, with a cache of
+    /// small chunks) does not reproduce.
     pub fn supports_filter_exec(exec: &FilterExec) -> bool {
         unsupported_filter_exec(exec).is_none()
     }
@@ -924,7 +928,7 @@ pub(crate) mod test_support {
         ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
         OperatorState, PhysicalOperator,
     };
-    use crate::operators::adaptive_filter::{depends_on_batches, is_infallible};
+    use crate::operators::adaptive_filter::depends_on_batches;
     use crate::operators::caching::CachingOperator;
     use crate::operators::projection::PhysicalProjection;
     use crate::test_utils::{
@@ -939,9 +943,10 @@ pub(crate) mod test_support {
     /// * `FilterExec` becomes `CachingOperator(PhysicalFilter)` and
     ///   `ProjectionExec` becomes `PhysicalProjection`, if supported (see
     ///   [`PhysicalFilter::supports_filter_exec`] and
-    ///   [`PhysicalProjection::supports_projection_exec`]) and, below a limit
-    ///   that stops the execution early, only if their expressions cannot
-    ///   fail.
+    ///   [`PhysicalProjection::supports_projection_exec`]).
+    /// * Below a limit that stops the execution early (unless a sort, which
+    ///   reads all of its input, is in between), the whole plan is executed
+    ///   by DataFusion.
     /// * A `FilterExec` or a `ProjectionExec` that is not lowered, and a node
     ///   whose expressions may fail depending on DataFusion's batches, are
     ///   executed by DataFusion with their whole input plan, so that they see
@@ -965,12 +970,18 @@ pub(crate) mod test_support {
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
     ) -> Result<Arc<dyn PhysicalOperator>> {
+        if limited && !plan.is::<SortExec>() {
+            // DataFusion pulls the input of a limit lazily, batch by batch,
+            // but for `FilterExec`, which pulls ahead to coalesce its output:
+            // the rows evaluated before the limit is reached, and so the
+            // errors, depend on these pulls, which a pipeline (on several
+            // threads, with a cache of small chunks) does not reproduce. A
+            // sort reads all of its input.
+            return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
+        }
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-            let fallible =
-                !is_infallible(filter.predicate(), filter.input().schema().as_ref());
-            if PhysicalFilter::supports_filter_exec(filter) && !(limited && fallible) {
-                let input =
-                    lower_below(filter.input(), limited || filter.fetch().is_some())?;
+            if PhysicalFilter::supports_filter_exec(filter) {
+                let input = lower_below(filter.input(), filter.fetch().is_some())?;
                 let filter: Arc<dyn PhysicalOperator> =
                     Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
                 return Ok(Arc::new(CachingOperator::new(filter)));
@@ -978,15 +989,8 @@ pub(crate) mod test_support {
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-            let input_schema = projection.input().schema();
-            let fallible = projection
-                .expr()
-                .iter()
-                .any(|expr| !is_infallible(&expr.expr, input_schema.as_ref()));
-            if PhysicalProjection::supports_projection_exec(projection)
-                && !(limited && fallible)
-            {
-                let input = lower_below(projection.input(), limited)?;
+            if PhysicalProjection::supports_projection_exec(projection) {
+                let input = lower_below(projection.input(), false)?;
                 return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
                     projection, input,
                 )?));
@@ -2929,11 +2933,22 @@ mod tests {
             "SELECT id, h FROM t1 WHERE h LIKE '%1%' ORDER BY h DESC, id LIMIT 20",
             "SELECT * FROM (SELECT * FROM t1 ORDER BY id LIMIT 100) WHERE a > 0",
             "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2 WHERE k < 0",
-            "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0 LIMIT 7",
             "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1 WHERE a > 0",
             "SELECT d, MAX(h) FROM t1 WHERE id % 3 = 0 GROUP BY d HAVING COUNT(*) > 100",
         ])
         .await;
+        // The limit is pushed into the filter (`fetch = 7`), which is lowered:
+        // with a fetch, it runs on one thread, and pulls its input like
+        // `FilterExec`. Below it, the merge of the sorted partitions, which
+        // stops early, stays in DataFusion with its input (see
+        // `plans_below_limits_stay_in_datafusion`).
+        let sql = "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0 LIMIT 7";
+        let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
+        assert_eq!(
+            (run.operators.filters, run.operators.scans),
+            (1, 0),
+            "{sql}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2944,7 +2959,7 @@ mod tests {
                 "SELECT id, a, h FROM t1 WHERE a > 10 AND d <> 'beta'",
                 "SELECT id FROM t1 WHERE id % 1000 = 7",
                 "SELECT id, a FROM t1 WHERE a > 0 ORDER BY id",
-                "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0 LIMIT 7",
+                "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0",
                 "SELECT id, s FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
             ] {
                 let run =
@@ -3584,6 +3599,57 @@ mod tests {
         assert!(drive(&filter_for("CAST(d AS INT) > 0", &schema), [chunk]).is_err());
     }
 
+    /// `GlobalLimitExec(1)` above `FilterExec(q >= 0)`, coalescing its output
+    /// into batches of `filter_batch_size` rows, above
+    /// `ProjectionExec(10 / x AS q)`, over a batch of `rows` ones and a batch
+    /// of `rows` zeros.
+    fn limited_filter(rows: usize, filter_batch_size: usize) -> Arc<dyn ExecutionPlan> {
+        let (ones, zeros) = (runs(&[(1, rows)]), runs(&[(0, rows)]));
+        let schema = ones.schema();
+        let projection = Arc::new(
+            datafusion_physical_plan::projection::ProjectionExec::try_new(
+                [datafusion_physical_expr::projection::ProjectionExpr::new(
+                    physical_expr("10 / x", &schema),
+                    "q",
+                )],
+                scan_batches(&schema, &[ones, zeros]),
+            )
+            .unwrap(),
+        );
+        let predicate = physical_expr("q >= 0", &projection.schema());
+        let filter = datafusion_physical_plan::filter::FilterExecBuilder::new(
+            predicate, projection,
+        )
+        .with_batch_size(filter_batch_size)
+        .build()
+        .unwrap();
+        Arc::new(datafusion_physical_plan::limit::GlobalLimitExec::new(
+            Arc::new(filter),
+            0,
+            Some(1),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plans_below_limits_stay_in_datafusion() {
+        // `FilterExec` pulls its input until it has a batch of its batch
+        // size, or its input ends: with batches of 8192 rows, it pulls the
+        // zeros, which the projection divides by, before the limit is reached.
+        // A native filter, which does not coalesce its output, reaches it with
+        // the ones.
+        let (error, operators) =
+            assert_native_plan_parity(|| limited_filter(2048, 8192), true).await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        assert_eq!((operators.filters, operators.projections), (0, 0));
+        // With batches of 32 rows, `FilterExec` returns the ones, and the limit
+        // is reached before it pulls the zeros. The native cache keeps the 32
+        // rows of a chunk, and pulls the zeros.
+        let (error, operators) =
+            assert_native_plan_parity(|| limited_filter(32, 32), true).await;
+        assert!(error.is_none());
+        assert_eq!((operators.filters, operators.projections), (0, 0));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fetch_zero_stays_in_datafusion() {
         // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
@@ -3711,13 +3777,13 @@ mod tests {
             assert!(error.unwrap().contains("Divide by zero"), "{expr}");
             assert_eq!(operators.filters + operators.projections, 0, "{expr}");
         }
-        // Infallible operators are lowered below the limit. (Which row comes
-        // first is not deterministic in a pipeline, so all rows are equal.)
+        // Infallible operators stay in DataFusion below the limit too, with
+        // their input (see `plans_below_limits_stay_in_datafusion`).
         for (expr, filter) in [("x + 1", false), ("x >= 0", true)] {
             let (error, operators) =
                 assert_native_plan_parity(|| limit(expr, filter, &ones), true).await;
             assert!(error.is_none(), "{expr}");
-            assert_eq!(operators.filters + operators.projections, 1, "{expr}");
+            assert_eq!(operators.filters + operators.projections, 0, "{expr}");
         }
     }
 

@@ -101,11 +101,11 @@ impl PhysicalProjection {
     /// into batches, empty ones included (see [`depends_on_batches`]).
     ///
     /// Below a limit that stops the execution early (e.g. a
-    /// `GlobalLimitExec`), the expressions are evaluated on fewer rows when
-    /// the limit is reached than in DataFusion, which evaluates whole
-    /// batches: a planner should only lower the projections whose
-    /// expressions cannot fail there (see
-    /// [`fallibility`](super::adaptive_filter::fallibility)).
+    /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion
+    /// (see
+    /// [`supports_filter_exec`](super::filter::PhysicalFilter::supports_filter_exec)):
+    /// the rows evaluated before the limit is reached, and so the errors,
+    /// depend on how the input is pulled.
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
         let input_schema = exec.input().schema();
         !exec
