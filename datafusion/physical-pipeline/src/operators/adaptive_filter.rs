@@ -462,6 +462,10 @@ fn constant_pattern_fallibility(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
 ) -> Fallibility {
+    if is_volatile(expr) {
+        // Never evaluated before the execution: it may count its calls.
+        return Fallibility::PerRow;
+    }
     if fails_without_rows(expr, schema) {
         return Fallibility::Uniform;
     }
@@ -588,6 +592,8 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 /// empty chunks, so they only lower expressions for which this is `false`.
 /// It is `true` if:
 ///
+/// * `expr` is volatile: it may observe how often it is evaluated, e.g. a
+///   function that counts its calls. It is never evaluated here either;
 /// * the right side of an `AND` or an `OR`, or a value after the first one
 ///   of an `IN` list, may fail on some rows and not on others
 ///   ([`Fallibility::PerRow`]). DataFusion evaluates the right side of an
@@ -615,6 +621,9 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if is_volatile(expr) {
+        return true;
+    }
     let (fallibility, depends_on_batches) = analyze(expr, schema);
     depends_on_batches
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))

@@ -887,9 +887,12 @@ pub(crate) mod test_support {
     use datafusion_common::{DFSchema, DataFusionError, Result};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
-    use datafusion_expr::ColumnarValue;
-    use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_expr::{
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility,
+    };
     use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
     use datafusion_physical_plan::aggregates::{AggregateExec, AggregateInputMode};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
@@ -1507,6 +1510,70 @@ pub(crate) mod test_support {
         fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "opaque({})", self.0.name())
         }
+    }
+
+    /// A volatile function that counts its calls: it returns the number of
+    /// times it was called, as a string, on all rows.
+    #[derive(Debug)]
+    pub(crate) struct CountCalls {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        signature: Signature,
+    }
+
+    impl PartialEq for CountCalls {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.calls, &other.calls)
+        }
+    }
+
+    impl Eq for CountCalls {}
+
+    impl std::hash::Hash for CountCalls {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.calls).hash(state);
+        }
+    }
+
+    impl ScalarUDFImpl for CountCalls {
+        fn name(&self) -> &str {
+            "count_calls"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let calls = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let values = std::iter::repeat_n(calls.to_string(), args.number_rows);
+            Ok(ColumnarValue::Array(Arc::new(
+                StringArray::from_iter_values(values),
+            )))
+        }
+    }
+
+    /// `count_calls()` (see [`CountCalls`]), counting in `calls`.
+    pub(crate) fn count_calls(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        let udf = ScalarUDF::new_from_impl(CountCalls {
+            calls: Arc::clone(calls),
+            signature: Signature::nullary(Volatility::Volatile),
+        });
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(udf),
+                vec![],
+                schema,
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
     }
 
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
@@ -3063,6 +3130,53 @@ mod tests {
             .await;
             assert!(error.is_none(), "{predicate}");
             assert_eq!(operators.filters, 1, "{predicate}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn volatile_predicates_are_not_evaluated_before_execution() {
+        use datafusion_physical_expr::expressions::{BinaryExpr, LikeExpr, lit};
+        // `count_calls()` returns how often it was called: DataFusion calls it
+        // once for the batch of 3 rows, and selects them all. Evaluating it
+        // before (on an empty batch, to find whether it fails without rows, or
+        // to compile the pattern of a `LIKE`) would change its results.
+        let batch = runs(&[(1, 3)]);
+        let schema = batch.schema();
+        /// A predicate of `count_calls()`.
+        type Predicate = fn(Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr>;
+        let predicates: [Predicate; 3] = [
+            |calls| {
+                Arc::new(BinaryExpr::new(
+                    calls,
+                    datafusion_expr::Operator::Eq,
+                    lit("1"),
+                ))
+            },
+            |calls| Arc::new(LikeExpr::new(false, false, calls, lit("1%"))),
+            |calls| Arc::new(LikeExpr::new(false, true, calls, lit("1"))),
+        ];
+        let filter = |predicate: Arc<dyn PhysicalExpr>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(FilterExec::try_new(predicate, scan(&batch)).unwrap())
+        };
+        for predicate in predicates {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let expr = predicate(count_calls(&calls, &schema));
+            let plan = filter(Arc::clone(&expr));
+            let exec = plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec), "{expr}");
+            assert!(depends_on_batches(&expr, &schema), "{expr}");
+            let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
+            AdaptiveFilter::try_new(&expr, &schema).unwrap();
+            lower(&plan).unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{expr}");
+
+            let (error, operators) = assert_native_plan_parity(
+                || filter(predicate(count_calls(&Arc::default(), &schema))),
+                false,
+            )
+            .await;
+            assert!(error.is_none(), "{expr}");
+            assert_eq!(operators.filters, 0, "{expr}");
         }
     }
 

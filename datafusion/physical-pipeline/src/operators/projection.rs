@@ -1137,6 +1137,36 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn volatile_expressions_are_not_evaluated_before_execution() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // `count_calls()` returns how often it was called: DataFusion calls it
+        // once for the batch of 3 rows. Evaluating it before (e.g. on an empty
+        // batch, to find whether it fails without rows) would change its
+        // results.
+        let batch = xys(&[((1, 1), 3)]);
+        let schema = batch.schema();
+        let plan = |calls: &Arc<AtomicUsize>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(count_calls(calls, &schema), "c")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let projection_plan = plan(&calls);
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        lower(&projection_plan).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (error, operators) =
+            assert_native_plan_parity(|| plan(&Arc::default()), false).await;
+        assert!(error.is_none());
+        assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that
