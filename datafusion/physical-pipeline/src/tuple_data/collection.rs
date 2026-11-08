@@ -19,26 +19,24 @@
 //! the blocks of another collection without copying or rewriting any row.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayDataBuilder, ArrayRef, AsArray, BooleanArray, GenericByteArray,
-    GenericByteViewArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt64Array,
-    make_array, make_view, new_null_array,
+    GenericByteViewArray, RecordBatch, RecordBatchOptions, make_array, make_view,
+    new_null_array,
 };
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::{cast_with_options, take};
+use arrow::compute::take;
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
     LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
 };
-use arrow_row::{RowConverter, Rows, SortField};
-use datafusion_common::hash_utils::RandomState;
+use arrow_row::Rows;
 use datafusion_common::{
     DataFusionError, Result, exec_datafusion_err, exec_err, internal_datafusion_err,
     internal_err, resources_datafusion_err,
@@ -46,7 +44,7 @@ use datafusion_common::{
 
 use super::layout::{
     ColumnLayout, ColumnStorage, HASH_WIDTH, MAX_INLINE_LEN, MAX_ROWS_PER_BLOCK,
-    TupleDataLayout, VAR_LEN_SLOT_WIDTH, strict_cast_options,
+    TupleDataLayout, VAR_LEN_SLOT_WIDTH, dictionary_encode,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
@@ -775,6 +773,8 @@ struct SourceColumn {
     values: ArrayRef,
     /// The logical nulls of `values`, `None` if all values are valid.
     nulls: Option<NullBuffer>,
+    /// The null keys of a dictionary column, `None` if all keys are valid.
+    key_nulls: Option<NullBuffer>,
     data: SourceData,
 }
 
@@ -807,10 +807,12 @@ impl ScatterSource {
 
 impl SourceColumn {
     fn try_new(column: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
-        let values = if column.is_dictionary() {
-            decode_dictionary(array)?
+        let (values, key_nulls) = if column.is_dictionary() {
+            // The nulls of a dictionary array are the nulls of its keys.
+            let key_nulls = array.nulls().filter(|n| n.null_count() > 0).cloned();
+            (decode_dictionary(array)?, key_nulls)
         } else {
-            Arc::clone(array)
+            (Arc::clone(array), None)
         };
         let nulls = values.logical_nulls().filter(|n| n.null_count() > 0);
         let data = match column.storage() {
@@ -834,6 +836,7 @@ impl SourceColumn {
         Ok(Self {
             values,
             nulls,
+            key_nulls,
             data,
         })
     }
@@ -925,6 +928,11 @@ fn scatter_rows(
         };
         if let Some(nulls) = &source.nulls {
             target.clear_validity(index, nulls, rows);
+        }
+        if let (Some(bit), Some(key_nulls)) =
+            (column.key_validity_bit(), &source.key_nulls)
+        {
+            target.clear_validity(bit, key_nulls, rows);
         }
         match &source.data {
             SourceData::Null => {}
@@ -1147,7 +1155,13 @@ pub(crate) fn gather_column(
     let values = gather_values(column, index, rows)?;
     match column.data_type() {
         DataType::Dictionary(key_type, _) => {
-            dictionary_encode(&values, key_type, column.data_type())
+            // The rows with a null key, the other rows can have valid keys of
+            // null values.
+            let key_nulls = match column.key_validity_bit() {
+                Some(bit) => gather_nulls(bit, rows),
+                None => values.logical_nulls(),
+            };
+            dictionary_encode(&values, key_nulls, key_type, column.data_type())
         }
         _ => Ok(values),
     }
@@ -1308,50 +1322,6 @@ fn gather_views<T: ByteViewType + ?Sized>(
         buffers,
         gather_nulls(index, rows),
     )?))
-}
-
-/// Dictionary encode `values` as an array of type `data_type`
-/// (`Dictionary(key_type, values.data_type())`): the dictionary holds the
-/// distinct values in order of first occurrence (distinct by their bits,
-/// so `-0.0` and `0.0` stay distinct), and null values have a null key.
-fn dictionary_encode(
-    values: &ArrayRef,
-    key_type: &DataType,
-    data_type: &DataType,
-) -> Result<ArrayRef> {
-    let nulls = values.logical_nulls().filter(|n| n.null_count() > 0);
-    let converter = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
-    let rows = converter.convert_columns(&[Arc::clone(values)])?;
-    let mut keys_of_rows =
-        HashMap::with_capacity_and_hasher(values.len(), RandomState::default());
-    let mut distinct = Vec::new();
-    let keys = (0..values.len())
-        .map(|i| {
-            if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
-                return 0;
-            }
-            *keys_of_rows.entry(rows.row(i)).or_insert_with(|| {
-                distinct.push(i as u32);
-                (distinct.len() - 1) as u64
-            })
-        })
-        .collect::<Vec<u64>>();
-    let dictionary = take(values.as_ref(), &UInt32Array::from(distinct), None)?;
-    let keys: ArrayRef = Arc::new(UInt64Array::new(ScalarBuffer::from(keys), nulls));
-    // Fails if the keys do not fit `key_type`.
-    let keys = cast_with_options(&keys, key_type, &strict_cast_options()).map_err(|e| {
-        exec_datafusion_err!(
-            "Cannot dictionary encode {} distinct values with keys of type {key_type}: {e}",
-            dictionary.len()
-        )
-    })?;
-    let data = keys
-        .to_data()
-        .into_builder()
-        .data_type(data_type.clone())
-        .child_data(vec![dictionary.to_data()])
-        .build()?;
-    Ok(make_array(data))
 }
 
 #[cfg(test)]
@@ -1967,7 +1937,6 @@ mod tests {
         let mut collection = collection_for(&batch, false);
         for column in collection.layout().columns() {
             assert_eq!(column.storage(), ColumnStorage::Encoded);
-            assert!(column.codec().unwrap().needs_cast());
         }
         let chunk = chunk_with_selection(&batch, (0..n as u32).rev().collect());
         let locations = collection.append_chunk(&chunk, None).unwrap();
@@ -2076,7 +2045,6 @@ mod tests {
         .unwrap();
 
         let mut collection = collection_for(&batch, false);
-        assert!(collection.layout().column(4).codec().unwrap().needs_cast());
         let chunk = chunk_with_selection(&batch, vec![7, 0, 3, 3, 5, 1, 2, 6, 4]);
         let locations = collection.append_chunk(&chunk, None).unwrap();
         // The exact schema, with the custom fields, is restored, also when no
@@ -2169,6 +2137,170 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_keys_of_null_values_are_restored() {
+        use arrow::array::{DictionaryArray, Int8Array};
+        use arrow::datatypes::Int8Type;
+
+        // Valid keys of a null value: the field is not nullable, as the
+        // dictionary has no null keys.
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![0, 1]),
+            Arc::new(StringArray::from(vec![Some("x"), None])),
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)])
+                .unwrap();
+        assert!(!batch.schema().field(0).is_nullable());
+        let mut collection = collection_for(&batch, false);
+        let locations = collection
+            .append_chunk(&DataChunk::from_record_batch(batch.clone()), None)
+            .unwrap();
+        let gathered = collection.gather(&locations).unwrap();
+        assert_identical(&gathered, &batch);
+        assert_eq!(gathered.column(0).to_data(), batch.column(0).to_data());
+        let mut state = TupleDataScanState::new();
+        let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+        assert_eq!(scanned.schema(), &batch.schema());
+        assert_identical(&scanned.into_record_batch().unwrap(), &batch);
+
+        // In a nullable field, null keys and valid keys of null values are
+        // both restored as they were.
+        let dictionary = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(1), None, Some(0), Some(2), None, Some(1)]),
+            Arc::new(StringArray::from(vec![Some("x"), None, Some("y")])),
+        )
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)])
+                .unwrap();
+        assert!(batch.schema().field(0).is_nullable());
+        let mut collection = collection_for(&batch, false);
+        let chunk = chunk_with_selection(&batch, vec![5, 4, 3, 2, 1, 0, 0]);
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        let gathered = collection.gather(&locations).unwrap();
+        let expected = chunk.compact().unwrap();
+        assert_identical(&gathered, &expected);
+        let keys = gathered
+            .column(0)
+            .as_any_dictionary()
+            .keys()
+            .nulls()
+            .cloned();
+        assert_eq!(
+            keys,
+            expected
+                .column(0)
+                .as_any_dictionary()
+                .keys()
+                .nulls()
+                .cloned()
+        );
+        assert_eq!(gathered.column(0).to_data(), expected.column(0).to_data());
+    }
+
+    #[test]
+    fn nested_dictionary_keys_of_null_values_are_restored() {
+        use arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int8Array, StructArray, UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, UnionFields};
+
+        // Dictionaries with valid keys of a null value in non-nullable
+        // fields, where Arrow allows them: in the values of run-end encoded
+        // arrays and in the children of unions (which do not check the
+        // nullability of their fields), and under null parents (structs and
+        // fixed size lists check the logical nulls of their children).
+        let dictionary = |keys: Vec<i8>| -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(keys),
+                    Arc::new(StringArray::from(vec![Some("x"), None, Some("y")])),
+                )
+                .unwrap(),
+            )
+        };
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let field = |name: &str| Field::new(name, dictionary_type.clone(), false);
+        let runs = ArrayDataBuilder::new(DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(field("values")),
+        ))
+        .len(5)
+        .add_child_data(Int32Array::from(vec![1, 3, 5]).to_data())
+        .add_child_data(dictionary(vec![1, 0, 1]).to_data())
+        .build()
+        .unwrap();
+        let unions: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                UnionFields::try_new(
+                    [0, 1],
+                    [field("d"), Field::new("i", DataType::Int32, true)],
+                )
+                .unwrap(),
+                vec![0, 0, 1, 0, 0].into(),
+                None,
+                vec![
+                    dictionary(vec![1, 0, 0, 2, 1]),
+                    Arc::new(Int32Array::from(vec![None, None, Some(3), None, None])),
+                ],
+            )
+            .unwrap(),
+        );
+        let structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![field("d")].into(),
+                vec![dictionary(vec![1, 0, 1, 2, 0])],
+                Some(NullBuffer::from(vec![false, true, false, true, true])),
+            )
+            .unwrap(),
+        );
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(field("item")),
+                2,
+                dictionary(vec![1, 1, 0, 2, 1, 0, 0, 0, 2, 1]),
+                Some(NullBuffer::from(vec![false, true, false, true, false])),
+            )
+            .unwrap(),
+        );
+        let batch = RecordBatch::try_from_iter(vec![
+            ("runs", make_array(runs)),
+            ("unions", unions),
+            ("structs", structs),
+            ("fixed", fixed),
+        ])
+        .unwrap();
+        let mut collection = collection_for(&batch, false);
+        let chunk = chunk_with_selection(&batch, vec![4, 3, 2, 1, 0, 2]);
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        let expected = chunk.compact().unwrap();
+        let gathered = collection.gather(&locations).unwrap();
+        assert_identical(&gathered, &expected);
+        // The dictionaries in non-nullable fields have no null keys.
+        let runs = gathered.column(0).to_data();
+        let unions = gathered.column(1).to_data();
+        let structs = gathered.column(2).to_data();
+        let fixed = gathered.column(3).to_data();
+        for dictionary in [
+            &runs.child_data()[1],
+            &unions.child_data()[0],
+            &structs.child_data()[0],
+            &fixed.child_data()[0],
+        ] {
+            assert!(matches!(dictionary.data_type(), DataType::Dictionary(..)));
+            assert_eq!(dictionary.null_count(), 0);
+        }
+        let mut state = TupleDataScanState::new().with_column_ids(vec![3, 0, 2, 1]);
+        let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+        assert_identical(
+            &scanned.into_record_batch().unwrap(),
+            &expected.project(&[3, 0, 2, 1]).unwrap(),
+        );
+    }
+
+    #[test]
     fn dictionaries_of_nested_values() {
         use arrow::array::{
             DictionaryArray, Int8Array, ListArray, StructArray, UnionArray,
@@ -2242,24 +2374,62 @@ mod tests {
     }
 
     #[test]
-    fn unions_of_dictionaries_are_not_supported() {
-        let union = DataType::Union(
-            arrow::datatypes::UnionFields::try_new(
-                [0],
-                [Field::new(
-                    "d",
-                    DataType::Dictionary(
-                        Box::new(DataType::Int8),
-                        Box::new(DataType::Utf8),
-                    ),
-                    true,
-                )],
+    fn unions_of_dictionaries() {
+        use arrow::array::{DictionaryArray, Int8Array, UnionArray};
+        use arrow::datatypes::{Int8Type, UnionFields};
+
+        // The row format decodes the dictionaries of the children of unions to
+        // their values but keeps the type of the union: the dictionaries are
+        // restored.
+        let dictionary: ArrayRef = Arc::new(
+            DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(vec![Some(0), None, Some(1), Some(1), Some(2)]),
+                Arc::new(StringArray::from(vec![Some("x"), None, Some("y")])),
             )
             .unwrap(),
-            arrow::datatypes::UnionMode::Sparse,
         );
-        let err = TupleDataLayout::try_new_from_types([union], false).unwrap_err();
-        assert!(err.to_string().contains("cannot be restored"), "{err}");
+        let fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("d", dictionary.data_type().clone(), true),
+                Field::new("i", DataType::Int32, true),
+            ],
+        )
+        .unwrap();
+        let ints: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(2),
+            None,
+            Some(3),
+        ]));
+        let type_ids = [0, 1, 0, 0, 1].into_iter().collect::<ScalarBuffer<i8>>();
+        let sparse = UnionArray::try_new(
+            fields.clone(),
+            type_ids.clone(),
+            None,
+            vec![Arc::clone(&dictionary), Arc::clone(&ints)],
+        )
+        .unwrap();
+        let dense = UnionArray::try_new(
+            fields,
+            type_ids,
+            Some(vec![0, 0, 1, 2, 1].into()),
+            vec![dictionary.slice(0, 3), ints.slice(0, 2)],
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("sparse", Arc::new(sparse) as ArrayRef),
+            ("dense", Arc::new(dense) as ArrayRef),
+        ])
+        .unwrap();
+        let mut collection = collection_for(&batch, false);
+        let chunk = chunk_with_selection(&batch, vec![4, 0, 3, 2, 1, 1]);
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        assert_identical(
+            &collection.gather(&locations).unwrap(),
+            &chunk.compact().unwrap(),
+        );
     }
 
     #[test]

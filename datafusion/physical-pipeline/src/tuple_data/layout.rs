@@ -15,10 +15,12 @@
 //! +----------------+----------+----------+-----+--------------+-----------------+
 //! ```
 //!
-//! * **validity**: `ceil(n / 8)` bytes with one bit per column (bit `i % 8`
-//!   of byte `i / 8`), set if the value of column `i` is valid (not null).
-//!   The validity of a column is the *logical* validity of its Arrow array
-//!   ([`Array::logical_nulls`](arrow::array::Array::logical_nulls)).
+//! * **validity**: one bit per column (bit `i % 8` of byte `i / 8`), set if
+//!   the value of column `i` is valid (not null). The validity of a column
+//!   is the *logical* validity of its Arrow array ([`Array::logical_nulls`]).
+//!   Every dictionary column has one more bit, after the bits of the
+//!   columns, set if its key is valid: a valid key can refer to a null value
+//!   (also in a non-nullable field), so that the keys are restored exactly.
 //! * **fixed-width columns** ([`ColumnStorage::Boolean`],
 //!   [`ColumnStorage::Fixed`]) are stored inline in their Arrow byte
 //!   representation (booleans as one byte, `0` or `1`). The bytes of null
@@ -40,14 +42,15 @@
 //!   ([`arrow_row`]) and the encoding is stored like a variable-length value
 //!   (also for null values, so that their exact encoding is preserved).
 //!   What the row format decoder does not preserve is restored when values
-//!   are gathered: nested dictionaries (decoded to their values) and the
-//!   child fields of run-end encoded arrays (decoded with Arrow's default
-//!   fields), so that the gathered arrays have exactly the original type.
-//!   Types for which this is not possible (e.g. unions of dictionaries) are
-//!   rejected by [`TupleDataLayout::try_new`].
+//!   are gathered, so that the gathered arrays have exactly the original
+//!   type: nested dictionaries (decoded to their values, dictionary encoded
+//!   again with valid keys of null values in non-nullable fields and null
+//!   keys otherwise) and the child fields of run-end encoded arrays
+//!   (decoded with Arrow's default fields).
 //! * **dictionary columns** are stored as their values: a
 //!   `Dictionary(K, V)` column uses the storage of `V`, and is dictionary
-//!   encoded again when it is gathered.
+//!   encoded again when it is gathered (with null keys exactly where the
+//!   keys were null).
 //! * the optional **hash** is a `u64` (little endian), e.g. the hash of the
 //!   join or group keys of the row, computed once when the row is inserted.
 //!
@@ -56,17 +59,21 @@
 //! [`PartitionedTupleData`](super::PartitionedTupleData) and by all threads
 //! of a sink.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayData, ArrayRef, make_array, new_null_array};
-use arrow::compute::{CastOptions, can_cast_types, cast_with_options};
-use arrow::datatypes::{
-    DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef, UnionFields,
+use arrow::array::{
+    Array, ArrayData, ArrayRef, UInt32Array, UInt64Array, make_array, new_null_array,
 };
+use arrow::buffer::{NullBuffer, ScalarBuffer};
+use arrow::compute::{CastOptions, cast_with_options, take};
+use arrow::datatypes::{DataType, Field, FieldRef, IntervalUnit, Schema, SchemaRef};
 use arrow_row::{RowConverter, RowParser, SortField};
 use datafusion_common::float_semantics::has_float_leaf;
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{
-    DataFusionError, Result, internal_datafusion_err, internal_err, not_impl_err,
+    DataFusionError, Result, exec_datafusion_err, internal_datafusion_err, internal_err,
+    not_impl_err,
 };
 
 /// The width in bytes of the slot of a variable-length (or row encoded)
@@ -137,6 +144,8 @@ pub struct ColumnLayout {
     storage: ColumnStorage,
     /// The byte offset of the value slot in the row.
     offset: usize,
+    /// The validity bit of the keys of a dictionary column.
+    key_validity_bit: Option<usize>,
     /// The row format codec of a [`ColumnStorage::Encoded`] column.
     codec: Option<RowCodec>,
 }
@@ -190,6 +199,7 @@ impl ColumnLayout {
             value_type,
             storage,
             offset,
+            key_validity_bit: None,
             codec,
         })
     }
@@ -225,6 +235,15 @@ impl ColumnLayout {
         self.storage.width()
     }
 
+    /// The index of the bit of the validity bytes of a row that is set if
+    /// the key of the value of a dictionary column is valid (`None` for
+    /// other columns): a dictionary can have valid keys of null values, also
+    /// in a non-nullable field, so the validity of the value does not tell
+    /// whether its key is null.
+    pub fn key_validity_bit(&self) -> Option<usize> {
+        self.key_validity_bit
+    }
+
     /// The row format codec of a [`ColumnStorage::Encoded`] column.
     pub(crate) fn codec(&self) -> Option<&RowCodec> {
         self.codec.as_ref()
@@ -239,10 +258,6 @@ pub(crate) struct RowCodec {
     pub(crate) parser: RowParser,
     /// The value type of the column.
     value_type: DataType,
-    /// The value type with dictionaries replaced by their values: the type
-    /// the row format decodes values to, up to the child fields of run-end
-    /// encoded arrays, for which the decoder uses Arrow's default fields.
-    decoded_type: DataType,
     /// Whether two values can be equal for DataFusion although their row
     /// encodings differ, so that they must be compared by their decoded
     /// values: the row format distinguishes `-0.0` and `+0.0`, and the nulls
@@ -258,20 +273,12 @@ impl RowCodec {
                 "TupleDataLayout does not support the data type {value_type}"
             );
         }
-        let decoded_type = without_dictionaries(value_type);
-        if &decoded_type != value_type && !can_cast_types(&decoded_type, value_type) {
-            return not_impl_err!(
-                "TupleDataLayout does not support the data type {value_type}: \
-                 its dictionaries cannot be restored from {decoded_type}"
-            );
-        }
         let converter = RowConverter::new(fields)?;
         let parser = converter.parser();
         let codec = Self {
             converter,
             parser,
             value_type: value_type.clone(),
-            decoded_type,
             compare_decoded: has_float_leaf(value_type) || has_union(value_type),
         };
         // Reject the types whose values cannot be restored exactly now
@@ -294,11 +301,6 @@ impl RowCodec {
         }
     }
 
-    /// Returns `true` if dictionaries must be restored after decoding.
-    pub(crate) fn needs_cast(&self) -> bool {
-        self.decoded_type != self.value_type
-    }
-
     /// Decode values encoded with [`Self::converter`] into an array of
     /// exactly the value type of the column.
     pub(crate) fn decode<'a>(
@@ -310,16 +312,11 @@ impl RowCodec {
             self.converter.convert_rows(rows)?.pop().ok_or_else(|| {
                 internal_datafusion_err!("RowConverter returned no column")
             })?;
-        // Restore the fields that the decoder replaced (the fields of
-        // run-end encoded arrays, also in the children of unions), then the
-        // dictionaries.
-        let values = with_data_type(values, &self.decoded_type)?;
-        if !self.needs_cast() {
+        let data = values.to_data();
+        if has_type(&data, &self.value_type) {
             return Ok(values);
         }
-        let values =
-            cast_with_options(&values, &self.value_type, &strict_cast_options())?;
-        with_data_type(values, &self.value_type)
+        Ok(make_array(restore(data, &self.value_type, true)?))
     }
 }
 
@@ -331,37 +328,23 @@ pub(crate) fn strict_cast_options() -> CastOptions<'static> {
     }
 }
 
-/// Give `array` (and its children) the data type `data_type` (and the types
-/// of its fields), which must have the same physical layout as the data type
-/// of `array` (see [`same_layout`]): only the names, nullability and
-/// metadata of nested fields may differ.
-///
-/// Also the children of an array that already has the type `data_type` are
-/// retyped if their types differ from the types of its fields, which the
-/// row format decoder produces for unions.
-fn with_data_type(array: ArrayRef, data_type: &DataType) -> Result<ArrayRef> {
-    let data = array.to_data();
-    if has_type(&data, data_type) {
-        return Ok(array);
+/// The data types of the children of an [`ArrayData`] of type `data_type`,
+/// and whether they are nullable.
+fn child_data_types(data_type: &DataType) -> Vec<(&DataType, bool)> {
+    fn field(field: &FieldRef) -> (&DataType, bool) {
+        (field.data_type(), field.is_nullable())
     }
-    Ok(make_array(retype(data, data_type)?))
-}
-
-/// The data types of the children of an [`ArrayData`] of type `data_type`.
-fn child_data_types(data_type: &DataType) -> Vec<&DataType> {
     match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => vec![field.data_type()],
-        DataType::Struct(fields) => fields.iter().map(|f| f.data_type()).collect(),
-        DataType::Union(fields, _) => fields.iter().map(|(_, f)| f.data_type()).collect(),
-        DataType::RunEndEncoded(run_ends, values) => {
-            vec![run_ends.data_type(), values.data_type()]
-        }
-        DataType::Dictionary(_, values) => vec![values.as_ref()],
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => vec![field(f)],
+        DataType::Struct(fields) => fields.iter().map(field).collect(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, f)| field(f)).collect(),
+        DataType::RunEndEncoded(run_ends, values) => vec![field(run_ends), field(values)],
+        DataType::Dictionary(_, values) => vec![(values.as_ref(), true)],
         _ => vec![],
     }
 }
@@ -374,30 +357,49 @@ fn has_type(data: &ArrayData, data_type: &DataType) -> bool {
             .child_data()
             .iter()
             .zip(child_data_types(data_type))
-            .all(|(child, data_type)| has_type(child, data_type))
+            .all(|(child, (data_type, _))| has_type(child, data_type))
 }
 
-/// [`with_data_type`] for [`ArrayData`].
-fn retype(data: ArrayData, data_type: &DataType) -> Result<ArrayData> {
-    if !same_layout(data.data_type(), data_type) {
-        return internal_err!(
-            "Cannot give an array of type {} the data type {data_type}",
-            data.data_type()
-        );
+/// Restore the data type `data_type` of values decoded by the row format
+/// (`data`), whose values are `nullable` if they are in a nullable field.
+///
+/// The row format decoder does not restore
+///
+/// * dictionaries, which it decodes to their values: they are dictionary
+///   encoded again (see [`dictionary_encode`]), with null keys for null
+///   values in nullable fields and valid keys of a null value otherwise;
+/// * the child fields of run-end encoded arrays, for which it uses Arrow's
+///   default fields;
+/// * the types of the children of unions, which keep their declared type.
+///
+/// Everything else (the physical layout and the buffers) is kept.
+fn restore(data: ArrayData, data_type: &DataType, nullable: bool) -> Result<ArrayData> {
+    if has_type(&data, data_type) {
+        return Ok(data);
+    }
+    if let DataType::Dictionary(key_type, value_type) = data_type {
+        let values = make_array(restore(data, value_type, true)?);
+        let key_nulls = if nullable {
+            values.logical_nulls().filter(|n| n.null_count() > 0)
+        } else {
+            None
+        };
+        return Ok(dictionary_encode(&values, key_nulls, key_type, data_type)?.to_data());
     }
     let child_types = child_data_types(data_type);
-    if child_types.len() != data.child_data().len() {
+    if !same_shape(data.data_type(), data_type)
+        || child_types.len() != data.child_data().len()
+    {
         return internal_err!(
-            "An array of type {data_type} must have {} children, got {}",
-            child_types.len(),
-            data.child_data().len()
+            "Cannot restore the data type {data_type} of an array of type {}",
+            data.data_type()
         );
     }
     let children = data
         .child_data()
         .iter()
         .zip(child_types)
-        .map(|(child, data_type)| retype(child.clone(), data_type))
+        .map(|(child, (data_type, nullable))| restore(child.clone(), data_type, nullable))
         .collect::<Result<Vec<_>>>()?;
     Ok(data
         .into_builder()
@@ -406,49 +408,73 @@ fn retype(data: ArrayData, data_type: &DataType) -> Result<ArrayData> {
         .build()?)
 }
 
-/// Whether arrays of types `a` and `b` have the same physical layout, i.e.
-/// the types are equal up to the names, nullability and metadata of nested
-/// fields.
-fn same_layout(a: &DataType, b: &DataType) -> bool {
+/// Whether arrays of types `a` and `b` have the same physical layout, not
+/// counting their children: the types are equal up to their children (and
+/// the names, nullability and metadata of their fields).
+fn same_shape(a: &DataType, b: &DataType) -> bool {
     match (a, b) {
-        (DataType::List(a), DataType::List(b))
-        | (DataType::LargeList(a), DataType::LargeList(b))
-        | (DataType::ListView(a), DataType::ListView(b))
-        | (DataType::LargeListView(a), DataType::LargeListView(b)) => {
-            same_layout(a.data_type(), b.data_type())
-        }
-        (DataType::FixedSizeList(a, a_size), DataType::FixedSizeList(b, b_size)) => {
-            a_size == b_size && same_layout(a.data_type(), b.data_type())
-        }
-        (DataType::Map(a, a_sorted), DataType::Map(b, b_sorted)) => {
-            a_sorted == b_sorted && same_layout(a.data_type(), b.data_type())
-        }
-        (DataType::Struct(a), DataType::Struct(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(a, b)| same_layout(a.data_type(), b.data_type()))
-        }
+        (DataType::List(_), DataType::List(_))
+        | (DataType::LargeList(_), DataType::LargeList(_))
+        | (DataType::ListView(_), DataType::ListView(_))
+        | (DataType::LargeListView(_), DataType::LargeListView(_)) => true,
+        (DataType::FixedSizeList(_, a), DataType::FixedSizeList(_, b)) => a == b,
+        (DataType::Map(_, a), DataType::Map(_, b)) => a == b,
+        (DataType::Struct(a), DataType::Struct(b)) => a.len() == b.len(),
         (DataType::Union(a, a_mode), DataType::Union(b, b_mode)) => {
-            a_mode == b_mode
-                && a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|((a_id, a), (b_id, b))| {
-                    a_id == b_id && same_layout(a.data_type(), b.data_type())
-                })
+            a_mode == b_mode && a.iter().map(|(id, _)| id).eq(b.iter().map(|(id, _)| id))
         }
-        (
-            DataType::RunEndEncoded(a_run_ends, a_values),
-            DataType::RunEndEncoded(b_run_ends, b_values),
-        ) => {
-            a_run_ends.data_type() == b_run_ends.data_type()
-                && same_layout(a_values.data_type(), b_values.data_type())
+        (DataType::RunEndEncoded(a, _), DataType::RunEndEncoded(b, _)) => {
+            a.data_type() == b.data_type()
         }
-        (
-            DataType::Dictionary(a_key, a_values),
-            DataType::Dictionary(b_key, b_values),
-        ) => a_key == b_key && same_layout(a_values, b_values),
         (a, b) => a == b,
     }
+}
+
+/// Dictionary encode `values` as an array of type `data_type`
+/// (`Dictionary(key_type, values.data_type())`): the dictionary holds the
+/// distinct values in order of first occurrence (distinct by their bits,
+/// so `-0.0` and `0.0` stay distinct), including null values that have a
+/// valid key, and the rows in `key_nulls` have a null key.
+pub(crate) fn dictionary_encode(
+    values: &ArrayRef,
+    key_nulls: Option<NullBuffer>,
+    key_type: &DataType,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    let key_nulls = key_nulls.filter(|n| n.null_count() > 0);
+    let converter = RowConverter::new(vec![SortField::new(values.data_type().clone())])?;
+    let rows = converter.convert_columns(&[Arc::clone(values)])?;
+    let mut keys_of_rows =
+        HashMap::with_capacity_and_hasher(values.len(), RandomState::default());
+    let mut distinct = Vec::new();
+    let keys = (0..values.len())
+        .map(|i| {
+            if key_nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+                return 0;
+            }
+            *keys_of_rows.entry(rows.row(i)).or_insert_with(|| {
+                distinct.push(i as u32);
+                (distinct.len() - 1) as u64
+            })
+        })
+        .collect::<Vec<u64>>();
+    let dictionary = take(values.as_ref(), &UInt32Array::from(distinct), None)?;
+    let keys: ArrayRef = Arc::new(UInt64Array::new(ScalarBuffer::from(keys), key_nulls));
+    // Fails if the keys do not fit `key_type`.
+    let keys =
+        cast_with_options(&keys, key_type, &strict_cast_options()).map_err(|e| {
+            exec_datafusion_err!(
+                "Cannot dictionary encode {} distinct values with keys of type {key_type}: {e}",
+                dictionary.len()
+            )
+        })?;
+    let data = keys
+        .to_data()
+        .into_builder()
+        .data_type(data_type.clone())
+        .child_data(vec![dictionary.to_data()])
+        .build()?;
+    Ok(make_array(data))
 }
 
 /// Whether `data_type` is a union or contains a union at any depth.
@@ -465,42 +491,6 @@ fn has_union(data_type: &DataType) -> bool {
         DataType::RunEndEncoded(_, values) => has_union(values.data_type()),
         DataType::Dictionary(_, values) => has_union(values),
         _ => false,
-    }
-}
-
-/// The data type the Arrow row format decodes values of `data_type` to:
-/// `data_type` with every dictionary replaced by its value type.
-fn without_dictionaries(data_type: &DataType) -> DataType {
-    let field = |field: &FieldRef| -> FieldRef {
-        Arc::new(
-            field
-                .as_ref()
-                .clone()
-                .with_data_type(without_dictionaries(field.data_type())),
-        )
-    };
-    match data_type {
-        DataType::Dictionary(_, value_type) => without_dictionaries(value_type),
-        DataType::List(f) => DataType::List(field(f)),
-        DataType::LargeList(f) => DataType::LargeList(field(f)),
-        DataType::ListView(f) => DataType::ListView(field(f)),
-        DataType::LargeListView(f) => DataType::LargeListView(field(f)),
-        DataType::FixedSizeList(f, size) => DataType::FixedSizeList(field(f), *size),
-        DataType::Map(f, sorted) => DataType::Map(field(f), *sorted),
-        DataType::Struct(fields) => {
-            DataType::Struct(fields.iter().map(field).collect::<Fields>())
-        }
-        DataType::Union(fields, mode) => DataType::Union(
-            fields
-                .iter()
-                .map(|(type_id, f)| (type_id, field(f)))
-                .collect::<UnionFields>(),
-            *mode,
-        ),
-        DataType::RunEndEncoded(run_ends, values) => {
-            DataType::RunEndEncoded(Arc::clone(run_ends), field(values))
-        }
-        data_type => data_type.clone(),
     }
 }
 
@@ -561,17 +551,29 @@ impl TupleDataLayout {
     /// [`Self::supports_data_type`].
     pub fn try_new(schema: SchemaRef, with_hash: bool) -> Result<Self> {
         let num_columns = schema.fields().len();
-        let validity_bytes = num_columns.div_ceil(8);
+        // One validity bit per column, and one more for the keys of every
+        // dictionary column.
+        let num_dictionaries = schema
+            .fields()
+            .iter()
+            .filter(|f| matches!(f.data_type(), DataType::Dictionary(..)))
+            .count();
+        let validity_bits = num_columns + num_dictionaries;
+        let validity_bytes = validity_bits.div_ceil(8);
         let mut all_valid = vec![0xFF_u8; validity_bytes];
-        if !num_columns.is_multiple_of(8)
+        if !validity_bits.is_multiple_of(8)
             && let Some(last) = all_valid.last_mut()
         {
-            *last = (1_u8 << (num_columns % 8)) - 1;
+            *last = (1_u8 << (validity_bits % 8)) - 1;
         }
         let mut row_width = validity_bytes;
         let mut columns = Vec::with_capacity(num_columns);
+        let mut key_validity_bits = num_columns..;
         for field in schema.fields() {
-            let column = ColumnLayout::try_new(field.data_type(), row_width)?;
+            let mut column = ColumnLayout::try_new(field.data_type(), row_width)?;
+            if column.is_dictionary() {
+                column.key_validity_bit = key_validity_bits.next();
+            }
             row_width = row_width.checked_add(column.width()).ok_or_else(|| {
                 internal_datafusion_err!("TupleDataLayout row width overflow")
             })?;
@@ -715,7 +717,7 @@ impl TupleDataLayout {
 mod tests {
     use super::*;
 
-    use arrow::datatypes::{TimeUnit, UnionMode};
+    use arrow::datatypes::{TimeUnit, UnionFields, UnionMode};
 
     fn layout(types: Vec<DataType>, with_hash: bool) -> TupleDataLayout {
         TupleDataLayout::try_new_from_types(types, with_hash).unwrap()
@@ -812,19 +814,25 @@ mod tests {
         assert_eq!(column.value_type(), &DataType::Float64);
         assert_eq!(column.storage(), ColumnStorage::Fixed(8));
         assert!(column.codec().is_none());
+        // The key validity bit follows the validity bits of the columns.
+        assert_eq!(column.key_validity_bit(), Some(3));
+        assert_eq!(layout.validity_bytes(), 1);
+        assert_eq!(layout.all_valid(), &[0b1111]);
+        let wide = TupleDataLayout::try_new_from_types(
+            (0..8).map(|_| dictionary.clone()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(wide.validity_bytes(), 2);
+        assert_eq!(wide.all_valid(), &[0xFF, 0xFF]);
+        assert_eq!(wide.column(7).key_validity_bit(), Some(15));
 
         let column = layout.column(1);
         assert_eq!(column.storage(), ColumnStorage::Encoded);
         let codec = column.codec().unwrap();
-        assert!(!codec.needs_cast());
         assert!(!codec.compare_decoded);
-
-        let codec = layout.column(2).codec().unwrap();
-        assert!(codec.needs_cast());
-        assert_eq!(
-            without_dictionaries(&list_of_dictionaries),
-            DataType::new_list(DataType::Utf8, true)
-        );
+        assert_eq!(column.key_validity_bit(), None);
+        assert_eq!(layout.column(2).value_type(), &list_of_dictionaries);
 
         let floats =
             DataType::Struct(vec![Field::new("f", DataType::Float32, true)].into());

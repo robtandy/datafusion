@@ -863,9 +863,35 @@ pub(crate) mod test_data {
             .unwrap()
     }
 
+    /// Whether `data_type` contains a dictionary below its top level.
+    fn has_nested_dictionary(data_type: &DataType) -> bool {
+        fn has_dictionary(data_type: &DataType) -> bool {
+            matches!(data_type, DataType::Dictionary(..))
+                || has_nested_dictionary(data_type)
+        }
+        match data_type {
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::ListView(f)
+            | DataType::LargeListView(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::Map(f, _) => has_dictionary(f.data_type()),
+            DataType::Struct(fields) => {
+                fields.iter().any(|f| has_dictionary(f.data_type()))
+            }
+            DataType::Union(fields, _) => {
+                fields.iter().any(|(_, f)| has_dictionary(f.data_type()))
+            }
+            DataType::RunEndEncoded(_, values) => has_dictionary(values.data_type()),
+            DataType::Dictionary(_, values) => has_dictionary(values),
+            _ => false,
+        }
+    }
+
     /// Assert that `actual` is identical to `expected`: same schema
-    /// (including metadata), same data types, logically equal arrays, and
-    /// byte-identical canonical Arrow IPC serializations.
+    /// (including metadata), same data types, valid and equal arrays
+    /// (logically equal for nested dictionaries), and byte-identical
+    /// canonical Arrow IPC serializations.
     pub(crate) fn assert_identical(actual: &RecordBatch, expected: &RecordBatch) {
         assert_eq!(actual.schema(), expected.schema(), "schemas differ");
         assert_eq!(actual.num_rows(), expected.num_rows(), "row counts differ");
@@ -880,21 +906,12 @@ pub(crate) mod test_data {
             let nulls =
                 |array: &ArrayRef| array.logical_nulls().filter(|n| n.null_count() > 0);
             assert!(nulls(a) == nulls(e), "nulls of {name} differ");
-            // Dictionaries are compared by their values: a valid key of a
-            // null value becomes a null key.
-            let decoded =
-                |array: &ArrayRef| match arrow::array::AsArray::as_any_dictionary_opt(
-                    array,
-                ) {
-                    Some(dictionary) => arrow::compute::take(
-                        dictionary.values().as_ref(),
-                        dictionary.keys(),
-                        None,
-                    )
-                    .unwrap(),
-                    None => Arc::clone(array),
-                };
-            let (a, e) = (&decoded(a), &decoded(e));
+            // The keys of nested dictionaries are not restored exactly (the
+            // row format decodes them to their values): their values are
+            // compared through the canonical form below.
+            if has_nested_dictionary(e.data_type()) {
+                continue;
+            }
             if a.to_data() != e.to_data() {
                 let options =
                     arrow::util::display::FormatOptions::default().with_null("NULL");
@@ -917,7 +934,10 @@ pub(crate) mod test_data {
         }
         // The canonical form normalizes the physical layout (e.g. the bytes
         // under null slots) through the row format, so it is only compared
-        // for the columns that the row format supports.
+        // for the columns that the row format supports. It decodes
+        // dictionaries, so its fields must be nullable: a non-nullable
+        // dictionary field can have null values (the schemas are compared
+        // above).
         let schema = expected.schema();
         let supported = (0..schema.fields().len())
             .filter(|&i| {
@@ -927,8 +947,24 @@ pub(crate) mod test_data {
             .collect::<Vec<_>>();
         let bytes = |batch: &RecordBatch, columns: &[usize]| {
             let batch = batch.project(columns).unwrap();
-            crate::test_utils::canonical_ipc_bytes(&batch.schema(), &[batch], true)
-                .unwrap()
+            let fields = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new_with_metadata(
+                fields,
+                batch.schema().metadata().clone(),
+            ));
+            let batch = RecordBatch::try_new_with_options(
+                Arc::clone(&schema),
+                batch.columns().to_vec(),
+                &arrow::array::RecordBatchOptions::new()
+                    .with_row_count(Some(batch.num_rows())),
+            )
+            .unwrap();
+            crate::test_utils::canonical_ipc_bytes(&schema, &[batch], true).unwrap()
         };
         if bytes(actual, &supported) != bytes(expected, &supported) {
             for &i in &supported {
