@@ -4,4 +4,1396 @@
 
 //! `PhysicalLimit`: `OFFSET` / `LIMIT` with early pipeline termination.
 //!
-//! Placeholder: implemented in Wave 2.
+//! [`PhysicalLimit`] skips the first `skip` rows of its input and emits at
+//! most `fetch` of the rows after them, like DataFusion's `GlobalLimitExec`
+//! (a `LocalLimitExec` over a single partition is a limit with `skip == 0`).
+//!
+//! It is a streaming operator, modelled after DuckDB's
+//! `PhysicalStreamingLimit`: no rows are buffered. Every input chunk claims
+//! the positions of its rows from a counter that is shared by all threads and
+//! all pipelines that contain the limit (the pipelines of the inputs of a
+//! `UNION ALL` below it). The operator emits the rows whose position is in
+//! `skip..skip + fetch`, slicing the chunks that straddle a boundary (with
+//! [`DataChunk::slice`], which does not copy), and returns
+//! [`OperatorResult::Finished`] as soon as all positions up to `skip + fetch`
+//! are claimed. That stops every thread of every pipeline that contains the
+//! limit, so the scans and joins below it stop early, and cancels the
+//! pipeline breakers whose output is then no longer needed.
+//!
+//! Which rows a limit returns depends on the order of its input:
+//!
+//! * If the order is arbitrary (e.g. DataFusion merges several partitions in
+//!   the order in which their batches arrive), the limit is a parallel
+//!   operator. The threads claim positions in the order in which they reach
+//!   the limit, so any `skip` rows are skipped and any `fetch` rows are
+//!   returned, exactly the freedom DataFusion's limit has.
+//! * If the order matters (e.g. the input is sorted), the limit is created
+//!   with [`PhysicalLimit::with_preserve_order`]. It is then not a parallel
+//!   operator, so the pipelines that contain it run on a single thread and,
+//!   for the inputs of an ordered union, one after the other: the positions
+//!   are the positions in the input order, and the limit returns exactly the
+//!   rows `skip..skip + fetch` of its input, in order. (DuckDB plans the same
+//!   non-parallel streaming limit when the source cannot restore the order
+//!   of parallel threads with batch indexes, which this engine does not
+//!   have.)
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use arrow::datatypes::SchemaRef;
+use datafusion_common::{Result, internal_err};
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+
+use crate::chunk::DataChunk;
+use crate::operator::{
+    ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
+    PhysicalOperator, downcast_state,
+};
+
+/// Skips the first `skip` rows of its input and emits at most `fetch` of the
+/// rows after them (all of them if `fetch` is `None`).
+///
+/// See the [module documentation](self) for how the rows are counted over
+/// all threads, and when the order of the input is preserved.
+#[derive(Debug)]
+pub struct PhysicalLimit {
+    /// The input, the only child.
+    children: Vec<Arc<dyn PhysicalOperator>>,
+    skip: usize,
+    fetch: Option<usize>,
+    preserve_order: bool,
+}
+
+impl PhysicalLimit {
+    /// Skip `skip` rows of `input`, then emit at most `fetch` rows.
+    ///
+    /// The limit is a parallel operator for an input whose order does not
+    /// matter, see [`Self::with_preserve_order`].
+    pub fn new(
+        input: Arc<dyn PhysicalOperator>,
+        skip: usize,
+        fetch: Option<usize>,
+    ) -> Self {
+        Self {
+            children: vec![input],
+            skip,
+            fetch,
+            preserve_order: false,
+        }
+    }
+
+    /// If `preserve_order` is `true`, the limit selects the rows by their
+    /// position in the order of its input: it is not a parallel operator, so
+    /// that the pipelines that contain it run on a single thread, which sees
+    /// the chunks of the input in order.
+    pub fn with_preserve_order(mut self, preserve_order: bool) -> Self {
+        self.preserve_order = preserve_order;
+        self
+    }
+
+    /// Lower a DataFusion limit node to a [`PhysicalLimit`]:
+    ///
+    /// * `GlobalLimitExec` (its `skip` and `fetch`);
+    /// * `LocalLimitExec` over a single partition (a limit of that
+    ///   partition). Over several partitions it limits every partition to
+    ///   `fetch` rows, which a limit of the whole input cannot do: it is not
+    ///   lowered (`Ok(None)`), unless the merge above it makes it redundant
+    ///   (see below);
+    /// * `CoalescePartitionsExec` with a `fetch`: the engine merges the
+    ///   partitions of its input anyway, what remains is the limit. If its
+    ///   input is a `LocalLimitExec` that keeps at least `fetch` rows of every
+    ///   partition, that limit does not restrict which rows the merge can
+    ///   return (at most `fetch` rows, which may all come from one
+    ///   partition), and the native limit replaces both.
+    ///
+    /// The order of the input is preserved (see [`Self::with_preserve_order`])
+    /// unless it is arbitrary in DataFusion too: the input merges several
+    /// partitions in the order in which their batches arrive.
+    ///
+    /// Nodes whose execution fails in DataFusion are not lowered either, so
+    /// that DataFusion executes them: a `GlobalLimitExec` whose input does not
+    /// have exactly one partition, a `CoalescePartitionsExec` whose input has
+    /// none, and a `LocalLimitExec` that advertises another number of
+    /// partitions than its input has (DataFusion executes some partitions of
+    /// its input only, or fails). Nor are limits of no rows (`fetch == 0`): DataFusion's merge
+    /// then ends without waiting for its input, and its limits end with the
+    /// first batch of their input, even an empty one, or once the skipped rows
+    /// are read, which a native limit, called with the non-empty chunks of its
+    /// input, cannot reproduce.
+    ///
+    /// `lower_input` lowers the input of the node. Returns `Ok(None)` for any
+    /// other node.
+    pub fn try_lower<F>(
+        plan: &Arc<dyn ExecutionPlan>,
+        mut lower_input: F,
+    ) -> Result<Option<Self>>
+    where
+        F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+    {
+        let (input, skip, fetch, preserve_order) =
+            if let Some(limit) = plan.downcast_ref::<GlobalLimitExec>() {
+                let input = limit.input();
+                if input.output_partitioning().partition_count() != 1 {
+                    return Ok(None);
+                }
+                (input, limit.skip(), limit.fetch(), order_matters(input))
+            } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
+                let input = limit.input();
+                if input.output_partitioning().partition_count() > 1
+                    || !advertises_its_input_partitions(plan)
+                {
+                    return Ok(None);
+                }
+                (input, 0, Some(limit.fetch()), order_matters(input))
+            } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
+                && let Some(fetch) = coalesce.fetch()
+            {
+                if coalesce.input().output_partitioning().partition_count() == 0 {
+                    return Ok(None);
+                }
+                let input = match coalesce.input().downcast_ref::<LocalLimitExec>() {
+                    Some(local)
+                        if local.fetch() >= fetch
+                            && advertises_its_input_partitions(coalesce.input()) =>
+                    {
+                        local.input()
+                    }
+                    _ => coalesce.input(),
+                };
+                let preserve_order = input.output_partitioning().partition_count() <= 1
+                    && order_matters(input);
+                (input, 0, Some(fetch), preserve_order)
+            } else {
+                return Ok(None);
+            };
+        if fetch == Some(0) {
+            return Ok(None);
+        }
+        let input = lower_input(input)?;
+        if input.schema() != plan.schema() {
+            return internal_err!(
+                "The lowered input {} of {} has schema {:?}, expected {:?}",
+                input.name(),
+                plan.name(),
+                input.schema(),
+                plan.schema()
+            );
+        }
+        Ok(Some(
+            Self::new(input, skip, fetch).with_preserve_order(preserve_order),
+        ))
+    }
+
+    /// The input of the limit.
+    pub fn input(&self) -> &Arc<dyn PhysicalOperator> {
+        &self.children[0]
+    }
+
+    /// The number of rows to skip.
+    pub fn skip(&self) -> usize {
+        self.skip
+    }
+
+    /// The maximum number of rows to emit after the skipped ones, `None` for
+    /// all of them.
+    pub fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    /// Whether the rows are selected by their position in the input order,
+    /// see [`Self::with_preserve_order`].
+    pub fn preserve_order(&self) -> bool {
+        self.preserve_order
+    }
+
+    /// The position after the last row to emit, `None` if all rows after the
+    /// skipped ones are emitted.
+    fn end(&self) -> Option<usize> {
+        self.fetch.map(|fetch| self.skip.saturating_add(fetch))
+    }
+}
+
+/// Whether `plan`, a `LocalLimitExec`, advertises the partitions of its input:
+/// DataFusion executes the partitions it advertises, so if its input was
+/// replaced without recomputing its properties
+/// (`ChildrenPropertiesMode::Keep`), it executes some partitions of its input
+/// only, or fails, unlike a limit of its whole input.
+fn advertises_its_input_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.children().first().is_some_and(|input| {
+        input.output_partitioning().partition_count()
+            == plan.output_partitioning().partition_count()
+    })
+}
+
+/// Whether the rows that a limit selects from `plan`, a plan with a single
+/// output partition, depend on its order, i.e. whether its order is
+/// deterministic and reproduced by the native operators that replace it:
+///
+/// * a sorted output has a deterministic order;
+/// * a merge of several partitions in the order in which their batches
+///   arrive (see [`merges_in_arrival_order`]) has an arbitrary order:
+///   DataFusion's result is arbitrary then;
+/// * a source has the order of its partition;
+/// * any other node has the order of the inputs whose order it keeps
+///   ([`ExecutionPlan::maintains_input_order`], e.g. the probe side of a hash
+///   join) or whose partition it passes through (see
+///   [`passes_partition_through`]), which must all be deterministic. A node
+///   that keeps the order of none of its inputs (e.g. an aggregation or a
+///   nested loop join) produces an order of its own, which the native
+///   operator replacing it does not reproduce: the order does not matter.
+///
+/// If the order matters, the limit must see its input in that order. That
+/// costs no parallelism compared to DataFusion, which executes the single
+/// partition on one thread too.
+///
+/// An order-preserving limit is not a parallel operator, so the executor runs
+/// the pipelines of the inputs of a union in its pipelines one after the
+/// other. That is how DataFusion reads a single partition with a
+/// deterministic order too, but it reads the inputs of a merge concurrently:
+/// a limit over a merge in arrival order is parallel, so that the pipelines of
+/// the inputs run concurrently and an input that never produces anything does
+/// not hold back the others.
+fn order_matters(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.output_ordering().is_some() {
+        return true;
+    }
+    if merges_in_arrival_order(plan) {
+        return false;
+    }
+    let children = plan.children();
+    if children.is_empty() {
+        return true;
+    }
+    let maintained = plan.maintains_input_order();
+    let mut ordered_by = children
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, child)| {
+            maintained.get(i) == Some(&true) || passes_partition_through(plan, child)
+        })
+        .map(|(_, child)| child)
+        .peekable();
+    ordered_by.peek().is_some() && ordered_by.all(order_matters)
+}
+
+/// Whether `plan`, a plan with a single output partition, passes a partition
+/// of its input `child` through as it is, without declaring that it keeps
+/// its order: a `CoalescePartitionsExec` of a single partition, a `UnionExec`
+/// (each of its partitions is a partition of one of its inputs, here of its
+/// only input with partitions), or an `InterleaveExec` of a single input
+/// (one of several inputs merges them, see [`merges_in_arrival_order`]).
+fn passes_partition_through(
+    plan: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+) -> bool {
+    let partitions = child.output_partitioning().partition_count();
+    (plan.is::<CoalescePartitionsExec>() && partitions <= 1)
+        || (plan.is::<UnionExec>() && partitions > 0)
+        || (plan.is::<InterleaveExec>() && plan.children().len() == 1)
+}
+
+/// Whether `plan` merges several partitions, of one input or of several
+/// inputs, into an output partition in the order in which their batches
+/// arrive: a `CoalescePartitionsExec`, or a `RepartitionExec` that does not
+/// preserve the order, with more input partitions than output partitions,
+/// or an `InterleaveExec` of several inputs.
+fn merges_in_arrival_order(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let input_partitions = plan
+        .children()
+        .iter()
+        .map(|child| child.output_partitioning().partition_count())
+        .sum::<usize>();
+    let merges_partitions =
+        input_partitions > plan.output_partitioning().partition_count();
+    if plan.is::<CoalescePartitionsExec>() {
+        merges_partitions
+    } else if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
+        merges_partitions && !repartition.preserve_order()
+    } else {
+        plan.is::<InterleaveExec>() && plan.children().len() > 1
+    }
+}
+
+/// The global operator state of a [`PhysicalLimit`], shared by all threads
+/// and pipelines.
+#[derive(Debug, Default)]
+struct LimitState {
+    /// The number of row positions claimed by the input chunks so far.
+    claimed: AtomicUsize,
+}
+
+impl GlobalOperatorState for LimitState {}
+
+impl PhysicalOperator for PhysicalLimit {
+    fn name(&self) -> &str {
+        "PhysicalLimit"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.input().schema()
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &self.children
+    }
+
+    fn description(&self) -> String {
+        let fetch = self
+            .fetch
+            .map_or_else(|| "None".to_string(), |fetch| fetch.to_string());
+        let mut description = format!("PhysicalLimit: skip={}, fetch={fetch}", self.skip);
+        if self.preserve_order {
+            description.push_str(", preserve_order=true");
+        }
+        description
+    }
+
+    fn parallel_operator(&self) -> bool {
+        !self.preserve_order
+    }
+
+    fn get_global_operator_state(
+        &self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalOperatorState>> {
+        Ok(Arc::new(LimitState::default()))
+    }
+
+    fn execute(
+        &self,
+        _ctx: &ExecutionContext,
+        input: &DataChunk,
+        output: &mut DataChunk,
+        gstate: &dyn GlobalOperatorState,
+        _lstate: &mut dyn OperatorState,
+    ) -> Result<OperatorResult> {
+        let state = downcast_state::<LimitState>(gstate.as_any(), self.name())?;
+        // Nothing is emitted after the skipped rows: the input is not needed.
+        // (Not `end == skip`, which also holds when `skip + fetch` saturates:
+        // then, like DataFusion's limit, the input is read to its end.)
+        if self.fetch == Some(0) {
+            return Ok(OperatorResult::Finished);
+        }
+        let end = self.end();
+        // Avoid claiming positions that cannot matter any more.
+        let claimed = state.claimed.load(Ordering::Relaxed);
+        match end {
+            // All positions up to the end were claimed (by another thread).
+            Some(end) if claimed >= end => return Ok(OperatorResult::Finished),
+            // All rows are skipped already and there is no fetch: the
+            // remaining rows are all emitted.
+            None if claimed >= self.skip => {
+                *output = input.clone();
+                return Ok(OperatorResult::NeedMoreInput);
+            }
+            _ => {}
+        }
+
+        let len = input.len();
+        let start = state.claimed.fetch_add(len, Ordering::Relaxed);
+        let stop = start.saturating_add(len);
+        // The positions to emit: `skip..end`, of `start..stop`.
+        let first = start.max(self.skip);
+        let last = end.map_or(stop, |end| end.min(stop));
+        if first < last {
+            *output = if first == start && last == stop {
+                input.clone()
+            } else {
+                input.slice(first - start, last - first)
+            };
+        }
+        Ok(match end {
+            Some(end) if stop >= end => OperatorResult::Finished,
+            _ => OperatorResult::NeedMoreInput,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::RecordBatch;
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
+    use datafusion_common::{JoinType, NullEquality};
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::empty::EmptyExec;
+    use datafusion_physical_plan::joins::{
+        HashJoinExec, NestedLoopJoinExec, PartitionMode,
+    };
+    use datafusion_physical_plan::sorts::sort::SortExec;
+    use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion_physical_plan::{
+        ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
+    };
+
+    use crate::bridge::{BridgeOperator, bridged_plans};
+    use crate::chunk::SelectionVector;
+    use crate::explain::{format_operator_tree, format_pipelines};
+    use crate::operators::union::PhysicalUnion;
+    use crate::operators::union::test_support::{
+        AfterBatch, INJECTED_FAILURE, SlowFirstFile, TestSource,
+        assert_lowered_plan_byte_eq, assert_native_byte_eq, assert_native_plan_byte_eq,
+        assert_native_plan_fails_like_datafusion, assert_parity,
+        assert_parity_with_config, batch_plan, count, lower, lower_without_repartitions,
+        pending_plan, run, sorted_values, values, values_chunk, values_chunks,
+        values_schema,
+    };
+    use crate::sources::ParquetScanSource;
+    use crate::sources::test_harness::write_parquet;
+    use crate::test_utils::{test_session_config, test_table_t1};
+
+    /// Chunks of all sizes, so that `skip` and `skip + fetch` fall on chunk
+    /// boundaries and inside chunks.
+    const SIZES: [usize; 7] = [7, 2048, 1, 100, 2048, 30, 1000];
+
+    fn limit(
+        input: Arc<dyn PhysicalOperator>,
+        skip: usize,
+        fetch: Option<usize>,
+        preserve_order: bool,
+    ) -> Arc<dyn PhysicalOperator> {
+        Arc::new(
+            PhysicalLimit::new(input, skip, fetch).with_preserve_order(preserve_order),
+        )
+    }
+
+    fn source(chunks: Vec<DataChunk>) -> Arc<dyn PhysicalOperator> {
+        Arc::new(TestSource::new(chunks))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_emits_the_rows_from_skip_to_skip_plus_fetch() -> Result<()> {
+        let total = SIZES.iter().sum::<usize>();
+        let cases = [
+            (0, None),
+            (0, Some(0)),
+            (0, Some(1)),
+            (0, Some(7)),
+            (0, Some(8)),
+            (0, Some(2055)),
+            (0, Some(total)),
+            (0, Some(total + 1)),
+            (0, Some(usize::MAX)),
+            (1, Some(5)),
+            (6, Some(2)),
+            (7, Some(2048)),
+            (7, None),
+            (2054, Some(3)),
+            (2055, Some(1)),
+            (100, Some(4000)),
+            (5, Some(0)),
+            (total - 1, Some(5)),
+            (total - 1, None),
+            (total, Some(5)),
+            (total, None),
+            (total + 10, None),
+            (total + 10, Some(1)),
+            (usize::MAX, Some(3)),
+            (usize::MAX, None),
+        ];
+        for (skip, fetch) in cases {
+            let first = skip.min(total);
+            let last = fetch
+                .map_or(total, |fetch| skip.saturating_add(fetch))
+                .clamp(first, total);
+            let expected = (first as i64..last as i64).collect::<Vec<_>>();
+            let case = format!("skip {skip}, fetch {fetch:?}");
+            // In input order, on any number of threads.
+            for threads in [1, 4] {
+                let input = source(values_chunks(0, &SIZES));
+                let output = run(limit(input, skip, fetch, true), threads).await?;
+                assert_eq!(values(&output), expected, "{case}, {threads} threads");
+            }
+            // In parallel, the threads claim the rows in the order in which
+            // they reach the limit: any rows, as many as in order.
+            let output = run(
+                limit(source(values_chunks(0, &SIZES)), skip, fetch, false),
+                1,
+            )
+            .await?;
+            assert_eq!(values(&output), expected, "{case}, 1 thread");
+            let output = run(
+                limit(source(values_chunks(0, &SIZES)), skip, fetch, false),
+                4,
+            )
+            .await?;
+            let mut actual = sorted_values(&output);
+            assert_eq!(actual.len(), expected.len(), "{case}, 4 threads");
+            actual.dedup();
+            assert_eq!(actual.len(), expected.len(), "{case}: duplicate rows");
+            assert!(
+                actual.iter().all(|v| (0..total as i64).contains(v)),
+                "{case}"
+            );
+            assert!(output.iter().all(|batch| batch.num_rows() > 0));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_slices_the_logical_rows_of_selected_chunks() -> Result<()> {
+        // 50 even values, then 100 values in reverse order.
+        let evens = values_chunk(0..100).with_selection(SelectionVector::from(
+            (0..100).step_by(2).collect::<Vec<u32>>(),
+        ))?;
+        let reversed = values_chunk(100..200).with_selection(SelectionVector::from(
+            (0..100).rev().collect::<Vec<u32>>(),
+        ))?;
+        let input = source(vec![evens, reversed]);
+        let output = run(limit(input, 30, Some(40), true), 4).await?;
+        let expected = (60..100)
+            .step_by(2)
+            .chain((180..200).rev())
+            .collect::<Vec<i64>>();
+        assert_eq!(values(&output), expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_stops_its_input_early() -> Result<()> {
+        // 1000 chunks of 10 rows.
+        let chunks = || values_chunks(0, &[10; 1000]);
+        for (skip, fetch, chunks_needed) in [(0, 25, 3), (95, 10, 11), (0, 0, 0)] {
+            // In order, a single thread reads exactly the chunks it needs.
+            let input = Arc::new(TestSource::new(chunks()));
+            let output =
+                run(limit(Arc::clone(&input) as _, skip, Some(fetch), true), 4).await?;
+            let expected = (skip as i64..(skip + fetch) as i64).collect::<Vec<_>>();
+            assert_eq!(values(&output), expected);
+            // With `fetch == 0`, the first chunk is not needed, but it is
+            // read before the limit sees it.
+            assert_eq!(input.produced(), chunks_needed.max(1), "skip {skip}");
+
+            // In parallel, threads that were already reading a chunk when the
+            // limit finished may still deliver it.
+            let input = Arc::new(TestSource::new(chunks()));
+            let output =
+                run(limit(Arc::clone(&input) as _, skip, Some(fetch), false), 4).await?;
+            assert_eq!(values(&output).len(), fetch);
+            assert!(
+                input.produced() <= chunks_needed + 4,
+                "{}",
+                input.produced()
+            );
+        }
+
+        // Without a fetch, all rows after the skipped ones are needed.
+        for preserve_order in [true, false] {
+            let input = Arc::new(TestSource::new(chunks()));
+            let root = limit(Arc::clone(&input) as _, 9995, None, preserve_order);
+            let output = run(root, 4).await?;
+            if preserve_order {
+                assert_eq!(values(&output), (9995..10_000).collect::<Vec<_>>());
+            } else {
+                // The threads skip any 9995 rows.
+                let mut actual = sorted_values(&output);
+                actual.dedup();
+                assert_eq!(actual.len(), 5);
+            }
+            assert_eq!(input.produced(), 1000);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finished_limit_stops_idle_threads_and_union_inputs() -> Result<()> {
+        // Thread 0 never gets any data, thread 1 reaches the limit.
+        let input = TestSource::new(values_chunks(0, &[10; 10])).with_idle_threads(1);
+        let output = run(limit(Arc::new(input), 0, Some(5), false), 2).await?;
+        assert_eq!(sorted_values(&output).len(), 5);
+
+        // The second input of the union never produces anything. In order, it
+        // does not even start.
+        for (preserve_order, threads) in [(false, 1), (false, 4), (true, 4)] {
+            let idle = TestSource::new(vec![]).with_idle_threads(usize::MAX);
+            let union = PhysicalUnion::try_new(vec![
+                source(values_chunks(0, &[10; 10])),
+                Arc::new(idle),
+            ])?
+            .with_preserve_order(preserve_order);
+            let root = limit(Arc::new(union), 3, Some(5), preserve_order);
+            let output = run(root, threads).await?;
+            if preserve_order {
+                assert_eq!(values(&output), (3..8).collect::<Vec<_>>());
+            } else {
+                assert_eq!(values(&output).len(), 5, "{threads} threads");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_counts_the_rows_of_all_union_inputs() -> Result<()> {
+        let inputs = || {
+            vec![
+                source(values_chunks(0, &[10; 10])),
+                source(values_chunks(100, &[50, 100])),
+                source(values_chunks(250, &[25, 25])),
+            ]
+        };
+        // The pipelines of all inputs share the limit.
+        let union = Arc::new(PhysicalUnion::try_new(inputs())?);
+        let root = limit(union, 0, Some(42), false);
+        assert_eq!(
+            format_pipelines(&root)?,
+            "MetaPipeline 0 (sink: ResultSink)\n  \
+             Pipeline 0: TestSource -> PhysicalLimit -> ResultSink\n  \
+             Pipeline 1: TestSource -> PhysicalLimit -> ResultSink\n  \
+             Pipeline 2: TestSource -> PhysicalLimit -> ResultSink\n"
+        );
+        let output = run(root, 4).await?;
+        let mut actual = sorted_values(&output);
+        actual.dedup();
+        assert_eq!(actual.len(), 42);
+
+        // Over an ordered union, the inputs come one after the other.
+        let union = Arc::new(PhysicalUnion::try_new(inputs())?.with_preserve_order(true));
+        let output = run(limit(union, 90, Some(170), true), 4).await?;
+        assert_eq!(values(&output), (90..260).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operators_can_be_executed_again() -> Result<()> {
+        // All the state of an execution lives in the states the executor
+        // creates, so an operator tree can be executed any number of times.
+        let union = PhysicalUnion::try_new(vec![
+            source(values_chunks(0, &[10; 10])),
+            source(values_chunks(100, &[50, 100])),
+        ])?
+        .with_preserve_order(true);
+        let root = limit(Arc::new(union), 95, Some(20), true);
+        for _ in 0..3 {
+            let output = run(Arc::clone(&root), 4).await?;
+            assert_eq!(values(&output), (95..115).collect::<Vec<_>>());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn limit_properties() {
+        let input = source(vec![values_chunk(0..3)]);
+        let parallel = PhysicalLimit::new(Arc::clone(&input), 5, Some(10));
+        assert!(parallel.parallel_operator());
+        assert!(!parallel.preserve_order());
+        assert_eq!((parallel.skip(), parallel.fetch()), (5, Some(10)));
+        assert!(Arc::ptr_eq(parallel.input(), &input));
+        assert_eq!(parallel.schema(), input.schema());
+        assert_eq!(parallel.description(), "PhysicalLimit: skip=5, fetch=10");
+
+        let ordered = PhysicalLimit::new(input, 0, None).with_preserve_order(true);
+        assert!(!ordered.parallel_operator());
+        assert!(!ordered.is_sink() && !ordered.is_source());
+        assert_eq!(
+            ordered.description(),
+            "PhysicalLimit: skip=0, fetch=None, preserve_order=true"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Lowering
+    // ---------------------------------------------------------------------
+
+    /// `t1` with its 4 skewed partitions, or in a single partition.
+    fn t1_scan(single_partition: bool) -> Result<Arc<dyn ExecutionPlan>> {
+        let partitions = test_table_t1()?;
+        let schema = partitions[0][0].schema();
+        let partitions = if single_partition {
+            vec![partitions.into_iter().flatten().collect()]
+        } else {
+            partitions
+        };
+        Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+    }
+
+    /// `t1` with all rows in a single batch per partition, sorted by `id`
+    /// within each partition.
+    fn sorted_t1_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        let partitions = test_table_t1()?;
+        let schema = partitions[0][0].schema();
+        let partitions = partitions
+            .iter()
+            .map(|batches| Ok(vec![concat_batches(&schema, batches)?]))
+            .collect::<Result<Vec<_>>>()?;
+        let ordering = id_ordering(&schema)?;
+        let source = MemorySourceConfig::try_new(&partitions, schema, None)?
+            .try_with_sort_information(vec![ordering])?;
+        Ok(datafusion_datasource::source::DataSourceExec::from_data_source(source))
+    }
+
+    fn id_ordering(schema: &SchemaRef) -> Result<LexOrdering> {
+        Ok(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("id", schema)?)])
+                .unwrap(),
+        )
+    }
+
+    /// An `InterleaveExec` with a single partition of two scans of `v` values.
+    fn interleaved_values() -> Result<Arc<dyn ExecutionPlan>> {
+        let by_v = |values: std::ops::Range<i64>| -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = values_chunk(values).into_record_batch()?;
+            let scan =
+                MemorySourceConfig::try_new_exec(&[vec![batch]], values_schema(), None)?;
+            let v = col("v", &scan.schema())?;
+            Ok(Arc::new(RepartitionExec::try_new(
+                scan,
+                Partitioning::Hash(vec![v], 1),
+            )?))
+        };
+        Ok(Arc::new(InterleaveExec::try_new(vec![
+            by_v(0..3)?,
+            by_v(10..13)?,
+        ])?))
+    }
+
+    /// Lower `plan` with [`PhysicalLimit::try_lower`], bridging its input.
+    fn try_lower(plan: Arc<dyn ExecutionPlan>) -> Result<Option<PhysicalLimit>> {
+        PhysicalLimit::try_lower(&plan, |input| {
+            Ok(Arc::new(BridgeOperator::new(Arc::clone(input))))
+        })
+    }
+
+    #[test]
+    fn lowering_of_limit_nodes() -> Result<()> {
+        let lowered = |plan| -> Result<(usize, Option<usize>, bool)> {
+            let limit = try_lower(plan)?.expect("a limit");
+            Ok((limit.skip(), limit.fetch(), limit.preserve_order()))
+        };
+        let coalesced = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(CoalescePartitionsExec::new(t1_scan(false)?)))
+        };
+        let merged = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = t1_scan(false)?;
+            let ordering = id_ordering(&scan.schema())?;
+            let sort =
+                SortExec::new(ordering.clone(), scan).with_preserve_partitioning(true);
+            Ok(Arc::new(SortPreservingMergeExec::new(
+                ordering,
+                Arc::new(sort),
+            )))
+        };
+
+        // The rows a limit over merged partitions returns are arbitrary.
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(coalesced()?, 5, Some(10))))?,
+            (5, Some(10), false)
+        );
+        assert_eq!(
+            lowered(Arc::new(
+                CoalescePartitionsExec::new(t1_scan(false)?).with_fetch(Some(7))
+            ))?,
+            (0, Some(7), false)
+        );
+        // Partitions and inputs interleaved in arrival order.
+        let interleaved = || -> Result<Arc<dyn ExecutionPlan>> {
+            let by_id = |single_partition| -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = t1_scan(single_partition)?;
+                let id = col("id", &scan.schema())?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    scan,
+                    Partitioning::Hash(vec![id], 1),
+                )?))
+            };
+            Ok(Arc::new(InterleaveExec::try_new(vec![
+                by_id(true)?,
+                by_id(false)?,
+            ])?))
+        };
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(interleaved()?, 0, Some(1))))?,
+            (0, Some(1), false)
+        );
+        let round_robin = Arc::new(RepartitionExec::try_new(
+            t1_scan(false)?,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(round_robin, 2, Some(3))))?,
+            (2, Some(3), false)
+        );
+        // A sorted input, or a single partition, has a deterministic order.
+        let sort_preserving = RepartitionExec::try_new(
+            sorted_t1_scan()?,
+            Partitioning::RoundRobinBatch(1),
+        )?
+        .with_preserve_order();
+        assert!(sort_preserving.preserve_order());
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(
+                Arc::new(sort_preserving),
+                0,
+                Some(3)
+            )))?,
+            (0, Some(3), true)
+        );
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(merged()?, 3, None)))?,
+            (3, None, true)
+        );
+        assert_eq!(
+            lowered(Arc::new(GlobalLimitExec::new(t1_scan(true)?, 0, Some(2))))?,
+            (0, Some(2), true)
+        );
+        assert_eq!(
+            lowered(Arc::new(LocalLimitExec::new(t1_scan(true)?, 4)))?,
+            (0, Some(4), true)
+        );
+        assert_eq!(
+            lowered(Arc::new(
+                CoalescePartitionsExec::new(t1_scan(true)?).with_fetch(Some(9))
+            ))?,
+            (0, Some(9), true)
+        );
+
+        // Through a join, the order of the inputs whose order it keeps: the
+        // probe side of a hash join. A nested loop join keeps none.
+        let keyed = |name: &str, partitions: usize| -> Result<Arc<dyn ExecutionPlan>> {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let batch = |p: i64| {
+                vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(arrow::array::Int64Array::from(vec![p, p + 1]))],
+                    )
+                    .unwrap(),
+                ]
+            };
+            let partitions = (0..partitions as i64).map(batch).collect::<Vec<_>>();
+            Ok(MemorySourceConfig::try_new_exec(&partitions, schema, None)?)
+        };
+        let hash_join =
+            |probe: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let build: Arc<dyn ExecutionPlan> =
+                    Arc::new(CoalescePartitionsExec::new(keyed("k", 3)?));
+                let on = vec![(col("k", &build.schema())?, col("v", &probe.schema())?)];
+                Ok(Arc::new(HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?))
+            };
+        let limited = |join| -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(GlobalLimitExec::new(join, 1, Some(2))))
+        };
+        assert_eq!(
+            lowered(limited(hash_join(keyed("v", 1)?)?)?)?,
+            (1, Some(2), true)
+        );
+        assert_eq!(
+            lowered(limited(hash_join(interleaved_values()?)?)?)?,
+            (1, Some(2), false)
+        );
+        let nested_loop = NestedLoopJoinExec::try_new(
+            Arc::new(CoalescePartitionsExec::new(keyed("k", 3)?)),
+            keyed("v", 1)?,
+            None,
+            &JoinType::Inner,
+            None,
+        )?;
+        assert_eq!(
+            lowered(limited(Arc::new(nested_loop))?)?,
+            (1, Some(2), false)
+        );
+
+        // A limit per partition is not a limit of all partitions...
+        for scan in [t1_scan(false)?, sorted_t1_scan()?] {
+            assert!(try_lower(Arc::new(LocalLimitExec::new(scan, 4)))?.is_none());
+        }
+        // ... unless a merge above it keeps at most as many rows: then the
+        // native limit replaces both.
+        for (local_fetch, absorbed) in [(7, true), (15, true), (6, false)] {
+            let local = Arc::new(LocalLimitExec::new(t1_scan(false)?, local_fetch));
+            let merged = Arc::new(CoalescePartitionsExec::new(local).with_fetch(Some(7)));
+            let limit = try_lower(merged)?.expect("a limit");
+            assert_eq!((limit.skip(), limit.fetch()), (0, Some(7)));
+            let bridged = limit.input().downcast_ref::<BridgeOperator>().unwrap();
+            assert_eq!(
+                bridged.plan().is::<LocalLimitExec>(),
+                !absorbed,
+                "local fetch {local_fetch}"
+            );
+        }
+        // Limits of no rows, which DataFusion ends without (or with an empty)
+        // input, are left to it.
+        let no_rows: [Arc<dyn ExecutionPlan>; 4] = [
+            Arc::new(GlobalLimitExec::new(t1_scan(true)?, 0, Some(0))),
+            Arc::new(GlobalLimitExec::new(coalesced()?, 7, Some(0))),
+            Arc::new(LocalLimitExec::new(t1_scan(true)?, 0)),
+            Arc::new(CoalescePartitionsExec::new(t1_scan(false)?).with_fetch(Some(0))),
+        ];
+        for plan in no_rows {
+            assert!(try_lower(plan)?.is_none());
+        }
+        // A `LocalLimitExec` whose input was replaced without recomputing its
+        // properties, with another number of partitions: DataFusion executes
+        // the partitions it advertises.
+        let keep = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep);
+        let stale = Arc::new(LocalLimitExec::new(t1_scan(false)?, 3))
+            .replace_children(vec![t1_scan(true)?], keep)?;
+        assert_eq!(stale.output_partitioning().partition_count(), 4);
+        assert!(try_lower(Arc::clone(&stale))?.is_none());
+        let merged = Arc::new(CoalescePartitionsExec::new(stale).with_fetch(Some(2)));
+        let limit = try_lower(merged)?.expect("a limit");
+        let bridged = limit.input().downcast_ref::<BridgeOperator>().unwrap();
+        assert!(bridged.plan().is::<LocalLimitExec>());
+        // Nodes that DataFusion fails to execute are left to it.
+        let multi_partition = GlobalLimitExec::new(t1_scan(false)?, 0, Some(1));
+        assert!(try_lower(Arc::new(multi_partition))?.is_none());
+        let no_partitions: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[], values_schema(), None)?;
+        assert_eq!(no_partitions.output_partitioning().partition_count(), 0);
+        let merged = CoalescePartitionsExec::new(no_partitions).with_fetch(Some(1));
+        assert!(try_lower(Arc::new(merged))?.is_none());
+        // Other nodes, including a coalesce without fetch.
+        assert!(try_lower(coalesced()?)?.is_none());
+        let mut called = false;
+        let scan = t1_scan(false)?;
+        assert!(
+            PhysicalLimit::try_lower(&scan, |_| {
+                called = true;
+                internal_err!("not called")
+            })?
+            .is_none()
+        );
+        assert!(!called);
+
+        // The lowered input must have the schema of the limit.
+        let err = PhysicalLimit::try_lower(
+            &(Arc::new(GlobalLimitExec::new(coalesced()?, 0, Some(1))) as _),
+            |_| Ok(source(vec![values_chunk(0..1)])),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("has schema"), "{err}");
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Differential tests
+    // ---------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limit_and_offset() {
+        for sql in [
+            // A parallel limit (over merged partitions), with constant rows so
+            // that the result does not depend on the rows selected.
+            "SELECT 1 AS one, 'x' AS x FROM t1 LIMIT 10 OFFSET 5",
+            "SELECT 'x' AS x FROM t1 OFFSET 4990",
+            "SELECT 'x' AS x FROM t1 WHERE a > 0 LIMIT 3000 OFFSET 7",
+            // Limits that keep all rows.
+            "SELECT * FROM t1 LIMIT 6000",
+            "SELECT * FROM t1 LIMIT 6000 OFFSET 0",
+            "SELECT * FROM t2 LIMIT 150",
+            // Limits in input order (a sorted input).
+            "SELECT id, d FROM t1 ORDER BY id LIMIT 10 OFFSET 5",
+            "SELECT * FROM t1 ORDER BY id LIMIT 3000 OFFSET 1000",
+            "SELECT id, h FROM t1 ORDER BY id DESC OFFSET 4990",
+            "SELECT id, c FROM t1 ORDER BY c, id LIMIT 2049 OFFSET 2047",
+            "SELECT * FROM t1 ORDER BY id LIMIT 10 OFFSET 4995",
+            "SELECT a FROM (SELECT a, id FROM t1 ORDER BY id LIMIT 20) LIMIT 5 OFFSET 2",
+            // A `LocalLimitExec` per partition of an aggregate (that has fewer
+            // groups than the limit) below a merge with the same fetch: the
+            // native limit replaces both.
+            "SELECT DISTINCT d FROM t1 LIMIT 100",
+            "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d LIMIT 50",
+        ] {
+            let root = assert_parity(sql).await;
+            assert!(count::<PhysicalLimit>(&root) > 0, "{sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_empty_limits() {
+        for sql in [
+            // DataFusion plans an empty relation for these.
+            "SELECT * FROM t1 LIMIT 0",
+            "SELECT * FROM t1 ORDER BY id LIMIT 0",
+            "SELECT * FROM t1 LIMIT 0 OFFSET 10",
+            // OFFSET reaching or exceeding the number of rows.
+            "SELECT * FROM t1 LIMIT 10 OFFSET 5000",
+            "SELECT * FROM t1 OFFSET 6000",
+            "SELECT * FROM t1 ORDER BY id LIMIT 5 OFFSET 6000",
+            "SELECT id FROM t1 ORDER BY id OFFSET 5000",
+            "SELECT * FROM t_empty LIMIT 5 OFFSET 2",
+            "SELECT * FROM t_empty ORDER BY id OFFSET 1",
+        ] {
+            assert_parity(sql).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limits_over_unions() {
+        for sql in [
+            // The fetch of the limit is pushed into the inputs of the union.
+            "SELECT 'same' AS s FROM t2 UNION ALL SELECT 'same' FROM t1 LIMIT 10 OFFSET 3",
+            "SELECT 'same' AS s FROM t2 UNION ALL SELECT 'same' FROM t1 LIMIT 7",
+            "SELECT k FROM t2 UNION ALL SELECT a FROM t1 LIMIT 10000",
+            "SELECT k FROM t2 UNION ALL SELECT a FROM t1 LIMIT 10 OFFSET 5150",
+        ] {
+            let root = assert_parity(sql).await;
+            assert!(count::<PhysicalLimit>(&root) > 0, "{sql}");
+            assert_eq!(count::<PhysicalUnion>(&root), 1, "{sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limits_with_other_partitionings() {
+        for target_partitions in [1, 3, 16] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for sql in [
+                "SELECT 1 AS one FROM t1 LIMIT 10 OFFSET 5",
+                "SELECT id, d FROM t1 ORDER BY id LIMIT 100 OFFSET 2040",
+                "SELECT * FROM t1 OFFSET 6000",
+            ] {
+                assert_parity_with_config(sql, config.clone()).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limit_plans() -> Result<()> {
+        // Limits that SQL does not produce: DataFusion plans an empty relation
+        // for a `LIMIT 0`. (Limits of no rows are left to DataFusion.)
+        let make = |skip, fetch| {
+            move || -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(GlobalLimitExec::new(
+                    Arc::new(CoalescePartitionsExec::new(t1_scan(false)?)),
+                    skip,
+                    fetch,
+                )))
+            }
+        };
+        for (skip, fetch) in [(0, Some(0)), (7, Some(0)), (0, Some(6000)), (0, None)] {
+            let root = assert_native_plan_byte_eq(make(skip, fetch), false).await;
+            let lowered = usize::from(fetch != Some(0));
+            assert_eq!(count::<PhysicalLimit>(&root), lowered, "fetch {fetch:?}");
+        }
+        let local = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(LocalLimitExec::new(t1_scan(false)?, 0)))
+        };
+        assert_native_plan_byte_eq(local, false).await;
+
+        // The order of a single partition is deterministic: the limits return
+        // the same rows as DataFusion, in the same order.
+        for (skip, fetch) in [
+            (2500, Some(100)),
+            (4000, None),
+            (0, Some(2049)),
+            (4999, Some(7)),
+        ] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(GlobalLimitExec::new(t1_scan(true)?, skip, fetch)))
+            };
+            assert_native_plan_byte_eq(make, true).await;
+        }
+        let local = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(LocalLimitExec::new(t1_scan(true)?, 3000)))
+        };
+        assert_native_plan_byte_eq(local, true).await;
+        Ok(())
+    }
+
+    /// Two partitions of 10 rows: the values `0..10` and `100..110`, or all
+    /// `7` if `constant`.
+    fn two_partitions(constant: bool) -> Result<Arc<dyn ExecutionPlan>> {
+        let partition = |start: i64| {
+            let values = if constant {
+                values_chunk([7; 10])
+            } else {
+                values_chunk(start..start + 10)
+            };
+            vec![values.into_record_batch().unwrap()]
+        };
+        Ok(MemorySourceConfig::try_new_exec(
+            &[partition(0), partition(100)],
+            values_schema(),
+            None,
+        )?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_local_limits_keep_their_rows_per_partition() -> Result<()> {
+        // A limit per partition: 3 rows of each partition.
+        let local = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(LocalLimitExec::new(two_partitions(false)?, 3)))
+        };
+        let root = assert_native_plan_byte_eq(local, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 0);
+
+        // Below a merge that keeps more rows than the limit of a partition, the
+        // limit per partition decides which rows are merged.
+        let merged = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(false)?, 3));
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(local).with_fetch(Some(6)),
+            ))
+        };
+        let root = assert_native_plan_byte_eq(merged, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 1);
+        assert!(bridged_plans(&root)[0].is::<LocalLimitExec>());
+        let offset = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(true)?, 3));
+            let merged = CoalescePartitionsExec::new(local).with_fetch(Some(5));
+            Ok(Arc::new(GlobalLimitExec::new(Arc::new(merged), 1, Some(4))))
+        };
+        let root = assert_native_plan_byte_eq(offset, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 2);
+        assert!(bridged_plans(&root)[0].is::<LocalLimitExec>());
+
+        // A merge that keeps at most as many rows as the limit of a partition
+        // makes that limit redundant: the native limit replaces both.
+        let absorbed = || -> Result<Arc<dyn ExecutionPlan>> {
+            let local = Arc::new(LocalLimitExec::new(two_partitions(true)?, 3));
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(local).with_fetch(Some(2)),
+            ))
+        };
+        let root = assert_native_plan_byte_eq(absorbed, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 1);
+        assert!(root.children()[0].is::<crate::sources::MemoryScanSource>());
+        assert!(bridged_plans(&root).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limit_over_a_merge_of_inputs_does_not_wait_for_idle_inputs() -> Result<()> {
+        // A limit of one row over a merge of two inputs whose first input
+        // never produces anything: DataFusion merges the inputs and returns
+        // the row of the second one. The merges: a `CoalescePartitionsExec` of
+        // a `UnionExec`, a native union whose pipelines must run concurrently,
+        // and an `InterleaveExec` with a single partition (which DataFusion
+        // executes, see `PhysicalUnion::try_lower`), also through a
+        // `CoalescePartitionsExec`, which passes a single partition through.
+        fn inputs() -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+            let row = values_chunk([42]).into_record_batch()?;
+            Ok(vec![
+                pending_plan(values_schema(), 1)?,
+                batch_plan(row, AfterBatch::End)?,
+            ])
+        }
+        fn union() -> Result<Arc<dyn ExecutionPlan>> {
+            UnionExec::try_new(inputs()?)
+        }
+        fn interleave() -> Result<Arc<dyn ExecutionPlan>> {
+            let by_v = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let v = col("v", &input.schema())?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    input,
+                    Partitioning::Hash(vec![v], 1),
+                )?))
+            };
+            let inputs = inputs()?.into_iter().map(by_v).collect::<Result<_>>()?;
+            Ok(Arc::new(InterleaveExec::try_new(inputs)?))
+        }
+        type Plan = Arc<dyn ExecutionPlan>;
+        fn global(input: Plan) -> Plan {
+            Arc::new(GlobalLimitExec::new(input, 0, Some(1)))
+        }
+        fn local(input: Plan) -> Plan {
+            Arc::new(LocalLimitExec::new(input, 1))
+        }
+        fn coalesce(input: Plan) -> Plan {
+            Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1)))
+        }
+        fn global_over_coalesce(input: Plan) -> Plan {
+            global(Arc::new(CoalescePartitionsExec::new(input)))
+        }
+        fn global_over_coalesce_with_fetch(input: Plan) -> Plan {
+            global(Arc::new(
+                CoalescePartitionsExec::new(input).with_fetch(Some(5)),
+            ))
+        }
+        fn coalesce_over_local(input: Plan) -> Plan {
+            coalesce(local(input))
+        }
+        /// Whether all limits in the tree below `operator` are parallel.
+        fn parallel(operator: &Arc<dyn PhysicalOperator>) -> bool {
+            operator
+                .downcast_ref::<PhysicalLimit>()
+                .is_none_or(|limit| !limit.preserve_order())
+                && operator.children().iter().all(parallel)
+        }
+        type Limit = fn(Plan) -> Plan;
+        type Merge = fn() -> Result<Plan>;
+        // The limits, the merges and the native unions below the limits.
+        let cases: [(Limit, Merge, usize); 9] = [
+            (coalesce, union, 1),
+            (global_over_coalesce, union, 1),
+            (global_over_coalesce_with_fetch, union, 1),
+            (coalesce_over_local, union, 1),
+            (global, interleave, 0),
+            (coalesce, interleave, 0),
+            (local, interleave, 0),
+            (global_over_coalesce, interleave, 0),
+            (global_over_coalesce_with_fetch, interleave, 0),
+        ];
+        for (limit, merge, unions) in cases {
+            let make = || Ok(limit(merge()?));
+            let root = assert_native_plan_byte_eq(make, false).await;
+            assert!(root.is::<PhysicalLimit>());
+            // The inputs of the union below the limits run concurrently.
+            assert!(parallel(&root));
+            assert_eq!(count::<PhysicalUnion>(&root), unions);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limits_over_a_parquet_file() -> Result<()> {
+        // A single file of several row groups is one partition in DataFusion,
+        // read in file order, and the limit (with its fetch pushed into the
+        // scan) returns the same rows over the native `ParquetScanSource`.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("t1.parquet");
+        let batches = test_table_t1()?.into_iter().flatten().collect::<Vec<_>>();
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(700))
+            .build();
+        write_parquet(&path, batches[0].schema(), &batches, Some(properties))?;
+        let path = path.to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        for sql in [
+            "SELECT * FROM p LIMIT 10 OFFSET 2045",
+            "SELECT id, d FROM p LIMIT 1500 OFFSET 700",
+            "SELECT id, d FROM p OFFSET 4000",
+        ] {
+            let root = assert_native_byte_eq(sql, test_session_config(), setup).await;
+            let limit = root.downcast_ref::<PhysicalLimit>().expect("a limit");
+            assert!(limit.preserve_order(), "{sql}");
+            assert!(limit.input().is::<ParquetScanSource>(), "{sql}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_of_no_rows_do_not_wait_for_their_input() -> Result<()> {
+        // A merge with `fetch=0` ends right away, even if its partitions never
+        // produce anything.
+        for partitions in [1, 2] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                let pending = pending_plan(values_schema(), partitions)?;
+                Ok(Arc::new(
+                    CoalescePartitionsExec::new(pending).with_fetch(Some(0)),
+                ))
+            };
+            let root = assert_native_plan_byte_eq(make, false).await;
+            assert_eq!(count::<PhysicalLimit>(&root), 0, "{partitions} partitions");
+        }
+        // A limit of no rows ends with the first batch of its input, even an
+        // empty one.
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let empty =
+                batch_plan(values_chunk([]).into_record_batch()?, AfterBatch::Idle)?;
+            Ok(Arc::new(GlobalLimitExec::new(empty, 0, Some(0))))
+        };
+        let root = assert_native_plan_byte_eq(make, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_read_their_input_as_long_as_datafusion_does() -> Result<()> {
+        // A limit that skips more rows than an input can have reads all of its
+        // input, like DataFusion's: the failure of the input after its first
+        // batch is reported.
+        for (skip, fetch) in [
+            (usize::MAX, Some(1)),
+            (usize::MAX, None),
+            (usize::MAX - 1, Some(5)),
+        ] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                let batch = values_chunk(0..10).into_record_batch()?;
+                let input = batch_plan(batch, AfterBatch::Fail)?;
+                Ok(Arc::new(GlobalLimitExec::new(input, skip, fetch)))
+            };
+            let root =
+                assert_native_plan_fails_like_datafusion(make, INJECTED_FAILURE).await;
+            assert!(root.is::<PhysicalLimit>(), "skip {skip}, fetch {fetch:?}");
+        }
+        // A limit whose last row is in the first batch does not read further:
+        // the failure is not reported.
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = values_chunk(0..10).into_record_batch()?;
+            let input = batch_plan(batch, AfterBatch::Fail)?;
+            Ok(Arc::new(GlobalLimitExec::new(input, 5, Some(5))))
+        };
+        let root = assert_native_plan_byte_eq(make, true).await;
+        assert!(root.is::<PhysicalLimit>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_keep_the_order_of_a_partition_that_unions_pass_through() -> Result<()>
+    {
+        // A `UnionExec` with a single partition (its other inputs have none)
+        // and an `InterleaveExec` of a single input pass a partition of their
+        // input through as it is, without declaring that they keep its order:
+        // here a partition of two CSV files whose first one is slow to read.
+        // DataFusion reads the files one after the other, so a limit returns
+        // the first rows of the first file, where a native scan on several
+        // threads would return the row of the second file first. The hash
+        // repartition below the interleave is removed, like a planner that
+        // does not need it, so that the native scan reads the files.
+        let files = SlowFirstFile::try_new().await?;
+        let empty = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(EmptyExec::new(values_schema()).with_partitions(0))
+        };
+        let union_after_empty = || UnionExec::try_new(vec![empty(), files.scan()?]);
+        let union_before_empty = || UnionExec::try_new(vec![files.scan()?, empty()]);
+        let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = files.scan()?;
+            let v = col("v", &scan.schema())?;
+            let by_v = RepartitionExec::try_new(scan, Partitioning::Hash(vec![v], 1))?;
+            Ok(Arc::new(InterleaveExec::try_new(vec![Arc::new(by_v)])?))
+        };
+        let merges: [&dyn Fn() -> Result<Arc<dyn ExecutionPlan>>; 3] =
+            [&union_after_empty, &union_before_empty, &interleave];
+        type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
+        let limits: [Limit; 3] = [
+            |input| Arc::new(GlobalLimitExec::new(input, 0, Some(1))),
+            |input| Arc::new(GlobalLimitExec::new(input, 1, Some(2))),
+            |input| Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1))),
+        ];
+        for merge in merges {
+            assert_eq!(merge()?.output_partitioning().partition_count(), 1);
+            for limit in limits {
+                let make = || Ok(limit(merge()?));
+                let root = assert_lowered_plan_byte_eq(
+                    make,
+                    lower_without_repartitions,
+                    files.task_ctx(),
+                    true,
+                )
+                .await;
+                let operators = format_operator_tree(&root);
+                let limit = root.downcast_ref::<PhysicalLimit>().expect(&operators);
+                assert!(limit.preserve_order(), "{operators}");
+                assert_eq!(count::<PhysicalUnion>(&root), 1, "{operators}");
+            }
+        }
+        // With the test lowering, the union is native too.
+        let make =
+            || Ok(Arc::new(GlobalLimitExec::new(union_after_empty()?, 0, Some(1))) as _);
+        let root = assert_lowered_plan_byte_eq(make, lower, files.task_ctx(), true).await;
+        assert_eq!(count::<PhysicalUnion>(&root), 1);
+        Ok(())
+    }
+}
