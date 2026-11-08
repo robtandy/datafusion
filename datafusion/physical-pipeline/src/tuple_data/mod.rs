@@ -1055,6 +1055,89 @@ pub(crate) mod test_data {
                 false,
             ),
         ];
+        // Degenerate types: fixed size lists of size 0, structs without
+        // fields in other types, and unions and run-end encoded arrays of
+        // nulls.
+        let item = |data_type: DataType| Arc::new(Field::new("item", data_type, true));
+        let empty_structs = |nulls: Vec<bool>| -> ArrayRef {
+            Arc::new(StructArray::new_empty_fields(
+                nulls.len(),
+                Some(NullBuffer::from(nulls)),
+            ))
+        };
+        let empty_struct_type = DataType::Struct(Fields::empty());
+        let union_fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("s", empty_struct_type.clone(), true),
+                Field::new("n", DataType::Null, true),
+            ],
+        )
+        .unwrap();
+        arrays.extend([
+            (
+                "fixed size lists of size 0",
+                Arc::new(
+                    FixedSizeListArray::try_new_with_length(
+                        item(DataType::Int32),
+                        0,
+                        Arc::new(Int32Array::from(Vec::<i32>::new())),
+                        Some(NullBuffer::from(vec![true, false, true, true])),
+                        4,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+                true,
+            ),
+            (
+                "lists of structs without fields",
+                Arc::new(ListArray::new(
+                    item(empty_struct_type.clone()),
+                    OffsetBuffer::from_lengths([2, 0, 3, 1]),
+                    empty_structs(vec![true, false, true, true, false, true]),
+                    Some(NullBuffer::from(vec![true, false, true, true])),
+                )),
+                true,
+            ),
+            (
+                "dictionary of structs without fields",
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![Some(0), None, Some(1), Some(0)]),
+                        empty_structs(vec![true, false]),
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+            (
+                "dense union of a struct without fields and of nulls",
+                Arc::new(
+                    UnionArray::try_new(
+                        union_fields,
+                        vec![0, 1, 0, 0].into(),
+                        Some(vec![0, 0, 1, 2].into()),
+                        vec![
+                            empty_structs(vec![true, false, true]),
+                            Arc::new(NullArray::new(1)),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                false,
+            ),
+            (
+                "run-end encoded nulls",
+                Arc::new(
+                    RunArray::<Int16Type>::try_new(
+                        &Int16Array::from(vec![2, 4]),
+                        &NullArray::new(2),
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+        ]);
         arrays.extend(
             dictionaries_of_values_without_nulls()
                 .into_iter()

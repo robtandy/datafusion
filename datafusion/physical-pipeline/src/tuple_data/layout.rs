@@ -155,6 +155,13 @@ pub struct ColumnLayout {
 
 impl ColumnLayout {
     fn try_new(data_type: &DataType, offset: usize) -> Result<Self> {
+        // Before anything is built for the type: Arrow cannot create rows
+        // (e.g. a null row) of a union without fields.
+        if has_union_without_fields(data_type) {
+            return not_impl_err!(
+                "TupleDataLayout does not support unions without fields: {data_type}"
+            );
+        }
         let value_type = match data_type {
             DataType::Dictionary(_, value_type) => {
                 if matches!(value_type.as_ref(), DataType::Dictionary(..)) {
@@ -746,6 +753,34 @@ fn without_dictionaries(data_type: &DataType) -> DataType {
     }
 }
 
+/// Whether `data_type` is or contains (at any depth) a union without
+/// fields, which cannot have any row: every row of a union has the type id
+/// of one of its fields.
+fn has_union_without_fields(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(fields, _) => {
+            fields.is_empty()
+                || fields
+                    .iter()
+                    .any(|(_, f)| has_union_without_fields(f.data_type()))
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_union_without_fields(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|f| has_union_without_fields(f.data_type())),
+        DataType::RunEndEncoded(_, values) => {
+            has_union_without_fields(values.data_type())
+        }
+        DataType::Dictionary(_, values) => has_union_without_fields(values),
+        _ => false,
+    }
+}
+
 /// Whether `data_type` is a union or contains a union at any depth.
 fn has_union(data_type: &DataType) -> bool {
     match data_type {
@@ -900,9 +935,10 @@ impl TupleDataLayout {
     /// Returns `true` if columns of type `data_type` can be stored in a
     /// [`TupleDataCollection`](super::TupleDataCollection).
     ///
-    /// All types are supported except nested dictionaries, dictionaries
-    /// inside nested types that Arrow cannot cast to (e.g. inside unions),
-    /// and types that the Arrow row format does not support.
+    /// All types are supported except dictionaries of dictionaries, types
+    /// with a union without fields (at any depth: such a union cannot have
+    /// rows), and nested types whose values the Arrow row format cannot
+    /// encode or restore exactly.
     pub fn supports_data_type(data_type: &DataType) -> bool {
         ColumnLayout::try_new(data_type, 0).is_ok()
     }
@@ -986,7 +1022,7 @@ impl TupleDataLayout {
 mod tests {
     use super::*;
 
-    use arrow::datatypes::{TimeUnit, UnionFields, UnionMode};
+    use arrow::datatypes::{Fields, TimeUnit, UnionFields, UnionMode};
 
     fn layout(types: Vec<DataType>, with_hash: bool) -> TupleDataLayout {
         TupleDataLayout::try_new_from_types(types, with_hash).unwrap()
@@ -1171,6 +1207,79 @@ mod tests {
         assert!(!TupleDataLayout::supports_data_type(
             &DataType::FixedSizeBinary(-1)
         ));
+    }
+
+    #[test]
+    fn unions_without_fields_are_not_supported() {
+        let union = |fields: Vec<Field>, mode| {
+            let type_ids = (0..fields.len() as i8).collect::<Vec<_>>();
+            DataType::Union(UnionFields::try_new(type_ids, fields).unwrap(), mode)
+        };
+        for mode in [UnionMode::Sparse, UnionMode::Dense] {
+            let empty = union(vec![], mode);
+            let item = || Arc::new(Field::new("item", empty.clone(), true));
+            let unsupported = [
+                empty.clone(),
+                // A union with an (inactive) union child without fields.
+                union(
+                    vec![
+                        Field::new("a", DataType::Int32, true),
+                        Field::new("b", empty.clone(), true),
+                    ],
+                    mode,
+                ),
+                DataType::List(item()),
+                DataType::LargeListView(item()),
+                DataType::FixedSizeList(item(), 2),
+                DataType::FixedSizeList(item(), 0),
+                DataType::Struct(vec![Field::new("u", empty.clone(), true)].into()),
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("k", DataType::Utf8, false),
+                                Field::new("v", empty.clone(), true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    item(),
+                ),
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(empty.clone())),
+            ];
+            for data_type in unsupported {
+                // Neither panics.
+                assert!(
+                    !TupleDataLayout::supports_data_type(&data_type),
+                    "{data_type}"
+                );
+                let err = TupleDataLayout::try_new_from_types([data_type.clone()], false)
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("unions without fields"),
+                    "{data_type}: {err}"
+                );
+            }
+            // Unions of nulls and of structs without fields are fine.
+            for data_type in [
+                union(vec![Field::new("n", DataType::Null, true)], mode),
+                union(
+                    vec![Field::new("s", DataType::Struct(Fields::empty()), true)],
+                    mode,
+                ),
+            ] {
+                assert!(
+                    TupleDataLayout::supports_data_type(&data_type),
+                    "{data_type}"
+                );
+            }
+        }
     }
 
     #[test]
