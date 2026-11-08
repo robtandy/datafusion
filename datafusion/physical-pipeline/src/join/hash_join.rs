@@ -3043,6 +3043,69 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_limit_above_the_join_stops_it() -> Result<()> {
+        use crate::operators::limit::PhysicalLimit;
+        // Every probe row matches many build rows; the `Left` join also has
+        // a pipeline of the unmatched build rows, which the limit skips.
+        let build_batches = (0..4)
+            .map(|i| data_batch("l", i * 1000..(i + 1) * 1000, 0))
+            .collect::<Vec<_>>();
+        let probe_batches = (0..50)
+            .map(|i| data_batch("r", i * 100..(i + 1) * 100, 1))
+            .collect::<Vec<_>>();
+        for join_type in [JoinType::Inner, JoinType::Left, JoinType::RightMark] {
+            for preserve_order in [false, true] {
+                let probe = source(data_schema("r"), probe_batches.clone());
+                let join = join_of(
+                    source(data_schema("l"), build_batches.clone()) as _,
+                    Arc::clone(&probe) as _,
+                    join_type,
+                )?;
+                let limit: Arc<dyn PhysicalOperator> = Arc::new(
+                    PhysicalLimit::new(join, 0, Some(10))
+                        .with_preserve_order(preserve_order),
+                );
+                let batches =
+                    with_timeout(Executor::collect(limit, task_ctx(), 4)).await?;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(rows, 10, "{join_type}");
+                assert!(probe.produced() < 50, "{join_type}: {}", probe.produced());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_build_side_is_charged_to_the_memory_pool() -> Result<()> {
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        let build_batches = (0..10)
+            .map(|i| data_batch("l", i * 1000..(i + 1) * 1000, 0))
+            .collect::<Vec<_>>();
+        let join = || {
+            join_of(
+                source(data_schema("l"), build_batches.clone()) as _,
+                source(data_schema("r"), vec![data_batch("r", 0..100, 0)]) as _,
+                JoinType::Inner,
+            )
+        };
+        let limited = |limit: usize| -> Result<Arc<TaskContext>> {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_limit(limit, 1.0)
+                .build_arc()?;
+            Ok(Arc::new(TaskContext::default().with_runtime(runtime)))
+        };
+        let err = with_timeout(Executor::collect(join()?, limited(64 * 1024)?, 4))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("PhysicalHashJoin"), "{err}");
+        let batches =
+            with_timeout(Executor::collect(join()?, limited(64 * 1024 * 1024)?, 4))
+                .await?;
+        assert!(!batches.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn lowering_of_hash_joins() -> Result<()> {
         let try_lower = |plan: Arc<dyn ExecutionPlan>| {
