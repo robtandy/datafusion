@@ -1239,6 +1239,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lists_built_per_batch_stay_in_datafusion() {
+        // On the batch of 4096 rows, the 32-bit offsets of the lists overflow,
+        // on each chunk of 2048 rows of a pipeline, they do not: when
+        // `CASE WHEN x THEN a ELSE b END` merges the lists of `a` on the first
+        // 2048 rows (`1 << 30` nulls) and of `b` on the others (`1 << 30` too),
+        // and when a constant list of `1 << 19` nulls is broadcast to the
+        // rows.
+        let batch = lists_to_merge();
+        let schema = batch.schema();
+        for expr in [
+            physical_expr("CASE WHEN x THEN a ELSE b END", &schema),
+            constant_list_of_nulls(),
+        ] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(Arc::clone(&expr), "m")],
+                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let projection_plan = plan();
+            let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(
+                !PhysicalProjection::supports_projection_exec(exec),
+                "{expr}"
+            );
+            let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+            let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+            assert!(outcome.unwrap_err().contains("overflow"), "{expr}");
+        }
+        // The lists of a column are passed on: the projection is lowered, and
+        // returns the 4096 rows (whose lists are not compared, as they have
+        // `1 << 31` values).
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(physical_expr("a", &schema), "a")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let operator = lower(&plan()).unwrap();
+        assert_eq!(NativeOperators::of(&operator).projections, 1);
+        let lowered =
+            Arc::new(crate::bridge::PipelineRootExec::try_new(operator, plan()).unwrap());
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        assert_eq!(outcome(plan(), Arc::clone(&task_ctx)).await, Ok(4096));
+        assert_eq!(outcome(lowered, task_ctx).await, Ok(4096));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn operations_on_unsupported_types_stay_in_datafusion() {
         // `NOT` of an integer fails whenever it is evaluated, on an empty batch
         // too, which a pipeline skips.

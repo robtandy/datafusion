@@ -1719,6 +1719,93 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// The number of rows of `plan`, executed on a task, or its error, or the
+    /// message of its panic.
+    pub(crate) async fn outcome(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+    ) -> std::result::Result<usize, String> {
+        match datafusion_common_runtime::SpawnedTask::spawn(collect(plan, task_ctx))
+            .join()
+            .await
+        {
+            Ok(Ok(batches)) => Ok(batches.iter().map(RecordBatch::num_rows).sum()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(join) if join.is_panic() => {
+                let panic = join.into_panic();
+                Err(panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default())
+            }
+            Err(join) => Err(join.to_string()),
+        }
+    }
+
+    /// Execute `plan` with DataFusion and lowered (see [`lower`]), each on a
+    /// task, and assert that the outcomes are the same, with no native filter
+    /// or projection.
+    pub(crate) async fn assert_same_outcome_in_datafusion(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+    ) -> std::result::Result<usize, String> {
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        assert_eq!((operators.filters, operators.projections), (0, 0));
+        let lowered =
+            Arc::new(PipelineRootExec::try_new(operator, Arc::clone(&plan)).unwrap());
+        let expected = outcome(plan, Arc::clone(&task_ctx)).await;
+        assert_eq!(outcome(lowered, task_ctx).await, expected);
+        expected
+    }
+
+    /// A batch of 4096 rows of `x` (`Boolean`), `true` on the first 2048 rows,
+    /// and of `a` and `b`, lists of nulls (which take no memory), empty but a
+    /// list of `1 << 30` nulls on the first row (`a`) and on the 2049th row
+    /// (`b`).
+    pub(crate) fn lists_to_merge() -> RecordBatch {
+        let field = Arc::new(Field::new_list_field(DataType::Null, true));
+        let list = |row: usize| -> ArrayRef {
+            let offsets = arrow::buffer::OffsetBuffer::from_lengths(
+                (0..4096).map(|other| if other == row { 1 << 30 } else { 0 }),
+            );
+            let nulls = Arc::new(arrow::array::NullArray::new(1 << 30));
+            Arc::new(
+                arrow::array::ListArray::try_new(
+                    Arc::clone(&field),
+                    offsets,
+                    nulls,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let x =
+            arrow::array::BooleanArray::from_iter((0..4096).map(|row| Some(row < 2048)));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Boolean, true),
+            Field::new("a", DataType::List(Arc::clone(&field)), true),
+            Field::new("b", DataType::List(Arc::clone(&field)), true),
+        ]));
+        RecordBatch::try_new(schema, vec![Arc::new(x), list(0), list(2048)]).unwrap()
+    }
+
+    /// A constant list of `1 << 19` nulls.
+    pub(crate) fn constant_list_of_nulls() -> Arc<dyn PhysicalExpr> {
+        let field = Arc::new(Field::new_list_field(DataType::Null, true));
+        let list = arrow::array::ListArray::try_new(
+            field,
+            arrow::buffer::OffsetBuffer::from_lengths([1 << 19]),
+            Arc::new(arrow::array::NullArray::new(1 << 19)),
+            None,
+        )
+        .unwrap();
+        Arc::new(datafusion_physical_expr::expressions::Literal::new(
+            datafusion_common::ScalarValue::List(Arc::new(list)),
+        ))
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -2074,11 +2161,8 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion_physical_plan::collect;
     use datafusion_physical_plan::filter::batch_filter;
     use datafusion_physical_plan::sorts::sort::SortExec;
-
-    use crate::bridge::PipelineRootExec;
 
     use crate::test_utils::test_session_config;
 
@@ -3904,45 +3988,6 @@ mod tests {
         }
     }
 
-    /// The number of rows of `plan`, executed on a task, or its error, or the
-    /// message of its panic.
-    async fn outcome(
-        plan: Arc<dyn ExecutionPlan>,
-        task_ctx: Arc<TaskContext>,
-    ) -> std::result::Result<usize, String> {
-        match datafusion_common_runtime::SpawnedTask::spawn(collect(plan, task_ctx))
-            .join()
-            .await
-        {
-            Ok(Ok(batches)) => Ok(batches.iter().map(RecordBatch::num_rows).sum()),
-            Ok(Err(error)) => Err(error.to_string()),
-            Err(join) if join.is_panic() => {
-                let panic = join.into_panic();
-                Err(panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                    .unwrap_or_default())
-            }
-            Err(join) => Err(join.to_string()),
-        }
-    }
-
-    /// Execute `plan` with DataFusion and lowered (see [`lower`]), each on a
-    /// task, and assert that the outcomes are the same, with no native filter.
-    async fn assert_same_outcome_in_datafusion(
-        plan: Arc<dyn ExecutionPlan>,
-        task_ctx: Arc<TaskContext>,
-    ) -> std::result::Result<usize, String> {
-        let operator = lower(&plan).unwrap();
-        assert_eq!(NativeOperators::of(&operator).filters, 0);
-        let lowered =
-            Arc::new(PipelineRootExec::try_new(operator, Arc::clone(&plan)).unwrap());
-        let expected = outcome(plan, Arc::clone(&task_ctx)).await;
-        assert_eq!(outcome(lowered, task_ctx).await, expected);
-        expected
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_whose_output_lists_may_overflow_stay_in_datafusion() {
         // `FilterExec` coalesces the first 256 rows of both batches into one,
@@ -3966,6 +4011,40 @@ mod tests {
         let plan = df.create_physical_plan().await.unwrap();
         let overflow = assert_same_outcome_in_datafusion(plan, ctx.task_ctx()).await;
         assert!(overflow.unwrap_err().contains("offset overflow"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lists_built_per_batch_stay_in_datafusion() {
+        // `CASE WHEN x THEN a ELSE b END` merges the lists of `a` on the first
+        // 2048 rows (`1 << 30` nulls) and of `b` on the others (`1 << 30` nulls
+        // too): on the batch of 4096 rows, their 32-bit offsets overflow, on
+        // each chunk of 2048 rows of a pipeline, they do not. The filter only
+        // outputs `x`.
+        let batch = lists_to_merge();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let case = physical_expr("CASE WHEN x THEN a ELSE b END", &schema);
+            let predicate = Arc::new(
+                datafusion_physical_expr::expressions::IsNotNullExpr::new(case),
+            );
+            Arc::new(
+                datafusion_physical_plan::filter::FilterExecBuilder::new(
+                    predicate,
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .apply_projection(Some(vec![0]))
+                .unwrap()
+                .build()
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(outcome.unwrap_err().contains("overflow"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
