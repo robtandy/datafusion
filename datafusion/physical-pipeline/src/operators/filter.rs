@@ -830,6 +830,7 @@ pub(crate) mod test_support {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_plan::aggregates::AggregateExec;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::limit::LocalLimitExec;
@@ -955,14 +956,19 @@ pub(crate) mod test_support {
     /// partition) does not keep. DataFusion then executes the child too, with
     /// its own children lowered.
     ///
-    /// The children of a node with a fetch are below a limit that stops the
-    /// execution early, unless the node is a sort, which reads all of its
-    /// input before it produces output.
+    /// The children of a node with a fetch (or of an aggregation with a soft
+    /// limit, which stops reading its input once it has enough groups) are
+    /// below a limit that stops the execution early, unless the node is a
+    /// sort, which reads all of its input before it produces output.
     fn bridged_plan(
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let limited = !plan.is::<SortExec>() && (limited || plan.fetch().is_some());
+        let soft_limit = plan
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|aggregate| aggregate.limit_options().is_some());
+        let limited =
+            !plan.is::<SortExec>() && (limited || plan.fetch().is_some() || soft_limit);
         let children = plan.children();
         let new_children = children
             .iter()
@@ -2840,6 +2846,42 @@ mod tests {
             assert!(error.is_none(), "{expr}");
             assert_eq!(operators.filters + operators.projections, 1, "{expr}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // `with_limit_options` is the only public way to build a soft limit.
+    #[expect(deprecated)]
+    async fn fallible_operators_below_soft_limits_stay_in_datafusion() {
+        use datafusion_physical_plan::aggregates::{
+            AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
+        };
+        // `SELECT DISTINCT x ... LIMIT 1`: the aggregation stops reading its
+        // input after the batch in which it has one group. DataFusion divides
+        // all 4096 rows of the batch, a native filter only the first chunk.
+        let batch = runs(&[(1, 2048), (0, 2048)]);
+        let plan = || {
+            let filter = filter_exec("10 / x > 0", scan(&batch), None);
+            let schema = filter.schema();
+            let group_by = PhysicalGroupBy::new_single(vec![(
+                physical_expr("x", &schema),
+                "x".to_owned(),
+            )]);
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Partial,
+                group_by,
+                vec![],
+                vec![],
+                filter,
+                schema,
+            )
+            .unwrap()
+            .with_limit_options(Some(LimitOptions::new(1)));
+            assert!(aggregate.limit_options().is_some());
+            Arc::new(aggregate) as Arc<dyn ExecutionPlan>
+        };
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        assert_eq!(operators.filters, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
