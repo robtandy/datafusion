@@ -2047,6 +2047,44 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// A batch of `rows` rows of `id` (`Int32`, the row number) and of `d`, a
+    /// dictionary (`Int32` keys) of a single string of 2 MiB: the keys of the
+    /// first `nulls` rows are null, the others `0`.
+    pub(crate) fn repeated_large_string(rows: i32, nulls: i32) -> RecordBatch {
+        let keys =
+            Int32Array::from_iter((0..rows).map(|row| (row >= nulls).then_some(0)));
+        let d = DictionaryArray::<Int32Type>::try_new(
+            keys,
+            Arc::new(StringArray::from(vec!["x".repeat(2 << 20)])),
+        )
+        .unwrap();
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            ("d", Arc::new(d) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// `id < bound AND CAST(d AS Utf8) IS NULL` (see [`repeated_large_string`]).
+    pub(crate) fn guarded_unpacking(
+        schema: &SchemaRef,
+        bound: i32,
+    ) -> Arc<dyn PhysicalExpr> {
+        let cast = Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+            physical_expr("d", schema),
+            DataType::Utf8,
+            None,
+        ));
+        Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+            physical_expr(&format!("id < {bound}"), schema),
+            datafusion_expr::Operator::And,
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(cast)),
+        ))
+    }
+
     /// A batch of 4096 rows of `x` (`Int32`) and of `d`, a dictionary of
     /// `(1 << 31) + 1` nulls (which take no memory) with `UInt64` keys: the
     /// first 2049 rows are `0` and the key `0`, the others `1` and the key
@@ -4028,6 +4066,38 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 1, "{input}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unpacking_repeated_values_stays_in_datafusion() {
+        // Unpacking a dictionary copies its values for every row that has
+        // them: the 32-bit offsets of 1536 strings of 2 MiB overflow.
+        // `FilterExec` unpacks all rows of the batch (a quarter of them pass
+        // `id < 512`), and fails, but the native filter only the rows that
+        // pass `id < 512`, whose keys are null.
+        let batch = repeated_large_string(2048, 512);
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                FilterExec::try_new(
+                    guarded_unpacking(&schema, 512),
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.to_lowercase().contains("overflow")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

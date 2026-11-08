@@ -1589,6 +1589,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unpacking_repeated_values_stays_in_datafusion() {
+        // `ProjectionExec` unpacks the dictionary on all rows of the batch
+        // (half of them pass `id < 2048`), and the 32-bit offsets of 2048
+        // strings of 2 MiB overflow, but a pipeline evaluates it on chunks of
+        // 2048 rows: those of the first one have null keys, and no row of the
+        // second one passes `id < 2048`, so `AND` does not unpack them (see
+        // the test of the same name for filters).
+        let batch = repeated_large_string(4096, 2048);
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(guarded_unpacking(&schema, 2048), "b")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.to_lowercase().contains("overflow")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn casts_of_dictionary_keys_stay_in_datafusion() {
         // `ProjectionExec` evaluates the cast of the keys of `d` on all rows of
         // the batch (half of them pass `x = 0`), and fails on `1 << 31`, but a

@@ -386,6 +386,10 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         Fallibility::Infallible if fails_on_operand_types(expr, schema) => {
             Fallibility::Uniform
         }
+        // Or on the number of rows it is evaluated on together.
+        Fallibility::Infallible if expands_shared_values(expr, schema) => {
+            Fallibility::PerRow
+        }
         fallibility => fallibility,
     }
 }
@@ -753,6 +757,12 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   memory, e.g. when `CASE WHEN x THEN a ELSE b END` merges lists of `a` and
 ///   of `b`, or when a constant list is broadcast to the rows of a batch, so
 ///   whether it fails depends on the number of rows of the batches;
+/// * a part of `expr` other than a column copies values that its operands
+///   share between rows (the values of dictionaries and of runs, and what
+///   views point to) into strings or binaries with 32-bit offsets (at any
+///   depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a single string
+///   of 2 MiB, which 1024 rows, but not 1023, overflow, without taking more
+///   memory than one row;
 /// * a part of `expr` that may fail is evaluated on, or produces,
 ///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
 ///   dictionary of `d`, even those that no row references (when DataFusion
@@ -822,6 +832,9 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
             && expr
                 .data_type(schema)
                 .is_ok_and(|data_type| contains_narrow_lengths(&data_type)))
+        // It copies values that its operands share between rows into arrays
+        // whose 32-bit offsets overflow beyond 2 GiB of bytes.
+        || expands_shared_values(expr, schema)
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -935,6 +948,74 @@ fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
             counts && can_build_nulls(values.data_type(), len.min(1))
         }
         _ => true,
+    }
+}
+
+/// Whether `expr` may copy values that its operands share between rows
+/// (the values of dictionaries and of runs, and the bytes or values that views
+/// point to, any number of times) into arrays with 32-bit byte offsets
+/// (`Utf8`, `Binary`), e.g. a cast that unpacks a dictionary. Their offsets
+/// overflow beyond 2 GiB of bytes in an array (e.g. a string of 2 MiB,
+/// repeated by 1024 rows), which the operands reach with more rows, but not
+/// more memory: whether it fails depends on how many rows it is evaluated on
+/// together.
+fn expands_shared_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    !expr.is::<Column>()
+        && expr
+            .data_type(schema)
+            .is_ok_and(|data_type| contains_byte_offsets(&data_type))
+        && expr.children().iter().any(|child| {
+            child
+                .data_type(schema)
+                .is_ok_and(|data_type| shares_values(&data_type))
+        })
+}
+
+/// Whether arrays of `data_type` contain, at any depth, values that several
+/// rows may share: dictionaries, run-end encoded arrays, and views.
+fn shares_values(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(..)
+        | DataType::RunEndEncoded(..)
+        | DataType::Utf8View
+        | DataType::BinaryView
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => shares_values(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| shares_values(field.data_type()))
+        }
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| shares_values(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether arrays of `data_type` contain, at any depth, bytes with 32-bit
+/// offsets (`Utf8`, `Binary`), but for the values of dictionaries, which
+/// Arrow builds once for all rows (packing distinct values, or casting the
+/// values of a dictionary).
+fn contains_byte_offsets(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8 | DataType::Binary => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_byte_offsets(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_byte_offsets(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_byte_offsets(field.data_type())),
+        DataType::RunEndEncoded(_, values) => contains_byte_offsets(values.data_type()),
+        _ => false,
     }
 }
 
@@ -1545,6 +1626,77 @@ mod tests {
             state.end_chunk();
         }
         assert_eq!(state.permutation(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn finds_expansions_of_shared_values() {
+        use Fallibility::*;
+        let strings = Arc::new(Field::new("values", DataType::Utf8, true));
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", dictionary.clone(), true),
+            Field::new("v", DataType::Utf8View, true),
+            Field::new(
+                "r",
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    Arc::clone(&strings),
+                ),
+                true,
+            ),
+            Field::new(
+                "t",
+                DataType::Struct(vec![Field::new("d", dictionary, true)].into()),
+                true,
+            ),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let cast = |name: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
+            Arc::new(CastExpr::new(physical_expr(name, &schema), to, None))
+        };
+        for (expr, expected) in [
+            // Unpacking dictionaries, runs or views into 32-bit offsets, also
+            // nested ones.
+            (cast("d", DataType::Utf8), (PerRow, true)),
+            (cast("d", DataType::Binary), (PerRow, true)),
+            (cast("r", DataType::Utf8), (PerRow, true)),
+            (cast("v", DataType::Utf8), (PerRow, true)),
+            (
+                cast(
+                    "t",
+                    DataType::Struct(vec![Field::new("d", DataType::Utf8, true)].into()),
+                ),
+                (PerRow, true),
+            ),
+            // But not into 64-bit offsets or views, nor into the values of a
+            // dictionary, which Arrow casts once.
+            (cast("d", DataType::LargeUtf8), (Infallible, false)),
+            (cast("d", DataType::Utf8View), (Infallible, false)),
+            (
+                cast(
+                    "d",
+                    DataType::Dictionary(
+                        Box::new(DataType::Int64),
+                        Box::new(DataType::Utf8),
+                    ),
+                ),
+                (Infallible, false),
+            ),
+            // Nor what does not share values.
+            (cast("s", DataType::Utf8View), (Infallible, false)),
+            (physical_expr("d", &schema), (Infallible, false)),
+            (physical_expr("d IS NULL", &schema), (Infallible, false)),
+        ] {
+            assert_eq!(
+                (
+                    fallibility(&expr, &schema),
+                    depends_on_batches(&expr, &schema)
+                ),
+                expected,
+                "{expr}"
+            );
+        }
     }
 
     #[test]
