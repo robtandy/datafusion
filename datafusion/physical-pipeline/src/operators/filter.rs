@@ -1380,6 +1380,22 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(y), Arc::new(s)]).unwrap()
     }
 
+    /// A batch of the columns `x` (`Int32`) and `s` (`Utf8`), with the runs
+    /// `((x, s), rows)`.
+    pub(crate) fn xss(runs: &[((i32, &str), usize)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let rows = || {
+            runs.iter()
+                .flat_map(|&(xs, rows)| std::iter::repeat_n(xs, rows))
+        };
+        let x = rows().map(|(x, _)| x).collect::<Int32Array>();
+        let s = StringArray::from_iter_values(rows().map(|(_, s)| s));
+        RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(s)]).unwrap()
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -2826,6 +2842,60 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{predicate}");
             assert_eq!(operators.filters, 1, "{predicate}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion() {
+        // One batch of 4096 rows, `(x, s) = (1, "a")` then `(0, "é")`. On
+        // strings that are all ASCII, Arrow matches an ASCII `ILIKE` pattern
+        // without wildcards without a regular expression; on others, it
+        // compiles one, here of 100000 `s` (each `[sSſ]`), which is too big.
+        // DataFusion evaluates the `ILIKE` on all rows of the batch and fails;
+        // the native filter only on the first chunk, which is all ASCII.
+        let pattern = "s".repeat(100_000);
+        let batch = xss(&[((1, "a"), 2048), ((0, "é"), 2048)]);
+        let predicate = format!("x > 0 AND s ILIKE '{pattern}'");
+        let plan = || filter_exec(&predicate, scan(&batch), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let error = error.unwrap();
+        assert!(error.contains("Unable to build regex"), "{error}");
+        assert_eq!(operators.filters, 0);
+        // On the chunks of the pipeline, the predicate does not fail.
+        let filter = filter_for(&predicate, &batch.schema());
+        assert!(filter.errors_depend_on_batches());
+        let chunks = [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
+        assert!(drive(&filter, chunks).is_ok());
+        // Patterns that compile are lowered.
+        for predicate in ["x > 0 AND s ILIKE 'A%'", "x > 0 AND s NOT ILIKE '%É'"] {
+            let (error, operators) = assert_native_plan_parity(
+                || filter_exec(predicate, scan(&batch), None),
+                false,
+            )
+            .await;
+            assert!(error.is_none(), "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_with_case_insensitive_patterns_stays_in_datafusion() {
+        // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
+        // batch, whose strings are not all ASCII: Arrow compiles the pattern of
+        // `ILIKE`, which is too big, and fails (see
+        // `case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion`).
+        let batch = xss(&[((1, "a"), 2048), ((0, "é"), 2048)]);
+        let predicate = format!("s ILIKE '{}'", "s".repeat(100_000));
+        let plan = || filter_exec(&predicate, scan(&batch), Some(0));
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        let error = error.unwrap();
+        assert!(error.contains("Unable to build regex"), "{error}");
+        assert_eq!(operators.filters, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

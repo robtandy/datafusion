@@ -1044,6 +1044,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion() {
+        // One batch of 4096 rows, `(x, s) = (1, "a")` then `(0, "é")`:
+        // DataFusion evaluates `s ILIKE 'sss…'` on all rows of the batch, and
+        // compiles its pattern (too big) because some strings are not ASCII,
+        // the native projection only on the first chunk (all ASCII), on which
+        // Arrow matches the pattern without compiling it.
+        let batch = xss(&[((1, "a"), 2048), ((0, "é"), 2048)]);
+        let schema = batch.schema();
+        let expr = format!("x > 0 AND s ILIKE '{}'", "s".repeat(100_000));
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(physical_expr(&expr, &schema), "m")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.unwrap().contains("Unable to build regex"));
+        assert_eq!(operators.projections, 0);
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(physical_expr(&expr, &schema), "m".to_owned())],
+        )
+        .unwrap();
+        assert!(project(&native, &DataChunk::from(batch.slice(0, 2048))).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that

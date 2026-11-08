@@ -57,7 +57,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
@@ -451,17 +451,70 @@ fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
 }
 
 /// How a `LIKE` or a regular expression match with a constant pattern can
-/// fail: only if its pattern does not compile, and then whenever it is
-/// evaluated.
+/// fail: only if Arrow cannot compile its pattern, which it compiles before
+/// it matches any row, so also on an empty batch. Except for a
+/// case-insensitive `LIKE`: Arrow matches strings that are all ASCII (as on
+/// an empty batch) with an ASCII pattern of a simple form (e.g. without
+/// wildcards) without compiling the pattern, so it is also evaluated on a
+/// constant string that is not ASCII. If only this fails, it fails on some
+/// rows (strings that are not all ASCII) and not on others.
 fn constant_pattern_fallibility(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
 ) -> Fallibility {
     if fails_without_rows(expr, schema) {
-        Fallibility::Uniform
-    } else {
-        Fallibility::Infallible
+        return Fallibility::Uniform;
     }
+    match on_non_ascii_strings(expr, schema) {
+        None => Fallibility::Infallible,
+        Some(Ok(probe)) if !fails_on_one_row(&probe) => Fallibility::Infallible,
+        Some(_) => Fallibility::PerRow,
+    }
+}
+
+/// For a case-insensitive `LIKE`, the same `LIKE` of a constant string that
+/// is not ASCII, of the type of the strings it matches.
+fn on_non_ascii_strings(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Option<Result<Arc<dyn PhysicalExpr>>> {
+    let non_ascii = |strings: &Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
+        let value = ScalarValue::from("é").cast_to(&strings.data_type(schema)?)?;
+        Ok(Arc::new(Literal::new(value)))
+    };
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>()
+        && matches!(binary.op(), Operator::ILikeMatch | Operator::NotILikeMatch)
+    {
+        return Some(
+            non_ascii(binary.left()).map(|left| -> Arc<dyn PhysicalExpr> {
+                Arc::new(BinaryExpr::new(
+                    left,
+                    *binary.op(),
+                    Arc::clone(binary.right()),
+                ))
+            }),
+        );
+    }
+    let like = expr.downcast_ref::<LikeExpr>()?;
+    like.case_insensitive().then(|| {
+        non_ascii(like.expr()).map(|strings| -> Arc<dyn PhysicalExpr> {
+            Arc::new(LikeExpr::new(
+                like.negated(),
+                true,
+                strings,
+                Arc::clone(like.pattern()),
+            ))
+        })
+    })
+}
+
+/// Whether evaluating `expr`, which references no column, on one row fails.
+fn fails_on_one_row(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+        .map_err(Into::into)
+        .and_then(|batch| expr.evaluate(&batch)?.into_array(1))
+        .is_err()
 }
 
 /// Whether `expr` is a constant: a literal, possibly cast (DataFusion casts
@@ -562,20 +615,49 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    has_fallible_conditional_operand(expr, schema)
-        || fails_uniformly(expr, schema)
-        || (!is_infallible(expr, schema) && fails_without_rows(expr, schema))
-        || evaluates_dictionaries(expr, schema)
+    let (fallibility, depends_on_batches) = analyze(expr, schema);
+    depends_on_batches
+        || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
 }
 
-/// Whether an operand in `expr` that DataFusion evaluates on rows that depend
-/// on the batch (the right side of an `AND` or an `OR`, or a value after the
-/// first one of an `IN` list) may fail on some rows and not on others.
-fn has_fallible_conditional_operand(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-) -> bool {
-    let conditional = if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+/// The fallibility of `expr` (see [`fallibility`]), and whether its errors
+/// depend on the batches it is evaluated on, but for failures on empty
+/// batches (see [`depends_on_batches`]). Each node is classified once.
+fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool) {
+    let node = node_fallibility(expr, schema);
+    let children = expr.children();
+    let analyzed = children
+        .iter()
+        .map(|child| analyze(child, schema))
+        .collect::<Vec<_>>();
+    let fallibility = analyzed
+        .iter()
+        .map(|&(fallibility, _)| fallibility)
+        .fold(node, Ord::max);
+    let conditional = conditional_operands(expr);
+    let depends_on_batches = analyzed.iter().any(|&(_, depends)| depends)
+        // It fails whenever DataFusion evaluates it.
+        || node == Fallibility::Uniform
+        // DataFusion evaluates an operand that may fail on some rows on rows
+        // that depend on the batch.
+        || children.iter().zip(&analyzed).any(|(child, &(fallibility, _))| {
+            fallibility == Fallibility::PerRow
+                && conditional.iter().any(|operand| Arc::ptr_eq(operand, child))
+        })
+        // It may fail and evaluates or produces dictionaries.
+        || (node != Fallibility::Infallible
+            && children.iter().copied().chain([expr]).any(|expr| {
+                expr.data_type(schema)
+                    .is_ok_and(|data_type| contains_dictionaries(&data_type))
+            }));
+    (fallibility, depends_on_batches)
+}
+
+/// The operands of `expr` that DataFusion evaluates on rows that depend on
+/// the batch: the right side of an `AND` or an `OR`, and the values after
+/// the first one of an `IN` list.
+fn conditional_operands(expr: &Arc<dyn PhysicalExpr>) -> &[Arc<dyn PhysicalExpr>] {
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         match binary.op() {
             Operator::And | Operator::Or => std::slice::from_ref(binary.right()),
             _ => &[],
@@ -584,37 +666,7 @@ fn has_fallible_conditional_operand(
         in_list.list().get(1..).unwrap_or_default()
     } else {
         &[]
-    };
-    conditional
-        .iter()
-        .any(|operand| fallibility(operand, schema) == Fallibility::PerRow)
-        || expr
-            .children()
-            .into_iter()
-            .any(|child| has_fallible_conditional_operand(child, schema))
-}
-
-/// Whether a part of `expr` fails whenever it is evaluated.
-fn fails_uniformly(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    node_fallibility(expr, schema) == Fallibility::Uniform
-        || expr
-            .children()
-            .into_iter()
-            .any(|child| fails_uniformly(child, schema))
-}
-
-/// Whether a part of `expr` that may fail has an operand or a result that
-/// contains dictionaries.
-fn evaluates_dictionaries(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    let children = expr.children();
-    (node_fallibility(expr, schema) != Fallibility::Infallible
-        && children.iter().copied().chain([expr]).any(|expr| {
-            expr.data_type(schema)
-                .is_ok_and(|data_type| contains_dictionaries(&data_type))
-        }))
-        || children
-            .into_iter()
-            .any(|child| evaluates_dictionaries(child, schema))
+    }
 }
 
 /// Whether arrays of `data_type` contain dictionaries, at any depth.
@@ -817,6 +869,28 @@ mod tests {
             physical_expr("b", &schema),
         ));
         assert_eq!(fallibility(&wrapping, &schema), Infallible);
+
+        // On strings that are all ASCII, as on an empty batch, Arrow matches
+        // an ASCII `ILIKE` pattern of a simple form without compiling it: a
+        // pattern of 100000 `s` (each `[sSſ]`) only fails on other strings.
+        let unicode = "s".repeat(100_000);
+        for (predicate, expected) in [
+            (format!("s ILIKE '{unicode}'"), PerRow),
+            (format!("u ILIKE '%{unicode}'"), PerRow),
+            (format!("s ILIKE '%{unicode}%'"), Uniform),
+            (format!("s LIKE '{unicode}'"), Infallible),
+        ] {
+            let expr = physical_expr(&predicate, &schema);
+            assert_eq!(fallibility(&expr, &schema), expected, "{expected:?}");
+        }
+        assert!(depends_on_batches(
+            &physical_expr(&format!("a > 0 AND s ILIKE '{unicode}'"), &schema),
+            &schema
+        ));
+        assert!(!depends_on_batches(
+            &physical_expr(&format!("s ILIKE '{unicode}' AND a > 0"), &schema),
+            &schema
+        ));
 
         // Packing values into a dictionary fails on batches with more distinct
         // values than its keys can index.
