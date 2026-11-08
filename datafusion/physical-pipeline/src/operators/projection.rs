@@ -1239,6 +1239,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operations_on_unsupported_types_stay_in_datafusion() {
+        // `NOT` of an integer fails whenever it is evaluated, on an empty batch
+        // too, which a pipeline skips.
+        let schema = xys(&[]).schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let not = Arc::new(datafusion_physical_expr::expressions::NotExpr::new(
+                physical_expr("x", &schema),
+            ));
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(not, "n")],
+                    scan_batches(&schema, std::slice::from_ref(&empty)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_some());
+        assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that

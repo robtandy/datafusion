@@ -3969,6 +3969,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operations_on_unsupported_types_stay_in_datafusion() {
+        // `NOT` of an integer fails whenever it is evaluated, on an empty batch
+        // too, which a pipeline skips.
+        let schema = runs(&[]).schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let not = Arc::new(datafusion_physical_expr::expressions::NotExpr::new(
+                physical_expr("x", &schema),
+            ));
+            Arc::new(
+                FilterExec::try_new(
+                    not,
+                    scan_batches(&schema, std::slice::from_ref(&empty)),
+                )
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_some());
+        assert_eq!(operators.filters, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fetch_zero_stays_in_datafusion() {
         // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
         // batch of its input, even an empty one, and stops: it never pulls the
