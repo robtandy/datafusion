@@ -23,11 +23,14 @@
 //! So an expression fails exactly when it fails in `ProjectionExec` for the
 //! same rows. The projection evaluates its expressions on chunks, not on the
 //! batches `ProjectionExec` sees (e.g. the batches a `FilterExec` coalesces
-//! its output into), so [`PhysicalProjection::try_from_projection_exec`] only
-//! lowers expressions whose errors do not depend on the batches (see
-//! [`depends_on_batches`]): `x = 0 OR 10 / x > 1`, whose right side DataFusion
-//! evaluates on all rows of a batch unless at most 20% of them have `x <> 0`,
-//! must be evaluated by DataFusion, on the batches of its input plan.
+//! its output into, or empty batches, which pipelines skip), so
+//! [`PhysicalProjection::try_from_projection_exec`] only lowers expressions
+//! whose errors do not depend on the batches (see [`depends_on_batches`]):
+//! `x = 0 OR 10 / x > 1`, whose right side DataFusion evaluates on all rows of
+//! a batch unless at most 20% of them have `x <> 0`, or
+//! `x = 0 OR s ~ 'a{1000000}'`, whose right side does not compile and is
+//! evaluated on empty batches, must be evaluated by DataFusion, on the
+//! batches of its input plan.
 //!
 //! The evaluation of expressions on some of the rows of a chunk (`BoundExprs`)
 //! is shared with [`PhysicalFilter`](super::filter::PhysicalFilter).
@@ -93,7 +96,7 @@ impl PhysicalProjection {
     /// Whether [`Self::try_from_projection_exec`] can lower `exec` with
     /// exactly its semantics, including its errors: whether none of its
     /// expressions has errors that depend on how DataFusion splits the rows
-    /// into batches (see [`depends_on_batches`]).
+    /// into batches, empty ones included (see [`depends_on_batches`]).
     ///
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), the expressions are evaluated on fewer rows when
@@ -958,6 +961,72 @@ mod tests {
         .unwrap();
         for batch in batches {
             assert!(project(&projection, &DataChunk::from(batch)).is_ok());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn projections_that_fail_on_some_batches_stay_in_datafusion() {
+        let schema = xys(&[]).schema();
+        let plan = |expr: &str, batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(physical_expr(expr, &schema), "m")],
+                    scan_batches(&schema, batches),
+                )
+                .unwrap(),
+            )
+        };
+        // One batch of 4096 rows, `(x, y) = (0, 1)` then `(1, 0)`: neither
+        // `x = 0` nor `y = 0` is true on all of its rows, but `x = 0` is on all
+        // rows of the first chunk, and `y = 0` on all rows of the second one.
+        let mixed = xys(&[((0, 1), 2048), ((1, 0), 2048)]);
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let zeros = xys(&[((0, 0), 2048)]);
+        let nested = "x = 0 OR (y = 0 OR s ~ 'a{1000000}')";
+        for (expr, batches, fails) in [
+            (nested, vec![mixed.clone()], true),
+            // On an empty batch, `OR` evaluates its right side.
+            (
+                "x = 0 OR s ~ 'a{1000000}'",
+                vec![empty.clone(), zeros.clone()],
+                true,
+            ),
+            ("x = 0 OR s ~ 'a{1000000}'", vec![zeros.clone()], false),
+            ("x = 0 OR s ~ 'a{1000000}'", vec![], false),
+            // Functions may fail on empty batches too.
+            ("regexp_like(s, 'a{1000000}')", vec![empty.clone()], true),
+            ("regexp_like(s, 'a{1000000}')", vec![], false),
+        ] {
+            let exec_plan = plan(expr, &batches);
+            let exec = exec_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(
+                !PhysicalProjection::supports_projection_exec(exec),
+                "{expr}"
+            );
+            let (error, operators) =
+                assert_native_plan_parity(|| plan(expr, &batches), false).await;
+            let input = format!("{expr} on {} batches", batches.len());
+            assert_eq!(error.is_some(), fails, "{input}: {error:?}");
+            assert_eq!(operators.projections, 0, "{input}");
+        }
+        // On the chunks of the pipeline, the projection does not fail.
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(physical_expr(nested, &schema), "m".to_owned())],
+        )
+        .unwrap();
+        for chunk in [mixed.slice(0, 2048), mixed.slice(2048, 2048)] {
+            assert!(project(&native, &DataChunk::from(chunk)).is_ok());
+        }
+        // A pattern that compiles cannot fail.
+        for batches in [vec![mixed], vec![empty, zeros], vec![]] {
+            let (error, operators) = assert_native_plan_parity(
+                || plan("x = 0 OR (y = 0 OR s ~ 'a+')", &batches),
+                false,
+            )
+            .await;
+            assert!(error.is_none());
+            assert_eq!(operators.projections, 1);
         }
     }
 

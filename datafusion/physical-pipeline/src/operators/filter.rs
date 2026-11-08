@@ -55,16 +55,18 @@
 //!
 //! DataFusion applies its 20% threshold to the batches it filters, the
 //! filter to its chunks, which are not DataFusion's batches (sources split
-//! batches into chunks, operators coalesce their output into batches). So
-//! [`PhysicalFilter::try_from_filter_exec`] only lowers predicates whose
-//! errors do not depend on the batches (see [`depends_on_batches`]): for the
-//! others, e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR 10 / x > 1`, the
-//! `FilterExec` must be executed by DataFusion, on the batches of its input
-//! plan. For the same reason, a `FilterExec` with a `fetch`, which stops
-//! after the batch in which the fetch is reached, is only lowered if its
-//! predicate cannot fail at all. A planner must also keep the filters whose
-//! predicate can fail in DataFusion below a limit that stops the execution
-//! early, see [`PhysicalFilter::supports_filter_exec`].
+//! batches into chunks, operators coalesce their output into batches, and
+//! pipelines skip empty chunks, while `FilterExec` also evaluates its
+//! predicate on empty batches). So [`PhysicalFilter::try_from_filter_exec`]
+//! only lowers predicates whose errors do not depend on the batches (see
+//! [`depends_on_batches`]): for the others, e.g. `x <> 0 AND 10 / x > 1`,
+//! `x = 0 OR 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'` (whose pattern does
+//! not compile), the `FilterExec` must be executed by DataFusion, on the
+//! batches of its input plan. For the same reason, a `FilterExec` with a
+//! `fetch`, which stops after the batch in which the fetch is reached, is
+//! only lowered if its predicate cannot fail at all. A planner must also keep
+//! the filters whose predicate can fail in DataFusion below a limit that
+//! stops the execution early, see [`PhysicalFilter::supports_filter_exec`].
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -147,9 +149,10 @@ impl PhysicalFilter {
     /// its semantics, including its errors. It cannot if
     ///
     /// * the errors of the predicate depend on how DataFusion splits the
-    ///   rows into batches (see [`depends_on_batches`]), e.g.
-    ///   `x <> 0 AND 10 / x > 1`: DataFusion must evaluate it on the batches
-    ///   of the input plan of `exec`;
+    ///   rows into batches, empty ones included (see [`depends_on_batches`]),
+    ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
+    ///   DataFusion must evaluate it on the batches of the input plan of
+    ///   `exec`;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -830,7 +833,7 @@ pub(crate) mod test_support {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalExpr;
-    use datafusion_physical_plan::aggregates::AggregateExec;
+    use datafusion_physical_plan::aggregates::{AggregateExec, AggregateInputMode};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::limit::LocalLimitExec;
@@ -936,10 +939,25 @@ pub(crate) mod test_support {
     }
 
     /// Whether some expression of `plan` may fail depending on the batches
-    /// it is evaluated on (judged without the schema of the expression,
-    /// which is conservative).
+    /// it is evaluated on: judged on the schema of the input of `plan` if it
+    /// has a single child, and without schema otherwise, which is
+    /// conservative (expressions that may fail then fail on empty batches).
+    /// The aggregations that merge partial states evaluate no expression on
+    /// their input (the arguments of their aggregate functions are those of
+    /// the partial aggregations).
     fn has_batch_dependent_expressions(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
-        let schema = Schema::empty();
+        if plan
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|aggregate| {
+                aggregate.mode().input_mode() == AggregateInputMode::Partial
+            })
+        {
+            return Ok(false);
+        }
+        let schema = match plan.children().as_slice() {
+            [child] => child.schema(),
+            _ => Arc::new(Schema::empty()),
+        };
         let mut batch_dependent = false;
         plan.apply_expressions(&mut |expr| {
             batch_dependent |= depends_on_batches(expr, &schema);
@@ -1342,6 +1360,34 @@ pub(crate) mod test_support {
         let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
         let expr = ctx.parse_sql_expr(sql, &df_schema).unwrap();
         ctx.create_physical_expr(expr, &df_schema).unwrap()
+    }
+
+    /// A batch of the columns `x` and `y` (`Int32`) and `s` (`Utf8`, `"a"` on
+    /// all rows), with the runs `((x, y), rows)`.
+    pub(crate) fn xys(runs: &[((i32, i32), usize)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let rows = || {
+            runs.iter()
+                .flat_map(|&(xy, rows)| std::iter::repeat_n(xy, rows))
+        };
+        let x = rows().map(|(x, _)| x).collect::<Int32Array>();
+        let y = rows().map(|(_, y)| y).collect::<Int32Array>();
+        let s = StringArray::from_iter_values(rows().map(|_| "a"));
+        RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(y), Arc::new(s)]).unwrap()
+    }
+
+    /// A scan of `batches` (of `schema`, possibly empty or none), in a single
+    /// partition.
+    pub(crate) fn scan_batches(
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Arc<dyn ExecutionPlan> {
+        MemorySourceConfig::try_new_exec(&[batches.to_vec()], Arc::clone(schema), None)
+            .unwrap()
     }
 
     /// Register `batches` as table `name`, with one partition per entry.
@@ -2761,6 +2807,105 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn patterns_that_fail_behind_short_circuits_stay_in_datafusion() {
+        // One batch of 4096 rows, `(x, y) = (0, 1)` then `(1, 0)`. Neither
+        // `x = 0` nor `y = 0` is true on all rows of the batch, so DataFusion
+        // evaluates `s ~ 'a{1000000}'`, whose pattern is too big to compile.
+        // But `x = 0` is true on all rows of the first chunk of the pipeline,
+        // and `y = 0` on all rows of the second one.
+        let batch = xys(&[((0, 1), 2048), ((1, 0), 2048)]);
+        let predicate = "x = 0 OR (y = 0 OR s ~ 'a{1000000}')";
+        let plan = filter_exec(predicate, scan(&batch), None);
+        let exec = plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec(predicate, scan(&batch), None),
+            false,
+        )
+        .await;
+        assert!(error.unwrap().contains("did not compile"));
+        assert_eq!(operators.filters, 0);
+
+        // On the chunks of the pipeline, the predicate does not fail.
+        let filter = filter_for(predicate, &batch.schema());
+        assert!(filter.errors_depend_on_batches());
+        let chunks = [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
+        assert!(drive(&filter, chunks).is_ok());
+
+        // A pattern that compiles cannot fail.
+        let predicate = "x = 0 OR (y = 0 OR s ~ 'a+')";
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec(predicate, scan(&batch), None),
+            false,
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(operators.filters, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn predicates_that_fail_on_empty_batches_stay_in_datafusion() {
+        // DataFusion evaluates the predicate on every batch, empty ones
+        // included, on which `OR` evaluates its right side: after an empty
+        // batch, `x = 0 OR s ~ 'a{1000000}'` fails even if `x = 0` on all
+        // rows. Without batches, it is not evaluated at all.
+        let schema = xys(&[]).schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let zeros = xys(&[((0, 0), 2048)]);
+        for (predicate, batches, fails) in [
+            (
+                "x = 0 OR s ~ 'a{1000000}'",
+                vec![empty.clone(), zeros.clone()],
+                true,
+            ),
+            ("x = 0 OR s ~ 'a{1000000}'", vec![zeros.clone()], false),
+            ("x = 0 OR s ~ 'a{1000000}'", vec![], false),
+            // Functions may fail on empty batches too.
+            ("regexp_like(s, 'a{1000000}')", vec![empty.clone()], true),
+            ("regexp_like(s, 'a{1000000}')", vec![], false),
+        ] {
+            let plan = || filter_exec(predicate, scan_batches(&schema, &batches), None);
+            let filter_plan = plan();
+            let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            let input = format!("{predicate} on {} batches", batches.len());
+            assert_eq!(error.is_some(), fails, "{input}: {error:?}");
+            assert_eq!(operators.filters, 0, "{input}");
+        }
+        // A pattern that compiles cannot fail, with or without empty batches,
+        // and `regexp_count` only compiles its pattern if there are rows.
+        for (predicate, batches, fails) in [
+            (
+                "x = 0 OR s ~ 'a+'",
+                vec![empty.clone(), zeros.clone()],
+                false,
+            ),
+            ("x = 0 OR s ~ 'a+'", vec![zeros.clone()], false),
+            ("x = 0 OR s ~ 'a+'", vec![], false),
+            (
+                "regexp_count(s, 'a{1000000}') > 0",
+                vec![empty.clone()],
+                false,
+            ),
+            (
+                "regexp_count(s, 'a{1000000}') > 0",
+                vec![empty, zeros],
+                true,
+            ),
+        ] {
+            let (error, operators) = assert_native_plan_parity(
+                || filter_exec(predicate, scan_batches(&schema, &batches), None),
+                false,
+            )
+            .await;
+            let input = format!("{predicate} on {} batches", batches.len());
+            assert_eq!(error.is_some(), fails, "{input}: {error:?}");
+            assert_eq!(operators.filters, 1, "{input}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fetch_with_fallible_predicates_stays_in_datafusion() {
         // `FilterExec` evaluates its predicate on whole batches until the fetch
         // is reached, on the first batch even with `fetch = 0`.
@@ -2782,16 +2927,29 @@ mod tests {
                 assert!(error.unwrap().contains("Divide by zero"), "{predicate}");
             }
         }
-        // A predicate that fails on every row or on none is not lowered
-        // either.
+        // A predicate that fails whenever it is evaluated is not lowered
+        // either, but a pattern that compiles cannot fail.
         let strings = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)])),
             vec![Arc::new(StringArray::from(vec!["a", "b"]))],
         )
         .unwrap();
-        let plan = filter_exec("s LIKE 'a%'", scan(&strings), Some(0));
-        let exec = plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        for (predicate, lowered) in [("s ~ 'a{1000000}'", false), ("s LIKE 'a%'", true)] {
+            let plan = filter_exec(predicate, scan(&strings), Some(0));
+            let exec = plan.downcast_ref::<FilterExec>().unwrap();
+            assert_eq!(
+                PhysicalFilter::supports_filter_exec(exec),
+                lowered,
+                "{predicate}"
+            );
+            let (error, operators) = assert_native_plan_parity(
+                || filter_exec(predicate, scan(&strings), Some(0)),
+                true,
+            )
+            .await;
+            assert_eq!(error.is_some(), !lowered, "{predicate}");
+            assert_eq!(operators.filters, usize::from(lowered), "{predicate}");
+        }
         // A predicate that cannot fail is lowered with its fetch.
         let batch = runs(&[(1, 2048), (0, 2048)]);
         let (error, operators) = assert_native_plan_parity(

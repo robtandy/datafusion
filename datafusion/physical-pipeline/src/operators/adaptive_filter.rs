@@ -39,10 +39,13 @@
 //! DataFusion decides per batch, from the share of rows that are left, on
 //! which rows it evaluates the conjuncts after the first one of an `AND`, and
 //! the right side of an `OR` (see `BinaryExpr::evaluate_conjunction` and
-//! `check_short_circuit`). If such an operand can fail on some rows and not on
-//! others, whether a query fails depends on how the rows are split into
-//! batches, which differs between DataFusion and a pipeline: see
-//! [`depends_on_batches`].
+//! `check_short_circuit`), if on any: on an empty batch, it evaluates the
+//! right side of an `OR`. If such an operand can fail on some rows and not on
+//! others, or fails whenever it is evaluated (e.g. a pattern that does not
+//! compile), whether a query fails depends on how the rows are split into
+//! batches, which differs between DataFusion and a pipeline, and so does an
+//! expression that fails on DataFusion's empty batches, which pipelines do
+//! not keep: see [`depends_on_batches`].
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
@@ -52,6 +55,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
@@ -331,9 +335,8 @@ impl AdaptiveFilterState {
 pub enum Fallibility {
     /// It never fails.
     Infallible,
-    /// It fails on all rows or on none: whether it fails only depends on
-    /// whether it is evaluated at all (on some rows), e.g. `s LIKE 'a%'`,
-    /// which only fails if its pattern is invalid.
+    /// It fails whenever it is evaluated, even without rows, e.g.
+    /// `s ~ 'a{1000000}'`, whose constant pattern is too big to compile.
     Uniform,
     /// It may fail on some rows and not on others, e.g. `10 / x`.
     PerRow,
@@ -345,9 +348,12 @@ pub enum Fallibility {
 /// This is conservative. Only columns, literals, comparisons, `AND`, `OR`,
 /// `NOT`, `IS [NOT] NULL`, `IN` lists, widening casts, arithmetic on numbers
 /// that wraps on overflow (DataFusion's default) and divisions of numbers by
-/// a constant that is neither `0` nor `-1` are infallible; `LIKE` and regular
-/// expressions with a constant pattern fail uniformly. Everything else,
-/// functions and `CASE` included, may fail on some rows.
+/// a constant that is neither `0` nor `-1` are infallible. `LIKE` and regular
+/// expressions with a constant pattern only fail if the pattern does not
+/// compile, which does not depend on the rows (the pattern is compiled before
+/// any row is matched): they are infallible if evaluating them on an empty
+/// batch succeeds, and fail uniformly otherwise. Everything else, functions
+/// and `CASE` included, may fail on some rows.
 pub fn fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
     expr.children()
         .into_iter()
@@ -379,14 +385,14 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
             | RegexIMatch | RegexNotMatch | RegexNotIMatch
                 if binary.right().is::<Literal>() =>
             {
-                Uniform
+                constant_pattern_fallibility(expr, schema)
             }
             _ => PerRow,
         };
     }
     if let Some(like) = expr.downcast_ref::<LikeExpr>() {
         return if like.pattern().is::<Literal>() {
-            Uniform
+            constant_pattern_fallibility(expr, schema)
         } else {
             PerRow
         };
@@ -408,6 +414,28 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
     } else {
         PerRow
     }
+}
+
+/// How a `LIKE` or a regular expression match with a constant pattern can
+/// fail: only if its pattern does not compile, and then whenever it is
+/// evaluated.
+fn constant_pattern_fallibility(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Fallibility {
+    if fails_without_rows(expr, schema) {
+        Fallibility::Uniform
+    } else {
+        Fallibility::Infallible
+    }
+}
+
+/// Whether evaluating `expr` on an empty batch of `schema` fails.
+fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+    expr.evaluate(&batch)
+        .and_then(|value| value.into_array(0))
+        .is_err()
 }
 
 /// Whether `binary` wraps on overflow instead of failing (DataFusion's
@@ -456,40 +484,55 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 }
 
 /// Whether the errors of `expr` (on `schema`) may depend on how its input
-/// rows are split into batches.
+/// rows are split into batches, empty batches included.
 ///
-/// DataFusion evaluates the conjuncts after the first one of an `AND` only on
-/// the rows that are left if at most 20% of the rows of the batch are, and on
-/// all rows otherwise, and the right side of an `OR` only on the rows for
-/// which the left side is `false` if at most 20% of them are (and not at all
-/// if none is). If such an operand may fail on some rows and not on others
-/// ([`Fallibility::PerRow`]), whether it fails depends on the batches: e.g.
-/// `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not on a
-/// batch with 85% of them. Native operators evaluate expressions on chunks,
-/// not on DataFusion's batches, so they only lower expressions for which this
-/// is `false`.
+/// DataFusion's `FilterExec` and `ProjectionExec` evaluate their expressions
+/// on every batch of their input, empty ones included. Native operators
+/// evaluate them on chunks, which are not DataFusion's batches, and never on
+/// empty chunks, so they only lower expressions for which this is `false`.
+/// It is `true` if:
+///
+/// * the right side of an `AND` or an `OR` may fail on some rows and not on
+///   others ([`Fallibility::PerRow`]). DataFusion evaluates it on all rows of
+///   a batch, on the rows that are left if at most 20% of them are, or on no
+///   row at all if none is left, so whether it fails depends on the batches:
+///   e.g. `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not
+///   on a batch with 85% of them;
+/// * a part of `expr` fails whenever it is evaluated
+///   ([`Fallibility::Uniform`]), which may depend on the batches: e.g.
+///   DataFusion evaluates the right side of
+///   `x = 0 OR (y = 0 OR s ~ 'a{1000000}')` unless `x = 0` on all rows of the
+///   batch, and then `s ~ 'a{1000000}'` unless `y = 0` on all of them, so it
+///   fails on rows with `x = 0` then rows with `y = 0` in one batch, but not
+///   in two; and it evaluates the right side of an `OR` on empty batches;
+/// * `expr` may fail and fails on an empty batch, e.g.
+///   `regexp_like(s, 'a{1000000}')` (unlike `regexp_count`, which only
+///   compiles its pattern if there are rows).
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
-        match binary.op() {
-            Operator::And => {
-                let conjuncts = split_conjunction(expr);
-                return conjuncts.iter().skip(1).any(|conjunct| {
-                    fallibility(conjunct, schema) == Fallibility::PerRow
-                }) || conjuncts
-                    .iter()
-                    .any(|conjunct| depends_on_batches(conjunct, schema));
-            }
-            Operator::Or
-                if fallibility(binary.right(), schema) == Fallibility::PerRow =>
-            {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    expr.children()
+    has_fallible_right_side(expr, schema)
+        || fails_uniformly(expr, schema)
+        || (!is_infallible(expr, schema) && fails_without_rows(expr, schema))
+}
+
+/// Whether the right side of an `AND` or an `OR` in `expr` may fail on some
+/// rows and not on others.
+fn has_fallible_right_side(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
+        matches!(binary.op(), Operator::And | Operator::Or)
+            && fallibility(binary.right(), schema) == Fallibility::PerRow
+    }) || expr
+        .children()
         .into_iter()
-        .any(|child| depends_on_batches(child, schema))
+        .any(|child| has_fallible_right_side(child, schema))
+}
+
+/// Whether a part of `expr` fails whenever it is evaluated.
+fn fails_uniformly(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    node_fallibility(expr, schema) == Fallibility::Uniform
+        || expr
+            .children()
+            .into_iter()
+            .any(|child| fails_uniformly(child, schema))
 }
 
 #[cfg(test)]
@@ -607,10 +650,14 @@ mod tests {
             ("b / 0 > 1", PerRow),
             ("b % -1 = 0", PerRow),
             ("b / a > 1", PerRow),
-            // Patterns that are constant fail on every row or on none.
-            ("s LIKE 'x%'", Uniform),
-            ("s NOT ILIKE 'x%'", Uniform),
-            ("s ~ '^a'", Uniform),
+            // A constant pattern only fails if it does not compile, and then
+            // whenever it is evaluated, even without rows.
+            ("s LIKE 'x%'", Infallible),
+            ("s NOT ILIKE '%x_y%'", Infallible),
+            ("s ~ '^a'", Infallible),
+            ("s !~* 'a+b'", Infallible),
+            ("s ~ 'a{1000000}'", Uniform),
+            ("s ~ 'a+' AND s LIKE 'a%' OR s ~ 'a{1000000}'", Uniform),
             ("s LIKE s", PerRow),
             ("CAST(s AS INT) > 1", PerRow),
             ("CAST(b AS INT) > 1", PerRow),
@@ -627,8 +674,10 @@ mod tests {
             );
         }
         assert_eq!(
-            fallible_conjuncts("a <> 0 AND 10 / a > 1 AND b < 2 AND s LIKE 'x'"),
-            vec![false, true, false, true]
+            fallible_conjuncts(
+                "a <> 0 AND 10 / a > 1 AND b < 2 AND s LIKE 'x' AND s ~ 'a{1000000}'"
+            ),
+            vec![false, true, false, false, true]
         );
 
         // Arithmetic that fails on overflow can fail.
@@ -662,14 +711,30 @@ mod tests {
             ("e OR (a > 0 AND 10 / a > 1)", true),
             ("CASE WHEN a > 0 AND 10 / a > 1 THEN 1 ELSE 0 END = 1", true),
             ("a > 0 AND s LIKE s", true),
+            // A pattern that does not compile fails whenever DataFusion
+            // evaluates it, which depends on the batches: on the batches on
+            // which the left sides are not all true, and on empty batches.
+            ("s ~ 'a{1000000}'", true),
+            ("a = 0 OR s ~ 'a{1000000}'", true),
+            ("a = 0 OR (b = 0 OR s ~ 'a{1000000}')", true),
+            ("a <> 0 AND (b <> 0 OR s ~ 'a{1000000}')", true),
+            ("CASE WHEN a > 0 THEN s ~ 'a{1000000}' ELSE false END", true),
+            // Functions may fail on empty batches.
+            ("regexp_like(s, 'a{1000000}')", true),
+            ("a = 0 OR regexp_count(s, 'a{1000000}') > 0", true),
             // The first conjunct and the left side of `OR` are evaluated on all
             // rows.
             ("10 / a > 1 AND b = 1", false),
             ("10 / a > 1 OR b = 1", false),
             ("upper(s) = 'X' AND a > 0", false),
-            // Uniform and infallible operands.
+            ("regexp_count(s, 'a+') > 0 AND a > 0", false),
+            // `regexp_count` only compiles its pattern if there are rows: it
+            // fails on the first row, whatever the batches.
+            ("regexp_count(s, 'a{1000000}') > 0 AND a > 0", false),
+            // Patterns that compile cannot fail.
             ("a > 0 AND s LIKE 'x%'", false),
             ("a = 1 OR s LIKE 'x%'", false),
+            ("a = 0 OR (b = 0 OR s ~ 'a+')", false),
             ("a > 0 AND b % 3 = 0 AND b + 1 > 0", false),
             // `CASE` evaluates its branches on the rows they are for.
             ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
