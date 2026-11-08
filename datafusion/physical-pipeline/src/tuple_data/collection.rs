@@ -25,16 +25,16 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayDataBuilder, ArrayRef, AsArray, BooleanArray, GenericByteArray,
-    GenericByteViewArray, RecordBatch, RecordBatchOptions, make_array, make_view,
-    new_null_array,
+    GenericByteViewArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array,
+    make_view, new_null_array,
 };
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::take;
+use arrow::compute::{cast, take};
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
-    LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
+    LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, UInt64Type, Utf8Type,
 };
 use arrow_row::Rows;
 use datafusion_common::{
@@ -814,7 +814,9 @@ impl SourceColumn {
         } else {
             (Arc::clone(array), None)
         };
-        let nulls = values.logical_nulls().filter(|n| n.null_count() > 0);
+        // The logical nulls of a dictionary are the null keys and the keys of
+        // null values (the decoded values of null keys are not null).
+        let nulls = array.logical_nulls().filter(|n| n.null_count() > 0);
         let data = match column.storage() {
             ColumnStorage::Null => SourceData::Null,
             ColumnStorage::Boolean => {
@@ -872,12 +874,34 @@ pub(crate) fn check_chunk(layout: &TupleDataLayout, chunk: &DataChunk) -> Result
     Ok(())
 }
 
-/// The values of a dictionary array: `values[keys[i]]` for every row `i`.
+/// The values of a dictionary array: `values[keys[i]]` for every row `i`
+/// with a valid key, and any value for the rows with a null key, which are
+/// null in [`Array::logical_nulls`] of the dictionary.
+///
+/// The value of a null key is not a null: Arrow's `take` cannot take null
+/// indices of every type (e.g. of run-end encoded arrays with a
+/// non-nullable values field, or of unions without nullable fields).
 pub(crate) fn decode_dictionary(array: &ArrayRef) -> Result<ArrayRef> {
     let Some(dictionary) = array.as_any_dictionary_opt() else {
         return internal_err!("Expected a dictionary array, got {}", array.data_type());
     };
-    Ok(take(dictionary.values().as_ref(), dictionary.keys(), None)?)
+    let (keys, values) = (dictionary.keys(), dictionary.values());
+    if keys.null_count() == 0 {
+        return Ok(take(values.as_ref(), keys, None)?);
+    }
+    if values.is_empty() {
+        // All keys are null.
+        return Ok(new_null_array(values.data_type(), keys.len()));
+    }
+    // Take the first value for the null keys (whose key values can be out
+    // of bounds).
+    let keys = cast(keys, &DataType::UInt64)?;
+    let keys = keys
+        .as_primitive::<UInt64Type>()
+        .iter()
+        .map(|key| key.unwrap_or(0))
+        .collect::<UInt64Array>();
+    Ok(take(values.as_ref(), &keys, None)?)
 }
 
 /// The bytes of the values of a fixed-width array, starting at its first
@@ -1612,8 +1636,8 @@ mod tests {
             Arc::clone(&schema),
             vec![
                 Arc::new(strings.clone()),
-                arrow::compute::cast(&strings, &DataType::Utf8View).unwrap(),
-                arrow::compute::cast(&strings, &DataType::LargeBinary).unwrap(),
+                cast(&strings, &DataType::Utf8View).unwrap(),
+                cast(&strings, &DataType::LargeBinary).unwrap(),
             ],
         )
         .unwrap();
@@ -1843,7 +1867,7 @@ mod tests {
                 Some(0),
             ])
         );
-        let values = arrow::compute::cast(column, &DataType::Utf8).unwrap();
+        let values = cast(column, &DataType::Utf8).unwrap();
         assert_eq!(
             values.as_string::<i32>().iter().collect::<Vec<_>>(),
             vec![
@@ -2641,6 +2665,43 @@ mod tests {
                 result.is_ok(),
                 "seed {seed}, case {case}, nullable {nullable}, size {size}"
             );
+        }
+    }
+
+    #[test]
+    fn dictionaries_with_null_keys_of_values_without_nulls() {
+        use crate::tuple_data::PartitionedTupleData;
+
+        for dictionary in
+            crate::tuple_data::test_data::dictionaries_of_values_without_nulls()
+        {
+            let batch = RecordBatch::try_from_iter(vec![("d", dictionary)]).unwrap();
+            for selection in [vec![0, 1, 2], vec![1, 2], vec![2, 0, 0]] {
+                let chunk = chunk_with_selection(&batch, selection);
+                let expected = chunk.compact().unwrap();
+                let mut collection = collection_for(&batch, false);
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &expected);
+                let mut state = TupleDataScanState::new();
+                let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+                assert_eq!(scanned.schema(), &batch.schema());
+                assert_identical(&scanned.into_record_batch().unwrap(), &expected);
+
+                let layout =
+                    Arc::new(TupleDataLayout::try_new(batch.schema(), true).unwrap());
+                let mut partitioned = PartitionedTupleData::try_new(layout, 1).unwrap();
+                let hashes = (0..chunk.len() as u64).map(|i| i << 63).collect::<Vec<_>>();
+                let locations = partitioned
+                    .append_chunk_with_locations(&chunk, &hashes)
+                    .unwrap();
+                for (row, location) in locations.iter().enumerate() {
+                    let gathered = partitioned
+                        .partition(location.partition)
+                        .gather(&[location.location])
+                        .unwrap();
+                    assert_identical(&gathered, &expected.slice(row, 1));
+                }
+            }
         }
     }
 

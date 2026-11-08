@@ -280,7 +280,9 @@ impl ProbeColumn {
         } else {
             Arc::clone(array)
         };
-        let nulls = values.logical_nulls().filter(|n| n.null_count() > 0);
+        // The logical nulls of a dictionary are the null keys and the keys of
+        // null values (the decoded values of null keys are not null).
+        let nulls = array.logical_nulls().filter(|n| n.null_count() > 0);
         let data = match layout.storage() {
             ColumnStorage::Null => ProbeData::Null,
             ColumnStorage::Boolean => {
@@ -1618,6 +1620,38 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dictionary_keys_with_null_keys_of_values_without_nulls() {
+        use crate::tuple_data::test_data::dictionaries_of_values_without_nulls;
+
+        for keys in dictionaries_of_values_without_nulls() {
+            for shift in 0..keys.len() {
+                let pairs = (0..keys.len())
+                    .map(|i| (i + shift) % keys.len())
+                    .collect::<Vec<_>>();
+                let [nothing, null] =
+                    assert_matches_join_key_comparator(&keys, &keys, &pairs);
+                if shift == 0 {
+                    // The null key only matches with `IS NOT DISTINCT FROM`.
+                    assert_eq!(nothing, vec![1, 2]);
+                    assert_eq!(null, vec![0, 1, 2]);
+                }
+            }
+            // A probe chunk whose selection excludes the null key.
+            let build = batch(vec![("k", Arc::clone(&keys))]);
+            let probe = chunk_with_selection(&build, vec![2, 1]);
+            let (matched, unmatched) = match_pairs(
+                &build,
+                &probe,
+                &[2, 0],
+                vec![0],
+                NullEquality::NullEqualsNothing,
+            );
+            assert_eq!(matched, vec![0]);
+            assert_eq!(unmatched, vec![1]);
         }
     }
 

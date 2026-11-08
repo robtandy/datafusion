@@ -895,7 +895,7 @@ pub(crate) mod test_data {
             ])),
             None,
         );
-        vec![
+        let mut arrays: Vec<(&'static str, ArrayRef, bool)> = vec![
             (
                 "empty struct",
                 Arc::new(StructArray::new_empty_fields(
@@ -1054,7 +1054,63 @@ pub(crate) mod test_data {
                 )),
                 false,
             ),
-        ]
+        ];
+        arrays.extend(
+            dictionaries_of_values_without_nulls()
+                .into_iter()
+                .zip([
+                    "dictionary with null keys of run-end encoded values",
+                    "dictionary with null keys of a union without nullable fields",
+                ])
+                .map(|(array, name)| (name, array, true)),
+        );
+        arrays
+    }
+
+    /// Dictionaries with null keys of run-end encoded values (with a
+    /// non-nullable values field) and of unions without nullable fields,
+    /// which Arrow's `take` cannot take null indices of.
+    pub(crate) fn dictionaries_of_values_without_nulls() -> Vec<ArrayRef> {
+        let runs = arrow::array::make_array(
+            arrow::array::ArrayData::builder(DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Int32, false)),
+            ))
+            .len(2)
+            .add_child_data(Int32Array::from(vec![1, 2]).to_data())
+            .add_child_data(Int32Array::from(vec![10, 20]).to_data())
+            .build()
+            .unwrap(),
+        );
+        let unions = UnionArray::try_new(
+            UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("i", DataType::Int32, false),
+                    Field::new("s", DataType::Utf8, false),
+                ],
+            )
+            .unwrap(),
+            vec![0, 1, 0].into(),
+            None,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 0, 30])),
+                Arc::new(StringArray::from(vec!["", "twenty", ""])),
+            ],
+        )
+        .unwrap();
+        [runs, Arc::new(unions)]
+            .into_iter()
+            .map(|values| -> ArrayRef {
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![None, Some(0), Some(1)]),
+                        values,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect()
     }
 
     /// `batch` as a chunk with the selection `selection`.
