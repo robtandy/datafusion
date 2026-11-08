@@ -29,10 +29,11 @@
 //!   `finalize` evaluates into the single output row, also for an empty
 //!   input;
 //! * with `GROUP BY` (`radix_ht`): every thread aggregates into its own
-//!   hash table (`grouped_ht`); `combine` scatters the groups of the table to
-//!   64 radix partitions by the upper bits of the hash of their keys; the
-//!   source threads claim the partitions and finalize each of them on its
-//!   own, merging the partial states of its groups into a new hash table.
+//!   hash table (`grouped_ht`) of bounded size; whenever the table is full,
+//!   and on `combine`, its groups are scattered to 64 radix partitions by the
+//!   upper bits of the hash of their keys; the source threads claim the
+//!   partitions and finalize each of them on its own, merging the partial
+//!   states of its groups into a new hash table.
 //!
 //! # Byte-for-byte compatibility
 //!

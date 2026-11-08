@@ -8,24 +8,29 @@
 //! (DuckDB's `RadixPartitionedHashTable`).
 //!
 //! ```text
-//!  sink (every thread)         combine (every thread)       get_data (every thread)
+//!  sink (every thread)               combine (every thread)    get_data (every thread)
 //!
-//!  chunks -> GroupedHashTable -> hash the keys of the   ->  claim partition p,
-//!            (thread-local)      groups once, scatter       merge the states of
-//!                                the groups to radix        its groups from all
-//!                                partition (hash >> 58)     threads into a new
-//!                                of 64 partitions           GroupedHashTable,
-//!                                                           evaluate, emit chunks
+//!  chunks -> GroupedHashTable -----> the same flush of the  -> claim partition p,
+//!            (thread-local)    |     remaining groups          merge the states of
+//!                              |                               its groups from all
+//!           when full: flush   |                               threads into a new
+//!           = hash the keys of +-->  64 radix partitions       GroupedHashTable,
+//!           the groups once,         (hash >> 58)              evaluate, emit chunks
+//!           scatter the groups
 //! ```
 //!
 //! * `sink`: every thread aggregates the rows of its chunks into its own
 //!   [`GroupedHashTable`] (DataFusion's partial aggregation), without any
-//!   synchronization.
-//! * `combine`: every thread emits the keys and partial states of the groups
-//!   of its table, hashes the keys of every group once and scatters the
-//!   groups to [`NUM_PARTITIONS`] radix partitions by the upper
-//!   [`RADIX_BITS`] bits of their hash. The partial states of a group, from
-//!   all threads, all end up in the same partition. This replaces the
+//!   synchronization. The table has a bounded capacity, so that it stays
+//!   cache resident: when it is full, it is *flushed*, as DuckDB abandons its
+//!   thread-local tables (or it grows, if the groups of the thread keep
+//!   coming back, see `RadixLocalState::aggregate`).
+//! * `combine`: every thread flushes the groups that remain in its table.
+//!   A flush emits the keys and partial states of the groups of the table,
+//!   hashes the keys of every group once and scatters the groups to
+//!   [`NUM_PARTITIONS`] radix partitions by the upper [`RADIX_BITS`] bits of
+//!   their hash. The partial states of a group, from all threads and
+//!   flushes, all end up in the same partition. This replaces the
 //!   `RepartitionExec(Hash)` between DataFusion's partial and final
 //!   aggregations: the states are moved by reference, not sent through
 //!   channels.
@@ -81,7 +86,8 @@ pub(crate) struct RadixHashAggregate;
 #[derive(Debug)]
 struct RadixSinkState {
     /// For every partition, the partial states of its groups, from all
-    /// threads (one entry per thread that had groups in the partition).
+    /// threads (one entry per flush of a thread-local table that had groups
+    /// in the partition).
     partitions: Vec<Mutex<Vec<GroupedStates>>>,
     /// The partitions that have groups, set by `finalize`.
     non_empty: Mutex<Option<Vec<usize>>>,
@@ -115,6 +121,8 @@ struct RadixLocalState {
     /// The input rows, if they must be sorted before they are aggregated.
     buffer: InputBuffer,
 }
+
+impl LocalSinkState for RadixLocalState {}
 
 impl RadixLocalState {
     /// Aggregate the input rows of `batch` into the thread-local table, and
@@ -190,8 +198,6 @@ impl Default for TableCapacity {
         }
     }
 }
-
-impl LocalSinkState for RadixLocalState {}
 
 /// The global source state: the partitions to finalize.
 #[derive(Debug)]
