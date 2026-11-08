@@ -2047,6 +2047,45 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// A batch of 4096 rows of `x` (`Int32`) and of `d`, a dictionary of
+    /// `(1 << 31) + 1` nulls (which take no memory) with `UInt64` keys: the
+    /// first 2049 rows are `0` and the key `0`, the others `1` and the key
+    /// `1 << 31`, which `Int32` keys cannot hold.
+    pub(crate) fn large_dictionary_keys() -> RecordBatch {
+        let rows = 4096;
+        let guarded = 2049;
+        let keys = arrow::array::UInt64Array::from_iter_values(
+            (0..rows).map(|row| if row < guarded { 0 } else { 1 << 31 }),
+        );
+        let d = DictionaryArray::<arrow::datatypes::UInt64Type>::try_new(
+            keys,
+            Arc::new(arrow::array::NullArray::new((1 << 31) + 1)),
+        )
+        .unwrap();
+        let x =
+            Int32Array::from_iter_values((0..rows).map(|row| i32::from(row >= guarded)));
+        RecordBatch::try_from_iter([
+            ("x", Arc::new(x) as ArrayRef),
+            ("d", Arc::new(d) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// `x = 0 AND CAST(d AS Dictionary(Int32, Null)) IS NULL` (see
+    /// [`large_dictionary_keys`]).
+    pub(crate) fn guarded_key_cast(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        let cast = Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+            physical_expr("d", schema),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Null)),
+            None,
+        ));
+        Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+            physical_expr("x = 0", schema),
+            datafusion_expr::Operator::And,
+            Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(cast)),
+        ))
+    }
+
     /// Two batches of 100 rows of a dictionary column `d`, with `keys`, and of
     /// the row number `i`: the 100 values of the first dictionary (`a0`, `a1`,
     /// …) are all distinct from those of the second one (`b0`, …).
@@ -3989,6 +4028,38 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 1, "{input}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_of_dictionary_keys_stay_in_datafusion() {
+        // Casting a dictionary into another casts its keys, which index its
+        // values, however many (nulls take no memory): `1 << 31` does not fit
+        // in `Int32` keys. `FilterExec` evaluates the cast on all rows of the
+        // batch (half of them pass `x = 0`), and fails, but the native filter
+        // only on the rows that pass `x = 0`.
+        let batch = large_dictionary_keys();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                FilterExec::try_new(
+                    guarded_key_cast(&schema),
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Can't cast value 2147483648")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

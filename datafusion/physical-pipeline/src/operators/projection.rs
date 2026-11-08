@@ -1589,6 +1589,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_of_dictionary_keys_stay_in_datafusion() {
+        // `ProjectionExec` evaluates the cast of the keys of `d` on all rows of
+        // the batch (half of them pass `x = 0`), and fails on `1 << 31`, but a
+        // pipeline evaluates it on chunks of 2048 rows, the second of which
+        // has a single row that passes `x = 0`, the only one `AND` evaluates
+        // the cast on (see the test of the same name for filters).
+        let batch = large_dictionary_keys();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(guarded_key_cast(&schema), "b")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Can't cast value 2147483648")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that

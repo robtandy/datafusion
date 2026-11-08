@@ -490,9 +490,13 @@ fn fails_on_operand_types(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
 /// (see `CastExpr::is_bigger_cast`), including the values of a dictionary
 /// that it unpacks, and into the values of a dictionary that it packs a
 /// constant into, or values that the keys of the dictionary can always index
-/// (keys of 32 bits or more: a batch has fewer rows than that), if Arrow
-/// supports it (see [`fails_on_operand_types`]: e.g. Arrow cannot pack
-/// booleans into a dictionary).
+/// (keys of 32 bits or more: a batch has fewer rows than that), or into the
+/// values of a dictionary that it casts a dictionary (but not a dictionary of
+/// dictionaries) into, whose keys hold all keys of the dictionary it casts
+/// (Arrow casts the keys, which index all values of the dictionary, however
+/// many: e.g. nulls take no memory), if Arrow supports it (see
+/// [`fails_on_operand_types`]: e.g. Arrow cannot pack booleans into a
+/// dictionary).
 fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
     let Ok(from) = cast.expr().data_type(schema) else {
         return Fallibility::PerRow;
@@ -504,14 +508,24 @@ fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
     let (to_values, keys_fit) = match cast.cast_type() {
         DataType::Dictionary(keys, values) => (
             values.as_ref(),
-            cast.expr().is::<Literal>()
-                || matches!(
-                    keys.as_ref(),
-                    DataType::Int32
-                        | DataType::Int64
-                        | DataType::UInt32
-                        | DataType::UInt64
-                ),
+            match &from {
+                DataType::Dictionary(from_keys, from_values) => {
+                    !matches!(from_values.as_ref(), DataType::Dictionary(..))
+                        && largest_key(from_keys)
+                            .zip(largest_key(keys))
+                            .is_some_and(|(from, to)| from <= to)
+                }
+                _ => {
+                    cast.expr().is::<Literal>()
+                        || matches!(
+                            keys.as_ref(),
+                            DataType::Int32
+                                | DataType::Int64
+                                | DataType::UInt32
+                                | DataType::UInt64
+                        )
+                }
+            },
         ),
         to => (to, true),
     };
@@ -520,6 +534,22 @@ fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
     } else {
         Fallibility::PerRow
     }
+}
+
+/// The largest key of dictionaries with keys of `keys`.
+fn largest_key(keys: &DataType) -> Option<u64> {
+    let largest = match keys {
+        DataType::Int8 => i8::MAX as u64,
+        DataType::Int16 => i16::MAX as u64,
+        DataType::Int32 => i32::MAX as u64,
+        DataType::Int64 => i64::MAX as u64,
+        DataType::UInt8 => u8::MAX.into(),
+        DataType::UInt16 => u16::MAX.into(),
+        DataType::UInt32 => u32::MAX.into(),
+        DataType::UInt64 => u64::MAX,
+        _ => return None,
+    };
+    Some(largest)
 }
 
 /// How a `LIKE` or a regular expression match with a constant pattern can
@@ -1191,6 +1221,55 @@ mod tests {
         assert!(depends_on_batches(&pack(DataType::Int8), &schema));
         assert_eq!(fallibility(&pack(DataType::Int32), &schema), Infallible);
         assert!(!depends_on_batches(&pack(DataType::Int32), &schema));
+        // Casting a dictionary into another casts its keys, which may index
+        // more values than the batch has rows (e.g. nulls, which take no
+        // memory).
+        let dictionary = |keys: DataType, values: DataType| {
+            DataType::Dictionary(Box::new(keys), Box::new(values))
+        };
+        for (from_keys, to_keys, expected) in [
+            (DataType::UInt64, DataType::Int32, PerRow),
+            (DataType::Int64, DataType::Int32, PerRow),
+            (DataType::UInt32, DataType::Int32, PerRow),
+            (DataType::Int64, DataType::UInt32, PerRow),
+            (DataType::UInt8, DataType::Int8, PerRow),
+            (DataType::Int32, DataType::Int32, Infallible),
+            (DataType::Int32, DataType::UInt32, Infallible),
+            (DataType::Int8, DataType::UInt8, Infallible),
+            (DataType::UInt32, DataType::Int64, Infallible),
+            (DataType::Int64, DataType::UInt64, Infallible),
+        ] {
+            let schema = Schema::new(vec![Field::new(
+                "d",
+                dictionary(from_keys.clone(), DataType::Null),
+                true,
+            )]);
+            let cast: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
+                physical_expr("d", &Arc::new(schema.clone())),
+                dictionary(to_keys.clone(), DataType::Null),
+                None,
+            ));
+            assert_eq!(
+                fallibility(&cast, &schema),
+                expected,
+                "{from_keys} into {to_keys}"
+            );
+        }
+        // Nor does it know the keys of a dictionary of dictionaries.
+        let nested = Schema::new(vec![Field::new(
+            "d",
+            dictionary(DataType::Int8, dictionary(DataType::UInt64, DataType::Utf8)),
+            true,
+        )]);
+        let cast: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
+            physical_expr("d", &Arc::new(nested.clone())),
+            dictionary(
+                DataType::Int64,
+                dictionary(DataType::UInt64, DataType::Utf8),
+            ),
+            None,
+        ));
+        assert_eq!(fallibility(&cast, &nested), PerRow);
         // Arrow cannot pack booleans into a dictionary, whatever the values.
         let booleans: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
             physical_expr("e", &schema),
