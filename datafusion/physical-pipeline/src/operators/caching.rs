@@ -258,8 +258,9 @@ fn owned_rows(chunk: &DataChunk) -> Result<RecordBatch> {
 ///   compacts them, but not when they are nested in other types.
 /// * Run-end encoded and list view arrays are not cached either.
 /// * Lists of values that take less than a byte each (e.g. fixed-size lists
-///   of nulls, booleans or empty lists), which `take` cannot copy, are not
-///   cached, nor run-end encoded arrays whose child fields are not Arrow's.
+///   of nulls, booleans, or empty lists or binaries), which `take` cannot
+///   copy, are not cached, nor run-end encoded arrays whose child fields are
+///   not Arrow's.
 pub fn can_cache(data_type: &DataType) -> bool {
     can_gather(data_type) && can_cache_nested(data_type, false)
 }
@@ -535,6 +536,12 @@ mod tests {
             true,
         ));
         assert!(!can_cache(&DataType::FixedSizeList(empty_lists, 1 << 30)));
+        let empty_binaries =
+            Arc::new(Field::new_list_field(DataType::FixedSizeBinary(0), true));
+        assert!(!can_cache(&DataType::FixedSizeList(
+            empty_binaries,
+            1 << 30
+        )));
         assert!(can_cache(&DataType::FixedSizeList(
             Arc::new(Field::new_list_field(DataType::Float32, true)),
             4

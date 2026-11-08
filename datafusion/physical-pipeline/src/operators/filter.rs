@@ -157,10 +157,10 @@ impl PhysicalFilter {
     ///   DataFusion must evaluate it on the batches of the input plan of
     ///   `exec`;
     /// * the input of `exec` has lists of values that take less than a byte
-    ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans or empty
-    ///   lists), which the native operators cannot gather with `take`, or
-    ///   run-end encoded arrays whose child fields are not Arrow's (see
-    ///   `can_gather`);
+    ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans, or empty
+    ///   lists or binaries), which the native operators cannot gather with
+    ///   `take`, or run-end encoded arrays whose child fields are not Arrow's
+    ///   (see `can_gather`);
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
     ///   (or run ends of less than 32 bits), or lists with 32-bit offsets, at
     ///   any depth: `FilterExec` coalesces its output batches, merging the
@@ -1900,6 +1900,8 @@ pub(crate) mod test_support {
         Runs,
         /// Fixed-size lists of no `Int32`.
         EmptyLists,
+        /// Fixed-size binaries of no byte.
+        EmptyBinaries,
         /// `false`, in bits.
         Booleans,
     }
@@ -1923,6 +1925,15 @@ pub(crate) mod test_support {
                     Arc::new(Field::new_list_field(DataType::Int32, true)),
                     0,
                     Arc::new(Int32Array::from(Vec::<i32>::new())),
+                    None,
+                    len,
+                )
+                .unwrap(),
+            ),
+            TinyValues::EmptyBinaries => Arc::new(
+                arrow::array::FixedSizeBinaryArray::try_new_with_len(
+                    0,
+                    arrow::buffer::Buffer::from(Vec::<u8>::new()),
                     None,
                     len,
                 )
@@ -4285,14 +4296,15 @@ mod tests {
         // Arrow's `take`, with which the native operators gather rows (e.g. the
         // cache, to copy the rows it keeps), computes the indices of the values
         // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, of
-        // runs, or of empty lists (of any type), which take no memory, or of
-        // booleans (128 MiB per row), they overflow from the fourth row on.
-        // DataFusion's `filter` does not.
-        let cases: [(&[i32], TinyValues); 5] = [
+        // runs, of empty lists (of any type) or binaries, which take no
+        // memory, or of booleans (128 MiB per row), they overflow from the
+        // fourth row on. DataFusion's `filter` does not.
+        let cases: [(&[i32], TinyValues); 6] = [
             (&[0, 0, 0, 0, 0, 1], TinyValues::Nulls),
             (&[1, 0, 1, 0, 1, 1], TinyValues::Nulls),
             (&[0, 0, 0, 0, 1, 0, 1, 0], TinyValues::Runs),
             (&[0, 0, 0, 0, 0, 1, 0, 1], TinyValues::EmptyLists),
+            (&[0, 0, 0, 0, 0, 1, 0, 1], TinyValues::EmptyBinaries),
             (&[0, 0, 0, 0, 1], TinyValues::Booleans),
         ];
         for (x, values) in cases {
