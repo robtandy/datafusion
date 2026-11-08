@@ -34,10 +34,11 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortedOutput, next_sorted_chunk};
+use super::{SortKeys, SortPlan, SortedOutput, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -84,6 +85,26 @@ impl PhysicalSort {
             run_rows: SORT_RUN_ROWS,
             run_bytes: SORT_RUN_BYTES,
         })
+    }
+
+    /// Lower a sort of a DataFusion plan that keeps all rows: see
+    /// [`try_lower`](super::try_lower), which lowers a sort that keeps only
+    /// its first rows to a [`PhysicalTopK`](super::PhysicalTopK). Returns
+    /// `Ok(None)` for such sorts and any other node, without calling
+    /// `lower_input`.
+    pub fn try_lower<F>(
+        plan: &Arc<dyn ExecutionPlan>,
+        lower_input: F,
+    ) -> Result<Option<Self>>
+    where
+        F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+    {
+        match SortPlan::try_new(plan)? {
+            Some(sort) if sort.fetch().is_none() => {
+                sort.into_sort(plan, lower_input).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Sort runs of at most `rows` rows and about `bytes` bytes.

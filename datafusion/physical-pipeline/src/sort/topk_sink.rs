@@ -48,10 +48,11 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, DynamicFilterPhysicalExpr, is_not_null, is_null, lit,
 };
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
+use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortedOutput, next_sorted_chunk};
+use super::{SortKeys, SortPlan, SortedOutput, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -144,6 +145,25 @@ impl PhysicalTopK {
         }
         self.dynamic_filter = Some(dynamic_filter);
         Ok(self)
+    }
+
+    /// Lower a sort of a DataFusion plan that keeps only its first rows: see
+    /// [`try_lower`](super::try_lower), which lowers a sort that keeps all
+    /// rows to a [`PhysicalSort`](super::PhysicalSort). Returns `Ok(None)` for
+    /// such sorts and any other node, without calling `lower_input`.
+    pub fn try_lower<F>(
+        plan: &Arc<dyn ExecutionPlan>,
+        lower_input: F,
+    ) -> Result<Option<Self>>
+    where
+        F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+    {
+        match SortPlan::try_new(plan)? {
+            Some(sort) if sort.fetch().is_some() => {
+                sort.into_topk(plan, lower_input).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// The input of the TopK.
