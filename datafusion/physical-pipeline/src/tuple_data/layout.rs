@@ -162,10 +162,10 @@ impl ColumnLayout {
                 "TupleDataLayout does not support unions without fields: {data_type}"
             );
         }
-        if has_list_view_of_run_end_encoded(data_type) {
+        if has_shared_run_end_encoded(data_type) {
             return not_impl_err!(
-                "TupleDataLayout does not support list views of run-end encoded values: \
-                 {data_type}"
+                "TupleDataLayout does not support run-end encoded values in list views or \
+                 dense unions, which can share them: {data_type}"
             );
         }
         if has_nested_dictionary_of_run_end_encoded(data_type) {
@@ -888,22 +888,26 @@ fn has_nested_dictionary_of_run_end_encoded(data_type: &DataType) -> bool {
         })
 }
 
-/// Whether `data_type` has (at any depth) a list view of values that contain
-/// a run-end encoded array. The views of a list view can share values, but
-/// the row format decodes them once per view, and their run ends can
-/// overflow (e.g. 2,048 views of the same 32 values with `Int16` run ends)
-/// although the list view holds them.
-fn has_list_view_of_run_end_encoded(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::ListView(item) | DataType::LargeListView(item)
-            if has_run_end_encoded(item.data_type()) =>
-        {
-            true
+/// Whether `data_type` has (at any depth) values that several rows can
+/// share and that contain a run-end encoded array: the items of a list view
+/// (whose views can overlap), or the children of a dense union (whose
+/// offsets can repeat). The row format decodes the shared values once per
+/// row, and their run ends can overflow (e.g. 2,048 views of the same 32
+/// values with `Int16` run ends) although the shared values fit them.
+fn has_shared_run_end_encoded(data_type: &DataType) -> bool {
+    let shared = match data_type {
+        DataType::ListView(item) | DataType::LargeListView(item) => {
+            has_run_end_encoded(item.data_type())
         }
-        data_type => child_data_types(data_type)
+        DataType::Union(fields, UnionMode::Dense) => fields
+            .iter()
+            .any(|(_, field)| has_run_end_encoded(field.data_type())),
+        _ => false,
+    };
+    shared
+        || child_data_types(data_type)
             .into_iter()
-            .any(|(child, _)| has_list_view_of_run_end_encoded(child)),
-    }
+            .any(|(child, _)| has_shared_run_end_encoded(child))
 }
 
 /// Whether `data_type` is a union or contains a union at any depth.
@@ -1061,11 +1065,12 @@ impl TupleDataLayout {
     /// [`TupleDataCollection`](super::TupleDataCollection).
     ///
     /// All types are supported except dictionaries of dictionaries,
-    /// dictionaries of run-end encoded values inside other types (the row
-    /// format decodes them to one value per row, whose run ends can
-    /// overflow), types with a union without fields (at any depth: such a
-    /// union cannot have rows), and nested types whose values the Arrow row
-    /// format cannot encode or restore exactly.
+    /// dictionaries of run-end encoded values inside other types, and
+    /// run-end encoded values in list views or dense unions (the row format
+    /// decodes these values once per row, whose run ends can overflow
+    /// although the shared values fit them), types with a union without
+    /// fields (at any depth: such a union cannot have rows), and nested types
+    /// whose values the Arrow row format cannot encode or restore exactly.
     pub fn supports_data_type(data_type: &DataType) -> bool {
         ColumnLayout::try_new(data_type, 0).is_ok()
     }
@@ -1485,8 +1490,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("v", views.data_type().clone(), true)]);
         let err = TupleDataLayout::try_new(Arc::new(schema), false).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("list views of run-end encoded values"),
+            err.to_string().contains("in list views or dense unions"),
             "{err}"
         );
 
@@ -1517,8 +1521,7 @@ mod tests {
             let err = TupleDataLayout::try_new_from_types([data_type.clone()], false)
                 .unwrap_err();
             assert!(
-                err.to_string()
-                    .contains("list views of run-end encoded values"),
+                err.to_string().contains("in list views or dense unions"),
                 "{data_type}: {err}"
             );
         }
@@ -1526,6 +1529,97 @@ mod tests {
             DataType::new_list(run_end_encoded.clone(), true),
             list_view(DataType::Float64),
             list_view(structs(DataType::Float64)),
+        ] {
+            assert!(
+                TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_unions_of_run_end_encoded_values_are_not_supported() {
+        use arrow::array::{
+            FixedSizeListArray, Float64Array, Int16Array, ListArray, RunArray, UnionArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Int16Type, Schema};
+
+        // A list of 2,048 entries of a dense union that all refer to the same
+        // 32 run-end encoded values, more values than `Int16` run ends count
+        // once the row format decodes every entry.
+        let runs = RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![32]),
+            &Float64Array::from(vec![1.5]),
+        )
+        .unwrap();
+        let run_end_encoded = runs.data_type().clone();
+        let item = Arc::new(Field::new("item", run_end_encoded.clone(), true));
+        let lists = FixedSizeListArray::try_new(item, 32, Arc::new(runs), None).unwrap();
+        let union_fields = |child: DataType| {
+            UnionFields::try_new([0], [Field::new("c", child, true)]).unwrap()
+        };
+        let union = UnionArray::try_new(
+            union_fields(lists.data_type().clone()),
+            vec![0; 2048].into(),
+            Some(vec![0; 2048].into()),
+            vec![Arc::new(lists.clone())],
+        )
+        .unwrap();
+        let list = ListArray::new(
+            Arc::new(Field::new("item", union.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2048]),
+            Arc::new(union),
+            None,
+        );
+        assert!(!TupleDataLayout::supports_data_type(list.data_type()));
+        let schema = Schema::new(vec![Field::new("l", list.data_type().clone(), true)]);
+        let err = TupleDataLayout::try_new(Arc::new(schema), false).unwrap_err();
+        assert!(
+            err.to_string().contains("in list views or dense unions"),
+            "{err}"
+        );
+
+        let dense =
+            |child: DataType| DataType::Union(union_fields(child), UnionMode::Dense);
+        let sparse =
+            |child: DataType| DataType::Union(union_fields(child), UnionMode::Sparse);
+        let structs =
+            |child: DataType| DataType::Struct(vec![Field::new("c", child, true)].into());
+        let runs_of = |values: DataType| {
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int16, false)),
+                Arc::new(Field::new("values", values, true)),
+            )
+        };
+        for data_type in [
+            dense(run_end_encoded.clone()),
+            dense(structs(run_end_encoded.clone())),
+            structs(dense(DataType::new_list(run_end_encoded.clone(), true))),
+            DataType::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(dense(run_end_encoded.clone())),
+            ),
+            runs_of(dense(run_end_encoded.clone())),
+        ] {
+            assert!(
+                !TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
+            let err = TupleDataLayout::try_new_from_types([data_type.clone()], false)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("in list views or dense unions"),
+                "{data_type}: {err}"
+            );
+        }
+        // Sparse unions do not share values, and a dense union without
+        // run-end encoded values can.
+        for data_type in [
+            sparse(run_end_encoded.clone()),
+            DataType::new_list(sparse(lists.data_type().clone()), true),
+            dense(DataType::Float64),
+            runs_of(dense(DataType::Float64)),
         ] {
             assert!(
                 TupleDataLayout::supports_data_type(&data_type),

@@ -26,13 +26,13 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayDataBuilder, ArrayRef, AsArray, BooleanArray, GenericByteArray,
-    GenericByteViewArray, RecordBatch, RecordBatchOptions, UInt64Array, make_array,
-    make_view, new_null_array,
+    GenericByteViewArray, RecordBatch, RecordBatchOptions, make_array, make_view,
+    new_null_array,
 };
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::take;
+use arrow::compute::concat;
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
     LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
@@ -1006,28 +1006,41 @@ impl DictionaryValues {
                 indices,
             });
         }
+        // The values that rows with a valid key refer to, in order, as slices
+        // of consecutive values: Arrow's `take` would merge the runs of equal
+        // run-end encoded values into runs of the value of their last row
+        // (see `SourceColumn::logical`), changing equal values that are not
+        // identical (e.g. nulls of different union variants).
         let keys = dictionary.keys();
-        let mut used = Vec::new();
-        let mut used_indices =
-            HashMap::with_capacity_and_hasher(indices.len(), RandomState::default());
-        for (row, index) in indices.iter_mut().enumerate() {
-            let value = *index;
-            *index = if keys.is_null(row) {
-                0
-            } else {
-                *used_indices.entry(value).or_insert_with(|| {
-                    used.push(value as u64);
-                    used.len() - 1
-                })
-            };
-        }
+        let mut used = (0..indices.len())
+            .filter(|&row| keys.is_valid(row))
+            .map(|row| indices[row])
+            .collect::<Vec<_>>();
+        used.sort_unstable();
+        used.dedup();
         if used.is_empty() {
             used.push(0);
         }
-        Ok(Self {
-            values: take(values.as_ref(), &UInt64Array::from(used), None)?,
-            indices,
-        })
+        let mut slices = Vec::new();
+        let mut start = 0;
+        for end in 1..=used.len() {
+            if end == used.len() || used[end] != used[end - 1] + 1 {
+                let first = used[start];
+                slices.push(values.slice(first, used[end - 1] + 1 - first));
+                start = end;
+            }
+        }
+        let values = concat(&slices.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
+        for (row, index) in indices.iter_mut().enumerate() {
+            *index = match keys.is_valid(row) {
+                // The position of the value among the used values.
+                true => used.binary_search(index).map_err(|_| {
+                    internal_datafusion_err!("Dictionary value {index} is not used")
+                })?,
+                false => 0,
+            };
+        }
+        Ok(Self { values, indices })
     }
 }
 
@@ -2357,12 +2370,12 @@ mod tests {
             Arc::clone(&sparse),
             Some(NullBuffer::from(vec![true, true, false, true, true, true])),
         ));
-        let batch = RecordBatch::try_from_iter(vec![
-            ("sparse", sparse),
-            ("dense", dense),
-            ("lists", lists),
-        ])
-        .unwrap();
+        // The values of dense unions can be shared by several rows, which
+        // the row format decodes once per row: the run ends could overflow.
+        assert!(!TupleDataLayout::supports_data_type(dense.data_type()));
+        let batch =
+            RecordBatch::try_from_iter(vec![("sparse", sparse), ("lists", lists)])
+                .unwrap();
         let mut collection = collection_for(&batch, false);
         let chunk = chunk_with_selection(&batch, vec![5, 0, 2, 2, 4, 1, 3]);
         let locations = collection.append_chunk(&chunk, None).unwrap();
@@ -3133,6 +3146,55 @@ mod tests {
                     assert_identical(&gathered, &expected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn unused_dictionary_values_of_run_end_encoded_unions() {
+        use arrow::array::{
+            DictionaryArray, Int8Array, Int16Array, RunArray, UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, Int16Type, UnionFields};
+
+        // Four run-end encoded values (two of them unused): a null of each
+        // variant of a dense union, which Arrow's `take` would merge into a
+        // run of the second one, then two valid values.
+        let union = UnionArray::try_new(
+            UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("i", DataType::Int32, true),
+                    Field::new("s", DataType::Utf8, true),
+                ],
+            )
+            .unwrap(),
+            vec![0, 1, 0, 1].into(),
+            Some(vec![0, 0, 1, 1].into()),
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(5)])),
+                Arc::new(StringArray::from(vec![None, Some("x")])),
+            ],
+        )
+        .unwrap();
+        let values =
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 2, 3, 4]), &union)
+                .unwrap();
+        for keys in [vec![0, 1], vec![1, 0], vec![0, 1, 3]] {
+            let dictionary = DictionaryArray::<Int8Type>::try_new(
+                Int8Array::from(keys),
+                Arc::new(values.clone()),
+            )
+            .unwrap();
+            let batch =
+                RecordBatch::try_from_iter(vec![("d", Arc::new(dictionary) as ArrayRef)])
+                    .unwrap();
+            let mut collection = collection_for(&batch, false);
+            let chunk = DataChunk::from_record_batch(batch.clone());
+            let locations = collection.append_chunk(&chunk, None).unwrap();
+            assert_identical(&collection.gather(&locations).unwrap(), &batch);
+            let mut state = TupleDataScanState::new();
+            let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+            assert_identical(&scanned.into_record_batch().unwrap(), &batch);
         }
     }
 
