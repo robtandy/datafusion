@@ -18,12 +18,18 @@
 //!   compared by their bits after normalizing `-0.0` to `+0.0`, so
 //!   `-0.0 = +0.0` and a `NaN` equals a `NaN` with the same bits;
 //!   dictionaries compare their values; nested values are compared value by
-//!   value (nested nulls are equal to each other, nested floats are
-//!   normalized too);
+//!   value (nested nulls are equal to each other, also the nulls of
+//!   different union variants, and nested floats are normalized too);
 //! * a null and a valid value are never equal;
 //! * two nulls are equal with [`NullEquality::NullEqualsNull`]
 //!   (`IS NOT DISTINCT FROM`) and not equal with
 //!   [`NullEquality::NullEqualsNothing`] (`=`).
+//!
+//! Nested keys are compared by their row encodings, which are equal exactly
+//! when the values are equal, except for keys with floats or unions: the row
+//! format distinguishes `-0.0` from `+0.0` and the nulls of different union
+//! variants. These keys are compared with Arrow's comparator on the decoded
+//! (and normalized) values instead, like `JoinKeyComparator` does.
 //!
 //! A probe chunk is usually compared with several candidates per row (e.g.
 //! the rows of a hash chain, one per round), so its keys are prepared once
@@ -104,11 +110,13 @@ enum ProbeData {
     Fixed(Buffer),
     /// A string or binary array.
     VarLen(ArrayRef),
-    /// Nested values without floats, encoded with the row format of the
-    /// column (equal values have equal encodings).
+    /// Nested values encoded with the row format of the column: equal
+    /// values have equal encodings.
     Encoded(Rows),
-    /// Nested values with floats, with `-0.0` normalized to `+0.0`.
-    Normalized(ArrayRef),
+    /// Nested values whose row encodings can differ although they are equal
+    /// (see `RowCodec::compare_decoded`), compared with Arrow's comparator
+    /// like `JoinKeyComparator` does, with `-0.0` normalized to `+0.0`.
+    Compared(ArrayRef),
 }
 
 impl RowMatcher {
@@ -287,9 +295,10 @@ impl ProbeColumn {
                 let codec = layout.codec().ok_or_else(|| {
                     internal_datafusion_err!("Encoded column without a row codec")
                 })?;
-                if codec.has_float_leaf {
-                    // The row format distinguishes `-0.0` and `+0.0`.
-                    ProbeData::Normalized(normalize_floats(&values))
+                if codec.compare_decoded {
+                    // The row format distinguishes `-0.0` and `+0.0`, and
+                    // the nulls of different union variants.
+                    ProbeData::Compared(normalize_floats(&values))
                 } else {
                     ProbeData::Encoded(codec.converter.convert_columns(&[values])?)
                 }
@@ -374,8 +383,8 @@ fn match_column(
         ProbeData::Encoded(encoded) => matches.retain(nulls, |_, i, row| {
             encoded.row(i).data() == row.var_len(offset)
         }),
-        // Compare the normalized values, like `JoinKeyComparator`.
-        ProbeData::Normalized(values) => {
+        // Compare the (normalized) values, like `JoinKeyComparator`.
+        ProbeData::Compared(values) => {
             let candidates = gather_values(layout, column, matches.rows)?;
             let comparator = make_comparator(
                 values.as_ref(),
@@ -844,6 +853,410 @@ mod tests {
             NullEquality::NullEqualsNothing,
         );
         assert_eq!(matched, vec![0, 2]);
+    }
+
+    /// Assert that matching probe row `i` of `probe` with row `pairs[i]` of
+    /// `build` agrees with DataFusion's `JoinKeyComparator`, in both null
+    /// equality modes, and return the matching rows of both modes.
+    fn assert_matches_join_key_comparator(
+        build: &ArrayRef,
+        probe: &ArrayRef,
+        pairs: &[usize],
+    ) -> [Vec<u32>; 2] {
+        let build_batch = batch(vec![("k", Arc::clone(build))]);
+        let probe_chunk =
+            DataChunk::from_record_batch(batch(vec![("k", Arc::clone(probe))]));
+        [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ]
+        .map(|null_equality| {
+            let (matched, _) =
+                match_pairs(&build_batch, &probe_chunk, pairs, vec![0], null_equality);
+            let comparator = JoinKeyComparator::new(
+                &[Arc::clone(build)],
+                &[Arc::clone(probe)],
+                &[SortOptions::default()],
+                null_equality,
+            )
+            .unwrap();
+            let expected = (0..pairs.len())
+                .filter(|&i| comparator.is_equal(pairs[i], i))
+                .map(|i| i as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(matched, expected, "{null_equality:?}");
+            matched
+        })
+    }
+
+    /// An element of a union: its type id and its value.
+    type UnionElement<'a> = (i8, Option<&'a str>);
+
+    /// A sparse `Union<i: Int32, s: Utf8>` of the given `(type id, value)`
+    /// elements: type id 0 is the `Int32` variant, 1 the `Utf8` variant, and
+    /// `None` is a null value of the variant.
+    fn sparse_union(elements: &[UnionElement<'_>]) -> arrow::array::UnionArray {
+        let fields = arrow::datatypes::UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("i", DataType::Int32, true),
+                Field::new("s", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+        let ints = elements
+            .iter()
+            .map(|&(t, v)| v.filter(|_| t == 0).map(|v| v.parse::<i32>().unwrap()))
+            .collect::<Int32Array>();
+        let strings = elements
+            .iter()
+            .map(|&(t, v)| v.filter(|_| t == 1))
+            .collect::<StringArray>();
+        arrow::array::UnionArray::try_new(
+            fields,
+            elements.iter().map(|&(t, _)| t).collect(),
+            None,
+            vec![Arc::new(ints), Arc::new(strings)],
+        )
+        .unwrap()
+    }
+
+    /// A `List<Union<i: Int32, s: Utf8>>` array, see [`sparse_union`].
+    fn union_lists(lists: &[Option<Vec<UnionElement<'_>>>]) -> ArrayRef {
+        let elements = lists
+            .iter()
+            .flatten()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let union = sparse_union(&elements);
+        let field = Arc::new(Field::new_list_field(union.data_type().clone(), true));
+        let offsets = arrow::buffer::OffsetBuffer::from_lengths(
+            lists.iter().map(|l| l.as_ref().map_or(0, Vec::len)),
+        );
+        let nulls =
+            NullBuffer::from(lists.iter().map(Option::is_some).collect::<Vec<_>>());
+        Arc::new(ListArray::new(field, offsets, Arc::new(union), Some(nulls)))
+    }
+
+    #[test]
+    fn nested_union_nulls_of_different_variants_are_equal() {
+        const INT: i8 = 0;
+        const STR: i8 = 1;
+        let build = union_lists(&[
+            Some(vec![(INT, Some("1")), (INT, None)]),
+            Some(vec![(STR, None)]),
+            Some(vec![(INT, Some("1"))]),
+            Some(vec![(INT, None)]),
+            None,
+            Some(vec![]),
+            Some(vec![(STR, Some("x")), (INT, None), (STR, None)]),
+        ]);
+        let probe = union_lists(&[
+            // A null element of the other variant.
+            Some(vec![(INT, Some("1")), (STR, None)]),
+            Some(vec![(INT, None)]),
+            // The same value in another variant.
+            Some(vec![(STR, Some("1"))]),
+            Some(vec![(INT, Some("2"))]),
+            None,
+            Some(vec![]),
+            Some(vec![(STR, Some("x")), (STR, None), (INT, None)]),
+        ]);
+        let pairs = [0, 1, 2, 3, 4, 5, 6];
+        let [nothing, null] = assert_matches_join_key_comparator(&build, &probe, &pairs);
+        // Valid lists whose null elements have different variants are equal.
+        assert_eq!(nothing, vec![0, 1, 5, 6]);
+        assert_eq!(null, vec![0, 1, 4, 5, 6]);
+
+        // A struct with a union field, and a union key at the top level.
+        let structs = |elements: &[(i8, Option<&str>)]| -> ArrayRef {
+            Arc::new(
+                StructArray::try_new(
+                    vec![Field::new(
+                        "u",
+                        sparse_union(elements).data_type().clone(),
+                        true,
+                    )]
+                    .into(),
+                    vec![Arc::new(sparse_union(elements))],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let build = structs(&[(INT, None), (STR, Some("a")), (INT, Some("3"))]);
+        let probe = structs(&[(STR, None), (STR, Some("a")), (STR, Some("3"))]);
+        let [nothing, null] =
+            assert_matches_join_key_comparator(&build, &probe, &[0, 1, 2]);
+        assert_eq!(nothing, vec![0, 1]);
+        assert_eq!(null, vec![0, 1]);
+        let build: ArrayRef = Arc::new(sparse_union(&[(INT, None), (STR, Some("a"))]));
+        let probe: ArrayRef = Arc::new(sparse_union(&[(STR, None), (STR, Some("a"))]));
+        let [nothing, null] = assert_matches_join_key_comparator(&build, &probe, &[0, 1]);
+        assert_eq!(nothing, vec![1]);
+        assert_eq!(null, vec![0, 1]);
+    }
+
+    /// Nested key types with nulls at all levels, sampled with repetitions
+    /// so that equal keys exist, agree with `JoinKeyComparator` on all
+    /// pairs. Covers the row encoding comparison (nested types without
+    /// floats and unions) and the comparator fallback (with unions).
+    #[test]
+    fn sampled_nested_keys_match_join_key_comparator() {
+        use arrow::array::{
+            FixedSizeListArray, Int32Builder, ListBuilder, ListViewArray, MapBuilder,
+            StringBuilder, StringDictionaryBuilder, UnionArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::{Int32Type, UnionFields};
+
+        const INT: i8 = 0;
+        const STR: i8 = 1;
+        // Lists of integers, with different bytes under null elements.
+        let ints = Int32Array::new(
+            vec![1, 77, 1, 0, 5, -3, 9].into(),
+            Some(NullBuffer::from(vec![
+                true, false, true, false, true, false, false,
+            ])),
+        );
+        let int_lists: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Int32, true)),
+            OffsetBuffer::from_lengths([2, 2, 0, 1, 2, 0]),
+            Arc::new(ints),
+            Some(NullBuffer::from(vec![true, true, true, true, true, false])),
+        ));
+        // Structs with a nested list, null structs with different children.
+        let fields = Fields::from(vec![
+            Field::new("i", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("l", DataType::new_list(DataType::Int32, true), true),
+        ]);
+        let structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![
+                        Some(1),
+                        None,
+                        Some(1),
+                        Some(2),
+                        None,
+                        Some(1),
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        Some("a"),
+                        Some("a"),
+                        None,
+                        Some("b"),
+                        None,
+                        Some("a"),
+                    ])),
+                    int_lists.slice(0, 6),
+                ],
+                Some(NullBuffer::from(vec![true, true, true, false, false, true])),
+            )
+            .unwrap(),
+        );
+        // Maps of strings to lists.
+        let mut maps = MapBuilder::new(
+            None,
+            StringBuilder::new(),
+            ListBuilder::new(Int32Builder::new()),
+        );
+        for i in 0..6 {
+            for j in 0..i % 3 {
+                maps.keys().append_value(format!("k{j}"));
+                if (i + j) % 4 == 0 {
+                    maps.values().append_null();
+                } else {
+                    maps.values().values().append_option((j != 1).then_some(j));
+                    maps.values().append(true);
+                }
+            }
+            maps.append(i != 4).unwrap();
+        }
+        let maps: ArrayRef = Arc::new(maps.finish());
+        // Fixed size lists and list views of dictionaries.
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new_list_field(DataType::Utf8, true)),
+                2,
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("x"),
+                    None,
+                    None,
+                    None,
+                    Some("y"),
+                    Some("x"),
+                    None,
+                    Some("z"),
+                    Some("x"),
+                    None,
+                ])),
+                Some(NullBuffer::from(vec![true, true, true, true, false, true])),
+            )
+            .unwrap(),
+        );
+        let mut dictionaries =
+            ListBuilder::new(StringDictionaryBuilder::<Int8Type>::new());
+        for i in 0..6 {
+            for j in 0..i % 3 {
+                dictionaries
+                    .values()
+                    .append_option((j != 1).then(|| format!("d{}", i % 2)));
+            }
+            dictionaries.append(i != 2);
+        }
+        let views: ArrayRef = Arc::new(ListViewArray::from(dictionaries.finish()));
+        // Lists of sparse and dense unions with nulls of both variants.
+        let union_fields = UnionFields::try_new(
+            [INT, STR],
+            [
+                Field::new("i", DataType::Int32, true),
+                Field::new("s", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+        let elements = [
+            (INT, Some("1")),
+            (INT, None),
+            (STR, None),
+            (STR, Some("1")),
+            (INT, None),
+            (STR, None),
+            (INT, Some("1")),
+            (STR, None),
+            (INT, None),
+            (STR, Some("a")),
+        ];
+        let sparse = sparse_union(&elements);
+        let dense_type_ids = elements
+            .iter()
+            .map(|&(t, _)| t)
+            .collect::<arrow::buffer::ScalarBuffer<i8>>();
+        let mut dense_offsets = vec![];
+        let (mut ints, mut strings) = (vec![], vec![]);
+        for &(t, v) in &elements {
+            if t == INT {
+                dense_offsets.push(ints.len() as i32);
+                ints.push(v.map(|v| v.parse::<i32>().unwrap()));
+            } else {
+                dense_offsets.push(strings.len() as i32);
+                strings.push(v);
+            }
+        }
+        let dense = UnionArray::try_new(
+            union_fields.clone(),
+            dense_type_ids,
+            Some(dense_offsets.into()),
+            vec![
+                Arc::new(Int32Array::from(ints)),
+                Arc::new(StringArray::from(strings)),
+            ],
+        )
+        .unwrap();
+        let lists_of = |union: UnionArray| -> ArrayRef {
+            Arc::new(ListArray::new(
+                Arc::new(Field::new_list_field(union.data_type().clone(), true)),
+                OffsetBuffer::from_lengths([2, 1, 1, 2, 0, 1, 1, 2]),
+                Arc::new(union),
+                Some(NullBuffer::from(vec![
+                    true, true, true, true, true, false, true, true,
+                ])),
+            ))
+        };
+        let mut union_maps =
+            MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+        for i in 0..6 {
+            for j in 0..i % 3 {
+                union_maps.keys().append_value(format!("k{j}"));
+                union_maps.values().append_option((i % 2 == 0).then_some(j));
+            }
+            union_maps.append(true).unwrap();
+        }
+        let union_maps = union_maps.finish();
+        let unions_in_maps: ArrayRef = {
+            // The same map, with union values.
+            let entries = union_maps.entries();
+            let values = entries.column(1).as_primitive::<Int32Type>();
+            let union = UnionArray::try_new(
+                union_fields,
+                (0..values.len())
+                    .map(|i| if i % 2 == 0 { INT } else { STR })
+                    .collect(),
+                None,
+                vec![
+                    Arc::new(values.clone()),
+                    Arc::new(StringArray::from(vec![None::<&str>; values.len()])),
+                ],
+            )
+            .unwrap();
+            let entry_fields = Fields::from(vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", union.data_type().clone(), true),
+            ]);
+            let entries = StructArray::try_new(
+                entry_fields,
+                vec![Arc::clone(entries.column(0)), Arc::new(union)],
+                None,
+            )
+            .unwrap();
+            Arc::new(
+                arrow::array::MapArray::try_new(
+                    Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                    union_maps.offsets().clone(),
+                    entries,
+                    union_maps.nulls().cloned(),
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+
+        let keys = [
+            ("lists", int_lists, false),
+            ("structs", structs, false),
+            ("maps", maps, false),
+            ("fixed size lists", fixed, false),
+            ("list views of dictionaries", views, false),
+            ("lists of sparse unions", lists_of(sparse), true),
+            ("lists of dense unions", lists_of(dense), true),
+            ("maps of unions", unions_in_maps, true),
+        ];
+        for (name, values, compare_decoded) in keys {
+            let layout =
+                TupleDataLayout::try_new_from_types([values.data_type().clone()], false)
+                    .unwrap();
+            assert_eq!(
+                layout.column(0).codec().unwrap().compare_decoded,
+                compare_decoded,
+                "{name}"
+            );
+            // Sample the values with repetitions.
+            let sample = |seed: u64| {
+                let indices = (0..3 * values.len() as u64)
+                    .map(|i| {
+                        let hash = (i + seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        ((hash >> 32) % values.len() as u64) as u32
+                    })
+                    .collect::<arrow::array::UInt32Array>();
+                arrow::compute::take(values.as_ref(), &indices, None).unwrap()
+            };
+            let (build, probe) = (sample(1), sample(1000));
+            let mut equal_pairs = 0;
+            for shift in 0..build.len() {
+                let pairs = (0..probe.len())
+                    .map(|i| (i + shift) % build.len())
+                    .collect::<Vec<_>>();
+                let [nothing, _] =
+                    assert_matches_join_key_comparator(&build, &probe, &pairs);
+                equal_pairs += nothing.len();
+            }
+            assert!(equal_pairs > 0, "{name}: no equal keys");
+        }
     }
 
     #[test]

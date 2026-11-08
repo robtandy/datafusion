@@ -231,9 +231,11 @@ pub(crate) struct RowCodec {
     /// Whether the decoded values must be cast to the value type of the
     /// column: the row format decodes dictionaries to their values.
     pub(crate) needs_cast: bool,
-    /// Whether the value type contains floats, which compare differently
-    /// in the row format (`-0.0 != +0.0`) than in DataFusion.
-    pub(crate) has_float_leaf: bool,
+    /// Whether two values can be equal for DataFusion although their row
+    /// encodings differ, so that they must be compared by their decoded
+    /// values: the row format distinguishes `-0.0` and `+0.0`, and the nulls
+    /// of different variants of a union.
+    pub(crate) compare_decoded: bool,
 }
 
 impl RowCodec {
@@ -258,8 +260,25 @@ impl RowCodec {
             converter,
             parser,
             needs_cast,
-            has_float_leaf: has_float_leaf(value_type),
+            compare_decoded: has_float_leaf(value_type) || has_union(value_type),
         })
+    }
+}
+
+/// Whether `data_type` is a union or contains a union at any depth.
+fn has_union(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(..) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_union(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| has_union(f.data_type())),
+        DataType::RunEndEncoded(_, values) => has_union(values.data_type()),
+        DataType::Dictionary(_, values) => has_union(values),
+        _ => false,
     }
 }
 
@@ -612,7 +631,7 @@ mod tests {
         assert_eq!(column.storage(), ColumnStorage::Encoded);
         let codec = column.codec().unwrap();
         assert!(!codec.needs_cast);
-        assert!(!codec.has_float_leaf);
+        assert!(!codec.compare_decoded);
 
         let codec = layout.column(2).codec().unwrap();
         assert!(codec.needs_cast);
@@ -624,7 +643,7 @@ mod tests {
         let floats =
             DataType::Struct(vec![Field::new("f", DataType::Float32, true)].into());
         let layout = TupleDataLayout::try_new_from_types([floats], false).unwrap();
-        assert!(layout.column(0).codec().unwrap().has_float_leaf);
+        assert!(layout.column(0).codec().unwrap().compare_decoded);
     }
 
     #[test]
