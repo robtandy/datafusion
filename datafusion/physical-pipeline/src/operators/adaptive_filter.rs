@@ -62,8 +62,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr,
-    Literal, NotExpr,
+    BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
+    LikeExpr, Literal, NotExpr,
 };
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
@@ -671,6 +671,11 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///
 /// * `expr` is volatile: it may observe how often it is evaluated, e.g. a
 ///   function that counts its calls. It is never evaluated here either;
+/// * several parts of `expr` may fail (see [`failing_parts`]): which error
+///   DataFusion raises first depends on its batches, e.g. on a batch of
+///   `("1", 0)` then `("invalid", 1)` rows, `CAST(s AS INT) + 10 / x` fails
+///   to cast in DataFusion, but divides by zero on the first chunk of a
+///   pipeline;
 /// * the right side of an `AND` or an `OR`, or a value after the first one
 ///   of an `IN` list, may fail on some rows and not on others
 ///   ([`Fallibility::PerRow`]). DataFusion evaluates the right side of an
@@ -709,12 +714,28 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if is_volatile(expr) {
+    if is_volatile(expr) || failing_parts(expr, schema) > 1 {
         return true;
     }
     let (fallibility, depends_on_batches) = analyze(expr, schema);
     depends_on_batches
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
+}
+
+/// The number of the parts of `expr` that may fail (on some rows or on all of
+/// them): if there are several, which error DataFusion raises first depends on
+/// its batches, as it evaluates each part on all rows of a batch before the
+/// next one, while a pipeline evaluates each part on a chunk. A `CASE` does not
+/// fail itself, but its branches may.
+pub fn failing_parts(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
+    let itself = usize::from(
+        !expr.is::<CaseExpr>()
+            && node_fallibility(expr, schema) != Fallibility::Infallible,
+    );
+    expr.children()
+        .into_iter()
+        .map(|child| failing_parts(child, schema))
+        .fold(itself, usize::saturating_add)
 }
 
 /// The fallibility of `expr` (see [`fallibility`]), and whether its errors
@@ -1181,6 +1202,25 @@ mod tests {
             // `CASE` evaluates its branches on the rows they are for.
             ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
             ("a > 0 AND b > 0", false),
+        ] {
+            let expr = physical_expr(predicate, &schema);
+            assert_eq!(depends_on_batches(&expr, &schema), expected, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn finds_several_failures() {
+        // Which of several parts that may fail fails first depends on the
+        // batches: DataFusion evaluates each part on all rows of a batch.
+        let schema = schema();
+        for (predicate, expected) in [
+            ("CAST(s AS INT) + 10 / a > 0", true),
+            ("CAST(10 / a AS SMALLINT) > 0", true),
+            ("upper(s) = lower(s)", true),
+            ("10 / a > 1", false),
+            ("upper(s) = 'X' AND a > 0", false),
+            // `CASE` itself does not fail.
+            ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
         ] {
             let expr = physical_expr(predicate, &schema);
             assert_eq!(depends_on_batches(&expr, &schema), expected, "{predicate}");

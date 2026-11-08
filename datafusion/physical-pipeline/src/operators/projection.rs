@@ -52,7 +52,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
-use super::adaptive_filter::depends_on_batches;
+use super::adaptive_filter::{depends_on_batches, failing_parts};
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -98,8 +98,12 @@ impl PhysicalProjection {
     /// Whether [`Self::try_from_projection_exec`] can lower `exec` with
     /// exactly its semantics, including its errors: whether none of its
     /// expressions has errors that depend on how DataFusion splits the rows
-    /// into batches, empty ones included (see [`depends_on_batches`]), and its
-    /// input has no lists of values that take no memory (see `can_gather`).
+    /// into batches, empty ones included (see [`depends_on_batches`]), at most
+    /// one part of all of its expressions may fail (which error
+    /// `ProjectionExec`, which evaluates each expression on a whole batch
+    /// before the next one, raises first depends on its batches, see
+    /// [`failing_parts`]), and its input has no lists of values that take no
+    /// memory (see `can_gather`).
     ///
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion
@@ -109,10 +113,16 @@ impl PhysicalProjection {
     /// depend on how the input is pulled.
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
         let input_schema = exec.input().schema();
-        input_schema
-            .fields()
+        let failing_parts = exec
+            .expr()
             .iter()
-            .all(|field| can_gather(field.data_type()))
+            .map(|projection| failing_parts(&projection.expr, input_schema.as_ref()))
+            .fold(0, usize::saturating_add);
+        failing_parts <= 1
+            && input_schema
+                .fields()
+                .iter()
+                .all(|field| can_gather(field.data_type()))
             && !exec.expr().iter().any(|projection| {
                 depends_on_batches(&projection.expr, input_schema.as_ref())
             })
@@ -891,8 +901,7 @@ mod tests {
             "SELECT a AS x, id, h, a AS y FROM t1 WHERE a > 10 AND d <> 'beta'",
             "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
-            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
-            "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day, ts FROM t1 WHERE f > DATE '1970-01-01'",
+            "SELECT id, CAST(g AS DOUBLE) AS gd, ts FROM t1 WHERE f > DATE '1970-01-01'",
             "SELECT id, c, -c AS minus_c FROM t1 WHERE c IS NULL OR c = 0.0 OR isnan(c)",
             "SELECT id * 2 AS id2, b FROM t1 WHERE id % 1000 = 7",
             "SELECT id, a + b AS s FROM t1",
@@ -903,6 +912,22 @@ mod tests {
             "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2 WHERE k < 0",
         ])
         .await;
+        // Several functions (whose failures are not known) or other parts that
+        // may fail: which error comes first depends on the batches.
+        assert_all_projections_in_datafusion(&[
+            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
+            "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day FROM t1",
+        ])
+        .await;
+    }
+
+    /// Assert that `queries` return the same results with the native operators
+    /// as with DataFusion, without native projections.
+    async fn assert_all_projections_in_datafusion(queries: &[&str]) {
+        for sql in queries {
+            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
+            assert_eq!(run.operators.projections, 0, "native projection: {sql}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1335,6 +1360,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn projections_with_several_failures_stay_in_datafusion() {
+        // `ProjectionExec` evaluates `CAST(s AS INT)` on all rows of the batch
+        // before `10 / x`, and fails to cast `"invalid"`; on the first chunk of
+        // a pipeline, `"1"` casts, and `10 / x` divides by zero.
+        let batch = xss(&[((0, "1"), 2048), ((1, "invalid"), 2048)]);
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [
+                        ProjectionExpr::new(
+                            physical_expr("CAST(s AS INT)", &schema),
+                            "c",
+                        ),
+                        ProjectionExpr::new(physical_expr("10 / x", &schema), "q"),
+                    ],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        // On one thread, a pipeline evaluates the first chunk first.
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) =
+            assert_native_plan_parity_with_config(plan, false, config).await;
+        assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
+        assert_eq!(operators.projections, 0);
+        // A single expression that may fail is lowered.
+        let (error, operators) = assert_native_plan_parity(
+            || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [
+                            ProjectionExpr::new(physical_expr("10 / x", &schema), "q"),
+                            ProjectionExpr::new(physical_expr("x + 1", &schema), "y"),
+                        ],
+                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                    )
+                    .unwrap(),
+                )
+            },
+            false,
+        )
+        .await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        assert_eq!(operators.projections, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lists_of_values_without_memory_stay_in_datafusion() {
         // A projection of `f IS NULL` above a filter gathers the selected rows
         // of `f`, fixed-size lists of `1 << 30` nulls, with Arrow's `take`,
@@ -1472,17 +1549,19 @@ mod tests {
         assert_all_native_byte_eq(&[
             "SELECT d8, sv, d32 AS d FROM vd WHERE d32 = 'k1'",
             "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
-            "SELECT CAST(d32 AS VARCHAR) || '!' AS x, length(sv) AS l FROM vd WHERE sv IS NOT NULL",
+            "SELECT CAST(d32 AS VARCHAR) || '!' AS x FROM vd WHERE sv IS NOT NULL",
             "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT d8 AS d, i + 1 AS j FROM vd WHERE d8 IS NOT NULL",
         ])
         .await;
         // `upper` takes the dictionary itself, and may evaluate all of its
-        // values, which depend on DataFusion's batches.
-        for sql in ["SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0"] {
-            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
-            assert_eq!(run.operators.projections, 0, "native projection: {sql}");
-        }
+        // values, which depend on DataFusion's batches; `||` and `length` may
+        // both fail.
+        assert_all_projections_in_datafusion(&[
+            "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
+            "SELECT CAST(d32 AS VARCHAR) || '!' AS x, length(sv) AS l FROM vd WHERE sv IS NOT NULL",
+        ])
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

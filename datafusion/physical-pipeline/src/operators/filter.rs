@@ -1056,9 +1056,11 @@ pub(crate) mod test_support {
     }
 
     /// Whether some expression of `plan` may fail depending on the batches
-    /// it is evaluated on: judged on the schema of the input of `plan` if it
-    /// has a single child, and without schema otherwise, which is
-    /// conservative (expressions that may fail then fail on empty batches).
+    /// it is evaluated on, or several parts of its expressions may fail (see
+    /// [`failing_parts`](crate::operators::adaptive_filter::failing_parts)):
+    /// judged on the schema of the input of `plan` if it has a single child,
+    /// and without schema otherwise, which is conservative (expressions that
+    /// may fail then fail on empty batches).
     /// The aggregations that merge partial states evaluate no expression on
     /// their input (the arguments of their aggregate functions are those of
     /// the partial aggregations).
@@ -1076,11 +1078,15 @@ pub(crate) mod test_support {
             _ => Arc::new(Schema::empty()),
         };
         let mut batch_dependent = false;
+        let mut failing_parts = 0_usize;
         plan.apply_expressions(&mut |expr| {
             batch_dependent |= depends_on_batches(expr, &schema);
+            failing_parts = failing_parts.saturating_add(
+                crate::operators::adaptive_filter::failing_parts(expr, &schema),
+            );
             Ok(TreeNodeRecursion::Continue)
         })?;
-        Ok(batch_dependent)
+        Ok(batch_dependent || failing_parts > 1)
     }
 
     /// `plan`, to be executed by DataFusion, with its children lowered: a
@@ -1352,10 +1358,18 @@ pub(crate) mod test_support {
         make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
         ordered: bool,
     ) -> (Option<String>, NativeOperators) {
-        let task_ctx = Arc::new(
-            TaskContext::default()
-                .with_session_config(SessionConfig::new().with_target_partitions(4)),
-        );
+        let config = SessionConfig::new().with_target_partitions(4);
+        assert_native_plan_parity_with_config(make_plan, ordered, config).await
+    }
+
+    /// [`assert_native_plan_parity`] with the session configuration `config`
+    /// (whose target partitions are the threads of the pipelines).
+    pub(crate) async fn assert_native_plan_parity_with_config(
+        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
+        ordered: bool,
+        config: SessionConfig,
+    ) -> (Option<String>, NativeOperators) {
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let plan = make_plan();
         let expected =
             collect(Arc::clone(&plan), Arc::clone(&task_ctx))
@@ -4109,6 +4123,25 @@ mod tests {
             .await;
             assert_eq!(outcome, Ok(x.iter().filter(|&&x| x > 0).count()));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn predicates_with_several_failures_stay_in_datafusion() {
+        // `FilterExec` evaluates `CAST(s AS INT)` on all rows of the batch
+        // before `10 / x`, and fails to cast `"invalid"`; on the first chunk of
+        // a pipeline, `"1"` casts, and `10 / x` divides by zero.
+        let batch = xss(&[((0, "1"), 2048), ((1, "invalid"), 2048)]);
+        let predicate = "CAST(s AS INT) + 10 / x > 0";
+        let plan = || filter_exec(predicate, scan(&batch), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        // On one thread, a pipeline evaluates the first chunk first.
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) =
+            assert_native_plan_parity_with_config(plan, false, config).await;
+        assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
+        assert_eq!(operators.filters, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
