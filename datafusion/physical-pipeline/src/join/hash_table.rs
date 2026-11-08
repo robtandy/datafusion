@@ -35,25 +35,29 @@
 //!   bits 63..48       bits 47..0 (0 = empty entry)
 //! ```
 //!
-//! The rows with the same 64-bit hash form a *chain* (a `next` array with
-//! one entry per row), and every chain has one entry, which points to its
-//! first row. So all duplicates of a key share an entry, and a table has as
-//! many entries as distinct hashes. Of the 64 bits of a hash, the upper
-//! [`PartitionedTupleData::radix_bits`] select the partition, the lower bits
-//! the first slot of the probe sequence, and bits 32..48 are the salt: a
-//! lookup only reads a row (its stored hash) if the salt of an entry matches,
-//! so almost all lookups of keys that are not in the table fail on the salt
-//! comparison without touching any row.
+//! The rows with equal keys form a *chain* (a `next` array with one entry
+//! per row), and every chain has one entry, which points to its first row.
+//! So all duplicates of a key share an entry, and a table has as many
+//! entries as distinct keys. Keys are equal with DataFusion's join key
+//! equality (see [`RowMatcher`]: e.g. `-0.0 = +0.0`, and NULLs are equal
+//! with [`NullEquality::NullEqualsNull`]). Of the 64 bits of a hash, the
+//! upper [`PartitionedTupleData::radix_bits`] select the partition, the
+//! lower bits the first slot of the probe sequence, and bits 32..48 are the
+//! salt: the keys of a row are only compared with the keys of the first row
+//! of a chain if the salt of its entry matches, so almost all lookups of
+//! keys that are not in the table fail on the salt comparison without
+//! touching any row. Hash collisions, even of all 64 bits, only cost a key
+//! comparison: like the probe rows, the build rows are inserted by comparing
+//! their keys with the first row of the chains whose salt matches.
 //!
 //! # Probe
 //!
-//! [`ChainScan`] looks up the chain of every row of a probe chunk and walks
-//! the candidate build rows in probe order (all candidates of the first
-//! probe row, in chain order, then those of the second probe row, ...) in
-//! batches of a bounded size, and [`JoinHashTable::match_keys`] keeps the
-//! candidates whose keys are equal,
-//! with DataFusion's join key equality (see [`RowMatcher`]). Hash collisions
-//! (even of all 64 bits) are therefore harmless: they only add candidates.
+//! [`ChainScan`] looks up the chain of every row of a probe chunk (comparing
+//! the keys of the probe rows with the first rows of the chains whose salt
+//! matches, in vectorized rounds, like DuckDB's `ScanStructure`) and walks
+//! the matches in probe order: all build rows of the chain of the first
+//! probe row, in chain order, then those of the second probe row, and so
+//! on, in batches of a bounded size.
 //!
 //! The table can track which build rows found a match
 //! ([`JoinHashTable::mark_matched`]), in an atomic bitset shared by all
@@ -68,12 +72,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::ArrayRef;
 use arrow::buffer::NullBuffer;
+use arrow::datatypes::SchemaRef;
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{
     NullEquality, Result, exec_err, internal_err, resources_datafusion_err,
 };
 
-use crate::chunk::{DataChunk, SelectionVector};
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::tuple_data::{
     PartitionedTupleData, RowLocation, RowMatcher, TupleDataCollection, TupleDataLayout,
 };
@@ -235,15 +240,22 @@ fn zeroed(len: usize, what: &str) -> Result<Vec<u64>> {
     Ok(values)
 }
 
-/// Build the pointer table of the partition `range` of `collection`.
+/// Build the pointer table of the partition `range` of `collection`, whose
+/// keys `matcher` compares (`key_schema` is the schema of the keys).
 ///
 /// The rows are inserted in reverse order and prepended to their chain, so
-/// that the rows of a chain are in the order of the collection.
+/// that the rows of a chain are in the order of the collection. A row whose
+/// salt matches the salt of an entry is compared with the first row of the
+/// chain of that entry. The comparisons are vectorized: the rows are
+/// inserted in batches, in rounds that stop every row at its next empty
+/// entry, which it claims, or at its next entry with its salt, whose chain
+/// it joins if its keys are equal (otherwise it continues after that entry
+/// in the next round).
 fn build_partition(
     collection: &TupleDataCollection,
     range: &PartitionRange,
-    num_keys: usize,
-    null_equality: NullEquality,
+    matcher: &RowMatcher,
+    key_schema: &SchemaRef,
 ) -> Result<PartitionTable> {
     let num_rows = range.rows.len();
     if num_rows == 0 {
@@ -255,31 +267,34 @@ fn build_partition(
     let Some(hash_offset) = collection.layout().hash_offset() else {
         return internal_err!("The rows of a JoinHashTable must store their hash");
     };
+    let num_keys = matcher.key_columns().len();
+    let null_equality = matcher.null_equality();
     let mut locations = Vec::new();
     let mut hashes = Vec::new();
-    let mut insert = Vec::new();
+    // The rows to insert (by index in the partition).
+    let mut inserted = Vec::new();
     locations
         .try_reserve_exact(num_rows)
         .and_then(|()| hashes.try_reserve_exact(num_rows))
-        .and_then(|()| insert.try_reserve_exact(num_rows))
+        .and_then(|()| inserted.try_reserve_exact(num_rows))
         .map_err(|e| {
             resources_datafusion_err!("Failed to allocate a JoinHashTable partition: {e}")
         })?;
-    let mut num_entries = 0;
     for block in range.blocks.clone() {
         let start = locations.len();
         locations.extend(
             (0..collection.block_len(block)).map(|row| RowLocation::new(block, row)),
         );
-        for row in collection.row_refs(&locations[start..])? {
+        for (i, row) in collection.row_refs(&locations[start..])?.iter().enumerate() {
+            hashes.push(row.hash(hash_offset));
             // Under `NullEqualsNothing`, rows with a NULL key never match:
             // they are kept (e.g. for the unmatched rows of an outer join),
             // but not looked up.
-            let lookup = null_equality == NullEquality::NullEqualsNull
-                || (0..num_keys).all(|key| row.is_valid(key));
-            hashes.push(row.hash(hash_offset));
-            insert.push(lookup);
-            num_entries += usize::from(lookup);
+            if null_equality == NullEquality::NullEqualsNull
+                || (0..num_keys).all(|key| row.is_valid(key))
+            {
+                inserted.push(start + i);
+            }
         }
     }
     if locations.len() != num_rows {
@@ -288,6 +303,7 @@ fn build_partition(
             locations.len()
         );
     }
+    let num_entries = inserted.len();
     let capacity = if num_entries == 0 {
         0
     } else {
@@ -304,38 +320,76 @@ fn build_partition(
     let mut entries = zeroed(capacity, "a JoinHashTable")?;
     let mut next = zeroed(num_rows, "the chains of a JoinHashTable")?;
     let mask = capacity.wrapping_sub(1);
-    let first_row = range.rows.start;
-    for i in (0..num_rows).rev() {
-        if !insert[i] {
-            continue;
-        }
-        let hash = hashes[i];
-        let salt = salt(hash);
-        let location = locations[i];
-        let mut slot = hash as usize & mask;
-        loop {
-            let current = entries[slot];
-            if current == 0 {
-                entries[slot] = entry(salt, location);
-                break;
-            }
-            if entry_salt(current) == salt {
-                let head = entry_location(current);
-                if hashes[collection.row_index(head) - first_row] == hash {
-                    // Prepend the row to the chain of its hash.
-                    next[i] = pack(head);
-                    entries[slot] = entry(salt, location);
-                    break;
+    let key_columns = (0..num_keys).collect::<Vec<_>>();
+    inserted.reverse();
+    // The rows of the current round, with the slot at which they continue.
+    let mut pending = Vec::new();
+    // The rows that stopped at an entry with their salt, with that entry,
+    // and the first row of its chain.
+    let mut compared = Vec::new();
+    let mut heads = Vec::new();
+    let mut no_match = Vec::new();
+    for batch in inserted.chunks(DEFAULT_VECTOR_SIZE) {
+        pending.clear();
+        pending.extend(batch.iter().map(|&row| (row, hashes[row] as usize & mask)));
+        while !pending.is_empty() {
+            compared.clear();
+            heads.clear();
+            for &(row, mut slot) in &pending {
+                let salt = salt(hashes[row]);
+                loop {
+                    let current = entries[slot];
+                    if current == 0 {
+                        // The first row of a new chain.
+                        entries[slot] = entry(salt, locations[row]);
+                        break;
+                    }
+                    if entry_salt(current) == salt {
+                        compared.push((row, slot));
+                        heads.push(entry_location(current));
+                        break;
+                    }
+                    slot = (slot + 1) & mask;
                 }
             }
-            slot = (slot + 1) & mask;
+            if compared.is_empty() {
+                break;
+            }
+            let rows = compared
+                .iter()
+                .map(|&(row, _)| locations[row])
+                .collect::<Vec<_>>();
+            let keys = collection.gather_columns(&rows, &key_columns)?;
+            let keys = DataChunk::try_new(Arc::clone(key_schema), keys, None)?;
+            let prepared = matcher.prepare(&keys)?;
+            let mut matched = (0..compared.len() as u32).collect::<Vec<_>>();
+            no_match.clear();
+            matcher.match_prepared(
+                &prepared,
+                &mut matched,
+                &heads,
+                collection,
+                Some(&mut no_match),
+            )?;
+            for &pair in &matched {
+                // Prepend the row to the chain of the entry, whose first row
+                // may have changed in this round, to a row with equal keys.
+                let (row, slot) = compared[pair as usize];
+                next[row] = pack(entry_location(entries[slot]));
+                entries[slot] = entry(salt(hashes[row]), locations[row]);
+            }
+            pending.clear();
+            pending.extend(no_match.iter().map(|&pair| {
+                let (row, slot) = compared[pair as usize];
+                (row, (slot + 1) & mask)
+            }));
         }
     }
     Ok(PartitionTable {
         entries,
         mask,
         next,
-        first_row,
+        first_row: range.rows.start,
         num_entries,
     })
 }
@@ -349,8 +403,10 @@ fn build_partition(
 /// that were not built yet and returns the [`JoinHashTable`].
 pub struct JoinHashTableBuilder {
     collection: TupleDataCollection,
-    num_keys: usize,
-    null_equality: NullEquality,
+    /// Compares the keys of the rows, the first columns of the layout.
+    matcher: RowMatcher,
+    /// The schema of the keys.
+    key_schema: SchemaRef,
     radix_bits: u32,
     partitions: Vec<PartitionRange>,
     /// The number of partitions claimed by [`Self::build_next_partition`].
@@ -363,7 +419,7 @@ impl fmt::Debug for JoinHashTableBuilder {
         f.debug_struct("JoinHashTableBuilder")
             .field("rows", &self.collection.len())
             .field("radix_bits", &self.radix_bits)
-            .field("num_keys", &self.num_keys)
+            .field("num_keys", &self.matcher.key_columns().len())
             .finish()
     }
 }
@@ -388,6 +444,10 @@ impl JoinHashTableBuilder {
                 layout.num_columns()
             );
         }
+        let key_columns = (0..num_keys).collect::<Vec<_>>();
+        let matcher =
+            RowMatcher::try_new(Arc::clone(layout), key_columns.clone(), null_equality)?;
+        let key_schema = Arc::new(layout.schema().project(&key_columns)?);
         let radix_bits = data.radix_bits();
         let (collection, blocks) = data.into_collection()?;
         // The location of every row, plus one, must fit in 48 bits.
@@ -415,8 +475,8 @@ impl JoinHashTableBuilder {
         let built = partitions.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
             collection,
-            num_keys,
-            null_equality,
+            matcher,
+            key_schema,
             radix_bits,
             partitions,
             claimed: AtomicUsize::new(0),
@@ -456,8 +516,8 @@ impl JoinHashTableBuilder {
             let table = build_partition(
                 &self.collection,
                 range,
-                self.num_keys,
-                self.null_equality,
+                &self.matcher,
+                &self.key_schema,
             )?;
             if self.built[partition].set(table).is_err() {
                 return internal_err!(
@@ -474,8 +534,8 @@ impl JoinHashTableBuilder {
     pub fn finish(self, track_matches: bool) -> Result<JoinHashTable> {
         let Self {
             collection,
-            num_keys,
-            null_equality,
+            matcher,
+            key_schema,
             radix_bits,
             partitions,
             built,
@@ -486,18 +546,13 @@ impl JoinHashTableBuilder {
             .zip(&partitions)
             .map(|(built, range)| match built.into_inner() {
                 Some(table) => Ok(table),
-                None => build_partition(&collection, range, num_keys, null_equality),
+                None => build_partition(&collection, range, &matcher, &key_schema),
             })
             .collect::<Result<Vec<_>>>()?;
         let num_entries = tables.iter().map(|table| table.num_entries).sum();
         let matched = track_matches
             .then(|| MatchedRows::try_new(collection.len()))
             .transpose()?;
-        let matcher = RowMatcher::try_new(
-            Arc::clone(collection.layout()),
-            (0..num_keys).collect(),
-            null_equality,
-        )?;
         Ok(JoinHashTable {
             collection,
             matcher,
@@ -651,133 +706,110 @@ impl JoinHashTable {
         &self.partitions[PartitionedTupleData::partition_index(hash, self.radix_bits)]
     }
 
-    /// Look up the chain of every probe row: `chains[i]` is set to the
-    /// packed location of the first build row whose hash is `hashes[i]`
-    /// (see [`ChainScan`]), or `0` if there is none or if the row is null
-    /// in `valid` (a row with a NULL key that cannot match).
+    /// Look up the chain of every probe row into `scan.chains`: the packed
+    /// location of the first build row of the chain whose keys are equal to
+    /// the keys of probe row `i` (the row `i` of `probe_keys`, whose first
+    /// [`Self::num_keys`] columns are the keys, and whose hash is
+    /// `scan.hashes[i]`), or `0` if there is none or if the row is null in
+    /// `valid` (a row with a NULL key that cannot match).
+    ///
+    /// Like the build rows when they are inserted, every probe row stops at
+    /// its next entry with its salt, and the keys of all these rows are
+    /// compared with the first rows of their chains at once; the rows whose
+    /// keys differ (a collision of the salt or of the hash) continue after
+    /// that entry in the next round.
     fn find_chains(
         &self,
-        hashes: &[u64],
+        probe_keys: &DataChunk,
         valid: Option<&NullBuffer>,
-        chains: &mut Vec<u64>,
+        scan: &mut ChainScan,
     ) -> Result<()> {
+        let ChainScan {
+            hashes,
+            chains,
+            slots,
+            candidates,
+            compared,
+            no_match,
+            ..
+        } = scan;
+        let num_rows = hashes.len();
         chains.clear();
-        chains.resize(hashes.len(), 0);
+        chains.resize(num_rows, 0);
         if self.is_empty() {
             return Ok(());
         }
-        // The rows whose chain is not found yet, and the slot of their table
-        // at which their search continues.
-        let mut pending = Vec::with_capacity(hashes.len());
+        if probe_keys.len() != num_rows || probe_keys.selection().is_some() {
+            return internal_err!(
+                "The probe keys of a join must be {num_rows} rows without a selection"
+            );
+        }
+        // The slot of the entry with its salt at which every row stopped,
+        // and the first row of the chain of that entry.
+        slots.clear();
+        slots.resize(num_rows, 0);
+        candidates.clear();
+        candidates.resize(num_rows, RowLocation::default());
+        // Stop the probe row `row` with hash `hash` at its next entry with
+        // its salt, from `slot` on.
+        let stop = |row: usize,
+                    hash: u64,
+                    mut slot: usize,
+                    slots: &mut [usize],
+                    candidates: &mut [RowLocation],
+                    compared: &mut Vec<u32>| {
+            let salt = salt(hash);
+            let table = self.partition(hash);
+            loop {
+                let current = table.entries[slot];
+                if current == 0 {
+                    // No build row has the keys of the row.
+                    return;
+                }
+                if entry_salt(current) == salt {
+                    slots[row] = slot;
+                    candidates[row] = entry_location(current);
+                    compared.push(row as u32);
+                    return;
+                }
+                slot = (slot + 1) & table.mask;
+            }
+        };
+        compared.clear();
         for (row, &hash) in hashes.iter().enumerate() {
             if valid.is_some_and(|valid| valid.is_null(row)) {
                 continue;
             }
             let table = self.partition(hash);
             if !table.entries.is_empty() {
-                pending.push((row, hash as usize & table.mask));
+                let slot = hash as usize & table.mask;
+                stop(row, hash, slot, slots, candidates, compared);
             }
         }
-        let mut candidates = Vec::with_capacity(pending.len());
-        while !pending.is_empty() {
-            // The next entry with the salt of every pending row.
-            candidates.clear();
-            let mut kept = 0;
-            for i in 0..pending.len() {
-                let (row, mut slot) = pending[i];
+        let mut prepared = None;
+        while !compared.is_empty() {
+            let prepared = match &prepared {
+                Some(prepared) => prepared,
+                None => prepared.insert(self.matcher.prepare(probe_keys)?),
+            };
+            no_match.clear();
+            self.matcher.match_prepared(
+                prepared,
+                compared,
+                candidates,
+                &self.collection,
+                Some(no_match),
+            )?;
+            for &row in compared.iter() {
+                chains[row as usize] = pack(candidates[row as usize]);
+            }
+            compared.clear();
+            for &row in no_match.iter() {
+                let row = row as usize;
                 let hash = hashes[row];
-                let salt = salt(hash);
-                let table = self.partition(hash);
-                loop {
-                    let current = table.entries[slot];
-                    if current == 0 {
-                        // No chain with the hash of the row.
-                        break;
-                    }
-                    if entry_salt(current) == salt {
-                        pending[kept] = (row, slot);
-                        kept += 1;
-                        candidates.push(entry_location(current));
-                        break;
-                    }
-                    slot = (slot + 1) & table.mask;
-                }
+                let slot = (slots[row] + 1) & self.partition(hash).mask;
+                stop(row, hash, slot, slots, candidates, compared);
             }
-            pending.truncate(kept);
-            if pending.is_empty() {
-                break;
-            }
-            // A chain is found if its rows have the full hash of the probe
-            // row, otherwise the search continues after its entry.
-            let stored = self.collection.gather_hashes(&candidates)?;
-            let mut kept = 0;
-            for i in 0..pending.len() {
-                let (row, slot) = pending[i];
-                let hash = hashes[row];
-                if stored[i] == hash {
-                    chains[row] = pack(candidates[i]);
-                } else {
-                    pending[kept] = (row, (slot + 1) & self.partition(hash).mask);
-                    kept += 1;
-                }
-            }
-            pending.truncate(kept);
-        }
-        Ok(())
-    }
-
-    /// The packed location of the row after `location`, a row of the chain
-    /// of hash `hash`, `0` if `location` is the last row of its chain.
-    #[inline]
-    fn next_in_chain(&self, hash: u64, location: RowLocation) -> u64 {
-        let table = self.partition(hash);
-        table.next[self.collection.row_index(location) - table.first_row]
-    }
-
-    /// Keep the candidate pairs whose keys are equal: the pair `i` is the
-    /// probe row `probe_rows[i]` (a row of `probe_keys`, a chunk whose first
-    /// [`Self::num_keys`] columns are the probe keys, without a selection)
-    /// and the build row at `candidates[i]`. The pairs that are kept keep
-    /// their order.
-    pub fn match_keys(
-        &self,
-        probe_keys: &DataChunk,
-        probe_rows: &mut Vec<u32>,
-        candidates: &mut Vec<RowLocation>,
-    ) -> Result<()> {
-        if probe_rows.len() != candidates.len() {
-            return internal_err!(
-                "Got {} probe rows for {} candidates",
-                probe_rows.len(),
-                candidates.len()
-            );
-        }
-        if probe_rows.is_empty() {
-            return Ok(());
-        }
-        if probe_keys.selection().is_some() {
-            return internal_err!("The probe keys of a join must not have a selection");
-        }
-        // The logical row `i` of the probe chunk is the probe row of pair `i`.
-        let pairs = probe_keys
-            .clone()
-            .with_selection(SelectionVector::from(probe_rows.clone()))?;
-        let prepared = self.matcher.prepare(&pairs)?;
-        let mut sel = (0..probe_rows.len() as u32).collect::<Vec<_>>();
-        self.matcher.match_prepared(
-            &prepared,
-            &mut sel,
-            candidates,
-            &self.collection,
-            None,
-        )?;
-        if sel.len() < probe_rows.len() {
-            for (kept, &pair) in sel.iter().enumerate() {
-                probe_rows[kept] = probe_rows[pair as usize];
-                candidates[kept] = candidates[pair as usize];
-            }
-            probe_rows.truncate(sel.len());
-            candidates.truncate(sel.len());
         }
         Ok(())
     }
@@ -792,27 +824,10 @@ impl JoinHashTable {
         }
     }
 
-    /// Drop the candidate pairs (`probe_rows[i]` and `candidates[i]`) whose
-    /// build row already found a match. Does nothing if the table does not
-    /// track matches.
-    pub fn retain_unmatched(
-        &self,
-        probe_rows: &mut Vec<u32>,
-        candidates: &mut Vec<RowLocation>,
-    ) {
-        let Some(matched) = &self.matched else {
-            return;
-        };
-        let mut kept = 0;
-        for pair in 0..candidates.len() {
-            if !matched.get(self.collection.row_index(candidates[pair])) {
-                probe_rows[kept] = probe_rows[pair];
-                candidates[kept] = candidates[pair];
-                kept += 1;
-            }
-        }
-        probe_rows.truncate(kept);
-        candidates.truncate(kept);
+    /// Whether the build row at `location` found a match. Always `false` if
+    /// the table does not track matches.
+    pub fn is_matched_at(&self, location: RowLocation) -> bool {
+        self.is_matched(self.collection.row_index(location))
     }
 
     /// Whether a key of each of the build rows at `locations` is NULL.
@@ -836,26 +851,33 @@ impl JoinHashTable {
     }
 }
 
-/// The candidate build rows of the rows of a probe chunk, walked in probe
-/// order: all candidates of probe row 0 (in the order of their chain), then
-/// all candidates of probe row 1, and so on (DuckDB's `ScanStructure`, but
-/// in probe order, so that the output of a join keeps the order of its probe
-/// side).
+/// The matches of the rows of a probe chunk, walked in probe order: all
+/// build rows that match probe row 0 (in the order of their chain), then all
+/// build rows that match probe row 1, and so on (DuckDB's `ScanStructure`,
+/// but in probe order, so that the output of a join keeps the order of its
+/// probe side).
 ///
-/// The candidates are the rows of the chain of the hash of a probe row:
-/// they have the hash of the probe row, but not necessarily its keys, see
-/// [`JoinHashTable::match_keys`].
+/// The matches of a probe row are the rows of the chain whose keys are equal
+/// to its keys (see [`JoinHashTable`]).
+///
+/// A scan can be [reset](Self::reset) to scan the matches of another probe
+/// chunk, reusing its buffers.
 #[derive(Debug, Default)]
 pub struct ChainScan {
     hashes: Vec<u64>,
     /// The first row of the chain of every probe row, packed (`0`: none).
     chains: Vec<u64>,
-    /// The next probe row whose candidates are returned.
+    /// The next probe row whose matches are returned.
     row: usize,
-    /// Whether the candidates of `row` are being returned.
+    /// Whether the matches of `row` are being returned.
     started: bool,
-    /// The next candidate of `row`, packed (`0`: none), if `started`.
+    /// The next match of `row`, packed (`0`: none), if `started`.
     next: u64,
+    // Buffers of `JoinHashTable::find_chains`.
+    slots: Vec<usize>,
+    candidates: Vec<RowLocation>,
+    compared: Vec<u32>,
+    no_match: Vec<u32>,
 }
 
 /// The probe rows covered by a batch of [`ChainScan::next_batch`].
@@ -863,42 +885,63 @@ pub struct ChainScan {
 pub struct ScanBatch {
     /// The first probe row of the batch.
     pub start: usize,
-    /// All candidates of the probe rows `start..end` were returned (in this
+    /// All matches of the probe rows `start..end` were returned (in this
     /// batch or, for `start`, possibly in previous batches too).
     pub end: usize,
-    /// The probe row `end` has more candidates, returned by the next
-    /// batches; the batch may have returned some of them.
+    /// The probe row `end` has more matches, returned by the next batches;
+    /// the batch may have returned some of them.
     pub in_progress: bool,
 }
 
 impl ChainScan {
-    /// Start a scan of the candidates of probe rows with hashes `hashes`
-    /// (see [`hash_join_keys`]). The rows that are null in `valid` have no
-    /// candidates.
+    /// Start a scan of the matches of the probe rows whose keys are the
+    /// first [`JoinHashTable::num_keys`] columns of `probe_keys` (without a
+    /// selection), with the hashes `hashes` (see [`hash_join_keys`]). The
+    /// rows that are null in `valid` have no matches.
     pub fn try_new(
         table: &JoinHashTable,
-        hashes: Vec<u64>,
+        probe_keys: &DataChunk,
+        hashes: &[u64],
         valid: Option<&NullBuffer>,
     ) -> Result<Self> {
-        let mut chains = Vec::new();
-        table.find_chains(&hashes, valid, &mut chains)?;
-        Ok(Self {
-            hashes,
-            chains,
-            row: 0,
-            started: false,
-            next: 0,
-        })
+        let mut scan = Self::default();
+        scan.reset(table, probe_keys, hashes, valid)?;
+        Ok(scan)
     }
 
-    /// A scan of `num_rows` probe rows without any candidate (e.g. for an
-    /// empty build side).
-    pub fn without_candidates(num_rows: usize) -> Self {
-        Self {
-            hashes: vec![0; num_rows],
-            chains: vec![0; num_rows],
-            ..Default::default()
-        }
+    /// Start a scan of other probe rows, see [`Self::try_new`].
+    pub fn reset(
+        &mut self,
+        table: &JoinHashTable,
+        probe_keys: &DataChunk,
+        hashes: &[u64],
+        valid: Option<&NullBuffer>,
+    ) -> Result<()> {
+        self.hashes.clear();
+        self.hashes.extend_from_slice(hashes);
+        self.row = 0;
+        self.started = false;
+        self.next = 0;
+        table.find_chains(probe_keys, valid, self)
+    }
+
+    /// A scan of `num_rows` probe rows without any match (e.g. for an empty
+    /// build side).
+    pub fn without_matches(num_rows: usize) -> Self {
+        let mut scan = Self::default();
+        scan.reset_without_matches(num_rows);
+        scan
+    }
+
+    /// Start a scan of `num_rows` probe rows without any match.
+    pub fn reset_without_matches(&mut self, num_rows: usize) {
+        self.hashes.clear();
+        self.hashes.resize(num_rows, 0);
+        self.chains.clear();
+        self.chains.resize(num_rows, 0);
+        self.row = 0;
+        self.started = false;
+        self.next = 0;
     }
 
     /// The number of probe rows.
@@ -906,61 +949,86 @@ impl ChainScan {
         self.chains.len()
     }
 
-    /// Whether the probe row `row` has candidates.
-    pub fn has_candidates(&self, row: usize) -> bool {
+    /// Drop the matches of the probe rows whose chain starts with a row for
+    /// which `skip` is true, before the scan starts.
+    pub fn skip_chains(&mut self, skip: impl Fn(RowLocation) -> bool) {
+        for chain in &mut self.chains {
+            if *chain != 0 && skip(unpack(*chain)) {
+                *chain = 0;
+            }
+        }
+    }
+
+    /// Whether the probe row `row` has matches.
+    pub fn has_matches(&self, row: usize) -> bool {
         self.chains[row] != 0
     }
 
-    /// Returns `true` once the candidates of all probe rows were returned.
+    /// Returns `true` once the matches of all probe rows were returned.
     pub fn is_done(&self) -> bool {
         self.row >= self.chains.len()
     }
 
-    /// Return the next candidates in `probe_rows` (the probe row of every
-    /// candidate) and `candidates` (its location), both cleared first.
+    /// Return the next matches in `probe_rows` (the probe row of every
+    /// match) and `matches` (the location of its build row), both cleared
+    /// first.
     ///
-    /// The batch ends once `max_cost` is reached: every candidate costs `1`,
-    /// and every probe row without any candidate costs `cost_without_candidates`
-    /// (e.g. `1` for a join that emits a row for it, `0` for one that does
-    /// not). So a join that emits at most one row per candidate, plus one row
-    /// per probe row without any candidate, emits at most `max_cost` rows per
-    /// batch.
+    /// The batch ends once `max_cost` is reached: every match costs `1`, and
+    /// every probe row without any match costs `cost_without_matches` (e.g.
+    /// `1` for a join that emits a row for it, `0` for one that does not). So
+    /// a join that emits at most one row per match, plus one row per probe
+    /// row without any match, emits at most `max_cost` rows per batch.
     pub fn next_batch(
         &mut self,
         table: &JoinHashTable,
         max_cost: usize,
-        cost_without_candidates: usize,
+        cost_without_matches: usize,
         probe_rows: &mut Vec<u32>,
-        candidates: &mut Vec<RowLocation>,
+        matches: &mut Vec<RowLocation>,
     ) -> ScanBatch {
         probe_rows.clear();
-        candidates.clear();
-        let start = self.row;
+        matches.clear();
         let max_cost = max_cost.max(1);
+        // Reserving can only fail if the memory is exhausted, then pushing
+        // fails as well.
+        let _ = probe_rows.try_reserve(max_cost);
+        let _ = matches.try_reserve(max_cost);
+        let start = self.row;
+        let (mut row, mut next, mut started) = (self.row, self.next, self.started);
+        let num_rows = self.chains.len();
         let mut cost = 0;
-        while self.row < self.chains.len() && cost < max_cost {
-            if !self.started {
-                self.next = self.chains[self.row];
-                if self.next == 0 {
-                    cost += cost_without_candidates;
-                    self.row += 1;
+        while row < num_rows && cost < max_cost {
+            if !started {
+                next = self.chains[row];
+                if next == 0 {
+                    cost += cost_without_matches;
+                    row += 1;
                     continue;
                 }
-                self.started = true;
+                started = true;
             }
-            let hash = self.hashes[self.row];
-            while self.next != 0 && cost < max_cost {
-                let location = unpack(self.next);
-                probe_rows.push(self.row as u32);
-                candidates.push(location);
+            // All rows of a chain are in the table of the same partition.
+            let partition = table.partition(self.hashes[row]);
+            let probe_row = row as u32;
+            loop {
+                let location = unpack(next);
+                probe_rows.push(probe_row);
+                matches.push(location);
                 cost += 1;
-                self.next = table.next_in_chain(hash, location);
+                next = partition.next
+                    [table.collection.row_index(location) - partition.first_row];
+                if next == 0 || cost >= max_cost {
+                    break;
+                }
             }
-            if self.next == 0 {
-                self.started = false;
-                self.row += 1;
+            if next == 0 {
+                started = false;
+                row += 1;
             }
         }
+        self.row = row;
+        self.next = next;
+        self.started = started;
         ScanBatch {
             start,
             end: self.row,
@@ -1063,8 +1131,8 @@ mod tests {
 
     /// All (probe row, `v` of the build row) pairs with equal keys, in the
     /// order of the scan, which returns batches of at most `max_cost`
-    /// candidates. The keys are the first `num_keys` columns of `probe`, and
-    /// `v` is the column after them.
+    /// matches. The keys are the first `num_keys` columns of `probe`, and `v`
+    /// is the column after them.
     fn probe(
         table: &JoinHashTable,
         probe: &RecordBatch,
@@ -1078,20 +1146,19 @@ mod tests {
             NullEquality::NullEqualsNothing => valid_keys(probe, num_keys),
             NullEquality::NullEqualsNull => None,
         };
-        let mut scan = ChainScan::try_new(table, hashes, valid.as_ref()).unwrap();
-        let (mut rows, mut candidates) = (vec![], vec![]);
+        let mut scan = ChainScan::try_new(table, &keys, &hashes, valid.as_ref()).unwrap();
+        let (mut rows, mut matches) = (vec![], vec![]);
         let mut pairs = vec![];
         let mut previous_end = 0;
         while !scan.is_done() {
-            let batch = scan.next_batch(table, max_cost, 0, &mut rows, &mut candidates);
+            let batch = scan.next_batch(table, max_cost, 0, &mut rows, &mut matches);
             assert!(rows.len() <= max_cost);
             assert_eq!(batch.start, previous_end);
             assert!(batch.end >= batch.start);
             previous_end = batch.end;
-            table.match_keys(&keys, &mut rows, &mut candidates).unwrap();
             let values = table
                 .collection()
-                .gather_columns(&candidates, &[num_keys])
+                .gather_columns(&matches, &[num_keys])
                 .unwrap();
             let values = values[0].as_primitive::<Int64Type>();
             pairs.extend(rows.iter().copied().zip(values.values().iter().copied()));
@@ -1233,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_collisions_only_add_candidates() {
+    fn hash_collisions_only_cost_key_comparisons() {
         let build = vec![batch_with_values(
             (0..50).map(|i| Some(i % 5)).collect(),
             100,
@@ -1241,8 +1308,8 @@ mod tests {
         let expected = |probe_batch: &RecordBatch| {
             expected(&build, probe_batch, NullEquality::NullEqualsNothing)
         };
-        // All rows have the same hash: a single chain, whose rows the key
-        // comparison tells apart.
+        // All rows have the same hash: one chain per key, in the same probe
+        // sequence, which the key comparisons tell apart.
         let same_hash = |b: &RecordBatch| vec![42; b.num_rows()];
         let collisions =
             table(&build, 1, NullEquality::NullEqualsNothing, 2, 2, same_hash);
@@ -1351,15 +1418,17 @@ mod tests {
         let table = table(&build, 1, NullEquality::NullEqualsNothing, 1, 1, |b| {
             hashes(b, 1)
         });
-        let mut scan = ChainScan::try_new(&table, hashes(&probe_batch, 1), None).unwrap();
+        let keys = DataChunk::from_record_batch(probe_batch.project(&[0]).unwrap());
+        let mut scan =
+            ChainScan::try_new(&table, &keys, &hashes(&probe_batch, 1), None).unwrap();
         assert_eq!(scan.num_rows(), 4);
-        assert!(!scan.has_candidates(0));
-        assert!(scan.has_candidates(1));
-        let (mut rows, mut candidates) = (vec![], vec![]);
+        assert!(!scan.has_matches(0));
+        assert!(scan.has_matches(1));
+        let (mut rows, mut matches) = (vec![], vec![]);
         let mut batches = vec![];
         while !scan.is_done() {
-            let batch = scan.next_batch(&table, 4, 1, &mut rows, &mut candidates);
-            assert_eq!(rows.len(), candidates.len());
+            let batch = scan.next_batch(&table, 4, 1, &mut rows, &mut matches);
+            assert_eq!(rows.len(), matches.len());
             batches.push((batch, rows.clone()));
         }
         let batch = |start, end, in_progress| ScanBatch {
@@ -1367,7 +1436,7 @@ mod tests {
             end,
             in_progress,
         };
-        // Probe row 0 has no candidates and costs 1.
+        // Probe row 0 has no match and costs 1.
         let expected = vec![
             (batch(0, 1, true), vec![1, 1, 1]),
             (batch(1, 1, true), vec![1, 1, 1, 1]),
@@ -1378,12 +1447,21 @@ mod tests {
         ];
         assert_eq!(batches, expected);
 
-        // Probe rows without candidates that cost nothing.
-        let mut scan = ChainScan::without_candidates(3);
-        let next = scan.next_batch(&table, 2, 1, &mut rows, &mut candidates);
+        // Skipped chains.
+        let mut scan =
+            ChainScan::try_new(&table, &keys, &hashes(&probe_batch, 1), None).unwrap();
+        let first = table.collection().row_locations().next().unwrap();
+        // Key 0's chain starts with the first row (rows are in build order).
+        scan.skip_chains(|head| head != first);
+        assert!(scan.has_matches(1) && scan.has_matches(3));
+        assert!(!scan.has_matches(2));
+
+        // Probe rows without matches that cost nothing.
+        let mut scan = ChainScan::without_matches(3);
+        let next = scan.next_batch(&table, 2, 1, &mut rows, &mut matches);
         assert_eq!(next, batch(0, 2, false));
         assert!(rows.is_empty());
-        let next = scan.next_batch(&table, 2, 0, &mut rows, &mut candidates);
+        let next = scan.next_batch(&table, 2, 0, &mut rows, &mut matches);
         assert_eq!(next, batch(2, 3, false));
         assert!(scan.is_done());
     }
@@ -1399,9 +1477,10 @@ mod tests {
         assert_eq!(table.num_rows(), 0);
         assert!(!table.tracks_matches());
         assert!(!table.is_matched(0));
-        let mut scan = ChainScan::try_new(&table, vec![1, 2, 3], None).unwrap();
-        let (mut rows, mut candidates) = (vec![], vec![]);
-        let next = scan.next_batch(&table, 10, 1, &mut rows, &mut candidates);
+        let keys = DataChunk::from_record_batch(batch(vec![Some(1), Some(2), None]));
+        let mut scan = ChainScan::try_new(&table, &keys, &[1, 2, 3], None).unwrap();
+        let (mut rows, mut matches) = (vec![], vec![]);
+        let next = scan.next_batch(&table, 10, 1, &mut rows, &mut matches);
         assert_eq!(next.end, 3);
         assert!(rows.is_empty());
 

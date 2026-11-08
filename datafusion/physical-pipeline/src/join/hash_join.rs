@@ -519,8 +519,9 @@ impl PhysicalHashJoin {
         let ProbeState {
             table,
             current,
+            scan: chain_scan,
             probe_rows,
-            candidates,
+            matches,
             ..
         } = state;
         let table: &JoinHashTable = table;
@@ -528,27 +529,17 @@ impl PhysicalHashJoin {
             return internal_err!("PhysicalHashJoin has no probe chunk");
         };
         let unmatched_cost = usize::from(spec.emits_unmatched_probe_rows());
-        let scan = chunk.scan.next_batch(
+        let scan = chain_scan.next_batch(
             table,
             DEFAULT_VECTOR_SIZE,
             unmatched_cost,
             probe_rows,
-            candidates,
+            matches,
         );
-        if spec.filter.is_none()
-            && matches!(
-                spec.join_type,
-                JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
-            )
-        {
-            // Only the build rows that did not match yet can change the result.
-            table.retain_unmatched(probe_rows, candidates);
-        }
-        table.match_keys(&chunk.keys, probe_rows, candidates)?;
         if let Some(filter) = &spec.filter {
-            self.apply_filter(filter, table, &chunk.batch, probe_rows, candidates)?;
+            self.apply_filter(filter, table, &chunk.batch, probe_rows, matches)?;
         }
-        table.mark_matched(candidates);
+        table.mark_matched(matches);
 
         let matched_in_progress = chunk.matched_in_progress;
         chunk.matched_in_progress = scan.in_progress
@@ -556,7 +547,7 @@ impl PhysicalHashJoin {
                 .last()
                 .is_some_and(|&row| row as usize == scan.end)
                 || (scan.end == scan.start && matched_in_progress));
-        // Whether the probe row `row`, whose candidates all were returned
+        // Whether the probe row `row`, whose matches all were returned
         // when `next` reached the first pair after it, found a match.
         let finished_matched = |row: usize, first: usize, next: usize| -> bool {
             next > first || (row == scan.start && matched_in_progress)
@@ -567,7 +558,7 @@ impl PhysicalHashJoin {
                 *output = self.output_chunk(
                     table,
                     probe.len(),
-                    Some((candidates.as_slice(), None)),
+                    Some((matches.as_slice(), None)),
                     Some((&chunk.batch, &probe)),
                     None,
                 )?;
@@ -601,7 +592,7 @@ impl PhysicalHashJoin {
                 *output = self.output_chunk(
                     table,
                     probe.len(),
-                    Some((candidates.as_slice(), build_take.as_ref())),
+                    Some((matches.as_slice(), build_take.as_ref())),
                     Some((&chunk.batch, &probe)),
                     None,
                 )?;
@@ -643,21 +634,21 @@ impl PhysicalHashJoin {
                 // The build rows are emitted once the probe side is exhausted.
             }
         }
-        if chunk.scan.is_done() {
+        if chain_scan.is_done() {
             *current = None;
         }
         Ok(())
     }
 
     /// Keep the pairs of probe rows and build rows (`probe_rows[i]` and
-    /// `candidates[i]`) for which the residual filter is true.
+    /// `matches[i]`) for which the residual filter is true.
     fn apply_filter(
         &self,
         filter: &JoinFilter,
         table: &JoinHashTable,
         batch: &RecordBatch,
         probe_rows: &mut Vec<u32>,
-        candidates: &mut Vec<RowLocation>,
+        matches: &mut Vec<RowLocation>,
     ) -> Result<()> {
         let num_pairs = probe_rows.len();
         if num_pairs == 0 {
@@ -671,7 +662,7 @@ impl PhysicalHashJoin {
             .collect::<Result<Vec<_>>>()?;
         let mut build_arrays = table
             .collection()
-            .gather_columns(candidates, &build_columns)?
+            .gather_columns(matches, &build_columns)?
             .into_iter();
         let probe_indices = UInt32Array::from(probe_rows.clone());
         let columns = filter
@@ -702,12 +693,12 @@ impl PhysicalHashJoin {
         for pair in 0..num_pairs {
             if mask.is_valid(pair) && mask.value(pair) {
                 probe_rows[kept] = probe_rows[pair];
-                candidates[kept] = candidates[pair];
+                matches[kept] = matches[pair];
                 kept += 1;
             }
         }
         probe_rows.truncate(kept);
-        candidates.truncate(kept);
+        matches.truncate(kept);
         Ok(())
     }
 
@@ -791,14 +782,22 @@ impl PhysicalHashJoin {
         DataChunk::try_new(Arc::clone(&spec.schema), columns, None)
     }
 
-    /// Start probing the rows of `input`. Returns `None` if the rows cannot
-    /// produce any output and do not need to be looked up.
+    /// Start probing the rows of `input`, resetting `scan` to the scan of
+    /// their matches. Returns `None` if the rows cannot produce any output
+    /// and do not need to be looked up.
     fn start_chunk(
         &self,
-        join: &JoinState,
-        table: &JoinHashTable,
+        state: &mut ProbeState,
         input: &DataChunk,
     ) -> Result<Option<ProbeChunk>> {
+        let ProbeState {
+            join,
+            table,
+            scan,
+            hashes,
+            ..
+        } = state;
+        let table: &JoinHashTable = table;
         let spec = &self.spec;
         // Evaluate the keys on the logical rows only: a key of a row that a
         // filter removed must not raise an error.
@@ -843,18 +842,27 @@ impl PhysicalHashJoin {
         } else {
             None
         };
-        let scan = if table.is_empty() {
-            ChainScan::without_candidates(num_rows)
+        if table.is_empty() {
+            scan.reset_without_matches(num_rows);
         } else {
-            let mut hashes = Vec::new();
-            hash_join_keys(&keys, num_rows, &mut hashes)?;
-            ChainScan::try_new(table, hashes, valid.as_ref())?
-        };
-        let keys = DataChunk::try_new(Arc::clone(&spec.key_schema), keys, None)?;
+            hash_join_keys(&keys, num_rows, hashes)?;
+            let keys = DataChunk::try_new(Arc::clone(&spec.key_schema), keys, None)?;
+            scan.reset(table, &keys, hashes, valid.as_ref())?;
+            if spec.filter.is_none()
+                && matches!(
+                    spec.join_type,
+                    JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark
+                )
+            {
+                // These joins only mark the build rows that match. Without a
+                // filter, a probe row that finds a chain marks all its rows
+                // (their keys are equal): a chain whose first row is marked
+                // is (being) marked already.
+                scan.skip_chains(|head| table.is_matched_at(head));
+            }
+        }
         Ok(Some(ProbeChunk {
             batch,
-            keys,
-            scan,
             matched_in_progress: false,
             excluded,
         }))
@@ -1141,9 +1149,13 @@ struct ProbeState {
     table: Arc<JoinHashTable>,
     /// The probe chunk being joined, until all its output was emitted.
     current: Option<ProbeChunk>,
-    /// The pairs of the current batch: probe rows and candidate build rows.
+    /// The matches of the rows of the current probe chunk.
+    scan: ChainScan,
+    /// The hashes of the keys of the current probe chunk.
+    hashes: Vec<u64>,
+    /// The pairs of the current batch: probe rows and matching build rows.
     probe_rows: Vec<u32>,
-    candidates: Vec<RowLocation>,
+    matches: Vec<RowLocation>,
 }
 
 impl OperatorState for ProbeState {}
@@ -1152,12 +1164,8 @@ impl OperatorState for ProbeState {}
 struct ProbeChunk {
     /// The (logical) rows of the chunk.
     batch: RecordBatch,
-    /// The probe keys.
-    keys: DataChunk,
-    /// The candidates of the rows.
-    scan: ChainScan,
-    /// Whether the probe row in progress of `scan` found a match in a
-    /// previous batch.
+    /// Whether the probe row in progress of the scan of the matches found a
+    /// match in a previous batch.
     matched_in_progress: bool,
     /// For a null-aware `RightAnti` join with a non-empty build side: the
     /// rows with a valid key (the others are never emitted).
@@ -1407,8 +1415,10 @@ impl PhysicalOperator for PhysicalHashJoin {
             join,
             table,
             current: None,
+            scan: ChainScan::default(),
+            hashes: Vec::new(),
             probe_rows: Vec::new(),
-            candidates: Vec::new(),
+            matches: Vec::new(),
         }))
     }
 
@@ -1423,7 +1433,7 @@ impl PhysicalOperator for PhysicalHashJoin {
         let state = downcast_state_mut::<ProbeState>(lstate.as_any_mut(), self.name())?;
         if state.current.is_none() {
             // A new input chunk.
-            match self.start_chunk(&state.join, &state.table, input)? {
+            match self.start_chunk(state, input)? {
                 Some(chunk) => state.current = Some(chunk),
                 None => return Ok(OperatorResult::NeedMoreInput),
             }
