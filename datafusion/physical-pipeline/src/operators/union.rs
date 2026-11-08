@@ -26,7 +26,9 @@
 //! the data types are equal, does not copy any data. Like that projection,
 //! it keeps the schema metadata of the input: the batches of DataFusion's
 //! union carry the schema metadata of the input they come from, not the
-//! merged schema metadata of the union.
+//! merged schema metadata of the union. (The plan of a `UnionExec` contains
+//! these projections already: [`PhysicalUnion::try_lower`] passes the chunks
+//! of its lowered inputs through as they are, as `UnionExec` does.)
 
 use std::sync::Arc;
 
@@ -34,8 +36,8 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::metadata::merge_metadata_for_union;
 use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec, can_interleave};
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -64,9 +66,10 @@ impl PhysicalUnion {
         Self::try_new_with_schema(inputs, schema)
     }
 
-    /// The union of `inputs`, with schema `schema` (e.g. the schema of the
-    /// `UnionExec` being lowered). Every input must have the data types of
-    /// `schema`; the field names, nullability and metadata may differ.
+    /// The union of `inputs`, with schema `schema`, to which the inputs are
+    /// coerced like `UnionExec::try_new` coerces its inputs to the schema of
+    /// the union. Every input must have the data types of `schema`; the field
+    /// names, nullability and metadata may differ.
     ///
     /// The chunks of an input keep its schema metadata, see the
     /// [module documentation](self).
@@ -103,11 +106,21 @@ impl PhysicalUnion {
     /// [`PhysicalUnion`] with the same schema. `lower_input` lowers the
     /// inputs of the node. Returns `Ok(None)` for any other node.
     ///
+    /// The node coerced its inputs when it was created, with projections that
+    /// are part of the plan, and passes the batches of its inputs through as
+    /// they are: so does the native union, it does not coerce the lowered
+    /// inputs again. A node whose inputs do not have its data types, which
+    /// only replacing its inputs without coercing them can create, is not
+    /// lowered, so that DataFusion executes it as it is.
+    ///
     /// `InterleaveExec` combines hash partitioned inputs partition by
     /// partition; the pipeline engine has no partitions, so it is a union of
     /// its inputs too. An `InterleaveExec` whose inputs are not partitioned
     /// alike (`can_interleave`) fails in DataFusion and is not lowered, so
-    /// that DataFusion executes it.
+    /// that DataFusion executes it. Nor is a node that advertises another
+    /// number of partitions than its inputs give it (after its inputs were
+    /// replaced without recomputing its properties): DataFusion then executes
+    /// some of the partitions of its inputs only, or fails.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         lower_input: F,
@@ -115,17 +128,37 @@ impl PhysicalUnion {
     where
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
-        let inputs = if let Some(union) = plan.downcast_ref::<UnionExec>() {
-            union.inputs()
-        } else if let Some(interleave) = plan.downcast_ref::<InterleaveExec>()
-            && can_interleave(interleave.inputs().iter())
-        {
-            interleave.inputs()
-        } else {
-            return Ok(None);
+        let partitions = |input: &Arc<dyn ExecutionPlan>| {
+            input.output_partitioning().partition_count()
         };
+        // The partitions the node executes when it advertises its partitions:
+        // all partitions of all its inputs, one after the other, or every
+        // partition of all inputs together.
+        let (inputs, input_partitions) =
+            if let Some(union) = plan.downcast_ref::<UnionExec>() {
+                (union.inputs(), union.inputs().iter().map(partitions).sum())
+            } else if let Some(interleave) = plan.downcast_ref::<InterleaveExec>()
+                && can_interleave(interleave.inputs().iter())
+            {
+                (interleave.inputs(), partitions(&interleave.inputs()[0]))
+            } else {
+                return Ok(None);
+            };
+        if partitions(plan) != input_partitions {
+            return Ok(None);
+        }
+        let schema = plan.schema();
         let inputs = inputs.iter().map(lower_input).collect::<Result<Vec<_>>>()?;
-        Self::try_new_with_schema(inputs, plan.schema()).map(Some)
+        for (index, input) in inputs.iter().enumerate() {
+            if check_data_types(index, &input.schema(), &schema).is_err() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Self {
+            children: inputs,
+            schema,
+            preserve_order: false,
+        }))
     }
 
     /// Whether the inputs are executed one after the other, in order, see
@@ -220,6 +253,28 @@ fn check_field_count(index: usize, schema: &Schema, expected: usize) -> Result<(
     Ok(())
 }
 
+/// Check that `input_schema`, the schema of the input at `index` of a union
+/// with schema `schema`, has the fields and data types of `schema`.
+fn check_data_types(index: usize, input_schema: &Schema, schema: &Schema) -> Result<()> {
+    check_field_count(index, input_schema, schema.fields().len())?;
+    for (i, (input_field, field)) in input_schema
+        .fields()
+        .iter()
+        .zip(schema.fields())
+        .enumerate()
+    {
+        if input_field.data_type() != field.data_type() {
+            return plan_err!(
+                "PhysicalUnion requires all inputs to have the data types of the union; \
+                 column {i} of input {index} has type {}, but the union expects {}",
+                input_field.data_type(),
+                field.data_type()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `input`, the input at `index` of a union with schema `schema`, wrapped in
 /// a [`UnionCoercion`] if its schema is not `schema`.
 ///
@@ -238,22 +293,7 @@ fn coerce_input(
     if &input_schema == schema {
         return Ok(input);
     }
-    check_field_count(index, &input_schema, schema.fields().len())?;
-    for (i, (input_field, field)) in input_schema
-        .fields()
-        .iter()
-        .zip(schema.fields())
-        .enumerate()
-    {
-        if input_field.data_type() != field.data_type() {
-            return plan_err!(
-                "PhysicalUnion requires all inputs to have the data types of the union; \
-                 column {i} of input {index} has type {}, but the union expects {}",
-                input_field.data_type(),
-                field.data_type()
-            );
-        }
-    }
+    check_data_types(index, &input_schema, schema)?;
     let cast = input_schema
         .fields()
         .iter()
@@ -1190,6 +1230,90 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lowered_unions_pass_the_chunks_of_their_inputs_through() -> Result<()> {
+        // `UnionExec` coerces its inputs when it is created, with projections
+        // in the plan, and passes the batches of its inputs through when it is
+        // executed: also those of inputs that were replaced without coercing
+        // them (`ChildrenPropertiesMode::Keep`).
+        let schema = |tag: &str| {
+            Arc::new(
+                Schema::new(vec![Field::new("v", DataType::Null, true)])
+                    .with_metadata(metadata(&[("tag", tag)])),
+            )
+        };
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let inputs = || -> Vec<Arc<dyn ExecutionPlan>> {
+                vec![
+                    Arc::new(PlaceholderRowExec::new(schema("left"))),
+                    Arc::new(PlaceholderRowExec::new(schema("right"))),
+                ]
+            };
+            UnionExec::try_new(inputs())?.replace_children(
+                inputs(),
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+            )
+        };
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let mut expected = datafusion_physical_plan::collect(make()?, task_ctx).await?;
+        let lowered = test_support::lower(&make()?)?;
+        assert!(lowered.is::<PhysicalUnion>());
+        let mut actual = run(lowered, 4).await?;
+        let by_schema = |batch: &RecordBatch| format!("{:?}", batch.schema());
+        expected.sort_by_key(by_schema);
+        actual.sort_by_key(by_schema);
+        assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unions_whose_partitioning_is_stale_are_left_to_datafusion() -> Result<()> {
+        // Inputs replaced without recomputing the properties of the node
+        // (`ChildrenPropertiesMode::Keep`), with more partitions than it
+        // advertises: DataFusion executes the partitions it advertises only.
+        let scan = |partitions: usize, start: i64| -> Result<Arc<dyn ExecutionPlan>> {
+            let partitions = (0..partitions as i64)
+                .map(|p| {
+                    let first = start + p * 10;
+                    vec![values_chunk(first..first + 3).into_record_batch().unwrap()]
+                })
+                .collect::<Vec<_>>();
+            Ok(MemorySourceConfig::try_new_exec(
+                &partitions,
+                values_schema(),
+                None,
+            )?)
+        };
+        let keep = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep);
+        let union = move || -> Result<Arc<dyn ExecutionPlan>> {
+            UnionExec::try_new(vec![scan(1, 0)?, scan(1, 100)?])?
+                .replace_children(vec![scan(2, 0)?, scan(2, 100)?], keep)
+        };
+        assert_eq!(union()?.output_partitioning().partition_count(), 2);
+        let root = assert_native_plan_byte_eq(union, false).await;
+        assert_eq!(count::<PhysicalUnion>(&root), 0);
+
+        let interleave = move || -> Result<Arc<dyn ExecutionPlan>> {
+            let inputs = |partitions| -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+                let by_v =
+                    |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                        let v = col("v", &input.schema())?;
+                        Ok(Arc::new(RepartitionExec::try_new(
+                            input,
+                            Partitioning::Hash(vec![v], partitions),
+                        )?))
+                    };
+                Ok(vec![by_v(scan(2, 0)?)?, by_v(scan(2, 100)?)?])
+            };
+            Arc::new(InterleaveExec::try_new(inputs(1)?)?)
+                .replace_children(inputs(2)?, keep)
+        };
+        assert_eq!(interleave()?.output_partitioning().partition_count(), 1);
+        let root = assert_native_plan_byte_eq(interleave, false).await;
+        assert_eq!(count::<PhysicalUnion>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn union_relabels_the_chunks_of_coerced_inputs() -> Result<()> {
         // The union schema is the schema of the first input.
         let nullable = Arc::new(Schema::new(vec![
@@ -1472,6 +1596,21 @@ mod tests {
             datafusion_physical_plan::collect(Arc::clone(&mismatched), task_ctx).await;
         assert!(failed.is_err());
         assert!(PhysicalUnion::try_lower(&mismatched, bridge)?.is_none());
+        // Inputs replaced without coercing them, with other data types.
+        let other_types = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("w", DataType::Int64, true),
+        ]));
+        let replaced = union.replace_children(
+            vec![
+                t2_scan()?,
+                Arc::new(EmptyExec::new(other_types)),
+                t2_scan()?,
+            ],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )?;
+        assert!(PhysicalUnion::try_lower(&replaced, bridge)?.is_none());
 
         let mut called = false;
         assert!(
