@@ -595,17 +595,21 @@ impl TupleDataCollection {
     /// returned. The locations of the rows of the returned chunk are
     /// available in [`TupleDataScanState::locations`].
     ///
-    /// Rows are returned in the order of [`Self::row_locations`].
+    /// Rows are returned in the order of [`Self::row_locations`]. A chunk has
+    /// fewer rows if the values of more rows do not fit their types together
+    /// (and so do the following chunks of the scan), e.g. if they would need
+    /// more dictionary keys than the key type has, more run-end encoded values
+    /// than the run end type counts, or larger offsets than the offset type
+    /// holds.
     pub fn scan_chunk(
         &self,
         state: &mut TupleDataScanState,
     ) -> Result<Option<DataChunk>> {
         state.locations.clear();
         let end = state.blocks.end.min(self.blocks.len());
-        while state.locations.len() < state.chunk_size && state.block < end {
+        while state.locations.len() < state.max_rows && state.block < end {
             let block = &self.blocks[state.block];
-            let n =
-                (block.count - state.row).min(state.chunk_size - state.locations.len());
+            let n = (block.count - state.row).min(state.max_rows - state.locations.len());
             let block_index = state.block;
             state.locations.extend(
                 (state.row..state.row + n).map(|row| RowLocation::new(block_index, row)),
@@ -632,14 +636,30 @@ impl TupleDataCollection {
                 schema
             }
         };
-        let columns = match &state.column_ids {
-            Some(column_ids) => self.gather_columns(&state.locations, column_ids)?,
-            None => {
-                let column_ids = (0..self.layout.num_columns()).collect::<Vec<_>>();
-                self.gather_columns(&state.locations, &column_ids)?
+        let column_ids = match &state.column_ids {
+            Some(column_ids) => Cow::Borrowed(column_ids.as_slice()),
+            None => Cow::Owned((0..self.layout.num_columns()).collect()),
+        };
+        // Halve the chunk until its values can be gathered together, and
+        // the following chunks too.
+        let mut len = state.locations.len();
+        let columns = loop {
+            match self.gather_columns(&state.locations[..len], &column_ids) {
+                Ok(columns) => break columns,
+                Err(e) if len == 1 => return Err(e),
+                Err(_) => {
+                    len /= 2;
+                    state.max_rows = len;
+                }
             }
         };
-        let batch = record_batch(schema, columns, state.locations.len())?;
+        if len < state.locations.len() {
+            // Continue the scan after the returned rows.
+            let next = state.locations[len];
+            (state.block, state.row) = (next.block(), next.row());
+            state.locations.truncate(len);
+        }
+        let batch = record_batch(schema, columns, len)?;
         Ok(Some(DataChunk::from_record_batch(batch)))
     }
 }
@@ -668,6 +688,9 @@ pub struct TupleDataScanState {
     block: usize,
     row: usize,
     chunk_size: usize,
+    /// The maximum number of rows of the next chunk: `chunk_size`, or fewer
+    /// once the values of more rows did not fit their types together.
+    max_rows: usize,
     schema: Option<SchemaRef>,
     locations: Vec<RowLocation>,
 }
@@ -687,6 +710,7 @@ impl TupleDataScanState {
             block: 0,
             row: 0,
             chunk_size: DEFAULT_VECTOR_SIZE,
+            max_rows: DEFAULT_VECTOR_SIZE,
             schema: None,
             locations: vec![],
         }
@@ -710,6 +734,7 @@ impl TupleDataScanState {
     /// Return chunks of at most `chunk_size` rows (at least one).
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size.max(1);
+        self.max_rows = self.chunk_size;
         self
     }
 
@@ -2892,6 +2917,119 @@ mod tests {
             let mut state = TupleDataScanState::new();
             let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
             assert_identical(&scanned.into_record_batch().unwrap(), &batch);
+        }
+    }
+
+    #[test]
+    fn scans_return_fewer_rows_whose_values_do_not_fit_together() {
+        use arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int8Array, Int16Array, RunArray,
+        };
+        use arrow::datatypes::{Int8Type, Int16Type};
+
+        // 8 chunks of 128 rows: lists of 32 run-end encoded values (more than
+        // `Int16` run ends count in 1,024 rows), and dictionaries of 128
+        // distinct strings per chunk (more than `Int8` keys count in 256
+        // rows of different chunks).
+        let lists = |chunk: i32| -> ArrayRef {
+            let runs = RunArray::<Int16Type>::try_new(
+                &Int16Array::from_iter_values((1..=128).map(|i| i * 32)),
+                &Int32Array::from_iter_values((0..128).map(|i| chunk * 128 + i)),
+            )
+            .unwrap();
+            let item = Arc::new(Field::new("item", runs.data_type().clone(), true));
+            Arc::new(FixedSizeListArray::try_new(item, 32, Arc::new(runs), None).unwrap())
+        };
+        let strings = |chunk: i32| -> ArrayRef {
+            let values = (0..128).map(|i| format!("{chunk}-{i}")).collect::<Vec<_>>();
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from_iter_values(0..=127),
+                    Arc::new(StringArray::from(values)),
+                )
+                .unwrap(),
+            )
+        };
+        let columns: [&dyn Fn(i32) -> ArrayRef; 2] = [&lists, &strings];
+        for column in columns {
+            let batches = (0..8)
+                .map(|chunk| {
+                    RecordBatch::try_from_iter(vec![("c", column(chunk))]).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut collection = collection_for(&batches[0], false);
+            for batch in &batches {
+                let chunk = DataChunk::from_record_batch(batch.clone());
+                collection.append_chunk(&chunk, None).unwrap();
+            }
+            let locations = collection.row_locations().collect::<Vec<_>>();
+            let mut state = TupleDataScanState::new();
+            let mut row = 0;
+            let mut sizes = vec![];
+            while let Some(chunk) = collection.scan_chunk(&mut state).unwrap() {
+                sizes.push(chunk.len());
+                assert_eq!(state.locations(), &locations[row..row + chunk.len()]);
+                let scanned = chunk.into_record_batch().unwrap();
+                // Compare with the appended rows, by appended chunk.
+                let mut start = 0;
+                while start < scanned.num_rows() {
+                    let (batch, offset) = ((row + start) / 128, (row + start) % 128);
+                    let len = (128 - offset).min(scanned.num_rows() - start);
+                    assert_identical(
+                        &scanned.slice(start, len),
+                        &batches[batch].slice(offset, len),
+                    );
+                    start += len;
+                }
+                row += scanned.num_rows();
+            }
+            assert_eq!(row, 1024);
+            // Halved until the values fit, also for the following chunks.
+            let size = sizes[0];
+            assert!(size < 1024 && sizes.iter().all(|&s| s == size), "{sizes:?}");
+        }
+    }
+
+    #[test]
+    fn too_many_run_end_encoded_values_to_gather_are_an_error() {
+        use arrow::array::{Int16Array, ListArray, RunArray};
+        use arrow::datatypes::Int16Type;
+
+        // 30,000 equal values (one run): one such array fits `Int16` run
+        // ends, three do not (and their run ends would wrap to valid ones).
+        let runs = || -> ArrayRef {
+            Arc::new(
+                RunArray::<Int16Type>::try_new(
+                    &Int16Array::from(vec![30_000]),
+                    &Int32Array::from(vec![7]),
+                )
+                .unwrap(),
+            )
+        };
+        let list = |values: ArrayRef| -> ArrayRef {
+            let item = Arc::new(Field::new("item", values.data_type().clone(), true));
+            Arc::new(ListArray::new(
+                item,
+                OffsetBuffer::from_lengths([values.len()]),
+                values,
+                None,
+            ))
+        };
+        for column in [runs(), list(runs())] {
+            let batch = RecordBatch::try_from_iter(vec![("c", column)]).unwrap();
+            let mut collection = collection_for(&batch, false);
+            let mut locations = vec![];
+            for _ in 0..3 {
+                let chunk = DataChunk::from_record_batch(batch.clone());
+                locations.extend(collection.append_chunk(&chunk, None).unwrap());
+            }
+            let rows = batch.num_rows();
+            assert_identical(
+                &collection.gather(&locations[rows..2 * rows]).unwrap(),
+                &batch,
+            );
+            let err = collection.gather(&locations).unwrap_err();
+            assert!(err.to_string().contains("run ends"), "{err}");
         }
     }
 

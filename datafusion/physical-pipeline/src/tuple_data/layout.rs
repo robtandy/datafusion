@@ -162,6 +162,12 @@ impl ColumnLayout {
                 "TupleDataLayout does not support unions without fields: {data_type}"
             );
         }
+        if has_list_view_of_run_end_encoded(data_type) {
+            return not_impl_err!(
+                "TupleDataLayout does not support list views of run-end encoded values: \
+                 {data_type}"
+            );
+        }
         if has_nested_dictionary_of_run_end_encoded(data_type) {
             return not_impl_err!(
                 "TupleDataLayout does not support dictionaries of run-end encoded values \
@@ -270,11 +276,18 @@ impl ColumnLayout {
 /// with the Arrow row format.
 #[derive(Debug)]
 pub(crate) struct RowCodec {
+    /// Encodes the values of the column.
     pub(crate) converter: RowConverter,
-    pub(crate) parser: RowParser,
+    /// Decodes the values encoded by `converter`, with `Int64` run ends (see
+    /// [`with_wide_run_ends`]): the row format encodes run-end encoded
+    /// arrays by their values, whatever their run end type.
+    decoder: RowConverter,
+    /// Parses the rows of `decoder`.
+    parser: RowParser,
     /// The value type of the column.
     value_type: DataType,
-    /// The value type with every dictionary replaced by its values.
+    /// The value type with every dictionary replaced by its values, and
+    /// `Int64` run ends.
     flat_type: DataType,
     /// Whether two values can be equal for DataFusion although their row
     /// encodings differ, so that they must be compared by their decoded
@@ -292,12 +305,15 @@ impl RowCodec {
             );
         }
         let converter = RowConverter::new(fields)?;
-        let parser = converter.parser();
+        let wide_type = with_wide_run_ends(value_type);
+        let decoder = RowConverter::new(vec![SortField::new(wide_type.clone())])?;
+        let parser = decoder.parser();
         let codec = Self {
             converter,
+            decoder,
             parser,
             value_type: value_type.clone(),
-            flat_type: without_dictionaries(value_type),
+            flat_type: without_dictionaries(&wide_type),
             compare_decoded: has_float_leaf(value_type) || has_union(value_type),
         };
         // Reject the types whose values cannot be restored exactly (or
@@ -343,9 +359,11 @@ impl RowCodec {
     }
 
     /// Like [`Self::decode`], but with every dictionary replaced by its
-    /// values, e.g. to compare values: unlike values of the value type,
-    /// values from collections with different dictionaries can always be
-    /// decoded together (their dictionaries do not need to fit the keys).
+    /// values and `Int64` run ends, e.g. to compare values: unlike values of
+    /// the value type, any values can be decoded together (e.g. values from
+    /// collections with different dictionaries, whose dictionaries do not
+    /// need to fit the keys, or more run-end encoded values than the run end
+    /// type counts).
     pub(crate) fn decode_flat<'a>(
         &self,
         encoded: impl IntoIterator<Item = &'a [u8]>,
@@ -368,7 +386,7 @@ impl RowCodec {
     ) -> Result<ArrayRef> {
         let rows = encoded.into_iter().map(|bytes| self.parser.parse(bytes));
         let values =
-            self.converter.convert_rows(rows)?.pop().ok_or_else(|| {
+            self.decoder.convert_rows(rows)?.pop().ok_or_else(|| {
                 internal_datafusion_err!("RowConverter returned no column")
             })?;
         let data = values.to_data();
@@ -433,7 +451,8 @@ fn has_type(data: &ArrayData, data_type: &DataType) -> bool {
 ///   which the decoder decodes as nulls) the key of any value, so that they
 ///   do not need a dictionary entry of their own;
 /// * the child fields of run-end encoded arrays, for which it uses Arrow's
-///   default fields;
+///   default fields, and their run end types (see [`RowCodec`], they are
+///   decoded as `Int64`): the run ends must fit their type;
 /// * the types of the children of unions, which keep their declared type.
 ///
 /// Everything else (the physical layout and the buffers) is kept.
@@ -488,13 +507,19 @@ fn restore(
             data.data_type()
         );
     }
+    let run_end_encoded = matches!(data_type, DataType::RunEndEncoded(..));
     let children = data
         .child_data()
         .iter()
         .zip(child_types)
         .zip(relevant_child_rows(&data, relevant))
-        .map(|((child, (data_type, nullable)), relevant)| {
-            restore(child.clone(), data_type, nullable, relevant.as_ref())
+        .enumerate()
+        .map(|(i, ((child, (data_type, nullable)), relevant))| {
+            if run_end_encoded && i == 0 {
+                narrow_run_ends(child, data_type)
+            } else {
+                restore(child.clone(), data_type, nullable, relevant.as_ref())
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(data
@@ -502,6 +527,22 @@ fn restore(
         .data_type(data_type.clone())
         .child_data(children)
         .build()?)
+}
+
+/// The run ends `run_ends` of a run-end encoded array (decoded as `Int64`)
+/// as `data_type`, if they fit it.
+fn narrow_run_ends(run_ends: &ArrayData, data_type: &DataType) -> Result<ArrayData> {
+    if run_ends.data_type() == data_type {
+        return Ok(run_ends.clone());
+    }
+    let run_ends = make_array(run_ends.clone());
+    let narrowed = cast_with_options(&run_ends, data_type, &strict_cast_options())
+        .map_err(|e| {
+            exec_datafusion_err!(
+                "Too many run-end encoded values for run ends of type {data_type}: {e}"
+            )
+        })?;
+    Ok(narrowed.to_data())
 }
 
 /// The rows of the children of `data` that matter (`None`: all rows), if the
@@ -661,9 +702,8 @@ fn same_shape(a: &DataType, b: &DataType) -> bool {
         (DataType::Union(a, a_mode), DataType::Union(b, b_mode)) => {
             a_mode == b_mode && a.iter().map(|(id, _)| id).eq(b.iter().map(|(id, _)| id))
         }
-        (DataType::RunEndEncoded(a, _), DataType::RunEndEncoded(b, _)) => {
-            a.data_type() == b.data_type()
-        }
+        // The run ends are decoded as `Int64`, see `restore`.
+        (DataType::RunEndEncoded(..), DataType::RunEndEncoded(..)) => true,
         (a, b) => a == b,
     }
 }
@@ -740,16 +780,39 @@ pub(crate) fn new_dictionary(
 
 /// `data_type` with every dictionary replaced by its value type.
 fn without_dictionaries(data_type: &DataType) -> DataType {
-    let field = |field: &FieldRef| -> FieldRef {
-        Arc::new(
-            field
-                .as_ref()
-                .clone()
-                .with_data_type(without_dictionaries(field.data_type())),
-        )
-    };
     match data_type {
         DataType::Dictionary(_, value_type) => without_dictionaries(value_type),
+        data_type => map_children(data_type, &without_dictionaries),
+    }
+}
+
+/// `data_type` with `Int64` run ends for every run-end encoded array (at any
+/// depth). The row format decodes the values of all rows of a nested type
+/// into one array (e.g. the values of all lists), whose run ends could
+/// overflow a narrower type although the run ends of every row fit it; they
+/// are narrowed when the values are restored, see [`restore`].
+fn with_wide_run_ends(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::RunEndEncoded(run_ends, values) => DataType::RunEndEncoded(
+            Arc::new(run_ends.as_ref().clone().with_data_type(DataType::Int64)),
+            Arc::new(
+                values
+                    .as_ref()
+                    .clone()
+                    .with_data_type(with_wide_run_ends(values.data_type())),
+            ),
+        ),
+        data_type => map_children(data_type, &with_wide_run_ends),
+    }
+}
+
+/// `data_type` with the data types of its children (of the fields of a
+/// nested type, or the value type of a dictionary) mapped by `f`.
+fn map_children(data_type: &DataType, f: &impl Fn(&DataType) -> DataType) -> DataType {
+    let field = |field: &FieldRef| -> FieldRef {
+        Arc::new(field.as_ref().clone().with_data_type(f(field.data_type())))
+    };
+    match data_type {
         DataType::List(f) => DataType::List(field(f)),
         DataType::LargeList(f) => DataType::LargeList(field(f)),
         DataType::ListView(f) => DataType::ListView(field(f)),
@@ -765,7 +828,10 @@ fn without_dictionaries(data_type: &DataType) -> DataType {
             *mode,
         ),
         DataType::RunEndEncoded(run_ends, values) => {
-            DataType::RunEndEncoded(Arc::clone(run_ends), field(values))
+            DataType::RunEndEncoded(field(run_ends), field(values))
+        }
+        DataType::Dictionary(key_type, value_type) => {
+            DataType::Dictionary(key_type.clone(), Box::new(f(value_type)))
         }
         data_type => data_type.clone(),
     }
@@ -820,6 +886,24 @@ fn has_nested_dictionary_of_run_end_encoded(data_type: &DataType) -> bool {
             DataType::Dictionary(_, values) => has_run_end_encoded(values),
             child => has_nested_dictionary_of_run_end_encoded(child),
         })
+}
+
+/// Whether `data_type` has (at any depth) a list view of values that contain
+/// a run-end encoded array. The views of a list view can share values, but
+/// the row format decodes them once per view, and their run ends can
+/// overflow (e.g. 2,048 views of the same 32 values with `Int16` run ends)
+/// although the list view holds them.
+fn has_list_view_of_run_end_encoded(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::ListView(item) | DataType::LargeListView(item)
+            if has_run_end_encoded(item.data_type()) =>
+        {
+            true
+        }
+        data_type => child_data_types(data_type)
+            .into_iter()
+            .any(|(child, _)| has_list_view_of_run_end_encoded(child)),
+    }
 }
 
 /// Whether `data_type` is a union or contains a union at any depth.
@@ -1368,6 +1452,80 @@ mod tests {
             dictionary(structs(run_end_encoded.clone())),
             structs(run_end_encoded.clone()),
             list(dictionary(DataType::Utf8)),
+        ] {
+            assert!(
+                TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_views_of_run_end_encoded_values_are_not_supported() {
+        use arrow::array::{Float64Array, GenericListViewArray, Int16Array, RunArray};
+        use arrow::buffer::ScalarBuffer;
+        use arrow::datatypes::{Int16Type, Schema};
+
+        // 2,048 views of the same 32 values (one run), more values than
+        // `Int16` run ends count once the row format decodes every view.
+        let runs = RunArray::<Int16Type>::try_new(
+            &Int16Array::from(vec![32]),
+            &Float64Array::from(vec![1.5]),
+        )
+        .unwrap();
+        let item = Arc::new(Field::new("item", runs.data_type().clone(), true));
+        let views = GenericListViewArray::<i32>::try_new(
+            Arc::clone(&item),
+            ScalarBuffer::from(vec![0; 2048]),
+            ScalarBuffer::from(vec![32; 2048]),
+            Arc::new(runs),
+            None,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![Field::new("v", views.data_type().clone(), true)]);
+        let err = TupleDataLayout::try_new(Arc::new(schema), false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("list views of run-end encoded values"),
+            "{err}"
+        );
+
+        let run_end_encoded = item.data_type().clone();
+        let structs =
+            |child: DataType| DataType::Struct(vec![Field::new("c", child, true)].into());
+        let list_view =
+            |item: DataType| DataType::ListView(Arc::new(Field::new("item", item, true)));
+        let large_list_view = |item: DataType| {
+            DataType::LargeListView(Arc::new(Field::new("item", item, true)))
+        };
+        let dictionary = |values: DataType| {
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(values))
+        };
+        for data_type in [
+            list_view(run_end_encoded.clone()),
+            large_list_view(run_end_encoded.clone()),
+            list_view(structs(run_end_encoded.clone())),
+            list_view(DataType::new_list(run_end_encoded.clone(), true)),
+            structs(list_view(run_end_encoded.clone())),
+            DataType::new_list(large_list_view(run_end_encoded.clone()), true),
+            dictionary(list_view(run_end_encoded.clone())),
+        ] {
+            assert!(
+                !TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
+            let err = TupleDataLayout::try_new_from_types([data_type.clone()], false)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("list views of run-end encoded values"),
+                "{data_type}: {err}"
+            );
+        }
+        for data_type in [
+            DataType::new_list(run_end_encoded.clone(), true),
+            list_view(DataType::Float64),
+            list_view(structs(DataType::Float64)),
         ] {
             assert!(
                 TupleDataLayout::supports_data_type(&data_type),

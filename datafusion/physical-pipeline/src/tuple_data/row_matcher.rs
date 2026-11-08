@@ -1756,6 +1756,82 @@ mod tests {
     }
 
     #[test]
+    fn many_distinct_candidates_of_run_end_encoded_lists() {
+        use arrow::array::{FixedSizeListArray, Int8Array, Int16Array, RunArray};
+        use arrow::datatypes::Int16Type;
+
+        // `FixedSizeList<RunEndEncoded<Int16, Float64>, 32>` of a constant
+        // list (one run) per value.
+        let constant_lists = |values: Vec<f64>| -> ArrayRef {
+            let run_ends = (1..=values.len()).map(|i| (i * 32) as i16);
+            let runs = RunArray::<Int16Type>::try_new(
+                &Int16Array::from_iter_values(run_ends),
+                &Float64Array::from(values),
+            )
+            .unwrap();
+            let item = Arc::new(Field::new("item", runs.data_type().clone(), true));
+            Arc::new(FixedSizeListArray::try_new(item, 32, Arc::new(runs), None).unwrap())
+        };
+        let dictionary = |keys: Vec<i8>, values: ArrayRef| -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(Int8Array::from(keys), values)
+                    .unwrap(),
+            )
+        };
+        // 16 batches of 128 distinct values: 2,048 candidates whose lists
+        // have 65,536 values together, more than `Int16` run ends count.
+        let builds = (0..16)
+            .map(|batch| {
+                let values = (0..128).map(|i| f64::from(batch * 128 + i)).collect();
+                dictionary((0..=127).collect(), constant_lists(values))
+            })
+            .collect::<Vec<_>>();
+        let probe = dictionary(vec![0; 2048], constant_lists(vec![0.0]));
+        let layout = Arc::new(
+            TupleDataLayout::try_new_from_types([probe.data_type().clone()], false)
+                .unwrap(),
+        );
+        let mut collection = TupleDataCollection::new(Arc::clone(&layout));
+        let mut candidates = vec![];
+        for build in &builds {
+            let chunk =
+                DataChunk::from_record_batch(batch(vec![("k", Arc::clone(build))]));
+            candidates.extend(collection.append_chunk(&chunk, None).unwrap());
+        }
+        let probe_chunk =
+            DataChunk::from_record_batch(batch(vec![("k", Arc::clone(&probe))]));
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            let matcher =
+                RowMatcher::try_new(Arc::clone(&layout), vec![0], null_equality).unwrap();
+            let mut sel = (0..2048).collect::<Vec<u32>>();
+            matcher
+                .match_rows(&probe_chunk, &mut sel, &candidates, &collection, None)
+                .unwrap();
+            let comparators = builds
+                .iter()
+                .map(|build| {
+                    JoinKeyComparator::new(
+                        &[Arc::clone(build)],
+                        &[Arc::clone(&probe)],
+                        &[SortOptions::default()],
+                        null_equality,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let expected = (0..2048_usize)
+                .filter(|&i| comparators[i / 128].is_equal(i % 128, i))
+                .map(|i| i as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(expected, vec![0], "{null_equality:?}");
+            assert_eq!(sel, expected, "{null_equality:?}");
+        }
+    }
+
+    #[test]
     fn run_end_encoded_keys_with_custom_fields() {
         use crate::tuple_data::test_data::custom_run_end_encoded;
 
