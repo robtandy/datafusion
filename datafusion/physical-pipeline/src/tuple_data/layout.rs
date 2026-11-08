@@ -63,7 +63,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayData, ArrayRef, UInt32Array, UInt64Array, make_array, new_null_array,
+    Array, ArrayData, ArrayRef, AsArray, UInt32Array, UInt64Array, make_array,
+    new_null_array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::compute::{CastOptions, cast_with_options, take};
@@ -260,6 +261,8 @@ pub(crate) struct RowCodec {
     pub(crate) parser: RowParser,
     /// The value type of the column.
     value_type: DataType,
+    /// The value type with every dictionary replaced by its values.
+    flat_type: DataType,
     /// Whether two values can be equal for DataFusion although their row
     /// encodings differ, so that they must be compared by their decoded
     /// values: the row format distinguishes `-0.0` and `+0.0`, and the nulls
@@ -281,6 +284,7 @@ impl RowCodec {
             converter,
             parser,
             value_type: value_type.clone(),
+            flat_type: without_dictionaries(value_type),
             compare_decoded: has_float_leaf(value_type) || has_union(value_type),
         };
         // Reject the types whose values cannot be restored exactly now
@@ -309,16 +313,43 @@ impl RowCodec {
         &self,
         encoded: impl IntoIterator<Item = &'a [u8]>,
     ) -> Result<ArrayRef> {
+        self.decode_as(encoded, &self.value_type)
+    }
+
+    /// Like [`Self::decode`], but with every dictionary replaced by its
+    /// values, e.g. to compare values: unlike values of the value type,
+    /// values from collections with different dictionaries can always be
+    /// decoded together (their dictionaries do not need to fit the keys).
+    pub(crate) fn decode_flat<'a>(
+        &self,
+        encoded: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<ArrayRef> {
+        self.decode_as(encoded, &self.flat_type)
+    }
+
+    /// `values` (of the value type of the column) with every dictionary
+    /// replaced by its values, exactly as [`Self::decode_flat`] decodes
+    /// them.
+    pub(crate) fn flatten(&self, values: &ArrayRef) -> Result<ArrayRef> {
+        let rows = self.converter.convert_columns(&[Arc::clone(values)])?;
+        self.decode_flat(rows.iter().map(|row| row.data()))
+    }
+
+    fn decode_as<'a>(
+        &self,
+        encoded: impl IntoIterator<Item = &'a [u8]>,
+        data_type: &DataType,
+    ) -> Result<ArrayRef> {
         let rows = encoded.into_iter().map(|bytes| self.parser.parse(bytes));
         let values =
             self.converter.convert_rows(rows)?.pop().ok_or_else(|| {
                 internal_datafusion_err!("RowConverter returned no column")
             })?;
         let data = values.to_data();
-        if has_type(&data, &self.value_type) {
+        if has_type(&data, data_type) {
             return Ok(values);
         }
-        Ok(make_array(restore(data, &self.value_type, true, None)?))
+        Ok(make_array(restore(data, data_type, true, None)?))
     }
 }
 
@@ -388,6 +419,17 @@ fn restore(
 ) -> Result<ArrayData> {
     if has_type(&data, data_type) {
         return Ok(data);
+    }
+    if let (DataType::Dictionary(..), false) = (
+        data.data_type(),
+        matches!(data_type, DataType::Dictionary(..)),
+    ) {
+        // E.g. a child of a dense union without rows, which the decoder
+        // creates with the type of its field.
+        let dictionary = make_array(data);
+        let dictionary = dictionary.as_any_dictionary();
+        let values = take(dictionary.values().as_ref(), dictionary.keys(), None)?;
+        return restore(values.to_data(), data_type, nullable, relevant);
     }
     if let DataType::Dictionary(key_type, value_type) = data_type {
         let values = make_array(restore(data, value_type, true, relevant)?);
@@ -656,6 +698,39 @@ pub(crate) fn dictionary_encode(
         .child_data(vec![dictionary.to_data()])
         .build()?;
     Ok(make_array(data))
+}
+
+/// `data_type` with every dictionary replaced by its value type.
+fn without_dictionaries(data_type: &DataType) -> DataType {
+    let field = |field: &FieldRef| -> FieldRef {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(without_dictionaries(field.data_type())),
+        )
+    };
+    match data_type {
+        DataType::Dictionary(_, value_type) => without_dictionaries(value_type),
+        DataType::List(f) => DataType::List(field(f)),
+        DataType::LargeList(f) => DataType::LargeList(field(f)),
+        DataType::ListView(f) => DataType::ListView(field(f)),
+        DataType::LargeListView(f) => DataType::LargeListView(field(f)),
+        DataType::FixedSizeList(f, size) => DataType::FixedSizeList(field(f), *size),
+        DataType::Map(f, sorted) => DataType::Map(field(f), *sorted),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+        DataType::Union(fields, mode) => DataType::Union(
+            fields
+                .iter()
+                .map(|(type_id, f)| (type_id, field(f)))
+                .collect(),
+            *mode,
+        ),
+        DataType::RunEndEncoded(run_ends, values) => {
+            DataType::RunEndEncoded(Arc::clone(run_ends), field(values))
+        }
+        data_type => data_type.clone(),
+    }
 }
 
 /// Whether `data_type` is a union or contains a union at any depth.

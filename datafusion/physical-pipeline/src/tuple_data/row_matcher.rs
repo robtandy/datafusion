@@ -28,8 +28,11 @@
 //! Nested keys are compared by their row encodings, which are equal exactly
 //! when the values are equal, except for keys with floats or unions: the row
 //! format distinguishes `-0.0` from `+0.0` and the nulls of different union
-//! variants. These keys are compared with Arrow's comparator on the decoded
-//! (and normalized) values instead, like `JoinKeyComparator` does.
+//! variants. These keys are compared with Arrow's comparator instead, like
+//! `JoinKeyComparator` does, on their decoded values with normalized floats
+//! and with dictionaries replaced by their values (which is how dictionaries
+//! compare), so that candidates of collections with different dictionaries
+//! can be compared together.
 //!
 //! A probe chunk is usually compared with several candidates per row (e.g.
 //! the rows of a hash chain, one per round), so its keys are prepared once
@@ -48,7 +51,6 @@ use datafusion_common::{NullEquality, Result, internal_datafusion_err, internal_
 
 use super::collection::{
     RowLocation, RowRef, TupleDataCollection, decode_dictionary, fixed_values,
-    gather_values,
 };
 use super::layout::{ColumnLayout, ColumnStorage, TupleDataLayout};
 use crate::chunk::{DataChunk, SelectionVector};
@@ -265,12 +267,7 @@ impl RowMatcher {
                 column,
                 null_equals_null: self.null_equality == NullEquality::NullEqualsNull,
             };
-            match_column(
-                self.layout.column(column),
-                column,
-                probe_column,
-                &mut matches,
-            )?;
+            match_column(self.layout.column(column), probe_column, &mut matches)?;
         }
         Ok(sel.len())
     }
@@ -297,8 +294,9 @@ impl ProbeColumn {
                 })?;
                 if codec.compare_decoded {
                     // The row format distinguishes `-0.0` and `+0.0`, and
-                    // the nulls of different union variants.
-                    ProbeData::Compared(normalize_floats(&values))
+                    // the nulls of different union variants. The values are
+                    // compared without dictionaries, as the candidates.
+                    ProbeData::Compared(normalize_floats(&codec.flatten(&values)?))
                 } else {
                     ProbeData::Encoded(codec.converter.convert_columns(&[values])?)
                 }
@@ -308,11 +306,10 @@ impl ProbeColumn {
     }
 }
 
-/// Compare the key column `column` (with layout `layout`) of the probe rows
-/// with their candidates.
+/// Compare a key column (with layout `layout`) of the probe rows with their
+/// candidates.
 fn match_column(
     layout: &ColumnLayout,
-    column: usize,
     probe: &ProbeColumn,
     matches: &mut ColumnMatches<'_, '_>,
 ) -> Result<()> {
@@ -385,7 +382,14 @@ fn match_column(
         }),
         // Compare the (normalized) values, like `JoinKeyComparator`.
         ProbeData::Compared(values) => {
-            let candidates = gather_values(layout, column, matches.rows)?;
+            // Without dictionaries: the candidates can come from collections
+            // with different dictionaries that would not fit the keys
+            // together.
+            let codec = layout.codec().ok_or_else(|| {
+                internal_datafusion_err!("Encoded column without a row codec")
+            })?;
+            let candidates =
+                codec.decode_flat(matches.rows.iter().map(|row| row.var_len(offset)))?;
             let comparator = make_comparator(
                 values.as_ref(),
                 normalize_floats(&candidates).as_ref(),
@@ -1321,6 +1325,128 @@ mod tests {
                     // Every row is IS NOT DISTINCT FROM itself.
                     assert_eq!(null.len(), keys.len(), "{name}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_dictionary_keys_of_different_batches() {
+        use arrow::array::{Int8Array, UnionArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::UnionFields;
+
+        // Keys with float dictionaries in structs, lists and unions: the
+        // candidates come from two batches with disjoint dictionaries that
+        // together have more values than Int8 keys can address, which must
+        // not matter for comparing them.
+        let dictionary = |keys: Vec<i8>, values: Vec<f64>| -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from(keys),
+                    Arc::new(Float64Array::from(values)),
+                )
+                .unwrap(),
+            )
+        };
+        let structs = |values: ArrayRef| -> ArrayRef {
+            Arc::new(
+                StructArray::try_new(
+                    vec![Field::new("d", values.data_type().clone(), true)].into(),
+                    vec![values],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let lists = |values: ArrayRef| -> ArrayRef {
+            Arc::new(ListArray::new(
+                Arc::new(Field::new_list_field(values.data_type().clone(), true)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, values.len())),
+                values,
+                None,
+            ))
+        };
+        let unions = |values: ArrayRef| -> ArrayRef {
+            let n = values.len();
+            Arc::new(
+                UnionArray::try_new(
+                    UnionFields::try_new(
+                        [0, 1],
+                        [
+                            Field::new("d", values.data_type().clone(), true),
+                            Field::new("i", DataType::Int32, true),
+                        ],
+                    )
+                    .unwrap(),
+                    vec![0; n].into(),
+                    None,
+                    vec![values, Arc::new(Int32Array::from(vec![1; n]))],
+                )
+                .unwrap(),
+            )
+        };
+        let keys = (0..=127).collect::<Vec<i8>>();
+        for wrap in [structs, lists, unions] {
+            let first = wrap(dictionary(keys.clone(), (0..128).map(f64::from).collect()));
+            let second = wrap(dictionary(
+                keys.clone(),
+                (128..256).map(f64::from).collect(),
+            ));
+            // -0.0 equals 0.0.
+            let probe = wrap(dictionary(vec![0; 256], vec![-0.0]));
+            let layout = Arc::new(
+                TupleDataLayout::try_new_from_types([first.data_type().clone()], false)
+                    .unwrap(),
+            );
+            let mut collection = TupleDataCollection::new(Arc::clone(&layout));
+            let mut candidates = vec![];
+            for build in [&first, &second] {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(layout.schema()),
+                    vec![Arc::clone(build)],
+                )
+                .unwrap();
+                candidates.extend(
+                    collection
+                        .append_chunk(&DataChunk::from_record_batch(batch), None)
+                        .unwrap(),
+                );
+            }
+            let probe_chunk = DataChunk::from_record_batch(
+                RecordBatch::try_new(
+                    Arc::clone(layout.schema()),
+                    vec![Arc::clone(&probe)],
+                )
+                .unwrap(),
+            );
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let matcher =
+                    RowMatcher::try_new(Arc::clone(&layout), vec![0], null_equality)
+                        .unwrap();
+                let mut sel = (0..256).collect::<Vec<u32>>();
+                matcher
+                    .match_rows(&probe_chunk, &mut sel, &candidates, &collection, None)
+                    .unwrap();
+                // Probe row `i` is compared with build row `i`.
+                let comparators = [&first, &second].map(|build| {
+                    JoinKeyComparator::new(
+                        &[Arc::clone(build)],
+                        &[Arc::clone(&probe)],
+                        &[SortOptions::default()],
+                        null_equality,
+                    )
+                    .unwrap()
+                });
+                let expected = (0..256)
+                    .filter(|&i| comparators[i / 128].is_equal(i % 128, i))
+                    .map(|i| i as u32)
+                    .collect::<Vec<_>>();
+                let name = first.data_type();
+                assert_eq!(expected, vec![0], "{name} {null_equality:?}");
+                assert_eq!(sel, expected, "{name} {null_equality:?}");
             }
         }
     }
