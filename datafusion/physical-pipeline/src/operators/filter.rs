@@ -1805,7 +1805,7 @@ pub(crate) mod test_support {
             .await
         {
             Ok(Ok(batches)) => Ok(batches.iter().map(RecordBatch::num_rows).sum()),
-            Ok(Err(error)) => Err(error.to_string()),
+            Ok(Err(error)) => Err(error.strip_backtrace()),
             Err(join) if join.is_panic() => {
                 let panic = join.into_panic();
                 Err(panic
