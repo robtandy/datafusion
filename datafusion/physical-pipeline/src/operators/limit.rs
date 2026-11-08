@@ -117,7 +117,11 @@ impl PhysicalLimit {
     /// Nodes whose execution fails in DataFusion are not lowered either, so
     /// that DataFusion executes them: a `GlobalLimitExec` whose input does not
     /// have exactly one partition, and a `CoalescePartitionsExec` whose input
-    /// has none.
+    /// has none. Nor are limits of no rows (`fetch == 0`): DataFusion's merge
+    /// then ends without waiting for its input, and its limits end with the
+    /// first batch of their input, even an empty one, or once the skipped rows
+    /// are read, which a native limit, called with the non-empty chunks of its
+    /// input, cannot reproduce.
     ///
     /// `lower_input` lowers the input of the node. Returns `Ok(None)` for any
     /// other node.
@@ -157,6 +161,9 @@ impl PhysicalLimit {
             } else {
                 return Ok(None);
             };
+        if fetch == Some(0) {
+            return Ok(None);
+        }
         let input = lower_input(input)?;
         if input.schema() != plan.schema() {
             return internal_err!(
@@ -782,6 +789,17 @@ mod tests {
                 "local fetch {local_fetch}"
             );
         }
+        // Limits of no rows, which DataFusion ends without (or with an empty)
+        // input, are left to it.
+        let no_rows: [Arc<dyn ExecutionPlan>; 4] = [
+            Arc::new(GlobalLimitExec::new(t1_scan(true)?, 0, Some(0))),
+            Arc::new(GlobalLimitExec::new(coalesced()?, 7, Some(0))),
+            Arc::new(LocalLimitExec::new(t1_scan(true)?, 0)),
+            Arc::new(CoalescePartitionsExec::new(t1_scan(false)?).with_fetch(Some(0))),
+        ];
+        for plan in no_rows {
+            assert!(try_lower(plan)?.is_none());
+        }
         // Nodes that DataFusion fails to execute are left to it.
         let multi_partition = GlobalLimitExec::new(t1_scan(false)?, 0, Some(1));
         assert!(try_lower(Arc::new(multi_partition))?.is_none());
@@ -898,7 +916,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_limit_plans() -> Result<()> {
         // Limits that SQL does not produce: DataFusion plans an empty relation
-        // for a `LIMIT 0`.
+        // for a `LIMIT 0`. (Limits of no rows are left to DataFusion.)
         let make = |skip, fetch| {
             move || -> Result<Arc<dyn ExecutionPlan>> {
                 Ok(Arc::new(GlobalLimitExec::new(
@@ -910,7 +928,8 @@ mod tests {
         };
         for (skip, fetch) in [(0, Some(0)), (7, Some(0)), (0, Some(6000)), (0, None)] {
             let root = assert_native_plan_byte_eq(make(skip, fetch), false).await;
-            assert_eq!(count::<PhysicalLimit>(&root), 1);
+            let lowered = usize::from(fetch != Some(0));
+            assert_eq!(count::<PhysicalLimit>(&root), lowered, "fetch {fetch:?}");
         }
         let local = || -> Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(LocalLimitExec::new(t1_scan(false)?, 0)))
@@ -1013,8 +1032,8 @@ mod tests {
                 )?))
             };
             Ok(Arc::new(InterleaveExec::try_new(vec![
-                by_v(pending_plan(values_schema())?)?,
-                by_v(batch_plan(values_chunk([42]).into_record_batch()?)?)?,
+                by_v(pending_plan(values_schema(), 1)?)?,
+                by_v(batch_plan(values_chunk([42]).into_record_batch()?, false)?)?,
             ])?))
         };
         type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
@@ -1061,6 +1080,31 @@ mod tests {
             assert!(limit.preserve_order(), "{sql}");
             assert!(limit.input().is::<ParquetScanSource>(), "{sql}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_of_no_rows_do_not_wait_for_their_input() -> Result<()> {
+        // A merge with `fetch=0` ends right away, even if its partitions never
+        // produce anything.
+        for partitions in [1, 2] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                let pending = pending_plan(values_schema(), partitions)?;
+                Ok(Arc::new(
+                    CoalescePartitionsExec::new(pending).with_fetch(Some(0)),
+                ))
+            };
+            let root = assert_native_plan_byte_eq(make, false).await;
+            assert_eq!(count::<PhysicalLimit>(&root), 0, "{partitions} partitions");
+        }
+        // A limit of no rows ends with the first batch of its input, even an
+        // empty one.
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let empty = batch_plan(values_chunk([]).into_record_batch()?, true)?;
+            Ok(Arc::new(GlobalLimitExec::new(empty, 0, Some(0))))
+        };
+        let root = assert_native_plan_byte_eq(make, false).await;
+        assert_eq!(count::<PhysicalLimit>(&root), 0);
         Ok(())
     }
 }

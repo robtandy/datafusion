@@ -359,6 +359,7 @@ pub(crate) mod test_support {
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::{ExecutionPlan, collect};
+    use futures::StreamExt;
 
     use super::PhysicalUnion;
     use crate::bridge::{BridgeOperator, PipelineRootExec};
@@ -386,7 +387,8 @@ pub(crate) mod test_support {
     ///
     /// * limits, unions and placeholder rows with `try_lower`;
     /// * `CoalescePartitionsExec`s without a fetch are removed (the pipeline
-    ///   engine merges the partitions of their input anyway);
+    ///   engine merges the partitions of their input anyway; with a fetch,
+    ///   they are limits);
     /// * `ProjectionExec`s with a [`TestProjection`], a stand-in for the
     ///   native projection, so that the operators below them are lowered
     ///   too;
@@ -405,7 +407,9 @@ pub(crate) mod test_support {
         if let Some(placeholder) = PhysicalPlaceholderRow::try_lower(plan)? {
             return Ok(Arc::new(placeholder));
         }
-        if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
+        if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
+            && coalesce.fetch().is_none()
+        {
             return lower(coalesce.input());
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
@@ -852,10 +856,12 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A `StreamingTableExec` partition that produces a single batch.
+    /// A `StreamingTableExec` partition that produces a single batch, and
+    /// then ends, or never produces anything again (if `then_pending`).
     #[derive(Debug)]
     struct BatchPartition {
         batch: RecordBatch,
+        then_pending: bool,
     }
 
     impl PartitionStream for BatchPartition {
@@ -864,35 +870,51 @@ pub(crate) mod test_support {
         }
 
         fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-            Box::pin(RecordBatchStreamAdapter::new(
-                self.batch.schema(),
-                futures::stream::iter([Ok(self.batch.clone())]),
-            ))
+            let batch = futures::stream::iter([Ok(self.batch.clone())]);
+            let stream = if self.then_pending {
+                batch.chain(futures::stream::pending()).boxed()
+            } else {
+                batch.boxed()
+            };
+            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
         }
     }
 
-    /// A plan with a single partition with schema `schema` that never
-    /// produces anything.
-    pub(crate) fn pending_plan(schema: SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
-        let partition = Arc::new(PendingPartition {
+    /// A plan with `partitions` partitions with schema `schema` that never
+    /// produce anything.
+    pub(crate) fn pending_plan(
+        schema: SchemaRef,
+        partitions: usize,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let partition: Arc<dyn PartitionStream> = Arc::new(PendingPartition {
             schema: Arc::clone(&schema),
         });
-        streaming_plan(schema, partition)
+        streaming_plan(schema, vec![partition; partitions])
     }
 
-    /// A plan with a single partition that produces `batch`.
-    pub(crate) fn batch_plan(batch: RecordBatch) -> Result<Arc<dyn ExecutionPlan>> {
+    /// A plan with a single partition that produces `batch`, and then ends,
+    /// or never produces anything again (if `then_pending`).
+    pub(crate) fn batch_plan(
+        batch: RecordBatch,
+        then_pending: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = batch.schema();
-        streaming_plan(schema, Arc::new(BatchPartition { batch }))
+        streaming_plan(
+            schema,
+            vec![Arc::new(BatchPartition {
+                batch,
+                then_pending,
+            })],
+        )
     }
 
     fn streaming_plan(
         schema: SchemaRef,
-        partition: Arc<dyn PartitionStream>,
+        partitions: Vec<Arc<dyn PartitionStream>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(StreamingTableExec::try_new(
             schema,
-            vec![partition],
+            partitions,
             None,
             vec![],
             false,
