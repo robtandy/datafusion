@@ -473,6 +473,7 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::BinaryExpr;
+    use datafusion_physical_plan::filter::FilterExec;
 
     use crate::operators::filter::test_support::*;
 
@@ -1031,15 +1032,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn projections_of_dictionary_values_stay_in_datafusion() {
+        // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
+        // merging the dictionaries of the two batches without the values that
+        // no row references, `"x"` and `"y"`: DataFusion casts `"1"` and `"2"`.
+        // The chunks of a pipeline keep their dictionaries: casting `"x"`
+        // fails.
+        let batches = dictionary_batches();
+        let schema = batches[0].schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let filter = FilterExec::try_new(
+                physical_expr("d <> 'x' AND d <> 'y'", &schema),
+                scan_batches(&schema, &batches),
+            )
+            .unwrap();
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        physical_expr("CAST(d AS INT)", &schema),
+                        "i",
+                    )],
+                    Arc::new(filter),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_none());
+        assert_eq!(operators.projections, 0);
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(physical_expr("CAST(d AS INT)", &schema), "i".to_owned())],
+        )
+        .unwrap();
+        let chunk = selected_chunk(&batches[0], vec![0]);
+        assert!(project(&native, &chunk).is_err());
+        // Unpacking the dictionary cannot fail.
+        let (error, operators) = assert_native_plan_parity(
+            || -> Arc<dyn ExecutionPlan> {
+                let filter = FilterExec::try_new(
+                    physical_expr("d <> 'x' AND d <> 'y'", &schema),
+                    scan_batches(&schema, &batches),
+                )
+                .unwrap();
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(
+                            physical_expr("CAST(d AS VARCHAR)", &schema),
+                            "v",
+                        )],
+                        Arc::new(filter),
+                    )
+                    .unwrap(),
+                )
+            },
+            false,
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(operators.projections, 1);
+    }
+
+    /// `batch`, with the selection `selection`.
+    fn selected_chunk(batch: &RecordBatch, selection: Vec<u32>) -> DataChunk {
+        DataChunk::from(batch.clone())
+            .with_selection(SelectionVector::from(selection))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_projections_of_views_and_dictionaries() {
         assert_all_native_byte_eq(&[
             "SELECT d8, sv, d32 AS d FROM vd WHERE d32 = 'k1'",
-            "SELECT i, upper(d32) AS u, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
+            "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
             "SELECT CAST(d32 AS VARCHAR) || '!' AS x, length(sv) AS l FROM vd WHERE sv IS NOT NULL",
             "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT d8 AS d, i + 1 AS j FROM vd WHERE d8 IS NOT NULL",
         ])
         .await;
+        // `upper` takes the dictionary itself, and may evaluate all of its
+        // values, which depend on DataFusion's batches.
+        for sql in ["SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0"] {
+            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
+            assert_eq!(run.operators.projections, 0, "native projection: {sql}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

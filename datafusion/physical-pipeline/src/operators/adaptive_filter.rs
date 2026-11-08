@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
@@ -346,9 +346,10 @@ pub enum Fallibility {
 /// nodes.
 ///
 /// This is conservative. Only columns, literals, comparisons, `AND`, `OR`,
-/// `NOT`, `IS [NOT] NULL`, `IN` lists, widening casts, arithmetic on numbers
-/// that wraps on overflow (DataFusion's default) and divisions of numbers by
-/// a constant that is neither `0` nor `-1` are infallible. `LIKE` and regular
+/// `NOT`, `IS [NOT] NULL`, `IN` lists, widening casts (also into and out of
+/// dictionaries, see `cast_fallibility`), arithmetic on numbers that wraps on
+/// overflow (DataFusion's default) and divisions of numbers by a constant
+/// that is neither `0` nor `-1` are infallible. `LIKE` and regular
 /// expressions with a constant pattern only fail if the pattern does not
 /// compile, which does not depend on the rows (the pattern is compiled before
 /// any row is matched): they are infallible if evaluating them on an empty
@@ -398,10 +399,7 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         };
     }
     if let Some(cast) = expr.downcast_ref::<CastExpr>() {
-        return match cast.expr().data_type(schema) {
-            Ok(from) if cast.is_bigger_cast(&from) => Infallible,
-            _ => PerRow,
-        };
+        return cast_fallibility(cast, schema);
     }
     if expr.is::<Column>()
         || expr.is::<Literal>()
@@ -413,6 +411,40 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         Infallible
     } else {
         PerRow
+    }
+}
+
+/// How `cast` can fail. It cannot if it widens values (see
+/// `CastExpr::is_bigger_cast`), including the values of a dictionary that it
+/// unpacks, and into the values of a dictionary that it packs a constant
+/// into, or values that the keys of the dictionary can always index (keys of
+/// 32 bits or more: a batch has fewer rows than that).
+fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
+    let Ok(from) = cast.expr().data_type(schema) else {
+        return Fallibility::PerRow;
+    };
+    let from_values = match &from {
+        DataType::Dictionary(_, values) => values.as_ref(),
+        from => from,
+    };
+    let (to_values, keys_fit) = match cast.cast_type() {
+        DataType::Dictionary(keys, values) => (
+            values.as_ref(),
+            cast.expr().is::<Literal>()
+                || matches!(
+                    keys.as_ref(),
+                    DataType::Int32
+                        | DataType::Int64
+                        | DataType::UInt32
+                        | DataType::UInt64
+                ),
+        ),
+        to => (to, true),
+    };
+    if keys_fit && CastExpr::check_bigger_cast(to_values, from_values) {
+        Fallibility::Infallible
+    } else {
+        Fallibility::PerRow
     }
 }
 
@@ -507,11 +539,19 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   in two; and it evaluates the right side of an `OR` on empty batches;
 /// * `expr` may fail and fails on an empty batch, e.g.
 ///   `regexp_like(s, 'a{1000000}')` (unlike `regexp_count`, which only
-///   compiles its pattern if there are rows).
+///   compiles its pattern if there are rows);
+/// * a part of `expr` that may fail is evaluated on, or produces,
+///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
+///   dictionary of `d`, even those that no row references (when DataFusion
+///   coalesces batches, e.g. the output of a `FilterExec`, it merges their
+///   dictionaries without these values, while chunks keep the dictionaries
+///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
+///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     has_fallible_right_side(expr, schema)
         || fails_uniformly(expr, schema)
         || (!is_infallible(expr, schema) && fails_without_rows(expr, schema))
+        || evaluates_dictionaries(expr, schema)
 }
 
 /// Whether the right side of an `AND` or an `OR` in `expr` may fail on some
@@ -535,6 +575,41 @@ fn fails_uniformly(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
             .any(|child| fails_uniformly(child, schema))
 }
 
+/// Whether a part of `expr` that may fail has an operand or a result that
+/// contains dictionaries.
+fn evaluates_dictionaries(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let children = expr.children();
+    (node_fallibility(expr, schema) != Fallibility::Infallible
+        && children.iter().copied().chain([expr]).any(|expr| {
+            expr.data_type(schema)
+                .is_ok_and(|data_type| contains_dictionaries(&data_type))
+        }))
+        || children
+            .into_iter()
+            .any(|child| evaluates_dictionaries(child, schema))
+}
+
+/// Whether arrays of `data_type` contain dictionaries, at any depth.
+fn contains_dictionaries(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(..) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_dictionaries(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_dictionaries(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| contains_dictionaries(field.data_type())),
+        DataType::RunEndEncoded(_, values) => contains_dictionaries(values.data_type()),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +625,11 @@ mod tests {
             Field::new("s", DataType::Utf8, true),
             Field::new("e", DataType::Boolean, true),
             Field::new("c", DataType::Float64, true),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
         ]))
     }
 
@@ -660,6 +740,12 @@ mod tests {
             ("s ~ 'a+' AND s LIKE 'a%' OR s ~ 'a{1000000}'", Uniform),
             ("s LIKE s", PerRow),
             ("CAST(s AS INT) > 1", PerRow),
+            // Unpacking a dictionary cannot fail, nor packing a constant.
+            ("CAST(d AS VARCHAR) = 'x'", Infallible),
+            ("CAST(d AS VARCHAR(10)) = 'x'", Infallible),
+            ("d = 'x'", Infallible),
+            ("d IN ('x', 'y')", Infallible),
+            ("CAST(d AS INT) > 1", PerRow),
             ("CAST(b AS INT) > 1", PerRow),
             ("upper(s) = 'X'", PerRow),
             ("CASE WHEN a > 0 THEN b > 1 ELSE false END", PerRow),
@@ -696,6 +782,18 @@ mod tests {
             physical_expr("b", &schema),
         ));
         assert_eq!(fallibility(&wrapping, &schema), Infallible);
+
+        // Packing values into a dictionary fails on batches with more distinct
+        // values than its keys can index.
+        let pack = |keys: DataType| -> Arc<dyn PhysicalExpr> {
+            let dictionary =
+                DataType::Dictionary(Box::new(keys), Box::new(DataType::Utf8));
+            Arc::new(CastExpr::new(physical_expr("s", &schema), dictionary, None))
+        };
+        assert_eq!(fallibility(&pack(DataType::Int8), &schema), PerRow);
+        assert!(depends_on_batches(&pack(DataType::Int8), &schema));
+        assert_eq!(fallibility(&pack(DataType::Int32), &schema), Infallible);
+        assert!(!depends_on_batches(&pack(DataType::Int32), &schema));
     }
 
     #[test]
@@ -719,6 +817,12 @@ mod tests {
             ("a = 0 OR (b = 0 OR s ~ 'a{1000000}')", true),
             ("a <> 0 AND (b <> 0 OR s ~ 'a{1000000}')", true),
             ("CASE WHEN a > 0 THEN s ~ 'a{1000000}' ELSE false END", true),
+            // DataFusion merges the dictionaries of the batches it coalesces,
+            // without the values that no row references, and a cast of a
+            // dictionary casts all of its values.
+            ("CAST(d AS INT) > 1", true),
+            ("upper(d) = 'X'", true),
+            ("CAST(d AS VARCHAR) = 'x' AND d <> 'y'", false),
             // Functions may fail on empty batches.
             ("regexp_like(s, 'a{1000000}')", true),
             ("a = 0 OR regexp_count(s, 'a{1000000}') > 0", true),

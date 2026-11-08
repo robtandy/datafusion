@@ -1380,6 +1380,25 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(y), Arc::new(s)]).unwrap()
     }
 
+    /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
+    /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
+    pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
+        let data_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![Field::new("d", data_type, true)]));
+        [["1", "x"], ["2", "y"]]
+            .into_iter()
+            .map(|values| {
+                let d = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![0, 1]),
+                    Arc::new(StringArray::from(values.to_vec())),
+                )
+                .unwrap();
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(d)]).unwrap()
+            })
+            .collect()
+    }
+
     /// A scan of `batches` (of `schema`, possibly empty or none), in a single
     /// partition.
     pub(crate) fn scan_batches(
@@ -2903,6 +2922,35 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 1, "{input}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn predicates_on_dictionary_values_stay_in_datafusion() {
+        // The first `FilterExec` coalesces the rows `"1"` and `"2"` into one
+        // batch, merging the dictionaries of the two batches without the
+        // values that no row references, `"x"` and `"y"`, so DataFusion casts
+        // `"1"` and `"2"`. The chunks of a pipeline keep their dictionaries:
+        // casting `"x"` fails.
+        let batches = dictionary_batches();
+        let schema = batches[0].schema();
+        let plan = || {
+            let input = filter_exec(
+                "d <> 'x' AND d <> 'y'",
+                scan_batches(&schema, &batches),
+                None,
+            );
+            filter_exec("CAST(d AS INT) > 0", input, None)
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_none());
+        assert_eq!(operators.filters, 0);
+        let chunk = DataChunk::from(batches[0].clone())
+            .with_selection(SelectionVector::from(vec![0]))
+            .unwrap();
+        assert!(drive(&filter_for("CAST(d AS INT) > 0", &schema), [chunk]).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
