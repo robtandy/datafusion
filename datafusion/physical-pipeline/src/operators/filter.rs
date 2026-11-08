@@ -64,9 +64,10 @@
 //! not compile), the `FilterExec` must be executed by DataFusion, on the
 //! batches of its input plan. For the same reason, a `FilterExec` with a
 //! `fetch`, which stops after the batch in which the fetch is reached, is
-//! only lowered if its predicate cannot fail at all, and a `FilterExec` whose
-//! output has dictionaries with narrow keys, which it may fail to merge when
-//! it coalesces its output batches, is not lowered. A planner must also keep
+//! only lowered if its predicate cannot fail at all (and not with a fetch of
+//! 0), and a `FilterExec` whose output has dictionaries with narrow keys,
+//! which it may fail to merge when it coalesces its output batches, is not
+//! lowered. A planner must also keep
 //! the filters whose predicate can fail in DataFusion below a limit that
 //! stops the execution early, see [`PhysicalFilter::supports_filter_exec`].
 
@@ -167,8 +168,12 @@ impl PhysicalFilter {
     ///   belong to partitions;
     /// * `exec` has a `fetch` and its predicate can fail: `FilterExec`
     ///   evaluates the predicate on whole batches until the fetch is reached,
-    ///   e.g. on the first batch even with `fetch = 0`, so it may fail on
-    ///   rows the native filter, which stops earlier, never sees.
+    ///   so it may fail on rows the native filter, which stops earlier, never
+    ///   sees;
+    /// * `exec` has a `fetch` of 0: `FilterExec` evaluates its predicate on
+    ///   the first batch of its input, even an empty one, and stops, but
+    ///   pipelines skip empty chunks, so the native filter would pull more of
+    ///   its input (whose errors it would raise).
     ///
     /// The predicates of the filters below a limit that stops the execution
     /// early (e.g. the input of a `GlobalLimitExec` or of a `FilterExec`
@@ -324,7 +329,14 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
             field.name()
         ));
     }
-    exec.fetch()?;
+    if exec.fetch()? == 0 {
+        return Some(
+            "it has a fetch of 0: `FilterExec` evaluates its predicate on the first \
+             batch of its input, even an empty one, and stops, but pipelines skip \
+             empty chunks"
+                .to_owned(),
+        );
+    }
     let partitions = exec.input().output_partitioning().partition_count();
     if partitions > 1 {
         return Some(format!(
@@ -3573,6 +3585,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_zero_stays_in_datafusion() {
+        // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
+        // batch of its input, even an empty one, and stops: it never pulls the
+        // zeros, which its input divides by. Pipelines skip empty chunks: a
+        // native filter would pull them.
+        let schema = runs(&[]).schema();
+        let plan = || {
+            let batches = [
+                RecordBatch::new_empty(Arc::clone(&schema)),
+                runs(&[(0, 10)]),
+            ];
+            let projection = Arc::new(
+                datafusion_physical_plan::projection::ProjectionExec::try_new(
+                    [datafusion_physical_expr::projection::ProjectionExpr::new(
+                        physical_expr("10 / x", &schema),
+                        "q",
+                    )],
+                    scan_batches(&schema, &batches),
+                )
+                .unwrap(),
+            );
+            filter_exec("q >= 0", projection, Some(0))
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let err =
+            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
+                .unwrap_err();
+        assert!(err.to_string().contains("fetch of 0"), "{err}");
+        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fetch_with_fallible_predicates_stays_in_datafusion() {
         // `FilterExec` evaluates its predicate on whole batches until the fetch
         // is reached, on the first batch even with `fetch = 0`.
@@ -3602,7 +3650,7 @@ mod tests {
         )
         .unwrap();
         for (predicate, lowered) in [("s ~ 'a{1000000}'", false), ("s LIKE 'a%'", true)] {
-            let plan = filter_exec(predicate, scan(&strings), Some(0));
+            let plan = filter_exec(predicate, scan(&strings), Some(1));
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
             assert_eq!(
                 PhysicalFilter::supports_filter_exec(exec),
@@ -3610,7 +3658,7 @@ mod tests {
                 "{predicate}"
             );
             let (error, operators) = assert_native_plan_parity(
-                || filter_exec(predicate, scan(&strings), Some(0)),
+                || filter_exec(predicate, scan(&strings), Some(1)),
                 true,
             )
             .await;
