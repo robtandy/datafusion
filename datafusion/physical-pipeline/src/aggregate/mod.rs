@@ -85,7 +85,6 @@ pub use hash_aggregate::PhysicalHashAggregate;
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::Arc;
-
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::{AsArray, RecordBatch, RecordBatchOptions};
