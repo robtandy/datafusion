@@ -866,7 +866,7 @@ fn has_union_without_fields(data_type: &DataType) -> bool {
 }
 
 /// Whether `data_type` is or contains a run-end encoded array at any depth.
-fn has_run_end_encoded(data_type: &DataType) -> bool {
+pub(crate) fn has_run_end_encoded(data_type: &DataType) -> bool {
     matches!(data_type, DataType::RunEndEncoded(..))
         || child_data_types(data_type)
             .into_iter()

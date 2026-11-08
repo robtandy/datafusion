@@ -244,6 +244,7 @@ impl PartitionedTupleData {
         }
         let source = ScatterSource::try_new(&self.layout, chunk)?;
         let physical = physical_rows(chunk)?;
+        let logical = source.logical_rows(physical.len())?;
         if let Some(locations) = locations.as_deref_mut() {
             locations.clear();
             locations.try_reserve(chunk.len()).map_err(|e| {
@@ -260,6 +261,7 @@ impl PartitionedTupleData {
             let result = self.partitions[0].append_rows(
                 &source,
                 &physical,
+                logical.as_deref(),
                 stored_hashes,
                 partition_locations,
             );
@@ -323,6 +325,7 @@ impl PartitionedTupleData {
             self.partitions[partition].append_rows(
                 &source,
                 &scratch.rows[range.clone()],
+                Some(&scratch.logical[range.clone()]),
                 stored_hashes.map(|_| &scratch.hashes[range.clone()]),
                 partition_locations,
             )?;

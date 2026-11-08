@@ -46,7 +46,7 @@ use datafusion_common::{
 
 use super::layout::{
     ColumnLayout, ColumnStorage, HASH_WIDTH, MAX_INLINE_LEN, MAX_ROWS_PER_BLOCK,
-    TupleDataLayout, VAR_LEN_SLOT_WIDTH, new_dictionary,
+    TupleDataLayout, VAR_LEN_SLOT_WIDTH, has_run_end_encoded, new_dictionary,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
@@ -338,7 +338,10 @@ impl TupleDataCollection {
     /// the locations of the new rows, one for every row of the chunk.
     ///
     /// If the chunk has a selection, only the selected rows are stored, in
-    /// the order of the selection; the chunk is not compacted. `hashes`
+    /// the order of the selection; the chunk is not compacted, except for
+    /// the columns with run-end encoded values, which are taken like
+    /// [`DataChunk::compact`] takes them (Arrow's `take` merges consecutive
+    /// runs of equal values, e.g. of nulls of different union variants). `hashes`
     /// must be given if and only if the layout has a hash slot, and then
     /// holds one hash for every (logical) row of the chunk.
     ///
@@ -356,20 +359,35 @@ impl TupleDataCollection {
         }
         let source = ScatterSource::try_new(&self.layout, chunk)?;
         let rows = physical_rows(chunk)?;
-        self.append_rows(&source, &rows, hashes, Some(&mut locations))?;
+        let logical = source.logical_rows(rows.len())?;
+        self.append_rows(
+            &source,
+            &rows,
+            logical.as_deref(),
+            hashes,
+            Some(&mut locations),
+        )?;
         Ok(locations)
     }
 
     /// Append the physical rows `rows` of `source` (with the hashes
     /// `hashes`, one for every entry of `rows`), and push their locations
-    /// to `locations`.
+    /// to `locations`. `logical` holds the logical rows of the entries of
+    /// `rows`, which are only needed if
+    /// [`ScatterSource::has_logical_columns`].
     pub(crate) fn append_rows(
         &mut self,
         source: &ScatterSource,
         rows: &[u32],
+        logical: Option<&[u32]>,
         hashes: Option<&[u64]>,
         mut locations: Option<&mut Vec<RowLocation>>,
     ) -> Result<()> {
+        if source.has_logical_columns()
+            && logical.is_none_or(|logical| logical.len() != rows.len())
+        {
+            return internal_err!("The logical rows of the scattered rows are missing");
+        }
         if let Some(locations) = locations.as_deref_mut() {
             locations.try_reserve(rows.len()).map_err(|e| {
                 resources_datafusion_err!("Failed to allocate row locations: {e}")
@@ -398,6 +416,7 @@ impl TupleDataCollection {
                 &layout,
                 source,
                 &rows[segment.clone()],
+                logical.map(|logical| &logical[segment.clone()]),
                 hashes.map(|hashes| &hashes[segment]),
                 target,
                 &mut block.heap,
@@ -791,12 +810,20 @@ pub(crate) fn physical_rows(chunk: &DataChunk) -> Result<Cow<'_, [u32]>> {
 /// encoded with the row format once per chunk (the values of dictionaries
 /// once per value, see [`DictionaryValues`]).
 ///
-/// All columns are indexed by *physical* row.
+/// The columns are indexed by *physical* row, except the columns with
+/// run-end encoded values of chunks with a selection, which are indexed by
+/// *logical* row (see [`SourceColumn::logical`]).
 pub(crate) struct ScatterSource {
     columns: Vec<SourceColumn>,
 }
 
 struct SourceColumn {
+    /// Whether the column holds the values of the logical rows of the chunk
+    /// (indexed by logical row): Arrow's `take` merges consecutive runs of
+    /// equal values of run-end encoded arrays (e.g. nulls of different union
+    /// variants) into one run with the value of its last row, so the values
+    /// of selected rows are taken like the chunk is compacted.
+    logical: bool,
     /// The values of the column (the values of the dictionary, for
     /// dictionaries).
     values: ArrayRef,
@@ -831,9 +858,37 @@ impl ScatterSource {
             .columns()
             .iter()
             .zip(chunk.columns())
-            .map(|(column, array)| SourceColumn::try_new(column, array))
+            .enumerate()
+            .map(|(i, (column, array))| {
+                if chunk.selection().is_some() && has_run_end_encoded(column.data_type())
+                {
+                    let mut source =
+                        SourceColumn::try_new(column, &chunk.compacted_column(i)?)?;
+                    source.logical = true;
+                    Ok(source)
+                } else {
+                    SourceColumn::try_new(column, array)
+                }
+            })
             .collect::<Result<_>>()?;
         Ok(Self { columns })
+    }
+
+    /// Returns `true` if some columns are indexed by logical row, see
+    /// [`SourceColumn::logical`].
+    pub(crate) fn has_logical_columns(&self) -> bool {
+        self.columns.iter().any(|column| column.logical)
+    }
+
+    /// The logical rows `0..len` if some columns are indexed by logical row.
+    pub(crate) fn logical_rows(&self, len: usize) -> Result<Option<Vec<u32>>> {
+        if !self.has_logical_columns() {
+            return Ok(None);
+        }
+        let len = u32::try_from(len).map_err(|_| {
+            exec_datafusion_err!("DataChunk with {len} rows is too large")
+        })?;
+        Ok(Some((0..len).collect()))
     }
 }
 
@@ -872,6 +927,7 @@ impl SourceColumn {
             }
         };
         Ok(Self {
+            logical: false,
             values,
             indices,
             nulls,
@@ -987,12 +1043,15 @@ pub(crate) fn fixed_values(array: &ArrayRef, width: usize) -> Buffer {
     }
 }
 
-/// Write the rows `rows` of `source` into `target`, the bytes of
-/// `rows.len()` new, zeroed rows.
+/// Write the (physical) rows `rows` of `source` into `target`, the bytes of
+/// `rows.len()` new, zeroed rows. `logical` holds the logical rows of the
+/// entries of `rows`, for the columns indexed by logical row (see
+/// [`SourceColumn::logical`]).
 fn scatter_rows(
     layout: &TupleDataLayout,
     source: &ScatterSource,
     rows: &[u32],
+    logical: Option<&[u32]>,
     hashes: Option<&[u64]>,
     target: &mut [u8],
     heap: &mut Vec<u8>,
@@ -1020,6 +1079,15 @@ fn scatter_rows(
             rows: &mut *target,
             row_width,
             offset: column.offset(),
+        };
+        let rows = match (source.logical, logical) {
+            (false, _) => rows,
+            (true, Some(logical)) => logical,
+            (true, None) => {
+                return internal_err!(
+                    "The logical rows of the scattered rows are missing"
+                );
+            }
         };
         if let Some(nulls) = &source.nulls {
             target.clear_validity(index, nulls, rows);
@@ -2987,6 +3055,84 @@ mod tests {
             // Halved until the values fit, also for the following chunks.
             let size = sizes[0];
             assert!(size < 1024 && sizes.iter().all(|&s| s == size), "{sizes:?}");
+        }
+    }
+
+    #[test]
+    fn selected_run_end_encoded_values_are_taken_like_arrow() {
+        use arrow::array::{Int16Array, ListArray, RunArray, StructArray, UnionArray};
+        use arrow::datatypes::{Int16Type, UnionFields};
+
+        use crate::tuple_data::PartitionedTupleData;
+
+        // A null of each variant of a dense union, in runs [1, 2]: Arrow's
+        // `take` merges equal values (all nulls are equal) into one run,
+        // whose value is the value of its last row.
+        let union = UnionArray::try_new(
+            UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("i", DataType::Int32, true),
+                    Field::new("s", DataType::Utf8, true),
+                ],
+            )
+            .unwrap(),
+            vec![0, 1].into(),
+            Some(vec![0, 0].into()),
+            vec![
+                Arc::new(Int32Array::from(vec![None::<i32>])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+            ],
+        )
+        .unwrap();
+        let runs: ArrayRef = Arc::new(
+            RunArray::<Int16Type>::try_new(&Int16Array::from(vec![1, 2]), &union)
+                .unwrap(),
+        );
+        let structs: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("r", runs.data_type().clone(), true)),
+            Arc::clone(&runs),
+        )]));
+        let lists: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", runs.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([1, 1]),
+            Arc::clone(&runs),
+            None,
+        ));
+        for column in [runs, structs, lists] {
+            let batch = RecordBatch::try_from_iter(vec![("c", column)]).unwrap();
+            for selection in [vec![1, 0, 0], vec![0, 1, 1, 0], vec![1, 1, 0]] {
+                let chunk = chunk_with_selection(&batch, selection);
+                let expected = chunk.compact().unwrap();
+                let mut collection = collection_for(&batch, false);
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &expected);
+                let mut state = TupleDataScanState::new();
+                let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+                assert_identical(&scanned.into_record_batch().unwrap(), &expected);
+
+                // Into 2 partitions, by the lowest bit of the row index.
+                let layout =
+                    Arc::new(TupleDataLayout::try_new(batch.schema(), true).unwrap());
+                let mut partitioned = PartitionedTupleData::try_new(layout, 1).unwrap();
+                let hashes = (0..chunk.len() as u64).map(|i| i << 63).collect::<Vec<_>>();
+                let locations = partitioned
+                    .append_chunk_with_locations(&chunk, &hashes)
+                    .unwrap();
+                for partition in 0..2 {
+                    let (rows, locations): (Vec<u32>, Vec<RowLocation>) = locations
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, location)| location.partition == partition)
+                        .map(|(row, location)| (row as u32, location.location))
+                        .unzip();
+                    let gathered =
+                        partitioned.partition(partition).gather(&locations).unwrap();
+                    let expected =
+                        chunk_with_selection(&expected, rows).compact().unwrap();
+                    assert_identical(&gathered, &expected);
+                }
+            }
         }
     }
 
