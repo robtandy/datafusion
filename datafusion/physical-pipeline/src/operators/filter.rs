@@ -177,9 +177,11 @@ impl PhysicalFilter {
     ///
     /// A planner must also keep the plans below a limit that stops the
     /// execution early (e.g. the input of a `GlobalLimitExec`, of a node with
-    /// a fetch, or of an aggregation with a soft limit, unless a sort, which
-    /// reads all of its input, is in between) in DataFusion, filters
-    /// included. DataFusion pulls its input lazily, batch by batch, but for
+    /// a fetch, or of an aggregation with a soft limit) in DataFusion, filters
+    /// included, unless a sort that reads all of its input is in between: a
+    /// sort whose order its input does not satisfy, without a fetch or with
+    /// a fetch that shares no prefix with the order of its input (a sort that
+    /// its input satisfies streams it, and such a TopK may stop early). DataFusion pulls its input lazily, batch by batch, but for
     /// `FilterExec`, which pulls ahead to coalesce its output, so the rows that
     /// are evaluated before the limit is reached, and so the errors, depend on
     /// these pulls, which a pipeline (on several threads, with a cache of
@@ -944,9 +946,9 @@ pub(crate) mod test_support {
     ///   `ProjectionExec` becomes `PhysicalProjection`, if supported (see
     ///   [`PhysicalFilter::supports_filter_exec`] and
     ///   [`PhysicalProjection::supports_projection_exec`]).
-    /// * Below a limit that stops the execution early (unless a sort, which
-    ///   reads all of its input, is in between), the whole plan is executed
-    ///   by DataFusion.
+    /// * Below a limit that stops the execution early (unless a sort that
+    ///   reads all of its input, see [`reads_all_input`], is in between), the
+    ///   whole plan is executed by DataFusion.
     /// * A `FilterExec` or a `ProjectionExec` that is not lowered, and a node
     ///   whose expressions may fail depending on DataFusion's batches, are
     ///   executed by DataFusion with their whole input plan, so that they see
@@ -970,13 +972,12 @@ pub(crate) mod test_support {
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        if limited && !plan.is::<SortExec>() {
+        if limited && !reads_all_input(plan) {
             // DataFusion pulls the input of a limit lazily, batch by batch,
             // but for `FilterExec`, which pulls ahead to coalesce its output:
             // the rows evaluated before the limit is reached, and so the
             // errors, depend on these pulls, which a pipeline (on several
-            // threads, with a cache of small chunks) does not reproduce. A
-            // sort reads all of its input.
+            // threads, with a cache of small chunks) does not reproduce.
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
@@ -1010,6 +1011,30 @@ pub(crate) mod test_support {
             }
         }
         Ok(Arc::new(BridgeOperator::new(bridged_plan(plan, limited)?)))
+    }
+
+    /// Whether `plan` reads all of its input, even if a limit above it stops
+    /// early: a sort whose order its input does not satisfy, without fetch,
+    /// or with a fetch (a TopK) that shares no prefix with the order of its
+    /// input. A sort that its input satisfies streams it, and a TopK can stop
+    /// once the next rows of its input sort after its own (see
+    /// `SortExec::execute`).
+    fn reads_all_input(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let Some(sort) = plan.downcast_ref::<SortExec>() else {
+            return false;
+        };
+        let Ok((prefix, satisfied)) = sort
+            .input()
+            .equivalence_properties()
+            .extract_common_sort_prefix(sort.expr().clone())
+        else {
+            return false;
+        };
+        !satisfied
+            && match sort.fetch() {
+                None => true,
+                Some(fetch) => fetch > 0 && prefix.is_empty(),
+            }
     }
 
     /// Whether some expression of `plan` may fail depending on the batches
@@ -1050,8 +1075,8 @@ pub(crate) mod test_support {
     ///
     /// The children of a node with a fetch (or of an aggregation with a soft
     /// limit, which stops reading its input once it has enough groups) are
-    /// below a limit that stops the execution early, unless the node is a
-    /// sort, which reads all of its input before it produces output.
+    /// below a limit that stops the execution early, unless the node reads
+    /// all of its input (see [`reads_all_input`]).
     fn bridged_plan(
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
@@ -1060,7 +1085,7 @@ pub(crate) mod test_support {
             .downcast_ref::<AggregateExec>()
             .is_some_and(|aggregate| aggregate.limit_options().is_some());
         let limited =
-            !plan.is::<SortExec>() && (limited || plan.fetch().is_some() || soft_limit);
+            !reads_all_input(plan) && (limited || plan.fetch().is_some() || soft_limit);
         let children = plan.children();
         let new_children = children
             .iter()
@@ -1992,7 +2017,9 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StringViewArray};
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{Field, Schema};
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion_physical_plan::filter::batch_filter;
+    use datafusion_physical_plan::sorts::sort::SortExec;
 
     use crate::test_utils::test_session_config;
 
@@ -3648,6 +3675,113 @@ mod tests {
             assert_native_plan_parity(|| limited_filter(32, 32), true).await;
         assert!(error.is_none());
         assert_eq!((operators.filters, operators.projections), (0, 0));
+    }
+
+    /// `FilterExec(q >= 0)`, coalescing its output into batches of 32 rows,
+    /// above `ProjectionExec(id, 10 / x AS q)`, over a batch of 32 rows with
+    /// `x = 1` then a batch of 32 rows with `x = 0`, ordered by `id` (`0` to
+    /// `63`), which the scan declares if `ordered`.
+    fn filtered_divisions(ordered: bool) -> Arc<dyn ExecutionPlan> {
+        use datafusion_physical_expr::projection::ProjectionExpr;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("x", DataType::Int32, false),
+        ]));
+        let batch = |first: i64, x: i32| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(first..first + 32)),
+                    Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(x, 32))),
+                ],
+            )
+            .unwrap()
+        };
+        let mut source = datafusion_datasource::memory::MemorySourceConfig::try_new(
+            &[vec![batch(0, 1), batch(32, 0)]],
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
+        if ordered {
+            let id = LexOrdering::new([PhysicalSortExpr::new_default(physical_expr(
+                "id", &schema,
+            ))])
+            .unwrap();
+            source = source.try_with_sort_information(vec![id]).unwrap();
+        }
+        let projection = Arc::new(
+            datafusion_physical_plan::projection::ProjectionExec::try_new(
+                [
+                    ProjectionExpr::new(physical_expr("id", &schema), "id"),
+                    ProjectionExpr::new(physical_expr("10 / x", &schema), "q"),
+                ],
+                datafusion_datasource::source::DataSourceExec::from_data_source(source),
+            )
+            .unwrap(),
+        );
+        let predicate = physical_expr("q >= 0", &projection.schema());
+        Arc::new(
+            datafusion_physical_plan::filter::FilterExecBuilder::new(
+                predicate, projection,
+            )
+            .with_batch_size(32)
+            .build()
+            .unwrap(),
+        )
+    }
+
+    /// A sort of [`filtered_divisions`] by `keys`, with `fetch`.
+    fn sorted_divisions(
+        keys: &[&str],
+        fetch: Option<usize>,
+        ordered: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        let input = filtered_divisions(ordered);
+        let ordering = LexOrdering::new(keys.iter().map(|key| {
+            PhysicalSortExpr::new_default(physical_expr(key, &input.schema()))
+        }))
+        .unwrap();
+        Arc::new(SortExec::new(ordering, input).with_fetch(fetch))
+    }
+
+    /// `GlobalLimitExec(1)` above `input`.
+    fn limit_one(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(datafusion_physical_plan::limit::GlobalLimitExec::new(
+            input,
+            0,
+            Some(1),
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_that_may_stop_early_keep_their_input_in_datafusion() {
+        // The input of the sort is ordered by `id`. A sort by `id` streams it,
+        // and a sort by `(id, q)` with a fetch (a TopK) stops after a batch
+        // once it has its rows and the next `id`s are greater: both stop
+        // before `FilterExec` pulls the zeros, which the projection divides
+        // by. A native cache, which keeps the 32 rows of the first chunk,
+        // would pull them.
+        let stopping: [fn() -> Arc<dyn ExecutionPlan>; 2] = [
+            || limit_one(sorted_divisions(&["id"], None, true)),
+            || sorted_divisions(&["id", "q"], Some(1), true),
+        ];
+        for plan in stopping {
+            let (error, operators) = assert_native_plan_parity(plan, true).await;
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!((operators.filters, operators.projections), (0, 0));
+        }
+        // A sort whose order its input does not satisfy reads all of its
+        // input, in DataFusion as natively: what is below it is lowered.
+        let reading: [fn() -> Arc<dyn ExecutionPlan>; 2] = [
+            || limit_one(sorted_divisions(&["id"], None, false)),
+            || sorted_divisions(&["id", "q"], Some(1), false),
+        ];
+        for plan in reading {
+            let (error, operators) = assert_native_plan_parity(plan, true).await;
+            assert!(error.unwrap().contains("Divide by zero"));
+            assert_eq!(operators.filters, 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
