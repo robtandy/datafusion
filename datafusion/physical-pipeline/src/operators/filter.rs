@@ -2047,6 +2047,18 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// The types of times that Arrow has no arrays of: of microseconds or
+    /// nanoseconds in 32 bits, of seconds or milliseconds in 64 bits.
+    pub(crate) fn times_without_arrays() -> Vec<DataType> {
+        use arrow::datatypes::TimeUnit;
+        vec![
+            DataType::Time32(TimeUnit::Microsecond),
+            DataType::Time32(TimeUnit::Nanosecond),
+            DataType::Time64(TimeUnit::Second),
+            DataType::Time64(TimeUnit::Millisecond),
+        ]
+    }
+
     /// A batch of 4096 rows of `x` (`Boolean`): `true` on the first 2048 rows,
     /// `false` on the others.
     pub(crate) fn half_true() -> RecordBatch {
@@ -4636,8 +4648,9 @@ mod tests {
         // Arrow cannot build for every type: an empty union has no value, so
         // no null; a fixed-size list of 32768 run-end encoded values is one run
         // of 32768 nulls, which `Int16` run ends cannot count; and no array
-        // has a fixed-size binary type of negative size, or a dictionary type
-        // with string keys (but a schema can).
+        // has a fixed-size binary type of negative size, a dictionary type
+        // with string keys, or a type of times of microseconds in 32 bits (but
+        // a schema can).
         let empty_union = DataType::Union(
             arrow::datatypes::UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new())
                 .unwrap(),
@@ -4653,12 +4666,15 @@ mod tests {
         );
         let string_keys =
             DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Utf8));
-        for (data_type, has_arrays) in [
+        let mut types = vec![
             (empty_union, true),
             (lists_of_runs, true),
             (DataType::FixedSizeBinary(-1), false),
             (string_keys, false),
-        ] {
+        ];
+        // Nor times of these units in these widths.
+        types.extend(times_without_arrays().into_iter().map(|time| (time, false)));
+        for (data_type, has_arrays) in types {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("x", DataType::Int32, false),
                 Field::new("u", data_type.clone(), true),

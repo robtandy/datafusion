@@ -1593,6 +1593,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn projections_of_types_without_arrays_stay_in_datafusion() {
+        // The classification probes `u IS NULL` on a null of the type of `u`,
+        // which Arrow cannot build for types it has no arrays of (but a schema
+        // can have, e.g. of a table without batches; see
+        // `operations_on_types_without_nulls_stay_in_datafusion`).
+        for data_type in times_without_arrays() {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("u", data_type.clone(), true)]));
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                let is_null =
+                    Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                        physical_expr("u", &schema),
+                    ));
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(is_null as Arc<dyn PhysicalExpr>, "b")],
+                        scan_batches(&schema, &[]),
+                    )
+                    .unwrap(),
+                )
+            };
+            let projection_plan = plan();
+            let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(
+                !PhysicalProjection::supports_projection_exec(exec),
+                "{data_type}"
+            );
+            let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+            assert_eq!(
+                assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+                Ok(0),
+                "{data_type}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn broadcast_constants_stay_in_datafusion() {
         // `ProjectionExec` evaluates `CASE WHEN x THEN '…' END` on the batch,
         // which copies a string of 2 MiB for each of its 2048 rows with `x`,

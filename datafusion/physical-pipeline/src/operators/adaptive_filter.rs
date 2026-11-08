@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
-use arrow::datatypes::{DataType, Field, Schema, UnionMode};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
@@ -903,8 +903,10 @@ const MAX_PROBE_VALUES: usize = 1 << 16;
 /// without fields, which have no value, so no null, run ends that cannot
 /// count the nulls, as one run, nor types of which there is no array
 /// (fixed-size binaries or lists of negative sizes, dictionaries with keys
-/// that are not integers, run ends that are not `Int16`, `Int32` or
-/// `Int64`).
+/// that are not integers, run ends that are not `Int16`, `Int32` or `Int64`,
+/// times of microseconds or nanoseconds in 32 bits, or of seconds or
+/// milliseconds in 64 bits, maps whose entries are not structs of a key and a
+/// value).
 fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
     // The values of the fixed-size lists of `len` values of `size`.
     let values = |size: i32| {
@@ -925,12 +927,21 @@ fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
         DataType::Struct(fields) => fields
             .iter()
             .all(|field| can_build_nulls(field.data_type(), len)),
+        DataType::Time32(unit) => {
+            matches!(unit, TimeUnit::Second | TimeUnit::Millisecond)
+        }
+        DataType::Time64(unit) => {
+            matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond)
+        }
         // Their values are empty.
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::Map(field, _) => can_build_nulls(field.data_type(), 0),
+        | DataType::LargeListView(field) => can_build_nulls(field.data_type(), 0),
+        DataType::Map(field, _) => {
+            matches!(field.data_type(), DataType::Struct(fields) if fields.len() == 2)
+                && can_build_nulls(field.data_type(), 0)
+        }
         DataType::Dictionary(keys, values) => {
             keys.is_dictionary_key_type() && can_build_nulls(values, 0)
         }
@@ -1854,6 +1865,59 @@ mod tests {
                 1,
                 true,
             ),
+            // Nor of times of microseconds or nanoseconds in 32 bits, or of
+            // seconds or milliseconds in 64 bits, at any depth.
+            (DataType::Time32(TimeUnit::Second), 1, true),
+            (DataType::Time32(TimeUnit::Millisecond), 1, true),
+            (DataType::Time32(TimeUnit::Microsecond), 0, false),
+            (DataType::Time32(TimeUnit::Nanosecond), 0, false),
+            (DataType::Time64(TimeUnit::Second), 0, false),
+            (DataType::Time64(TimeUnit::Millisecond), 0, false),
+            (DataType::Time64(TimeUnit::Microsecond), 1, true),
+            (DataType::Time64(TimeUnit::Nanosecond), 1, true),
+            (
+                DataType::new_list(DataType::Time64(TimeUnit::Second), true),
+                1,
+                false,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int8),
+                    Box::new(DataType::Time32(TimeUnit::Nanosecond)),
+                ),
+                1,
+                false,
+            ),
+            // Nor of maps whose entries are not structs of a key and a value.
+            (
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Int32, false),
+                                Field::new("value", DataType::Utf8, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                1,
+                true,
+            ),
+            (DataType::Map(field(DataType::Int32), false), 0, false),
+            (
+                DataType::Map(
+                    field(DataType::Struct(
+                        vec![Field::new("key", DataType::Int32, false)].into(),
+                    )),
+                    false,
+                ),
+                0,
+                false,
+            ),
         ] {
             assert_eq!(
                 can_build_nulls(&data_type, len),
@@ -1864,6 +1928,104 @@ mod tests {
                 assert_eq!(new_null_array(&data_type, len).len(), len);
             }
         }
+    }
+
+    #[test]
+    fn builds_the_nulls_of_the_types_it_claims_to() {
+        // `can_build_nulls` must only claim what `new_null_array` builds, which
+        // panics otherwise: check it on many types, also nested.
+        use arrow::datatypes::{IntervalUnit, UnionFields};
+        let units = [
+            TimeUnit::Second,
+            TimeUnit::Millisecond,
+            TimeUnit::Microsecond,
+            TimeUnit::Nanosecond,
+        ];
+        let mut flat = vec![
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::UInt64,
+            DataType::Float16,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(0),
+            DataType::FixedSizeBinary(-1),
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            DataType::Decimal32(9, 2),
+            DataType::Decimal128(0, 0),
+            DataType::Decimal256(100, 0),
+            DataType::Union(
+                UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new()).unwrap(),
+                UnionMode::Sparse,
+            ),
+        ];
+        for unit in units {
+            flat.extend([
+                DataType::Time32(unit),
+                DataType::Time64(unit),
+                DataType::Duration(unit),
+                DataType::Timestamp(unit, Some("+01:00".into())),
+            ]);
+        }
+        let mut types = flat.clone();
+        for inner in &flat {
+            for nullable in [true, false] {
+                let field = Arc::new(Field::new("f", inner.clone(), nullable));
+                let entries = DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new("value", inner.clone(), nullable),
+                    ]
+                    .into(),
+                );
+                types.extend([
+                    DataType::List(Arc::clone(&field)),
+                    DataType::LargeListView(Arc::clone(&field)),
+                    DataType::FixedSizeList(Arc::clone(&field), 2),
+                    DataType::Struct(vec![Arc::clone(&field)].into()),
+                    DataType::Map(Arc::new(Field::new("entries", entries, false)), false),
+                    DataType::Map(Arc::clone(&field), false),
+                    DataType::RunEndEncoded(
+                        Arc::new(Field::new("run_ends", DataType::Int16, false)),
+                        Arc::clone(&field),
+                    ),
+                    DataType::Dictionary(
+                        Box::new(DataType::UInt16),
+                        Box::new(inner.clone()),
+                    ),
+                ]);
+                for mode in [UnionMode::Sparse, UnionMode::Dense] {
+                    types.push(DataType::Union(
+                        UnionFields::try_new(
+                            vec![0, 5],
+                            vec![
+                                Field::new("a", inner.clone(), nullable),
+                                Field::new("b", DataType::Int32, true),
+                            ],
+                        )
+                        .unwrap(),
+                        mode,
+                    ));
+                }
+            }
+        }
+        let wrong = types
+            .iter()
+            .flat_map(|data_type| [(data_type, 0), (data_type, 1)])
+            .filter(|&(data_type, len)| {
+                can_build_nulls(data_type, len)
+                    && std::panic::catch_unwind(|| new_null_array(data_type, len))
+                        .is_err()
+            })
+            .map(|(data_type, len)| format!("{data_type} x {len}"))
+            .collect::<Vec<_>>();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
