@@ -57,8 +57,8 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Schema};
+use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
@@ -338,7 +338,8 @@ pub enum Fallibility {
     /// It never fails.
     Infallible,
     /// It fails whenever it is evaluated, even without rows, e.g.
-    /// `s ~ 'a{1000000}'`, whose constant pattern is too big to compile.
+    /// `s ~ 'a{1000000}'`, whose constant pattern is too big to compile, or a
+    /// comparison of types that Arrow cannot compare.
     Uniform,
     /// It may fail on some rows and not on others, e.g. `10 / x`.
     PerRow,
@@ -347,16 +348,18 @@ pub enum Fallibility {
 /// How evaluating `expr` (on `schema`) can fail: the most fallible of its
 /// nodes.
 ///
-/// This is conservative. Only columns, literals, comparisons, `AND`, `OR`,
-/// `NOT`, `IS [NOT] NULL`, `IN` lists, widening casts (also into and out of
-/// dictionaries, see `cast_fallibility`), arithmetic on numbers that wraps on
-/// overflow (DataFusion's default) and divisions of numbers by a constant
-/// that is neither `0` nor `-1` are infallible. `LIKE` and regular
-/// expressions with a constant pattern only fail if the pattern does not
-/// compile, which does not depend on the rows (the pattern is compiled before
-/// any row is matched): they are infallible if evaluating them on an empty
-/// batch succeeds, and fail uniformly otherwise. Everything else, functions
-/// and `CASE` included, may fail on some rows.
+/// This is conservative. Only columns, literals, `AND`, `OR`, `NOT`,
+/// `IS [NOT] NULL`, comparisons and `IN` lists of types that Arrow can compare
+/// (comparing types that it cannot compare fails uniformly), widening casts
+/// (also into and out of dictionaries, see `cast_fallibility`), arithmetic on
+/// numbers that wraps on overflow (DataFusion's default) and divisions of
+/// numbers by a constant that is neither `0` nor `-1` are infallible. `LIKE`
+/// and regular expressions with a constant pattern only fail if the pattern
+/// does not compile, which does not depend on the rows (the pattern is
+/// compiled before any row is matched): they are infallible if evaluating
+/// them on an empty batch succeeds, and fail uniformly otherwise (see
+/// `constant_pattern_fallibility` for case-insensitive `LIKE`s). Everything
+/// else, functions and `CASE` included, may fail on some rows.
 pub fn fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
     expr.children()
         .into_iter()
@@ -376,8 +379,18 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         use Operator::*;
         return match binary.op() {
-            Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom
-            | And | Or => Infallible,
+            And | Or => Infallible,
+            Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom => {
+                match (
+                    binary.left().data_type(schema),
+                    binary.right().data_type(schema),
+                ) {
+                    (Ok(left), Ok(right)) => {
+                        comparison_fallibility(&left, *binary.op(), &right)
+                    }
+                    _ => PerRow,
+                }
+            }
             Plus | Minus | Multiply
                 if wraps_on_overflow(binary) && is_number(binary, schema) =>
             {
@@ -403,12 +416,34 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
     if let Some(cast) = expr.downcast_ref::<CastExpr>() {
         return cast_fallibility(cast, schema);
     }
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        // The values of the list are compared with the expression, once per
+        // type.
+        let Ok(data_type) = in_list.expr().data_type(schema) else {
+            return PerRow;
+        };
+        let mut value_types = Vec::<DataType>::new();
+        for value in in_list.list() {
+            match value.data_type(schema) {
+                Ok(value_type) if !value_types.contains(&value_type) => {
+                    value_types.push(value_type)
+                }
+                Ok(_) => {}
+                Err(_) => return PerRow,
+            }
+        }
+        return value_types
+            .iter()
+            .map(|value_type| {
+                comparison_fallibility(&data_type, Operator::Eq, value_type)
+            })
+            .fold(Infallible, Ord::max);
+    }
     if expr.is::<Column>()
         || expr.is::<Literal>()
         || expr.is::<NotExpr>()
         || expr.is::<IsNullExpr>()
         || expr.is::<IsNotNullExpr>()
-        || expr.is::<InListExpr>()
     {
         Infallible
     } else {
@@ -473,6 +508,38 @@ fn constant_pattern_fallibility(
         None => Fallibility::Infallible,
         Some(Ok(probe)) if !fails_on_one_row(&probe) => Fallibility::Infallible,
         Some(_) => Fallibility::PerRow,
+    }
+}
+
+/// How comparing values of types `left` and `right` with `op` can fail: only
+/// if Arrow cannot compare these types (e.g. dictionaries of dictionaries),
+/// whatever the values, and then whenever it is evaluated. Comparing null
+/// values of these types tells, without evaluating the compared expressions.
+fn comparison_fallibility(
+    left: &DataType,
+    op: Operator,
+    right: &DataType,
+) -> Fallibility {
+    let schema = Schema::new(vec![
+        Field::new("left", left.clone(), true),
+        Field::new("right", right.clone(), true),
+    ]);
+    let comparison = BinaryExpr::new(
+        Arc::new(Column::new("left", 0)),
+        op,
+        Arc::new(Column::new("right", 1)),
+    );
+    let fails = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![new_null_array(left, 1), new_null_array(right, 1)],
+    )
+    .map_err(Into::into)
+    .and_then(|batch| comparison.evaluate(&batch)?.into_array(1))
+    .is_err();
+    if fails {
+        Fallibility::Uniform
+    } else {
+        Fallibility::Infallible
     }
 }
 
@@ -926,6 +993,52 @@ mod tests {
             &physical_expr(&format!("s ILIKE '{unicode}' AND a > 0"), &schema),
             &schema
         ));
+
+        // Arrow cannot compare some types, whatever the values.
+        let nested = Arc::new(Schema::new(vec![
+            Field::new(
+                "n",
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Dictionary(
+                        Box::new(DataType::Int32),
+                        Box::new(DataType::Utf8),
+                    )),
+                ),
+                true,
+            ),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+                true,
+            ),
+        ]));
+        let compare = |name: &str, op: Operator| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                physical_expr(name, &nested),
+                op,
+                physical_expr(name, &nested),
+            ))
+        };
+        for (expr, expected) in [
+            (compare("n", Operator::Eq), Uniform),
+            (compare("n", Operator::Lt), Uniform),
+            (compare("n", Operator::IsDistinctFrom), Uniform),
+            (compare("l", Operator::Eq), Infallible),
+            (compare("l", Operator::Lt), Infallible),
+            (
+                datafusion_physical_expr::expressions::in_list(
+                    physical_expr("n", &nested),
+                    vec![physical_expr("n", &nested)],
+                    &false,
+                    &nested,
+                )
+                .unwrap(),
+                Uniform,
+            ),
+        ] {
+            assert_eq!(fallibility(&expr, &nested), expected, "{expr}");
+        }
 
         // Packing values into a dictionary fails on batches with more distinct
         // values than its keys can index.

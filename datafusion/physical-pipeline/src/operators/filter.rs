@@ -1597,6 +1597,32 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(s)]).unwrap()
     }
 
+    /// A batch of two columns `a` and `b` of dictionaries of dictionaries
+    /// (`Dictionary(Int32, Dictionary(Int32, Utf8))`), which Arrow cannot
+    /// compare.
+    pub(crate) fn nested_dictionaries() -> RecordBatch {
+        let column = || -> ArrayRef {
+            let inner = DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(StringArray::from(vec!["p", "q"])),
+            )
+            .unwrap();
+            Arc::new(
+                DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from(vec![0, 1, 0]),
+                    Arc::new(inner),
+                )
+                .unwrap(),
+            )
+        };
+        let (a, b) = (column(), column());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", a.data_type().clone(), true),
+            Field::new("b", b.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(schema, vec![a, b]).unwrap()
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -3227,6 +3253,38 @@ mod tests {
             ))
             .unwrap();
         assert!(drive(&filter_for(&predicate, &schema), [selected]).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_with_comparisons_that_arrow_cannot_evaluate_stays_in_datafusion() {
+        // Arrow cannot compare dictionaries of dictionaries. With `fetch = 0`,
+        // `FilterExec` evaluates its predicate on the first batch, and fails.
+        let batch = nested_dictionaries();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let predicate =
+                Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                    physical_expr("a", &schema),
+                    datafusion_expr::Operator::Eq,
+                    physical_expr("b", &schema),
+                ));
+            Arc::new(
+                datafusion_physical_plan::filter::FilterExecBuilder::new(
+                    predicate,
+                    scan(&batch),
+                )
+                .with_fetch(Some(0))
+                .build()
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        let error = error.unwrap();
+        assert!(error.contains("Invalid comparison operation"), "{error}");
+        assert_eq!(operators.filters, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
