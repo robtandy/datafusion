@@ -1260,6 +1260,56 @@ mod tests {
     }
 
     #[test]
+    fn dictionaries_of_nested_keys() {
+        use arrow::array::Int8Array;
+
+        const INT: i8 = 0;
+        const STR: i8 = 1;
+        // Dictionaries of unions and of lists of unions, with null keys and
+        // null values: the values are compared, the unions by value.
+        let unions: ArrayRef = Arc::new(sparse_union(&[
+            (INT, None),
+            (STR, None),
+            (STR, Some("a")),
+            (INT, Some("1")),
+        ]));
+        let lists = union_lists(&[
+            Some(vec![(INT, None)]),
+            Some(vec![(STR, None)]),
+            None,
+            Some(vec![(STR, Some("a"))]),
+        ]);
+        // The expected matches for `NullEqualsNothing` and `NullEqualsNull`.
+        let cases = [
+            // [NULL(i), "a", NULL, 1, NULL(s), NULL(i)] and
+            // [NULL(s), "a", NULL, 1, NULL(i), NULL].
+            (unions, vec![1, 3], vec![0, 1, 2, 3, 4, 5]),
+            // [[NULL(i)], NULL, NULL, ["a"], [NULL(s)], [NULL(i)]] and
+            // [[NULL(s)], NULL, NULL, ["a"], [NULL(i)], NULL]: lists with
+            // nulls of different variants are equal.
+            (lists, vec![0, 3, 4], vec![0, 1, 2, 3, 4, 5]),
+        ];
+        for (values, expected_nothing, expected_null) in cases {
+            let dictionary = |keys: Vec<Option<i8>>| -> ArrayRef {
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(keys),
+                        Arc::clone(&values),
+                    )
+                    .unwrap(),
+                )
+            };
+            let build =
+                dictionary(vec![Some(0), Some(2), None, Some(3), Some(1), Some(0)]);
+            let probe = dictionary(vec![Some(1), Some(2), None, Some(3), Some(0), None]);
+            let [nothing, null] =
+                assert_matches_join_key_comparator(&build, &probe, &[0, 1, 2, 3, 4, 2]);
+            assert_eq!(nothing, expected_nothing);
+            assert_eq!(null, expected_null);
+        }
+    }
+
+    #[test]
     fn run_end_encoded_keys_with_custom_fields() {
         use crate::tuple_data::test_data::custom_run_end_encoded;
 

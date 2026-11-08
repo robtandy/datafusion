@@ -2169,6 +2169,79 @@ mod tests {
     }
 
     #[test]
+    fn dictionaries_of_nested_values() {
+        use arrow::array::{
+            DictionaryArray, Int8Array, ListArray, StructArray, UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, Int32Type, UnionFields};
+
+        let union = UnionArray::try_new(
+            UnionFields::try_new(
+                [0, 1],
+                [
+                    Field::new("i", DataType::Int32, true),
+                    Field::new("s", DataType::Utf8, true),
+                ],
+            )
+            .unwrap(),
+            vec![0, 1, 0].into(),
+            None,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, None])),
+                Arc::new(StringArray::from(vec![None, Some("x"), None])),
+            ],
+        )
+        .unwrap();
+        let values: [(&str, ArrayRef); 4] = [
+            (
+                "run-end encoded values",
+                custom_run_end_encoded(
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                    &[1, 2, 3],
+                    true,
+                ),
+            ),
+            ("union values", Arc::new(union)),
+            (
+                "struct values",
+                Arc::new(
+                    StructArray::try_from(vec![(
+                        "a",
+                        Arc::new(Int32Array::from(vec![Some(1), None, Some(3)]))
+                            as ArrayRef,
+                    )])
+                    .unwrap(),
+                ),
+            ),
+            (
+                "list values",
+                Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(1)]),
+                    None,
+                    Some(vec![]),
+                ])),
+            ),
+        ];
+        for (name, values) in values {
+            let keys =
+                Int8Array::from(vec![Some(0), None, Some(1), Some(0), Some(2), Some(1)]);
+            let dictionary = DictionaryArray::<Int8Type>::try_new(keys, values).unwrap();
+            let batch = RecordBatch::try_from_iter(vec![(
+                name,
+                Arc::new(dictionary) as ArrayRef,
+            )])
+            .unwrap();
+            let mut collection = collection_for(&batch, false);
+            let chunk = chunk_with_selection(&batch, vec![4, 0, 5, 1, 1, 3, 2]);
+            let locations = collection.append_chunk(&chunk, None).unwrap();
+            assert_identical(
+                &collection.gather(&locations).unwrap(),
+                &chunk.compact().unwrap(),
+            );
+        }
+    }
+
+    #[test]
     fn unions_of_dictionaries_are_not_supported() {
         let union = DataType::Union(
             arrow::datatypes::UnionFields::try_new(

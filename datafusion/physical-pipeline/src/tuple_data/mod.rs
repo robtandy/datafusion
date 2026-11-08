@@ -882,10 +882,18 @@ pub(crate) mod test_data {
             assert!(nulls(a) == nulls(e), "nulls of {name} differ");
             // Dictionaries are compared by their values: a valid key of a
             // null value becomes a null key.
-            let decoded = |array: &ArrayRef| match array.data_type() {
-                DataType::Dictionary(_, value_type) => cast(array, value_type).unwrap(),
-                _ => Arc::clone(array),
-            };
+            let decoded =
+                |array: &ArrayRef| match arrow::array::AsArray::as_any_dictionary_opt(
+                    array,
+                ) {
+                    Some(dictionary) => arrow::compute::take(
+                        dictionary.values().as_ref(),
+                        dictionary.keys(),
+                        None,
+                    )
+                    .unwrap(),
+                    None => Arc::clone(array),
+                };
             let (a, e) = (&decoded(a), &decoded(e));
             if a.to_data() != e.to_data() {
                 let options =
