@@ -4,7 +4,9 @@
 
 //! `PhysicalUnion`: parallel `UNION ALL` over several child pipelines.
 //!
-//! [`PhysicalUnion`] replaces DataFusion's `UnionExec` and `InterleaveExec`.
+//! [`PhysicalUnion`] replaces DataFusion's `UnionExec` and `InterleaveExec`
+//! ([`PhysicalUnion::try_lower`] leaves an `InterleaveExec` of several inputs
+//! to DataFusion, which executes all of them before it produces anything).
 //! Like DuckDB's `PhysicalUnion`, it does not move any data: it only builds
 //! pipelines (see [`MetaPipelineBuilder::build_union`]). The first input
 //! continues the pipeline of the operators above the union, and every other
@@ -38,7 +40,7 @@ use arrow::error::ArrowError;
 use datafusion_common::metadata::merge_metadata_for_union;
 use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_plan::union::{InterleaveExec, UnionExec, can_interleave};
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::chunk::{DataChunk, SelectionVector};
@@ -116,10 +118,18 @@ impl PhysicalUnion {
     /// lowered, so that DataFusion executes it as it is.
     ///
     /// `InterleaveExec` combines hash partitioned inputs partition by
-    /// partition; the pipeline engine has no partitions, so it is a union of
-    /// its inputs too. An `InterleaveExec` whose inputs are not partitioned
-    /// alike (`can_interleave`) fails in DataFusion and is not lowered, so
-    /// that DataFusion executes it. Nor is a node that advertises another
+    /// partition; the pipeline engine has no partitions, so an
+    /// `InterleaveExec` of a single input is a union of it. One of several
+    /// inputs is not lowered, so that DataFusion executes it: its `execute`
+    /// executes the partition of every input before it produces anything, so
+    /// an input that fails to execute (e.g. a scan of an object store that is
+    /// not registered) fails the plan, also if a limit above it gets its rows
+    /// from another input first. The pipelines of the inputs of a native
+    /// union start independently, and those that have not started when a
+    /// limit above them finishes do not start at all, without executing their
+    /// input. (`UnionExec` executes the input of a partition when the
+    /// partition is executed, as the native union executes an input when its
+    /// pipeline starts.) Nor is a node lowered that advertises another
     /// number of partitions than its inputs give it (after its inputs were
     /// replaced without recomputing its properties): DataFusion then executes
     /// some of the partitions of its inputs only, or fails.
@@ -134,15 +144,15 @@ impl PhysicalUnion {
             input.output_partitioning().partition_count()
         };
         // The partitions the node executes when it advertises its partitions:
-        // all partitions of all its inputs, one after the other, or every
-        // partition of all inputs together.
+        // all partitions of all its inputs, one after the other, or those of
+        // the single input of an interleave.
         let (inputs, input_partitions) =
             if let Some(union) = plan.downcast_ref::<UnionExec>() {
                 (union.inputs(), union.inputs().iter().map(partitions).sum())
             } else if let Some(interleave) = plan.downcast_ref::<InterleaveExec>()
-                && can_interleave(interleave.inputs().iter())
+                && let [input] = interleave.inputs().as_slice()
             {
-                (interleave.inputs(), partitions(&interleave.inputs()[0]))
+                (interleave.inputs(), partitions(input))
             } else {
                 return Ok(None);
             };
@@ -426,8 +436,13 @@ pub(crate) mod test_support {
 
     use arrow::array::{AsArray, Int64Array, RecordBatch, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
+    use datafusion::datasource::physical_plan::JsonSource;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::{Result, exec_err};
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_datasource::source::DataSourceExec;
+    use datafusion_execution::object_store::ObjectStoreUrl;
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -651,8 +666,25 @@ pub(crate) mod test_support {
         make_plan: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
         message: &str,
     ) -> Arc<dyn PhysicalOperator> {
-        let task_ctx =
-            Arc::new(TaskContext::default().with_session_config(test_session_config()));
+        assert_lowered_plan_fails_like_datafusion(
+            make_plan,
+            lower,
+            test_session_config(),
+            message,
+        )
+        .await
+    }
+
+    /// [`assert_native_plan_fails_like_datafusion`], with `lower` lowering the
+    /// plan and session config `config` (whose target partitions are the
+    /// threads of the pipeline engine).
+    pub(crate) async fn assert_lowered_plan_fails_like_datafusion(
+        make_plan: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        lower: impl Fn(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+        config: SessionConfig,
+        message: &str,
+    ) -> Arc<dyn PhysicalOperator> {
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
         let expected =
             with_timeout(collect(make_plan().expect("plan"), Arc::clone(&task_ctx)))
                 .await;
@@ -1001,6 +1033,23 @@ pub(crate) mod test_support {
         }
     }
 
+    /// The error of executing an [`unregistered_store_scan`].
+    pub(crate) const UNREGISTERED_STORE: &str = "No suitable object store found";
+
+    /// A JSON scan with schema `schema` of a file in an object store that is
+    /// not registered: executing it fails.
+    pub(crate) fn unregistered_store_scan(
+        schema: SchemaRef,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("unregistered://store")?,
+            Arc::new(JsonSource::new(schema)),
+        )
+        .with_file(PartitionedFile::new("data.json", 10))
+        .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
     /// A plan with `partitions` partitions with schema `schema` that never
     /// produce anything.
     pub(crate) fn pending_plan(
@@ -1062,13 +1111,14 @@ mod tests {
     };
 
     use super::test_support::{
-        TestSource, assert_native_plan_byte_eq, assert_operator_byte_eq, assert_parity,
-        assert_parity_with_config, count, run, sorted_values, values, values_chunk,
-        values_chunks, values_schema,
+        TestSource, UNREGISTERED_STORE, assert_lowered_plan_fails_like_datafusion,
+        assert_native_plan_byte_eq, assert_operator_byte_eq, assert_parity,
+        assert_parity_with_config, count, lower, run, sorted_values,
+        unregistered_store_scan, values, values_chunk, values_chunks, values_schema,
     };
     use crate::bridge::BridgeOperator;
     use crate::chunk::SelectionVector;
-    use crate::explain::format_pipelines;
+    use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operator::{
         GlobalSourceState, LocalSourceState, SourceResult, TaskInterrupt, downcast_state,
     };
@@ -1324,7 +1374,7 @@ mod tests {
         };
         let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
         let mut expected = datafusion_physical_plan::collect(make()?, task_ctx).await?;
-        let lowered = test_support::lower(&make()?)?;
+        let lowered = lower(&make()?)?;
         assert!(lowered.is::<PhysicalUnion>());
         let mut actual = run(lowered, 4).await?;
         let by_schema = |batch: &RecordBatch| format!("{:?}", batch.schema());
@@ -1371,7 +1421,7 @@ mod tests {
                             Partitioning::Hash(vec![v], partitions),
                         )?))
                     };
-                Ok(vec![by_v(scan(2, 0)?)?, by_v(scan(2, 100)?)?])
+                Ok(vec![by_v(scan(2, 0)?)?])
             };
             Arc::new(InterleaveExec::try_new(inputs(1)?)?)
                 .replace_children(inputs(2)?, keep)
@@ -1379,6 +1429,80 @@ mod tests {
         assert_eq!(interleave()?.output_partitioning().partition_count(), 1);
         let root = assert_native_plan_byte_eq(interleave, false).await;
         assert_eq!(count::<PhysicalUnion>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interleaves_fail_when_an_input_fails_to_execute_like_interleave_exec()
+    -> Result<()> {
+        // `InterleaveExec` executes the partition of every input before it
+        // produces anything: an input that fails to execute fails the plan,
+        // also if a limit above it gets its row from another input first, in
+        // either order of the inputs. Lowered like a planner that removes the
+        // hash repartitions below the interleave (the pipeline engine merges
+        // its inputs anyway), so that the ready input is a native scan that
+        // produces its row right away. With one thread on a current thread
+        // runtime, a native union would run the pipeline of its first input
+        // first: the limit would finish before the failing input executes.
+        fn lower_without_repartitions(
+            plan: &Arc<dyn ExecutionPlan>,
+        ) -> Result<Arc<dyn PhysicalOperator>> {
+            if let Some(limit) =
+                PhysicalLimit::try_lower(plan, lower_without_repartitions)?
+            {
+                return Ok(Arc::new(limit));
+            }
+            if let Some(union) =
+                PhysicalUnion::try_lower(plan, lower_without_repartitions)?
+            {
+                return Ok(Arc::new(union));
+            }
+            if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
+                return lower_without_repartitions(repartition.input());
+            }
+            lower(plan)
+        }
+        let config = test_session_config().with_target_partitions(1);
+        for failing_first in [false, true] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                let by_v =
+                    |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                        let v = col("v", &input.schema())?;
+                        Ok(Arc::new(RepartitionExec::try_new(
+                            input,
+                            Partitioning::Hash(vec![v], 1),
+                        )?))
+                    };
+                let batch = values_chunk([1]).into_record_batch()?;
+                let ready = MemorySourceConfig::try_new_exec(
+                    &[vec![batch]],
+                    values_schema(),
+                    None,
+                )?;
+                let mut inputs = vec![
+                    by_v(ready)?,
+                    by_v(unregistered_store_scan(values_schema())?)?,
+                ];
+                if failing_first {
+                    inputs.reverse();
+                }
+                let interleave = Arc::new(InterleaveExec::try_new(inputs)?);
+                Ok(Arc::new(GlobalLimitExec::new(interleave, 0, Some(1))))
+            };
+            let root = assert_lowered_plan_fails_like_datafusion(
+                make,
+                lower_without_repartitions,
+                config.clone(),
+                UNREGISTERED_STORE,
+            )
+            .await;
+            assert!(
+                root.is::<PhysicalLimit>(),
+                "{}",
+                format_operator_tree(&root)
+            );
+            assert_eq!(count::<PhysicalUnion>(&root), 0);
+        }
         Ok(())
     }
 
@@ -1702,13 +1826,19 @@ mod tests {
         assert!(!lowered.preserve_order());
         assert_eq!(lowered.description(), "PhysicalUnion");
 
+        // An `InterleaveExec` of a single input is a union of it; one of
+        // several inputs is left to DataFusion, which executes all of them
+        // before it produces anything.
+        let single: Arc<dyn ExecutionPlan> =
+            Arc::new(InterleaveExec::try_new(vec![t2_by_k()?])?);
+        let lowered = PhysicalUnion::try_lower(&single, bridge)?.expect("a union");
+        assert_eq!(lowered.schema(), single.schema());
+        assert_eq!(lowered.children().len(), 1);
         let interleave: Arc<dyn ExecutionPlan> =
             Arc::new(InterleaveExec::try_new(vec![t2_by_k()?, t2_by_k()?])?);
-        let lowered = PhysicalUnion::try_lower(&interleave, bridge)?.expect("a union");
-        assert_eq!(lowered.schema(), interleave.schema());
-        assert_eq!(lowered.children().len(), 2);
-        // Inputs that are not partitioned alike, which DataFusion fails to
-        // interleave: DataFusion executes the node.
+        assert!(PhysicalUnion::try_lower(&interleave, bridge)?.is_none());
+        // Also inputs that are not partitioned alike, which DataFusion fails
+        // to interleave.
         let mismatched = Arc::clone(&interleave).replace_children(
             vec![t2_scan()?, t2_by_k()?],
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
@@ -1828,7 +1958,8 @@ mod tests {
             assert_operator_byte_eq(expected, union, plan, false).await;
         }
 
-        // A union of hash partitioned inputs.
+        // A union of hash partitioned inputs, which DataFusion executes (see
+        // `PhysicalUnion::try_lower`), and one of a single input.
         let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
             Ok(Arc::new(InterleaveExec::try_new(vec![
                 t2_by_k()?,
@@ -1837,8 +1968,13 @@ mod tests {
             ])?))
         };
         let root = assert_native_plan_byte_eq(interleave, false).await;
-        assert_eq!(count::<PhysicalUnion>(&root), 1);
+        assert!(root.is::<BridgeOperator>());
         assert_eq!(interleave()?.output_partitioning().partition_count(), 4);
+        let single = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(InterleaveExec::try_new(vec![t2_by_k()?])?))
+        };
+        let root = assert_native_plan_byte_eq(single, false).await;
+        assert_eq!(count::<PhysicalUnion>(&root), 1);
         Ok(())
     }
 }

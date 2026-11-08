@@ -416,6 +416,7 @@ mod tests {
     };
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion_physical_plan::union::UnionExec;
     use datafusion_physical_plan::{
         ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
     };
@@ -1155,11 +1156,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn limit_over_a_merge_of_inputs_does_not_wait_for_idle_inputs() -> Result<()> {
-        // A limit of one row over an `InterleaveExec` with a single partition,
-        // whose first input never produces anything: DataFusion interleaves
-        // the inputs and returns the row of the second one. Also through a
+        // A limit of one row over a merge of two inputs whose first input
+        // never produces anything: DataFusion merges the inputs and returns
+        // the row of the second one. The merges: a `CoalescePartitionsExec` of
+        // a `UnionExec`, a native union whose pipelines must run concurrently,
+        // and an `InterleaveExec` with a single partition (which DataFusion
+        // executes, see `PhysicalUnion::try_lower`), also through a
         // `CoalescePartitionsExec`, which passes a single partition through.
-        let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
+        fn inputs() -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+            let row = values_chunk([42]).into_record_batch()?;
+            Ok(vec![
+                pending_plan(values_schema(), 1)?,
+                batch_plan(row, AfterBatch::End)?,
+            ])
+        }
+        fn union() -> Result<Arc<dyn ExecutionPlan>> {
+            UnionExec::try_new(inputs()?)
+        }
+        fn interleave() -> Result<Arc<dyn ExecutionPlan>> {
             let by_v = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
                 let v = col("v", &input.schema())?;
                 Ok(Arc::new(RepartitionExec::try_new(
@@ -1167,28 +1181,30 @@ mod tests {
                     Partitioning::Hash(vec![v], 1),
                 )?))
             };
-            Ok(Arc::new(InterleaveExec::try_new(vec![
-                by_v(pending_plan(values_schema(), 1)?)?,
-                by_v(batch_plan(
-                    values_chunk([42]).into_record_batch()?,
-                    AfterBatch::End,
-                )?)?,
-            ])?))
-        };
-        type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
-        let limits: [Limit; 5] = [
-            |input| Arc::new(GlobalLimitExec::new(input, 0, Some(1))),
-            |input| Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1))),
-            |input| Arc::new(LocalLimitExec::new(input, 1)),
-            |input| {
-                let merged = Arc::new(CoalescePartitionsExec::new(input));
-                Arc::new(GlobalLimitExec::new(merged, 0, Some(1)))
-            },
-            |input| {
-                let merged = CoalescePartitionsExec::new(input).with_fetch(Some(5));
-                Arc::new(GlobalLimitExec::new(Arc::new(merged), 0, Some(1)))
-            },
-        ];
+            let inputs = inputs()?.into_iter().map(by_v).collect::<Result<_>>()?;
+            Ok(Arc::new(InterleaveExec::try_new(inputs)?))
+        }
+        type Plan = Arc<dyn ExecutionPlan>;
+        fn global(input: Plan) -> Plan {
+            Arc::new(GlobalLimitExec::new(input, 0, Some(1)))
+        }
+        fn local(input: Plan) -> Plan {
+            Arc::new(LocalLimitExec::new(input, 1))
+        }
+        fn coalesce(input: Plan) -> Plan {
+            Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1)))
+        }
+        fn global_over_coalesce(input: Plan) -> Plan {
+            global(Arc::new(CoalescePartitionsExec::new(input)))
+        }
+        fn global_over_coalesce_with_fetch(input: Plan) -> Plan {
+            global(Arc::new(
+                CoalescePartitionsExec::new(input).with_fetch(Some(5)),
+            ))
+        }
+        fn coalesce_over_local(input: Plan) -> Plan {
+            coalesce(local(input))
+        }
         /// Whether all limits in the tree below `operator` are parallel.
         fn parallel(operator: &Arc<dyn PhysicalOperator>) -> bool {
             operator
@@ -1196,13 +1212,27 @@ mod tests {
                 .is_none_or(|limit| !limit.preserve_order())
                 && operator.children().iter().all(parallel)
         }
-        for limit in limits {
-            let make = || Ok(limit(interleave()?));
+        type Limit = fn(Plan) -> Plan;
+        type Merge = fn() -> Result<Plan>;
+        // The limits, the merges and the native unions below the limits.
+        let cases: [(Limit, Merge, usize); 9] = [
+            (coalesce, union, 1),
+            (global_over_coalesce, union, 1),
+            (global_over_coalesce_with_fetch, union, 1),
+            (coalesce_over_local, union, 1),
+            (global, interleave, 0),
+            (coalesce, interleave, 0),
+            (local, interleave, 0),
+            (global_over_coalesce, interleave, 0),
+            (global_over_coalesce_with_fetch, interleave, 0),
+        ];
+        for (limit, merge, unions) in cases {
+            let make = || Ok(limit(merge()?));
             let root = assert_native_plan_byte_eq(make, false).await;
             assert!(root.is::<PhysicalLimit>());
             // The inputs of the union below the limits run concurrently.
             assert!(parallel(&root));
-            assert_eq!(count::<PhysicalUnion>(&root), 1);
+            assert_eq!(count::<PhysicalUnion>(&root), unions);
         }
         Ok(())
     }
