@@ -8,11 +8,11 @@
 //!
 //! A [`PhysicalFilter`](super::filter::PhysicalFilter) splits its predicate
 //! `a AND b AND c` into its conjuncts and evaluates them one after the other,
-//! each one only on the rows selected by the conjuncts before it, until no
-//! row is left. The order matters: a cheap conjunct that removes most rows
-//! should come first. The best order is not known when the query is planned,
-//! and can change while it runs, so every thread measures the cost (elapsed
-//! nanoseconds per input row) and the selectivity (`selected_rows /
+//! each one only on the rows that the conjuncts before it did not reject,
+//! until no row is left. The order matters: a cheap conjunct that removes
+//! most rows should come first. The best order is not known when the query is
+//! planned, and can change while it runs, so every thread measures the cost
+//! (elapsed nanoseconds per input row) and the selectivity (`selected_rows /
 //! input_rows`) of every conjunct in its [`AdaptiveFilterState`], and
 //! periodically orders the conjuncts by decreasing rank
 //! `(1.0 - selectivity) / cost`, the order that minimizes the expected cost
@@ -20,21 +20,25 @@
 //!
 //! # Fallible conjuncts
 //!
-//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), must not
-//! be evaluated on more rows than in the order of the predicate: for
-//! `x <> 0 AND 10 / x > 1`, the division must only see the rows for which
-//! `x <> 0`. DuckDB disables reordering altogether if a conjunct can fail;
-//! here every fallible conjunct is instead kept after all the conjuncts that
-//! precede it in the predicate, so that it is only evaluated on rows that
-//! all of them selected, while the conjuncts that cannot fail are reordered
-//! freely (evaluating them on more or fewer rows has no observable effect).
-//! A conjunct is considered infallible only if it is built from expressions
+//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), must fail
+//! exactly when it fails in DataFusion. DataFusion evaluates the conjuncts in
+//! the order of the predicate, and the rows a fallible conjunct is evaluated
+//! on depend on the conjuncts before it (see
+//! [`PhysicalFilter`](super::filter::PhysicalFilter)). So a fallible conjunct
+//! never moves, and no conjunct moves across it: only runs of consecutive
+//! infallible conjuncts between fallible ones (the *segments* of the filter)
+//! are reordered. Within a segment the order has no observable effect: the
+//! conjuncts cannot fail, and the rows that the next fallible conjunct sees
+//! are those that no conjunct of the segment rejects, whatever their order.
+//! DuckDB is stricter and does not reorder at all if a conjunct can fail. A
+//! conjunct is considered infallible only if it is built from expressions
 //! that are known to never fail, see [`is_infallible`].
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
 //! it is evaluated.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,8 +94,8 @@ impl FilterConjunct {
 #[derive(Debug, Clone)]
 pub struct AdaptiveFilter {
     conjuncts: Vec<FilterConjunct>,
-    /// Whether a conjunct is volatile.
-    volatile: bool,
+    /// The segments of conjuncts that are reordered.
+    segments: Vec<Range<usize>>,
 }
 
 impl AdaptiveFilter {
@@ -99,8 +103,9 @@ impl AdaptiveFilter {
     /// conjuncts.
     ///
     /// Nested `AND`s are flattened, in order: `(a AND b) AND c` has the
-    /// conjuncts `a`, `b` and `c`. A predicate that is not an `AND` (e.g.
-    /// `a OR b`) has a single conjunct.
+    /// conjuncts `a`, `b` and `c`, like in DataFusion's evaluation of `AND`.
+    /// A predicate that is not an `AND` (e.g. `a OR b`) has a single
+    /// conjunct.
     pub fn try_new(
         predicate: &Arc<dyn PhysicalExpr>,
         input_schema: &Schema,
@@ -115,9 +120,14 @@ impl AdaptiveFilter {
             })
             .collect::<Result<Vec<_>>>()?;
         let volatile = conjuncts.iter().any(|conjunct| is_volatile(&conjunct.expr));
+        let segments = if volatile {
+            vec![]
+        } else {
+            infallible_runs(&conjuncts)
+        };
         Ok(Self {
             conjuncts,
-            volatile,
+            segments,
         })
     }
 
@@ -126,19 +136,19 @@ impl AdaptiveFilter {
         &self.conjuncts
     }
 
-    /// Whether the conjuncts can be evaluated in more than one order: no
-    /// conjunct is volatile, there are at least two conjuncts and one of the
-    /// conjuncts after the first is infallible (it may then move before the
-    /// first one).
-    ///
-    /// Statistics are only collected for adaptive filters.
+    /// The segments of the filter: the ranges of conjuncts that are
+    /// reordered, the maximal runs of at least two consecutive infallible
+    /// conjuncts (none if a conjunct is volatile). Every other conjunct is
+    /// always evaluated at its position in the predicate.
+    pub fn segments(&self) -> &[Range<usize>] {
+        &self.segments
+    }
+
+    /// Whether the conjuncts can be evaluated in more than one order, i.e.
+    /// whether the filter has a segment. Statistics are only collected for
+    /// adaptive filters.
     pub fn is_adaptive(&self) -> bool {
-        !self.volatile
-            && self
-                .conjuncts
-                .iter()
-                .skip(1)
-                .any(|conjunct| !conjunct.fallible)
+        !self.segments.is_empty()
     }
 
     /// Create the state of one thread: the conjuncts are evaluated in the
@@ -146,13 +156,27 @@ impl AdaptiveFilter {
     pub fn create_state(&self) -> AdaptiveFilterState {
         AdaptiveFilterState {
             permutation: (0..self.conjuncts.len()).collect(),
-            fallible: self.conjuncts.iter().map(|c| c.fallible).collect(),
-            adaptive: self.is_adaptive(),
+            segments: self.segments.clone(),
             stats: vec![ConjunctStats::default(); self.conjuncts.len()],
             chunks: 0,
             next_adaptation: WARMUP_CHUNKS,
         }
     }
+}
+
+/// The maximal runs of at least two consecutive infallible conjuncts.
+fn infallible_runs(conjuncts: &[FilterConjunct]) -> Vec<Range<usize>> {
+    let mut runs = vec![];
+    let mut start = 0;
+    for end in 0..=conjuncts.len() {
+        if end == conjuncts.len() || conjuncts[end].fallible {
+            if end - start >= 2 {
+                runs.push(start..end);
+            }
+            start = end + 1;
+        }
+    }
+    runs
 }
 
 /// Statistics of one conjunct, summed over the chunks of a thread. They
@@ -205,12 +229,11 @@ impl ConjunctStats {
 #[derive(Debug, Clone)]
 pub struct AdaptiveFilterState {
     /// The order in which the conjuncts are evaluated (indices into
-    /// [`AdaptiveFilter::conjuncts`]).
+    /// [`AdaptiveFilter::conjuncts`]). Only the conjuncts of a segment move,
+    /// within their segment.
     permutation: Vec<usize>,
-    /// Whether each conjunct is fallible.
-    fallible: Vec<bool>,
-    /// See [`AdaptiveFilter::is_adaptive`].
-    adaptive: bool,
+    /// See [`AdaptiveFilter::segments`].
+    segments: Vec<Range<usize>>,
     stats: Vec<ConjunctStats>,
     /// Chunks evaluated by this thread.
     chunks: usize,
@@ -229,7 +252,7 @@ impl AdaptiveFilterState {
     /// [`AdaptiveFilter::is_adaptive`]): if not, [`Self::record`] and
     /// [`Self::end_chunk`] do not have to be called.
     pub fn is_adaptive(&self) -> bool {
-        self.adaptive
+        !self.segments.is_empty()
     }
 
     /// The statistics of every conjunct (in the order of the predicate).
@@ -256,7 +279,7 @@ impl AdaptiveFilterState {
     /// [`ADAPT_INTERVAL`] chunks, the conjuncts are reordered by decreasing
     /// rank (see [`Self::adapt`]).
     pub fn end_chunk(&mut self) {
-        if !self.adaptive {
+        if !self.is_adaptive() {
             return;
         }
         self.chunks += 1;
@@ -266,44 +289,25 @@ impl AdaptiveFilterState {
         }
     }
 
-    /// Order the conjuncts by decreasing rank, keeping every fallible
-    /// conjunct after all the conjuncts that precede it in the predicate,
-    /// then let the statistics decay.
+    /// Order the conjuncts of every segment by decreasing rank, then let the
+    /// statistics decay. Conjuncts that are not part of a segment keep their
+    /// position.
     ///
-    /// The order is built greedily: at every position, the conjunct with the
-    /// highest rank among those that may come next is chosen. Conjuncts
-    /// without statistics (that were never evaluated, because the conjuncts
-    /// before them removed all rows) come last, and ties keep the current
-    /// order, so that the order does not oscillate.
+    /// Conjuncts without statistics (that were never evaluated, because the
+    /// conjuncts before them rejected all rows) come last in their segment,
+    /// and ties keep the current order, so that the order does not
+    /// oscillate.
     pub fn adapt(&mut self) {
-        let n = self.permutation.len();
         let ranks = self
             .stats
             .iter()
             .map(|stats| stats.rank().unwrap_or(f64::NEG_INFINITY))
             .collect::<Vec<_>>();
-        let mut placed = vec![false; n];
-        // All conjuncts before this one (in the predicate) are placed.
-        let mut first_unplaced = 0;
-        let mut permutation = Vec::with_capacity(n);
-        while permutation.len() < n {
-            let mut best: Option<usize> = None;
-            for &candidate in &self.permutation {
-                let available = !placed[candidate]
-                    && (!self.fallible[candidate] || candidate == first_unplaced);
-                if available && best.is_none_or(|best| ranks[candidate] > ranks[best]) {
-                    best = Some(candidate);
-                }
-            }
-            // The first unplaced conjunct is always available.
-            let best = best.unwrap_or(first_unplaced);
-            placed[best] = true;
-            permutation.push(best);
-            while first_unplaced < n && placed[first_unplaced] {
-                first_unplaced += 1;
-            }
+        for segment in &self.segments {
+            // A stable sort: ties keep the current order.
+            self.permutation[segment.clone()]
+                .sort_by(|&a, &b| ranks[b].total_cmp(&ranks[a]));
         }
-        self.permutation = permutation;
         self.stats.iter_mut().for_each(ConjunctStats::decay);
     }
 }
@@ -313,11 +317,12 @@ impl AdaptiveFilterState {
 ///
 /// This is conservative: only columns, literals, comparisons, `AND`, `OR`,
 /// `NOT`, `IS [NOT] NULL`, `IN` lists and widening casts are infallible
-/// (with infallible inputs). DataFusion itself evaluates these on rows that
-/// a previous conjunct already removed (see `BinaryExpr::evaluate_conjunction`).
-/// Arithmetic may fail on overflow (whether a `BinaryExpr` checks for
-/// overflow is not visible), division on zero, and functions or `CASE` are
-/// not inspected, so they are all considered fallible.
+/// (with infallible inputs). DataFusion considers all of them cheap and
+/// infallible too (`is_cheap_and_infallible` in its `BinaryExpr`), so it
+/// never removes rejected rows before evaluating them. Arithmetic may fail
+/// on overflow (whether a `BinaryExpr` checks for overflow is not visible),
+/// division on zero, and functions or `CASE` are not inspected, so they are
+/// all considered fallible.
 pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<bool> {
     let node_is_infallible = if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         use Operator::*;
@@ -384,20 +389,21 @@ mod tests {
             .collect()
     }
 
-    /// A state whose conjuncts are all infallible unless listed in
-    /// `fallible`, with the given selectivities and costs (nanoseconds per
-    /// row).
+    /// A state for conjuncts with the given selectivities and costs
+    /// (nanoseconds per row); the conjuncts listed in `fallible` are
+    /// fallible.
     fn state_of(conjuncts: &[(f64, f64)], fallible: &[usize]) -> AdaptiveFilterState {
-        let mut state = AdaptiveFilterState {
-            permutation: (0..conjuncts.len()).collect(),
-            fallible: (0..conjuncts.len())
-                .map(|c| fallible.contains(&c))
-                .collect(),
-            adaptive: true,
-            stats: vec![ConjunctStats::default(); conjuncts.len()],
-            chunks: 0,
-            next_adaptation: WARMUP_CHUNKS,
+        let conjuncts_of_filter = (0..conjuncts.len())
+            .map(|c| FilterConjunct {
+                expr: physical_expr("true", &schema()),
+                fallible: fallible.contains(&c),
+            })
+            .collect::<Vec<_>>();
+        let filter = AdaptiveFilter {
+            segments: infallible_runs(&conjuncts_of_filter),
+            conjuncts: conjuncts_of_filter,
         };
+        let mut state = filter.create_state();
         for (conjunct, &(selectivity, cost)) in conjuncts.iter().enumerate() {
             record(&mut state, conjunct, selectivity, cost);
         }
@@ -468,23 +474,38 @@ mod tests {
     }
 
     #[test]
-    fn only_filters_with_reorderable_conjuncts_are_adaptive() {
-        for (predicate, adaptive) in [
-            ("a > 1", false),
-            ("a > 1 AND b < 2", true),
-            // The infallible `b < 2` can move before the division.
-            ("10 / a > 1 AND b < 2", true),
-            // The division must stay after `a <> 0`.
-            ("a <> 0 AND 10 / a > 1", false),
-            ("a + 1 > 2 AND 10 / a > 1 AND b % 2 = 0", false),
-            ("a + 1 > 2 AND 10 / a > 1 AND b < 2", true),
+    fn only_runs_of_infallible_conjuncts_are_reordered() {
+        // The segments, as `(start, end)`.
+        for (predicate, segments) in [
+            ("a > 1", vec![]),
+            ("a > 1 AND b < 2", vec![(0, 2)]),
+            ("a > 1 AND b < 2 AND s = 'x'", vec![(0, 3)]),
+            // Nothing moves across a fallible conjunct, in either direction.
+            ("10 / a > 1 AND b < 2", vec![]),
+            ("a <> 0 AND 10 / a > 1", vec![]),
+            ("a <> 0 AND 10 / a > 1 AND b < 2", vec![]),
+            (
+                "a > 1 AND b < 2 AND 10 / a > 1 AND e AND s = 'x'",
+                vec![(0, 2), (3, 5)],
+            ),
+            ("a + 1 > 2 AND 10 / a > 1 AND b % 2 = 0", vec![]),
             // Volatile conjuncts keep the order.
-            ("random() < 0.5 AND b < 2", false),
-            ("b < 2 AND a > 1 AND random() < 0.5", false),
+            ("random() < 0.5 AND b < 2 AND a > 1", vec![]),
+            ("b < 2 AND a > 1 AND random() < 0.5", vec![]),
         ] {
             let filter = adaptive_filter(predicate);
-            assert_eq!(filter.is_adaptive(), adaptive, "{predicate}");
-            assert_eq!(filter.create_state().is_adaptive(), adaptive, "{predicate}");
+            let actual = filter
+                .segments()
+                .iter()
+                .map(|segment| (segment.start, segment.end))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, segments, "{predicate}");
+            assert_eq!(filter.is_adaptive(), !segments.is_empty(), "{predicate}");
+            assert_eq!(
+                filter.create_state().is_adaptive(),
+                !segments.is_empty(),
+                "{predicate}"
+            );
         }
     }
 
@@ -523,31 +544,36 @@ mod tests {
     }
 
     #[test]
-    fn fallible_conjuncts_stay_after_their_predecessors() {
-        // Conjuncts `0, 2, 4` are infallible, `1` and `3` fallible. Ranks
-        // increase with the index: without constraints, the order would be
-        // reversed.
+    fn fallible_conjuncts_never_move_and_nothing_moves_across_them() {
+        // Conjunct `2` is fallible. The ranks increase with the index: without
+        // the fallible conjunct, the order would be reversed.
         let conjuncts = [(0.9, 1.0), (0.8, 1.0), (0.7, 1.0), (0.6, 1.0), (0.5, 1.0)];
-        let mut state = state_of(&conjuncts, &[1, 3]);
+        let mut state = state_of(&conjuncts, &[2]);
         state.adapt();
-        // `4` and `2` move first; `1` must follow `0`, and `3` all of
-        // `0, 1, 2`.
-        assert_eq!(state.permutation(), &[4, 2, 0, 1, 3]);
+        assert_eq!(state.permutation(), &[1, 0, 2, 4, 3]);
 
-        // The first conjunct can be fallible too: infallible ones may move
-        // before it.
-        let mut state = state_of(&[(0.9, 1.0), (0.1, 1.0), (0.5, 1.0)], &[0]);
+        // A fallible first conjunct stays first, even if the conjuncts after
+        // it are much more selective, and so does a fallible last conjunct.
+        let mut state = state_of(&[(0.9, 1.0), (0.1, 1.0), (0.0, 1.0)], &[0]);
         state.adapt();
-        assert_eq!(state.permutation(), &[1, 2, 0]);
+        assert_eq!(state.permutation(), &[0, 2, 1]);
+        let mut state = state_of(&[(0.9, 1.0), (0.1, 1.0), (0.0, 1.0)], &[2]);
+        state.adapt();
+        assert_eq!(state.permutation(), &[1, 0, 2]);
+        // Single infallible conjuncts between fallible ones never move.
+        let mut state = state_of(&[(0.9, 1.0), (0.1, 1.0), (0.0, 1.0)], &[1]);
+        assert!(!state.is_adaptive());
+        state.adapt();
+        assert_eq!(state.permutation(), &[0, 1, 2]);
     }
 
     #[test]
     fn unobserved_conjuncts_come_last_and_ties_keep_the_order() {
         // `0` removes every row, so the others were never evaluated.
-        let mut state = state_of(&[(0.0, 1.0)], &[]);
-        state.stats.extend([ConjunctStats::default(); 2]);
+        let mut state = state_of(&[(0.0, 1.0), (0.5, 1.0), (0.5, 1.0)], &[]);
+        state.stats[1] = ConjunctStats::default();
+        state.stats[2] = ConjunctStats::default();
         state.permutation = vec![2, 1, 0];
-        state.fallible = vec![false; 3];
         state.adapt();
         assert_eq!(state.permutation(), &[0, 2, 1]);
         assert_eq!(state.stats()[1].selectivity(), None);
@@ -562,12 +588,12 @@ mod tests {
 
     #[test]
     fn non_adaptive_states_never_reorder() {
-        let mut state = adaptive_filter("a <> 0 AND 10 / a > 1").create_state();
-        record(&mut state, 1, 0.0, 1.0);
+        let mut state = adaptive_filter("a <> 0 AND 10 / a > 1 AND b < 2").create_state();
+        record(&mut state, 2, 0.0, 1.0);
         for _ in 0..100 {
             state.end_chunk();
         }
-        assert_eq!(state.permutation(), &[0, 1]);
+        assert_eq!(state.permutation(), &[0, 1, 2]);
     }
 
     #[test]

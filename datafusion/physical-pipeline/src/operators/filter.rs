@@ -10,36 +10,64 @@
 //!
 //! 1. The predicate is split into its conjuncts by an [`AdaptiveFilter`],
 //!    which also decides the order in which they are evaluated.
-//! 2. The first conjunct is evaluated on the columns it references. The
-//!    `true` rows of the resulting `BooleanArray` (`NULL` is not selected)
-//!    become the selection.
-//! 3. Every following conjunct is only evaluated on the rows selected so far
-//!    (see below) and refines the selection. As soon as no row is left, the
-//!    remaining conjuncts are skipped and no output is produced.
+//! 2. The conjuncts are evaluated one after the other, each on the columns
+//!    it references. A conjunct rejects the rows for which it is `false`. A
+//!    row is selected if every conjunct is `true` for it: a `NULL` row is not
+//!    selected, but, as in DataFusion, it is not rejected either, so the
+//!    following conjuncts are still evaluated on it.
+//! 3. As soon as every row is rejected, the remaining conjuncts are skipped
+//!    and no output is produced.
 //! 4. The output chunk shares the columns of the input (`Arc` clones, after
 //!    applying the projection embedded in the `FilterExec`, if any) and
-//!    carries the selection. No column is copied: the columns that are
-//!    not referenced by the predicate are never touched.
+//!    carries the selected rows as its selection. No column is copied: the
+//!    columns that are not referenced by the predicate are never touched.
 //!
-//! A conjunct is evaluated on the selected rows by compacting (`take`) only
-//! the columns it references, so it never sees a row that a previous
-//! conjunct removed: `x <> 0 AND 10 / x > 1` never divides by zero. If the
-//! conjunct cannot fail (see
-//! [`is_infallible`](super::adaptive_filter::is_infallible)) and enough rows
-//! are still selected, it is evaluated on all physical rows instead, which
-//! avoids the copy; its result for the rows that are not selected is ignored.
+//! # The rows a conjunct is evaluated on
 //!
-//! Since `p AND q` is `true` exactly when both `p` and `q` are `true`, the
-//! selected rows do not depend on the order of the conjuncts: they are the
-//! rows for which the predicate is `true`, as in DataFusion.
+//! A conjunct that can fail (see
+//! [`is_infallible`](super::adaptive_filter::is_infallible)), e.g.
+//! `10 / x > 1`, is evaluated on exactly the rows on which DataFusion
+//! evaluates it (`BinaryExpr::evaluate_conjunction`), so that the filter
+//! fails exactly when `FilterExec` fails:
+//!
+//! * on the rows that the conjuncts before it did not reject, if they
+//!   rejected some rows and at most 20% of the rows of the chunk are left
+//!   (DataFusion's `PRE_SELECTION_THRESHOLD`): `x <> 0 AND 10 / x > 1` does
+//!   not divide by zero if at least 80% of the rows have `x = 0`;
+//! * on all rows of the chunk otherwise, including the rejected ones:
+//!   `x <> 0 AND 10 / x > 1` divides by zero if some, but less than 80%, of
+//!   the rows have `x = 0`.
+//!
+//! The [`AdaptiveFilter`] never moves a conjunct across a fallible one, so a
+//! fallible conjunct always follows the same conjuncts as in DataFusion.
+//!
+//! A conjunct that cannot fail is evaluated on the rows that were not
+//! rejected, or, if more than a quarter of the physical rows are left, on
+//! all physical rows, which avoids copying its columns; its result for the
+//! other rows is ignored.
+//!
+//! Only the columns a conjunct references are compacted (`take`) to the rows
+//! it is evaluated on. Since `p AND q` is `true` exactly when both `p` and
+//! `q` are `true`, the selected rows are the rows for which the predicate is
+//! `true`, as in DataFusion.
+//!
+//! DataFusion applies its 20% threshold to the batches it filters, the
+//! filter to its chunks. They are the same if the chunks are DataFusion's
+//! batches, i.e. for batches of at most
+//! [`DEFAULT_VECTOR_SIZE`](crate::chunk::DEFAULT_VECTOR_SIZE) rows, which
+//! sources do not split. For a batch split into several chunks, the filter
+//! can only fail differently if a fallible conjunct that is not the first
+//! one fails on rows that are rejected before it, see
+//! [`PhysicalFilter::errors_depend_on_chunking`].
 
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
-use arrow_buffer::BooleanBuffer;
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use datafusion_common::instant::Instant;
 use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err, plan_err};
 use datafusion_expr::ColumnarValue;
@@ -56,6 +84,18 @@ use crate::operator::{
     PhysicalOperator, downcast_state, downcast_state_mut,
 };
 
+/// DataFusion's `PRE_SELECTION_THRESHOLD` (in `BinaryExpr`): before a
+/// conjunct that may fail is evaluated, the rows that the conjuncts before
+/// it rejected are only removed if at most this fraction of the rows is
+/// left.
+const PRE_SELECTION_THRESHOLD: f32 = 0.2;
+
+/// An infallible conjunct is evaluated on all physical rows of a chunk,
+/// instead of only on the rows that are not rejected, if more than one in
+/// this many rows are left: gathering the columns of the rows (`take`)
+/// costs more per row than evaluating a cheap conjunct.
+const DENSE_SELECTION: usize = 4;
+
 /// Filters the [`DataChunk`]s of its input with a predicate by attaching a
 /// [`SelectionVector`], like DataFusion's `FilterExec`.
 ///
@@ -68,6 +108,9 @@ pub struct PhysicalFilter {
     filter: AdaptiveFilter,
     /// The conjuncts of `filter`, bound to the input columns they reference.
     conjuncts: Vec<BoundExprs>,
+    /// The position of the last fallible conjunct (fallible conjuncts never
+    /// move).
+    last_fallible: Option<usize>,
     /// The input columns of the output, if not all of them.
     projection: Option<Vec<usize>>,
     /// The maximum number of rows to produce.
@@ -173,11 +216,16 @@ impl PhysicalFilter {
                 BoundExprs::try_new([Arc::clone(conjunct.expr())], input_schema.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
+        let last_fallible = filter
+            .conjuncts()
+            .iter()
+            .rposition(|conjunct| conjunct.is_fallible());
         Ok(Self {
             children: vec![input],
             predicate,
             filter,
             conjuncts,
+            last_fallible,
             projection,
             fetch: None,
             schema,
@@ -213,13 +261,17 @@ impl PhysicalFilter {
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
     }
-}
 
-/// An infallible conjunct is evaluated on all physical rows of a chunk,
-/// instead of only on the selected ones, if more than one in this many rows
-/// are selected: gathering the columns of the selected rows (`take`) costs
-/// more per row than evaluating a cheap conjunct.
-const DENSE_SELECTION: usize = 4;
+    /// Whether the filter may fail on other inputs than DataFusion when
+    /// DataFusion's batches are split into several chunks (see the
+    /// [module documentation](self)): whether a fallible conjunct follows
+    /// another conjunct. The first conjunct is always evaluated on all rows,
+    /// so a predicate whose other conjuncts cannot fail fails exactly when
+    /// DataFusion fails, whatever the chunks.
+    pub fn errors_depend_on_chunking(&self) -> bool {
+        self.last_fallible.is_some_and(|last| last > 0)
+    }
+}
 
 /// The global state of a [`PhysicalFilter`]: the rows it may still produce.
 #[derive(Debug)]
@@ -278,14 +330,193 @@ enum Selected {
     Rows(SelectionVector),
 }
 
-/// The result of evaluating a conjunct.
+/// The result of a conjunct for the rows it was evaluated on.
 enum Mask {
-    /// All rows are `true`.
-    All,
-    /// No row is `true`.
-    Nothing,
-    /// The rows that are `true` (`NULL` is not `true`), and their number.
-    Some(BooleanBuffer, usize),
+    /// Every row is `true`.
+    True,
+    /// Every row is `false`.
+    False,
+    /// Every row is `NULL`.
+    Null,
+    /// The rows that are not `false` (`true` or `NULL`), and those that are
+    /// `NULL` (`None` if none is).
+    Mixed {
+        not_false: BooleanBuffer,
+        null: Option<BooleanBuffer>,
+    },
+}
+
+/// The rows of a [`Mask`]: how the rows the conjunct was evaluated on relate
+/// to the logical rows of the chunk.
+enum MaskRows<'a> {
+    /// The rows that are not rejected, in order.
+    Undecided,
+    /// All logical rows.
+    Logical,
+    /// All physical rows; the logical rows are `incoming` (all physical rows
+    /// if `None`).
+    Physical(Option<&'a SelectionVector>),
+}
+
+/// The logical rows of a chunk that the conjuncts evaluated so far did not
+/// reject, as bitmaps over the logical rows.
+struct Undecided {
+    /// The number of logical rows of the chunk.
+    num_rows: usize,
+    /// The rows that are not rejected (`None` for all logical rows).
+    rows: Option<BooleanBuffer>,
+    /// The rows of `rows` for which a conjunct was `NULL` (`None` if none
+    /// is). Such rows are not selected, but the next conjuncts are still
+    /// evaluated on them.
+    nulls: Option<BooleanBuffer>,
+    /// The number of rows of `rows`.
+    count: usize,
+    /// The number of rows of `nulls`.
+    null_count: usize,
+}
+
+impl Undecided {
+    fn all(num_rows: usize) -> Self {
+        Self {
+            num_rows,
+            rows: None,
+            nulls: None,
+            count: num_rows,
+            null_count: 0,
+        }
+    }
+
+    /// The number of rows that are not rejected.
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    /// The number of rows for which every conjunct so far was `true`.
+    fn true_count(&self) -> usize {
+        self.count - self.null_count
+    }
+
+    /// The physical rows that are not rejected (`None` for all physical
+    /// rows), given the physical rows of the logical rows, `incoming`.
+    fn physical_rows<'a>(
+        &self,
+        incoming: Option<&'a SelectionVector>,
+    ) -> Option<Cow<'a, SelectionVector>> {
+        let Some(rows) = &self.rows else {
+            return incoming.map(Cow::Borrowed);
+        };
+        let mut physical = Vec::with_capacity(self.count);
+        match incoming {
+            Some(incoming) => {
+                let incoming = incoming.indices();
+                physical.extend(rows.set_indices().map(|row| incoming[row]));
+            }
+            None => physical.extend(rows.set_indices_u32()),
+        }
+        Some(Cow::Owned(SelectionVector::from(physical)))
+    }
+
+    /// Reject the rows for which the conjunct with result `mask` is `false`,
+    /// and record those for which it is `NULL`.
+    fn update(&mut self, mask: Mask, mask_rows: &MaskRows<'_>) {
+        let (not_false, null) = match mask {
+            Mask::True => return,
+            Mask::False => {
+                self.rows = Some(BooleanBuffer::new_unset(self.num_rows));
+                self.nulls = None;
+                self.count = 0;
+                self.null_count = 0;
+                return;
+            }
+            Mask::Null => {
+                self.nulls = Some(
+                    self.rows
+                        .clone()
+                        .unwrap_or_else(|| BooleanBuffer::new_set(self.num_rows)),
+                );
+                self.null_count = self.count;
+                return;
+            }
+            Mask::Mixed { not_false, null } => (not_false, null),
+        };
+        // The mask, over the logical rows.
+        let (not_false, null) = match mask_rows {
+            MaskRows::Logical | MaskRows::Physical(None) => (not_false, null),
+            MaskRows::Undecided => match &self.rows {
+                None => (not_false, null),
+                // Scatter the results to the rows they were computed for.
+                Some(rows) => (
+                    scatter(&not_false, rows, self.num_rows),
+                    null.map(|null| scatter(&null, rows, self.num_rows)),
+                ),
+            },
+            MaskRows::Physical(Some(incoming)) => (
+                gather(&not_false, incoming),
+                null.map(|null| gather(&null, incoming)),
+            ),
+        };
+        let rows = match &self.rows {
+            Some(rows) => rows & &not_false,
+            None => not_false,
+        };
+        let nulls = match (&self.nulls, null) {
+            (None, None) => None,
+            (Some(nulls), None) => Some(nulls & &rows),
+            (None, Some(null)) => Some(&null & &rows),
+            (Some(nulls), Some(null)) => Some(&(nulls | &null) & &rows),
+        };
+        self.count = rows.count_set_bits();
+        self.null_count = nulls.as_ref().map_or(0, BooleanBuffer::count_set_bits);
+        self.nulls = nulls.filter(|_| self.null_count > 0);
+        self.rows = Some(rows);
+    }
+
+    /// The selected rows: those for which every conjunct was `true`.
+    fn into_selected(self, incoming: Option<&SelectionVector>) -> Selected {
+        let true_count = self.true_count();
+        if true_count == 0 {
+            return Selected::Nothing;
+        }
+        let selected = match (self.rows, self.nulls) {
+            (None, None) => return Selected::All,
+            (Some(rows), None) => rows,
+            (rows, Some(nulls)) => {
+                let rows = rows.unwrap_or_else(|| BooleanBuffer::new_set(self.num_rows));
+                &rows & &!&nulls
+            }
+        };
+        let mut physical = Vec::with_capacity(true_count);
+        match incoming {
+            Some(incoming) => {
+                let incoming = incoming.indices();
+                physical.extend(selected.set_indices().map(|row| incoming[row]));
+            }
+            None => physical.extend(selected.set_indices_u32()),
+        }
+        Selected::Rows(SelectionVector::from(physical))
+    }
+}
+
+/// The bitmap over `num_rows` rows whose bit for the `i`-th set bit of
+/// `rows` is the `i`-th bit of `values`.
+fn scatter(
+    values: &BooleanBuffer,
+    rows: &BooleanBuffer,
+    num_rows: usize,
+) -> BooleanBuffer {
+    let mut builder = BooleanBufferBuilder::new(num_rows);
+    builder.append_n(num_rows, false);
+    for (value, row) in values.iter().zip(rows.set_indices()) {
+        if value {
+            builder.set_bit(row, true);
+        }
+    }
+    builder.finish()
+}
+
+/// The bitmap whose `i`-th bit is the bit `rows[i]` of `values`.
+fn gather(values: &BooleanBuffer, rows: &SelectionVector) -> BooleanBuffer {
+    BooleanBuffer::from_iter(rows.iter().map(|row| values.value(row)))
 }
 
 impl PhysicalOperator for PhysicalFilter {
@@ -388,97 +619,69 @@ impl PhysicalFilter {
         input: &DataChunk,
         state: &mut AdaptiveFilterState,
     ) -> Result<Selected> {
-        let physical_rows = input.physical_len();
         let incoming = logical_rows(input);
-        // The rows selected so far, `None` if they are the rows of `incoming`.
-        let mut selected: Option<SelectionVector> = None;
+        let mut undecided = Undecided::all(input.len());
         let timed = state.is_adaptive();
         for position in 0..self.conjuncts.len() {
-            let conjunct = state.permutation()[position];
-            let rows = selected.as_ref().or(incoming);
-            let input_rows = rows.map_or(physical_rows, SelectionVector::len);
-            let start = timed.then(Instant::now);
-            if let Some(refined) =
-                self.evaluate_conjunct(conjunct, input, rows, physical_rows)?
+            if undecided.len() == 0 {
+                // Every row is rejected: DataFusion stops here too.
+                break;
+            }
+            if undecided.true_count() == 0
+                && self.last_fallible.is_none_or(|last| position > last)
             {
-                selected = Some(refined);
+                // No row can pass, and the remaining conjuncts cannot fail.
+                break;
             }
-            let selected_rows = selected
-                .as_ref()
-                .or(incoming)
-                .map_or(physical_rows, SelectionVector::len);
+            let conjunct = state.permutation()[position];
+            let input_rows = undecided.len();
+            let start = timed.then(Instant::now);
+            self.evaluate_conjunct(conjunct, input, incoming, &mut undecided)?;
             if let Some(start) = start {
-                state.record(conjunct, input_rows, selected_rows, start.elapsed());
-            }
-            if selected_rows == 0 {
-                state.end_chunk();
-                return Ok(Selected::Nothing);
+                state.record(conjunct, input_rows, undecided.len(), start.elapsed());
             }
         }
         state.end_chunk();
-        Ok(match selected {
-            Some(rows) => Selected::Rows(rows),
-            None => Selected::All,
-        })
+        Ok(undecided.into_selected(incoming))
     }
 
-    /// Evaluate conjunct `conjunct` on the physical rows `rows` of `input`
-    /// (all physical rows if `None`). Returns the rows of `rows` for which it
-    /// is `true`, or `None` if it is `true` for all of them.
+    /// Evaluate conjunct `conjunct` on `input` (whose logical rows are
+    /// `incoming`, all physical rows if `None`), and reject the rows of
+    /// `undecided` for which it is `false`.
     fn evaluate_conjunct(
         &self,
         conjunct: usize,
         input: &DataChunk,
-        rows: Option<&SelectionVector>,
-        physical_rows: usize,
-    ) -> Result<Option<SelectionVector>> {
+        incoming: Option<&SelectionVector>,
+        undecided: &mut Undecided,
+    ) -> Result<()> {
         let bound = &self.conjuncts[conjunct];
         let expr = &bound.exprs()[0];
-        let Some(rows) = rows else {
-            let batch = bound.batch(input, None)?;
-            return Ok(match evaluate_mask(expr, &batch)? {
-                Mask::All => None,
-                Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-                Mask::Some(mask, count) => {
-                    let mut selected = Vec::with_capacity(count);
-                    selected.extend(mask.set_indices_u32());
-                    Some(SelectionVector::from(selected))
-                }
-            });
-        };
-        let infallible = !self.filter.conjuncts()[conjunct].is_fallible();
-        if infallible && rows.len() * DENSE_SELECTION > physical_rows {
-            // Many rows are selected and the conjunct cannot fail on the
-            // other ones: evaluating it on all physical rows is cheaper than
+        let left = undecided.len();
+        if self.filter.conjuncts()[conjunct].is_fallible() {
+            // Evaluate the conjunct on the rows DataFusion evaluates it on:
+            // only on the rows that are left if some rows were rejected and
+            // at most 20% of them are left, otherwise on all rows.
+            let num_rows = undecided.num_rows;
+            let pre_select = left < num_rows
+                && left as f32 / num_rows as f32 <= PRE_SELECTION_THRESHOLD;
+            if !pre_select {
+                let batch = bound.batch(input, incoming)?;
+                undecided.update(evaluate_mask(expr, &batch)?, &MaskRows::Logical);
+                return Ok(());
+            }
+        } else if left * DENSE_SELECTION > input.physical_len() {
+            // Many rows are left and the conjunct cannot fail on the other
+            // ones: evaluating it on all physical rows is cheaper than
             // gathering its columns.
             let batch = bound.batch(input, None)?;
-            return Ok(match evaluate_mask(expr, &batch)? {
-                Mask::All => None,
-                Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-                Mask::Some(mask, _) => {
-                    let mut selected = Vec::with_capacity(rows.len());
-                    selected.extend(
-                        rows.indices()
-                            .iter()
-                            .filter(|&&row| mask.value(row as usize)),
-                    );
-                    Some(SelectionVector::from(selected))
-                }
-            });
+            undecided.update(evaluate_mask(expr, &batch)?, &MaskRows::Physical(incoming));
+            return Ok(());
         }
-        // Only evaluate the conjunct on the selected rows.
-        let batch = bound.batch(input, Some(rows))?;
-        Ok(match evaluate_mask(expr, &batch)? {
-            Mask::All => None,
-            Mask::Nothing => Some(SelectionVector::new(Vec::<u32>::new())),
-            Mask::Some(mask, count) => {
-                // `mask` has an entry for every row of `rows`.
-                let rows = rows.indices();
-                let mut selected = Vec::with_capacity(count);
-                selected.extend(mask.set_indices().map(|row| rows[row]));
-                Some(SelectionVector::from(selected))
-            }
-        })
+        let rows = undecided.physical_rows(incoming);
+        let batch = bound.batch(input, rows.as_deref())?;
+        undecided.update(evaluate_mask(expr, &batch)?, &MaskRows::Undecided);
+        Ok(())
     }
 
     /// The output chunk: the (projected) columns of `input` with the
@@ -512,15 +715,15 @@ impl PhysicalFilter {
 }
 
 /// Evaluate a conjunct on `batch`, with the semantics of `FilterExec`: the
-/// result must be a boolean, and only `true` rows are selected.
+/// result must be a boolean.
 fn evaluate_mask(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Mask> {
     let num_rows = batch.num_rows();
     let array = match expr.evaluate(batch)? {
         ColumnarValue::Scalar(ScalarValue::Boolean(value)) => {
-            return Ok(if value == Some(true) {
-                Mask::All
-            } else {
-                Mask::Nothing
+            return Ok(match value {
+                Some(true) => Mask::True,
+                Some(false) => Mask::False,
+                None => Mask::Null,
             });
         }
         value => value.into_array(num_rows)?,
@@ -534,15 +737,28 @@ fn evaluate_mask(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Ma
             mask.len()
         );
     }
-    // `NULL` is not selected.
-    let selected = match mask.nulls() {
-        Some(nulls) if nulls.null_count() > 0 => mask.values() & nulls.inner(),
-        _ => mask.values().clone(),
-    };
-    Ok(match selected.count_set_bits() {
-        0 => Mask::Nothing,
-        count if count == num_rows => Mask::All,
-        count => Mask::Some(selected, count),
+    let null = mask
+        .nulls()
+        .filter(|nulls| nulls.null_count() > 0)
+        .map(|nulls| !nulls.inner());
+    Ok(match null {
+        None => match mask.values().count_set_bits() {
+            0 => Mask::False,
+            count if count == num_rows => Mask::True,
+            _ => Mask::Mixed {
+                not_false: mask.values().clone(),
+                null: None,
+            },
+        },
+        Some(null) => {
+            if mask.null_count() == num_rows {
+                return Ok(Mask::Null);
+            }
+            Mask::Mixed {
+                not_false: mask.values() | &null,
+                null: Some(null),
+            }
+        }
     })
 }
 
@@ -565,7 +781,7 @@ pub(crate) mod test_support {
     use arrow::datatypes::{DataType, Field, Int8Type, Int32Type, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{DFSchema, Result};
+    use datafusion_common::{DFSchema, DataFusionError, Result};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalExpr;
@@ -694,7 +910,6 @@ pub(crate) mod test_support {
             )
         ) && child.output_ordering().is_none()
             && !limits_partitions;
-
         if !single_partition && !unconstrained {
             return bridged_plan(child);
         }
@@ -871,6 +1086,77 @@ pub(crate) mod test_support {
             root,
             operators,
         }
+    }
+
+    /// Run `sql` with DataFusion and with its native operators (see
+    /// [`lower`]), and assert that either both succeed, with byte-identical
+    /// results, or both fail with the same error. Returns the error, if any,
+    /// and the native operators that were used.
+    pub(crate) async fn assert_native_parity_with_setup<F>(
+        sql: &str,
+        setup: F,
+    ) -> (Option<String>, NativeOperators)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let config = test_session_config();
+        let datafusion = datafusion_context(config.clone());
+        setup(&datafusion).await.unwrap();
+        let native = datafusion_context(config);
+        setup(&native).await.unwrap();
+
+        let expected = run_sql(&datafusion, sql).await;
+        let df = native.sql(sql).await.unwrap();
+        let ordered = has_top_level_order_by(df.logical_plan());
+        let plan = df.create_physical_plan().await.unwrap();
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        let root = Arc::new(PipelineRootExec::try_new(operator, plan).unwrap());
+        let actual = collect(
+            Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+            native.task_ctx(),
+        )
+        .await
+        .map(|batches| EngineOutput {
+            plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+            schema: root.schema(),
+            batches,
+            ordered,
+        });
+        let error = match (expected, actual) {
+            (Ok(expected), Ok(actual)) => {
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\nquery: {sql}");
+                }
+                None
+            }
+            (Err(expected), Err(actual)) => {
+                assert_eq!(
+                    error_kind(&expected),
+                    error_kind(&actual),
+                    "Errors differ: {expected} vs {actual}\nquery: {sql}"
+                );
+                Some(expected.find_root().strip_backtrace())
+            }
+            (Ok(_), Err(actual)) => {
+                panic!("Only the native operators failed: {actual}\nquery: {sql}")
+            }
+            (Err(expected), Ok(_)) => {
+                panic!("Only DataFusion failed: {expected}\nquery: {sql}")
+            }
+        };
+        (error, operators)
+    }
+
+    /// The kind of an error, e.g. `DivideByZero` or `CastError`, without the
+    /// data it reports: with several partitions, which row fails first is
+    /// not deterministic, neither in DataFusion nor in the pipeline.
+    fn error_kind(error: &DataFusionError) -> String {
+        let debug = match error.find_root() {
+            DataFusionError::ArrowError(error, _) => format!("ArrowError::{error:?}"),
+            error => format!("{error:?}"),
+        };
+        debug.split('(').next().unwrap_or_default().to_owned()
     }
 
     /// Parse the SQL expression `sql` on `schema` into a physical expression,
@@ -1116,7 +1402,6 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_physical_plan::filter::batch_filter;
 
-    use crate::bridge::PipelineRootExec;
     use crate::test_utils::test_session_config;
 
     fn schema() -> SchemaRef {
@@ -1320,86 +1605,320 @@ mod tests {
         assert!(err.to_string().contains("Divide by zero"), "{err}");
     }
 
-    #[test]
-    fn fallible_conjuncts_only_see_the_rows_selected_before_them() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, true),
-            Field::new("y", DataType::Int32, false),
-        ]));
-        // More than half of the rows have `x = 0`. (`FilterExec` only removes
-        // the rows of a previous conjunct before evaluating a fallible one if
-        // at most 20% of the rows are left, so DataFusion would divide by
-        // zero here. The pipeline never evaluates a conjunct on a row that a
-        // previous one removed.)
-        let batches = (0..30)
-            .map(|b| {
-                RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(Int32Array::from_iter(
-                            (0..2048).map(|i| (i % 13 != 0).then_some(i % 2 * (i % 7))),
-                        )),
-                        Arc::new(Int32Array::from_iter_values(
-                            (0..2048).map(|i| (b * 2048 + i) % 101),
-                        )),
-                    ],
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let predicate = "x <> 0 AND 10 / x > 1 AND y = 5";
-        let filter = PhysicalFilter::try_new(
-            source(Arc::clone(&schema), vec![]),
-            physical_expr(predicate, &schema),
+    /// A filter for `predicate` on the columns of `batch`.
+    fn filter_for(predicate: &str, schema: &SchemaRef) -> PhysicalFilter {
+        PhysicalFilter::try_new(
+            source(Arc::clone(schema), vec![]),
+            physical_expr(predicate, schema),
             None,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Filter `input` natively (in the thread state `lstate`) and with
+    /// DataFusion's `FilterExec` kernel, which evaluates the predicate on the
+    /// logical rows of `input`, and assert that both select the same rows or
+    /// both fail with the same error. Returns the error, if any.
+    fn assert_filter_parity(
+        filter: &PhysicalFilter,
+        input: &DataChunk,
+        gstate: &dyn GlobalOperatorState,
+        lstate: &mut dyn OperatorState,
+    ) -> Option<String> {
+        let batch = input.compact().unwrap();
+        let expected = batch_filter(&batch, filter.predicate());
+        let actual = drive_with_states(filter, [input.clone()], gstate, lstate).map(
+            |(outputs, _)| {
+                let outputs = outputs
+                    .iter()
+                    .map(|chunk| chunk.compact().unwrap())
+                    .collect::<Vec<_>>();
+                arrow::compute::concat_batches(&filter.schema(), &outputs).unwrap()
+            },
+        );
+        match (expected, actual) {
+            (Ok(expected), Ok(actual)) => {
+                assert_eq!(actual, expected, "{}", filter.predicate());
+                None
+            }
+            (Err(expected), Err(actual)) => {
+                let expected = expected.find_root().strip_backtrace();
+                assert_eq!(
+                    actual.find_root().strip_backtrace(),
+                    expected,
+                    "{}",
+                    filter.predicate()
+                );
+                Some(expected)
+            }
+            (expected, actual) => panic!(
+                "{}: DataFusion returned {expected:?}, the native filter {actual:?}",
+                filter.predicate()
+            ),
+        }
+    }
+
+    /// A batch with the columns `x` and `y` (`Int32`, nullable).
+    fn xy(x: Vec<Option<i32>>, y: Vec<Option<i32>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(x)), Arc::new(Int32Array::from(y))],
+        )
+        .unwrap()
+    }
+
+    /// Whether filtering `batch` with `predicate` fails, natively and in
+    /// DataFusion (both must agree).
+    fn fails(predicate: &str, batch: &RecordBatch) -> bool {
+        let filter = filter_for(predicate, &batch.schema());
+        let (gstate, mut lstate) = states(&filter);
+        assert_filter_parity(
+            &filter,
+            &DataChunk::from(batch.clone()),
+            gstate.as_ref(),
+            lstate.as_mut(),
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn dense_guards_fail_like_datafusion() {
+        let some = |values: &[i32]| values.iter().map(|&v| Some(v)).collect::<Vec<_>>();
+        // `x <> 0` leaves 3 of the 4 rows: DataFusion evaluates `10 / x` on
+        // all rows, including `x = 0`, and fails.
+        let batch = xy(some(&[0, 1, 1, 1]), some(&[1, 1, 1, 1]));
+        assert!(fails("x <> 0 AND 10 / x > 1", &batch));
+        // At most 20% of the rows left: only those are divided.
+        let batch = xy(some(&[0, 0, 0, 0, 2]), some(&[1; 5]));
+        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
+        let batch = xy(some(&[0, 0, 0, 0, 0, 0, 0, 2, 3, 0]), some(&[1; 10]));
+        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
+        let batch = xy(some(&[0, 0, 0, 0, 0, 0, 2, 3, 4, 0]), some(&[1; 10]));
+        assert!(fails("x <> 0 AND 10 / x > 1", &batch));
+        // A guard on another column.
+        let batch = xy(some(&[0, 5, 0, 5, 5]), some(&[0, 1, 0, 1, 1]));
+        assert!(fails("y = 1 AND 10 / x > 1", &batch));
+        let batch = xy(some(&[0, 5, 0, 0, 0, 0]), some(&[0, 1, 0, 0, 0, 0]));
+        assert!(!fails("y = 1 AND 10 / x > 1", &batch));
+        // Everything rejected: the division is not evaluated.
+        let batch = xy(some(&[0, 0, 0]), some(&[1, 1, 1]));
+        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
+        // The first conjunct is always evaluated on all rows.
+        assert!(fails("10 / x > 1 AND x <> 0", &batch));
+    }
+
+    #[test]
+    fn nullable_conjuncts_fail_like_datafusion() {
+        let mut x = vec![Some(0)];
+        x.extend([Some(-1); 9]);
+        let mut y = vec![Some(0)];
+        y.extend([Some(5); 9]);
+        // `x > 0` is `NULL` for the first row, which is not selected but not
+        // rejected either: DataFusion evaluates `10 / y` on it and fails.
+        let mut nullable_x = x.clone();
+        nullable_x[0] = None;
+        assert!(fails(
+            "x > 0 AND 10 / y > 1",
+            &xy(nullable_x.clone(), y.clone())
+        ));
+        assert!(!fails("x > 0 AND 10 / y > 1", &xy(x, y.clone())));
+        // Only `NULL` rows left: they are evaluated too.
+        assert!(fails(
+            "x > 0 AND 10 / y > 1",
+            &xy(vec![None; 10], y.clone())
+        ));
+        assert!(!fails(
+            "x > 0 AND 10 / y > 1",
+            &xy(vec![None; 10], vec![Some(5); 10])
+        ));
+        // A `NULL` and a `false` row: the `NULL` row is evaluated.
+        let mut z = vec![None, Some(0)];
+        z.extend([Some(-1); 8]);
+        assert!(fails("x > 0 AND 10 / y > 1", &xy(z, y)));
+    }
+
+    #[test]
+    fn chunks_with_a_selection_fail_like_their_rows() {
+        // DataFusion evaluates the predicate on the rows of the chunk: those
+        // of its selection.
+        let mut x = vec![Some(0); 100];
+        x[90] = Some(1);
+        x[95] = Some(2);
+        let batch = xy(x, vec![Some(1); 100]);
+        let filter = filter_for("x <> 0 AND 10 / x > 1", &batch.schema());
+        let (gstate, mut lstate) = states(&filter);
+        for (selection, fail) in [
+            // 2 of 100 rows: no failure.
+            ((0..100).collect::<Vec<u32>>(), false),
+            // 2 of 4 rows: a failure.
+            (vec![89, 90, 94, 95], true),
+            // 2 of 10 rows: no failure.
+            ((86..96).collect(), false),
+            // 2 of 3 rows, not increasing.
+            (vec![95, 0, 90], true),
+        ] {
+            let input = DataChunk::from(batch.clone())
+                .with_selection(SelectionVector::from(selection))
+                .unwrap();
+            let error =
+                assert_filter_parity(&filter, &input, gstate.as_ref(), lstate.as_mut());
+            assert_eq!(error.is_some(), fail, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn adaptation_does_not_change_errors() {
+        // The selective `y = 1` must not move before the division: after
+        // warm-up chunks without `x = 0`, a chunk with `x = 0` and `y = 0`
+        // fails, as in DataFusion.
+        let batch = |zeros: bool| {
+            xy(
+                (0..2048)
+                    .map(|i| Some(if zeros && i % 2 == 0 { 0 } else { 1 + i % 5 }))
+                    .collect(),
+                (0..2048).map(|i| Some(i32::from(i % 50 == 1))).collect(),
+            )
+        };
+        let filter = filter_for("10 / x > 1 AND y = 1 AND x > 0", &batch(false).schema());
         assert_eq!(
             filter
                 .adaptive_filter()
-                .conjuncts()
+                .segments()
                 .iter()
-                .map(|c| c.is_fallible())
+                .map(|s| (s.start, s.end))
                 .collect::<Vec<_>>(),
-            vec![false, true, false]
+            vec![(1, 3)]
         );
         let (gstate, mut lstate) = states(&filter);
-        for batch in &batches {
-            let input = DataChunk::from(batch.clone());
-            let (outputs, _) = drive_with_states(
+        let chunks = super::super::adaptive_filter::WARMUP_CHUNKS
+            + super::super::adaptive_filter::ADAPT_INTERVAL;
+        for _ in 0..chunks {
+            let error = assert_filter_parity(
                 &filter,
-                [input.clone()],
+                &DataChunk::from(batch(false)),
                 gstate.as_ref(),
                 lstate.as_mut(),
-            )
-            .unwrap();
-            let rows = outputs
-                .iter()
-                .map(|chunk| chunk.compact().unwrap())
-                .collect::<Vec<_>>();
-            // DataFusion evaluates the predicate on the rows with `x <> 0`.
-            let guarded = batch_filter(batch, &physical_expr("x <> 0", &schema)).unwrap();
-            let reference =
-                batch_filter(&guarded, &physical_expr(predicate, &schema)).unwrap();
-            assert!(reference.num_rows() > 0);
-            assert_eq!(
-                arrow::compute::concat_batches(&schema, &rows).unwrap(),
-                reference
             );
-            // The division is never evaluated before `x <> 0`.
-            let permutation = lstate
-                .downcast_ref::<FilterState>()
-                .unwrap()
-                .adaptive
-                .permutation()
-                .to_vec();
-            let position = |c| permutation.iter().position(|&p| p == c).unwrap();
-            assert!(position(0) < position(1), "{permutation:?}");
+            assert!(error.is_none());
         }
-        // (Whether `y = 5` moves before `x <> 0` depends on the measured
-        // costs; see `adapts_the_order_of_the_conjuncts`.)
-        let state = lstate.downcast_ref::<FilterState>().unwrap();
-        assert!(state.adaptive.is_adaptive());
+        let permutation = lstate
+            .downcast_ref::<FilterState>()
+            .unwrap()
+            .adaptive
+            .permutation()
+            .to_vec();
+        // The division stays first; `y = 1` moved before `x > 0`.
+        assert_eq!(permutation, vec![0, 1, 2]);
+        let error = assert_filter_parity(
+            &filter,
+            &DataChunk::from(batch(true)),
+            gstate.as_ref(),
+            lstate.as_mut(),
+        );
+        assert!(error.unwrap().contains("Divide by zero"));
+    }
+
+    /// A pseudo-random number generator (a linear congruential generator).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    #[test]
+    fn errors_match_datafusion_on_random_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+            Field::new("z", DataType::Int32, false),
+        ]));
+        let mut random = Lcg(42);
+        // Chunks of up to 300 rows in which a varying share of the rows has
+        // `x = 0`, `y = 0` or `NULL`s: guards leave below and above 20% of the
+        // rows.
+        let chunks = (0..400)
+            .map(|_| {
+                let rows = 1 + random.below(300) as usize;
+                let zeros = random.below(100);
+                let nulls = random.below(30);
+                let value = |random: &mut Lcg| match random.below(100) {
+                    p if p < nulls => None,
+                    p if p < nulls + zeros => Some(0),
+                    _ => Some(1 + random.below(6) as i32),
+                };
+                let x = (0..rows)
+                    .map(|_| value(&mut random))
+                    .collect::<Int32Array>();
+                let y = (0..rows)
+                    .map(|_| value(&mut random))
+                    .collect::<Int32Array>();
+                let z = Int32Array::from_iter_values(
+                    (0..rows).map(|_| random.below(10) as i32),
+                );
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(x), Arc::new(y), Arc::new(z)],
+                )
+                .unwrap();
+                let chunk = DataChunk::from(batch);
+                if random.below(4) == 0 {
+                    // A chunk with a selection.
+                    let selection = (0..rows as u32)
+                        .filter(|_| random.below(3) != 0)
+                        .collect::<Vec<_>>();
+                    if !selection.is_empty() {
+                        return chunk
+                            .with_selection(SelectionVector::from(selection))
+                            .unwrap();
+                    }
+                }
+                chunk
+            })
+            .collect::<Vec<_>>();
+        for predicate in [
+            "x <> 0 AND 10 / x > 1",
+            "y > 2 AND 10 / x > 1",
+            "10 / x > 1 AND y = 1",
+            "y = 1 AND z > 3 AND 10 / x > 1 AND y < 5",
+            "x IS NOT NULL AND y > 0 AND 100 % x = 1 AND z <> 4",
+            "(x = 0 OR 10 / x > 2) AND y > 1",
+            "y <> 0 AND 10 / y > 1 AND x <> 0 AND 10 / x > 1",
+            "x > 0 AND z > 2 AND 10 / (x - 1) > 1",
+            "CASE WHEN x <> 0 THEN 10 / x > 1 ELSE false END AND y > 0",
+            "x > 0 AND y > 0 AND z > 0",
+        ] {
+            let filter = filter_for(predicate, &schema);
+            let (gstate, mut lstate) = states(&filter);
+            let mut errors = 0;
+            let mut rows = 0;
+            for chunk in &chunks {
+                match assert_filter_parity(
+                    &filter,
+                    chunk,
+                    gstate.as_ref(),
+                    lstate.as_mut(),
+                ) {
+                    Some(_) => errors += 1,
+                    None => rows += 1,
+                }
+            }
+            // Both outcomes are covered (`CASE` guards its division, and the
+            // last predicate cannot fail).
+            assert!(rows > 0, "{predicate}");
+            let can_fail =
+                !predicate.starts_with("CASE") && !predicate.ends_with("z > 0");
+            assert_eq!(errors > 0, can_fail, "{predicate}");
+        }
     }
 
     #[test]
@@ -1527,6 +2046,14 @@ mod tests {
             drive(&filter, [DataChunk::from_record_batch(batch(0, 10))]).unwrap();
         assert!(outputs.is_empty());
         assert!(finished);
+    }
+
+    #[test]
+    fn errors_only_depend_on_chunking_after_the_first_conjunct() {
+        // The first conjunct is evaluated on all rows, whatever the chunks.
+        assert!(!new_filter("a > 0 AND b > 0", None).errors_depend_on_chunking());
+        assert!(!new_filter("10 / a > 1 AND b > 0", None).errors_depend_on_chunking());
+        assert!(new_filter("a > 0 AND 10 / a > 1", None).errors_depend_on_chunking());
     }
 
     #[test]
@@ -1659,35 +2186,101 @@ mod tests {
         .await;
     }
 
+    /// A table `name` of 3 partitions with 4 batches of 100 rows each, with
+    /// the columns `id` and `x`, `y`, `a`, `b` (`INT`, nullable) given by
+    /// `row(id)`. The batches are not split into several chunks, so the
+    /// filter decides like DataFusion for the same rows.
+    fn register_guard_table(
+        ctx: &SessionContext,
+        name: &str,
+        row: impl Fn(i64) -> [Option<i32>; 4],
+    ) -> Result<()> {
+        let schema = Arc::new(Schema::new(
+            std::iter::once(Field::new("id", DataType::Int64, false))
+                .chain(
+                    ["x", "y", "a", "b"]
+                        .into_iter()
+                        .map(|name| Field::new(name, DataType::Int32, true)),
+                )
+                .collect::<Vec<_>>(),
+        ));
+        let batch = |batch: i64| {
+            let ids = batch * 100..(batch + 1) * 100;
+            let rows = ids.clone().map(&row).collect::<Vec<_>>();
+            let mut columns: Vec<ArrayRef> =
+                vec![Arc::new(Int64Array::from_iter_values(ids))];
+            for column in 0..4 {
+                columns.push(Arc::new(Int32Array::from_iter(
+                    rows.iter().map(|row| row[column]),
+                )));
+            }
+            RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+        };
+        register_partitions(
+            ctx,
+            name,
+            vec![vec![batch(0), batch(1)], vec![batch(2)], vec![batch(3)]],
+        )
+    }
+
+    /// The tables of the error parity tests.
+    async fn guard_tables(ctx: &SessionContext) -> Result<()> {
+        register_all_tables(ctx)?;
+        // Half of the rows have `x = 0`; `y = 1` on 2% of the rows, and only
+        // where `x <> 0`.
+        register_guard_table(ctx, "dense", |i| {
+            let x = if i % 2 == 0 { 0 } else { 1 + (i % 7) as i32 };
+            [Some(x), Some(i32::from(i % 50 == 1)), None, None]
+        })?;
+        // 90% of the rows have `x = 0`.
+        register_guard_table(ctx, "sparse", |i| {
+            let x = if i % 10 == 3 { 1 + (i % 4) as i32 } else { 0 };
+            [Some(x), None, None, None]
+        })?;
+        // `a > 0` is `NULL` on 5% of the rows and `false` on the others; `b
+        // = 0` on the `NULL` rows of `nulls`, but not of `nulls_ok`.
+        register_guard_table(ctx, "nulls", |i| {
+            let null = i % 20 == 7;
+            [None, None, (!null).then_some(-1), Some(i32::from(!null))]
+        })?;
+        register_guard_table(ctx, "nulls_ok", |i| {
+            let null = i % 20 == 7;
+            [None, None, (!null).then_some(-1), Some(2)]
+        })
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn errors_match_datafusion() {
-        for sql in [
-            "SELECT id FROM fallible WHERE 10 / x > 1",
-            "SELECT id FROM fallible WHERE CAST(s AS INT) > 5",
+    async fn differential_errors_match_datafusion() {
+        for (sql, fails) in [
+            // Dense guards: DataFusion divides all rows, including `x = 0`.
+            ("SELECT * FROM dense WHERE x <> 0 AND 10 / x > 1", true),
+            (
+                "SELECT id FROM dense WHERE x > 0 AND x < 100 AND 100 % x = 1",
+                true,
+            ),
+            // A selective conjunct after the division does not guard it, even
+            // once the conjuncts are reordered at runtime.
+            (
+                "SELECT * FROM dense WHERE 10 / x > 1 AND y = 1 AND id > 0",
+                true,
+            ),
+            // Sparse guards: only the rows that are left are divided.
+            ("SELECT * FROM sparse WHERE x <> 0 AND 10 / x > 1", false),
+            ("SELECT id, 10 / x AS q FROM sparse WHERE x <> 0", false),
+            ("SELECT id, 10 / x AS q FROM dense WHERE x <> 0", false),
+            // `NULL` rows are not rejected: the division is evaluated on them.
+            ("SELECT * FROM nulls WHERE a > 0 AND 10 / b > 1", true),
+            ("SELECT * FROM nulls_ok WHERE a > 0 AND 10 / b > 1", false),
+            ("SELECT * FROM nulls WHERE a IS NULL AND 10 / b > 1", true),
+            // No guard.
+            ("SELECT id FROM fallible WHERE 10 / x > 1", true),
+            ("SELECT id FROM fallible WHERE CAST(s AS INT) > 5", true),
+            ("SELECT id FROM fallible WHERE x <> 0 AND 10 / x > 1", false),
         ] {
-            let err = run_native(sql, test_session_config(), all_tables)
-                .await
-                .err()
-                .unwrap_or_else(|| panic!("{sql} succeeded"));
-            assert!(
-                err.to_string().contains("Divide by zero")
-                    || err.to_string().contains("Cannot cast"),
-                "{sql}: {err}"
-            );
-            // The pipeline fails too.
-            let ctx = SessionContext::new();
-            register_all_tables(&ctx).unwrap();
-            let plan = ctx
-                .sql(sql)
-                .await
-                .unwrap()
-                .create_physical_plan()
-                .await
-                .unwrap();
-            let root =
-                Arc::new(PipelineRootExec::try_new(lower(&plan).unwrap(), plan).unwrap());
-            let result = datafusion_physical_plan::collect(root, ctx.task_ctx()).await;
-            assert!(result.is_err(), "{sql}");
+            let (error, operators) =
+                assert_native_parity_with_setup(sql, guard_tables).await;
+            assert!(operators.filters > 0, "{sql}");
+            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
         }
     }
 
