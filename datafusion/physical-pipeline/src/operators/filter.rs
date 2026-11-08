@@ -41,11 +41,11 @@ use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow_buffer::BooleanBuffer;
 use datafusion_common::instant::Instant;
-use datafusion_common::{Result, ScalarValue, internal_err, plan_err};
+use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err, plan_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use itertools::Itertools;
 
 use super::adaptive_filter::{AdaptiveFilter, AdaptiveFilterState};
@@ -70,7 +70,7 @@ pub struct PhysicalFilter {
     conjuncts: Vec<BoundExprs>,
     /// The input columns of the output, if not all of them.
     projection: Option<Vec<usize>>,
-    /// The maximum number of rows to produce, over all threads.
+    /// The maximum number of rows to produce.
     fetch: Option<usize>,
     schema: SchemaRef,
 }
@@ -92,17 +92,35 @@ impl PhysicalFilter {
         Self::try_new_with_schema(input, predicate, projection, schema)
     }
 
+    /// Whether [`Self::try_from_filter_exec`] can lower `exec` with exactly
+    /// its semantics.
+    ///
+    /// The `fetch` of a `FilterExec` limits the rows of each of its
+    /// partitions, but the chunks of a pipeline do not belong to partitions:
+    /// a `FilterExec` with a `fetch` can only be lowered if its input has a
+    /// single partition. (A planner that knows that a limit above it limits
+    /// the rows of all partitions together anyway can still lower it with
+    /// [`Self::try_new`] and [`Self::with_fetch`].)
+    pub fn supports_filter_exec(exec: &FilterExec) -> bool {
+        exec.fetch().is_none()
+            || exec.input().output_partitioning().partition_count() <= 1
+    }
+
     /// Lower a DataFusion [`FilterExec`]: apply its predicate, projection and
     /// fetch to the chunks of `input` (the lowered input of `exec`) and
     /// produce exactly its output schema.
     ///
-    /// The `fetch` of a `FilterExec` limits the rows of each of its output
-    /// partitions; the `fetch` of a `PhysicalFilter` limits the rows over all
-    /// threads, which is what the limit above such a `FilterExec` enforces.
+    /// Fails if `exec` is not supported, see [`Self::supports_filter_exec`].
     pub fn try_from_filter_exec(
         exec: &FilterExec,
         input: Arc<dyn PhysicalOperator>,
     ) -> Result<Self> {
+        if !Self::supports_filter_exec(exec) {
+            return not_impl_err!(
+                "PhysicalFilter cannot limit each of the {} input partitions of a FilterExec to its fetch",
+                exec.input().output_partitioning().partition_count()
+            );
+        }
         check_lowered_input(exec.input().schema().as_ref(), input.as_ref())?;
         let projection = exec
             .projection()
@@ -166,8 +184,11 @@ impl PhysicalFilter {
         })
     }
 
-    /// Produce at most `fetch` rows in total (over all threads), then
-    /// return [`OperatorResult::Finished`].
+    /// Produce at most `fetch` rows: the first `fetch` rows of the input that
+    /// pass the filter, then return [`OperatorResult::Finished`]. Like a
+    /// `FilterExec` with a single input partition, a filter with a fetch is
+    /// executed by a single thread (see [`PhysicalOperator::parallel_operator`]),
+    /// so that it filters its input in order.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
@@ -297,6 +318,13 @@ impl PhysicalOperator for PhysicalFilter {
             let _ = write!(description, ", fetch={fetch}");
         }
         description
+    }
+
+    /// A filter with a fetch is executed by a single thread, which filters
+    /// its input in order and produces its first `fetch` rows, as
+    /// `FilterExec` does for a single partition.
+    fn parallel_operator(&self) -> bool {
+        self.fetch.is_none()
     }
 
     fn get_global_operator_state(
@@ -543,6 +571,7 @@ pub(crate) mod test_support {
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
+    use datafusion_physical_plan::limit::LocalLimitExec;
     use datafusion_physical_plan::projection::ProjectionExec;
     use datafusion_physical_plan::repartition::RepartitionExec;
     use datafusion_physical_plan::{
@@ -567,8 +596,10 @@ pub(crate) mod test_support {
     /// Lower `plan` into an operator tree that executes every `FilterExec`
     /// and `ProjectionExec` natively.
     ///
-    /// * `FilterExec` becomes `CachingOperator(PhysicalFilter)`, and
-    ///   `ProjectionExec` becomes `PhysicalProjection`.
+    /// * `FilterExec` becomes `CachingOperator(PhysicalFilter)` (unless
+    ///   `PhysicalFilter` cannot keep its per-partition fetch, see
+    ///   [`PhysicalFilter::supports_filter_exec`]), and `ProjectionExec`
+    ///   becomes `PhysicalProjection`.
     /// * `CoalescePartitionsExec` (without fetch) and round robin
     ///   `RepartitionExec`s above native operators are removed: they only
     ///   change the partitioning, which the pipeline engine does not need.
@@ -577,7 +608,9 @@ pub(crate) mod test_support {
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        if let Some(filter) = plan.downcast_ref::<FilterExec>()
+            && PhysicalFilter::supports_filter_exec(filter)
+        {
             let input = lower(filter.input())?;
             let filter: Arc<dyn PhysicalOperator> =
                 Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
@@ -601,9 +634,10 @@ pub(crate) mod test_support {
     /// `plan`, to be executed by DataFusion, with its children lowered: a
     /// child that contains native operators is executed by a
     /// [`PipelineRootExec`], unless `plan` needs the partitioning or the
-    /// order of the child and the child has several partitions, which a
-    /// `PipelineRootExec` (a single partition) does not keep. DataFusion then
-    /// executes the child too, with its own children lowered.
+    /// order of the child (or limits every partition of the child) and the
+    /// child has several partitions, which a `PipelineRootExec` (a single
+    /// partition) does not keep. DataFusion then executes the child too, with
+    /// its own children lowered.
     fn bridged_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = plan.children();
         let new_children = children
@@ -647,6 +681,10 @@ pub(crate) mod test_support {
             return Ok(Arc::clone(bridge.plan()));
         }
         let single_partition = child.output_partitioning().partition_count() == 1;
+        // A `FilterExec` with a fetch and a `LocalLimitExec` limit every
+        // partition of their input.
+        let limits_partitions = (parent.is::<FilterExec>() && parent.fetch().is_some())
+            || parent.is::<LocalLimitExec>();
         let unconstrained = matches!(
             parent
                 .input_distribution_requirements()
@@ -654,7 +692,9 @@ pub(crate) mod test_support {
             None | Some(
                 Distribution::UnspecifiedDistribution | Distribution::SinglePartition
             )
-        ) && child.output_ordering().is_none();
+        ) && child.output_ordering().is_none()
+            && !limits_partitions;
+
         if !single_partition && !unconstrained {
             return bridged_plan(child);
         }
@@ -787,6 +827,50 @@ pub(crate) mod test_support {
             panic!("Results differ: {message}\nquery: {sql}");
         }
         run
+    }
+
+    /// Execute `plan`, created by `make_plan`, with DataFusion and with its
+    /// native operators (see [`lower`]), and assert that the results are
+    /// byte-identical (in the same order if `ordered`).
+    pub(crate) async fn assert_native_plan_byte_eq(
+        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
+        ordered: bool,
+    ) -> NativeRun {
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_target_partitions(4)),
+        );
+        let plan = make_plan();
+        let expected = EngineOutput {
+            schema: plan.schema(),
+            batches: collect(Arc::clone(&plan), Arc::clone(&task_ctx))
+                .await
+                .unwrap(),
+            plan,
+            ordered,
+        };
+        let plan = make_plan();
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        let root = Arc::new(PipelineRootExec::try_new(operator, plan).unwrap());
+        let batches = collect(Arc::clone(&root) as Arc<dyn ExecutionPlan>, task_ctx)
+            .await
+            .unwrap();
+        let actual = EngineOutput {
+            plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+            schema: root.schema(),
+            batches,
+            ordered,
+        };
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("Results differ: {message}");
+        }
+        NativeRun {
+            expected,
+            actual,
+            root,
+            operators,
+        }
     }
 
     /// Parse the SQL expression `sql` on `schema` into a physical expression,
@@ -1631,7 +1715,6 @@ mod tests {
             "SELECT id, h FROM t1 WHERE h LIKE '%1%' ORDER BY h DESC, id LIMIT 20",
             "SELECT * FROM (SELECT * FROM t1 ORDER BY id LIMIT 100) WHERE a > 0",
             "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2 WHERE k < 0",
-            "SELECT id FROM t1 WHERE id < 5 LIMIT 100",
             "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0 LIMIT 7",
             "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1 WHERE a > 0",
             "SELECT d, MAX(h) FROM t1 WHERE id % 3 = 0 GROUP BY d HAVING COUNT(*) > 100",
@@ -1655,6 +1738,91 @@ mod tests {
                         .await;
                 assert!(run.operators.filters > 0, "{sql}");
             }
+        }
+    }
+
+    /// A plan `FilterExec(a % 2 = 0, fetch = 3)` over `partitions`
+    /// partitions of 20 rows each.
+    fn filter_with_fetch(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let batch = |start: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(start..start + 20))],
+            )
+            .unwrap()
+        };
+        let partitions = (0..partitions as i64)
+            .map(|p| vec![batch(p * 100)])
+            .collect::<Vec<_>>();
+        let input = datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+            &partitions,
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap();
+        let predicate = physical_expr("a % 2 = 0", &schema);
+        Arc::new(
+            datafusion_physical_plan::filter::FilterExecBuilder::new(predicate, input)
+                .with_fetch(Some(3))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_partition_fetch_is_kept() {
+        // DataFusion produces 3 rows per partition: 6 rows for 2 partitions.
+        // The chunks of a pipeline do not belong to partitions, so such a
+        // `FilterExec` stays in DataFusion.
+        let plan = filter_with_fetch(2);
+        let exec = plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let err =
+            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("each of the 2 input partitions"),
+            "{err}"
+        );
+        let run = assert_native_plan_byte_eq(|| filter_with_fetch(2), false).await;
+        assert_eq!(run.operators.filters, 0);
+        let rows = run
+            .actual
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        assert_eq!(rows, 6);
+
+        // With a single partition, the native filter produces the first 3
+        // rows, in order, on a single thread.
+        let plan = filter_with_fetch(1);
+        let exec = plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let filter =
+            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
+                .unwrap();
+        assert!(!filter.parallel_operator());
+        assert!(new_filter("a > 0", None).parallel_operator());
+        let run = assert_native_plan_byte_eq(|| filter_with_fetch(1), true).await;
+        assert_eq!(run.operators.filters, 1);
+        let rows = run
+            .actual
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        assert_eq!(rows, 3);
+
+        // In SQL, a limit above the filter enforces the fetch over all
+        // partitions: the filter stays in DataFusion, with the same result.
+        for sql in [
+            "SELECT id FROM t1 WHERE id < 5 LIMIT 100",
+            "SELECT id, a FROM t1 WHERE a > 1000 LIMIT 10",
+        ] {
+            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
+            assert_eq!(run.operators.filters, 0, "{sql}");
         }
     }
 
