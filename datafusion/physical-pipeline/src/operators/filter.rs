@@ -2027,11 +2027,13 @@ mod tests {
     }
 
     #[test]
-    fn fetch_limits_the_rows_over_all_threads() {
+    fn fetch_limits_the_rows_of_all_states() {
         let filter = new_filter("b % 10 = 1", None).with_fetch(Some(25));
         let ctx = context();
         let gstate = filter.get_global_operator_state(&ctx).unwrap();
-        // Two threads, sharing the global state: 10 rows per chunk.
+        // Two local states sharing the global state, as for the pipelines of
+        // the inputs of a union below the filter (which run one after the
+        // other, as the filter is not parallel): 10 rows per chunk.
         let mut threads = (0..2)
             .map(|_| filter.get_operator_state(&ctx, gstate.as_ref()).unwrap())
             .collect::<Vec<_>>();
