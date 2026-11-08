@@ -816,6 +816,8 @@ pub(crate) mod test_support {
     ///   `PhysicalFilter` cannot keep its per-partition fetch, see
     ///   [`PhysicalFilter::supports_filter_exec`]), and `ProjectionExec`
     ///   becomes `PhysicalProjection`.
+    /// * Scans become the native sources of
+    ///   [`try_create_scan_source`](crate::sources::try_create_scan_source).
     /// * `CoalescePartitionsExec` (without fetch) and round robin
     ///   `RepartitionExec`s above native operators are removed: they only
     ///   change the partitioning, which the pipeline engine does not need.
@@ -837,6 +839,9 @@ pub(crate) mod test_support {
             return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
                 projection, input,
             )?));
+        }
+        if let Some(scan) = crate::sources::try_create_scan_source(plan)? {
+            return Ok(scan);
         }
         if only_repartitions(plan) {
             let input = lower(plan.children()[0])?;
@@ -925,6 +930,8 @@ pub(crate) mod test_support {
         pub(crate) filters: usize,
         pub(crate) projections: usize,
         pub(crate) caching: usize,
+        /// Native scan sources.
+        pub(crate) scans: usize,
     }
 
     impl NativeOperators {
@@ -940,6 +947,9 @@ pub(crate) mod test_support {
             self.filters += usize::from(operator.is::<PhysicalFilter>());
             self.projections += usize::from(operator.is::<PhysicalProjection>());
             self.caching += usize::from(operator.is::<CachingOperator>());
+            self.scans += usize::from(
+                operator.children().is_empty() && !operator.is::<BridgeOperator>(),
+            );
             if let Some(bridge) = operator.downcast_ref::<BridgeOperator>() {
                 self.add_plan(bridge.plan());
             }
@@ -2131,6 +2141,7 @@ mod tests {
         for sql in queries {
             let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
             assert!(run.operators.filters > 0, "no native filter: {sql}");
+            assert!(run.operators.scans > 0, "no native scan: {sql}");
         }
     }
 
