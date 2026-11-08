@@ -90,7 +90,7 @@ use itertools::Itertools;
 use super::adaptive_filter::{
     AdaptiveFilter, AdaptiveFilterState, depends_on_batches, is_infallible,
 };
-use super::projection::{BoundExprs, check_lowered_input, logical_rows};
+use super::projection::{BoundExprs, can_gather, check_lowered_input, logical_rows};
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -156,6 +156,9 @@ impl PhysicalFilter {
     ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
     ///   DataFusion must evaluate it on the batches of the input plan of
     ///   `exec`;
+    /// * the input of `exec` has lists of values that take no memory (e.g.
+    ///   fixed-size lists of `1 << 30` nulls), which the native operators
+    ///   cannot gather with `take` (see `can_gather`);
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
     ///   (or run ends of less than 32 bits), or lists with 32-bit offsets, at
     ///   any depth: `FilterExec` coalesces its output batches, merging the
@@ -324,6 +327,17 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
         return Some(format!(
             "the errors of its predicate {} depend on DataFusion's batches",
             exec.predicate()
+        ));
+    }
+    if let Some(field) = input_schema
+        .fields()
+        .iter()
+        .find(|field| !can_gather(field.data_type()))
+    {
+        return Some(format!(
+            "its input column '{}' has lists of values that take no memory, which the \
+             native operators cannot gather",
+            field.name()
         ));
     }
     if let Some(field) = exec
@@ -1789,6 +1803,28 @@ pub(crate) mod test_support {
             Field::new("b", DataType::List(Arc::clone(&field)), true),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(x), list(0), list(2048)]).unwrap()
+    }
+
+    /// A batch of six rows of `x` (`Int32`) and of `f`, fixed-size lists of
+    /// `1 << 30` nulls (which take no memory).
+    pub(crate) fn wide_lists_of_nulls(x: [i32; 6]) -> RecordBatch {
+        let field = Arc::new(Field::new_list_field(DataType::Null, true));
+        let f = arrow::array::FixedSizeListArray::try_new(
+            Arc::clone(&field),
+            1 << 30,
+            Arc::new(arrow::array::NullArray::new(6 << 30)),
+            None,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("f", DataType::FixedSizeList(field, 1 << 30), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(x.to_vec())), Arc::new(f)],
+        )
+        .unwrap()
     }
 
     /// A constant list of `1 << 19` nulls.
@@ -4045,6 +4081,34 @@ mod tests {
             assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
                 .await;
         assert!(outcome.unwrap_err().contains("overflow"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lists_of_values_without_memory_stay_in_datafusion() {
+        // Arrow's `take`, with which the native operators gather rows (e.g. the
+        // cache, to copy the rows it keeps), computes the indices of the values
+        // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, they
+        // overflow from the fourth row on. DataFusion's `filter` does not.
+        for x in [[0, 0, 0, 0, 0, 1], [1, 0, 1, 0, 1, 1]] {
+            let batch = wide_lists_of_nulls(x);
+            let schema = batch.schema();
+            let plan = || {
+                filter_exec(
+                    "x > 0",
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                    None,
+                )
+            };
+            let filter_plan = plan();
+            let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec));
+            let outcome = assert_same_outcome_in_datafusion(
+                plan(),
+                Arc::new(TaskContext::default()),
+            )
+            .await;
+            assert_eq!(outcome, Ok(x.iter().filter(|&&x| x > 0).count()));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

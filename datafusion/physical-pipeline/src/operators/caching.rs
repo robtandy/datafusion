@@ -42,6 +42,7 @@ use arrow_select::coalesce::BatchCoalescer;
 use arrow_select::take::take;
 use datafusion_common::{Result, plan_err};
 
+use super::projection::can_gather;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
@@ -256,8 +257,10 @@ fn owned_rows(chunk: &DataChunk) -> Result<RecordBatch> {
 /// * View arrays share their data buffers after a copy: the coalescer
 ///   compacts them, but not when they are nested in other types.
 /// * Run-end encoded and list view arrays are not cached either.
+/// * Lists of values that take no memory (e.g. fixed-size lists of nulls),
+///   which `take` cannot copy, are not cached.
 pub fn can_cache(data_type: &DataType) -> bool {
-    can_cache_nested(data_type, false)
+    can_gather(data_type) && can_cache_nested(data_type, false)
 }
 
 fn can_cache_nested(data_type: &DataType, nested: bool) -> bool {
@@ -514,6 +517,18 @@ mod tests {
         assert!(can_cache(&DataType::Struct(Fields::from(vec![
             Field::new("s", DataType::LargeUtf8, true)
         ]))));
+        // Nor lists of values that take no memory: copying them with `take`
+        // overflows the 32-bit indices of the values of fixed-size lists.
+        let nulls = Arc::new(Field::new_list_field(DataType::Null, true));
+        assert!(!can_cache(&DataType::FixedSizeList(
+            Arc::clone(&nulls),
+            1 << 30
+        )));
+        assert!(!can_cache(&DataType::List(nulls)));
+        assert!(can_cache(&DataType::FixedSizeList(
+            Arc::new(Field::new_list_field(DataType::Float32, true)),
+            4
+        )));
 
         // Chunks of dictionaries are passed through.
         let schema = Arc::new(Schema::new(vec![Field::new(

@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
@@ -98,7 +98,8 @@ impl PhysicalProjection {
     /// Whether [`Self::try_from_projection_exec`] can lower `exec` with
     /// exactly its semantics, including its errors: whether none of its
     /// expressions has errors that depend on how DataFusion splits the rows
-    /// into batches, empty ones included (see [`depends_on_batches`]).
+    /// into batches, empty ones included (see [`depends_on_batches`]), and its
+    /// input has no lists of values that take no memory (see `can_gather`).
     ///
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion
@@ -108,10 +109,13 @@ impl PhysicalProjection {
     /// depend on how the input is pulled.
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
         let input_schema = exec.input().schema();
-        !exec
-            .expr()
+        input_schema
+            .fields()
             .iter()
-            .any(|projection| depends_on_batches(&projection.expr, input_schema.as_ref()))
+            .all(|field| can_gather(field.data_type()))
+            && !exec.expr().iter().any(|projection| {
+                depends_on_batches(&projection.expr, input_schema.as_ref())
+            })
     }
 
     /// Lower a DataFusion [`ProjectionExec`]: evaluate its expressions on the
@@ -466,6 +470,45 @@ fn remap_columns(
         ))))
     })
     .data()
+}
+
+/// Whether the native operators can gather rows of arrays of `data_type`
+/// (with [`gather`], or `DataChunk::compact`): not if they contain, at any
+/// depth, lists whose values take no memory (nulls, or structs or fixed-size
+/// lists of them), which may have more values than Arrow's `take` can count
+/// (it computes the indices of the values of fixed-size lists in 32 bits), and
+/// whose cost is proportional to the number of values. DataFusion filters such
+/// arrays without copying their values.
+pub(crate) fn can_gather(data_type: &DataType) -> bool {
+    fn takes_no_memory(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Null => true,
+            DataType::Struct(fields) => fields
+                .iter()
+                .all(|field| takes_no_memory(field.data_type())),
+            DataType::FixedSizeList(field, _) => takes_no_memory(field.data_type()),
+            _ => false,
+        }
+    }
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => {
+            !takes_no_memory(field.data_type()) && can_gather(field.data_type())
+        }
+        DataType::Struct(fields) => {
+            fields.iter().all(|field| can_gather(field.data_type()))
+        }
+        DataType::Union(fields, _) => fields
+            .iter()
+            .all(|(_, field)| can_gather(field.data_type())),
+        DataType::Dictionary(_, values) => can_gather(values),
+        DataType::RunEndEncoded(_, values) => can_gather(values.data_type()),
+        _ => true,
+    }
 }
 
 /// The rows `rows` of `column`: a slice if `rows` is a contiguous range,
@@ -847,8 +890,8 @@ mod tests {
             "SELECT id, a + b AS s, c * 2 AS c2, upper(d) AS u, NOT e AS ne FROM t1 WHERE a > 10",
             "SELECT a AS x, id, h, a AS y FROM t1 WHERE a > 10 AND d <> 'beta'",
             "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
-            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
+            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
             "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day, ts FROM t1 WHERE f > DATE '1970-01-01'",
             "SELECT id, c, -c AS minus_c FROM t1 WHERE c IS NULL OR c = 0.0 OR isnan(c)",
             "SELECT id * 2 AS id2, b FROM t1 WHERE id % 1000 = 7",
@@ -1271,9 +1314,10 @@ mod tests {
             let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
             assert!(outcome.unwrap_err().contains("overflow"), "{expr}");
         }
-        // The lists of a column are passed on: the projection is lowered, and
-        // returns the 4096 rows (whose lists are not compared, as they have
-        // `1 << 31` values).
+        // Lists of nulls cannot be gathered at all (see `can_gather`): a
+        // projection of the column stays in DataFusion too, and returns the
+        // 4096 rows (whose lists are not compared, as they have `1 << 31`
+        // values).
         let plan = || -> Arc<dyn ExecutionPlan> {
             Arc::new(
                 ProjectionExec::try_new(
@@ -1283,13 +1327,46 @@ mod tests {
                 .unwrap(),
             )
         };
-        let operator = lower(&plan()).unwrap();
-        assert_eq!(NativeOperators::of(&operator).projections, 1);
-        let lowered =
-            Arc::new(crate::bridge::PipelineRootExec::try_new(operator, plan()).unwrap());
         let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
-        assert_eq!(outcome(plan(), Arc::clone(&task_ctx)).await, Ok(4096));
-        assert_eq!(outcome(lowered, task_ctx).await, Ok(4096));
+        assert_eq!(
+            assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+            Ok(4096)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lists_of_values_without_memory_stay_in_datafusion() {
+        // A projection of `f IS NULL` above a filter gathers the selected rows
+        // of `f`, fixed-size lists of `1 << 30` nulls, with Arrow's `take`,
+        // whose 32-bit indices overflow (see the test of the same name for
+        // filters).
+        let batch = wide_lists_of_nulls([1, 0, 1, 0, 1, 1]);
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let filter = FilterExec::try_new(
+                physical_expr("x > 0", &schema),
+                scan_batches(&schema, std::slice::from_ref(&batch)),
+            )
+            .unwrap();
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        physical_expr("f IS NULL", &schema),
+                        "n",
+                    )],
+                    Arc::new(filter),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        assert_eq!(
+            assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+            Ok(4)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
