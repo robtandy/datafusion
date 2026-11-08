@@ -2301,6 +2301,30 @@ mod tests {
     }
 
     #[test]
+    fn exotic_types_round_trip() {
+        for (name, array, nullable) in crate::tuple_data::test_data::exotic_arrays() {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                name,
+                array.data_type().clone(),
+                nullable,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+            let mut collection = collection_for(&batch, false);
+            let locations = collection
+                .append_chunk(&DataChunk::from_record_batch(batch.clone()), None)
+                .unwrap();
+            assert_identical(&collection.gather(&locations).unwrap(), &batch);
+            let reversed = locations.iter().rev().copied().collect::<Vec<_>>();
+            let indices = (0..batch.num_rows() as u32).rev().collect::<Vec<_>>();
+            assert_identical(
+                &collection.gather(&reversed).unwrap(),
+                &chunk_with_selection(&batch, indices).compact().unwrap(),
+            );
+            assert_identical(&collection.gather(&[]).unwrap(), &batch.slice(0, 0));
+        }
+    }
+
+    #[test]
     fn dictionaries_of_nested_values() {
         use arrow::array::{
             DictionaryArray, Int8Array, ListArray, StructArray, UnionArray,

@@ -1310,6 +1310,22 @@ mod tests {
     }
 
     #[test]
+    fn exotic_keys_match_join_key_comparator() {
+        for (name, keys, _) in crate::tuple_data::test_data::exotic_arrays() {
+            for shift in 0..keys.len() {
+                let pairs = (0..keys.len())
+                    .map(|i| (i + shift) % keys.len())
+                    .collect::<Vec<_>>();
+                let [_, null] = assert_matches_join_key_comparator(&keys, &keys, &pairs);
+                if shift == 0 {
+                    // Every row is IS NOT DISTINCT FROM itself.
+                    assert_eq!(null.len(), keys.len(), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn run_end_encoded_keys_with_custom_fields() {
         use crate::tuple_data::test_data::custom_run_end_encoded;
 

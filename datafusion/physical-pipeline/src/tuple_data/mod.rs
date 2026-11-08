@@ -853,6 +853,210 @@ pub(crate) mod test_data {
         arrow::array::make_array(data)
     }
 
+    /// Arrays of rarely used types and type combinations.
+    pub(crate) fn exotic_arrays() -> Vec<(&'static str, ArrayRef, bool)> {
+        use arrow::array::{
+            Int16Array, LargeListArray, LargeListViewArray, MapArray, StringArray,
+        };
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::UInt64Type;
+
+        let views = [
+            Some("a long string value!"),
+            None,
+            Some("b"),
+            Some("a long string value!"),
+        ]
+        .into_iter()
+        .collect::<DictionaryArray<Int8Type>>();
+        let views = DictionaryArray::<Int8Type>::try_new(
+            views.keys().clone(),
+            cast(views.values(), &DataType::Utf8View).unwrap(),
+        )
+        .unwrap();
+        let halves = cast(
+            &Float32Array::from(vec![Some(-0.0), None, Some(0.0)]),
+            &DataType::Float16,
+        )
+        .unwrap();
+        let map_fields = Fields::from(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Null, true),
+        ]);
+        let inner_lists = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths([2, 0, 1, 2]),
+            Arc::new(StringViewArray::from(vec![
+                Some("a value longer than twelve"),
+                None,
+                Some("x"),
+                Some("a value longer than twelve"),
+                None,
+            ])),
+            None,
+        );
+        vec![
+            (
+                "empty struct",
+                Arc::new(StructArray::new_empty_fields(
+                    4,
+                    Some(NullBuffer::from(vec![true, false, true, false])),
+                )),
+                true,
+            ),
+            (
+                "list of nulls",
+                Arc::new(ListArray::new(
+                    Arc::new(Field::new_list_field(DataType::Null, true)),
+                    OffsetBuffer::from_lengths([2, 0, 2, 1]),
+                    Arc::new(NullArray::new(5)),
+                    Some(NullBuffer::from(vec![true, false, true, true])),
+                )),
+                true,
+            ),
+            (
+                "fixed size list of nulls",
+                Arc::new(FixedSizeListArray::new(
+                    Arc::new(Field::new_list_field(DataType::Null, true)),
+                    3,
+                    Arc::new(NullArray::new(12)),
+                    None,
+                )),
+                false,
+            ),
+            ("dictionary of views", Arc::new(views), true),
+            (
+                "dictionary with u64 keys of binaries",
+                Arc::new(
+                    DictionaryArray::<UInt64Type>::try_new(
+                        UInt64Array::from(vec![Some(0), Some(1), None, Some(0)]),
+                        Arc::new(BinaryArray::from(vec![Some(b"xy".as_ref()), None])),
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+            (
+                "non-nullable dictionary of decimals",
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![0, 1, 0, 1]),
+                        Arc::new(
+                            Decimal256Array::from(vec![Some(i256::from_i128(5)), None])
+                                .with_precision_and_scale(40, 3)
+                                .unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                ),
+                false,
+            ),
+            (
+                "dictionary of half floats",
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![Some(0), Some(2), None, Some(1)]),
+                        halves,
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+            (
+                "non-nullable dictionary of nulls",
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(vec![0, 0, 0, 0]),
+                        Arc::new(NullArray::new(1)),
+                    )
+                    .unwrap(),
+                ),
+                false,
+            ),
+            (
+                "large list view",
+                Arc::new(LargeListViewArray::from(
+                    LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                        Some(vec![Some(1), None]),
+                        None,
+                        Some(vec![]),
+                        Some(vec![Some(1), None]),
+                    ]),
+                )),
+                true,
+            ),
+            (
+                "union with a single field",
+                Arc::new(
+                    UnionArray::try_new(
+                        UnionFields::try_new(
+                            [5],
+                            [Field::new("only", DataType::Utf8, true)],
+                        )
+                        .unwrap(),
+                        vec![5, 5, 5, 5].into(),
+                        None,
+                        vec![Arc::new(StringArray::from(vec![
+                            Some("a"),
+                            None,
+                            Some("a"),
+                            None,
+                        ]))],
+                    )
+                    .unwrap(),
+                ),
+                false,
+            ),
+            (
+                "run-end encoded floats with int16 run ends",
+                Arc::new(
+                    RunArray::<Int16Type>::try_new(
+                        &Int16Array::from(vec![1, 2, 4]),
+                        &Float64Array::from(vec![Some(-0.0), None, Some(0.0)]),
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+            (
+                "sorted map of nulls",
+                Arc::new(
+                    MapArray::try_new(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(map_fields.clone()),
+                            false,
+                        )),
+                        OffsetBuffer::from_lengths([1, 0, 1, 1]),
+                        StructArray::try_new(
+                            map_fields,
+                            vec![
+                                Arc::new(StringArray::from(vec!["a", "b", "a"])),
+                                Arc::new(NullArray::new(3)),
+                            ],
+                            None,
+                        )
+                        .unwrap(),
+                        Some(NullBuffer::from(vec![true, false, true, true])),
+                        true,
+                    )
+                    .unwrap(),
+                ),
+                true,
+            ),
+            (
+                "non-nullable lists of lists of views",
+                Arc::new(ListArray::new(
+                    Arc::new(Field::new("inner", inner_lists.data_type().clone(), false)),
+                    OffsetBuffer::from_lengths([1, 1, 1, 1]),
+                    Arc::new(inner_lists),
+                    None,
+                )),
+                false,
+            ),
+        ]
+    }
+
     /// `batch` as a chunk with the selection `selection`.
     pub(crate) fn chunk_with_selection(
         batch: &RecordBatch,
