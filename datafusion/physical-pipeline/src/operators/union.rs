@@ -427,7 +427,7 @@ pub(crate) mod test_support {
     use arrow::array::{AsArray, Int64Array, RecordBatch, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::Result;
+    use datafusion_common::{Result, exec_err};
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -640,6 +640,34 @@ pub(crate) mod test_support {
             ordered,
         )
         .await;
+        root
+    }
+
+    /// Assert that the plan created by `make_plan` fails with an error that
+    /// contains `message`, both when executed by DataFusion and when lowered
+    /// by [`lower`] and executed by the pipeline engine. `make_plan` is called
+    /// once per engine. Returns the lowered operator tree.
+    pub(crate) async fn assert_native_plan_fails_like_datafusion(
+        make_plan: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        message: &str,
+    ) -> Arc<dyn PhysicalOperator> {
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(test_session_config()));
+        let expected =
+            with_timeout(collect(make_plan().expect("plan"), Arc::clone(&task_ctx)))
+                .await;
+        let error = expected.expect_err("DataFusion fails");
+        assert!(error.to_string().contains(message), "DataFusion: {error}");
+        let plan = make_plan().expect("plan");
+        let root = lower(&plan).expect("lowering");
+        match run_native(Arc::clone(&root), plan, task_ctx, false).await {
+            Ok(output) => panic!(
+                "The pipeline engine returned {} batches, DataFusion fails: {error}\noperators: {}",
+                output.batches.len(),
+                format_operator_tree(&root)
+            ),
+            Err(e) => assert!(e.to_string().contains(message), "pipeline engine: {e}"),
+        }
         root
     }
 
@@ -933,12 +961,26 @@ pub(crate) mod test_support {
         }
     }
 
+    /// What the stream of a [`batch_plan`] does after its batch.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum AfterBatch {
+        /// It ends.
+        End,
+        /// It never produces anything again.
+        Idle,
+        /// It fails with [`INJECTED_FAILURE`].
+        Fail,
+    }
+
+    /// The error of a [`batch_plan`] that fails after its batch.
+    pub(crate) const INJECTED_FAILURE: &str = "the stream fails after its batch";
+
     /// A `StreamingTableExec` partition that produces a single batch, and
-    /// then ends, or never produces anything again (if `then_pending`).
+    /// then does what `after` says.
     #[derive(Debug)]
     struct BatchPartition {
         batch: RecordBatch,
-        then_pending: bool,
+        after: AfterBatch,
     }
 
     impl PartitionStream for BatchPartition {
@@ -948,10 +990,12 @@ pub(crate) mod test_support {
 
         fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
             let batch = futures::stream::iter([Ok(self.batch.clone())]);
-            let stream = if self.then_pending {
-                batch.chain(futures::stream::pending()).boxed()
-            } else {
-                batch.boxed()
+            let stream = match self.after {
+                AfterBatch::End => batch.boxed(),
+                AfterBatch::Idle => batch.chain(futures::stream::pending()).boxed(),
+                AfterBatch::Fail => batch
+                    .chain(futures::stream::iter([exec_err!("{INJECTED_FAILURE}")]))
+                    .boxed(),
             };
             Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
         }
@@ -969,20 +1013,14 @@ pub(crate) mod test_support {
         streaming_plan(schema, vec![partition; partitions])
     }
 
-    /// A plan with a single partition that produces `batch`, and then ends,
-    /// or never produces anything again (if `then_pending`).
+    /// A plan with a single partition that produces `batch`, and then does
+    /// what `after` says.
     pub(crate) fn batch_plan(
         batch: RecordBatch,
-        then_pending: bool,
+        after: AfterBatch,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = batch.schema();
-        streaming_plan(
-            schema,
-            vec![Arc::new(BatchPartition {
-                batch,
-                then_pending,
-            })],
-        )
+        streaming_plan(schema, vec![Arc::new(BatchPartition { batch, after })])
     }
 
     fn streaming_plan(

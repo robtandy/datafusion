@@ -358,11 +358,13 @@ impl PhysicalOperator for PhysicalLimit {
         _lstate: &mut dyn OperatorState,
     ) -> Result<OperatorResult> {
         let state = downcast_state::<LimitState>(gstate.as_any(), self.name())?;
-        let end = self.end();
         // Nothing is emitted after the skipped rows: the input is not needed.
-        if end == Some(self.skip) {
+        // (Not `end == skip`, which also holds when `skip + fetch` saturates:
+        // then, like DataFusion's limit, the input is read to its end.)
+        if self.fetch == Some(0) {
             return Ok(OperatorResult::Finished);
         }
+        let end = self.end();
         // Avoid claiming positions that cannot matter any more.
         let claimed = state.claimed.load(Ordering::Relaxed);
         match end {
@@ -423,9 +425,10 @@ mod tests {
     use crate::explain::format_pipelines;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        TestSource, assert_native_byte_eq, assert_native_plan_byte_eq, assert_parity,
-        assert_parity_with_config, batch_plan, count, pending_plan, run, sorted_values,
-        values, values_chunk, values_chunks, values_schema,
+        AfterBatch, INJECTED_FAILURE, TestSource, assert_native_byte_eq,
+        assert_native_plan_byte_eq, assert_native_plan_fails_like_datafusion,
+        assert_parity, assert_parity_with_config, batch_plan, count, pending_plan, run,
+        sorted_values, values, values_chunk, values_chunks, values_schema,
     };
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::write_parquet;
@@ -1166,7 +1169,10 @@ mod tests {
             };
             Ok(Arc::new(InterleaveExec::try_new(vec![
                 by_v(pending_plan(values_schema(), 1)?)?,
-                by_v(batch_plan(values_chunk([42]).into_record_batch()?, false)?)?,
+                by_v(batch_plan(
+                    values_chunk([42]).into_record_batch()?,
+                    AfterBatch::End,
+                )?)?,
             ])?))
         };
         type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
@@ -1248,11 +1254,43 @@ mod tests {
         // A limit of no rows ends with the first batch of its input, even an
         // empty one.
         let make = || -> Result<Arc<dyn ExecutionPlan>> {
-            let empty = batch_plan(values_chunk([]).into_record_batch()?, true)?;
+            let empty =
+                batch_plan(values_chunk([]).into_record_batch()?, AfterBatch::Idle)?;
             Ok(Arc::new(GlobalLimitExec::new(empty, 0, Some(0))))
         };
         let root = assert_native_plan_byte_eq(make, false).await;
         assert_eq!(count::<PhysicalLimit>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_read_their_input_as_long_as_datafusion_does() -> Result<()> {
+        // A limit that skips more rows than an input can have reads all of its
+        // input, like DataFusion's: the failure of the input after its first
+        // batch is reported.
+        for (skip, fetch) in [
+            (usize::MAX, Some(1)),
+            (usize::MAX, None),
+            (usize::MAX - 1, Some(5)),
+        ] {
+            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                let batch = values_chunk(0..10).into_record_batch()?;
+                let input = batch_plan(batch, AfterBatch::Fail)?;
+                Ok(Arc::new(GlobalLimitExec::new(input, skip, fetch)))
+            };
+            let root =
+                assert_native_plan_fails_like_datafusion(make, INJECTED_FAILURE).await;
+            assert!(root.is::<PhysicalLimit>(), "skip {skip}, fetch {fetch:?}");
+        }
+        // A limit whose last row is in the first batch does not read further:
+        // the failure is not reported.
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = values_chunk(0..10).into_record_batch()?;
+            let input = batch_plan(batch, AfterBatch::Fail)?;
+            Ok(Arc::new(GlobalLimitExec::new(input, 5, Some(5))))
+        };
+        let root = assert_native_plan_byte_eq(make, true).await;
+        assert!(root.is::<PhysicalLimit>());
         Ok(())
     }
 }
