@@ -484,15 +484,17 @@ fn remap_columns(
 
 /// Whether the native operators can gather rows of arrays of `data_type`
 /// (with [`gather`], or `DataChunk::compact`): not if they contain, at any
-/// depth, lists whose values take no memory (nulls, or structs or fixed-size
-/// lists of them), which may have more values than Arrow's `take` can count
-/// (it computes the indices of the values of fixed-size lists in 32 bits), and
-/// whose cost is proportional to the number of values. DataFusion filters such
-/// arrays without copying their values.
+/// depth, lists whose values may take no memory (nulls, run-end encoded
+/// values, of which one run stands for any number of values, or structs or
+/// fixed-size lists of them), which may have more values than Arrow's `take`
+/// can count (it computes the indices of the values of fixed-size lists in 32
+/// bits), and whose cost is proportional to the number of values. DataFusion
+/// filters such arrays without copying their values.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
     fn takes_no_memory(data_type: &DataType) -> bool {
         match data_type {
-            DataType::Null => true,
+            // One run stands for any number of values.
+            DataType::Null | DataType::RunEndEncoded(..) => true,
             DataType::Struct(fields) => fields
                 .iter()
                 .all(|field| takes_no_memory(field.data_type())),
@@ -1414,36 +1416,75 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lists_of_values_without_memory_stay_in_datafusion() {
         // A projection of `f IS NULL` above a filter gathers the selected rows
-        // of `f`, fixed-size lists of `1 << 30` nulls, with Arrow's `take`,
-        // whose 32-bit indices overflow (see the test of the same name for
-        // filters).
-        let batch = wide_lists_of_nulls([1, 0, 1, 0, 1, 1]);
-        let schema = batch.schema();
-        let plan = || -> Arc<dyn ExecutionPlan> {
-            let filter = FilterExec::try_new(
-                physical_expr("x > 0", &schema),
-                scan_batches(&schema, std::slice::from_ref(&batch)),
-            )
-            .unwrap();
-            Arc::new(
-                ProjectionExec::try_new(
-                    [ProjectionExpr::new(
-                        physical_expr("f IS NULL", &schema),
-                        "n",
-                    )],
-                    Arc::new(filter),
+        // of `f`, fixed-size lists of `1 << 30` nulls or of runs, with Arrow's
+        // `take`, whose 32-bit indices overflow (see the test of the same name
+        // for filters).
+        let cases: [(&[i32], bool, usize); 2] = [
+            (&[1, 0, 1, 0, 1, 1], false, 4),
+            (&[0, 0, 0, 0, 1, 0, 1, 0], true, 2),
+        ];
+        for (x, runs, rows) in cases {
+            let batch = wide_lists(x, runs);
+            let schema = batch.schema();
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                let filter = FilterExec::try_new(
+                    physical_expr("x > 0", &schema),
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
                 )
-                .unwrap(),
-            )
+                .unwrap();
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(
+                            physical_expr("f IS NULL", &schema),
+                            "n",
+                        )],
+                        Arc::new(filter),
+                    )
+                    .unwrap(),
+                )
+            };
+            let projection_plan = plan();
+            let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(
+                !PhysicalProjection::supports_projection_exec(exec),
+                "{runs}"
+            );
+            let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+            assert_eq!(
+                assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+                Ok(rows),
+                "{runs}"
+            );
+        }
+    }
+
+    #[test]
+    fn lists_of_values_without_memory_cannot_be_gathered() {
+        let list = |values: DataType, size: i32| {
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(values, true)), size)
         };
-        let projection_plan = plan();
-        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
-        assert_eq!(
-            assert_same_outcome_in_datafusion(plan(), task_ctx).await,
-            Ok(4)
+        let runs = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int64, false)),
+            Arc::new(Field::new("values", DataType::Int32, true)),
         );
+        for (data_type, gathered) in [
+            (list(DataType::Null, 1 << 30), false),
+            (list(runs.clone(), 1 << 30), false),
+            (DataType::new_list(runs.clone(), true), false),
+            (list(list(runs.clone(), 2), 4), false),
+            (
+                DataType::Struct(
+                    vec![Field::new("f", list(runs.clone(), 2), true)].into(),
+                ),
+                false,
+            ),
+            // A run-end encoded column has one value per row.
+            (runs, true),
+            (list(DataType::Float32, 768), true),
+            (DataType::new_list(DataType::Utf8, true), true),
+        ] {
+            assert_eq!(can_gather(&data_type), gathered, "{data_type}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

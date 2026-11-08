@@ -1819,14 +1819,27 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![Arc::new(x), list(0), list(2048)]).unwrap()
     }
 
-    /// A batch of six rows of `x` (`Int32`) and of `f`, fixed-size lists of
-    /// `1 << 30` nulls (which take no memory).
-    pub(crate) fn wide_lists_of_nulls(x: [i32; 6]) -> RecordBatch {
-        let field = Arc::new(Field::new_list_field(DataType::Null, true));
+    /// A batch of the rows `x` (`Int32`) and of `f`, fixed-size lists of
+    /// `1 << 30` values that take no memory: nulls, or if `runs`, one run of
+    /// `42` (`RunEndEncoded<Int64, Int32>`).
+    pub(crate) fn wide_lists(x: &[i32], runs: bool) -> RecordBatch {
+        let values = x.len() << 30;
+        let child: ArrayRef = if runs {
+            Arc::new(
+                arrow::array::RunArray::<arrow::datatypes::Int64Type>::try_new(
+                    &Int64Array::from(vec![values as i64]),
+                    &Int32Array::from(vec![42]),
+                )
+                .unwrap(),
+            )
+        } else {
+            Arc::new(arrow::array::NullArray::new(values))
+        };
+        let field = Arc::new(Field::new_list_field(child.data_type().clone(), true));
         let f = arrow::array::FixedSizeListArray::try_new(
             Arc::clone(&field),
             1 << 30,
-            Arc::new(arrow::array::NullArray::new(6 << 30)),
+            child,
             None,
         )
         .unwrap();
@@ -4101,10 +4114,16 @@ mod tests {
     async fn lists_of_values_without_memory_stay_in_datafusion() {
         // Arrow's `take`, with which the native operators gather rows (e.g. the
         // cache, to copy the rows it keeps), computes the indices of the values
-        // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, they
-        // overflow from the fourth row on. DataFusion's `filter` does not.
-        for x in [[0, 0, 0, 0, 0, 1], [1, 0, 1, 0, 1, 1]] {
-            let batch = wide_lists_of_nulls(x);
+        // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, or of
+        // runs, they overflow from the fourth row on. DataFusion's `filter`
+        // does not.
+        let cases: [(&[i32], bool); 3] = [
+            (&[0, 0, 0, 0, 0, 1], false),
+            (&[1, 0, 1, 0, 1, 1], false),
+            (&[0, 0, 0, 0, 1, 0, 1, 0], true),
+        ];
+        for (x, runs) in cases {
+            let batch = wide_lists(x, runs);
             let schema = batch.schema();
             let plan = || {
                 filter_exec(
