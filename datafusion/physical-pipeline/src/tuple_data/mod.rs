@@ -827,6 +827,32 @@ pub(crate) mod test_data {
         RecordBatch::try_new(Arc::new(schema), columns).unwrap()
     }
 
+    /// A run-end encoded array with custom child fields: other names,
+    /// nullability and metadata than Arrow's default fields.
+    pub(crate) fn custom_run_end_encoded(
+        values: ArrayRef,
+        run_ends: &[i32],
+        nullable: bool,
+    ) -> ArrayRef {
+        let data_type = DataType::RunEndEncoded(
+            Arc::new(
+                Field::new("ends", DataType::Int32, false)
+                    .with_metadata(metadata("ends")),
+            ),
+            Arc::new(
+                Field::new("samples", values.data_type().clone(), nullable)
+                    .with_metadata(metadata("samples")),
+            ),
+        );
+        let data = arrow::array::ArrayData::builder(data_type)
+            .len(run_ends.last().map_or(0, |&end| end as usize))
+            .add_child_data(Int32Array::from(run_ends.to_vec()).to_data())
+            .add_child_data(values.to_data())
+            .build()
+            .unwrap();
+        arrow::array::make_array(data)
+    }
+
     /// `batch` as a chunk with the selection `selection`.
     pub(crate) fn chunk_with_selection(
         batch: &RecordBatch,
@@ -846,6 +872,10 @@ pub(crate) mod test_data {
         for (i, (a, e)) in actual.columns().iter().zip(expected.columns()).enumerate() {
             let name = expected.schema().field(i).name().clone();
             assert_eq!(a.data_type(), e.data_type(), "data types of {name} differ");
+            // E.g. the children of nested arrays have the types of their fields.
+            if let Err(e) = a.to_data().validate_full() {
+                panic!("{name} is not valid: {e}");
+            }
             assert_eq!(a.len(), e.len(), "lengths of {name} differ");
             let nulls =
                 |array: &ArrayRef| array.logical_nulls().filter(|n| n.null_count() > 0);

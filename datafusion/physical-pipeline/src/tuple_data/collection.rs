@@ -32,7 +32,7 @@ use arrow::array::{
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::{CastOptions, cast_with_options, take};
+use arrow::compute::{cast_with_options, take};
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
     LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
@@ -46,7 +46,7 @@ use datafusion_common::{
 
 use super::layout::{
     ColumnLayout, ColumnStorage, HASH_WIDTH, MAX_INLINE_LEN, MAX_ROWS_PER_BLOCK,
-    TupleDataLayout, VAR_LEN_SLOT_WIDTH,
+    TupleDataLayout, VAR_LEN_SLOT_WIDTH, strict_cast_options,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
@@ -1196,34 +1196,8 @@ pub(crate) fn gather_values(
             let codec = column.codec().ok_or_else(|| {
                 internal_datafusion_err!("Encoded column without a row codec")
             })?;
-            let encoded = rows
-                .iter()
-                .map(|row| codec.parser.parse(row.var_len(offset)));
-            let values =
-                codec
-                    .converter
-                    .convert_rows(encoded)?
-                    .pop()
-                    .ok_or_else(|| {
-                        internal_datafusion_err!("RowConverter returned no column")
-                    })?;
-            if codec.needs_cast && values.data_type() != value_type {
-                Ok(cast_with_options(
-                    &values,
-                    value_type,
-                    &strict_cast_options(),
-                )?)
-            } else {
-                Ok(values)
-            }
+            codec.decode(rows.iter().map(|row| row.var_len(offset)))
         }
-    }
-}
-
-fn strict_cast_options() -> CastOptions<'static> {
-    CastOptions {
-        safe: false,
-        ..Default::default()
     }
 }
 
@@ -1385,11 +1359,11 @@ mod tests {
     use super::*;
 
     use arrow::array::{Int32Array, Int64Array, StringArray};
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{Field, Fields, Schema};
 
     use crate::chunk::SelectionVector;
     use crate::tuple_data::test_data::{
-        all_types_batch, assert_identical, chunk_with_selection,
+        all_types_batch, assert_identical, chunk_with_selection, custom_run_end_encoded,
     };
 
     fn collection_for(batch: &RecordBatch, with_hash: bool) -> TupleDataCollection {
@@ -1993,9 +1967,198 @@ mod tests {
         let mut collection = collection_for(&batch, false);
         for column in collection.layout().columns() {
             assert_eq!(column.storage(), ColumnStorage::Encoded);
-            assert!(column.codec().unwrap().needs_cast);
+            assert!(column.codec().unwrap().needs_cast());
         }
         let chunk = chunk_with_selection(&batch, (0..n as u32).rev().collect());
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        assert_identical(
+            &collection.gather(&locations).unwrap(),
+            &chunk.compact().unwrap(),
+        );
+    }
+
+    #[test]
+    fn run_end_encoded_fields_are_restored() {
+        use arrow::array::{ListArray, StructArray};
+
+        // Top level: 8 rows.
+        let top = custom_run_end_encoded(
+            Arc::new(StringArray::from(vec![
+                Some("a"),
+                None,
+                Some("b"),
+                Some("a"),
+            ])),
+            &[2, 3, 6, 8],
+            true,
+        );
+        // In a list: 8 lists of 12 run-end encoded values.
+        let values = custom_run_end_encoded(
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            &[3, 4, 8, 9, 12],
+            false,
+        );
+        let item = Arc::new(Field::new("element", values.data_type().clone(), false));
+        let lists: ArrayRef = Arc::new(ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([2, 0, 3, 1, 2, 1, 0, 3]),
+            values,
+            Some(NullBuffer::from(vec![
+                true, true, false, true, true, true, true, true,
+            ])),
+        ));
+        // In a struct, next to another field.
+        let samples = custom_run_end_encoded(
+            Arc::new(Int32Array::from(vec![Some(7), None])),
+            &[5, 8],
+            true,
+        );
+        let structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![
+                    Field::new("r", samples.data_type().clone(), true),
+                    Field::new("i", DataType::Int32, true),
+                ]
+                .into(),
+                vec![samples, Arc::new(Int32Array::from_iter_values(0..8))],
+                Some(NullBuffer::from(vec![
+                    true, false, true, true, true, true, true, true,
+                ])),
+            )
+            .unwrap(),
+        );
+        // As the values of a map.
+        let map_values = custom_run_end_encoded(
+            Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
+            &[4, 6, 9],
+            true,
+        );
+        let entry_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", map_values.data_type().clone(), true),
+        ]);
+        let entries = StructArray::try_new(
+            entry_fields,
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..9).map(|i| format!("k{i}")),
+                )),
+                map_values,
+            ],
+            None,
+        )
+        .unwrap();
+        let maps: ArrayRef = Arc::new(
+            arrow::array::MapArray::try_new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                OffsetBuffer::from_lengths([1, 2, 0, 1, 1, 3, 0, 1]),
+                entries,
+                Some(NullBuffer::from(vec![
+                    true, true, true, false, true, true, true, true,
+                ])),
+                false,
+            )
+            .unwrap(),
+        );
+        // With dictionary values, which are cast back after decoding.
+        let dictionary = [Some("p"), None, Some("q")]
+            .into_iter()
+            .collect::<arrow::array::DictionaryArray<arrow::datatypes::Int8Type>>(
+        );
+        let dictionaries = custom_run_end_encoded(Arc::new(dictionary), &[1, 5, 8], true);
+        let batch = RecordBatch::try_from_iter(vec![
+            ("top", top),
+            ("lists", lists),
+            ("structs", structs),
+            ("maps", maps),
+            ("dictionaries", dictionaries),
+        ])
+        .unwrap();
+
+        let mut collection = collection_for(&batch, false);
+        assert!(collection.layout().column(4).codec().unwrap().needs_cast());
+        let chunk = chunk_with_selection(&batch, vec![7, 0, 3, 3, 5, 1, 2, 6, 4]);
+        let locations = collection.append_chunk(&chunk, None).unwrap();
+        // The exact schema, with the custom fields, is restored.
+        let gathered = collection.gather(&locations).unwrap();
+        assert_eq!(gathered.schema(), batch.schema());
+        assert_identical(&gathered, &chunk.compact().unwrap());
+
+        let mut state = TupleDataScanState::new().with_column_ids(vec![2, 4, 0, 3, 1]);
+        let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+        let expected = chunk.compact().unwrap().project(&[2, 4, 0, 3, 1]).unwrap();
+        assert_eq!(scanned.schema(), &expected.schema());
+        assert_identical(&scanned.into_record_batch().unwrap(), &expected);
+    }
+
+    #[test]
+    fn run_end_encoded_fields_in_unions_are_restored() {
+        use arrow::array::{ListArray, UnionArray};
+        use arrow::datatypes::UnionFields;
+
+        let samples = custom_run_end_encoded(
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])),
+            &[2, 3, 6],
+            true,
+        );
+        let fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("r", samples.data_type().clone(), true),
+                Field::new("i", DataType::Int32, true),
+            ],
+        )
+        .unwrap();
+        let type_ids = [0, 1, 0, 0, 1, 0].into_iter().collect::<ScalarBuffer<i8>>();
+        let sparse: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields.clone(),
+                type_ids.clone(),
+                None,
+                vec![
+                    Arc::clone(&samples),
+                    Arc::new(Int32Array::from(vec![
+                        Some(1),
+                        Some(2),
+                        None,
+                        Some(3),
+                        None,
+                        Some(4),
+                    ])),
+                ],
+            )
+            .unwrap(),
+        );
+        let dense: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                fields,
+                type_ids,
+                Some(vec![0, 0, 1, 2, 1, 3].into()),
+                vec![
+                    custom_run_end_encoded(
+                        Arc::new(StringArray::from(vec![Some("c"), None])),
+                        &[1, 4],
+                        true,
+                    ),
+                    Arc::new(Int32Array::from(vec![Some(5), None])),
+                ],
+            )
+            .unwrap(),
+        );
+        let lists: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new_list_field(sparse.data_type().clone(), true)),
+            OffsetBuffer::from_lengths([2, 0, 1, 2, 1, 0]),
+            Arc::clone(&sparse),
+            Some(NullBuffer::from(vec![true, true, false, true, true, true])),
+        ));
+        let batch = RecordBatch::try_from_iter(vec![
+            ("sparse", sparse),
+            ("dense", dense),
+            ("lists", lists),
+        ])
+        .unwrap();
+        let mut collection = collection_for(&batch, false);
+        let chunk = chunk_with_selection(&batch, vec![5, 0, 2, 2, 4, 1, 3]);
         let locations = collection.append_chunk(&chunk, None).unwrap();
         assert_identical(
             &collection.gather(&locations).unwrap(),

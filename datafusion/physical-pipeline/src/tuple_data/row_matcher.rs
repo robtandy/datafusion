@@ -1260,6 +1260,35 @@ mod tests {
     }
 
     #[test]
+    fn run_end_encoded_keys_with_custom_fields() {
+        use crate::tuple_data::test_data::custom_run_end_encoded;
+
+        // Compared with their row encodings.
+        let strings = |values: Vec<Option<&str>>, run_ends: &[i32]| {
+            custom_run_end_encoded(Arc::new(StringArray::from(values)), run_ends, true)
+        };
+        // [a, a, NULL, NULL, b, b] and [a, b, b, NULL, NULL, NULL].
+        let build = strings(vec![Some("a"), None, Some("b")], &[2, 4, 6]);
+        let probe = strings(vec![Some("a"), Some("b"), None], &[1, 3, 6]);
+        let [nothing, null] =
+            assert_matches_join_key_comparator(&build, &probe, &[1, 4, 5, 2, 3, 0]);
+        assert_eq!(nothing, vec![0, 1, 2]);
+        assert_eq!(null, vec![0, 1, 2, 3, 4]);
+
+        // With floats, compared by value: -0.0 = 0.0 and NaN = NaN.
+        let floats = |values: Vec<Option<f64>>, run_ends: &[i32]| {
+            custom_run_end_encoded(Arc::new(Float64Array::from(values)), run_ends, true)
+        };
+        // [-0.0, -0.0, NULL, NaN, NaN] and [0.0, NaN, NaN, NULL, NULL].
+        let build = floats(vec![Some(-0.0), None, Some(f64::NAN)], &[2, 3, 5]);
+        let probe = floats(vec![Some(0.0), Some(f64::NAN), None], &[1, 3, 5]);
+        let [nothing, null] =
+            assert_matches_join_key_comparator(&build, &probe, &[1, 3, 4, 2, 0]);
+        assert_eq!(nothing, vec![0, 1, 2]);
+        assert_eq!(null, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn nested_keys() {
         let list = |values: Vec<Option<Vec<Option<f64>>>>| -> ArrayRef {
             Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(values))
