@@ -1161,7 +1161,7 @@ pub(crate) fn gather_column(
                 Some(bit) => gather_nulls(bit, rows),
                 None => values.logical_nulls(),
             };
-            dictionary_encode(&values, key_nulls, key_type, column.data_type())
+            dictionary_encode(&values, key_nulls, None, key_type, column.data_type())
         }
         _ => Ok(values),
     }
@@ -2321,6 +2321,102 @@ mod tests {
                 &chunk_with_selection(&batch, indices).compact().unwrap(),
             );
             assert_identical(&collection.gather(&[]).unwrap(), &batch.slice(0, 0));
+        }
+    }
+
+    #[test]
+    fn full_dictionaries_under_masked_slots() {
+        use arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int8Array, StructArray, UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, UnionFields};
+
+        // Non-nullable dictionaries that use all 128 Int8 keys, with one
+        // more row in a slot that is masked by a null parent or that belongs
+        // to an inactive union variant: the masked value must not need a
+        // dictionary entry of its own.
+        let dictionary = || -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    Int8Array::from_iter_values((0..=127).chain([0])),
+                    Arc::new(Int32Array::from_iter_values(0..=127)),
+                )
+                .unwrap(),
+            )
+        };
+        let dictionary_type =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+        let field = |name: &str| Field::new(name, dictionary_type.clone(), false);
+        let valid_but_last =
+            || NullBuffer::from((0..129).map(|i| i < 128).collect::<Vec<_>>());
+        let structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![field("d")].into(),
+                vec![dictionary()],
+                Some(valid_but_last()),
+            )
+            .unwrap(),
+        );
+        let fixed: ArrayRef = Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(field("item")),
+                1,
+                dictionary(),
+                Some(valid_but_last()),
+            )
+            .unwrap(),
+        );
+        let unions: ArrayRef = Arc::new(
+            UnionArray::try_new(
+                UnionFields::try_new(
+                    [0, 1],
+                    [field("d"), Field::new("i", DataType::Int32, true)],
+                )
+                .unwrap(),
+                (0..129).map(|i| i8::from(i >= 128)).collect(),
+                None,
+                vec![dictionary(), Arc::new(Int32Array::from(vec![7; 129]))],
+            )
+            .unwrap(),
+        );
+        // The same in a nullable field (the masked slots get null keys), and
+        // a struct in a null struct.
+        let nullable_structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![Field::new("d", dictionary_type.clone(), true)].into(),
+                vec![dictionary()],
+                Some(valid_but_last()),
+            )
+            .unwrap(),
+        );
+        let inner =
+            StructArray::try_new(vec![field("d")].into(), vec![dictionary()], None)
+                .unwrap();
+        let nested_structs: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![Field::new("inner", inner.data_type().clone(), false)].into(),
+                vec![Arc::new(inner)],
+                Some(valid_but_last()),
+            )
+            .unwrap(),
+        );
+        for (name, array) in [
+            ("structs", structs),
+            ("fixed", fixed),
+            ("unions", unions),
+            ("nullable structs", nullable_structs),
+            ("nested structs", nested_structs),
+        ] {
+            let batch = RecordBatch::try_from_iter(vec![(name, array)]).unwrap();
+            let mut collection = collection_for(&batch, false);
+            let locations = collection
+                .append_chunk(&DataChunk::from_record_batch(batch.clone()), None)
+                .unwrap();
+            assert_identical(&collection.gather(&locations).unwrap(), &batch);
+            let mut state = TupleDataScanState::new();
+            let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+            assert_eq!(scanned.schema(), &batch.schema());
+            assert_identical(&scanned.into_record_batch().unwrap(), &batch);
         }
     }
 

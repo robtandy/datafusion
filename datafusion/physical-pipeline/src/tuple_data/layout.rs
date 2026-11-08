@@ -65,9 +65,11 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayData, ArrayRef, UInt32Array, UInt64Array, make_array, new_null_array,
 };
-use arrow::buffer::{NullBuffer, ScalarBuffer};
+use arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow::compute::{CastOptions, cast_with_options, take};
-use arrow::datatypes::{DataType, Field, FieldRef, IntervalUnit, Schema, SchemaRef};
+use arrow::datatypes::{
+    DataType, Field, FieldRef, IntervalUnit, Schema, SchemaRef, UnionMode,
+};
 use arrow_row::{RowConverter, RowParser, SortField};
 use datafusion_common::float_semantics::has_float_leaf;
 use datafusion_common::hash_utils::RandomState;
@@ -316,7 +318,7 @@ impl RowCodec {
         if has_type(&data, &self.value_type) {
             return Ok(values);
         }
-        Ok(make_array(restore(data, &self.value_type, true)?))
+        Ok(make_array(restore(data, &self.value_type, true, None)?))
     }
 }
 
@@ -361,30 +363,53 @@ fn has_type(data: &ArrayData, data_type: &DataType) -> bool {
 }
 
 /// Restore the data type `data_type` of values decoded by the row format
-/// (`data`), whose values are `nullable` if they are in a nullable field.
+/// (`data`), whose values are `nullable` if they are in a nullable field, and
+/// of which only the rows in `relevant` matter (`None`: all rows).
 ///
 /// The row format decoder does not restore
 ///
 /// * dictionaries, which it decodes to their values: they are dictionary
-///   encoded again (see [`dictionary_encode`]), with null keys for null
-///   values in nullable fields and valid keys of a null value otherwise;
+///   encoded again (see [`dictionary_encode`]). In nullable fields null
+///   values get null keys. In non-nullable fields every key is valid: null
+///   values that matter get the key of a null value, and the rows that do
+///   not matter (masked by a null parent, or of an inactive union variant,
+///   which the decoder decodes as nulls) the key of any value, so that they
+///   do not need a dictionary entry of their own;
 /// * the child fields of run-end encoded arrays, for which it uses Arrow's
 ///   default fields;
 /// * the types of the children of unions, which keep their declared type.
 ///
 /// Everything else (the physical layout and the buffers) is kept.
-fn restore(data: ArrayData, data_type: &DataType, nullable: bool) -> Result<ArrayData> {
+fn restore(
+    data: ArrayData,
+    data_type: &DataType,
+    nullable: bool,
+    relevant: Option<&BooleanBuffer>,
+) -> Result<ArrayData> {
     if has_type(&data, data_type) {
         return Ok(data);
     }
     if let DataType::Dictionary(key_type, value_type) = data_type {
-        let values = make_array(restore(data, value_type, true)?);
-        let key_nulls = if nullable {
-            values.logical_nulls().filter(|n| n.null_count() > 0)
+        let values = make_array(restore(data, value_type, true, relevant)?);
+        let (key_nulls, any_key) = if nullable {
+            let valid = match (values.logical_nulls(), relevant) {
+                (None, None) => None,
+                (Some(nulls), None) => Some(nulls.into_inner()),
+                (None, Some(relevant)) => Some(relevant.clone()),
+                (Some(nulls), Some(relevant)) => Some(nulls.inner() & relevant),
+            };
+            (valid.map(NullBuffer::new), None)
         } else {
-            None
+            (None, relevant.map(|relevant| !relevant))
         };
-        return Ok(dictionary_encode(&values, key_nulls, key_type, data_type)?.to_data());
+        return Ok(dictionary_encode(
+            &values,
+            key_nulls,
+            any_key.as_ref(),
+            key_type,
+            data_type,
+        )?
+        .to_data());
     }
     let child_types = child_data_types(data_type);
     if !same_shape(data.data_type(), data_type)
@@ -399,13 +424,158 @@ fn restore(data: ArrayData, data_type: &DataType, nullable: bool) -> Result<Arra
         .child_data()
         .iter()
         .zip(child_types)
-        .map(|(child, (data_type, nullable))| restore(child.clone(), data_type, nullable))
+        .zip(relevant_child_rows(&data, relevant))
+        .map(|((child, (data_type, nullable)), relevant)| {
+            restore(child.clone(), data_type, nullable, relevant.as_ref())
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(data
         .into_builder()
         .data_type(data_type.clone())
         .child_data(children)
         .build()?)
+}
+
+/// The rows of the children of `data` that matter (`None`: all rows), if the
+/// rows of `data` in `relevant` matter (`None`: all rows): the children of
+/// null rows do not matter, nor the rows of the children of sparse unions
+/// that belong to another variant.
+fn relevant_child_rows(
+    data: &ArrayData,
+    relevant: Option<&BooleanBuffer>,
+) -> Vec<Option<BooleanBuffer>> {
+    let children = data.child_data();
+    let (offset, len) = (data.offset(), data.len());
+    let is_relevant = |i: usize| relevant.is_none_or(|r| r.value(i));
+    // Whether the children of row `i` of `data` matter.
+    let children_matter = |i: usize| is_relevant(i) && data.is_valid(i);
+    // Whether all children of all rows matter.
+    let all = relevant.is_none() && data.null_count() == 0;
+    // The child rows in the ranges of the rows whose children matter.
+    let ranges = |child: &ArrayData, ranges: &mut dyn Iterator<Item = (usize, usize)>| {
+        let mut rows = vec![false; child.len()];
+        for (i, (start, end)) in ranges.enumerate() {
+            if children_matter(i) {
+                rows[start..end].iter_mut().for_each(|row| *row = true);
+            }
+        }
+        Some(BooleanBuffer::from(rows))
+    };
+    match data.data_type() {
+        DataType::Struct(_) if !all => children
+            .iter()
+            .map(|child| {
+                Some(BooleanBuffer::collect_bool(child.len(), |j| {
+                    j.checked_sub(offset)
+                        .is_some_and(|i| i < len && children_matter(i))
+                }))
+            })
+            .collect(),
+        DataType::FixedSizeList(_, size) if !all => {
+            let size = (*size).max(1) as usize;
+            vec![Some(BooleanBuffer::collect_bool(children[0].len(), |j| {
+                (j / size)
+                    .checked_sub(offset)
+                    .is_some_and(|i| i < len && children_matter(i))
+            }))]
+        }
+        DataType::List(_) | DataType::Map(..) if !all => {
+            let offsets = data.buffer::<i32>(0);
+            let mut bounds = offsets.windows(2).map(|w| (w[0] as usize, w[1] as usize));
+            vec![ranges(&children[0], &mut bounds)]
+        }
+        DataType::LargeList(_) if !all => {
+            let offsets = data.buffer::<i64>(0);
+            let mut bounds = offsets.windows(2).map(|w| (w[0] as usize, w[1] as usize));
+            vec![ranges(&children[0], &mut bounds)]
+        }
+        DataType::ListView(_) if !all => {
+            let (offsets, sizes) = (data.buffer::<i32>(0), data.buffer::<i32>(1));
+            let mut bounds = offsets
+                .iter()
+                .zip(sizes)
+                .take(len)
+                .map(|(&o, &s)| (o as usize, (o + s) as usize));
+            vec![ranges(&children[0], &mut bounds)]
+        }
+        DataType::LargeListView(_) if !all => {
+            let (offsets, sizes) = (data.buffer::<i64>(0), data.buffer::<i64>(1));
+            let mut bounds = offsets
+                .iter()
+                .zip(sizes)
+                .take(len)
+                .map(|(&o, &s)| (o as usize, (o + s) as usize));
+            vec![ranges(&children[0], &mut bounds)]
+        }
+        DataType::Union(fields, UnionMode::Sparse) => {
+            let type_ids = data.buffer::<i8>(0);
+            fields
+                .iter()
+                .zip(children)
+                .map(|((type_id, _), child)| {
+                    Some(BooleanBuffer::collect_bool(child.len(), |j| {
+                        j.checked_sub(offset).is_some_and(|i| {
+                            i < len && is_relevant(i) && type_ids[i] == type_id
+                        })
+                    }))
+                })
+                .collect()
+        }
+        DataType::Union(fields, UnionMode::Dense) if relevant.is_some() => {
+            let (type_ids, offsets) = (data.buffer::<i8>(0), data.buffer::<i32>(1));
+            fields
+                .iter()
+                .zip(children)
+                .map(|((type_id, _), child)| {
+                    let mut rows = vec![false; child.len()];
+                    for i in
+                        (0..len).filter(|&i| is_relevant(i) && type_ids[i] == type_id)
+                    {
+                        if let Some(row) = rows.get_mut(offsets[i] as usize) {
+                            *row = true;
+                        }
+                    }
+                    Some(BooleanBuffer::from(rows))
+                })
+                .collect()
+        }
+        DataType::RunEndEncoded(..) if relevant.is_some() => {
+            let run_ends: Vec<usize> = match children[0].data_type() {
+                DataType::Int16 => children[0]
+                    .buffer::<i16>(0)
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect(),
+                DataType::Int32 => children[0]
+                    .buffer::<i32>(0)
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect(),
+                _ => children[0]
+                    .buffer::<i64>(0)
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect(),
+            };
+            // A run matters if one of its rows in the array matters.
+            let mut start = 0;
+            let runs = run_ends
+                .iter()
+                .map(|&end| {
+                    let rows = start.max(offset)..end.min(offset + len);
+                    start = end;
+                    rows.into_iter().any(|row| is_relevant(row - offset))
+                })
+                .collect::<Vec<_>>();
+            let mut values = vec![false; children[1].len()];
+            values
+                .iter_mut()
+                .zip(runs)
+                .for_each(|(value, run)| *value = run);
+            vec![None, Some(BooleanBuffer::from(values))]
+        }
+        _ => vec![None; children.len()],
+    }
 }
 
 /// Whether arrays of types `a` and `b` have the same physical layout, not
@@ -434,10 +604,13 @@ fn same_shape(a: &DataType, b: &DataType) -> bool {
 /// (`Dictionary(key_type, values.data_type())`): the dictionary holds the
 /// distinct values in order of first occurrence (distinct by their bits,
 /// so `-0.0` and `0.0` stay distinct), including null values that have a
-/// valid key, and the rows in `key_nulls` have a null key.
+/// valid key. The rows in `key_nulls` have a null key, and the rows in
+/// `any_key` (which do not matter) the valid key of any value: of the first
+/// value, which is the value of the first such row if there is no other.
 pub(crate) fn dictionary_encode(
     values: &ArrayRef,
     key_nulls: Option<NullBuffer>,
+    any_key: Option<&BooleanBuffer>,
     key_type: &DataType,
     data_type: &DataType,
 ) -> Result<ArrayRef> {
@@ -447,9 +620,14 @@ pub(crate) fn dictionary_encode(
     let mut keys_of_rows =
         HashMap::with_capacity_and_hasher(values.len(), RandomState::default());
     let mut distinct = Vec::new();
+    let mut any = None;
     let keys = (0..values.len())
         .map(|i| {
             if key_nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+                return 0;
+            }
+            if any_key.is_some_and(|rows| rows.value(i)) {
+                any.get_or_insert(i);
                 return 0;
             }
             *keys_of_rows.entry(rows.row(i)).or_insert_with(|| {
@@ -458,6 +636,9 @@ pub(crate) fn dictionary_encode(
             })
         })
         .collect::<Vec<u64>>();
+    if let (Some(row), true) = (any, distinct.is_empty()) {
+        distinct.push(row as u32);
+    }
     let dictionary = take(values.as_ref(), &UInt32Array::from(distinct), None)?;
     let keys: ArrayRef = Arc::new(UInt64Array::new(ScalarBuffer::from(keys), key_nulls));
     // Fails if the keys do not fit `key_type`.
