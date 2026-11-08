@@ -1451,6 +1451,176 @@ mod tests {
         }
     }
 
+    /// Randomized keys with float dictionaries (with nulls, `-0.0` and
+    /// `NaN`) in structs, lists and sparse unions, whose candidates come
+    /// from two batches with different dictionaries, agree with
+    /// `JoinKeyComparator` on all pairs.
+    #[test]
+    fn randomized_dictionary_keys_of_different_batches() {
+        use arrow::array::{Int8Array, UnionArray};
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow::datatypes::UnionFields;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        fn dictionary(rng: &mut StdRng, n: usize) -> ArrayRef {
+            let size = rng.random_range(1..6);
+            let values = (0..size)
+                .map(|_| match rng.random_range(0..8) {
+                    0 => None,
+                    1 => Some(-0.0),
+                    2 => Some(0.0),
+                    3 => Some(f64::NAN),
+                    _ => Some(f64::from(rng.random_range(0..4))),
+                })
+                .collect::<Float64Array>();
+            let keys = (0..n)
+                .map(|_| (!rng.random_bool(0.1)).then(|| rng.random_range(0..size) as i8))
+                .collect::<Int8Array>();
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap(),
+            )
+        }
+        fn keys(rng: &mut StdRng, case: usize, n: usize) -> ArrayRef {
+            let nulls = |rng: &mut StdRng| {
+                NullBuffer::from(
+                    (0..n).map(|_| !rng.random_bool(0.15)).collect::<Vec<_>>(),
+                )
+            };
+            match case {
+                0 => {
+                    let values = dictionary(rng, n);
+                    let fields = vec![Field::new("d", values.data_type().clone(), true)];
+                    Arc::new(
+                        StructArray::try_new(
+                            fields.into(),
+                            vec![values],
+                            Some(nulls(rng)),
+                        )
+                        .unwrap(),
+                    )
+                }
+                1 => {
+                    let lengths =
+                        (0..n).map(|_| rng.random_range(0..3)).collect::<Vec<_>>();
+                    let values = dictionary(rng, lengths.iter().sum());
+                    Arc::new(ListArray::new(
+                        Arc::new(Field::new_list_field(values.data_type().clone(), true)),
+                        OffsetBuffer::from_lengths(lengths),
+                        values,
+                        Some(nulls(rng)),
+                    ))
+                }
+                _ => {
+                    let values = dictionary(rng, n);
+                    let fields = UnionFields::try_new(
+                        [0, 1],
+                        [
+                            Field::new("d", values.data_type().clone(), true),
+                            Field::new("i", DataType::Int32, true),
+                        ],
+                    )
+                    .unwrap();
+                    let type_ids = (0..n)
+                        .map(|_| i8::from(rng.random_bool(0.3)))
+                        .collect::<ScalarBuffer<i8>>();
+                    let ints = (0..n)
+                        .map(|_| (!rng.random_bool(0.3)).then(|| rng.random_range(0..2)))
+                        .collect::<Int32Array>();
+                    Arc::new(
+                        UnionArray::try_new(
+                            fields,
+                            type_ids,
+                            None,
+                            vec![values, Arc::new(ints)],
+                        )
+                        .unwrap(),
+                    )
+                }
+            }
+        }
+
+        for seed in 0..100 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let case = rng.random_range(0..3);
+            let n = rng.random_range(1..30);
+            let builds = [keys(&mut rng, case, n), keys(&mut rng, case, n)];
+            let probe = keys(&mut rng, case, 2 * n);
+            let layout = Arc::new(
+                TupleDataLayout::try_new_from_types(
+                    [builds[0].data_type().clone()],
+                    false,
+                )
+                .unwrap(),
+            );
+            let mut collection = TupleDataCollection::new(Arc::clone(&layout));
+            let mut locations = vec![];
+            for build in &builds {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(layout.schema()),
+                    vec![Arc::clone(build)],
+                )
+                .unwrap();
+                locations.extend(
+                    collection
+                        .append_chunk(&DataChunk::from_record_batch(batch), None)
+                        .unwrap(),
+                );
+            }
+            let probe_chunk = DataChunk::from_record_batch(
+                RecordBatch::try_new(
+                    Arc::clone(layout.schema()),
+                    vec![Arc::clone(&probe)],
+                )
+                .unwrap(),
+            );
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let matcher =
+                    RowMatcher::try_new(Arc::clone(&layout), vec![0], null_equality)
+                        .unwrap();
+                let prepared = matcher.prepare(&probe_chunk).unwrap();
+                let comparators = [&builds[0], &builds[1]].map(|build| {
+                    JoinKeyComparator::new(
+                        &[Arc::clone(build)],
+                        &[Arc::clone(&probe)],
+                        &[SortOptions::default()],
+                        null_equality,
+                    )
+                    .unwrap()
+                });
+                // Probe row `i` is compared with build row `(i + shift) % 2n`.
+                for shift in 0..2 * n {
+                    let pairs = (0..2 * n)
+                        .map(|i| (i + shift) % (2 * n))
+                        .collect::<Vec<_>>();
+                    let candidates =
+                        pairs.iter().map(|&row| locations[row]).collect::<Vec<_>>();
+                    let mut sel = (0..2 * n as u32).collect::<Vec<_>>();
+                    matcher
+                        .match_prepared(
+                            &prepared,
+                            &mut sel,
+                            &candidates,
+                            &collection,
+                            None,
+                        )
+                        .unwrap();
+                    let expected = (0..2 * n)
+                        .filter(|&i| comparators[pairs[i] / n].is_equal(pairs[i] % n, i))
+                        .map(|i| i as u32)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        sel, expected,
+                        "seed {seed}, case {case}, {null_equality:?}, shift {shift}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn run_end_encoded_keys_with_custom_fields() {
         use crate::tuple_data::test_data::custom_run_end_encoded;
