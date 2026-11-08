@@ -42,10 +42,12 @@ use arrow::datatypes::{Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
-use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{Column, LambdaExpr, LambdaVariable};
+use datafusion_physical_expr::expressions::{
+    Column, LambdaExpr, LambdaVariable, Literal,
+};
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
@@ -309,7 +311,9 @@ pub(crate) fn logical_rows(chunk: &DataChunk) -> Option<&SelectionVector> {
 /// expressions on some of the rows of a [`DataChunk`], only the columns they
 /// reference have to be gathered: the expressions are rewritten to refer to a
 /// batch of only these columns (in input order, see [`Self::batch`]), and the
-/// other columns are never touched.
+/// other columns are never touched. Expressions that may read columns they do
+/// not reference as `Column`s (with lambdas, or opaque leaves, see
+/// `has_opaque_leaves`) see all input columns, unchanged.
 #[derive(Debug, Clone)]
 pub(crate) struct BoundExprs {
     /// The input columns referenced by the expressions, in increasing order.
@@ -329,9 +333,13 @@ impl BoundExprs {
     ) -> Result<Self> {
         let exprs = exprs.into_iter().collect::<Vec<_>>();
         let num_fields = input_schema.fields().len();
-        if exprs.iter().any(has_lambdas) {
+        if exprs
+            .iter()
+            .any(|expr| has_lambdas(expr) || has_opaque_leaves(expr))
+        {
             // The parameters of a lambda are numbered after the columns of
-            // the input: such expressions see all input columns, unchanged.
+            // the input, and opaque leaves may read any input column: such
+            // expressions see all input columns, unchanged.
             return Ok(Self {
                 columns: (0..num_fields).collect(),
                 schema: Arc::new(input_schema.clone()),
@@ -409,6 +417,21 @@ impl BoundExprs {
             &options,
         )?)
     }
+}
+
+/// Whether `expr` has a leaf that may read input columns without referencing
+/// them as `Column`s (e.g. a custom expression without children): a leaf that
+/// is neither a column, a literal nor a function (whose arguments are its
+/// children). DataFusion does not project the input of a `CASE` for such
+/// expressions either (see `CaseExpr`).
+fn has_opaque_leaves(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.exists(|expr| {
+        Ok(expr.children().is_empty()
+            && !expr.is::<Column>()
+            && !expr.is::<Literal>()
+            && !expr.is::<ScalarFunctionExpr>())
+    })
+    .unwrap_or(true)
 }
 
 /// Whether `expr` contains a lambda function or one of its parameters.
@@ -1039,6 +1062,43 @@ mod tests {
             )
             .await;
             assert!(error.is_none());
+            assert_eq!(operators.projections, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opaque_columns_see_all_input_columns() {
+        // `opaque(x)` reads `x` without a `Column` child: bound to the columns
+        // that the expressions reference (`y`, or none), it would read `y` as
+        // `x`, or no column at all.
+        let batch = xys(&[((0, 1), 100), ((2, 2), 100), ((3, 0), 100)]);
+        let schema = batch.schema();
+        let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            opaque_column("x", &schema),
+            Operator::Plus,
+            physical_expr("y", &schema),
+        ));
+        for exprs in [
+            vec![(sum, "z")],
+            vec![(opaque_column("x", &schema), "x")],
+            vec![
+                (physical_expr("s", &schema), "s"),
+                (opaque_column("y", &schema), "y"),
+            ],
+        ] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    ProjectionExec::try_new(
+                        exprs.iter().map(|(expr, name)| {
+                            ProjectionExpr::new(Arc::clone(expr), *name)
+                        }),
+                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(error.is_none(), "{error:?}");
             assert_eq!(operators.projections, 1);
         }
     }

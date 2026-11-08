@@ -832,7 +832,9 @@ pub(crate) mod test_support {
     use datafusion_common::{DFSchema, DataFusionError, Result};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
+    use datafusion_expr::ColumnarValue;
     use datafusion_physical_expr::PhysicalExpr;
+    use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_plan::aggregates::{AggregateExec, AggregateInputMode};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
@@ -1394,6 +1396,52 @@ pub(crate) mod test_support {
         let x = rows().map(|(x, _)| x).collect::<Int32Array>();
         let s = StringArray::from_iter_values(rows().map(|(_, s)| s));
         RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(s)]).unwrap()
+    }
+
+    /// A column that is not a child of the expression (like the `CustomColumn`
+    /// of the tests of DataFusion's `CaseExpr`): the input columns it reads
+    /// are opaque.
+    #[derive(Debug, Hash, PartialEq, Eq)]
+    pub(crate) struct OpaqueColumn(Column);
+
+    /// The [`OpaqueColumn`] of the column `name` of `schema`.
+    pub(crate) fn opaque_column(name: &str, schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        Arc::new(OpaqueColumn(Column::new_with_schema(name, schema).unwrap()))
+    }
+
+    impl std::fmt::Display for OpaqueColumn {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "opaque({})", self.0)
+        }
+    }
+
+    impl PhysicalExpr for OpaqueColumn {
+        fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
+            self.0.data_type(input_schema)
+        }
+
+        fn nullable(&self, input_schema: &Schema) -> Result<bool> {
+            self.0.nullable(input_schema)
+        }
+
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+            self.0.evaluate(batch)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            Ok(self)
+        }
+
+        fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "opaque({})", self.0.name())
+        }
     }
 
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
@@ -2840,6 +2888,43 @@ mod tests {
             )
             .await;
             assert_eq!(error.is_some(), fails, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn opaque_columns_see_all_input_columns() {
+        // `opaque(x)` reads `x` without a `Column` child: bound to the columns
+        // that the predicate references (`y`, or none), it would read `y` as
+        // `x`, or no column at all.
+        let batch = xys(&[((0, 1), 100), ((2, 2), 100), ((3, 0), 100)]);
+        let schema = batch.schema();
+        let one: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::Literal::new(
+                ScalarValue::Int32(Some(1)),
+            ));
+        for (left, op, right) in [
+            (
+                physical_expr("y", &schema),
+                datafusion_expr::Operator::Eq,
+                opaque_column("x", &schema),
+            ),
+            (
+                opaque_column("x", &schema),
+                datafusion_expr::Operator::Gt,
+                one,
+            ),
+        ] {
+            let predicate: Arc<dyn PhysicalExpr> = Arc::new(
+                datafusion_physical_expr::expressions::BinaryExpr::new(left, op, right),
+            );
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    FilterExec::try_new(Arc::clone(&predicate), scan(&batch)).unwrap(),
+                )
+            };
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(error.is_none(), "{predicate}: {error:?}");
             assert_eq!(operators.filters, 1, "{predicate}");
         }
     }
