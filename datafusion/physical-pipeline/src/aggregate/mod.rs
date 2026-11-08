@@ -593,11 +593,14 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_common::Result;
 
+    use datafusion::prelude::ParquetReadOptions;
+
     use super::PhysicalHashAggregate;
     use super::test_support::*;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::count;
-    use crate::test_utils::{register_test_tables, test_session_config};
+    use crate::sources::test_harness::write_parquet;
+    use crate::test_utils::{register_test_tables, test_session_config, test_table_t1};
 
     async fn assert_all_parity(queries: &[&str]) {
         for sql in queries {
@@ -924,6 +927,50 @@ mod tests {
         ] {
             assert_aggregate_parity_with_setup(sql, test_session_config(), &setup).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_aggregates_of_parquet_files() -> Result<()> {
+        // Three files of small row groups, scanned by the native
+        // `ParquetScanSource`. DataFusion pushes a dynamic filter of the
+        // ungrouped `MIN` and `MAX` aggregates into the scan, which it
+        // tightens as it aggregates; the native aggregation leaves it as it
+        // is, which filters nothing.
+        let dir = tempfile::tempdir()?;
+        let batches = test_table_t1()?.into_iter().flatten().collect::<Vec<_>>();
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(500))
+            .build();
+        for (i, batches) in batches.chunks(2).enumerate() {
+            let path = dir.path().join(format!("part-{i}.parquet"));
+            write_parquet(
+                &path,
+                batches[0].schema(),
+                batches,
+                Some(properties.clone()),
+            )?;
+        }
+        let path = dir.path().to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        for sql in [
+            // (Without a filter, DataFusion answers from the statistics.)
+            "SELECT MIN(a), MAX(a), MIN(b), MAX(d) FROM p WHERE e",
+            "SELECT MIN(id), MAX(id), COUNT(*) FROM p WHERE a > 0",
+            "SELECT d, COUNT(*), SUM(a), MIN(g), MAX(h) FROM p GROUP BY d",
+            "SELECT e, f, COUNT(DISTINCT a), MEDIAN(b) FROM p GROUP BY e, f",
+            "SELECT d, e, COUNT(*) FROM p GROUP BY ROLLUP (d, e)",
+            "SELECT id % 100 AS k, ARRAY_AGG(id ORDER BY id) FROM p GROUP BY id % 100",
+        ] {
+            for target_partitions in [1, 4] {
+                let config =
+                    test_session_config().with_target_partitions(target_partitions);
+                assert_aggregate_parity_with_setup(sql, config, &setup).await;
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
