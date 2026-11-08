@@ -476,6 +476,19 @@ fn constant_pattern_fallibility(
     }
 }
 
+/// Whether `expr` is a case-insensitive `LIKE` with a constant pattern.
+fn is_case_insensitive_constant_like(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    match expr.downcast_ref::<BinaryExpr>() {
+        Some(binary) => {
+            matches!(binary.op(), Operator::ILikeMatch | Operator::NotILikeMatch)
+                && is_constant(binary.right())
+        }
+        None => expr
+            .downcast_ref::<LikeExpr>()
+            .is_some_and(|like| like.case_insensitive() && is_constant(like.pattern())),
+    }
+}
+
 /// For a case-insensitive `LIKE`, the same `LIKE` of a constant string that
 /// is not ASCII, of the type of the strings it matches.
 fn on_non_ascii_strings(
@@ -610,6 +623,11 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   batch, and then `s ~ 'a{1000000}'` unless `y = 0` on all of them, so it
 ///   fails on rows with `x = 0` then rows with `y = 0` in one batch, but not
 ///   in two; and it evaluates the right side of an `OR` on empty batches;
+/// * a case-insensitive `LIKE` fails only on strings that are not all ASCII
+///   (see `constant_pattern_fallibility`): what Arrow considers ASCII depends
+///   on how the strings are represented, e.g. on the bytes beneath nulls,
+///   which DataFusion's `filter` keeps and the `take` of a native operator
+///   drops;
 /// * `expr` may fail and fails on an empty batch, e.g.
 ///   `regexp_like(s, 'a{1000000}')` (unlike `regexp_count`, which only
 ///   compiles its pattern if there are rows);
@@ -647,6 +665,11 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
     let depends_on_batches = analyzed.iter().any(|&(_, depends)| depends)
         // It fails whenever DataFusion evaluates it.
         || node == Fallibility::Uniform
+        // A case-insensitive `LIKE` that only fails on strings that are not
+        // all ASCII: what Arrow considers ASCII depends on the representation
+        // of the strings (e.g. the bytes beneath nulls, which `filter` keeps
+        // and `take` drops).
+        || (node == Fallibility::PerRow && is_case_insensitive_constant_like(expr))
         // DataFusion evaluates an operand that may fail on some rows on rows
         // that depend on the batch.
         || children.iter().zip(&analyzed).any(|(child, &(fallibility, _))| {
@@ -896,7 +919,10 @@ mod tests {
             &physical_expr(&format!("a > 0 AND s ILIKE '{unicode}'"), &schema),
             &schema
         ));
-        assert!(!depends_on_batches(
+        // Whether Arrow compiles it depends on the representation of the
+        // strings, e.g. on bytes beneath nulls, which `filter` keeps and
+        // `take` drops: it depends on the batches anywhere.
+        assert!(depends_on_batches(
             &physical_expr(&format!("s ILIKE '{unicode}' AND a > 0"), &schema),
             &schema
         ));

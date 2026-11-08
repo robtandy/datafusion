@@ -1167,6 +1167,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn case_insensitive_patterns_on_bytes_beneath_nulls_stay_in_datafusion() {
+        // `x = 0` selects every other row, the first one too, whose string is
+        // null above bytes that are not ASCII: DataFusion's `filter` keeps
+        // them, so Arrow compiles the pattern of the `ILIKE`, which is too
+        // big; the native projection gathers the rows with `take`, which drops
+        // them, so Arrow does not compile the pattern.
+        let batch = non_ascii_beneath_a_null();
+        let schema = batch.schema();
+        let expr = format!("s ILIKE '{}'", "s".repeat(100_000));
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let filter = FilterExec::try_new(
+                physical_expr("x = 0", &schema),
+                scan_batches(&schema, std::slice::from_ref(&batch)),
+            )
+            .unwrap();
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(physical_expr(&expr, &schema), "m")],
+                    Arc::new(filter),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.unwrap().contains("Unable to build regex"));
+        assert_eq!(operators.projections, 0);
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(physical_expr(&expr, &schema), "m".to_owned())],
+        )
+        .unwrap();
+        let selected = selected_chunk(&batch, (0..2048).step_by(2).collect());
+        assert!(project(&native, &selected).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that

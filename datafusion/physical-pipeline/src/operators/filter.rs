@@ -1576,6 +1576,27 @@ pub(crate) mod test_support {
         )
     }
 
+    /// A batch of 2048 rows of `x` (`Int32`), alternately `0` and `1`, and of
+    /// `s` (`Utf8`), `"a"` but on the first row, which is null, above the
+    /// bytes of `"é"`, which are not ASCII.
+    pub(crate) fn non_ascii_beneath_a_null() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let x = Int32Array::from_iter_values((0..2048).map(|row| row % 2));
+        let values = std::iter::once("é")
+            .chain(std::iter::repeat_n("a", 2047))
+            .collect::<String>();
+        let offsets = arrow::buffer::OffsetBuffer::from_lengths(
+            std::iter::once("é".len()).chain(std::iter::repeat_n(1, 2047)),
+        );
+        let nulls = arrow::buffer::NullBuffer::from_iter((0..2048).map(|row| row != 0));
+        let s = StringArray::try_new(offsets, values.into_bytes().into(), Some(nulls))
+            .unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(x), Arc::new(s)]).unwrap()
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -3178,6 +3199,34 @@ mod tests {
             assert!(error.is_none(), "{expr}");
             assert_eq!(operators.filters, 0, "{expr}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn case_insensitive_patterns_on_bytes_beneath_nulls_stay_in_datafusion() {
+        // `x = 0` selects every other row, the first one too, whose string is
+        // null above bytes that are not ASCII. DataFusion's `filter` keeps
+        // these bytes: Arrow finds that the strings are not all ASCII and
+        // compiles the pattern of the `ILIKE`, which is too big. The native
+        // filter gathers the selected rows with `take`, which drops them: the
+        // strings are ASCII, and the pattern is not compiled.
+        let batch = non_ascii_beneath_a_null();
+        let schema = batch.schema();
+        let predicate = format!("s ILIKE '{}'", "s".repeat(100_000));
+        let plan =
+            || filter_exec(&predicate, filter_exec("x = 0", scan(&batch), None), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let error = error.unwrap();
+        assert!(error.contains("Unable to build regex"), "{error}");
+        assert_eq!(operators.filters, 0);
+        let selected = DataChunk::from(batch.clone())
+            .with_selection(SelectionVector::from(
+                (0..2048).step_by(2).collect::<Vec<_>>(),
+            ))
+            .unwrap();
+        assert!(drive(&filter_for(&predicate, &schema), [selected]).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
