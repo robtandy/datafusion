@@ -910,6 +910,7 @@ mod tests {
     use super::test_support::{
         assert_native_byte_eq, assert_parity, assert_parity_with_config, lower,
     };
+    use crate::bridge::PipelineRootExec;
     use crate::bridge::{BridgeOperator, bridged_plans};
     use crate::explain::format_operator_tree;
     use crate::operators::limit::PhysicalLimit;
@@ -920,7 +921,12 @@ mod tests {
     };
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::{data_batch, data_schema, write_parquet};
-    use crate::test_utils::{test_session_config, test_table_t1};
+    use crate::test_utils::{
+        canonical_ipc_bytes, datafusion_context, run_sql, test_session_config,
+        test_table_t1,
+    };
+    use datafusion::datasource::MemTable;
+    use datafusion_physical_plan::collect;
 
     // ---------------------------------------------------------------------
     // Sort keys
@@ -1681,6 +1687,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_order_by_dictionary_and_nested_keys() {
+        assert_sorted_natively(&[
+            "SELECT id, arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 ORDER BY dd, id",
+            "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
+            "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l, id",
+            "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
+            "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s NULLS FIRST, id",
+            "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
+            "SELECT id, make_array(c) AS l FROM t1 ORDER BY l, id LIMIT 2400",
+        ])
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topk_returns_the_first_rows_of_the_sort_around_zeros() -> Result<()> {
+        // DataFusion compares `-0.0 = 0.0` but sorts `-0.0` first. The native
+        // TopK returns the first rows of DataFusion's sort, also when the
+        // `-0.0`s come after the heap is full of `0.0`s (DataFusion's own TopK
+        // then discards them with its `v < 0.0` filter).
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let batch = |values: Vec<f64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Float64Array::from(values))],
+            )
+        };
+        let partitions = vec![vec![batch(vec![0.0; 3000])?, batch(vec![-0.0; 5])?]];
+        let ctx = datafusion_context(test_session_config());
+        let table = MemTable::try_new(Arc::clone(&schema), partitions)?;
+        ctx.register_table("z", Arc::new(table))?;
+        let sorted = run_sql(&ctx, "SELECT v FROM z ORDER BY v").await?;
+        let sorted = concat_batches(&sorted.schema, &sorted.batches)?;
+        for k in [1, 5, 6, 10, 2049] {
+            let sql = format!("SELECT v FROM z ORDER BY v LIMIT {k}");
+            let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+            let root = lower(&plan)?;
+            assert_eq!(count::<PhysicalTopK>(&root), 1);
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let output = collect(exec, ctx.task_ctx()).await?;
+            let expected =
+                canonical_ipc_bytes(&sorted.schema(), &[sorted.slice(0, k)], true)?;
+            let actual = canonical_ipc_bytes(&sorted.schema(), &output, true)?;
+            assert_eq!(actual, expected, "k = {k}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_order_by_limit() {
         for sql in [
             "SELECT * FROM t1 ORDER BY id LIMIT 10",
@@ -1939,9 +1994,7 @@ mod tests {
         }
         // On a single thread, the files after the first ones are pruned once
         // the threshold is known.
-        let ctx = crate::test_utils::datafusion_context(
-            test_session_config().with_target_partitions(1),
-        );
+        let ctx = datafusion_context(test_session_config().with_target_partitions(1));
         setup(&ctx).await?;
         let plan = ctx
             .sql("SELECT * FROM p ORDER BY id LIMIT 10")
@@ -1949,15 +2002,9 @@ mod tests {
             .create_physical_plan()
             .await?;
         let root = lower(&plan)?;
-        let exec = Arc::new(crate::bridge::PipelineRootExec::try_new(
-            Arc::clone(&root),
-            plan,
-        )?);
-        let output = datafusion_physical_plan::collect(
-            Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
-            ctx.task_ctx(),
-        )
-        .await?;
+        let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan)?);
+        let output =
+            collect(Arc::clone(&exec) as Arc<dyn ExecutionPlan>, ctx.task_ctx()).await?;
         let ids = output
             .iter()
             .flat_map(|batch| {

@@ -1167,6 +1167,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topk_of_chunks_without_columns() -> Result<()> {
+        let schema = Arc::new(Schema::empty());
+        let chunks = (0..3)
+            .map(|_| DataChunk::try_new_without_columns(Arc::clone(&schema), 2000))
+            .collect::<Result<Vec<_>>>()?;
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new_default(lit(1_i32))]).unwrap();
+        for k in [1, 1500, 6000, 7000] {
+            let input =
+                Arc::new(TestSource::with_schema(Arc::clone(&schema), chunks.clone()));
+            let root = PhysicalTopK::try_new(input, ordering.clone(), k)?;
+            let output = run(Arc::new(root), 4).await?;
+            let rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(rows, k.min(6000), "k = {k}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_can_be_executed_again() -> Result<()> {
         let input = Arc::new(TestSource::new(scrambled_chunks(5000, 600)));
         let root: Arc<dyn PhysicalOperator> = Arc::new(topk(input, true, 5));

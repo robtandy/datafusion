@@ -329,7 +329,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalSortExpr;
-    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::expressions::{col, lit};
 
     use crate::chunk::SelectionVector;
     use crate::executor::Executor;
@@ -543,6 +543,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_chunks_without_columns() -> Result<()> {
+        let schema = Arc::new(Schema::empty());
+        let chunks = (0..3)
+            .map(|_| DataChunk::try_new_without_columns(Arc::clone(&schema), 2000))
+            .collect::<Result<Vec<_>>>()?;
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new_default(lit(1_i32))]).unwrap();
+        for (fetch, run_rows) in [(None, SORT_RUN_ROWS), (None, 1500), (Some(10), 700)] {
+            let input =
+                Arc::new(TestSource::with_schema(Arc::clone(&schema), chunks.clone()));
+            let root = PhysicalSort::try_new(input, ordering.clone(), fetch)?
+                .with_run_limits(run_rows, SORT_RUN_BYTES);
+            let output = run(Arc::new(root), 4).await?;
+            let rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(rows, fetch.unwrap_or(6000));
+            assert!(output.iter().all(|batch| batch.num_columns() == 0));
+        }
         Ok(())
     }
 
