@@ -387,9 +387,7 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
             Fallibility::Uniform
         }
         // Or on the number of rows it is evaluated on together.
-        Fallibility::Infallible if expands_shared_values(expr, schema) => {
-            Fallibility::PerRow
-        }
+        Fallibility::Infallible if expands_values(expr, schema) => Fallibility::PerRow,
         fallibility => fallibility,
     }
 }
@@ -759,10 +757,14 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   whether it fails depends on the number of rows of the batches;
 /// * a part of `expr` other than a column copies values that its operands
 ///   share between rows (the values of dictionaries and of runs, and what
-///   views point to) into strings or binaries with 32-bit offsets (at any
-///   depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a single string
-///   of 2 MiB, which 1024 rows, but not 1023, overflow, without taking more
-///   memory than one row;
+///   views point to), or a constant (that is not null, nor an empty string or
+///   binary), into strings or binaries with 32-bit offsets (at any depth):
+///   e.g. `CAST(d AS Utf8)` unpacks a dictionary of a single string of 2 MiB,
+///   which 1024 rows, but not 1023, overflow, without taking more memory than
+///   one row, and `CASE WHEN x THEN '…' END` copies a constant for every row
+///   with `x`;
+/// * `expr` is such a constant (e.g. a string that a projection outputs),
+///   which whoever evaluates it copies for every row of the batch;
 /// * a part of `expr` that may fail is evaluated on, or produces,
 ///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
 ///   dictionary of `d`, even those that no row references (when DataFusion
@@ -777,6 +779,8 @@ pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
     let (fallibility, depends_on_batches) = analyze(expr, schema);
     depends_on_batches
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
+        // Whoever evaluates it copies it for every row of the batch.
+        || is_broadcast_constant(expr, schema)
 }
 
 /// The number of the parts of `expr` that may fail (on some rows or on all of
@@ -832,9 +836,10 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
             && expr
                 .data_type(schema)
                 .is_ok_and(|data_type| contains_narrow_lengths(&data_type)))
-        // It copies values that its operands share between rows into arrays
-        // whose 32-bit offsets overflow beyond 2 GiB of bytes.
-        || expands_shared_values(expr, schema)
+        // It copies values that its operands share between rows, or a
+        // constant, into arrays whose 32-bit offsets overflow beyond 2 GiB of
+        // bytes.
+        || expands_values(expr, schema)
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -951,24 +956,62 @@ fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
     }
 }
 
-/// Whether `expr` may copy values that its operands share between rows
-/// (the values of dictionaries and of runs, and the bytes or values that views
-/// point to, any number of times) into arrays with 32-bit byte offsets
-/// (`Utf8`, `Binary`), e.g. a cast that unpacks a dictionary. Their offsets
-/// overflow beyond 2 GiB of bytes in an array (e.g. a string of 2 MiB,
-/// repeated by 1024 rows), which the operands reach with more rows, but not
-/// more memory: whether it fails depends on how many rows it is evaluated on
-/// together.
-fn expands_shared_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+/// Whether `expr` may copy values into arrays with 32-bit byte offsets
+/// (`Utf8`, `Binary`) more times than its input has them: values that its
+/// operands share between rows (the values of dictionaries and of runs, and
+/// the bytes or values that views point to, any number of times), e.g. a cast
+/// that unpacks a dictionary, or a constant operand, which it may copy for
+/// every row (see [`is_broadcast_constant`]), e.g. `CASE WHEN x THEN '…' END`.
+/// Their offsets overflow beyond 2 GiB of bytes in an array (e.g. a string of
+/// 2 MiB, copied for 1024 rows), which the input reaches with more rows, but
+/// not more memory: whether it fails depends on how many rows it is evaluated
+/// on together.
+fn expands_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     !expr.is::<Column>()
         && expr
             .data_type(schema)
             .is_ok_and(|data_type| contains_byte_offsets(&data_type))
         && expr.children().iter().any(|child| {
-            child
-                .data_type(schema)
-                .is_ok_and(|data_type| shares_values(&data_type))
+            if is_constant_tree(child) {
+                is_broadcast_constant(child, schema)
+            } else {
+                child
+                    .data_type(schema)
+                    .is_ok_and(|data_type| shares_values(&data_type))
+            }
         })
+}
+
+/// Whether `expr` is a constant (see `is_constant_tree`) whose value may have
+/// bytes with 32-bit offsets (see [`contains_byte_offsets`]): not a literal
+/// null, nor an empty string or binary. Whoever evaluates it on a batch may
+/// copy it for every row of the batch: e.g. `ProjectionExec` outputs it as a
+/// column, and `CASE WHEN x THEN '…' END` copies it for every row with `x`.
+fn is_broadcast_constant(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
+        let value = literal.value();
+        let no_bytes = match value {
+            ScalarValue::Utf8(value) => value.as_deref().is_none_or(str::is_empty),
+            ScalarValue::Binary(value) => value.as_deref().is_none_or(<[u8]>::is_empty),
+            value => value.is_null(),
+        };
+        return !no_bytes && contains_byte_offsets(&value.data_type());
+    }
+    is_constant_tree(expr)
+        && expr
+            .data_type(schema)
+            .is_ok_and(|data_type| contains_byte_offsets(&data_type))
+}
+
+/// Whether all the leaves of `expr` are literals: it reads nothing of the
+/// batch it is evaluated on.
+fn is_constant_tree(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let children = expr.children();
+    if children.is_empty() {
+        expr.is::<Literal>()
+    } else {
+        children.into_iter().all(is_constant_tree)
+    }
 }
 
 /// Whether arrays of `data_type` contain, at any depth, values that several
@@ -1629,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_expansions_of_shared_values() {
+    fn finds_expansions_of_values() {
         use Fallibility::*;
         let strings = Arc::new(Field::new("values", DataType::Utf8, true));
         let dictionary =
@@ -1651,6 +1694,7 @@ mod tests {
                 true,
             ),
             Field::new("s", DataType::Utf8, true),
+            Field::new("e", DataType::Boolean, true),
         ]));
         let cast = |name: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
             Arc::new(CastExpr::new(physical_expr(name, &schema), to, None))
@@ -1696,6 +1740,42 @@ mod tests {
                 expected,
                 "{expr}"
             );
+        }
+
+        // Constants, which are copied for every row.
+        let constant = |value: ScalarValue| -> Arc<dyn PhysicalExpr> {
+            Arc::new(Literal::new(value))
+        };
+        let case = |value: ScalarValue| -> Arc<dyn PhysicalExpr> {
+            Arc::new(
+                CaseExpr::try_new(
+                    None,
+                    vec![(physical_expr("e", &schema), constant(value))],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let string = |value: &str| ScalarValue::Utf8(Some(value.to_string()));
+        for (expr, depends) in [
+            (case(string("abc")), true),
+            (case(ScalarValue::Binary(Some(vec![1]))), true),
+            (constant(string("abc")), true),
+            (
+                Arc::new(IsNullExpr::new(case(string("abc")))) as Arc<dyn PhysicalExpr>,
+                true,
+            ),
+            // Unless they are null or empty, with 64-bit offsets or views, or
+            // compared.
+            (case(string("")), false),
+            (case(ScalarValue::Utf8(None)), false),
+            (constant(string("")), false),
+            (case(ScalarValue::LargeUtf8(Some("abc".to_string()))), false),
+            (case(ScalarValue::Utf8View(Some("abc".to_string()))), false),
+            (case(ScalarValue::Int64(Some(1))), false),
+            (physical_expr("s = 'abc'", &schema), false),
+        ] {
+            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
         }
     }
 

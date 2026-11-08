@@ -916,8 +916,8 @@ mod tests {
         assert_all_native_byte_eq(&[
             "SELECT id, a + b AS s, c * 2 AS c2, upper(d) AS u, NOT e AS ne FROM t1 WHERE a > 10",
             "SELECT a AS x, id, h, a AS y FROM t1 WHERE a > 10 AND d <> 'beta'",
-            "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
-            "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
+            "SELECT id, CASE WHEN a IS NULL THEN 0 WHEN a < 0 THEN -1 ELSE 1 END AS sign FROM t1 WHERE b > 100",
+            "SELECT 1 AS one, '' AS s FROM t1 WHERE a > 0",
             "SELECT id, CAST(g AS DOUBLE) AS gd, ts FROM t1 WHERE f > DATE '1970-01-01'",
             "SELECT id, c, -c AS minus_c FROM t1 WHERE c IS NULL OR c = 0.0 OR isnan(c)",
             "SELECT id * 2 AS id2, b FROM t1 WHERE id % 1000 = 7",
@@ -930,10 +930,14 @@ mod tests {
         ])
         .await;
         // Several functions (whose failures are not known) or other parts that
-        // may fail: which error comes first depends on the batches.
+        // may fail: which error comes first depends on the batches. Or string
+        // constants, copied for every row of a batch, whose 32-bit offsets
+        // overflow on batches with enough rows.
         assert_all_projections_in_datafusion(&[
             "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
             "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day FROM t1",
+            "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
+            "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
         ])
         .await;
     }
@@ -1586,6 +1590,53 @@ mod tests {
         let (error, operators) = assert_native_plan_parity(plan, false).await;
         assert!(error.is_some());
         assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broadcast_constants_stay_in_datafusion() {
+        // `ProjectionExec` evaluates `CASE WHEN x THEN '…' END` on the batch,
+        // which copies a string of 2 MiB for each of its 2048 rows with `x`,
+        // and panics, but a pipeline on chunks of 2048 rows, on which `CASE`
+        // returns the constant itself, or nulls (see the test of the same
+        // name for filters). A constant that a projection outputs is copied
+        // for every row of the batch too.
+        let batch = half_true();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(case_of_a_large_constant(&schema), "b")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.to_lowercase().contains("overflow")),
+            "{outcome:?}"
+        );
+        let constant = |value: &str| {
+            let projection = ProjectionExec::try_new(
+                [ProjectionExpr::new(
+                    Arc::new(Literal::new(datafusion_common::ScalarValue::Utf8(Some(
+                        value.to_string(),
+                    )))) as Arc<dyn PhysicalExpr>,
+                    "c",
+                )],
+                scan_batches(&schema, std::slice::from_ref(&batch)),
+            )
+            .unwrap();
+            PhysicalProjection::supports_projection_exec(&projection)
+        };
+        assert!(!constant("x"));
+        assert!(constant(""));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

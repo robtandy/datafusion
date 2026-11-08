@@ -2047,6 +2047,31 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// A batch of 4096 rows of `x` (`Boolean`): `true` on the first 2048 rows,
+    /// `false` on the others.
+    pub(crate) fn half_true() -> RecordBatch {
+        let x =
+            arrow::array::BooleanArray::from_iter((0..4096).map(|row| Some(row < 2048)));
+        RecordBatch::try_from_iter([("x", Arc::new(x) as ArrayRef)]).unwrap()
+    }
+
+    /// `(CASE WHEN x THEN '…' END) IS NULL`, with a string of 2 MiB (see
+    /// [`half_true`]).
+    pub(crate) fn case_of_a_large_constant(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        let constant = Arc::new(datafusion_physical_expr::expressions::Literal::new(
+            datafusion_common::ScalarValue::Utf8(Some("x".repeat(2 << 20))),
+        ));
+        let case = datafusion_physical_expr::expressions::CaseExpr::try_new(
+            None,
+            vec![(physical_expr("x", schema), constant)],
+            None,
+        )
+        .unwrap();
+        Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(case),
+        ))
+    }
+
     /// A batch of `rows` rows of `id` (`Int32`, the row number) and of `d`, a
     /// dictionary (`Int32` keys) of a single string of 2 MiB: the keys of the
     /// first `nulls` rows are null, the others `0`.
@@ -4066,6 +4091,38 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 1, "{input}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broadcast_constants_stay_in_datafusion() {
+        // `CASE WHEN x THEN '…' END` copies a string of 2 MiB for every row
+        // with `x`: the 32-bit offsets of 2048 copies overflow. `FilterExec`
+        // evaluates it on the batch, with 2048 such rows, and panics, but the
+        // native filter on chunks of 2048 rows, on which `CASE` returns the
+        // constant itself, or nulls.
+        let batch = half_true();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                FilterExec::try_new(
+                    case_of_a_large_constant(&schema),
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.to_lowercase().contains("overflow")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
