@@ -19,6 +19,7 @@
 //! the blocks of another collection without copying or rewriting any row.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -31,12 +32,13 @@ use arrow::array::{
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::{cast, take};
+use arrow::compute::take;
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
-    LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, UInt64Type, Utf8Type,
+    LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
 };
 use arrow_row::Rows;
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{
     DataFusionError, Result, exec_datafusion_err, exec_err, internal_datafusion_err,
     internal_err, resources_datafusion_err,
@@ -44,7 +46,7 @@ use datafusion_common::{
 
 use super::layout::{
     ColumnLayout, ColumnStorage, HASH_WIDTH, MAX_INLINE_LEN, MAX_ROWS_PER_BLOCK,
-    TupleDataLayout, VAR_LEN_SLOT_WIDTH, dictionary_encode,
+    TupleDataLayout, VAR_LEN_SLOT_WIDTH, new_dictionary,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
@@ -760,8 +762,9 @@ pub(crate) fn physical_rows(chunk: &DataChunk) -> Result<Cow<'_, [u32]>> {
 
 /// The columns of a [`DataChunk`], prepared for scattering any of its rows
 /// into collections with a given layout (e.g. into all partitions of a
-/// [`PartitionedTupleData`](super::PartitionedTupleData)): dictionaries are
-/// decoded and nested values are encoded with the row format once per chunk.
+/// [`PartitionedTupleData`](super::PartitionedTupleData)): nested values are
+/// encoded with the row format once per chunk (the values of dictionaries
+/// once per value, see [`DictionaryValues`]).
 ///
 /// All columns are indexed by *physical* row.
 pub(crate) struct ScatterSource {
@@ -769,9 +772,13 @@ pub(crate) struct ScatterSource {
 }
 
 struct SourceColumn {
-    /// The values of the column (decoded, for dictionaries).
+    /// The values of the column (the values of the dictionary, for
+    /// dictionaries).
     values: ArrayRef,
-    /// The logical nulls of `values`, `None` if all values are valid.
+    /// For dictionaries, the index in `values` of the value of every row,
+    /// see [`DictionaryValues`].
+    indices: Option<Vec<usize>>,
+    /// The logical nulls of the column, `None` if all values are valid.
     nulls: Option<NullBuffer>,
     /// The null keys of a dictionary column, `None` if all keys are valid.
     key_nulls: Option<NullBuffer>,
@@ -807,15 +814,19 @@ impl ScatterSource {
 
 impl SourceColumn {
     fn try_new(column: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
-        let (values, key_nulls) = if column.is_dictionary() {
+        let (values, indices, key_nulls) = if column.is_dictionary() {
             // The nulls of a dictionary array are the nulls of its keys.
             let key_nulls = array.nulls().filter(|n| n.null_count() > 0).cloned();
-            (decode_dictionary(array)?, key_nulls)
+            // Encode only the values that the rows refer to.
+            let used_only = matches!(column.storage(), ColumnStorage::Encoded);
+            let DictionaryValues { values, indices } =
+                DictionaryValues::try_new(array, used_only)?;
+            (values, Some(indices), key_nulls)
         } else {
-            (Arc::clone(array), None)
+            (Arc::clone(array), None, None)
         };
         // The logical nulls of a dictionary are the null keys and the keys of
-        // null values (the decoded values of null keys are not null).
+        // null values (the value of a null key is any value).
         let nulls = array.logical_nulls().filter(|n| n.null_count() > 0);
         let data = match column.storage() {
             ColumnStorage::Null => SourceData::Null,
@@ -837,6 +848,7 @@ impl SourceColumn {
         };
         Ok(Self {
             values,
+            indices,
             nulls,
             key_nulls,
             data,
@@ -874,34 +886,68 @@ pub(crate) fn check_chunk(layout: &TupleDataLayout, chunk: &DataChunk) -> Result
     Ok(())
 }
 
-/// The values of a dictionary array: `values[keys[i]]` for every row `i`
-/// with a valid key, and any value for the rows with a null key, which are
-/// null in [`Array::logical_nulls`] of the dictionary.
-///
-/// The value of a null key is not a null: Arrow's `take` cannot take null
-/// indices of every type (e.g. of run-end encoded arrays with a
-/// non-nullable values field, or of unions without nullable fields).
-pub(crate) fn decode_dictionary(array: &ArrayRef) -> Result<ArrayRef> {
-    let Some(dictionary) = array.as_any_dictionary_opt() else {
-        return internal_err!("Expected a dictionary array, got {}", array.data_type());
-    };
-    let (keys, values) = (dictionary.keys(), dictionary.values());
-    if keys.null_count() == 0 {
-        return Ok(take(values.as_ref(), keys, None)?);
+/// The values of the rows of a dictionary array, without expanding them to
+/// one value per row, which could make them too large for their type (e.g.
+/// the run-end encoded children of nested values, or the offsets of
+/// strings): the value of every row `i` with a valid key is
+/// `values[indices[i]]`, and the rows with a null key (which are null in
+/// [`Array::logical_nulls`] of the dictionary) have the index of any value.
+pub(crate) struct DictionaryValues {
+    pub(crate) values: ArrayRef,
+    pub(crate) indices: Vec<usize>,
+}
+
+impl DictionaryValues {
+    /// The values of the rows of the dictionary array `array`. With
+    /// `used_only`, if the dictionary has more values than rows, `values`
+    /// holds only the values that rows with a valid key refer to (e.g. to
+    /// encode them).
+    pub(crate) fn try_new(array: &ArrayRef, used_only: bool) -> Result<Self> {
+        let Some(dictionary) = array.as_any_dictionary_opt() else {
+            return internal_err!(
+                "Expected a dictionary array, got {}",
+                array.data_type()
+            );
+        };
+        let values = dictionary.values();
+        if values.is_empty() {
+            // All keys are null: they refer to a null value.
+            return Ok(Self {
+                values: new_null_array(values.data_type(), 1),
+                indices: vec![0; array.len()],
+            });
+        }
+        // In bounds also for the null keys, whose key values can be any.
+        let mut indices = dictionary.normalized_keys();
+        if !used_only || values.len() <= indices.len() {
+            return Ok(Self {
+                values: Arc::clone(values),
+                indices,
+            });
+        }
+        let keys = dictionary.keys();
+        let mut used = Vec::new();
+        let mut used_indices =
+            HashMap::with_capacity_and_hasher(indices.len(), RandomState::default());
+        for (row, index) in indices.iter_mut().enumerate() {
+            let value = *index;
+            *index = if keys.is_null(row) {
+                0
+            } else {
+                *used_indices.entry(value).or_insert_with(|| {
+                    used.push(value as u64);
+                    used.len() - 1
+                })
+            };
+        }
+        if used.is_empty() {
+            used.push(0);
+        }
+        Ok(Self {
+            values: take(values.as_ref(), &UInt64Array::from(used), None)?,
+            indices,
+        })
     }
-    if values.is_empty() {
-        // All keys are null.
-        return Ok(new_null_array(values.data_type(), keys.len()));
-    }
-    // Take the first value for the null keys (whose key values can be out
-    // of bounds).
-    let keys = cast(keys, &DataType::UInt64)?;
-    let keys = keys
-        .as_primitive::<UInt64Type>()
-        .iter()
-        .map(|key| key.unwrap_or(0))
-        .collect::<UInt64Array>();
-    Ok(take(values.as_ref(), &keys, None)?)
 }
 
 /// The bytes of the values of a fixed-width array, starting at its first
@@ -958,25 +1004,10 @@ fn scatter_rows(
         {
             target.clear_validity(bit, key_nulls, rows);
         }
-        match &source.data {
-            SourceData::Null => {}
-            SourceData::Boolean(values) => {
-                target.scatter_bool(values, source.nulls.as_ref(), rows)
-            }
-            SourceData::Fixed(values) => {
-                target.scatter_fixed(values, column.width(), source.nulls.as_ref(), rows)
-            }
-            SourceData::VarLen => scatter_var_len(
-                &mut target,
-                &source.values,
-                source.nulls.as_ref(),
-                rows,
-                heap,
-            )?,
-            SourceData::Encoded(encoded) => {
-                // The encoding of null values is stored too, it is part of
-                // the value (e.g. the variant of a null union value).
-                target.scatter_bytes(|i| encoded.row(i).data(), None, rows, heap)?
+        match source.indices.as_deref() {
+            None => scatter_values(&mut target, column, source, rows, heap, |i| i)?,
+            Some(indices) => {
+                scatter_values(&mut target, column, source, rows, heap, |i| indices[i])?
             }
         }
     }
@@ -988,37 +1019,71 @@ fn scatter_rows(
     Ok(())
 }
 
+/// Write the values of the (physical) rows `rows` of `source` (with layout
+/// `column`) into `target`: the value of row `i` is value `index(i)` of
+/// `source`.
+fn scatter_values(
+    target: &mut ScatterTarget<'_>,
+    column: &ColumnLayout,
+    source: &SourceColumn,
+    rows: &[u32],
+    heap: &mut Vec<u8>,
+    index: impl Fn(usize) -> usize + Copy,
+) -> Result<()> {
+    let nulls = source.nulls.as_ref();
+    match &source.data {
+        SourceData::Null => {}
+        SourceData::Boolean(values) => target.scatter_bool(values, nulls, rows, index),
+        SourceData::Fixed(values) => {
+            target.scatter_fixed(values, column.width(), nulls, rows, index)
+        }
+        SourceData::VarLen => {
+            scatter_var_len(target, &source.values, nulls, rows, index, heap)?
+        }
+        SourceData::Encoded(encoded) => {
+            // The encoding of null values is stored too, it is part of the
+            // value (e.g. the variant of a null union value).
+            target.scatter_bytes(|i| encoded.row(index(i)).data(), None, rows, heap)?
+        }
+    }
+    Ok(())
+}
+
 fn scatter_var_len(
     target: &mut ScatterTarget<'_>,
     values: &ArrayRef,
     nulls: Option<&NullBuffer>,
     rows: &[u32],
+    index: impl Fn(usize) -> usize + Copy,
     heap: &mut Vec<u8>,
 ) -> Result<()> {
     match values.data_type() {
         DataType::Utf8 => {
             let values = values.as_string::<i32>();
-            target.scatter_bytes(|i| values.value(i).as_bytes(), nulls, rows, heap)
+            let value = |i| values.value(index(i)).as_bytes();
+            target.scatter_bytes(value, nulls, rows, heap)
         }
         DataType::LargeUtf8 => {
             let values = values.as_string::<i64>();
-            target.scatter_bytes(|i| values.value(i).as_bytes(), nulls, rows, heap)
+            let value = |i| values.value(index(i)).as_bytes();
+            target.scatter_bytes(value, nulls, rows, heap)
         }
         DataType::Utf8View => {
             let values = values.as_string_view();
-            target.scatter_bytes(|i| values.value(i).as_bytes(), nulls, rows, heap)
+            let value = |i| values.value(index(i)).as_bytes();
+            target.scatter_bytes(value, nulls, rows, heap)
         }
         DataType::Binary => {
             let values = values.as_binary::<i32>();
-            target.scatter_bytes(|i| values.value(i), nulls, rows, heap)
+            target.scatter_bytes(|i| values.value(index(i)), nulls, rows, heap)
         }
         DataType::LargeBinary => {
             let values = values.as_binary::<i64>();
-            target.scatter_bytes(|i| values.value(i), nulls, rows, heap)
+            target.scatter_bytes(|i| values.value(index(i)), nulls, rows, heap)
         }
         DataType::BinaryView => {
             let values = values.as_binary_view();
-            target.scatter_bytes(|i| values.value(i), nulls, rows, heap)
+            target.scatter_bytes(|i| values.value(index(i)), nulls, rows, heap)
         }
         data_type => internal_err!("Unexpected variable-length data type {data_type}"),
     }
@@ -1042,42 +1107,49 @@ impl ScatterTarget<'_> {
         }
     }
 
+    /// Store the booleans of the rows `rows`: the value of row `i` is value
+    /// `index(i)` of `values`.
     fn scatter_bool(
         &mut self,
         values: &BooleanBuffer,
         nulls: Option<&NullBuffer>,
         rows: &[u32],
+        index: impl Fn(usize) -> usize,
     ) {
         let offset = self.offset;
         for (row, &i) in self.rows.chunks_exact_mut(self.row_width).zip(rows) {
             let i = i as usize;
             let valid = nulls.is_none_or(|n| n.is_valid(i));
-            row[offset] = u8::from(valid && values.value(i));
+            row[offset] = u8::from(valid && values.value(index(i)));
         }
     }
 
+    /// Store the fixed-width values of the rows `rows`: the value of row `i`
+    /// is value `index(i)` of `values`.
     fn scatter_fixed(
         &mut self,
         values: &[u8],
         width: usize,
         nulls: Option<&NullBuffer>,
         rows: &[u32],
+        index: impl Fn(usize) -> usize + Copy,
     ) {
         match width {
             0 => {}
-            1 => self.scatter_fixed_width::<1>(values, nulls, rows),
-            2 => self.scatter_fixed_width::<2>(values, nulls, rows),
-            4 => self.scatter_fixed_width::<4>(values, nulls, rows),
-            8 => self.scatter_fixed_width::<8>(values, nulls, rows),
-            16 => self.scatter_fixed_width::<16>(values, nulls, rows),
-            32 => self.scatter_fixed_width::<32>(values, nulls, rows),
+            1 => self.scatter_fixed_width::<1>(values, nulls, rows, index),
+            2 => self.scatter_fixed_width::<2>(values, nulls, rows, index),
+            4 => self.scatter_fixed_width::<4>(values, nulls, rows, index),
+            8 => self.scatter_fixed_width::<8>(values, nulls, rows, index),
+            16 => self.scatter_fixed_width::<16>(values, nulls, rows, index),
+            32 => self.scatter_fixed_width::<32>(values, nulls, rows, index),
             width => {
                 let offset = self.offset;
                 for (row, &i) in self.rows.chunks_exact_mut(self.row_width).zip(rows) {
                     let i = i as usize;
                     if nulls.is_none_or(|n| n.is_valid(i)) {
+                        let v = index(i);
                         row[offset..offset + width]
-                            .copy_from_slice(&values[i * width..(i + 1) * width]);
+                            .copy_from_slice(&values[v * width..(v + 1) * width]);
                     }
                 }
             }
@@ -1090,22 +1162,24 @@ impl ScatterTarget<'_> {
         values: &[u8],
         nulls: Option<&NullBuffer>,
         rows: &[u32],
+        index: impl Fn(usize) -> usize,
     ) {
         let offset = self.offset;
         let rows_and_indices = self.rows.chunks_exact_mut(self.row_width).zip(rows);
         match nulls {
             None => {
                 for (row, &i) in rows_and_indices {
-                    let i = i as usize;
-                    row[offset..offset + W].copy_from_slice(&values[i * W..(i + 1) * W]);
+                    let v = index(i as usize);
+                    row[offset..offset + W].copy_from_slice(&values[v * W..(v + 1) * W]);
                 }
             }
             Some(nulls) => {
                 for (row, &i) in rows_and_indices {
                     let i = i as usize;
                     if nulls.is_valid(i) {
+                        let v = index(i);
                         row[offset..offset + W]
-                            .copy_from_slice(&values[i * W..(i + 1) * W]);
+                            .copy_from_slice(&values[v * W..(v + 1) * W]);
                     }
                 }
             }
@@ -1176,19 +1250,63 @@ pub(crate) fn gather_column(
     index: usize,
     rows: &[RowRef<'_>],
 ) -> Result<ArrayRef> {
-    let values = gather_values(column, index, rows)?;
     match column.data_type() {
         DataType::Dictionary(key_type, _) => {
-            // The rows with a null key, the other rows can have valid keys of
-            // null values.
-            let key_nulls = match column.key_validity_bit() {
-                Some(bit) => gather_nulls(bit, rows),
-                None => values.logical_nulls(),
-            };
-            dictionary_encode(&values, key_nulls, None, key_type, column.data_type())
+            gather_dictionary(column, index, key_type, rows)
         }
-        _ => Ok(values),
+        _ => gather_values(column, index, rows),
     }
+}
+
+/// Gather the dictionary column `index` (with layout `column` and keys of
+/// type `key_type`) of `rows`. The dictionary holds the distinct values of
+/// the rows with a valid key (including null values) in order of first
+/// occurrence, distinct by their stored bytes (so `-0.0` and `0.0` stay
+/// distinct, and so do the null values of different union variants). Each
+/// is decoded once: the values of all rows could be too large for their
+/// type (e.g. nested run-end encoded values, or strings with offsets).
+fn gather_dictionary<'r>(
+    column: &ColumnLayout,
+    index: usize,
+    key_type: &DataType,
+    rows: &[RowRef<'r>],
+) -> Result<ArrayRef> {
+    let Some(key_bit) = column.key_validity_bit() else {
+        return internal_err!("Dictionary column {index} without a key validity bit");
+    };
+    let (offset, width) = (column.offset(), column.width());
+    // The bytes of the slots of null values are zero, but an encoded null
+    // value is stored with its encoding, which is part of the value.
+    let stored = |row: RowRef<'r>| -> (bool, &'r [u8]) {
+        let bytes = match column.storage() {
+            ColumnStorage::VarLen | ColumnStorage::Encoded => row.var_len(offset),
+            _ => &row.row[offset..offset + width],
+        };
+        (row.is_valid(index), bytes)
+    };
+    let mut keys_of_values =
+        HashMap::with_capacity_and_hasher(rows.len(), RandomState::default());
+    let mut distinct = Vec::new();
+    let keys = rows
+        .iter()
+        .map(|&row| {
+            if !row.is_valid(key_bit) {
+                return 0;
+            }
+            *keys_of_values.entry(stored(row)).or_insert_with(|| {
+                distinct.push(row);
+                distinct.len() as u64 - 1
+            })
+        })
+        .collect::<Vec<u64>>();
+    let dictionary = gather_values(column, index, &distinct)?;
+    new_dictionary(
+        keys,
+        gather_nulls(key_bit, rows),
+        &dictionary,
+        key_type,
+        column.data_type(),
+    )
 }
 
 /// Gather the values of column `index` of `rows`, with the value type of
@@ -1353,6 +1471,7 @@ mod tests {
     use super::*;
 
     use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::compute::cast;
     use arrow::datatypes::{Field, Fields, Schema};
 
     use crate::chunk::SelectionVector;
@@ -2702,6 +2821,77 @@ mod tests {
                     assert_identical(&gathered, &expected.slice(row, 1));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dictionaries_of_run_end_encoded_lists_are_not_expanded() {
+        use crate::tuple_data::PartitionedTupleData;
+
+        for dictionary in
+            crate::tuple_data::test_data::dictionaries_of_run_end_encoded_lists()
+        {
+            let batch = RecordBatch::try_from_iter(vec![("d", dictionary)]).unwrap();
+            let rows = batch.num_rows() as u32;
+            for selection in [
+                (0..rows).collect(),
+                vec![1, 0],
+                (0..rows).rev().step_by(3).collect::<Vec<_>>(),
+            ] {
+                let chunk = chunk_with_selection(&batch, selection);
+                let expected = chunk.compact().unwrap();
+                let mut collection = collection_for(&batch, false);
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &expected);
+                let mut state = TupleDataScanState::new();
+                let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+                assert_eq!(scanned.schema(), &batch.schema());
+                assert_identical(&scanned.into_record_batch().unwrap(), &expected);
+
+                // Into 2 partitions, by the lowest bit of the row index.
+                let layout =
+                    Arc::new(TupleDataLayout::try_new(batch.schema(), true).unwrap());
+                let mut partitioned = PartitionedTupleData::try_new(layout, 1).unwrap();
+                let hashes = (0..chunk.len() as u64).map(|i| i << 63).collect::<Vec<_>>();
+                let locations = partitioned
+                    .append_chunk_with_locations(&chunk, &hashes)
+                    .unwrap();
+                for partition in 0..2 {
+                    let (rows, locations): (Vec<u32>, Vec<RowLocation>) = locations
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, location)| location.partition == partition)
+                        .map(|(row, location)| (row as u32, location.location))
+                        .unzip();
+                    let gathered =
+                        partitioned.partition(partition).gather(&locations).unwrap();
+                    let expected =
+                        chunk_with_selection(&expected, rows).compact().unwrap();
+                    assert_identical(&gathered, &expected);
+                }
+            }
+
+            // Slices with fewer rows than dictionary values (some keys null),
+            // so that only the values that they refer to are encoded.
+            for (offset, len) in [(0, 1), (1, 2), (5, 2)] {
+                let slice = batch.slice(offset, len);
+                let mut collection = collection_for(&batch, false);
+                let chunk = DataChunk::from_record_batch(slice.clone());
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &slice);
+            }
+
+            // Appended in chunks of 128 rows, gathered and scanned at once.
+            let mut collection = collection_for(&batch, false);
+            let mut locations = vec![];
+            for start in (0..batch.num_rows()).step_by(128) {
+                let chunk = DataChunk::from_record_batch(batch.slice(start, 128));
+                locations.extend(collection.append_chunk(&chunk, None).unwrap());
+            }
+            assert_identical(&collection.gather(&locations).unwrap(), &batch);
+            let mut state = TupleDataScanState::new();
+            let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+            assert_identical(&scanned.into_record_batch().unwrap(), &batch);
         }
     }
 

@@ -162,6 +162,12 @@ impl ColumnLayout {
                 "TupleDataLayout does not support unions without fields: {data_type}"
             );
         }
+        if has_nested_dictionary_of_run_end_encoded(data_type) {
+            return not_impl_err!(
+                "TupleDataLayout does not support dictionaries of run-end encoded values \
+                 inside other types: {data_type}"
+            );
+        }
         let value_type = match data_type {
             DataType::Dictionary(_, value_type) => {
                 if matches!(value_type.as_ref(), DataType::Dictionary(..)) {
@@ -702,6 +708,18 @@ pub(crate) fn dictionary_encode(
         distinct.push(row as u32);
     }
     let dictionary = take(values.as_ref(), &UInt32Array::from(distinct), None)?;
+    new_dictionary(keys, key_nulls, &dictionary, key_type, data_type)
+}
+
+/// The dictionary array of type `data_type` (`Dictionary(key_type, _)`)
+/// with the keys `keys` (null in `key_nulls`) of the values `dictionary`.
+pub(crate) fn new_dictionary(
+    keys: Vec<u64>,
+    key_nulls: Option<NullBuffer>,
+    dictionary: &ArrayRef,
+    key_type: &DataType,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
     let keys: ArrayRef = Arc::new(UInt64Array::new(ScalarBuffer::from(keys), key_nulls));
     // Fails if the keys do not fit `key_type`.
     let keys =
@@ -779,6 +797,29 @@ fn has_union_without_fields(data_type: &DataType) -> bool {
         DataType::Dictionary(_, values) => has_union_without_fields(values),
         _ => false,
     }
+}
+
+/// Whether `data_type` is or contains a run-end encoded array at any depth.
+fn has_run_end_encoded(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::RunEndEncoded(..))
+        || child_data_types(data_type)
+            .into_iter()
+            .any(|(child, _)| has_run_end_encoded(child))
+}
+
+/// Whether `data_type` contains, below its top level, a dictionary whose
+/// values contain a run-end encoded array. Unlike the dictionary of a
+/// column, which is gathered once per distinct value, the row format decodes
+/// such a dictionary to one value per row, and the run ends of these values
+/// can overflow (e.g. `Int16` run ends count at most 32,767 values) although
+/// the dictionary can hold them.
+fn has_nested_dictionary_of_run_end_encoded(data_type: &DataType) -> bool {
+    child_data_types(data_type)
+        .into_iter()
+        .any(|(child, _)| match child {
+            DataType::Dictionary(_, values) => has_run_end_encoded(values),
+            child => has_nested_dictionary_of_run_end_encoded(child),
+        })
 }
 
 /// Whether `data_type` is a union or contains a union at any depth.
@@ -935,10 +976,12 @@ impl TupleDataLayout {
     /// Returns `true` if columns of type `data_type` can be stored in a
     /// [`TupleDataCollection`](super::TupleDataCollection).
     ///
-    /// All types are supported except dictionaries of dictionaries, types
-    /// with a union without fields (at any depth: such a union cannot have
-    /// rows), and nested types whose values the Arrow row format cannot
-    /// encode or restore exactly.
+    /// All types are supported except dictionaries of dictionaries,
+    /// dictionaries of run-end encoded values inside other types (the row
+    /// format decodes them to one value per row, whose run ends can
+    /// overflow), types with a union without fields (at any depth: such a
+    /// union cannot have rows), and nested types whose values the Arrow row
+    /// format cannot encode or restore exactly.
     pub fn supports_data_type(data_type: &DataType) -> bool {
         ColumnLayout::try_new(data_type, 0).is_ok()
     }
@@ -1279,6 +1322,57 @@ mod tests {
                     "{data_type}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nested_dictionaries_of_run_end_encoded_values_are_not_supported() {
+        let run_end_encoded = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int16, false)),
+            Arc::new(Field::new("values", DataType::Int32, true)),
+        );
+        let dictionary = |values: DataType| {
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(values))
+        };
+        let structs =
+            |child: DataType| DataType::Struct(vec![Field::new("c", child, true)].into());
+        let list = |item: DataType| DataType::new_list(item, true);
+        let union = |child: DataType| {
+            DataType::Union(
+                UnionFields::try_new([0], [Field::new("c", child, true)]).unwrap(),
+                UnionMode::Sparse,
+            )
+        };
+        for data_type in [
+            structs(dictionary(run_end_encoded.clone())),
+            list(dictionary(run_end_encoded.clone())),
+            union(dictionary(run_end_encoded.clone())),
+            structs(dictionary(structs(run_end_encoded.clone()))),
+            dictionary(structs(dictionary(run_end_encoded.clone()))),
+        ] {
+            assert!(
+                !TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
+            let err = TupleDataLayout::try_new_from_types([data_type.clone()], false)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("dictionaries of run-end encoded values"),
+                "{data_type}: {err}"
+            );
+        }
+        // Dictionaries of columns are gathered once per distinct value.
+        for data_type in [
+            dictionary(run_end_encoded.clone()),
+            dictionary(structs(run_end_encoded.clone())),
+            structs(run_end_encoded.clone()),
+            list(dictionary(DataType::Utf8)),
+        ] {
+            assert!(
+                TupleDataLayout::supports_data_type(&data_type),
+                "{data_type}"
+            );
         }
     }
 

@@ -1150,6 +1150,50 @@ pub(crate) mod test_data {
         arrays
     }
 
+    /// Dictionaries of 2048 rows of `FixedSizeList<RunEndEncoded<Int16, _>,
+    /// 32>` values: expanded to one value per row, their run-end encoded
+    /// values would have 65,536 rows, more than `Int16` run ends can count.
+    /// With one value referenced by every row, two values and null keys, and
+    /// floats (`-0.0` and `+0.0` are equal for DataFusion, so they are
+    /// compared by value).
+    pub(crate) fn dictionaries_of_run_end_encoded_lists() -> Vec<ArrayRef> {
+        const ROWS: usize = 2048;
+        let lists = |run_ends: Vec<i16>, values: ArrayRef| -> ArrayRef {
+            let runs =
+                RunArray::<Int16Type>::try_new(&Int16Array::from(run_ends), &values)
+                    .unwrap();
+            let item = Arc::new(Field::new("item", runs.data_type().clone(), true));
+            Arc::new(FixedSizeListArray::try_new(item, 32, Arc::new(runs), None).unwrap())
+        };
+        let dictionary = |keys: Int8Array, values: ArrayRef| -> ArrayRef {
+            Arc::new(DictionaryArray::<Int8Type>::try_new(keys, values).unwrap())
+        };
+        vec![
+            dictionary(
+                Int8Array::from(vec![0; ROWS]),
+                lists(vec![32], Arc::new(Int32Array::from(vec![10]))),
+            ),
+            dictionary(
+                (0..ROWS)
+                    .map(|i| (i % 5 != 4).then_some(i8::from(i % 3 == 0)))
+                    .collect(),
+                lists(
+                    vec![32, 48, 64],
+                    Arc::new(Int32Array::from(vec![10, 10, 20])),
+                ),
+            ),
+            dictionary(
+                (0..ROWS)
+                    .map(|i| (i % 7 != 6).then_some((i % 3) as i8))
+                    .collect(),
+                lists(
+                    vec![32, 64, 80, 96],
+                    Arc::new(Float32Array::from(vec![-0.0, 0.0, 1.5, f32::NAN])),
+                ),
+            ),
+        ]
+    }
+
     /// Dictionaries with null keys of run-end encoded values (with a
     /// non-nullable values field) and of unions without nullable fields,
     /// which Arrow's `take` cannot take null indices of.

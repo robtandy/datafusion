@@ -39,6 +39,7 @@
 //! ([`RowMatcher::prepare`], DuckDB's `TupleDataVectorFormat`) and then
 //! compared with [`RowMatcher::match_prepared`] in every round.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, make_comparator};
@@ -47,10 +48,11 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 use arrow_row::Rows;
 use datafusion_common::float_semantics::normalize_floats;
+use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{NullEquality, Result, internal_datafusion_err, internal_err};
 
 use super::collection::{
-    RowLocation, RowRef, TupleDataCollection, decode_dictionary, fixed_values,
+    DictionaryValues, RowLocation, RowRef, TupleDataCollection, fixed_values,
 };
 use super::layout::{ColumnLayout, ColumnStorage, TupleDataLayout};
 use crate::chunk::{DataChunk, SelectionVector};
@@ -70,10 +72,10 @@ pub struct RowMatcher {
 }
 
 /// The key columns of a probe chunk, prepared for
-/// [`RowMatcher::match_prepared`] by [`RowMatcher::prepare`]: dictionaries
-/// are decoded, nested values are encoded with the row format (or have
-/// their floats normalized), and the logical nulls are computed, once per
-/// probe chunk.
+/// [`RowMatcher::match_prepared`] by [`RowMatcher::prepare`]: nested values
+/// are encoded with the row format (or have their floats normalized; the
+/// values of dictionaries once per value, without expanding them to one
+/// value per row), and the logical nulls are computed, once per probe chunk.
 #[derive(Debug)]
 pub struct PreparedProbe {
     /// The number of (logical) rows of the probe chunk.
@@ -100,10 +102,14 @@ impl PreparedProbe {
 struct ProbeColumn {
     /// The logical nulls of the key, `None` if all keys are valid.
     nulls: Option<NullBuffer>,
+    /// For dictionaries, the index in the values of `data` of the value of
+    /// every row, see [`DictionaryValues`].
+    indices: Option<Vec<usize>>,
     data: ProbeData,
 }
 
-/// The values of a probe key column, by physical row.
+/// The values of a probe key column (by physical row, or for dictionaries,
+/// the values of the dictionary).
 #[derive(Debug)]
 enum ProbeData {
     Null,
@@ -267,7 +273,13 @@ impl RowMatcher {
                 column,
                 null_equals_null: self.null_equality == NullEquality::NullEqualsNull,
             };
-            match_column(self.layout.column(column), probe_column, &mut matches)?;
+            let layout = self.layout.column(column);
+            match probe_column.indices.as_deref() {
+                None => match_column(layout, probe_column, &mut matches, |i| i)?,
+                Some(indices) => {
+                    match_column(layout, probe_column, &mut matches, |i| indices[i])?
+                }
+            }
         }
         Ok(sel.len())
     }
@@ -275,13 +287,17 @@ impl RowMatcher {
 
 impl ProbeColumn {
     fn try_new(layout: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
-        let values = if layout.is_dictionary() {
-            decode_dictionary(array)?
+        let (values, indices) = if layout.is_dictionary() {
+            // Encode (or flatten) only the values that the rows refer to.
+            let used_only = matches!(layout.storage(), ColumnStorage::Encoded);
+            let DictionaryValues { values, indices } =
+                DictionaryValues::try_new(array, used_only)?;
+            (values, Some(indices))
         } else {
-            Arc::clone(array)
+            (Arc::clone(array), None)
         };
         // The logical nulls of a dictionary are the null keys and the keys of
-        // null values (the decoded values of null keys are not null).
+        // null values (the value of a null key is any value).
         let nulls = array.logical_nulls().filter(|n| n.null_count() > 0);
         let data = match layout.storage() {
             ColumnStorage::Null => ProbeData::Null,
@@ -304,46 +320,53 @@ impl ProbeColumn {
                 }
             }
         };
-        Ok(Self { nulls, data })
+        Ok(Self {
+            nulls,
+            indices,
+            data,
+        })
     }
 }
 
 /// Compare a key column (with layout `layout`) of the probe rows with their
-/// candidates.
+/// candidates, where the value of physical probe row `i` is value `index(i)`
+/// of `probe`.
 fn match_column(
     layout: &ColumnLayout,
     probe: &ProbeColumn,
     matches: &mut ColumnMatches<'_, '_>,
+    index: impl Fn(usize) -> usize + Copy,
 ) -> Result<()> {
     let nulls = probe.nulls.as_ref();
     let offset = layout.offset();
     match &probe.data {
         // Both sides are always null.
         ProbeData::Null => matches.retain(nulls, |_, _, _| true),
-        ProbeData::Boolean(values) => {
-            matches.retain(nulls, |_, i, row| values.value(i) == (row.row[offset] != 0))
-        }
+        ProbeData::Boolean(values) => matches.retain(nulls, |_, i, row| {
+            values.value(index(i)) == (row.row[offset] != 0)
+        }),
         ProbeData::Fixed(bytes) => {
             let bytes = bytes.as_slice();
             match layout.value_type() {
                 DataType::Float16 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<2>(&bytes[i * 2..], &row.row[offset..])
+                    float_bits_eq::<2>(&bytes[index(i) * 2..], &row.row[offset..])
                 }),
                 DataType::Float32 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<4>(&bytes[i * 4..], &row.row[offset..])
+                    float_bits_eq::<4>(&bytes[index(i) * 4..], &row.row[offset..])
                 }),
                 DataType::Float64 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<8>(&bytes[i * 8..], &row.row[offset..])
+                    float_bits_eq::<8>(&bytes[index(i) * 8..], &row.row[offset..])
                 }),
                 _ => match layout.width() {
-                    1 => matches.retain_fixed::<1>(nulls, bytes, offset),
-                    2 => matches.retain_fixed::<2>(nulls, bytes, offset),
-                    4 => matches.retain_fixed::<4>(nulls, bytes, offset),
-                    8 => matches.retain_fixed::<8>(nulls, bytes, offset),
-                    16 => matches.retain_fixed::<16>(nulls, bytes, offset),
-                    32 => matches.retain_fixed::<32>(nulls, bytes, offset),
+                    1 => matches.retain_fixed::<1>(nulls, bytes, offset, index),
+                    2 => matches.retain_fixed::<2>(nulls, bytes, offset, index),
+                    4 => matches.retain_fixed::<4>(nulls, bytes, offset, index),
+                    8 => matches.retain_fixed::<8>(nulls, bytes, offset, index),
+                    16 => matches.retain_fixed::<16>(nulls, bytes, offset, index),
+                    32 => matches.retain_fixed::<32>(nulls, bytes, offset, index),
                     width => matches.retain(nulls, |_, i, row| {
-                        bytes[i * width..(i + 1) * width]
+                        let v = index(i);
+                        bytes[v * width..(v + 1) * width]
                             == row.row[offset..offset + width]
                     }),
                 },
@@ -354,7 +377,7 @@ fn match_column(
                 ($values:expr, $as_bytes:expr) => {{
                     let values = $values;
                     matches.retain(nulls, |_, i, row| {
-                        $as_bytes(values.value(i)) == row.var_len(offset)
+                        $as_bytes(values.value(index(i))) == row.var_len(offset)
                     })
                 }};
             }
@@ -380,7 +403,7 @@ fn match_column(
         }
         // Equal values have equal row encodings.
         ProbeData::Encoded(encoded) => matches.retain(nulls, |_, i, row| {
-            encoded.row(i).data() == row.var_len(offset)
+            encoded.row(index(i)).data() == row.var_len(offset)
         }),
         // Compare the (normalized) values, like `JoinKeyComparator`.
         ProbeData::Compared(values) => {
@@ -390,14 +413,34 @@ fn match_column(
             let codec = layout.codec().ok_or_else(|| {
                 internal_datafusion_err!("Encoded column without a row codec")
             })?;
-            let candidates =
-                codec.decode_flat(matches.rows.iter().map(|row| row.var_len(offset)))?;
+            // Decode every distinct candidate value once: e.g. the candidates
+            // of the rows of a dictionary often have the same values, which
+            // could be too large for their type once per candidate (e.g.
+            // nested run-end encoded values).
+            let mut distinct = Vec::new();
+            let mut indices_of_encodings = HashMap::with_capacity_and_hasher(
+                matches.rows.len(),
+                RandomState::default(),
+            );
+            let candidates = matches
+                .rows
+                .iter()
+                .map(|row| {
+                    let encoding = row.var_len(offset);
+                    *indices_of_encodings.entry(encoding).or_insert_with(|| {
+                        distinct.push(encoding);
+                        distinct.len() - 1
+                    })
+                })
+                .collect::<Vec<_>>();
             let comparator = make_comparator(
                 values.as_ref(),
-                normalize_floats(&candidates).as_ref(),
+                normalize_floats(&codec.decode_flat(distinct)?).as_ref(),
                 SortOptions::default(),
             )?;
-            matches.retain(nulls, |entry, i, _| comparator(i, entry).is_eq())
+            matches.retain(nulls, |entry, i, _| {
+                comparator(index(i), candidates[entry]).is_eq()
+            })
         }
     }
     Ok(())
@@ -479,16 +522,19 @@ impl ColumnMatches<'_, '_> {
     }
 
     /// [`Self::retain`] for fixed-width values of `W` bytes (`bytes` holds
-    /// the probe values, the candidate values are at `offset`).
+    /// the probe values, the value of physical probe row `i` is value
+    /// `index(i)`; the candidate values are at `offset`).
     #[inline]
     fn retain_fixed<const W: usize>(
         &mut self,
         nulls: Option<&NullBuffer>,
         bytes: &[u8],
         offset: usize,
+        index: impl Fn(usize) -> usize,
     ) {
         self.retain(nulls, |_, i, row| {
-            let probe: &[u8; W] = bytes[i * W..(i + 1) * W].try_into().unwrap();
+            let v = index(i);
+            let probe: &[u8; W] = bytes[v * W..(v + 1) * W].try_into().unwrap();
             let candidate: &[u8; W] = row.row[offset..offset + W].try_into().unwrap();
             probe == candidate
         })
@@ -1652,6 +1698,60 @@ mod tests {
             );
             assert_eq!(matched, vec![0]);
             assert_eq!(unmatched, vec![1]);
+        }
+    }
+
+    #[test]
+    fn dictionary_keys_of_run_end_encoded_lists() {
+        use crate::tuple_data::test_data::dictionaries_of_run_end_encoded_lists;
+
+        for keys in dictionaries_of_run_end_encoded_lists() {
+            let len = keys.len();
+            for shift in [0, 1, 3, 1000] {
+                let pairs = (0..len).map(|i| (i + shift) % len).collect::<Vec<_>>();
+                let [_, null] = assert_matches_join_key_comparator(&keys, &keys, &pairs);
+                if shift == 0 {
+                    // Every row is `IS NOT DISTINCT FROM` itself.
+                    assert_eq!(null.len(), len);
+                }
+            }
+            // Probe slices with fewer rows than dictionary values (some keys
+            // null), so that only the values that they refer to are encoded.
+            for (offset, len) in [(0, 1), (1, 2), (5, 2)] {
+                let probe = keys.slice(offset, len);
+                for shift in [0, 1, 2] {
+                    let pairs = (0..len).map(|i| offset + i + shift).collect::<Vec<_>>();
+                    assert_matches_join_key_comparator(&keys, &probe, &pairs);
+                }
+            }
+            // A probe chunk whose selection excludes almost all rows.
+            let build = batch(vec![("k", Arc::clone(&keys))]);
+            let probe = chunk_with_selection(&build, vec![1, 0]);
+            let build_rows = [0, 3];
+            let comparator = JoinKeyComparator::new(
+                &[Arc::clone(&keys)],
+                &[Arc::clone(&keys)],
+                &[SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+            )
+            .unwrap();
+            let expected = [1, 0]
+                .into_iter()
+                .zip(build_rows)
+                .enumerate()
+                .filter(|&(_, (probe_row, build_row))| {
+                    comparator.is_equal(build_row, probe_row)
+                })
+                .map(|(row, _)| row as u32)
+                .collect::<Vec<_>>();
+            let (matched, _) = match_pairs(
+                &build,
+                &probe,
+                &build_rows,
+                vec![0],
+                NullEquality::NullEqualsNothing,
+            );
+            assert_eq!(matched, expected);
         }
     }
 
