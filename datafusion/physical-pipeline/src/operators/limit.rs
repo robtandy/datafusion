@@ -358,6 +358,7 @@ mod tests {
     use super::*;
 
     use arrow::compute::concat_batches;
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
@@ -370,10 +371,12 @@ mod tests {
     use crate::explain::format_pipelines;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        TestSource, assert_native_plan_byte_eq, assert_parity, assert_parity_with_config,
-        batch_plan, count, pending_plan, run, sorted_values, values, values_chunk,
-        values_chunks, values_schema,
+        TestSource, assert_native_byte_eq, assert_native_plan_byte_eq, assert_parity,
+        assert_parity_with_config, batch_plan, count, pending_plan, run, sorted_values,
+        values, values_chunk, values_chunks, values_schema,
     };
+    use crate::sources::ParquetScanSource;
+    use crate::sources::test_harness::write_parquet;
     use crate::test_utils::{test_session_config, test_table_t1};
 
     /// Chunks of all sizes, so that `skip` and `skip + fetch` fall on chunk
@@ -1027,6 +1030,36 @@ mod tests {
             // The inputs of the union below the limit run concurrently.
             assert!(!lowered.preserve_order());
             assert_eq!(count::<PhysicalUnion>(&root), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_limits_over_a_parquet_file() -> Result<()> {
+        // A single file of several row groups is one partition in DataFusion,
+        // read in file order, and the limit (with its fetch pushed into the
+        // scan) returns the same rows over the native `ParquetScanSource`.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("t1.parquet");
+        let batches = test_table_t1()?.into_iter().flatten().collect::<Vec<_>>();
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(700))
+            .build();
+        write_parquet(&path, batches[0].schema(), &batches, Some(properties))?;
+        let path = path.to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        for sql in [
+            "SELECT * FROM p LIMIT 10 OFFSET 2045",
+            "SELECT id, d FROM p LIMIT 1500 OFFSET 700",
+            "SELECT id, d FROM p OFFSET 4000",
+        ] {
+            let root = assert_native_byte_eq(sql, test_session_config(), setup).await;
+            let limit = root.downcast_ref::<PhysicalLimit>().expect("a limit");
+            assert!(limit.preserve_order(), "{sql}");
+            assert!(limit.input().is::<ParquetScanSource>(), "{sql}");
         }
         Ok(())
     }
