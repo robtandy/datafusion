@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
@@ -490,7 +490,8 @@ fn remap_columns(
 /// fixed-size lists of them), which may have more values than Arrow's `take`
 /// can count (it computes the indices of the values of fixed-size lists in 32
 /// bits), and whose cost is proportional to the number of values. DataFusion
-/// filters such arrays without copying their values.
+/// filters such arrays without copying their values. Nor run-end encoded
+/// arrays whose child fields are not Arrow's, which Arrow's `filter` renames.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
     fn takes_no_memory(data_type: &DataType) -> bool {
         match data_type {
@@ -519,7 +520,13 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
             .iter()
             .all(|(_, field)| can_gather(field.data_type())),
         DataType::Dictionary(_, values) => can_gather(values),
-        DataType::RunEndEncoded(_, values) => can_gather(values.data_type()),
+        // Arrow's `filter` rebuilds run-end encoded arrays with its own child
+        // fields: the batches of DataFusion may not have other ones.
+        DataType::RunEndEncoded(run_ends, values) => {
+            **run_ends == Field::new("run_ends", run_ends.data_type().clone(), false)
+                && **values == Field::new("values", values.data_type().clone(), true)
+                && can_gather(values.data_type())
+        }
         _ => true,
     }
 }
@@ -1504,6 +1511,13 @@ mod tests {
             ),
             // A run-end encoded column has one value per row.
             (runs, true),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("ends", DataType::Int64, false)),
+                    Arc::new(Field::new("samples", DataType::Int32, true)),
+                ),
+                false,
+            ),
             (list(DataType::Float32, 768), true),
             (DataType::new_list(DataType::Utf8, true), true),
         ] {

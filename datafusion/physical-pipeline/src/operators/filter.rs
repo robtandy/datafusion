@@ -77,7 +77,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, AsArray, RecordBatch};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use datafusion_common::instant::Instant;
 use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err, plan_err};
@@ -388,7 +388,9 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
 /// cannot index all of their values (keys of less than 32 bits), adds up run
 /// ends (run ends of less than 32 bits), and the offsets of lists (32-bit
 /// offsets, which lists of nulls overflow without memory). The 32-bit offsets
-/// of strings and binaries overflow too, but on more than 2 GiB of data.
+/// of strings and binaries overflow too, but on more than 2 GiB of data. And
+/// Arrow's `filter` rebuilds run-end encoded arrays with its own child
+/// fields, so their fields must be Arrow's.
 fn may_fail_to_coalesce(data_type: &DataType) -> bool {
     let narrow = |index: &DataType| {
         !matches!(
@@ -400,8 +402,14 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
         DataType::Dictionary(keys, values) => {
             narrow(keys) || may_fail_to_coalesce(values)
         }
+        // Arrow's `filter` rebuilds run-end encoded arrays with its own fields
+        // (see `RunArray::try_new`), so the output would not have its type.
         DataType::RunEndEncoded(run_ends, values) => {
-            narrow(run_ends.data_type()) || may_fail_to_coalesce(values.data_type())
+            narrow(run_ends.data_type())
+                || **run_ends
+                    != Field::new("run_ends", run_ends.data_type().clone(), false)
+                || **values != Field::new("values", values.data_type().clone(), true)
+                || may_fail_to_coalesce(values.data_type())
         }
         // Their 32-bit offsets overflow on more than `i32::MAX` values, which
         // need no memory if they are nulls.
@@ -1430,15 +1438,16 @@ pub(crate) mod test_support {
         let plan = make_plan();
         let operator = lower(&plan).unwrap();
         let operators = NativeOperators::of(&operator);
-        let root = Arc::new(PipelineRootExec::try_new(operator, plan).unwrap());
-        let actual = collect(Arc::clone(&root) as Arc<dyn ExecutionPlan>, task_ctx)
-            .await
-            .map(|batches| EngineOutput {
-                plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
-                schema: root.schema(),
-                batches,
-                ordered,
-            });
+        let root = executable(operator, plan).unwrap();
+        let actual =
+            collect(Arc::clone(&root), task_ctx)
+                .await
+                .map(|batches| EngineOutput {
+                    plan: Arc::clone(&root),
+                    schema: root.schema(),
+                    batches,
+                    ordered,
+                });
         let error = match (expected, actual) {
             (Ok(expected), Ok(actual)) => {
                 if let Err(message) = compare_outputs(&expected, &actual) {
@@ -1495,18 +1504,15 @@ pub(crate) mod test_support {
         let plan = df.create_physical_plan().await.unwrap();
         let operator = lower(&plan).unwrap();
         let operators = NativeOperators::of(&operator);
-        let root = Arc::new(PipelineRootExec::try_new(operator, plan).unwrap());
-        let actual = collect(
-            Arc::clone(&root) as Arc<dyn ExecutionPlan>,
-            native.task_ctx(),
-        )
-        .await
-        .map(|batches| EngineOutput {
-            plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
-            schema: root.schema(),
-            batches,
-            ordered,
-        });
+        let root = executable(operator, plan).unwrap();
+        let actual = collect(Arc::clone(&root), native.task_ctx())
+            .await
+            .map(|batches| EngineOutput {
+                plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+                schema: root.schema(),
+                batches,
+                ordered,
+            });
         let error = match (expected, actual) {
             (Ok(expected), Ok(actual)) => {
                 if let Err(message) = compare_outputs(&expected, &actual) {
@@ -1794,6 +1800,22 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// The plan that executes `operator`, the lowering of `plan` (see
+    /// [`lower`]): a `PipelineRootExec`, or if `operator` executes everything
+    /// in DataFusion (a `BridgeOperator`), the plan it executes, as a planner
+    /// would not run a pipeline for it (and a `PipelineRootExec` checks that
+    /// the batches have its schema exactly, which DataFusion's do not always:
+    /// Arrow's `filter` renames the fields of run-end encoded arrays).
+    pub(crate) fn executable(
+        operator: Arc<dyn PhysicalOperator>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if let Some(bridge) = operator.downcast_ref::<BridgeOperator>() {
+            return Ok(Arc::clone(bridge.plan()));
+        }
+        Ok(Arc::new(PipelineRootExec::try_new(operator, plan)?))
+    }
+
     /// The number of rows of `plan`, executed on a task, or its error, or the
     /// message of its panic.
     pub(crate) async fn outcome(
@@ -1828,8 +1850,7 @@ pub(crate) mod test_support {
         let operator = lower(&plan).unwrap();
         let operators = NativeOperators::of(&operator);
         assert_eq!((operators.filters, operators.projections), (0, 0));
-        let lowered =
-            Arc::new(PipelineRootExec::try_new(operator, Arc::clone(&plan)).unwrap());
+        let lowered = executable(operator, Arc::clone(&plan)).unwrap();
         let expected = outcome(plan, Arc::clone(&task_ctx)).await;
         assert_eq!(outcome(lowered, task_ctx).await, expected);
         expected
@@ -1899,6 +1920,37 @@ pub(crate) mod test_support {
             vec![Arc::new(Int32Array::from(x.to_vec())), Arc::new(f)],
         )
         .unwrap()
+    }
+
+    /// A batch of 8 rows of `x` (`Int32`), alternately `1` and `0`, and of `r`,
+    /// run-end encoded values whose child fields have other names than
+    /// Arrow's (`ends` and `samples`).
+    pub(crate) fn runs_with_named_fields() -> RecordBatch {
+        let ends = Int32Array::from(vec![2, 4, 6, 8]);
+        let samples = Int32Array::from(vec![1, 2, 3, 4]);
+        let data_type = DataType::RunEndEncoded(
+            Arc::new(Field::new("ends", DataType::Int32, false)),
+            Arc::new(Field::new("samples", DataType::Int32, true)),
+        );
+        let data = arrow::array::ArrayData::try_new(
+            data_type.clone(),
+            8,
+            None,
+            0,
+            vec![],
+            vec![
+                arrow::array::Array::to_data(&ends),
+                arrow::array::Array::to_data(&samples),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("r", data_type, true),
+        ]));
+        let x = Int32Array::from_iter_values((0..8).map(|row| i32::from(row % 2 == 0)));
+        RecordBatch::try_new(schema, vec![Arc::new(x), arrow::array::make_array(data)])
+            .unwrap()
     }
 
     /// A constant fixed-size list of 8 values, one run of `42` with 16-bit run
@@ -3724,18 +3776,40 @@ mod tests {
             (
                 DataType::RunEndEncoded(
                     Arc::new(Field::new("run_ends", DataType::Int16, false)),
-                    field(DataType::Utf8),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
                 ),
                 true,
             ),
             (
                 DataType::RunEndEncoded(
                     Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                    field(DataType::Utf8),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
                 ),
                 false,
             ),
             (DataType::Utf8, false),
+            // Arrow's `filter` renames the fields of run-end encoded arrays.
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("ends", DataType::Int32, false)),
+                    field(DataType::Utf8),
+                ),
+                true,
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
+                    Arc::new(Field::new("values", DataType::Utf8, false)),
+                ),
+                true,
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                ),
+                false,
+            ),
         ] {
             assert_eq!(may_fail_to_coalesce(&data_type), fails, "{data_type}");
         }
@@ -4285,6 +4359,31 @@ mod tests {
             assert_native_plan_parity_with_config(|| plan("s"), false, config()).await;
         assert!(error.unwrap().contains("Divide by zero"));
         assert_eq!((operators.filters, operators.projections), (1, 1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_runs_with_named_fields_stay_in_datafusion() {
+        // Arrow's `filter` rebuilds run-end encoded arrays with its own names
+        // of fields, so the output of `FilterExec` does not have its type any
+        // more (and its coalescer fails); a native filter keeps the type.
+        let batch = runs_with_named_fields();
+        let schema = batch.schema();
+        let plan = || {
+            filter_exec(
+                "x > 0",
+                scan_batches(&schema, std::slice::from_ref(&batch)),
+                None,
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let task_ctx = Arc::new(TaskContext::default());
+        let datafusion = outcome(plan(), Arc::clone(&task_ctx)).await;
+        assert_eq!(
+            assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+            datafusion
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
