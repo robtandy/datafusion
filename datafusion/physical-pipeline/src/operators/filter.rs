@@ -157,12 +157,14 @@ impl PhysicalFilter {
     ///   DataFusion must evaluate it on the batches of the input plan of
     ///   `exec`;
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
-    ///   (or run ends of less than 32 bits), at any depth: `FilterExec`
-    ///   coalesces its output batches, merging the dictionaries of distinct
-    ///   batches, which fails if they have more values than the keys can
-    ///   index (e.g. two batches of 100 distinct values, with `Int8` keys).
-    ///   Whether it fails depends on the batches of the input plan, and the
-    ///   native filter does not coalesce its output;
+    ///   (or run ends of less than 32 bits), or lists with 32-bit offsets, at
+    ///   any depth: `FilterExec` coalesces its output batches, merging the
+    ///   dictionaries of distinct batches, which fails if they have more values
+    ///   than the keys can index (e.g. two batches of 100 distinct values, with
+    ///   `Int8` keys), and adding up the offsets of lists, which fails beyond
+    ///   `i32::MAX` values (e.g. two lists of `1 << 30` nulls). Whether it
+    ///   fails depends on the batches of the input plan, and the native filter
+    ///   does not coalesce its output;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -331,7 +333,7 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
         .find(|field| may_fail_to_coalesce(field.data_type()))
     {
         return Some(format!(
-            "it may fail to coalesce the dictionaries or run ends of its output column '{}'",
+            "it may fail to coalesce the dictionaries, run ends or lists of its output column '{}'",
             field.name()
         ));
     }
@@ -361,8 +363,10 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
 /// Whether `FilterExec` may fail to coalesce batches of `data_type`, at any
 /// depth: it concatenates the arrays of the batches it coalesces, which
 /// merges the dictionaries of distinct batches, and fails when their keys
-/// cannot index all of their values (keys of less than 32 bits), and adds up
-/// run ends (run ends of less than 32 bits).
+/// cannot index all of their values (keys of less than 32 bits), adds up run
+/// ends (run ends of less than 32 bits), and the offsets of lists (32-bit
+/// offsets, which lists of nulls overflow without memory). The 32-bit offsets
+/// of strings and binaries overflow too, but on more than 2 GiB of data.
 fn may_fail_to_coalesce(data_type: &DataType) -> bool {
     let narrow = |index: &DataType| {
         !matches!(
@@ -377,12 +381,12 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
         DataType::RunEndEncoded(run_ends, values) => {
             narrow(run_ends.data_type()) || may_fail_to_coalesce(values.data_type())
         }
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
+        // Their 32-bit offsets overflow on more than `i32::MAX` values, which
+        // need no memory if they are nulls.
+        DataType::List(_) | DataType::ListView(_) | DataType::Map(..) => true,
+        DataType::LargeList(field)
         | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => may_fail_to_coalesce(field.data_type()),
+        | DataType::FixedSizeList(field, _) => may_fail_to_coalesce(field.data_type()),
         DataType::Struct(fields) => fields
             .iter()
             .any(|field| may_fail_to_coalesce(field.data_type())),
@@ -1684,6 +1688,37 @@ pub(crate) mod test_support {
         Arc::new(BinaryExpr::new(physical_expr("x = 0", schema), Or, inner))
     }
 
+    /// Two batches of 512 rows of `x` (`Int32`), `1` on the first 256 rows and
+    /// `0` on the others, and of `l`, lists of nulls, empty but on the first
+    /// row, a list of `1 << 30` nulls (which take no memory).
+    pub(crate) fn long_lists_of_nulls() -> Vec<RecordBatch> {
+        let field = Arc::new(Field::new_list_field(DataType::Null, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("l", DataType::List(Arc::clone(&field)), true),
+        ]));
+        (0..2)
+            .map(|_| {
+                let x = Int32Array::from_iter_values(
+                    (0..512).map(|row| i32::from(row < 256)),
+                );
+                let offsets = arrow::buffer::OffsetBuffer::from_lengths(
+                    std::iter::once(1 << 30).chain(std::iter::repeat_n(0, 511)),
+                );
+                let nulls = Arc::new(arrow::array::NullArray::new(1 << 30));
+                let l = arrow::array::ListArray::try_new(
+                    Arc::clone(&field),
+                    offsets,
+                    nulls,
+                    None,
+                )
+                .unwrap();
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(x), Arc::new(l)])
+                    .unwrap()
+            })
+            .collect()
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -2037,9 +2072,13 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StringViewArray};
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{Field, Schema};
+    use datafusion_execution::TaskContext;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::collect;
     use datafusion_physical_plan::filter::batch_filter;
     use datafusion_physical_plan::sorts::sort::SortExec;
+
+    use crate::bridge::PipelineRootExec;
 
     use crate::test_utils::test_session_config;
 
@@ -3457,7 +3496,14 @@ mod tests {
             (utf8(DataType::Int32), false),
             (utf8(DataType::UInt64), false),
             (DataType::List(field(utf8(DataType::Int8))), true),
-            (DataType::List(field(utf8(DataType::Int32))), false),
+            // Lists of more than `i32::MAX` values overflow their offsets (lists
+            // of nulls take no memory).
+            (DataType::List(field(DataType::Null)), true),
+            (DataType::List(field(DataType::Int32)), true),
+            (DataType::ListView(field(DataType::Int32)), true),
+            (DataType::LargeList(field(DataType::Null)), false),
+            (DataType::LargeList(field(utf8(DataType::Int32))), false),
+            (DataType::LargeList(field(utf8(DataType::Int8))), true),
             (
                 DataType::Struct(vec![field(utf8(DataType::UInt8))].into()),
                 true,
@@ -3856,6 +3902,70 @@ mod tests {
             let (_, operators) = assert_native_parity_with_setup(&sql, setup).await;
             assert_eq!(operators.filters + operators.projections, 0, "{sql}");
         }
+    }
+
+    /// The number of rows of `plan`, executed on a task, or its error, or the
+    /// message of its panic.
+    async fn outcome(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+    ) -> std::result::Result<usize, String> {
+        match datafusion_common_runtime::SpawnedTask::spawn(collect(plan, task_ctx))
+            .join()
+            .await
+        {
+            Ok(Ok(batches)) => Ok(batches.iter().map(RecordBatch::num_rows).sum()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(join) if join.is_panic() => {
+                let panic = join.into_panic();
+                Err(panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default())
+            }
+            Err(join) => Err(join.to_string()),
+        }
+    }
+
+    /// Execute `plan` with DataFusion and lowered (see [`lower`]), each on a
+    /// task, and assert that the outcomes are the same, with no native filter.
+    async fn assert_same_outcome_in_datafusion(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+    ) -> std::result::Result<usize, String> {
+        let operator = lower(&plan).unwrap();
+        assert_eq!(NativeOperators::of(&operator).filters, 0);
+        let lowered =
+            Arc::new(PipelineRootExec::try_new(operator, Arc::clone(&plan)).unwrap());
+        let expected = outcome(plan, Arc::clone(&task_ctx)).await;
+        assert_eq!(outcome(lowered, task_ctx).await, expected);
+        expected
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_whose_output_lists_may_overflow_stay_in_datafusion() {
+        // `FilterExec` coalesces the first 256 rows of both batches into one,
+        // whose lists have `2 << 30` nulls: more than their 32-bit offsets can
+        // count, and Arrow's `concat` panics. The native filter does not
+        // coalesce its output: it returned the 512 rows.
+        let batches = long_lists_of_nulls();
+        let schema = batches[0].schema();
+        let plan = filter_exec("x > 0", scan_batches(&schema, &batches), None);
+        let exec = plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let task_ctx = Arc::new(TaskContext::default());
+        let overflow = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        assert!(overflow.unwrap_err().contains("offset overflow"));
+
+        // The same in SQL, on one target partition.
+        let config = test_session_config().with_target_partitions(1);
+        let ctx = crate::test_utils::datafusion_context(config);
+        register_partitions(&ctx, "lists", vec![batches]).unwrap();
+        let df = ctx.sql("SELECT * FROM lists WHERE x > 0").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+        let overflow = assert_same_outcome_in_datafusion(plan, ctx.task_ctx()).await;
+        assert!(overflow.unwrap_err().contains("offset overflow"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
