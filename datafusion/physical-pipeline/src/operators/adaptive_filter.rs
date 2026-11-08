@@ -58,6 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
+use arrow::compute::{CastOptions, cast_with_options};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
@@ -338,8 +339,9 @@ pub enum Fallibility {
     /// It never fails.
     Infallible,
     /// It fails whenever it is evaluated, even without rows, e.g.
-    /// `s ~ 'a{1000000}'`, whose constant pattern is too big to compile, or a
-    /// comparison of types that Arrow cannot compare.
+    /// `s ~ 'a{1000000}'`, whose constant pattern is too big to compile, or an
+    /// operation on types that Arrow does not support (e.g. a comparison of
+    /// dictionaries of dictionaries, or a cast of booleans into a dictionary).
     Uniform,
     /// It may fail on some rows and not on others, e.g. `10 / x`.
     PerRow,
@@ -381,22 +383,16 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         return match binary.op() {
             And | Or => Infallible,
             Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom => {
-                match (
-                    binary.left().data_type(schema),
-                    binary.right().data_type(schema),
-                ) {
-                    (Ok(left), Ok(right)) => {
-                        comparison_fallibility(&left, *binary.op(), &right)
-                    }
-                    _ => PerRow,
-                }
+                binary_fallibility(binary, schema)
             }
             Plus | Minus | Multiply
                 if wraps_on_overflow(binary) && is_number(binary, schema) =>
             {
-                Infallible
+                binary_fallibility(binary, schema)
             }
-            Divide | Modulo if is_safe_division(binary, schema) => Infallible,
+            Divide | Modulo if is_safe_division(binary, schema) => {
+                binary_fallibility(binary, schema)
+            }
             LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch | RegexMatch
             | RegexIMatch | RegexNotMatch | RegexNotIMatch
                 if is_constant(binary.right()) =>
@@ -434,9 +430,7 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         }
         return value_types
             .iter()
-            .map(|value_type| {
-                comparison_fallibility(&data_type, Operator::Eq, value_type)
-            })
+            .map(|value_type| operation_fallibility(&data_type, Operator::Eq, value_type))
             .fold(Infallible, Ord::max);
     }
     if expr.is::<Column>()
@@ -455,7 +449,9 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
 /// `CastExpr::is_bigger_cast`), including the values of a dictionary that it
 /// unpacks, and into the values of a dictionary that it packs a constant
 /// into, or values that the keys of the dictionary can always index (keys of
-/// 32 bits or more: a batch has fewer rows than that).
+/// 32 bits or more: a batch has fewer rows than that), and if Arrow supports
+/// it at all: Arrow cannot pack some values into a dictionary (e.g. booleans),
+/// whatever the values, so such a cast fails uniformly.
 fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
     let Ok(from) = cast.expr().data_type(schema) else {
         return Fallibility::PerRow;
@@ -478,10 +474,19 @@ fn cast_fallibility(cast: &CastExpr, schema: &Schema) -> Fallibility {
         ),
         to => (to, true),
     };
-    if keys_fit && CastExpr::check_bigger_cast(to_values, from_values) {
-        Fallibility::Infallible
-    } else {
-        Fallibility::PerRow
+    if !(keys_fit && CastExpr::check_bigger_cast(to_values, from_values)) {
+        return Fallibility::PerRow;
+    }
+    // Whether Arrow supports the cast at all (e.g. it cannot pack booleans
+    // into a dictionary) does not depend on the values: casting a null value
+    // tells, without evaluating the cast expression.
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    match cast_with_options(&new_null_array(&from, 1), cast.cast_type(), &options) {
+        Ok(_) => Fallibility::Infallible,
+        Err(_) => Fallibility::Uniform,
     }
 }
 
@@ -511,15 +516,26 @@ fn constant_pattern_fallibility(
     }
 }
 
-/// How comparing values of types `left` and `right` with `op` can fail: only
-/// if Arrow cannot compare these types (e.g. dictionaries of dictionaries),
-/// whatever the values, and then whenever it is evaluated. Comparing null
-/// values of these types tells, without evaluating the compared expressions.
-fn comparison_fallibility(
-    left: &DataType,
-    op: Operator,
-    right: &DataType,
-) -> Fallibility {
+/// How `binary`, a comparison or an operation that cannot fail on the values
+/// of its operands (see [`node_fallibility`]), can fail: see
+/// [`operation_fallibility`].
+fn binary_fallibility(binary: &BinaryExpr, schema: &Schema) -> Fallibility {
+    match (
+        binary.left().data_type(schema),
+        binary.right().data_type(schema),
+    ) {
+        (Ok(left), Ok(right)) => operation_fallibility(&left, *binary.op(), &right),
+        _ => Fallibility::PerRow,
+    }
+}
+
+/// How the comparison or operation `op` of values of types `left` and
+/// `right`, which cannot fail on the values, can fail: only if Arrow does not
+/// support these types (e.g. it cannot compare dictionaries of dictionaries,
+/// nor add integers of different types), whatever the values, and then
+/// whenever it is evaluated. Evaluating it on null values of these types
+/// tells, without evaluating the operands.
+fn operation_fallibility(left: &DataType, op: Operator, right: &DataType) -> Fallibility {
     let schema = Schema::new(vec![
         Field::new("left", left.clone(), true),
         Field::new("right", right.clone(), true),
@@ -1051,6 +1067,21 @@ mod tests {
         assert!(depends_on_batches(&pack(DataType::Int8), &schema));
         assert_eq!(fallibility(&pack(DataType::Int32), &schema), Infallible);
         assert!(!depends_on_batches(&pack(DataType::Int32), &schema));
+        // Arrow cannot pack booleans into a dictionary, whatever the values.
+        let booleans: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
+            physical_expr("e", &schema),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean)),
+            None,
+        ));
+        assert_eq!(fallibility(&booleans, &schema), Uniform);
+        assert!(depends_on_batches(&booleans, &schema));
+        // Nor add integers of different types.
+        let mixed: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            physical_expr("a", &schema),
+            Operator::Plus,
+            physical_expr("b", &schema),
+        ));
+        assert_eq!(fallibility(&mixed, &schema), Uniform);
     }
 
     #[test]

@@ -1664,6 +1664,26 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![a, b]).unwrap()
     }
 
+    /// `x = 0` packed into a dictionary of booleans, on `schema`: Arrow cannot
+    /// pack booleans into a dictionary, so this fails whenever it is
+    /// evaluated.
+    pub(crate) fn packed_booleans(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+            physical_expr("x = 0", schema),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean)),
+            None,
+        ))
+    }
+
+    /// `x = 0 OR (y = 0 OR packed_booleans IS NOT NULL)`, on `schema`.
+    pub(crate) fn nested_packed_booleans(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        use datafusion_expr::Operator::Or;
+        use datafusion_physical_expr::expressions::{BinaryExpr, IsNotNullExpr};
+        let packed = Arc::new(IsNotNullExpr::new(packed_booleans(schema)));
+        let inner = Arc::new(BinaryExpr::new(physical_expr("y = 0", schema), Or, packed));
+        Arc::new(BinaryExpr::new(physical_expr("x = 0", schema), Or, inner))
+    }
+
     /// Two batches of a dictionary column `d` (`Int32` keys) with two rows,
     /// `"1"` and `"x"`, then `"2"` and `"y"`, with distinct dictionaries.
     pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
@@ -3781,6 +3801,60 @@ mod tests {
             let (error, operators) = assert_native_plan_parity(plan, true).await;
             assert!(error.unwrap().contains("Divide by zero"));
             assert_eq!(operators.filters, 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_that_arrow_cannot_evaluate_stay_in_datafusion() {
+        // On one batch of `(x, y) = (0, 1)` then `(1, 0)` rows, DataFusion
+        // evaluates the cast, as neither `x = 0` nor `y = 0` is true on all of
+        // its rows, and fails; on the chunks of a pipeline, `x = 0` and then
+        // `y = 0` are true on all rows.
+        let mixed = xys(&[((0, 1), 2048), ((1, 0), 2048)]);
+        let schema = mixed.schema();
+        // DataFusion also evaluates it on an empty batch, which a pipeline
+        // skips.
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let nested = || nested_packed_booleans(&schema);
+        let alone = || -> Arc<dyn PhysicalExpr> {
+            Arc::new(datafusion_physical_expr::expressions::IsNotNullExpr::new(
+                packed_booleans(&schema),
+            ))
+        };
+        for (predicate, batch) in [
+            (&nested as &dyn Fn() -> Arc<dyn PhysicalExpr>, &mixed),
+            (&alone, &empty),
+        ] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    FilterExec::try_new(
+                        predicate(),
+                        scan_batches(&schema, std::slice::from_ref(batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let filter_plan = plan();
+            let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec));
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            let error = error.unwrap();
+            assert!(error.contains("dictionary packing"), "{error}");
+            assert_eq!(operators.filters, 0);
+        }
+        // In SQL, the `OR`s are reassociated, but the filter and the
+        // projection stay in DataFusion.
+        let setup = async |ctx: &datafusion::prelude::SessionContext| {
+            register_partitions(ctx, "t", vec![vec![mixed.clone()]])
+        };
+        let predicate = "x = 0 OR (y = 0 OR \
+            arrow_cast(x = 0, 'Dictionary(Int32, Boolean)') IS NOT NULL)";
+        for sql in [
+            format!("SELECT * FROM t WHERE {predicate}"),
+            format!("SELECT {predicate} AS m FROM t"),
+        ] {
+            let (_, operators) = assert_native_parity_with_setup(&sql, setup).await;
+            assert_eq!(operators.filters + operators.projections, 0, "{sql}");
         }
     }
 

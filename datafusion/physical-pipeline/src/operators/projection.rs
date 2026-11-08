@@ -1206,6 +1206,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_that_arrow_cannot_evaluate_stay_in_datafusion() {
+        // Arrow cannot pack booleans into a dictionary: the cast fails whenever
+        // it is evaluated, which depends on DataFusion's batches (see the
+        // test of the same name for filters), empty ones included.
+        let mixed = xys(&[((0, 1), 2048), ((1, 0), 2048)]);
+        let schema = mixed.schema();
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        for (expr, batch) in [
+            (nested_packed_booleans(&schema), &mixed),
+            (packed_booleans(&schema), &empty),
+        ] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(Arc::clone(&expr), "m")],
+                        scan_batches(&schema, std::slice::from_ref(batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let projection_plan = plan();
+            let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(
+                !PhysicalProjection::supports_projection_exec(exec),
+                "{expr}"
+            );
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(error.unwrap().contains("dictionary packing"), "{expr}");
+            assert_eq!(operators.projections, 0, "{expr}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_dictionary_values_stay_in_datafusion() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that
