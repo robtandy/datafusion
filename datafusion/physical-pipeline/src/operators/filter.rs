@@ -191,6 +191,14 @@ impl PhysicalFilter {
     /// are evaluated before the limit is reached, and so the errors, depend on
     /// these pulls, which a pipeline (on several threads, with a cache of
     /// small chunks) does not reproduce.
+    ///
+    /// Likewise, a planner must keep a filter or a projection with a part that
+    /// may fail (see
+    /// [`failing_parts`](super::adaptive_filter::failing_parts)) in DataFusion,
+    /// with its input plan, if native operators below it in the same pipeline
+    /// have parts that may fail too: DataFusion evaluates each operator on a
+    /// whole batch before the next one, a pipeline each chunk with all of its
+    /// operators, so which error comes first depends on the batches.
     pub fn supports_filter_exec(exec: &FilterExec) -> bool {
         unsupported_filter_exec(exec).is_none()
     }
@@ -948,7 +956,7 @@ pub(crate) mod test_support {
         ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
         OperatorState, PhysicalOperator,
     };
-    use crate::operators::adaptive_filter::depends_on_batches;
+    use crate::operators::adaptive_filter::{depends_on_batches, failing_parts};
     use crate::operators::caching::CachingOperator;
     use crate::operators::projection::PhysicalProjection;
     use crate::test_utils::{
@@ -998,21 +1006,36 @@ pub(crate) mod test_support {
             // threads, with a cache of small chunks) does not reproduce.
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
+        // DataFusion evaluates each operator on a whole batch before the next
+        // one, a pipeline each chunk with all of its operators: if native
+        // operators of a pipeline have several parts that may fail, which
+        // error comes first depends on the batches.
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
             if PhysicalFilter::supports_filter_exec(filter) {
                 let input = lower_below(filter.input(), filter.fetch().is_some())?;
-                let filter: Arc<dyn PhysicalOperator> =
-                    Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
-                return Ok(Arc::new(CachingOperator::new(filter)));
+                let own = failing_parts(filter.predicate(), &filter.input().schema());
+                if own == 0 || native_failing_parts(&input) == 0 {
+                    let filter: Arc<dyn PhysicalOperator> =
+                        Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
+                    return Ok(Arc::new(CachingOperator::new(filter)));
+                }
             }
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             if PhysicalProjection::supports_projection_exec(projection) {
                 let input = lower_below(projection.input(), false)?;
-                return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
-                    projection, input,
-                )?));
+                let input_schema = projection.input().schema();
+                let own = projection
+                    .expr()
+                    .iter()
+                    .map(|expr| failing_parts(&expr.expr, &input_schema))
+                    .sum::<usize>();
+                if own == 0 || native_failing_parts(&input) == 0 {
+                    return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
+                        projection, input,
+                    )?));
+                }
             }
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
@@ -1029,6 +1052,32 @@ pub(crate) mod test_support {
             }
         }
         Ok(Arc::new(BridgeOperator::new(bridged_plan(plan, limited)?)))
+    }
+
+    /// The parts that may fail (see [`failing_parts`]) of the native filters
+    /// and projections of `operator`, which evaluate the same chunks one after
+    /// the other, down to the operators that DataFusion or a source executes.
+    fn native_failing_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
+        let input_schema = || operator.children()[0].schema();
+        let own = if let Some(filter) = operator.downcast_ref::<PhysicalFilter>() {
+            failing_parts(filter.predicate(), &input_schema())
+        } else if let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
+            let input_schema = input_schema();
+            projection
+                .exprs()
+                .iter()
+                .map(|(expr, _)| failing_parts(expr, &input_schema))
+                .sum()
+        } else if operator.is::<CachingOperator>() {
+            0
+        } else {
+            return 0;
+        };
+        operator
+            .children()
+            .iter()
+            .map(native_failing_parts)
+            .fold(own, usize::saturating_add)
     }
 
     /// Whether `plan` reads all of its input, even if a limit above it stops
@@ -1078,15 +1127,13 @@ pub(crate) mod test_support {
             _ => Arc::new(Schema::empty()),
         };
         let mut batch_dependent = false;
-        let mut failing_parts = 0_usize;
+        let mut parts = 0_usize;
         plan.apply_expressions(&mut |expr| {
             batch_dependent |= depends_on_batches(expr, &schema);
-            failing_parts = failing_parts.saturating_add(
-                crate::operators::adaptive_filter::failing_parts(expr, &schema),
-            );
+            parts = parts.saturating_add(failing_parts(expr, &schema));
             Ok(TreeNodeRecursion::Continue)
         })?;
-        Ok(batch_dependent || failing_parts > 1)
+        Ok(batch_dependent || parts > 1)
     }
 
     /// `plan`, to be executed by DataFusion, with its children lowered: a
@@ -4180,6 +4227,64 @@ mod tests {
             assert_native_plan_parity_with_config(plan, false, config).await;
         assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
         assert_eq!(operators.filters, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn chains_with_several_failures_stay_in_datafusion() {
+        // `ProjectionExec(x, CAST(s AS INT))` casts all rows of the batch, and
+        // fails on `"invalid"`, before `FilterExec(10 / x > 1)` sees the batch;
+        // a pipeline evaluates both operators on its first chunk first, and
+        // divides by zero.
+        let batch = xss(&[((0, "1"), 2048), ((1, "invalid"), 2048)]);
+        let schema = batch.schema();
+        let plan = |cast: &str| {
+            let projection = Arc::new(
+                datafusion_physical_plan::projection::ProjectionExec::try_new(
+                    [
+                        datafusion_physical_expr::projection::ProjectionExpr::new(
+                            physical_expr("x", &schema),
+                            "x",
+                        ),
+                        datafusion_physical_expr::projection::ProjectionExpr::new(
+                            physical_expr(cast, &schema),
+                            "c",
+                        ),
+                    ],
+                    scan(&batch),
+                )
+                .unwrap(),
+            );
+            filter_exec("10 / x > 1", projection, None)
+        };
+        // Each operator alone could be lowered.
+        let filter_plan = plan("CAST(s AS INT)");
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let projection = exec
+            .input()
+            .downcast_ref::<datafusion_physical_plan::projection::ProjectionExec>()
+            .unwrap();
+        assert!(
+            crate::operators::projection::PhysicalProjection::supports_projection_exec(
+                projection
+            )
+        );
+        // On one thread, a pipeline evaluates the first chunk first.
+        let config =
+            || datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) = assert_native_plan_parity_with_config(
+            || plan("CAST(s AS INT)"),
+            false,
+            config(),
+        )
+        .await;
+        assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
+        assert_eq!((operators.filters, operators.projections), (0, 0));
+        // Without a part that may fail in the projection, both are lowered.
+        let (error, operators) =
+            assert_native_plan_parity_with_config(|| plan("s"), false, config()).await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        assert_eq!((operators.filters, operators.projections), (1, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

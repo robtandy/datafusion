@@ -106,11 +106,12 @@ impl PhysicalProjection {
     /// memory (see `can_gather`).
     ///
     /// Below a limit that stops the execution early (e.g. a
-    /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion
-    /// (see
+    /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion,
+    /// and so it must a projection with a part that may fail above native
+    /// operators of the same pipeline with parts that may fail (see
     /// [`supports_filter_exec`](super::filter::PhysicalFilter::supports_filter_exec)):
-    /// the rows evaluated before the limit is reached, and so the errors,
-    /// depend on how the input is pulled.
+    /// the rows evaluated before the limit is reached, and which error comes
+    /// first, depend on DataFusion's batches.
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
         let input_schema = exec.input().schema();
         let failing_parts = exec
