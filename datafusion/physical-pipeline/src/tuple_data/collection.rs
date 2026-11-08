@@ -32,7 +32,6 @@ use arrow::array::{
 use arrow::buffer::{
     BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer,
 };
-use arrow::compute::concat;
 use arrow::datatypes::{
     ArrowNativeType, BinaryType, BinaryViewType, ByteArrayType, ByteViewType, DataType,
     LargeBinaryType, LargeUtf8Type, SchemaRef, StringViewType, Utf8Type,
@@ -46,7 +45,7 @@ use datafusion_common::{
 
 use super::layout::{
     ColumnLayout, ColumnStorage, HASH_WIDTH, MAX_INLINE_LEN, MAX_ROWS_PER_BLOCK,
-    TupleDataLayout, VAR_LEN_SLOT_WIDTH, has_run_end_encoded, new_dictionary,
+    RowCodec, TupleDataLayout, VAR_LEN_SLOT_WIDTH, has_run_end_encoded, new_dictionary,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
@@ -894,14 +893,11 @@ impl ScatterSource {
 
 impl SourceColumn {
     fn try_new(column: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
-        let (values, indices, key_nulls) = if column.is_dictionary() {
+        let (values, mut dictionary, key_nulls) = if column.is_dictionary() {
             // The nulls of a dictionary array are the nulls of its keys.
             let key_nulls = array.nulls().filter(|n| n.null_count() > 0).cloned();
-            // Encode only the values that the rows refer to.
-            let used_only = matches!(column.storage(), ColumnStorage::Encoded);
-            let DictionaryValues { values, indices } =
-                DictionaryValues::try_new(array, used_only)?;
-            (values, Some(indices), key_nulls)
+            let dictionary = DictionaryValues::try_new(array)?;
+            (Arc::clone(&dictionary.values), Some(dictionary), key_nulls)
         } else {
             (Arc::clone(array), None, None)
         };
@@ -921,11 +917,14 @@ impl SourceColumn {
                 let codec = column.codec().ok_or_else(|| {
                     internal_datafusion_err!("Encoded column without a row codec")
                 })?;
-                SourceData::Encoded(
-                    codec.converter.convert_columns(&[Arc::clone(&values)])?,
-                )
+                SourceData::Encoded(match &mut dictionary {
+                    // Only the values that the rows refer to.
+                    Some(dictionary) => dictionary.encode(codec, array)?,
+                    None => codec.converter.convert_columns(&[Arc::clone(&values)])?,
+                })
             }
         };
+        let indices = dictionary.map(|dictionary| dictionary.indices);
         Ok(Self {
             logical: false,
             values,
@@ -979,11 +978,8 @@ pub(crate) struct DictionaryValues {
 }
 
 impl DictionaryValues {
-    /// The values of the rows of the dictionary array `array`. With
-    /// `used_only`, if the dictionary has more values than rows, `values`
-    /// holds only the values that rows with a valid key refer to (e.g. to
-    /// encode them).
-    pub(crate) fn try_new(array: &ArrayRef, used_only: bool) -> Result<Self> {
+    /// The values of the rows of the dictionary array `array`.
+    pub(crate) fn try_new(array: &ArrayRef) -> Result<Self> {
         let Some(dictionary) = array.as_any_dictionary_opt() else {
             return internal_err!(
                 "Expected a dictionary array, got {}",
@@ -998,20 +994,31 @@ impl DictionaryValues {
                 indices: vec![0; array.len()],
             });
         }
-        // In bounds also for the null keys, whose key values can be any.
-        let mut indices = dictionary.normalized_keys();
-        if !used_only || values.len() <= indices.len() {
-            return Ok(Self {
-                values: Arc::clone(values),
-                indices,
-            });
+        Ok(Self {
+            values: Arc::clone(values),
+            // In bounds also for the null keys, whose key values can be any.
+            indices: dictionary.normalized_keys(),
+        })
+    }
+
+    /// Encode the values with `codec`, and make `indices` the indices of the
+    /// encodings of the values of the rows (of the dictionary array `array`).
+    ///
+    /// If the dictionary has more values than rows, only the values that rows
+    /// with a valid key refer to are encoded, in order, slice by slice of
+    /// consecutive values: an array of these values (from Arrow's `take`, or
+    /// concatenated slices) could differ from them (`take` merges the runs
+    /// of equal run-end encoded values into runs of the value of their last
+    /// row, see `SourceColumn::logical`, which changes equal values that are
+    /// not identical, e.g. nulls of different union variants) or be too large
+    /// for their type (concatenated slices of run-end encoded values have a
+    /// value for every slice, e.g. a list each, whose run ends can overflow).
+    pub(crate) fn encode(&mut self, codec: &RowCodec, array: &ArrayRef) -> Result<Rows> {
+        let Self { values, indices } = self;
+        if values.len() <= indices.len() {
+            return Ok(codec.converter.convert_columns(&[Arc::clone(values)])?);
         }
-        // The values that rows with a valid key refer to, in order, as slices
-        // of consecutive values: Arrow's `take` would merge the runs of equal
-        // run-end encoded values into runs of the value of their last row
-        // (see `SourceColumn::logical`), changing equal values that are not
-        // identical (e.g. nulls of different union variants).
-        let keys = dictionary.keys();
+        let keys = array.as_any_dictionary().keys();
         let mut used = (0..indices.len())
             .filter(|&row| keys.is_valid(row))
             .map(|row| indices[row])
@@ -1021,16 +1028,16 @@ impl DictionaryValues {
         if used.is_empty() {
             used.push(0);
         }
-        let mut slices = Vec::new();
+        let mut encoded = codec.converter.empty_rows(used.len(), 0);
         let mut start = 0;
         for end in 1..=used.len() {
             if end == used.len() || used[end] != used[end - 1] + 1 {
                 let first = used[start];
-                slices.push(values.slice(first, used[end - 1] + 1 - first));
+                let slice = values.slice(first, used[end - 1] + 1 - first);
+                codec.converter.append(&mut encoded, &[slice])?;
                 start = end;
             }
         }
-        let values = concat(&slices.iter().map(AsRef::as_ref).collect::<Vec<_>>())?;
         for (row, index) in indices.iter_mut().enumerate() {
             *index = match keys.is_valid(row) {
                 // The position of the value among the used values.
@@ -1040,7 +1047,7 @@ impl DictionaryValues {
                 false => 0,
             };
         }
-        Ok(Self { values, indices })
+        Ok(encoded)
     }
 }
 
@@ -3238,6 +3245,54 @@ mod tests {
             );
             let err = collection.gather(&locations).unwrap_err();
             assert!(err.to_string().contains("run ends"), "{err}");
+        }
+    }
+
+    #[test]
+    fn dictionaries_of_shared_run_end_encoded_lists_are_not_expanded() {
+        use crate::tuple_data::PartitionedTupleData;
+
+        for dictionary in
+            crate::tuple_data::test_data::dictionaries_of_shared_run_end_encoded_lists()
+        {
+            let batch = RecordBatch::try_from_iter(vec![("d", dictionary)]).unwrap();
+            let rows = batch.num_rows() as u32;
+            for selection in [
+                (0..rows).collect(),
+                vec![1, 0],
+                (0..rows).rev().step_by(3).collect::<Vec<_>>(),
+            ] {
+                let chunk = chunk_with_selection(&batch, selection);
+                let expected = chunk.compact().unwrap();
+                let mut collection = collection_for(&batch, false);
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &expected);
+                let mut state = TupleDataScanState::new();
+                let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
+                assert_identical(&scanned.into_record_batch().unwrap(), &expected);
+
+                // Into 2 partitions, by the lowest bit of the row index.
+                let layout =
+                    Arc::new(TupleDataLayout::try_new(batch.schema(), true).unwrap());
+                let mut partitioned = PartitionedTupleData::try_new(layout, 1).unwrap();
+                let hashes = (0..chunk.len() as u64).map(|i| i << 63).collect::<Vec<_>>();
+                let locations = partitioned
+                    .append_chunk_with_locations(&chunk, &hashes)
+                    .unwrap();
+                for partition in 0..2 {
+                    let (rows, locations): (Vec<u32>, Vec<RowLocation>) = locations
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, location)| location.partition == partition)
+                        .map(|(row, location)| (row as u32, location.location))
+                        .unzip();
+                    let gathered =
+                        partitioned.partition(partition).gather(&locations).unwrap();
+                    let expected =
+                        chunk_with_selection(&expected, rows).compact().unwrap();
+                    assert_identical(&gathered, &expected);
+                }
+            }
         }
     }
 

@@ -371,14 +371,6 @@ impl RowCodec {
         self.decode_as(encoded, &self.flat_type)
     }
 
-    /// `values` (of the value type of the column) with every dictionary
-    /// replaced by its values, exactly as [`Self::decode_flat`] decodes
-    /// them.
-    pub(crate) fn flatten(&self, values: &ArrayRef) -> Result<ArrayRef> {
-        let rows = self.converter.convert_columns(&[Arc::clone(values)])?;
-        self.decode_flat(rows.iter().map(|row| row.data()))
-    }
-
     fn decode_as<'a>(
         &self,
         encoded: impl IntoIterator<Item = &'a [u8]>,

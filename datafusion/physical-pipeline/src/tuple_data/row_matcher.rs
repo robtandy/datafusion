@@ -287,12 +287,9 @@ impl RowMatcher {
 
 impl ProbeColumn {
     fn try_new(layout: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
-        let (values, indices) = if layout.is_dictionary() {
-            // Encode (or flatten) only the values that the rows refer to.
-            let used_only = matches!(layout.storage(), ColumnStorage::Encoded);
-            let DictionaryValues { values, indices } =
-                DictionaryValues::try_new(array, used_only)?;
-            (values, Some(indices))
+        let (values, mut dictionary) = if layout.is_dictionary() {
+            let dictionary = DictionaryValues::try_new(array)?;
+            (Arc::clone(&dictionary.values), Some(dictionary))
         } else {
             (Arc::clone(array), None)
         };
@@ -310,19 +307,26 @@ impl ProbeColumn {
                 let codec = layout.codec().ok_or_else(|| {
                     internal_datafusion_err!("Encoded column without a row codec")
                 })?;
+                let encoded = match &mut dictionary {
+                    // Only the values that the rows refer to.
+                    Some(dictionary) => dictionary.encode(codec, array)?,
+                    None => codec.converter.convert_columns(&[values])?,
+                };
                 if codec.compare_decoded {
                     // The row format distinguishes `-0.0` and `+0.0`, and
                     // the nulls of different union variants. The values are
                     // compared without dictionaries, as the candidates.
-                    ProbeData::Compared(normalize_floats(&codec.flatten(&values)?))
+                    let values =
+                        codec.decode_flat(encoded.iter().map(|row| row.data()))?;
+                    ProbeData::Compared(normalize_floats(&values))
                 } else {
-                    ProbeData::Encoded(codec.converter.convert_columns(&[values])?)
+                    ProbeData::Encoded(encoded)
                 }
             }
         };
         Ok(Self {
             nulls,
-            indices,
+            indices: dictionary.map(|dictionary| dictionary.indices),
             data,
         })
     }
@@ -1828,6 +1832,29 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(expected, vec![0], "{null_equality:?}");
             assert_eq!(sel, expected, "{null_equality:?}");
+        }
+    }
+
+    #[test]
+    fn dictionary_keys_of_shared_run_end_encoded_lists() {
+        use crate::tuple_data::test_data::dictionaries_of_shared_run_end_encoded_lists;
+
+        for keys in dictionaries_of_shared_run_end_encoded_lists() {
+            let len = keys.len();
+            for shift in [0, 1, 3, 600] {
+                let pairs = (0..len).map(|i| (i + shift) % len).collect::<Vec<_>>();
+                let [_, null] = assert_matches_join_key_comparator(&keys, &keys, &pairs);
+                if shift == 0 {
+                    // Every row is `IS NOT DISTINCT FROM` itself.
+                    assert_eq!(null.len(), len);
+                }
+            }
+            // Probe chunks with fewer rows than dictionary values.
+            for (offset, len) in [(0, 1), (3, 2), (510, 4)] {
+                let probe = keys.slice(offset, len);
+                let pairs = (0..len).map(|i| offset + (i * 7) % len).collect::<Vec<_>>();
+                assert_matches_join_key_comparator(&keys, &probe, &pairs);
+            }
         }
     }
 

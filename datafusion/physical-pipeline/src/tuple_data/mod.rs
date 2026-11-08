@@ -1194,6 +1194,46 @@ pub(crate) mod test_data {
         ]
     }
 
+    /// Dictionaries of 1,024 rows (keys `0, 2, ..., 2046`) of 2,048
+    /// `RunEndEncoded<Int16, FixedSizeList<RunEndEncoded<Int16, Float64>,
+    /// 32>>` values that share one list (in one run), or two lists (and with
+    /// null keys): materialized, the lists of the referenced values would
+    /// have 32,768 run-end encoded values, more than `Int16` run ends count.
+    pub(crate) fn dictionaries_of_shared_run_end_encoded_lists() -> Vec<ArrayRef> {
+        let lists = |values: Vec<f64>| -> ArrayRef {
+            let run_ends = (1..=values.len()).map(|i| (i * 32) as i16);
+            let runs = RunArray::<Int16Type>::try_new(
+                &Int16Array::from_iter_values(run_ends),
+                &Float64Array::from(values),
+            )
+            .unwrap();
+            let item = Arc::new(Field::new("item", runs.data_type().clone(), true));
+            Arc::new(FixedSizeListArray::try_new(item, 32, Arc::new(runs), None).unwrap())
+        };
+        let dictionary = |keys: Int16Array, run_ends: Vec<i16>, values: Vec<f64>| {
+            let shared = RunArray::<Int16Type>::try_new(
+                &Int16Array::from(run_ends),
+                &lists(values),
+            )
+            .unwrap();
+            Arc::new(
+                DictionaryArray::<Int16Type>::try_new(keys, Arc::new(shared)).unwrap(),
+            ) as ArrayRef
+        };
+        vec![
+            dictionary(
+                Int16Array::from_iter_values((0..1024).map(|i| i * 2)),
+                vec![2048],
+                vec![1.5],
+            ),
+            dictionary(
+                (0..1024).map(|i| (i % 5 != 4).then_some(i * 2)).collect(),
+                vec![1024, 2048],
+                vec![1.5, -0.0],
+            ),
+        ]
+    }
+
     /// Dictionaries with null keys of run-end encoded values (with a
     /// non-nullable values field) and of unions without nullable fields,
     /// which Arrow's `take` cannot take null indices of.
