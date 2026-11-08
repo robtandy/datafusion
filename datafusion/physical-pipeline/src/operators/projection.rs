@@ -1341,6 +1341,29 @@ mod tests {
             let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
             assert!(outcome.unwrap_err().contains("overflow"), "{expr}");
         }
+        // So do 16-bit run ends: a constant fixed-size list of 8 values in one
+        // run, broadcast to the rows, has 32768 values on the batch of 4096
+        // rows, and 16384 on a chunk of 2048.
+        let ints = xys(&[((0, 0), 4096)]);
+        let ints_schema = ints.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(constant_list_of_short_runs(), "m")],
+                    scan_batches(&ints_schema, std::slice::from_ref(&ints)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        assert!(
+            assert_same_outcome_in_datafusion(plan(), task_ctx)
+                .await
+                .is_err()
+        );
         // Lists of nulls cannot be gathered at all (see `can_gather`): a
         // projection of the column stays in DataFusion too, and returns the
         // 4096 rows (whose lists are not compared, as they have `1 << 31`

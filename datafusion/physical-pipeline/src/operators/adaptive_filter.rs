@@ -701,11 +701,12 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   `regexp_like(s, 'a{1000000}')` (unlike `regexp_count`, which only
 ///   compiles its pattern if there are rows);
 /// * a part of `expr` other than a column produces lists with 32-bit offsets
-///   (at any depth): building them overflows their offsets beyond `i32::MAX`
-///   values in a batch, which lists of nulls reach without memory, e.g. when
-///   `CASE WHEN x THEN a ELSE b END` merges lists of `a` and of `b`, or when a
-///   constant list is broadcast to the rows of a batch, so whether it fails
-///   depends on the number of rows of the batches;
+///   or run-end encoded arrays with run ends of less than 64 bits (at any
+///   depth): building them overflows their offsets or run ends beyond as many
+///   values in a batch as they can count, which nulls and runs reach without
+///   memory, e.g. when `CASE WHEN x THEN a ELSE b END` merges lists of `a` and
+///   of `b`, or when a constant list is broadcast to the rows of a batch, so
+///   whether it fails depends on the number of rows of the batches;
 /// * a part of `expr` that may fail is evaluated on, or produces,
 ///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
 ///   dictionary of `d`, even those that no row references (when DataFusion
@@ -767,13 +768,14 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
             fallibility == Fallibility::PerRow
                 && conditional.iter().any(|operand| Arc::ptr_eq(operand, child))
         })
-        // It builds lists with 32-bit offsets (a column only passes its lists
-        // on), which overflow beyond `i32::MAX` values in a batch, so whether
-        // it fails depends on the number of rows of the batches.
+        // It builds lists with 32-bit offsets or narrow run ends (a column
+        // only passes its own on), which overflow beyond as many values in a
+        // batch as they can count, so whether it fails depends on the number
+        // of rows of the batches.
         || (!expr.is::<Column>()
             && expr
                 .data_type(schema)
-                .is_ok_and(|data_type| contains_lists_with_32_bit_offsets(&data_type)))
+                .is_ok_and(|data_type| contains_narrow_lengths(&data_type)))
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -799,29 +801,29 @@ fn conditional_operands(expr: &Arc<dyn PhysicalExpr>) -> &[Arc<dyn PhysicalExpr>
     }
 }
 
-/// Whether arrays of `data_type` contain lists with 32-bit offsets (`List`,
-/// `ListView` or `Map`), at any depth. Building them (e.g. merging the
-/// branches of a `CASE`, or broadcasting a constant list to the rows of a
-/// batch) overflows their offsets beyond `i32::MAX` values, which lists of
-/// nulls reach without memory.
-fn contains_lists_with_32_bit_offsets(data_type: &DataType) -> bool {
+/// Whether arrays of `data_type` contain, at any depth, lists with 32-bit
+/// offsets (`List`, `ListView` or `Map`), or run-end encoded arrays with run
+/// ends of less than 64 bits: building them (e.g. merging the branches of a
+/// `CASE`, or broadcasting a constant to the rows of a batch) overflows the
+/// offsets or the run ends beyond as many values as they can count, which
+/// nulls and runs reach without memory.
+fn contains_narrow_lengths(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(_) | DataType::ListView(_) | DataType::Map(..) => true,
+        DataType::RunEndEncoded(run_ends, values) => {
+            run_ends.data_type() != &DataType::Int64
+                || contains_narrow_lengths(values.data_type())
+        }
         DataType::LargeList(field)
         | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _) => {
-            contains_lists_with_32_bit_offsets(field.data_type())
-        }
+        | DataType::FixedSizeList(field, _) => contains_narrow_lengths(field.data_type()),
         DataType::Struct(fields) => fields
             .iter()
-            .any(|field| contains_lists_with_32_bit_offsets(field.data_type())),
+            .any(|field| contains_narrow_lengths(field.data_type())),
         DataType::Union(fields, _) => fields
             .iter()
-            .any(|(_, field)| contains_lists_with_32_bit_offsets(field.data_type())),
-        DataType::Dictionary(_, values) => contains_lists_with_32_bit_offsets(values),
-        DataType::RunEndEncoded(_, values) => {
-            contains_lists_with_32_bit_offsets(values.data_type())
-        }
+            .any(|(_, field)| contains_narrow_lengths(field.data_type())),
+        DataType::Dictionary(_, values) => contains_narrow_lengths(values),
         _ => false,
     }
 }
@@ -1258,6 +1260,9 @@ mod tests {
         }
         let constant = crate::operators::filter::test_support::constant_list_of_nulls();
         assert!(depends_on_batches(&constant, &schema));
+        // So do run-end encoded arrays with run ends of less than 64 bits.
+        let runs = crate::operators::filter::test_support::constant_list_of_short_runs();
+        assert!(depends_on_batches(&runs, &schema));
     }
 
     #[test]

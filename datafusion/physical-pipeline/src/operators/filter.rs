@@ -1854,6 +1854,25 @@ pub(crate) mod test_support {
         .unwrap()
     }
 
+    /// A constant fixed-size list of 8 values, one run of `42` with 16-bit run
+    /// ends (`RunEndEncoded<Int16, Int32>`): broadcast to more than 4095 rows,
+    /// its values overflow the run ends.
+    pub(crate) fn constant_list_of_short_runs() -> Arc<dyn PhysicalExpr> {
+        let runs = arrow::array::RunArray::<arrow::datatypes::Int16Type>::try_new(
+            &arrow::array::Int16Array::from(vec![8]),
+            &Int32Array::from(vec![42]),
+        )
+        .unwrap();
+        let data_type = arrow::array::Array::data_type(&runs).clone();
+        let field = Arc::new(Field::new_list_field(data_type, true));
+        let list =
+            arrow::array::FixedSizeListArray::try_new(field, 8, Arc::new(runs), None)
+                .unwrap();
+        Arc::new(datafusion_physical_expr::expressions::Literal::new(
+            datafusion_common::ScalarValue::FixedSizeList(Arc::new(list)),
+        ))
+    }
+
     /// A constant list of `1 << 19` nulls.
     pub(crate) fn constant_list_of_nulls() -> Arc<dyn PhysicalExpr> {
         let field = Arc::new(Field::new_list_field(DataType::Null, true));
