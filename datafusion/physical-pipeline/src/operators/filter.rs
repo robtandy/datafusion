@@ -4420,35 +4420,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn operations_on_empty_unions_stay_in_datafusion() {
-        // An empty union has no value, so no row: there is no null of its
-        // type to probe `IS NULL` with.
+    async fn operations_on_types_without_nulls_stay_in_datafusion() {
+        // The classification probes expressions on columns of nulls of the
+        // types of their operands, or on empty batches of their input, which
+        // Arrow cannot build for every type: an empty union has no value, so
+        // no null; a fixed-size list of 32768 run-end encoded values is one run
+        // of 32768 nulls, which `Int16` run ends cannot count; and no array
+        // has a fixed-size binary type of negative size, or a dictionary type
+        // with string keys (but a schema can).
         let empty_union = DataType::Union(
             arrow::datatypes::UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new())
                 .unwrap(),
             arrow::datatypes::UnionMode::Sparse,
         );
-        let schema = Arc::new(Schema::new(vec![Field::new("u", empty_union, true)]));
-        let empty = RecordBatch::new_empty(Arc::clone(&schema));
-        let plan = || -> Arc<dyn ExecutionPlan> {
-            let predicate =
+        let short_runs = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int16, false)),
+            Arc::new(Field::new("values", DataType::Int32, true)),
+        );
+        let lists_of_runs = DataType::FixedSizeList(
+            Arc::new(Field::new_list_field(short_runs, true)),
+            32768,
+        );
+        let string_keys =
+            DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Utf8));
+        for (data_type, has_arrays) in [
+            (empty_union, true),
+            (lists_of_runs, true),
+            (DataType::FixedSizeBinary(-1), false),
+            (string_keys, false),
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("x", DataType::Int32, false),
+                Field::new("u", data_type.clone(), true),
+            ]));
+            // An empty batch, or none if there is no array of the type.
+            let batches = if has_arrays {
+                vec![RecordBatch::new_empty(Arc::clone(&schema))]
+            } else {
+                vec![]
+            };
+            // `u IS NULL` is probed on a null of the type of `u`, and
+            // `10 / x > 1`, which can fail, on an empty batch, with a column
+            // of the type of `u`.
+            let is_null: Arc<dyn PhysicalExpr> =
                 Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
                     physical_expr("u", &schema),
                 ));
-            Arc::new(
-                FilterExec::try_new(
-                    predicate,
-                    scan_batches(&schema, std::slice::from_ref(&empty)),
+            let mut predicates = vec![is_null];
+            if !has_arrays {
+                predicates.push(physical_expr("10 / x > 1", &schema));
+            }
+            for predicate in predicates {
+                let plan = || -> Arc<dyn ExecutionPlan> {
+                    Arc::new(
+                        FilterExec::try_new(
+                            Arc::clone(&predicate),
+                            scan_batches(&schema, &batches),
+                        )
+                        .unwrap(),
+                    )
+                };
+                let filter_plan = plan();
+                let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+                assert!(
+                    !PhysicalFilter::supports_filter_exec(exec),
+                    "{predicate} on {data_type}"
+                );
+                // (`assert_native_plan_parity` cannot encode the rows of types
+                // without arrays.)
+                let outcome = assert_same_outcome_in_datafusion(
+                    plan(),
+                    Arc::new(TaskContext::default()),
                 )
-                .unwrap(),
-            )
-        };
-        let filter_plan = plan();
-        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
-        assert!(error.is_none());
-        assert_eq!(operators.filters, 0);
+                .await;
+                assert_eq!(outcome, Ok(0), "{predicate} on {data_type}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

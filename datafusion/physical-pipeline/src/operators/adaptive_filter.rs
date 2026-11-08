@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, UnionMode};
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
@@ -453,8 +453,12 @@ fn fails_on_operand_types(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
     else {
         return true;
     };
-    // An empty union has no value, so no null either: conservatively, fail.
-    if data_types.iter().any(contains_empty_unions) {
+    // Without a null to probe with (e.g. an empty union has no value, so no
+    // null), conservatively, fail.
+    if !data_types
+        .iter()
+        .all(|data_type| can_build_nulls(data_type, 1))
+    {
         return true;
     }
     let fields = data_types
@@ -611,8 +615,16 @@ fn is_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
             .is_some_and(|cast| is_constant(cast.expr()))
 }
 
-/// Whether evaluating `expr` on an empty batch of `schema` fails.
+/// Whether evaluating `expr` on an empty batch of `schema` fails (or,
+/// conservatively, whether there is no array of a type of `schema`).
 fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if !schema
+        .fields()
+        .iter()
+        .all(|field| can_build_nulls(field.data_type(), 0))
+    {
+        return true;
+    }
     let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
     expr.evaluate(&batch)
         .and_then(|value| value.into_array(0))
@@ -832,27 +844,67 @@ fn contains_narrow_lengths(data_type: &DataType) -> bool {
     }
 }
 
-/// Whether `data_type` contains unions without fields, at any depth.
-fn contains_empty_unions(data_type: &DataType) -> bool {
+/// The most values, at any depth, of the columns of nulls that the probes of
+/// the classification evaluate expressions on: a value of a fixed-size list
+/// stands for its size of values.
+const MAX_PROBE_VALUES: usize = 1 << 16;
+
+/// Whether Arrow builds an array of `len` nulls of `data_type` (with
+/// `new_null_array`, and empty ones with `new_empty_array`), with at most
+/// [`MAX_PROBE_VALUES`] values at any depth. It cannot (it panics) for unions
+/// without fields, which have no value, so no null, run ends that cannot
+/// count the nulls, as one run, nor types of which there is no array
+/// (fixed-size binaries or lists of negative sizes, dictionaries with keys
+/// that are not integers, run ends that are not `Int16`, `Int32` or
+/// `Int64`).
+fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
+    // The values of the fixed-size lists of `len` values of `size`.
+    let values = |size: i32| {
+        usize::try_from(size)
+            .ok()
+            .and_then(|size| size.checked_mul(len))
+    };
+    if len > MAX_PROBE_VALUES {
+        return false;
+    }
     match data_type {
-        DataType::Union(fields, _) => {
-            fields.is_empty()
-                || fields
-                    .iter()
-                    .any(|(_, field)| contains_empty_unions(field.data_type()))
+        DataType::FixedSizeBinary(size) => {
+            values(*size).is_some_and(|bytes| bytes <= MAX_PROBE_VALUES)
         }
+        DataType::FixedSizeList(field, size) => {
+            values(*size).is_some_and(|values| can_build_nulls(field.data_type(), values))
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| can_build_nulls(field.data_type(), len)),
+        // Their values are empty.
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
         | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => contains_empty_unions(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| contains_empty_unions(field.data_type())),
-        DataType::Dictionary(_, values) => contains_empty_unions(values),
-        DataType::RunEndEncoded(_, values) => contains_empty_unions(values.data_type()),
-        _ => false,
+        | DataType::Map(field, _) => can_build_nulls(field.data_type(), 0),
+        DataType::Dictionary(keys, values) => {
+            keys.is_dictionary_key_type() && can_build_nulls(values, 0)
+        }
+        // Every child of a sparse union has the nulls, the first one of a
+        // dense union.
+        DataType::Union(fields, mode) => {
+            (len == 0 || !fields.is_empty())
+                && fields.iter().enumerate().all(|(index, (_, field))| {
+                    let dense = *mode == UnionMode::Dense && index > 0;
+                    can_build_nulls(field.data_type(), if dense { 0 } else { len })
+                })
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            let counts = match run_ends.data_type() {
+                DataType::Int16 => i16::try_from(len).is_ok(),
+                DataType::Int32 => i32::try_from(len).is_ok(),
+                DataType::Int64 => i64::try_from(len).is_ok(),
+                _ => false,
+            };
+            counts && can_build_nulls(values.data_type(), len.min(1))
+        }
+        _ => true,
     }
 }
 
@@ -1414,6 +1466,93 @@ mod tests {
             state.end_chunk();
         }
         assert_eq!(state.permutation(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn finds_types_without_nulls() {
+        let field = |data_type: DataType| Arc::new(Field::new("f", data_type, true));
+        let list = |data_type: DataType, size: i32| {
+            DataType::FixedSizeList(field(data_type), size)
+        };
+        let runs = |run_ends: DataType| {
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", run_ends, false)),
+                field(DataType::Int32),
+            )
+        };
+        let union = |types: Vec<DataType>, mode: UnionMode| {
+            DataType::Union(
+                arrow::datatypes::UnionFields::try_new(
+                    0..types.len() as i8,
+                    types
+                        .into_iter()
+                        .map(|data_type| Field::new("f", data_type, true)),
+                )
+                .unwrap(),
+                mode,
+            )
+        };
+        let long_runs = list(runs(DataType::Int16), 32768);
+        for (data_type, len, built) in [
+            (DataType::Int32, 1, true),
+            (DataType::Int32, MAX_PROBE_VALUES + 1, false),
+            // An empty union has no null, but empty arrays.
+            (union(vec![], UnionMode::Sparse), 1, false),
+            (union(vec![], UnionMode::Sparse), 0, true),
+            // One run of the nulls.
+            (runs(DataType::Int16), 32767, true),
+            (long_runs.clone(), 1, false),
+            (long_runs.clone(), 0, true),
+            (list(runs(DataType::Int32), 32768), 1, true),
+            (runs(DataType::Utf8), 0, false),
+            (
+                DataType::Struct(vec![Field::new("l", long_runs.clone(), true)].into()),
+                1,
+                false,
+            ),
+            // The values of lists and dictionaries are empty, and so are the
+            // other children of a dense union than its first one.
+            (DataType::new_list(long_runs.clone(), true), 1, true),
+            (union(vec![long_runs.clone()], UnionMode::Dense), 1, false),
+            (
+                union(vec![DataType::Int32, long_runs.clone()], UnionMode::Dense),
+                1,
+                true,
+            ),
+            (
+                union(vec![DataType::Int32, long_runs.clone()], UnionMode::Sparse),
+                1,
+                false,
+            ),
+            // Values of fixed-size lists stand for their size of values.
+            (list(DataType::Int64, 1 << 16), 1, true),
+            (list(DataType::Int64, 1 << 16), 2, false),
+            (list(list(DataType::Int64, 1 << 10), 1 << 10), 1, false),
+            (DataType::FixedSizeBinary(16), 1, true),
+            (DataType::FixedSizeBinary((1 << 16) + 1), 1, false),
+            // There is no array of these types.
+            (list(DataType::Int64, -1), 1, false),
+            (DataType::FixedSizeBinary(-1), 0, false),
+            (
+                DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Utf8)),
+                0,
+                false,
+            ),
+            (
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                1,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                can_build_nulls(&data_type, len),
+                built,
+                "{data_type} x {len}"
+            );
+            if built {
+                assert_eq!(new_null_array(&data_type, len).len(), len);
+            }
+        }
     }
 
     #[test]
