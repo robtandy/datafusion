@@ -24,14 +24,22 @@
 //! the order matters. So a single-threaded pipeline keeps the order of its
 //! input.
 //!
+//! The cache owns the rows it holds: they are copied out of their chunks,
+//! so the cache does not keep the buffers of the chunks alive (a slice of a
+//! column of 2048 strings keeps all of them). Columns whose copy would still
+//! share buffers with the chunk (dictionaries, and view arrays nested in
+//! other types) are not cached, see [`can_cache`].
+//!
 //! Since chunks are only emitted once the cache is full, caching delays the
 //! output of a pipeline: it should not be used below a `LIMIT` that may stop
 //! the pipeline early (DuckDB does not cache in such pipelines either).
 
 use std::sync::Arc;
 
+use arrow::array::{RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow_select::coalesce::BatchCoalescer;
+use arrow_select::take::take;
 use datafusion_common::{Result, plan_err};
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
@@ -107,14 +115,20 @@ impl CachingOperator {
 /// The state of a [`CachingOperator`] in one thread: the cached rows.
 struct CachingState {
     /// Accumulates the cached rows into chunks of [`DEFAULT_VECTOR_SIZE`]
-    /// rows. Buffered rows are copied, so the cache does not keep the
-    /// buffers of its input chunks alive (view arrays are compacted too).
+    /// rows. It owns them: they are copied before they are pushed (see
+    /// [`owned_rows`]), and it compacts view arrays.
     cache: BatchCoalescer,
 }
 
 impl OperatorState for CachingState {}
 
 impl CachingState {
+    /// Cache the rows of `chunk`.
+    fn push(&mut self, chunk: &DataChunk) -> Result<()> {
+        self.cache.push_batch(owned_rows(chunk)?)?;
+        Ok(())
+    }
+
     /// Move the next full chunk of the cache, if any, to `output`.
     fn emit_completed(&mut self, output: &mut DataChunk) {
         if let Some(batch) = self.cache.next_completed_batch() {
@@ -172,7 +186,7 @@ impl PhysicalOperator for CachingOperator {
         let state = downcast_state_mut::<CachingState>(lstate.as_any_mut(), self.name())?;
         if self.caching_supported && input.len() < self.threshold {
             // A small chunk: cache its rows, emit the cache once it is full.
-            state.cache.push_batch(input.compact()?)?;
+            state.push(input)?;
             state.emit_completed(output);
             return Ok(OperatorResult::NeedMoreInput);
         }
@@ -203,37 +217,66 @@ impl PhysicalOperator for CachingOperator {
     }
 }
 
+/// The logical rows of `chunk`, copied into arrays that do not share any
+/// buffer with the columns of `chunk`.
+///
+/// `DataChunk::compact` slices the columns for contiguous selections, and
+/// the coalescer buffers slices of most arrays until it emits them: a cached
+/// row would keep the buffers of its whole chunk alive. `take` copies the
+/// values of all the types [`can_cache`] accepts (view arrays share their
+/// data buffers, which the coalescer compacts).
+fn owned_rows(chunk: &DataChunk) -> Result<RecordBatch> {
+    let indices = match chunk.selection() {
+        Some(selection) if chunk.num_columns() > 0 => selection.to_uint32_array(),
+        _ => UInt32Array::from_iter_values(0..chunk.len() as u32),
+    };
+    let columns = chunk
+        .columns()
+        .iter()
+        .map(|column| take(column.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(chunk.len()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(chunk.schema()),
+        columns,
+        &options,
+    )?)
+}
+
 /// Whether columns of `data_type` can be cached.
 ///
-/// Caching concatenates the rows of different chunks. For dictionary arrays,
-/// this merges the dictionaries of the chunks, which may need more distinct
-/// keys than a key type narrower than 32 bits can represent, even if every
-/// chunk is valid (DataFusion only concatenates the batches of a single
-/// partition, which a pipeline does not know about). Chunks with such
-/// dictionaries, at any nesting level, are therefore not cached.
+/// The cache must own its rows (they are copied with Arrow's `take` kernel
+/// before they are cached), and concatenates the rows of different chunks.
+///
+/// * Dictionaries are not cached: copying their rows keeps their whole
+///   dictionary, and concatenating the dictionaries of different chunks may
+///   need more keys than the key type has, even if every chunk is valid
+///   (DataFusion only concatenates the batches of a single partition, which a
+///   pipeline does not know about).
+/// * View arrays share their data buffers after a copy: the coalescer
+///   compacts them, but not when they are nested in other types.
+/// * Run-end encoded and list view arrays are not cached either.
 pub fn can_cache(data_type: &DataType) -> bool {
+    can_cache_nested(data_type, false)
+}
+
+fn can_cache_nested(data_type: &DataType, nested: bool) -> bool {
     match data_type {
-        DataType::Dictionary(key, value) => {
-            matches!(
-                key.as_ref(),
-                DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64
-            ) && can_cache(value)
-        }
+        DataType::Dictionary(_, _)
+        | DataType::RunEndEncoded(_, _)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => false,
+        DataType::Utf8View | DataType::BinaryView => !nested,
         DataType::List(field)
         | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => can_cache(field.data_type()),
-        DataType::Struct(fields) => {
-            fields.iter().all(|field| can_cache(field.data_type()))
-        }
-        DataType::Union(fields, _) => {
-            fields.iter().all(|(_, field)| can_cache(field.data_type()))
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            can_cache(run_ends.data_type()) && can_cache(values.data_type())
-        }
+        | DataType::Map(field, _) => can_cache_nested(field.data_type(), true),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| can_cache_nested(field.data_type(), true)),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .all(|(_, field)| can_cache_nested(field.data_type(), true)),
         _ => true,
     }
 }
@@ -243,7 +286,7 @@ mod tests {
     use super::*;
 
     use arrow::array::{
-        Array, ArrayRef, AsArray, DictionaryArray, Int64Array, RecordBatch,
+        Array, ArrayRef, AsArray, DictionaryArray, Int64Array, RecordBatch, StringArray,
         StringViewArray,
     };
     use arrow::datatypes::{Field, Fields, Int8Type, Int32Type, Int64Type, Schema};
@@ -453,22 +496,26 @@ mod tests {
     }
 
     #[test]
-    fn narrow_dictionaries_are_not_cached() {
+    fn dictionaries_and_nested_views_are_not_cached() {
         let dictionary =
             |key: DataType| DataType::Dictionary(Box::new(key), Box::new(DataType::Utf8));
-        assert!(can_cache(&dictionary(DataType::Int32)));
-        assert!(can_cache(&dictionary(DataType::UInt64)));
         assert!(!can_cache(&dictionary(DataType::Int8)));
-        assert!(!can_cache(&dictionary(DataType::UInt16)));
+        assert!(!can_cache(&dictionary(DataType::Int32)));
         let nested = DataType::Struct(Fields::from(vec![Field::new(
             "d",
-            DataType::new_list(dictionary(DataType::Int8), true),
+            DataType::new_list(dictionary(DataType::Int64), true),
             true,
         )]));
         assert!(!can_cache(&nested));
-        assert!(can_cache(&DataType::new_list(DataType::Utf8View, true)));
+        // The coalescer compacts view arrays, but not nested ones.
+        assert!(can_cache(&DataType::Utf8View));
+        assert!(!can_cache(&DataType::new_list(DataType::Utf8View, true)));
+        assert!(can_cache(&DataType::new_list(DataType::Utf8, true)));
+        assert!(can_cache(&DataType::Struct(Fields::from(vec![
+            Field::new("s", DataType::LargeUtf8, true)
+        ]))));
 
-        // Chunks of narrow dictionaries are passed through.
+        // Chunks of dictionaries are passed through.
         let schema = Arc::new(Schema::new(vec![Field::new(
             "d",
             dictionary(DataType::Int8),
@@ -492,30 +539,66 @@ mod tests {
         });
         let (outputs, _) = drive(&operator, inputs).unwrap();
         assert_eq!(outputs.len(), 3);
+    }
 
-        // Wider keys are cached.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "d",
-            dictionary(DataType::Int32),
-            true,
-        )]));
-        let operator = CachingOperator::new(source(Arc::clone(&schema), vec![]));
-        let inputs = (0..3).map(|b| {
-            let values = (0..100).map(|i| format!("{b}-{i}")).collect::<Vec<_>>();
-            let array: ArrayRef = Arc::new(
-                values
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<DictionaryArray<Int32Type>>(),
+    #[test]
+    fn cached_rows_do_not_keep_the_buffers_of_their_chunks() {
+        // Chunks of 2048 strings of 128 bytes (a 262144-byte buffer), of which
+        // one row is selected: a contiguous selection, which `compact` would
+        // slice without copying.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("l", DataType::new_list(DataType::Utf8, true), true),
+        ]));
+        let chunk = |i: usize| {
+            let strings = (0..2048).map(|j| format!("{:0128}", i * 2048 + j));
+            let s = StringArray::from_iter_values(strings.clone());
+            let l = arrow::array::ListArray::from_iter_primitive::<Int32Type, _, _>(
+                (0..2048).map(|j: i32| Some(vec![Some(j)])),
             );
-            DataChunk::from_record_batch(
-                RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap(),
-            )
-        });
-        let (outputs, _) = drive(&operator, inputs).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].len(), 300);
-        assert_eq!(outputs[0].column(0).null_count(), 0);
+            // A list of strings instead of integers.
+            let l = arrow::compute::cast(&l, &DataType::new_list(DataType::Utf8, true))
+                .unwrap();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s), l]).unwrap();
+            DataChunk::from_record_batch(batch)
+                .with_selection(SelectionVector::from(vec![7]))
+                .unwrap()
+        };
+        let input_bytes = chunk(0).column(0).get_array_memory_size();
+        assert!(input_bytes >= 262_144, "{input_bytes}");
+
+        let operator = CachingOperator::new(source(Arc::clone(&schema), vec![]));
+        assert!(operator.caching_supported());
+        let (gstate, mut lstate) = states(&operator);
+        let ctx = context();
+        for i in 0..100 {
+            let mut output = DataChunk::empty(Arc::clone(&schema));
+            operator
+                .execute(
+                    &ctx,
+                    &chunk(i),
+                    &mut output,
+                    gstate.as_ref(),
+                    lstate.as_mut(),
+                )
+                .unwrap();
+            assert!(output.is_empty());
+        }
+        // Before the final flush, the cache only holds the 100 cached rows.
+        let cached_bytes = lstate.downcast_ref::<CachingState>().unwrap().cache.size();
+        assert!(
+            cached_bytes < input_bytes,
+            "{cached_bytes} vs {input_bytes}"
+        );
+
+        let mut output = DataChunk::empty(Arc::clone(&schema));
+        operator
+            .final_execute(&ctx, &mut output, gstate.as_ref(), lstate.as_mut())
+            .unwrap();
+        assert_eq!(output.len(), 100);
+        let strings = output.column(0).as_string::<i32>();
+        assert_eq!(strings.value(1), format!("{:0128}", 2048 + 7));
     }
 
     // ---------------------------------------------------------------------
