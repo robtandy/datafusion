@@ -775,7 +775,7 @@ pub(crate) mod test_support {
     use std::sync::Arc;
 
     use arrow::array::{
-        DictionaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
+        ArrayRef, DictionaryArray, Int32Array, Int64Array, RecordBatch, StringArray,
         StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Int8Type, Int32Type, Schema, SchemaRef};
@@ -1320,6 +1320,70 @@ pub(crate) mod test_support {
         ])
     }
 
+    /// A table `name` of 3 partitions with 4 batches of 100 rows each, with
+    /// the columns `id` and `x`, `y`, `a`, `b` (`INT`, nullable) given by
+    /// `row(id)`. The batches are not split into several chunks, so the
+    /// filter decides like DataFusion for the same rows.
+    pub(crate) fn register_guard_table(
+        ctx: &SessionContext,
+        name: &str,
+        row: impl Fn(i64) -> [Option<i32>; 4],
+    ) -> Result<()> {
+        let schema = Arc::new(Schema::new(
+            std::iter::once(Field::new("id", DataType::Int64, false))
+                .chain(
+                    ["x", "y", "a", "b"]
+                        .into_iter()
+                        .map(|name| Field::new(name, DataType::Int32, true)),
+                )
+                .collect::<Vec<_>>(),
+        ));
+        let batch = |batch: i64| {
+            let ids = batch * 100..(batch + 1) * 100;
+            let rows = ids.clone().map(&row).collect::<Vec<_>>();
+            let mut columns: Vec<ArrayRef> =
+                vec![Arc::new(Int64Array::from_iter_values(ids))];
+            for column in 0..4 {
+                columns.push(Arc::new(Int32Array::from_iter(
+                    rows.iter().map(|row| row[column]),
+                )));
+            }
+            RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+        };
+        register_partitions(
+            ctx,
+            name,
+            vec![vec![batch(0), batch(1)], vec![batch(2)], vec![batch(3)]],
+        )
+    }
+
+    /// The tables of the error parity tests: [`register_all_tables`] and the
+    /// guard tables `dense`, `sparse`, `nulls` and `nulls_ok`.
+    pub(crate) async fn guard_tables(ctx: &SessionContext) -> Result<()> {
+        register_all_tables(ctx)?;
+        // Half of the rows have `x = 0`; `y = 1` on 2% of the rows, and only
+        // where `x <> 0`.
+        register_guard_table(ctx, "dense", |i| {
+            let x = if i % 2 == 0 { 0 } else { 1 + (i % 7) as i32 };
+            [Some(x), Some(i32::from(i % 50 == 1)), None, None]
+        })?;
+        // 90% of the rows have `x = 0`.
+        register_guard_table(ctx, "sparse", |i| {
+            let x = if i % 10 == 3 { 1 + (i % 4) as i32 } else { 0 };
+            [Some(x), None, None, None]
+        })?;
+        // `a > 0` is `NULL` on 5% of the rows and `false` on the others; `b
+        // = 0` on the `NULL` rows of `nulls`, but not of `nulls_ok`.
+        register_guard_table(ctx, "nulls", |i| {
+            let null = i % 20 == 7;
+            [None, None, (!null).then_some(-1), Some(i32::from(!null))]
+        })?;
+        register_guard_table(ctx, "nulls_ok", |i| {
+            let null = i % 20 == 7;
+            [None, None, (!null).then_some(-1), Some(2)]
+        })
+    }
+
     /// A source that emits `batches` (in one partition, so in order).
     pub(crate) fn source(
         schema: SchemaRef,
@@ -1409,7 +1473,6 @@ mod tests {
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray, StringViewArray};
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{Field, Schema};
-    use datafusion::prelude::SessionContext;
     use datafusion_physical_plan::filter::batch_filter;
 
     use crate::test_utils::test_session_config;
@@ -2197,69 +2260,6 @@ mod tests {
             "SELECT id, big FROM fallible WHERE big < 100000 AND CAST(big AS INT) % 2 = 0",
         ])
         .await;
-    }
-
-    /// A table `name` of 3 partitions with 4 batches of 100 rows each, with
-    /// the columns `id` and `x`, `y`, `a`, `b` (`INT`, nullable) given by
-    /// `row(id)`. The batches are not split into several chunks, so the
-    /// filter decides like DataFusion for the same rows.
-    fn register_guard_table(
-        ctx: &SessionContext,
-        name: &str,
-        row: impl Fn(i64) -> [Option<i32>; 4],
-    ) -> Result<()> {
-        let schema = Arc::new(Schema::new(
-            std::iter::once(Field::new("id", DataType::Int64, false))
-                .chain(
-                    ["x", "y", "a", "b"]
-                        .into_iter()
-                        .map(|name| Field::new(name, DataType::Int32, true)),
-                )
-                .collect::<Vec<_>>(),
-        ));
-        let batch = |batch: i64| {
-            let ids = batch * 100..(batch + 1) * 100;
-            let rows = ids.clone().map(&row).collect::<Vec<_>>();
-            let mut columns: Vec<ArrayRef> =
-                vec![Arc::new(Int64Array::from_iter_values(ids))];
-            for column in 0..4 {
-                columns.push(Arc::new(Int32Array::from_iter(
-                    rows.iter().map(|row| row[column]),
-                )));
-            }
-            RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
-        };
-        register_partitions(
-            ctx,
-            name,
-            vec![vec![batch(0), batch(1)], vec![batch(2)], vec![batch(3)]],
-        )
-    }
-
-    /// The tables of the error parity tests.
-    async fn guard_tables(ctx: &SessionContext) -> Result<()> {
-        register_all_tables(ctx)?;
-        // Half of the rows have `x = 0`; `y = 1` on 2% of the rows, and only
-        // where `x <> 0`.
-        register_guard_table(ctx, "dense", |i| {
-            let x = if i % 2 == 0 { 0 } else { 1 + (i % 7) as i32 };
-            [Some(x), Some(i32::from(i % 50 == 1)), None, None]
-        })?;
-        // 90% of the rows have `x = 0`.
-        register_guard_table(ctx, "sparse", |i| {
-            let x = if i % 10 == 3 { 1 + (i % 4) as i32 } else { 0 };
-            [Some(x), None, None, None]
-        })?;
-        // `a > 0` is `NULL` on 5% of the rows and `false` on the others; `b
-        // = 0` on the `NULL` rows of `nulls`, but not of `nulls_ok`.
-        register_guard_table(ctx, "nulls", |i| {
-            let null = i % 20 == 7;
-            [None, None, (!null).then_some(-1), Some(i32::from(!null))]
-        })?;
-        register_guard_table(ctx, "nulls_ok", |i| {
-            let null = i % 20 == 7;
-            [None, None, (!null).then_some(-1), Some(2)]
-        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

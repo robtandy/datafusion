@@ -20,6 +20,14 @@
 //!   never divides by zero, exactly as in DataFusion where the filter output
 //!   is compacted. Input columns that are not referenced are never touched.
 //!
+//! So an expression fails exactly when it fails in `ProjectionExec` for the
+//! same rows. (DataFusion evaluates the right side of an `OR` only on the
+//! rows where the left side is `false` if at most 20% of the rows of the
+//! batch are; the projection decides the same per chunk. So
+//! `x = 0 OR 10 / x > 1` fails like in DataFusion as long as DataFusion's
+//! batches are not split into several chunks, see
+//! [`PhysicalFilter`](super::filter::PhysicalFilter) for the same caveat.)
+//!
 //! The evaluation of expressions on some of the rows of a chunk (`BoundExprs`)
 //! is shared with [`PhysicalFilter`](super::filter::PhysicalFilter).
 
@@ -808,6 +816,34 @@ mod tests {
             "SELECT id, CAST(big AS INT) AS b32 FROM fallible WHERE big < 100000",
         ])
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_projection_errors_match_datafusion() {
+        for (sql, fails) in [
+            // No guard: `x = 0` on half of the rows.
+            ("SELECT id, 10 / x AS q FROM dense", true),
+            // Guarded by the filter, or by `CASE`.
+            ("SELECT id, 10 / x AS q FROM dense WHERE x <> 0", false),
+            (
+                "SELECT id, CASE WHEN x <> 0 THEN 10 / x END AS q FROM dense",
+                false,
+            ),
+            // `OR` divides all rows unless at most 20% have `x <> 0`.
+            ("SELECT id, x = 0 OR 10 / x > 1 AS b FROM dense", true),
+            ("SELECT id, x = 0 OR 10 / x > 1 AS b FROM sparse", false),
+            // The filter keeps the rows with `b = 0`.
+            ("SELECT id, 10 / b AS q FROM nulls WHERE a IS NULL", true),
+            (
+                "SELECT id, 10 / b AS q FROM nulls_ok WHERE a IS NULL",
+                false,
+            ),
+        ] {
+            let (error, operators) =
+                assert_native_parity_with_setup(sql, guard_tables).await;
+            assert!(operators.projections > 0, "{sql}");
+            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
