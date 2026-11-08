@@ -433,6 +433,7 @@ fn has_nulls(column: &ArrayRef, selection: Option<&SelectionVector>) -> bool {
 pub(crate) mod test_support {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arrow::array::{AsArray, Int64Array, RecordBatch, RecordBatchOptions};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef};
@@ -440,17 +441,25 @@ pub(crate) mod test_support {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::{Result, exec_err};
     use datafusion_datasource::PartitionedFile;
+    use datafusion_datasource::file_groups::FileGroup;
     use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
     use datafusion_datasource::source::DataSourceExec;
+    use datafusion_datasource_csv::source::CsvSource;
     use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::projection::ProjectionExec;
+    use datafusion_physical_plan::repartition::RepartitionExec;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
     use futures::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use object_store::{ObjectStoreExt, PutPayload};
 
     use super::PhysicalUnion;
     use crate::bridge::{BridgeOperator, PipelineRootExec};
@@ -519,6 +528,27 @@ pub(crate) mod test_support {
             return Ok(source);
         }
         Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
+    }
+
+    /// Lower `plan` like [`lower`], but without the `RepartitionExec`s that do
+    /// not preserve the order (their inputs are lowered instead), like a
+    /// planner that removes them: the pipeline engine merges the partitions
+    /// of their inputs anyway.
+    pub(crate) fn lower_without_repartitions(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        if let Some(limit) = PhysicalLimit::try_lower(plan, lower_without_repartitions)? {
+            return Ok(Arc::new(limit));
+        }
+        if let Some(union) = PhysicalUnion::try_lower(plan, lower_without_repartitions)? {
+            return Ok(Arc::new(union));
+        }
+        if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
+            && !repartition.preserve_order()
+        {
+            return lower_without_repartitions(repartition.input());
+        }
+        lower(plan)
     }
 
     /// Evaluates the expressions of a `ProjectionExec` on the compacted input
@@ -715,6 +745,41 @@ pub(crate) mod test_support {
     ) {
         let task_ctx =
             Arc::new(TaskContext::default().with_session_config(test_session_config()));
+        assert_operator_byte_eq_with_context(expected, root, plan, ordered, task_ctx)
+            .await
+    }
+
+    /// [`assert_native_plan_byte_eq`], with `lower` lowering the plan, and
+    /// both engines executing with `task_ctx`.
+    pub(crate) async fn assert_lowered_plan_byte_eq(
+        make_plan: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        lower: impl Fn(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+        task_ctx: Arc<TaskContext>,
+        ordered: bool,
+    ) -> Arc<dyn PhysicalOperator> {
+        let plan = make_plan().expect("plan");
+        let root = lower(&plan).expect("lowering");
+        let expected = make_plan().expect("plan");
+        assert_operator_byte_eq_with_context(
+            expected,
+            Arc::clone(&root),
+            plan,
+            ordered,
+            task_ctx,
+        )
+        .await;
+        root
+    }
+
+    /// [`assert_operator_byte_eq`], with both engines executing with
+    /// `task_ctx`.
+    pub(crate) async fn assert_operator_byte_eq_with_context(
+        expected: Arc<dyn ExecutionPlan>,
+        root: Arc<dyn PhysicalOperator>,
+        plan: Arc<dyn ExecutionPlan>,
+        ordered: bool,
+        task_ctx: Arc<TaskContext>,
+    ) {
         let description = datafusion_physical_plan::displayable(expected.as_ref())
             .indent(true)
             .to_string();
@@ -829,7 +894,7 @@ pub(crate) mod test_support {
         chunks: Vec<DataChunk>,
         idle_threads: usize,
         /// Every thread waits this long before it reads its first chunk.
-        delay: Option<std::time::Duration>,
+        delay: Option<Duration>,
         /// The number of chunks handed out.
         produced: AtomicUsize,
     }
@@ -854,7 +919,7 @@ pub(crate) mod test_support {
 
         /// Make every thread wait for `delay` before it reads its first
         /// chunk.
-        pub(crate) fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
             self.delay = Some(delay);
             self
         }
@@ -968,7 +1033,7 @@ pub(crate) mod test_support {
 
     /// Await `execution`, failing the test if it does not complete in time.
     async fn with_timeout<T>(execution: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(30), execution)
+        tokio::time::timeout(Duration::from_secs(30), execution)
             .await
             .expect("the execution did not complete")
     }
@@ -1030,6 +1095,71 @@ pub(crate) mod test_support {
                     .boxed(),
             };
             Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
+        }
+    }
+
+    /// Two CSV files of `v` values, in an object store that takes 20 µs to
+    /// read a byte: the first one, of 2,000 rows from 0, takes about 200 ms
+    /// to read, the second one, of the single row 1, does not. DataFusion
+    /// reads the files of a partition one after the other.
+    pub(crate) struct SlowFirstFile {
+        sizes: [u64; 2],
+        task_ctx: Arc<TaskContext>,
+    }
+
+    impl SlowFirstFile {
+        const URL: &str = "slow://files";
+        const FILES: [&str; 2] = ["first.csv", "second.csv"];
+
+        pub(crate) async fn try_new() -> Result<Self> {
+            let store = InMemory::new();
+            let first = (0..2000).fold("v\n".to_string(), |csv, v| format!("{csv}{v}\n"));
+            let mut sizes = [0; 2];
+            for ((name, size), csv) in Self::FILES
+                .iter()
+                .zip(&mut sizes)
+                .zip([first, "v\n1\n".into()])
+            {
+                *size = csv.len() as u64;
+                store.put(&Path::from(*name), PutPayload::from(csv)).await?;
+            }
+            let config = ThrottleConfig {
+                wait_get_per_byte: Duration::from_micros(20),
+                ..ThrottleConfig::default()
+            };
+            let runtime = Arc::new(RuntimeEnv::default());
+            runtime.register_object_store(
+                ObjectStoreUrl::parse(Self::URL)?.as_ref(),
+                Arc::new(ThrottledStore::new(store, config)),
+            );
+            let task_ctx = TaskContext::default()
+                .with_session_config(test_session_config())
+                .with_runtime(runtime);
+            Ok(Self {
+                sizes,
+                task_ctx: Arc::new(task_ctx),
+            })
+        }
+
+        /// A task context with the object store of the files.
+        pub(crate) fn task_ctx(&self) -> Arc<TaskContext> {
+            Arc::clone(&self.task_ctx)
+        }
+
+        /// A scan of the two files, in a single partition.
+        pub(crate) fn scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+            let files = Self::FILES
+                .iter()
+                .zip(self.sizes)
+                .map(|(name, size)| PartitionedFile::new(*name, size))
+                .collect();
+            let config = FileScanConfigBuilder::new(
+                ObjectStoreUrl::parse(Self::URL)?,
+                Arc::new(CsvSource::new(values_schema())),
+            )
+            .with_file_group(FileGroup::new(files))
+            .build();
+            Ok(DataSourceExec::from_data_source(config))
         }
     }
 
@@ -1113,8 +1243,9 @@ mod tests {
     use super::test_support::{
         TestSource, UNREGISTERED_STORE, assert_lowered_plan_fails_like_datafusion,
         assert_native_plan_byte_eq, assert_operator_byte_eq, assert_parity,
-        assert_parity_with_config, count, lower, run, sorted_values,
-        unregistered_store_scan, values, values_chunk, values_chunks, values_schema,
+        assert_parity_with_config, count, lower, lower_without_repartitions, run,
+        sorted_values, unregistered_store_scan, values, values_chunk, values_chunks,
+        values_schema,
     };
     use crate::bridge::BridgeOperator;
     use crate::chunk::SelectionVector;
@@ -1444,24 +1575,6 @@ mod tests {
         // produces its row right away. With one thread on a current thread
         // runtime, a native union would run the pipeline of its first input
         // first: the limit would finish before the failing input executes.
-        fn lower_without_repartitions(
-            plan: &Arc<dyn ExecutionPlan>,
-        ) -> Result<Arc<dyn PhysicalOperator>> {
-            if let Some(limit) =
-                PhysicalLimit::try_lower(plan, lower_without_repartitions)?
-            {
-                return Ok(Arc::new(limit));
-            }
-            if let Some(union) =
-                PhysicalUnion::try_lower(plan, lower_without_repartitions)?
-            {
-                return Ok(Arc::new(union));
-            }
-            if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
-                return lower_without_repartitions(repartition.input());
-            }
-            lower(plan)
-        }
         let config = test_session_config().with_target_partitions(1);
         for failing_first in [false, true] {
             let make = move || -> Result<Arc<dyn ExecutionPlan>> {

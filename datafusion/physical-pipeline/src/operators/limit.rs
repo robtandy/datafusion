@@ -45,7 +45,7 @@ use datafusion_common::{Result, internal_err};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::repartition::RepartitionExec;
-use datafusion_physical_plan::union::InterleaveExec;
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::chunk::DataChunk;
@@ -240,11 +240,11 @@ fn advertises_its_input_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// * a source has the order of its partition;
 /// * any other node has the order of the inputs whose order it keeps
 ///   ([`ExecutionPlan::maintains_input_order`], e.g. the probe side of a hash
-///   join; a `CoalescePartitionsExec` passes a single partition through),
-///   which must all be deterministic. A node that keeps the order of none of
-///   its inputs (e.g. an aggregation or a nested loop join) produces an order
-///   of its own, which the native operator replacing it does not reproduce:
-///   the order does not matter.
+///   join) or whose partition it passes through (see
+///   [`passes_partition_through`]), which must all be deterministic. A node
+///   that keeps the order of none of its inputs (e.g. an aggregation or a
+///   nested loop join) produces an order of its own, which the native
+///   operator replacing it does not reproduce: the order does not matter.
 ///
 /// If the order matters, the limit must see its input in that order. That
 /// costs no parallelism compared to DataFusion, which executes the single
@@ -273,13 +273,27 @@ fn order_matters(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .into_iter()
         .enumerate()
         .filter(|&(i, child)| {
-            maintained.get(i) == Some(&true)
-                || (plan.is::<CoalescePartitionsExec>()
-                    && child.output_partitioning().partition_count() <= 1)
+            maintained.get(i) == Some(&true) || passes_partition_through(plan, child)
         })
         .map(|(_, child)| child)
         .peekable();
     ordered_by.peek().is_some() && ordered_by.all(order_matters)
+}
+
+/// Whether `plan`, a plan with a single output partition, passes a partition
+/// of its input `child` through as it is, without declaring that it keeps
+/// its order: a `CoalescePartitionsExec` of a single partition, a `UnionExec`
+/// (each of its partitions is a partition of one of its inputs, here of its
+/// only input with partitions), or an `InterleaveExec` of a single input
+/// (one of several inputs merges them, see [`merges_in_arrival_order`]).
+fn passes_partition_through(
+    plan: &Arc<dyn ExecutionPlan>,
+    child: &Arc<dyn ExecutionPlan>,
+) -> bool {
+    let partitions = child.output_partitioning().partition_count();
+    (plan.is::<CoalescePartitionsExec>() && partitions <= 1)
+        || (plan.is::<UnionExec>() && partitions > 0)
+        || (plan.is::<InterleaveExec>() && plan.children().len() == 1)
 }
 
 /// Whether `plan` merges several partitions, of one input or of several
@@ -411,25 +425,27 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::empty::EmptyExec;
     use datafusion_physical_plan::joins::{
         HashJoinExec, NestedLoopJoinExec, PartitionMode,
     };
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-    use datafusion_physical_plan::union::UnionExec;
     use datafusion_physical_plan::{
         ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
     };
 
     use crate::bridge::{BridgeOperator, bridged_plans};
     use crate::chunk::SelectionVector;
-    use crate::explain::format_pipelines;
+    use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        AfterBatch, INJECTED_FAILURE, TestSource, assert_native_byte_eq,
-        assert_native_plan_byte_eq, assert_native_plan_fails_like_datafusion,
-        assert_parity, assert_parity_with_config, batch_plan, count, pending_plan, run,
-        sorted_values, values, values_chunk, values_chunks, values_schema,
+        AfterBatch, INJECTED_FAILURE, SlowFirstFile, TestSource,
+        assert_lowered_plan_byte_eq, assert_native_byte_eq, assert_native_plan_byte_eq,
+        assert_native_plan_fails_like_datafusion, assert_parity,
+        assert_parity_with_config, batch_plan, count, lower, lower_without_repartitions,
+        pending_plan, run, sorted_values, values, values_chunk, values_chunks,
+        values_schema,
     };
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::write_parquet;
@@ -1321,6 +1337,63 @@ mod tests {
         };
         let root = assert_native_plan_byte_eq(make, true).await;
         assert!(root.is::<PhysicalLimit>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_keep_the_order_of_a_partition_that_unions_pass_through() -> Result<()>
+    {
+        // A `UnionExec` with a single partition (its other inputs have none)
+        // and an `InterleaveExec` of a single input pass a partition of their
+        // input through as it is, without declaring that they keep its order:
+        // here a partition of two CSV files whose first one is slow to read.
+        // DataFusion reads the files one after the other, so a limit returns
+        // the first rows of the first file, where a native scan on several
+        // threads would return the row of the second file first. The hash
+        // repartition below the interleave is removed, like a planner that
+        // does not need it, so that the native scan reads the files.
+        let files = SlowFirstFile::try_new().await?;
+        let empty = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(EmptyExec::new(values_schema()).with_partitions(0))
+        };
+        let union_after_empty = || UnionExec::try_new(vec![empty(), files.scan()?]);
+        let union_before_empty = || UnionExec::try_new(vec![files.scan()?, empty()]);
+        let interleave = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = files.scan()?;
+            let v = col("v", &scan.schema())?;
+            let by_v = RepartitionExec::try_new(scan, Partitioning::Hash(vec![v], 1))?;
+            Ok(Arc::new(InterleaveExec::try_new(vec![Arc::new(by_v)])?))
+        };
+        let merges: [&dyn Fn() -> Result<Arc<dyn ExecutionPlan>>; 3] =
+            [&union_after_empty, &union_before_empty, &interleave];
+        type Limit = fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>;
+        let limits: [Limit; 3] = [
+            |input| Arc::new(GlobalLimitExec::new(input, 0, Some(1))),
+            |input| Arc::new(GlobalLimitExec::new(input, 1, Some(2))),
+            |input| Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(1))),
+        ];
+        for merge in merges {
+            assert_eq!(merge()?.output_partitioning().partition_count(), 1);
+            for limit in limits {
+                let make = || Ok(limit(merge()?));
+                let root = assert_lowered_plan_byte_eq(
+                    make,
+                    lower_without_repartitions,
+                    files.task_ctx(),
+                    true,
+                )
+                .await;
+                let operators = format_operator_tree(&root);
+                let limit = root.downcast_ref::<PhysicalLimit>().expect(&operators);
+                assert!(limit.preserve_order(), "{operators}");
+                assert_eq!(count::<PhysicalUnion>(&root), 1, "{operators}");
+            }
+        }
+        // With the test lowering, the union is native too.
+        let make =
+            || Ok(Arc::new(GlobalLimitExec::new(union_after_empty()?, 0, Some(1))) as _);
+        let root = assert_lowered_plan_byte_eq(make, lower, files.task_ctx(), true).await;
+        assert_eq!(count::<PhysicalUnion>(&root), 1);
         Ok(())
     }
 }
