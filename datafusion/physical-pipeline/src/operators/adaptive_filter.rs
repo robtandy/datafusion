@@ -453,6 +453,10 @@ fn fails_on_operand_types(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
     else {
         return true;
     };
+    // An empty union has no value, so no null either: conservatively, fail.
+    if data_types.iter().any(contains_empty_unions) {
+        return true;
+    }
     let fields = data_types
         .iter()
         .enumerate()
@@ -824,6 +828,30 @@ fn contains_narrow_lengths(data_type: &DataType) -> bool {
             .iter()
             .any(|(_, field)| contains_narrow_lengths(field.data_type())),
         DataType::Dictionary(_, values) => contains_narrow_lengths(values),
+        _ => false,
+    }
+}
+
+/// Whether `data_type` contains unions without fields, at any depth.
+fn contains_empty_unions(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(fields, _) => {
+            fields.is_empty()
+                || fields
+                    .iter()
+                    .any(|(_, field)| contains_empty_unions(field.data_type()))
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_empty_unions(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_empty_unions(field.data_type())),
+        DataType::Dictionary(_, values) => contains_empty_unions(values),
+        DataType::RunEndEncoded(_, values) => contains_empty_unions(values.data_type()),
         _ => false,
     }
 }

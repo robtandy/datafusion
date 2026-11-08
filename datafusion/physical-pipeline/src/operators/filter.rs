@@ -4288,6 +4288,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operations_on_empty_unions_stay_in_datafusion() {
+        // An empty union has no value, so no row: there is no null of its
+        // type to probe `IS NULL` with.
+        let empty_union = DataType::Union(
+            arrow::datatypes::UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new())
+                .unwrap(),
+            arrow::datatypes::UnionMode::Sparse,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("u", empty_union, true)]));
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let predicate =
+                Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                    physical_expr("u", &schema),
+                ));
+            Arc::new(
+                FilterExec::try_new(
+                    predicate,
+                    scan_batches(&schema, std::slice::from_ref(&empty)),
+                )
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_none());
+        assert_eq!(operators.filters, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn operations_on_unsupported_types_stay_in_datafusion() {
         // `NOT` of an integer fails whenever it is evaluated, on an empty batch
         // too, which a pipeline skips.
