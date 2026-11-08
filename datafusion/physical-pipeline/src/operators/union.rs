@@ -32,14 +32,16 @@
 
 use std::sync::Arc;
 
+use arrow::array::ArrayRef;
 use arrow::datatypes::{Schema, SchemaRef};
+use arrow::error::ArrowError;
 use datafusion_common::metadata::merge_metadata_for_union;
 use datafusion_common::{Result, exec_err, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec, can_interleave};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use crate::chunk::DataChunk;
+use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
     PhysicalOperator,
@@ -321,7 +323,8 @@ fn coerce_input(
 /// relabels a column without copying it, unless the column does not have the
 /// type the schema of its input declares, as the `Null` columns of
 /// placeholder rows. A column passed through must have the type of the union,
-/// as in the batches of that projection.
+/// and a non-nullable field of the union must not hold nulls in the rows of
+/// the chunk, as in the batches of that projection.
 #[derive(Debug)]
 struct UnionCoercion {
     children: Vec<Arc<dyn PhysicalOperator>>,
@@ -375,12 +378,36 @@ impl PhysicalOperator for UnionCoercion {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
+        // Like the batches of the projection, a non-nullable field holds no
+        // nulls, in the rows of the chunk.
+        for (column, field) in columns.iter().zip(self.schema.fields()) {
+            if !field.is_nullable() && has_nulls(column, input.selection()) {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "Column '{}' is declared as non-nullable but contains null values",
+                    field.name()
+                ))
+                .into());
+            }
+        }
         *output = DataChunk::try_new(
             Arc::clone(&self.schema),
             columns,
             input.selection().cloned(),
         )?;
         Ok(OperatorResult::NeedMoreInput)
+    }
+}
+
+/// Whether the logical rows of a chunk (the rows of `selection`, or all rows
+/// without a selection) hold nulls in `column`. Nulls are counted with the
+/// null buffer, like `RecordBatch::try_new` counts them.
+fn has_nulls(column: &ArrayRef, selection: Option<&SelectionVector>) -> bool {
+    let Some(nulls) = column.nulls().filter(|nulls| nulls.null_count() > 0) else {
+        return false;
+    };
+    match selection {
+        Some(selection) => selection.iter().any(|row| nulls.is_null(row)),
+        None => true,
     }
 }
 
@@ -407,7 +434,7 @@ pub(crate) mod test_support {
     use datafusion_physical_plan::projection::ProjectionExec;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
-    use datafusion_physical_plan::{ExecutionPlan, collect};
+    use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
     use futures::StreamExt;
 
     use super::PhysicalUnion;
@@ -437,7 +464,7 @@ pub(crate) mod test_support {
     /// * limits, unions and placeholder rows with `try_lower`;
     /// * `CoalescePartitionsExec`s without a fetch are removed (the pipeline
     ///   engine merges the partitions of their input anyway; with a fetch,
-    ///   they are limits);
+    ///   they are limits; without input partitions, they fail in DataFusion);
     /// * `ProjectionExec`s with a [`TestProjection`], a stand-in for the
     ///   native projection, so that the operators below them are lowered
     ///   too;
@@ -458,6 +485,7 @@ pub(crate) mod test_support {
         }
         if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
             && coalesce.fetch().is_none()
+            && coalesce.input().output_partitioning().partition_count() > 0
         {
             return lower(coalesce.input());
         }
@@ -985,7 +1013,9 @@ mod tests {
     use datafusion_common::DataFusionError;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::empty::EmptyExec;
+    use datafusion_physical_plan::limit::GlobalLimitExec;
     use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
     use datafusion_physical_plan::repartition::RepartitionExec;
     use datafusion_physical_plan::{
@@ -1004,6 +1034,7 @@ mod tests {
     use crate::operator::{
         GlobalSourceState, LocalSourceState, SourceResult, TaskInterrupt, downcast_state,
     };
+    use crate::operators::limit::PhysicalLimit;
     use crate::operators::placeholder_row::PhysicalPlaceholderRow;
     use crate::test_utils::{test_session_config, test_table_t2};
 
@@ -1310,6 +1341,60 @@ mod tests {
         assert_eq!(interleave()?.output_partitioning().partition_count(), 1);
         let root = assert_native_plan_byte_eq(interleave, false).await;
         assert_eq!(count::<PhysicalUnion>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_coercion_checks_non_nullable_fields_like_union_exec() -> Result<()> {
+        // The projection that coerces an input fails when a non-nullable field
+        // of the union gets a null, also if a limit above it discards the row:
+        // the casts of the `Null` columns of placeholder rows are nulls.
+        let schema =
+            |name| Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+        let message = "Column 'a' is declared as non-nullable but contains null values";
+        let expected = UnionExec::try_new(vec![
+            Arc::new(PlaceholderRowExec::new(schema("a"))),
+            Arc::new(PlaceholderRowExec::new(schema("b"))),
+        ])?;
+        let expected = GlobalLimitExec::new(
+            Arc::new(CoalescePartitionsExec::new(expected)),
+            2,
+            Some(1),
+        );
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let expected =
+            datafusion_physical_plan::collect(Arc::new(expected), task_ctx).await;
+        assert!(expected.unwrap_err().to_string().contains(message));
+        let union = PhysicalUnion::try_new(vec![
+            Arc::new(PhysicalPlaceholderRow::new(schema("a"))),
+            Arc::new(PhysicalPlaceholderRow::new(schema("b"))),
+        ])?;
+        let limit = PhysicalLimit::new(Arc::new(union), 2, Some(1));
+        let actual = run(Arc::new(limit), 4).await;
+        assert!(actual.unwrap_err().to_string().contains(message));
+
+        // Only the logical rows of a chunk count.
+        let nullable =
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, true)]));
+        let values = Int32Array::from(vec![Some(1), None, Some(3)]);
+        let chunk = DataChunk::from_record_batch(RecordBatch::try_new(
+            nullable,
+            vec![Arc::new(values)],
+        )?);
+        for (selection, fails) in [(vec![0, 2], false), (vec![2, 1], true)] {
+            let selected = chunk
+                .clone()
+                .with_selection(SelectionVector::from(selection))?;
+            let union = PhysicalUnion::try_new_with_schema(
+                vec![Arc::new(TestSource::new(vec![selected]))],
+                schema("a"),
+            )?;
+            let result = run(Arc::new(union), 1).await;
+            assert_eq!(result.is_err(), fails, "{result:?}");
+            if let Ok(output) = result {
+                assert_eq!(output[0].num_rows(), 2);
+            }
+        }
         Ok(())
     }
 
