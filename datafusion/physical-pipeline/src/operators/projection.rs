@@ -102,8 +102,11 @@ impl PhysicalProjection {
     /// one part of all of its expressions may fail (which error
     /// `ProjectionExec`, which evaluates each expression on a whole batch
     /// before the next one, raises first depends on its batches, see
-    /// [`failing_parts`]), and its input has no lists of values that take no
-    /// memory (see `can_gather`).
+    /// [`failing_parts`]), and its input has no lists of values that take
+    /// less than a byte each (e.g. fixed-size lists of `1 << 30` nulls,
+    /// booleans or empty lists), which the native operators cannot gather with
+    /// `take`, and no run-end encoded arrays whose child fields are not
+    /// Arrow's (see `can_gather`).
     ///
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion,
@@ -485,22 +488,26 @@ fn remap_columns(
 
 /// Whether the native operators can gather rows of arrays of `data_type`
 /// (with [`gather`], or `DataChunk::compact`): not if they contain, at any
-/// depth, lists whose values may take no memory (nulls, run-end encoded
-/// values, of which one run stands for any number of values, or structs or
-/// fixed-size lists of them), which may have more values than Arrow's `take`
-/// can count (it computes the indices of the values of fixed-size lists in 32
-/// bits), and whose cost is proportional to the number of values. DataFusion
-/// filters such arrays without copying their values. Nor run-end encoded
-/// arrays whose child fields are not Arrow's, which Arrow's `filter` renames.
+/// depth, lists whose values may take less than a byte each (nulls, booleans,
+/// run-end encoded values, of which one run stands for any number of values,
+/// empty fixed-size lists of any type, or structs or fixed-size lists of such
+/// values), which may have more values than Arrow's `take` can count (it
+/// computes the indices of the values of fixed-size lists in 32 bits, which
+/// count at most 512 MiB of booleans), and whose cost is proportional to the
+/// number of values. DataFusion filters such arrays without copying their
+/// values. Nor run-end encoded arrays whose child fields are not Arrow's,
+/// which Arrow's `filter` renames.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
-    fn takes_no_memory(data_type: &DataType) -> bool {
+    fn takes_little_memory(data_type: &DataType) -> bool {
         match data_type {
             // One run stands for any number of values.
-            DataType::Null | DataType::RunEndEncoded(..) => true,
+            DataType::Null | DataType::Boolean | DataType::RunEndEncoded(..) => true,
             DataType::Struct(fields) => fields
                 .iter()
-                .all(|field| takes_no_memory(field.data_type())),
-            DataType::FixedSizeList(field, _) => takes_no_memory(field.data_type()),
+                .all(|field| takes_little_memory(field.data_type())),
+            // Empty lists have no value, whatever their type.
+            DataType::FixedSizeList(_, 0) => true,
+            DataType::FixedSizeList(field, _) => takes_little_memory(field.data_type()),
             _ => false,
         }
     }
@@ -511,7 +518,7 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
         | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _)
         | DataType::Map(field, _) => {
-            !takes_no_memory(field.data_type()) && can_gather(field.data_type())
+            !takes_little_memory(field.data_type()) && can_gather(field.data_type())
         }
         DataType::Struct(fields) => {
             fields.iter().all(|field| can_gather(field.data_type()))
@@ -1445,17 +1452,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lists_of_values_without_memory_stay_in_datafusion() {
+    async fn lists_of_tiny_values_stay_in_datafusion() {
         // A projection of `f IS NULL` above a filter gathers the selected rows
-        // of `f`, fixed-size lists of `1 << 30` nulls or of runs, with Arrow's
-        // `take`, whose 32-bit indices overflow (see the test of the same name
-        // for filters).
-        let cases: [(&[i32], bool, usize); 2] = [
-            (&[1, 0, 1, 0, 1, 1], false, 4),
-            (&[0, 0, 0, 0, 1, 0, 1, 0], true, 2),
+        // of `f`, fixed-size lists of `1 << 30` nulls, runs, empty lists or
+        // booleans, with Arrow's `take`, whose 32-bit indices overflow (see the
+        // test of the same name for filters).
+        let cases: [(&[i32], TinyValues, usize); 4] = [
+            (&[1, 0, 1, 0, 1, 1], TinyValues::Nulls, 4),
+            (&[0, 0, 0, 0, 1, 0, 1, 0], TinyValues::Runs, 2),
+            (&[0, 0, 0, 0, 0, 1, 0, 1], TinyValues::EmptyLists, 2),
+            (&[0, 0, 0, 0, 1], TinyValues::Booleans, 1),
         ];
-        for (x, runs, rows) in cases {
-            let batch = wide_lists(x, runs);
+        for (x, values, rows) in cases {
+            let batch = wide_lists(x, values);
             let schema = batch.schema();
             let plan = || -> Arc<dyn ExecutionPlan> {
                 let filter = FilterExec::try_new(
@@ -1478,19 +1487,19 @@ mod tests {
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
             assert!(
                 !PhysicalProjection::supports_projection_exec(exec),
-                "{runs}"
+                "{values:?}"
             );
             let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
             assert_eq!(
                 assert_same_outcome_in_datafusion(plan(), task_ctx).await,
                 Ok(rows),
-                "{runs}"
+                "{values:?}"
             );
         }
     }
 
     #[test]
-    fn lists_of_values_without_memory_cannot_be_gathered() {
+    fn lists_of_tiny_values_cannot_be_gathered() {
         let list = |values: DataType, size: i32| {
             DataType::FixedSizeList(Arc::new(Field::new_list_field(values, true)), size)
         };
@@ -1509,7 +1518,27 @@ mod tests {
                 ),
                 false,
             ),
-            // A run-end encoded column has one value per row.
+            // Empty lists take no memory, whatever their type, and booleans
+            // take a bit.
+            (list(list(DataType::Int32, 0), 1 << 30), false),
+            (list(list(DataType::Utf8, 0), 2), false),
+            (DataType::new_list(list(DataType::Int32, 0), true), false),
+            (list(DataType::Boolean, 1 << 30), false),
+            (DataType::new_list(DataType::Boolean, true), false),
+            (
+                list(
+                    DataType::Struct(
+                        vec![Field::new("b", DataType::Boolean, true)].into(),
+                    ),
+                    4,
+                ),
+                false,
+            ),
+            (list(DataType::Struct(Vec::<Field>::new().into()), 4), false),
+            // An empty list, a boolean or a run-end encoded column has one
+            // value per row.
+            (list(DataType::Int32, 0), true),
+            (DataType::Boolean, true),
             (runs, true),
             (
                 DataType::RunEndEncoded(

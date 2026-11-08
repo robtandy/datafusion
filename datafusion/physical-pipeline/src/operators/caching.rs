@@ -257,8 +257,9 @@ fn owned_rows(chunk: &DataChunk) -> Result<RecordBatch> {
 /// * View arrays share their data buffers after a copy: the coalescer
 ///   compacts them, but not when they are nested in other types.
 /// * Run-end encoded and list view arrays are not cached either.
-/// * Lists of values that take no memory (e.g. fixed-size lists of nulls),
-///   which `take` cannot copy, are not cached.
+/// * Lists of values that take less than a byte each (e.g. fixed-size lists
+///   of nulls, booleans or empty lists), which `take` cannot copy, are not
+///   cached, nor run-end encoded arrays whose child fields are not Arrow's.
 pub fn can_cache(data_type: &DataType) -> bool {
     can_gather(data_type) && can_cache_nested(data_type, false)
 }
@@ -517,14 +518,23 @@ mod tests {
         assert!(can_cache(&DataType::Struct(Fields::from(vec![
             Field::new("s", DataType::LargeUtf8, true)
         ]))));
-        // Nor lists of values that take no memory: copying them with `take`
-        // overflows the 32-bit indices of the values of fixed-size lists.
+        // Nor lists of values that take less than a byte each: copying them
+        // with `take` overflows the 32-bit indices of the values of fixed-size
+        // lists.
         let nulls = Arc::new(Field::new_list_field(DataType::Null, true));
         assert!(!can_cache(&DataType::FixedSizeList(
             Arc::clone(&nulls),
             1 << 30
         )));
         assert!(!can_cache(&DataType::List(nulls)));
+        let empty_lists = Arc::new(Field::new_list_field(
+            DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(DataType::Int32, true)),
+                0,
+            ),
+            true,
+        ));
+        assert!(!can_cache(&DataType::FixedSizeList(empty_lists, 1 << 30)));
         assert!(can_cache(&DataType::FixedSizeList(
             Arc::new(Field::new_list_field(DataType::Float32, true)),
             4

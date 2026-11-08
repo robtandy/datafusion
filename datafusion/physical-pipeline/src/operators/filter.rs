@@ -156,9 +156,11 @@ impl PhysicalFilter {
     ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
     ///   DataFusion must evaluate it on the batches of the input plan of
     ///   `exec`;
-    /// * the input of `exec` has lists of values that take no memory (e.g.
-    ///   fixed-size lists of `1 << 30` nulls), which the native operators
-    ///   cannot gather with `take` (see `can_gather`);
+    /// * the input of `exec` has lists of values that take less than a byte
+    ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans or empty
+    ///   lists), which the native operators cannot gather with `take`, or
+    ///   run-end encoded arrays whose child fields are not Arrow's (see
+    ///   `can_gather`);
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
     ///   (or run ends of less than 32 bits), or lists with 32-bit offsets, at
     ///   any depth: `FilterExec` coalesces its output batches, merging the
@@ -167,7 +169,8 @@ impl PhysicalFilter {
     ///   `Int8` keys), and adding up the offsets of lists, which fails beyond
     ///   `i32::MAX` values (e.g. two lists of `1 << 30` nulls). Whether it
     ///   fails depends on the batches of the input plan, and the native filter
-    ///   does not coalesce its output;
+    ///   does not coalesce its output. Nor run-end encoded arrays whose child
+    ///   fields are not Arrow's, which Arrow's `filter` renames;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -343,8 +346,9 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
         .find(|field| !can_gather(field.data_type()))
     {
         return Some(format!(
-            "its input column '{}' has lists of values that take no memory, which the \
-             native operators cannot gather",
+            "its input column '{}' has lists of values that take less than a byte \
+             each, or run-end encoded arrays with other child fields than Arrow's, \
+             which the native operators cannot gather",
             field.name()
         ));
     }
@@ -1887,21 +1891,47 @@ pub(crate) mod test_support {
         RecordBatch::try_new(schema, vec![Arc::new(x), list(0), list(2048)]).unwrap()
     }
 
+    /// Values that take less than a byte each.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) enum TinyValues {
+        /// Nulls.
+        Nulls,
+        /// One run of `42` (`RunEndEncoded<Int64, Int32>`).
+        Runs,
+        /// Fixed-size lists of no `Int32`.
+        EmptyLists,
+        /// `false`, in bits.
+        Booleans,
+    }
+
     /// A batch of the rows `x` (`Int32`) and of `f`, fixed-size lists of
-    /// `1 << 30` values that take no memory: nulls, or if `runs`, one run of
-    /// `42` (`RunEndEncoded<Int64, Int32>`).
-    pub(crate) fn wide_lists(x: &[i32], runs: bool) -> RecordBatch {
-        let values = x.len() << 30;
-        let child: ArrayRef = if runs {
-            Arc::new(
+    /// `1 << 30` `values`, which take less than a byte each (no memory, but
+    /// for booleans).
+    pub(crate) fn wide_lists(x: &[i32], values: TinyValues) -> RecordBatch {
+        let len = x.len() << 30;
+        let child: ArrayRef = match values {
+            TinyValues::Nulls => Arc::new(arrow::array::NullArray::new(len)),
+            TinyValues::Runs => Arc::new(
                 arrow::array::RunArray::<arrow::datatypes::Int64Type>::try_new(
-                    &Int64Array::from(vec![values as i64]),
+                    &Int64Array::from(vec![len as i64]),
                     &Int32Array::from(vec![42]),
                 )
                 .unwrap(),
-            )
-        } else {
-            Arc::new(arrow::array::NullArray::new(values))
+            ),
+            TinyValues::EmptyLists => Arc::new(
+                arrow::array::FixedSizeListArray::try_new_with_length(
+                    Arc::new(Field::new_list_field(DataType::Int32, true)),
+                    0,
+                    Arc::new(Int32Array::from(Vec::<i32>::new())),
+                    None,
+                    len,
+                )
+                .unwrap(),
+            ),
+            TinyValues::Booleans => Arc::new(arrow::array::BooleanArray::new(
+                arrow::buffer::BooleanBuffer::new_unset(len),
+                None,
+            )),
         };
         let field = Arc::new(Field::new_list_field(child.data_type().clone(), true));
         let f = arrow::array::FixedSizeListArray::try_new(
@@ -4251,19 +4281,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lists_of_values_without_memory_stay_in_datafusion() {
+    async fn lists_of_tiny_values_stay_in_datafusion() {
         // Arrow's `take`, with which the native operators gather rows (e.g. the
         // cache, to copy the rows it keeps), computes the indices of the values
-        // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, or of
-        // runs, they overflow from the fourth row on. DataFusion's `filter`
-        // does not.
-        let cases: [(&[i32], bool); 3] = [
-            (&[0, 0, 0, 0, 0, 1], false),
-            (&[1, 0, 1, 0, 1, 1], false),
-            (&[0, 0, 0, 0, 1, 0, 1, 0], true),
+        // of fixed-size lists in 32 bits: with lists of `1 << 30` nulls, of
+        // runs, or of empty lists (of any type), which take no memory, or of
+        // booleans (128 MiB per row), they overflow from the fourth row on.
+        // DataFusion's `filter` does not.
+        let cases: [(&[i32], TinyValues); 5] = [
+            (&[0, 0, 0, 0, 0, 1], TinyValues::Nulls),
+            (&[1, 0, 1, 0, 1, 1], TinyValues::Nulls),
+            (&[0, 0, 0, 0, 1, 0, 1, 0], TinyValues::Runs),
+            (&[0, 0, 0, 0, 0, 1, 0, 1], TinyValues::EmptyLists),
+            (&[0, 0, 0, 0, 1], TinyValues::Booleans),
         ];
-        for (x, runs) in cases {
-            let batch = wide_lists(x, runs);
+        for (x, values) in cases {
+            let batch = wide_lists(x, values);
             let schema = batch.schema();
             let plan = || {
                 filter_exec(
