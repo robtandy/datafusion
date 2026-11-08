@@ -287,20 +287,33 @@ impl RowCodec {
             flat_type: without_dictionaries(value_type),
             compare_decoded: has_float_leaf(value_type) || has_union(value_type),
         };
-        // Reject the types whose values cannot be restored exactly now
-        // rather than when they are gathered.
+        // Reject the types whose values cannot be restored exactly (or
+        // without dictionaries, to compare them) now rather than when they
+        // are gathered or compared.
         let round_trip = codec
             .converter
             .convert_columns(&[new_null_array(value_type, 1)])
             .map_err(DataFusionError::from)
-            .and_then(|rows| codec.decode(rows.iter().map(|row| row.data())));
+            .and_then(|rows| {
+                let encoded = || rows.iter().map(|row| row.data());
+                Ok([
+                    (codec.decode(encoded())?, value_type),
+                    (codec.decode_flat(encoded())?, &codec.flat_type),
+                ])
+            });
         match round_trip {
-            Ok(values) if has_type(&values.to_data(), value_type) => Ok(codec),
-            Ok(values) => not_impl_err!(
-                "TupleDataLayout does not support the data type {value_type}: \
-                 its values are restored as {}",
-                values.data_type()
-            ),
+            Ok(decoded) => {
+                for (values, data_type) in decoded {
+                    if !has_type(&values.to_data(), data_type) {
+                        return not_impl_err!(
+                            "TupleDataLayout does not support the data type {value_type}: \
+                             its values are restored as {}",
+                            values.data_type()
+                        );
+                    }
+                }
+                Ok(codec)
+            }
             Err(e) => not_impl_err!(
                 "TupleDataLayout does not support the data type {value_type}: {e}"
             ),
