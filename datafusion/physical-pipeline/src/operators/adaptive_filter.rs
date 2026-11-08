@@ -40,10 +40,12 @@
 //! which rows it evaluates the conjuncts after the first one of an `AND`, and
 //! the right side of an `OR` (see `BinaryExpr::evaluate_conjunction` and
 //! `check_short_circuit`), if on any: on an empty batch, it evaluates the
-//! right side of an `OR`. If such an operand can fail on some rows and not on
-//! others, or fails whenever it is evaluated (e.g. a pattern that does not
-//! compile), whether a query fails depends on how the rows are split into
-//! batches, which differs between DataFusion and a pipeline, and so does an
+//! right side of an `OR`. Likewise, it evaluates a value after the first one
+//! of an `IN` list on all rows of a batch unless the values before it match
+//! all of them. If such an operand can fail on some rows and not on others,
+//! or fails whenever it is evaluated (e.g. a pattern that does not compile),
+//! whether a query fails depends on how the rows are split into batches,
+//! which differs between DataFusion and a pipeline, and so does an
 //! expression that fails on DataFusion's empty batches, which pipelines do
 //! not keep: see [`depends_on_batches`].
 //!
@@ -533,12 +535,15 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 /// empty chunks, so they only lower expressions for which this is `false`.
 /// It is `true` if:
 ///
-/// * the right side of an `AND` or an `OR` may fail on some rows and not on
-///   others ([`Fallibility::PerRow`]). DataFusion evaluates it on all rows of
-///   a batch, on the rows that are left if at most 20% of them are, or on no
-///   row at all if none is left, so whether it fails depends on the batches:
-///   e.g. `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not
-///   on a batch with 85% of them;
+/// * the right side of an `AND` or an `OR`, or a value after the first one
+///   of an `IN` list, may fail on some rows and not on others
+///   ([`Fallibility::PerRow`]). DataFusion evaluates the right side of an
+///   `AND` or an `OR` on all rows of a batch, on the rows that are left if at
+///   most 20% of them are, or on no row at all if none is left, and a value of
+///   an `IN` list on all rows of a batch unless the values before it match
+///   all of them, so whether it fails depends on the batches: e.g.
+///   `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not on a
+///   batch with 85% of them;
 /// * a part of `expr` fails whenever it is evaluated
 ///   ([`Fallibility::Uniform`]), which may depend on the batches: e.g.
 ///   DataFusion evaluates the right side of
@@ -557,22 +562,36 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    has_fallible_right_side(expr, schema)
+    has_fallible_conditional_operand(expr, schema)
         || fails_uniformly(expr, schema)
         || (!is_infallible(expr, schema) && fails_without_rows(expr, schema))
         || evaluates_dictionaries(expr, schema)
 }
 
-/// Whether the right side of an `AND` or an `OR` in `expr` may fail on some
-/// rows and not on others.
-fn has_fallible_right_side(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
-        matches!(binary.op(), Operator::And | Operator::Or)
-            && fallibility(binary.right(), schema) == Fallibility::PerRow
-    }) || expr
-        .children()
-        .into_iter()
-        .any(|child| has_fallible_right_side(child, schema))
+/// Whether an operand in `expr` that DataFusion evaluates on rows that depend
+/// on the batch (the right side of an `AND` or an `OR`, or a value after the
+/// first one of an `IN` list) may fail on some rows and not on others.
+fn has_fallible_conditional_operand(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    let conditional = if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        match binary.op() {
+            Operator::And | Operator::Or => std::slice::from_ref(binary.right()),
+            _ => &[],
+        }
+    } else if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        in_list.list().get(1..).unwrap_or_default()
+    } else {
+        &[]
+    };
+    conditional
+        .iter()
+        .any(|operand| fallibility(operand, schema) == Fallibility::PerRow)
+        || expr
+            .children()
+            .into_iter()
+            .any(|child| has_fallible_conditional_operand(child, schema))
 }
 
 /// Whether a part of `expr` fails whenever it is evaluated.
@@ -825,6 +844,13 @@ mod tests {
             ("e OR (a > 0 AND 10 / a > 1)", true),
             ("CASE WHEN a > 0 AND 10 / a > 1 THEN 1 ELSE 0 END = 1", true),
             ("a > 0 AND s LIKE s", true),
+            // DataFusion evaluates a value after the first one of an `IN`
+            // list on all rows of a batch, unless the values before it match
+            // all of them.
+            ("b IN (1, 10 / a)", true),
+            ("b NOT IN (1, 2, b / a)", true),
+            ("b IN (10 / a, 1)", false),
+            ("b IN (1, 2, a, b + 1)", false),
             // A pattern that does not compile fails whenever DataFusion
             // evaluates it, which depends on the batches: on the batches on
             // which the left sides are not all true, and on empty batches.

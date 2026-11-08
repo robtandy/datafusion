@@ -2829,6 +2829,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_lists_with_fallible_values_stay_in_datafusion() {
+        // One batch of 4096 rows, `(x, y) = (1, 0)` then `(2, 1)`. `x = 1` is
+        // not true on all rows of the batch, so DataFusion evaluates `10 / y`
+        // on all of them, and fails. But it is true on all rows of the first
+        // chunk of the pipeline, and `y = 1` on all rows of the second one.
+        let batch = xys(&[((1, 0), 2048), ((2, 1), 2048)]);
+        for predicate in ["x IN (1, 10 / y)", "x NOT IN (1, 10 / y)"] {
+            let plan = filter_exec(predicate, scan(&batch), None);
+            let exec = plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let (error, operators) = assert_native_plan_parity(
+                || filter_exec(predicate, scan(&batch), None),
+                false,
+            )
+            .await;
+            assert!(error.unwrap().contains("Divide by zero"), "{predicate}");
+            assert_eq!(operators.filters, 0, "{predicate}");
+
+            // On the chunks of the pipeline, the predicate does not fail.
+            let filter = filter_for(predicate, &batch.schema());
+            assert!(filter.errors_depend_on_batches());
+            let chunks =
+                [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
+            assert!(drive(&filter, chunks).is_ok(), "{predicate}");
+        }
+        // The first value is evaluated on all rows.
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec("x IN (10 / y, 1)", scan(&batch), None),
+            false,
+        )
+        .await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        assert_eq!(operators.filters, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn patterns_that_fail_behind_short_circuits_stay_in_datafusion() {
         // One batch of 4096 rows, `(x, y) = (0, 1)` then `(1, 0)`. Neither
         // `x = 0` nor `y = 0` is true on all rows of the batch, so DataFusion

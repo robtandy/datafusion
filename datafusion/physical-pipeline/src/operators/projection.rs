@@ -986,6 +986,9 @@ mod tests {
         let nested = "x = 0 OR (y = 0 OR s ~ 'a{1000000}')";
         for (expr, batches, fails) in [
             (nested, vec![mixed.clone()], true),
+            // `x IN (0, 10 / y)` evaluates `10 / y` on all rows of the batch,
+            // but on none of the first chunk.
+            ("x IN (0, 10 / (y - 1))", vec![mixed.clone()], true),
             // On an empty batch, `OR` evaluates its right side.
             (
                 "x = 0 OR s ~ 'a{1000000}'",
@@ -1017,8 +1020,17 @@ mod tests {
         )
         .unwrap();
         for chunk in [mixed.slice(0, 2048), mixed.slice(2048, 2048)] {
-            assert!(project(&native, &DataChunk::from(chunk)).is_ok());
+            assert!(project(&native, &DataChunk::from(chunk.clone())).is_ok());
         }
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(
+                physical_expr("x IN (0, 10 / (y - 1))", &schema),
+                "m".to_owned(),
+            )],
+        )
+        .unwrap();
+        assert!(project(&native, &DataChunk::from(mixed.slice(0, 2048))).is_ok());
         // A pattern that compiles cannot fail.
         for batches in [vec![mixed], vec![empty, zeros], vec![]] {
             let (error, operators) = assert_native_plan_parity(
