@@ -64,7 +64,9 @@
 //! not compile), the `FilterExec` must be executed by DataFusion, on the
 //! batches of its input plan. For the same reason, a `FilterExec` with a
 //! `fetch`, which stops after the batch in which the fetch is reached, is
-//! only lowered if its predicate cannot fail at all. A planner must also keep
+//! only lowered if its predicate cannot fail at all, and a `FilterExec` whose
+//! output has dictionaries with narrow keys, which it may fail to merge when
+//! it coalesces its output batches, is not lowered. A planner must also keep
 //! the filters whose predicate can fail in DataFusion below a limit that
 //! stops the execution early, see [`PhysicalFilter::supports_filter_exec`].
 
@@ -153,6 +155,13 @@ impl PhysicalFilter {
     ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
     ///   DataFusion must evaluate it on the batches of the input plan of
     ///   `exec`;
+    /// * the output of `exec` has dictionaries with keys of less than 32 bits
+    ///   (or run ends of less than 32 bits), at any depth: `FilterExec`
+    ///   coalesces its output batches, merging the dictionaries of distinct
+    ///   batches, which fails if they have more values than the keys can
+    ///   index (e.g. two batches of 100 distinct values, with `Int8` keys).
+    ///   Whether it fails depends on the batches of the input plan, and the
+    ///   native filter does not coalesce its output;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -304,6 +313,17 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
             exec.predicate()
         ));
     }
+    if let Some(field) = exec
+        .schema()
+        .fields()
+        .iter()
+        .find(|field| may_fail_to_coalesce(field.data_type()))
+    {
+        return Some(format!(
+            "it may fail to coalesce the dictionaries or run ends of its output column '{}'",
+            field.name()
+        ));
+    }
     exec.fetch()?;
     let partitions = exec.input().output_partitioning().partition_count();
     if partitions > 1 {
@@ -318,6 +338,41 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
         ));
     }
     None
+}
+
+/// Whether `FilterExec` may fail to coalesce batches of `data_type`, at any
+/// depth: it concatenates the arrays of the batches it coalesces, which
+/// merges the dictionaries of distinct batches, and fails when their keys
+/// cannot index all of their values (keys of less than 32 bits), and adds up
+/// run ends (run ends of less than 32 bits).
+fn may_fail_to_coalesce(data_type: &DataType) -> bool {
+    let narrow = |index: &DataType| {
+        !matches!(
+            index,
+            DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64
+        )
+    };
+    match data_type {
+        DataType::Dictionary(keys, values) => {
+            narrow(keys) || may_fail_to_coalesce(values)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            narrow(run_ends.data_type()) || may_fail_to_coalesce(values.data_type())
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => may_fail_to_coalesce(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| may_fail_to_coalesce(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| may_fail_to_coalesce(field.data_type())),
+        _ => false,
+    }
 }
 
 /// The global state of a [`PhysicalFilter`]: the rows it may still produce.
@@ -872,9 +927,9 @@ pub(crate) mod test_support {
     ///   [`PhysicalProjection::supports_projection_exec`]) and, below a limit
     ///   that stops the execution early, only if their expressions cannot
     ///   fail.
-    /// * A node whose expressions may fail depending on DataFusion's batches,
-    ///   or that stays in DataFusion because its expressions may fail, is
-    ///   executed by DataFusion with its whole input plan, so that it sees
+    /// * A `FilterExec` or a `ProjectionExec` that is not lowered, and a node
+    ///   whose expressions may fail depending on DataFusion's batches, are
+    ///   executed by DataFusion with their whole input plan, so that they see
     ///   DataFusion's batches.
     /// * Scans become the native sources of
     ///   [`try_create_scan_source`](crate::sources::try_create_scan_source).
@@ -905,9 +960,7 @@ pub(crate) mod test_support {
                     Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
                 return Ok(Arc::new(CachingOperator::new(filter)));
             }
-            if fallible {
-                return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
-            }
+            return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             let input_schema = projection.input().schema();
@@ -1295,7 +1348,19 @@ pub(crate) mod test_support {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        let config = test_session_config();
+        assert_native_parity_with_config(sql, test_session_config(), setup).await
+    }
+
+    /// [`assert_native_parity_with_setup`] with the session configuration
+    /// `config`.
+    pub(crate) async fn assert_native_parity_with_config<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> (Option<String>, NativeOperators)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
         let datafusion = datafusion_context(config.clone());
         setup(&datafusion).await.unwrap();
         let native = datafusion_context(config);
@@ -1459,6 +1524,35 @@ pub(crate) mod test_support {
                 )
                 .unwrap();
                 RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(d)]).unwrap()
+            })
+            .collect()
+    }
+
+    /// Two batches of 100 rows of a dictionary column `d`, with `keys`, and of
+    /// the row number `i`: the 100 values of the first dictionary (`a0`, `a1`,
+    /// …) are all distinct from those of the second one (`b0`, …).
+    pub(crate) fn distinct_dictionary_batches(keys: &DataType) -> Vec<RecordBatch> {
+        let data_type =
+            DataType::Dictionary(Box::new(keys.clone()), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", data_type.clone(), true),
+            Field::new("i", DataType::Int32, false),
+        ]));
+        ["a", "b"]
+            .into_iter()
+            .zip([0, 100])
+            .map(|(prefix, first_row)| {
+                let values = StringArray::from_iter_values(
+                    (0..100).map(|v| format!("{prefix}{v}")),
+                );
+                let d = DictionaryArray::<Int32Type>::try_new(
+                    Int32Array::from_iter_values(0..100),
+                    Arc::new(values),
+                )
+                .unwrap();
+                let d = arrow::compute::cast(&d, &data_type).unwrap();
+                let i = Int32Array::from_iter_values(first_row..first_row + 100);
+                RecordBatch::try_new(Arc::clone(&schema), vec![d, Arc::new(i)]).unwrap()
             })
             .collect()
     }
@@ -2678,14 +2772,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_string_view_and_dictionary_filters() {
         assert_all_native_byte_eq(&[
-            "SELECT * FROM vd WHERE d32 = 'k3'",
-            "SELECT i, d8, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
+            "SELECT d32, i FROM vd WHERE d32 = 'k3'",
+            "SELECT i, d32, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
             // Patterns that compile cannot fail, after other conjuncts too.
             "SELECT i, sv FROM vd WHERE i % 3 = 0 AND sv LIKE '%7%'",
             "SELECT i, sv FROM vd WHERE i % 2 = 0 AND (sv ILIKE 'A%' OR sv ~ '7$')",
             "SELECT i, d32 FROM vd WHERE d32 IN ('k1', 'k2', 'k39') OR d8 IS NULL",
             "SELECT i, sv FROM vd WHERE sv > 'short4' AND i % 3 = 0",
-            "SELECT * FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",
+            "SELECT i, d32 FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",
+        ])
+        .await;
+        // `FilterExec` coalesces its output, merging the dictionaries of `d8`
+        // (`Int8` keys), which may fail.
+        assert_all_byte_eq_in_datafusion(&[
+            "SELECT * FROM vd WHERE d32 = 'k3'",
+            "SELECT i, d8, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
             "SELECT * FROM vd WHERE sv IS NULL",
         ])
         .await;
@@ -2981,6 +3082,109 @@ mod tests {
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
         assert_eq!(operators.filters, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_whose_output_dictionaries_may_overflow_stay_in_datafusion() {
+        // One partition of two batches of 100 rows, with 100 distinct values
+        // each, in dictionaries with `Int8` keys. `FilterExec` coalesces them
+        // into one batch, and merging their 200 values overflows the keys.
+        // The native filter does not coalesce its output: it selected the 200
+        // rows.
+        let batches = distinct_dictionary_batches(&DataType::Int8);
+        let schema = batches[0].schema();
+        let predicate = "d <> 'missing'";
+        let plan = || filter_exec(predicate, scan_batches(&schema, &batches), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let err =
+            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
+                .unwrap_err();
+        assert!(err.to_string().contains("dictionaries"), "{err}");
+        let overflow = "Dictionary key bigger than the key type";
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.unwrap().contains(overflow));
+        assert_eq!(operators.filters, 0);
+        let filter = filter_for(predicate, &schema);
+        assert!(drive(&filter, batches.iter().cloned().map(DataChunk::from)).is_ok());
+
+        // The same in SQL, on one target partition (with more, DataFusion
+        // distributes the batches to several filters).
+        let setup = async |ctx: &datafusion::prelude::SessionContext| {
+            register_partitions(ctx, "narrow", vec![batches.clone()])
+        };
+        let (error, operators) = assert_native_parity_with_config(
+            "SELECT * FROM narrow WHERE d <> 'missing'",
+            test_session_config().with_target_partitions(1),
+            setup,
+        )
+        .await;
+        assert!(error.unwrap().contains(overflow));
+        assert_eq!(operators.filters, 0);
+
+        // Without the dictionaries in its output, or with keys of 32 bits,
+        // which can index the values of any batch, the filter is lowered.
+        let projected = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                datafusion_physical_plan::filter::FilterExecBuilder::new(
+                    physical_expr(predicate, &schema),
+                    scan_batches(&schema, &batches),
+                )
+                .apply_projection(Some(vec![1]))
+                .unwrap()
+                .build()
+                .unwrap(),
+            )
+        };
+        let (error, operators) = assert_native_plan_parity(projected, false).await;
+        assert!(error.is_none());
+        assert_eq!(operators.filters, 1);
+        let wide = distinct_dictionary_batches(&DataType::Int32);
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec(predicate, scan_batches(&wide[0].schema(), &wide), None),
+            false,
+        )
+        .await;
+        assert!(error.is_none());
+        assert_eq!(operators.filters, 1);
+    }
+
+    #[test]
+    fn finds_outputs_that_may_fail_to_coalesce() {
+        let utf8 = |keys: DataType| {
+            DataType::Dictionary(Box::new(keys), Box::new(DataType::Utf8))
+        };
+        let field = |data_type: DataType| Arc::new(Field::new("f", data_type, true));
+        for (data_type, fails) in [
+            (utf8(DataType::Int8), true),
+            (utf8(DataType::UInt16), true),
+            (utf8(DataType::Int32), false),
+            (utf8(DataType::UInt64), false),
+            (DataType::List(field(utf8(DataType::Int8))), true),
+            (DataType::List(field(utf8(DataType::Int32))), false),
+            (
+                DataType::Struct(vec![field(utf8(DataType::UInt8))].into()),
+                true,
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int16, false)),
+                    field(DataType::Utf8),
+                ),
+                true,
+            ),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                    field(DataType::Utf8),
+                ),
+                false,
+            ),
+            (DataType::Utf8, false),
+        ] {
+            assert_eq!(may_fail_to_coalesce(&data_type), fails, "{data_type}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
