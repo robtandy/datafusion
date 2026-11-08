@@ -116,8 +116,10 @@ impl PhysicalLimit {
     ///
     /// Nodes whose execution fails in DataFusion are not lowered either, so
     /// that DataFusion executes them: a `GlobalLimitExec` whose input does not
-    /// have exactly one partition, and a `CoalescePartitionsExec` whose input
-    /// has none. Nor are limits of no rows (`fetch == 0`): DataFusion's merge
+    /// have exactly one partition, a `CoalescePartitionsExec` whose input has
+    /// none, and a `LocalLimitExec` that advertises another number of
+    /// partitions than its input has (DataFusion executes some partitions of
+    /// its input only, or fails). Nor are limits of no rows (`fetch == 0`): DataFusion's merge
     /// then ends without waiting for its input, and its limits end with the
     /// first batch of their input, even an empty one, or once the skipped rows
     /// are read, which a native limit, called with the non-empty chunks of its
@@ -141,7 +143,9 @@ impl PhysicalLimit {
                 (input, limit.skip(), limit.fetch(), order_matters(input))
             } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
                 let input = limit.input();
-                if input.output_partitioning().partition_count() > 1 {
+                if input.output_partitioning().partition_count() > 1
+                    || !advertises_its_input_partitions(plan)
+                {
                     return Ok(None);
                 }
                 (input, 0, Some(limit.fetch()), order_matters(input))
@@ -152,7 +156,12 @@ impl PhysicalLimit {
                     return Ok(None);
                 }
                 let input = match coalesce.input().downcast_ref::<LocalLimitExec>() {
-                    Some(local) if local.fetch() >= fetch => local.input(),
+                    Some(local)
+                        if local.fetch() >= fetch
+                            && advertises_its_input_partitions(coalesce.input()) =>
+                    {
+                        local.input()
+                    }
                     _ => coalesce.input(),
                 };
                 let preserve_order = input.output_partitioning().partition_count() <= 1
@@ -206,6 +215,18 @@ impl PhysicalLimit {
     fn end(&self) -> Option<usize> {
         self.fetch.map(|fetch| self.skip.saturating_add(fetch))
     }
+}
+
+/// Whether `plan`, a `LocalLimitExec`, advertises the partitions of its input:
+/// DataFusion executes the partitions it advertises, so if its input was
+/// replaced without recomputing its properties
+/// (`ChildrenPropertiesMode::Keep`), it executes some partitions of its input
+/// only, or fails, unlike a limit of its whole input.
+fn advertises_its_input_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.children().first().is_some_and(|input| {
+        input.output_partitioning().partition_count()
+            == plan.output_partitioning().partition_count()
+    })
 }
 
 /// Whether the rows that a limit selects from `input`, a plan with a single
@@ -369,9 +390,11 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
-    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion_physical_plan::{
+        ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
+    };
 
     use crate::bridge::{BridgeOperator, bridged_plans};
     use crate::chunk::SelectionVector;
@@ -800,6 +823,18 @@ mod tests {
         for plan in no_rows {
             assert!(try_lower(plan)?.is_none());
         }
+        // A `LocalLimitExec` whose input was replaced without recomputing its
+        // properties, with another number of partitions: DataFusion executes
+        // the partitions it advertises.
+        let keep = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep);
+        let stale = Arc::new(LocalLimitExec::new(t1_scan(false)?, 3))
+            .replace_children(vec![t1_scan(true)?], keep)?;
+        assert_eq!(stale.output_partitioning().partition_count(), 4);
+        assert!(try_lower(Arc::clone(&stale))?.is_none());
+        let merged = Arc::new(CoalescePartitionsExec::new(stale).with_fetch(Some(2)));
+        let limit = try_lower(merged)?.expect("a limit");
+        let bridged = limit.input().downcast_ref::<BridgeOperator>().unwrap();
+        assert!(bridged.plan().is::<LocalLimitExec>());
         // Nodes that DataFusion fails to execute are left to it.
         let multi_partition = GlobalLimitExec::new(t1_scan(false)?, 0, Some(1));
         assert!(try_lower(Arc::new(multi_partition))?.is_none());
