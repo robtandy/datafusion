@@ -2420,6 +2420,230 @@ mod tests {
         }
     }
 
+    /// Randomized round trips of non-nullable and nullable nested
+    /// dictionaries that use (almost) all their `Int8` keys, with more rows
+    /// in slots that are masked by null parents or belong to inactive union
+    /// variants, and with null values where Arrow allows them.
+    #[test]
+    fn randomized_nested_dictionaries_round_trip() {
+        use arrow::array::{
+            DictionaryArray, FixedSizeListArray, Int8Array, ListArray, StructArray,
+            UnionArray,
+        };
+        use arrow::datatypes::{Int8Type, UnionFields};
+        use rand::rngs::StdRng;
+        use rand::seq::SliceRandom;
+        use rand::{Rng, SeedableRng};
+
+        for seed in 0..200 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let nullable = rng.random_bool(0.5);
+            // Value 3 of the dictionary is null if `null_value`.
+            let null_value = rng.random_bool(0.5);
+            let size = if rng.random_bool(0.5) {
+                128
+            } else {
+                rng.random_range(120..128)
+            };
+            // The first `size` rows matter (they are valid and of the variant
+            // of the dictionary) and use every value once, the other rows are
+            // random, and often masked or of the other variant.
+            let n = size + rng.random_range(1..40);
+            let matters = |rng: &mut StdRng, i: usize| i < size || rng.random_bool(0.4);
+            let parent_nulls = NullBuffer::from(
+                (0..n).map(|i| matters(&mut rng, i)).collect::<Vec<_>>(),
+            );
+            let type_ids = (0..n)
+                .map(|i| i8::from(!matters(&mut rng, i)))
+                .collect::<Vec<_>>();
+            let random_keys = (0..n)
+                .map(|i| {
+                    if i < size {
+                        i
+                    } else {
+                        rng.random_range(0..size)
+                    }
+                })
+                .collect::<Vec<_>>();
+            // Structs and fixed size lists reject the null values of
+            // non-nullable children that are not masked by a null parent.
+            let masked_keys = random_keys
+                .iter()
+                .enumerate()
+                .map(|(i, &key)| {
+                    let unmasked_null =
+                        key == 3 && null_value && parent_nulls.is_valid(i);
+                    if unmasked_null && !nullable {
+                        4
+                    } else {
+                        key as i8
+                    }
+                })
+                .collect::<Vec<_>>();
+            let all_keys = random_keys.iter().map(|&key| key as i8).collect::<Vec<_>>();
+            let dictionary = |keys: Vec<i8>| -> ArrayRef {
+                let values =
+                    (0..size as i32).map(|i| (i != 3 || !null_value).then_some(i));
+                Arc::new(
+                    DictionaryArray::<Int8Type>::try_new(
+                        Int8Array::from(keys),
+                        Arc::new(Int32Array::from_iter(values)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let data_type =
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+            let field = |name: &str| Field::new(name, data_type.clone(), nullable);
+            let union_fields = || {
+                UnionFields::try_new(
+                    [0, 1],
+                    [field("d"), Field::new("i", DataType::Int32, true)],
+                )
+                .unwrap()
+            };
+            let case = rng.random_range(0..6);
+            let array: ArrayRef = match case {
+                0 => Arc::new(
+                    StructArray::try_new(
+                        vec![field("d")].into(),
+                        vec![dictionary(masked_keys)],
+                        Some(parent_nulls),
+                    )
+                    .unwrap(),
+                ),
+                1 => Arc::new(
+                    FixedSizeListArray::try_new(
+                        Arc::new(field("item")),
+                        1,
+                        dictionary(masked_keys),
+                        Some(parent_nulls),
+                    )
+                    .unwrap(),
+                ),
+                2 => Arc::new(
+                    UnionArray::try_new(
+                        union_fields(),
+                        type_ids.into(),
+                        None,
+                        vec![
+                            dictionary(all_keys),
+                            Arc::new(Int32Array::from(vec![1; n])),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                3 => {
+                    // A dense union, with the keys of the active rows.
+                    let mut counts = [0_usize; 2];
+                    let offsets = type_ids
+                        .iter()
+                        .map(|&id| {
+                            counts[id as usize] += 1;
+                            (counts[id as usize] - 1) as i32
+                        })
+                        .collect::<Vec<_>>();
+                    let keys = (0..n)
+                        .filter(|&i| type_ids[i] == 0)
+                        .map(|i| all_keys[i])
+                        .collect();
+                    Arc::new(
+                        UnionArray::try_new(
+                            union_fields(),
+                            type_ids.into(),
+                            Some(offsets.into()),
+                            vec![
+                                dictionary(keys),
+                                Arc::new(Int32Array::from(vec![1; counts[1]])),
+                            ],
+                        )
+                        .unwrap(),
+                    )
+                }
+                4 => {
+                    // Run-end encoded values (a run per row) in a struct.
+                    let runs = make_array(
+                        ArrayDataBuilder::new(DataType::RunEndEncoded(
+                            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                            Arc::new(field("values")),
+                        ))
+                        .len(n)
+                        .add_child_data(
+                            Int32Array::from_iter_values(1..=n as i32).to_data(),
+                        )
+                        .add_child_data(dictionary(all_keys).to_data())
+                        .build()
+                        .unwrap(),
+                    );
+                    Arc::new(
+                        StructArray::try_new(
+                            vec![Field::new("r", runs.data_type().clone(), true)].into(),
+                            vec![runs],
+                            Some(parent_nulls),
+                        )
+                        .unwrap(),
+                    )
+                }
+                _ => {
+                    // A struct in a list in a struct.
+                    let inner = StructArray::try_new(
+                        vec![field("d")].into(),
+                        vec![dictionary(masked_keys)],
+                        Some(parent_nulls),
+                    )
+                    .unwrap();
+                    let lists = ListArray::new(
+                        Arc::new(Field::new("item", inner.data_type().clone(), true)),
+                        OffsetBuffer::from_lengths(std::iter::repeat_n(1, n)),
+                        Arc::new(inner),
+                        None,
+                    );
+                    let outer_nulls = NullBuffer::from(
+                        (0..n).map(|i| matters(&mut rng, i)).collect::<Vec<_>>(),
+                    );
+                    Arc::new(
+                        StructArray::try_new(
+                            vec![Field::new("l", lists.data_type().clone(), true)].into(),
+                            vec![Arc::new(lists)],
+                            Some(outer_nulls),
+                        )
+                        .unwrap(),
+                    )
+                }
+            };
+            let batch = RecordBatch::try_from_iter(vec![("c", array)]).unwrap();
+            // All rows that matter, and some others, in random order.
+            let mut selection = (0..n as u32)
+                .filter(|&i| (i as usize) < size || rng.random_bool(0.7))
+                .collect::<Vec<_>>();
+            selection.shuffle(&mut rng);
+            let rows_per_block = rng.random_range(1..50);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let layout = TupleDataLayout::try_new(batch.schema(), false)
+                    .unwrap()
+                    .with_rows_per_block(rows_per_block)
+                    .unwrap();
+                let mut collection = TupleDataCollection::new(Arc::new(layout));
+                let chunk = chunk_with_selection(&batch, selection);
+                let expected = chunk.compact().unwrap();
+                let locations = collection.append_chunk(&chunk, None).unwrap();
+                assert_identical(&collection.gather(&locations).unwrap(), &expected);
+                let mut state = TupleDataScanState::new();
+                let mut scanned = vec![];
+                while let Some(chunk) = collection.scan_chunk(&mut state).unwrap() {
+                    scanned.push(chunk.into_record_batch().unwrap());
+                }
+                let scanned =
+                    arrow::compute::concat_batches(&batch.schema(), &scanned).unwrap();
+                assert_identical(&scanned, &expected);
+            }));
+            assert!(
+                result.is_ok(),
+                "seed {seed}, case {case}, nullable {nullable}, size {size}"
+            );
+        }
+    }
+
     #[test]
     fn dictionaries_of_nested_values() {
         use arrow::array::{
