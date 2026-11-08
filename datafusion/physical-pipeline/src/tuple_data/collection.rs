@@ -2079,10 +2079,12 @@ mod tests {
         assert!(collection.layout().column(4).codec().unwrap().needs_cast());
         let chunk = chunk_with_selection(&batch, vec![7, 0, 3, 3, 5, 1, 2, 6, 4]);
         let locations = collection.append_chunk(&chunk, None).unwrap();
-        // The exact schema, with the custom fields, is restored.
+        // The exact schema, with the custom fields, is restored, also when no
+        // rows are gathered.
         let gathered = collection.gather(&locations).unwrap();
         assert_eq!(gathered.schema(), batch.schema());
         assert_identical(&gathered, &chunk.compact().unwrap());
+        assert_identical(&collection.gather(&[]).unwrap(), &batch.slice(0, 0));
 
         let mut state = TupleDataScanState::new().with_column_ids(vec![2, 4, 0, 3, 1]);
         let scanned = collection.scan_chunk(&mut state).unwrap().unwrap();
