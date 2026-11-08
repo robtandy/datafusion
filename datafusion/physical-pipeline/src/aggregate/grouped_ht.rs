@@ -172,13 +172,18 @@ impl GroupedHashTable {
         Ok(())
     }
 
-    /// Emit the keys and states of all groups, and reset the table. Returns
-    /// `None` if the table has no groups.
+    /// Emit the keys and states of all groups, and reset the table, which
+    /// can then aggregate more rows. Returns `None` if the table has no
+    /// groups.
     pub(crate) fn emit_states(&mut self) -> Result<Option<GroupedStates>> {
-        if self.is_empty() {
+        let num_groups = self.num_groups();
+        if num_groups == 0 {
             return Ok(None);
         }
         let keys = self.group_values.emit(EmitTo::All)?;
+        // Some `GroupValues` keep their hash table on `emit(EmitTo::All)`:
+        // clear it, keeping room for as many groups.
+        self.group_values.clear_shrink(num_groups);
         let states = self
             .accumulators
             .iter_mut()
@@ -304,5 +309,204 @@ fn grouping_id(group: &[bool], ordinal: usize) -> u64 {
         semantic_id
     } else {
         semantic_id | ((ordinal as u64) << group.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{AsArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use datafusion::functions_aggregate::count::count_udaf;
+    use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion_physical_expr::expressions::{col, lit};
+    use datafusion_physical_plan::aggregates::{
+        AggregateExec, AggregateMode, PhysicalGroupBy,
+    };
+    use datafusion_physical_plan::empty::EmptyExec;
+
+    use super::super::PhysicalHashAggregate;
+    use crate::bridge::BridgeOperator;
+
+    fn input_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Utf8, true),
+        ]))
+    }
+
+    /// `GROUP BY GROUPING SETS (groups)` over columns `a` and `b`.
+    fn grouping_sets(groups: Vec<Vec<bool>>) -> Result<PhysicalGroupBy> {
+        let schema = input_schema();
+        Ok(PhysicalGroupBy::new(
+            vec![
+                (col("a", &schema)?, "a".into()),
+                (col("b", &schema)?, "b".into()),
+            ],
+            vec![
+                (lit(ScalarValue::Int32(None)), "a".into()),
+                (lit(ScalarValue::Utf8(None)), "b".into()),
+            ],
+            groups,
+            true,
+        ))
+    }
+
+    /// The `AggregateSpec` of `COUNT(a)` grouped by `group_by`.
+    fn spec(group_by: PhysicalGroupBy) -> Result<Arc<AggregateSpec>> {
+        let schema = input_schema();
+        let count = AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("count(a)")
+            .build()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![Arc::new(count)],
+            vec![None],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            schema,
+        )?;
+        let input = Arc::new(BridgeOperator::new(Arc::clone(aggregate.input())));
+        let aggregate = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?;
+        Ok(aggregate.spec())
+    }
+
+    fn batch() -> Result<RecordBatch> {
+        Ok(RecordBatch::try_new(
+            input_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(1)])),
+                Arc::new(StringArray::from(vec![Some("x"), Some("y"), None])),
+            ],
+        )?)
+    }
+
+    #[test]
+    fn grouping_ids_are_those_of_datafusion() -> Result<()> {
+        // With repeated grouping sets, the ordinals go into the high bits.
+        let group_sets = [
+            vec![vec![false, false], vec![true, false], vec![true, true]],
+            vec![
+                vec![false, true],
+                vec![true, true],
+                vec![false, true],
+                vec![true, true],
+                vec![false, true],
+            ],
+        ];
+        for groups in group_sets {
+            let group_by = grouping_sets(groups.clone())?;
+            let spec = spec(group_by.clone())?;
+            let grouping_id_type = spec.group_schema.field(2).data_type().clone();
+            let expected = evaluate_group_by(&group_by, &batch()?)?;
+            let mut ordinals = HashMap::<&[bool], usize>::new();
+            for (group, keys) in groups.iter().zip(&expected) {
+                let ordinal = ordinals.entry(group).or_insert(0);
+                let id = ScalarValue::UInt64(Some(grouping_id(group, *ordinal)))
+                    .cast_to(&grouping_id_type)?;
+                *ordinal += 1;
+                assert_eq!(keys[2].data_type(), &grouping_id_type);
+                assert_eq!(ScalarValue::try_from_array(&keys[2], 0)?, id, "{group:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_grouping_sets_are_added_to_empty_tables() -> Result<()> {
+        let group_by = grouping_sets(vec![
+            vec![false, false],
+            vec![true, true],
+            vec![false, true],
+            vec![true, true],
+        ])?;
+        let spec = spec(group_by)?;
+        let mut table = GroupedHashTable::try_new_update(&spec)?;
+        table.add_empty_grouping_sets(&spec)?;
+        // One group per occurrence of the grouping set without columns.
+        assert_eq!(table.num_groups(), 2);
+        let states = table.emit_states()?.expect("groups");
+        assert!(states.keys[0].is_null(0) && states.keys[1].is_null(0));
+        assert_eq!(
+            states.states[0][0].as_primitive::<Int64Type>().values(),
+            &[0, 0]
+        );
+        assert!(table.is_empty());
+
+        // Tables with groups get none.
+        table.update(&spec, &batch()?)?;
+        let groups = table.num_groups();
+        table.add_empty_grouping_sets(&spec)?;
+        assert_eq!(table.num_groups(), groups);
+
+        // Neither do aggregations without grouping sets.
+        let schema = input_schema();
+        let spec = self::spec(PhysicalGroupBy::new_single(vec![(
+            col("a", &schema)?,
+            "a".into(),
+        )]))?;
+        let mut table = GroupedHashTable::try_new_update(&spec)?;
+        table.add_empty_grouping_sets(&spec)?;
+        assert!(table.is_empty());
+        assert!(table.emit_states()?.is_none());
+        assert!(table.evaluate()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn tables_can_aggregate_again_after_emitting_their_states() -> Result<()> {
+        // Several group columns (DataFusion's `GroupValuesColumn`) and one.
+        let schema = input_schema();
+        for group_by in [
+            PhysicalGroupBy::new_single(vec![
+                (col("a", &schema)?, "a".into()),
+                (col("b", &schema)?, "b".into()),
+            ]),
+            PhysicalGroupBy::new_single(vec![(col("b", &schema)?, "b".into())]),
+        ] {
+            let spec = spec(group_by)?;
+            let mut table = GroupedHashTable::try_new_update(&spec)?;
+            table.update(&spec, &batch()?)?;
+            let groups = table.num_groups();
+            let first = table.emit_states()?.expect("groups");
+            assert!(table.is_empty());
+            // The same keys again, twice: the same groups, counted again.
+            table.update(&spec, &batch()?)?;
+            table.update(&spec, &batch()?)?;
+            assert_eq!(table.num_groups(), groups);
+            let second = table.emit_states()?.expect("groups");
+            let counts = |states: &GroupedStates| {
+                states.states[0][0]
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .sum::<i64>()
+            };
+            assert_eq!(counts(&second), 2 * counts(&first));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn filters_select_the_group_indices_of_their_rows() {
+        let group_indices = (0..6).collect::<Vec<_>>();
+        let all = BooleanArray::from(vec![true; 6]);
+        assert_eq!(compact_group_indices(&group_indices, &all), None);
+        let some = BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            Some(true),
+            None,
+            Some(true),
+        ]);
+        assert_eq!(
+            compact_group_indices(&group_indices, &some),
+            Some(vec![0, 3, 5])
+        );
+        let none = BooleanArray::from(vec![false; 6]);
+        assert_eq!(compact_group_indices(&group_indices, &none), Some(vec![]));
     }
 }

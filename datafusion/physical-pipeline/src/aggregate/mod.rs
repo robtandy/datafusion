@@ -106,6 +106,7 @@ pub(crate) mod test_support {
     use parking_lot::Mutex;
 
     use super::PhysicalHashAggregate;
+    use super::radix_ht::TableCapacity;
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
     use crate::explain::format_operator_tree;
@@ -140,8 +141,36 @@ pub(crate) mod test_support {
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
+        lower_with(plan, None)
+    }
+
+    /// Thread-local tables of at most 64 groups, which are flushed (and
+    /// grown) all the time.
+    pub(crate) const TINY_TABLES: TableCapacity = TableCapacity {
+        initial: 8,
+        maximum: 64,
+    };
+
+    /// Lower `plan` like [`lower`], with the thread-local tables of the
+    /// grouped aggregations of [`TINY_TABLES`].
+    pub(crate) fn lower_with_tiny_tables(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        lower_with(plan, Some(TINY_TABLES))
+    }
+
+    /// Lower `plan` like [`lower`], with thread-local tables of capacity
+    /// `capacity` (the default if `None`).
+    fn lower_with(
+        plan: &Arc<dyn ExecutionPlan>,
+        capacity: Option<TableCapacity>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let lower = |plan: &Arc<dyn ExecutionPlan>| lower_with(plan, capacity);
         if let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, lower)? {
-            return Ok(Arc::new(aggregate));
+            return Ok(Arc::new(match capacity {
+                Some(capacity) => aggregate.with_table_capacity(capacity),
+                None => aggregate,
+            }));
         }
         if let Some(limit) = PhysicalLimit::try_lower(plan, lower)? {
             return Ok(Arc::new(limit));
@@ -500,43 +529,53 @@ pub(crate) mod test_support {
         let ctx = datafusion_context(config);
         setup(&ctx).await.expect("setup");
         let expected = run_sql(&ctx, sql).await.expect("DataFusion");
-        // A new plan: executing a plan changes the state of some nodes.
-        let plan = ctx
-            .sql(sql)
-            .await
-            .expect("planning")
-            .create_physical_plan()
-            .await
-            .expect("physical planning");
-        let root = lower(&plan).expect("lowering");
-        assert!(
-            count::<PhysicalHashAggregate>(&root) > 0,
-            "No aggregation was lowered\nquery: {sql}\nlowered: {}",
-            format_operator_tree(&root)
-        );
-        let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan).expect("root"));
-        let batches = collect(Arc::clone(&exec), ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to run the lowered plan: {e}\nquery: {sql}\nlowered: {}",
-                    format_operator_tree(&root)
-                )
-            });
-        let actual = EngineOutput {
-            schema: exec.schema(),
-            plan: exec,
-            batches,
-            ordered: expected.ordered,
-        };
-        if let Err(message) = compare_outputs(&expected, &actual) {
-            panic!(
-                "Results differ: {message}\nquery: {sql}\nlowered: {}",
+        let mut lowered = None;
+        for (lower, tables) in [
+            (lower as fn(&_) -> _, "default"),
+            (lower_with_tiny_tables, "tiny"),
+        ] {
+            // A new plan: executing a plan changes the state of some nodes.
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("planning")
+                .create_physical_plan()
+                .await
+                .expect("physical planning");
+            let root = lower(&plan).expect("lowering");
+            assert!(
+                count::<PhysicalHashAggregate>(&root) > 0,
+                "No aggregation was lowered\nquery: {sql}\nlowered: {}",
                 format_operator_tree(&root)
             );
+            let exec: Arc<dyn ExecutionPlan> = Arc::new(
+                PipelineRootExec::try_new(Arc::clone(&root), plan).expect("root"),
+            );
+            let batches = collect(Arc::clone(&exec), ctx.task_ctx())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to run the lowered plan ({tables} tables): {e}\n\
+                         query: {sql}\nlowered: {}",
+                        format_operator_tree(&root)
+                    )
+                });
+            let actual = EngineOutput {
+                schema: exec.schema(),
+                plan: exec,
+                batches,
+                ordered: expected.ordered,
+            };
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!(
+                    "Results differ ({tables} tables): {message}\nquery: {sql}\n\
+                     lowered: {}",
+                    format_operator_tree(&root)
+                );
+            }
+            lowered.get_or_insert(root);
         }
-        root
+        lowered.expect("a lowered plan")
     }
 }
 
@@ -810,6 +849,57 @@ mod tests {
                 "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
                 "SELECT e, NTH_VALUE(a, 2 ORDER BY id) FROM t1 GROUP BY e",
                 "SELECT d, COUNT(*) FROM t_empty GROUP BY ROLLUP (d)",
+            ] {
+                assert_aggregate_parity_with_config(sql, config.clone()).await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_aggregates_with_other_plans_and_settings() {
+        let settings: [&[(&str, &str)]; 5] = [
+            // Partitioned joins: `SinglePartitioned` aggregations of their
+            // output, which is partitioned by the group keys.
+            &[
+                (
+                    "datafusion.optimizer.hash_join_single_partition_threshold",
+                    "0",
+                ),
+                (
+                    "datafusion.optimizer.hash_join_single_partition_threshold_rows",
+                    "0",
+                ),
+            ],
+            // `Final` aggregations of coalesced partial states.
+            &[("datafusion.optimizer.repartition_aggregations", "false")],
+            // DataFusion's legacy aggregation stream.
+            &[("datafusion.execution.enable_migration_aggregate", "false")],
+            // DataFusion skips the partial aggregation.
+            &[
+                (
+                    "datafusion.execution.skip_partial_aggregation_probe_rows_threshold",
+                    "1",
+                ),
+                (
+                    "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                    "0.0",
+                ),
+            ],
+            &[("datafusion.execution.batch_size", "100")],
+        ];
+        for settings in settings {
+            let mut config = test_session_config();
+            for (key, value) in settings {
+                config = config.set_str(key, value);
+            }
+            for sql in [
+                "SELECT t1.a, COUNT(*), SUM(t2.w), MIN(t1.d) FROM t1 JOIN t2 ON t1.a = t2.k \
+                 GROUP BY t1.a",
+                "SELECT d, e, COUNT(*), SUM(a), AVG(g) FROM t1 GROUP BY d, e",
+                "SELECT id % 100 AS k, COUNT(*), MEDIAN(a) FROM t1 GROUP BY id % 100",
+                "SELECT d, COUNT(DISTINCT a), ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
+                "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
+                "SELECT COUNT(*), SUM(b) FILTER (WHERE a > 0) FROM t1",
             ] {
                 assert_aggregate_parity_with_config(sql, config.clone()).await;
             }

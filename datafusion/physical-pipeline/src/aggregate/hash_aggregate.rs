@@ -9,12 +9,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array,
+    ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array,
 };
 use arrow::compute::{
     SortColumn, concat, filter_record_batch, lexsort_to_indices, take_record_batch,
 };
 use arrow::datatypes::SchemaRef;
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
@@ -25,7 +26,7 @@ use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
-use super::radix_ht::RadixHashAggregate;
+use super::radix_ht::{RadixHashAggregate, TableCapacity};
 use super::ungrouped::UngroupedAggregate;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -49,6 +50,8 @@ pub struct PhysicalHashAggregate {
     /// The input, the only child.
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: Arc<AggregateSpec>,
+    /// The capacity of the thread-local tables of a grouped aggregation.
+    table_capacity: TableCapacity,
 }
 
 /// The aggregation that a [`PhysicalHashAggregate`] computes.
@@ -110,7 +113,7 @@ pub(crate) struct FilteredArguments {
 }
 
 impl AggregateUpdate {
-    fn try_new(
+    fn new(
         expr: Arc<AggregateFunctionExpr>,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -131,33 +134,29 @@ impl AggregateUpdate {
         &self,
         batch: &RecordBatch,
     ) -> Result<FilteredArguments> {
-        let selection = self
-            .filter
-            .as_ref()
-            .map(|filter| {
-                let mask = filter.evaluate(batch)?.into_array(batch.num_rows())?;
-                Ok::<_, datafusion_common::DataFusionError>(mask.as_boolean().clone())
-            })
-            .transpose()?;
-        let selected = selection.as_ref().map(BooleanArray::true_count);
-        let values = match selected {
-            None => self.evaluate_arguments(batch)?,
-            Some(0) => self
+        let Some(filter) = &self.filter else {
+            return Ok(FilteredArguments {
+                values: self.evaluate_arguments(batch)?,
+                selection: None,
+            });
+        };
+        let mask = filter.evaluate(batch)?.into_array(batch.num_rows())?;
+        let mask = as_boolean_array(&mask)?.clone();
+        let values = match mask.true_count() {
+            0 => self
                 .arguments
                 .iter()
                 .map(|argument| {
                     Ok(new_empty_array(&argument.data_type(batch.schema_ref())?))
                 })
                 .collect::<Result<_>>()?,
-            Some(selected) if selected == batch.num_rows() => {
-                self.evaluate_arguments(batch)?
-            }
-            Some(_) => {
-                let mask = selection.as_ref().expect("a selection");
-                self.evaluate_arguments(&filter_record_batch(batch, mask)?)?
-            }
+            selected if selected == batch.num_rows() => self.evaluate_arguments(batch)?,
+            _ => self.evaluate_arguments(&filter_record_batch(batch, &mask)?)?,
         };
-        Ok(FilteredArguments { values, selection })
+        Ok(FilteredArguments {
+            values,
+            selection: Some(mask),
+        })
     }
 
     /// Evaluate the arguments of the aggregate for all rows of `batch`.
@@ -251,7 +250,17 @@ impl PhysicalHashAggregate {
     /// * aggregations of input without partitions, which DataFusion
     ///   aggregates differently from an empty input (e.g. it produces no
     ///   grand total for a `ROLLUP`, and fails to coalesce the partial
-    ///   states of an ungrouped aggregation).
+    ///   states of an ungrouped aggregation);
+    /// * aggregations whose groups may span several partitions of the input
+    ///   of the final (or single) `AggregateExec`, which aggregates every
+    ///   partition on its own (the native operator aggregates all rows
+    ///   together, which is the same if every partition has its own groups:
+    ///   if there is a single partition, or the partitions are partitioned
+    ///   by the group keys);
+    /// * aggregations that advertise another number of partitions than their
+    ///   input has (after their input was replaced without recomputing their
+    ///   properties): DataFusion then aggregates some partitions of their
+    ///   input only, or fails.
     ///
     /// The limits that DataFusion pushes into an aggregation (`lim=[n]`,
     /// for a `DISTINCT ... LIMIT` or a top-k `ORDER BY ... LIMIT`) are hints
@@ -283,11 +292,14 @@ impl PhysicalHashAggregate {
         }) {
             return Ok(None);
         }
-        if raw.input().output_partitioning().partition_count() == 0 {
+        if raw.input().output_partitioning().partition_count() == 0
+            || !advertises_its_input_partitions(raw)
+            || !groups_are_partition_local(last.unwrap_or(raw))
+        {
             return Ok(None);
         }
         if let Some(last) = last
-            && !is_final_of(last, raw)
+            && (!is_final_of(last, raw) || !advertises_its_input_partitions(last))
         {
             return Ok(None);
         }
@@ -387,7 +399,7 @@ impl PhysicalHashAggregate {
         let update = update_exprs
             .into_iter()
             .zip(raw.filter_expr())
-            .map(|(expr, filter)| AggregateUpdate::try_new(expr, filter.clone()))
+            .map(|(expr, filter)| AggregateUpdate::new(expr, filter.clone()))
             .collect();
         let num_fields = group_schema.fields().len() + merge.len();
         if schema.fields().len() != num_fields {
@@ -398,6 +410,7 @@ impl PhysicalHashAggregate {
         }
         Ok(Self {
             children: vec![input],
+            table_capacity: TableCapacity::default(),
             spec: Arc::new(AggregateSpec {
                 input_schema,
                 group_by,
@@ -432,6 +445,19 @@ impl PhysicalHashAggregate {
     pub fn is_ungrouped(&self) -> bool {
         self.spec.is_ungrouped()
     }
+
+    /// Use thread-local tables of capacity `capacity` (in groups) for a
+    /// grouped aggregation, e.g. tiny ones to test how they are flushed.
+    #[cfg(test)]
+    pub(crate) fn with_table_capacity(mut self, capacity: TableCapacity) -> Self {
+        self.table_capacity = capacity;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spec(&self) -> Arc<AggregateSpec> {
+        Arc::clone(&self.spec)
+    }
 }
 
 /// The `AggregateExec` in `Partial` mode below `plan`, the input of an
@@ -452,6 +478,37 @@ fn partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
         return partial_aggregate(coalesce.input());
     }
     None
+}
+
+/// Whether `aggregate` advertises the partitions of its input: DataFusion
+/// aggregates the input partitions of the partitions an aggregation
+/// advertises.
+fn advertises_its_input_partitions(aggregate: &AggregateExec) -> bool {
+    aggregate
+        .properties()
+        .output_partitioning()
+        .partition_count()
+        == aggregate.input().output_partitioning().partition_count()
+}
+
+/// Whether no group of `aggregate`, the `AggregateExec` that produces the
+/// final values, spans several partitions of its input. DataFusion
+/// aggregates every partition on its own, which is the same as aggregating
+/// all rows together exactly then: if there is a single partition, or the
+/// partitions are partitioned by (a subset of) the group keys. (With grouping
+/// sets, a single stage aggregation makes groups of the rows of all
+/// partitions, e.g. the grand total of a `ROLLUP`.)
+fn groups_are_partition_local(aggregate: &AggregateExec) -> bool {
+    let input = aggregate.input();
+    let partitioning = input.output_partitioning();
+    if partitioning.partition_count() == 1 {
+        return true;
+    }
+    let group_by = aggregate.group_expr();
+    let keys = group_by.input_exprs();
+    !group_by.has_grouping_set()
+        && !keys.is_empty()
+        && partitioning.keeps_keys_local(&keys, input.equivalence_properties(), true)
 }
 
 /// Whether `last` merges the states produced by `partial`: it groups by the
@@ -623,7 +680,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
         if self.spec.is_ungrouped() {
             UngroupedAggregate::local_sink_state(&self.spec)
         } else {
-            RadixHashAggregate::local_sink_state(&self.spec)
+            RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity)
         }
     }
 
@@ -631,14 +688,14 @@ impl PhysicalOperator for PhysicalHashAggregate {
         &self,
         _ctx: &ExecutionContext,
         input: &DataChunk,
-        _gstate: &dyn GlobalSinkState,
+        gstate: &dyn GlobalSinkState,
         lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         let batch = input.compact()?;
         if self.spec.is_ungrouped() {
             UngroupedAggregate::sink(&self.spec, batch, lstate)?;
         } else {
-            RadixHashAggregate::sink(&self.spec, batch, lstate)?;
+            RadixHashAggregate::sink(&self.spec, batch, gstate, lstate)?;
         }
         Ok(SinkResult::NeedMoreInput)
     }
@@ -719,5 +776,413 @@ impl PhysicalOperator for PhysicalHashAggregate {
         } else {
             RadixHashAggregate::get_data(&self.spec, gstate, lstate)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::functions_aggregate::count::count_udaf;
+    use datafusion::functions_aggregate::sum::sum_udaf;
+    use datafusion_common::ScalarValue;
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_execution::TaskContext;
+    use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion_physical_expr::expressions::{col, lit};
+    use datafusion_physical_plan::{
+        ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
+    };
+
+    use super::super::test_support::lower;
+    use crate::bridge::BridgeOperator;
+    use crate::executor::Executor;
+    use crate::operators::union::test_support::assert_lowered_plan_byte_eq;
+    use crate::test_utils::{canonical_batch, test_session_config};
+
+    type Plan = Arc<dyn ExecutionPlan>;
+
+    fn input_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]))
+    }
+
+    /// `partitions` partitions of rows `(k, v)`, optionally sorted by `k`.
+    fn input(partitions: usize, sorted: bool) -> Result<Plan> {
+        let schema = input_schema();
+        let batch = |p: i64| {
+            let rows = (0..1000).map(move |i| p * 1000 + i);
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from_iter(
+                        rows.clone()
+                            .map(|i| (i % 11 != 3).then(|| format!("key {}", i % 37))),
+                    )),
+                    Arc::new(Int64Array::from_iter(
+                        rows.map(|i| (i % 7 != 2).then_some(i)),
+                    )),
+                ],
+            )
+        };
+        let partitions = (0..partitions as i64)
+            .map(|p| Ok(vec![batch(p)?]))
+            .collect::<Result<Vec<_>>>()?;
+        let source = MemorySourceConfig::try_new(&partitions, Arc::clone(&schema), None)?;
+        let source = if sorted {
+            let ordering =
+                LexOrdering::new([PhysicalSortExpr::new_default(col("k", &schema)?)])
+                    .expect("an ordering");
+            source.try_with_sort_information(vec![ordering])?
+        } else {
+            source
+        };
+        Ok(Arc::new(
+            datafusion_datasource::source::DataSourceExec::new(Arc::new(source)),
+        ))
+    }
+
+    fn aggregates(schema: &SchemaRef) -> Result<Vec<Arc<AggregateFunctionExpr>>> {
+        Ok(vec![
+            Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![lit(1i64)])
+                    .schema(Arc::clone(schema))
+                    .alias("count(*)")
+                    .build()?,
+            ),
+            Arc::new(
+                AggregateExprBuilder::new(sum_udaf(), vec![col("v", schema)?])
+                    .schema(Arc::clone(schema))
+                    .alias("sum(v)")
+                    .build()?,
+            ),
+        ])
+    }
+
+    fn group_by(grouped: bool) -> Result<PhysicalGroupBy> {
+        Ok(if grouped {
+            PhysicalGroupBy::new_single(vec![(col("k", &input_schema())?, "k".into())])
+        } else {
+            PhysicalGroupBy::default()
+        })
+    }
+
+    /// An aggregation in mode `mode` over `input`.
+    fn single(mode: AggregateMode, grouped: bool, input: Plan) -> Result<Plan> {
+        let schema = input.schema();
+        Ok(Arc::new(AggregateExec::try_new(
+            mode,
+            group_by(grouped)?,
+            aggregates(&schema)?,
+            vec![None, None],
+            input,
+            schema,
+        )?))
+    }
+
+    /// The partial aggregation of `input`.
+    fn partial(grouped: bool, input: Plan) -> Result<Plan> {
+        single(AggregateMode::Partial, grouped, input)
+    }
+
+    /// The final aggregation in mode `mode` of `states`, the partial states
+    /// of an aggregation of `input_schema`, possibly redistributed.
+    fn last(mode: AggregateMode, grouped: bool, states: Plan) -> Result<Plan> {
+        let input_schema = input_schema();
+        Ok(Arc::new(AggregateExec::try_new(
+            mode,
+            group_by(grouped)?.as_final(),
+            aggregates(&input_schema)?,
+            vec![None, None],
+            states,
+            input_schema,
+        )?))
+    }
+
+    fn hash_repartition(states: Plan) -> Result<Plan> {
+        let key = col("k", &states.schema())?;
+        Ok(Arc::new(RepartitionExec::try_new(
+            states,
+            Partitioning::Hash(vec![key], 3),
+        )?))
+    }
+
+    fn coalesce(states: Plan) -> Plan {
+        Arc::new(CoalescePartitionsExec::new(states))
+    }
+
+    /// Lower `plan` with [`PhysicalHashAggregate::try_lower`], bridging the
+    /// input.
+    fn try_lower(plan: &Plan) -> Result<Option<PhysicalHashAggregate>> {
+        PhysicalHashAggregate::try_lower(plan, |input| {
+            Ok(Arc::new(BridgeOperator::new(Arc::clone(input))))
+        })
+    }
+
+    /// The plans of all the aggregations that are lowered: a single stage,
+    /// and both stages through a repartition, a coalesce or directly.
+    /// A named function that creates a plan.
+    type MakePlan = (&'static str, Box<dyn Fn() -> Result<Plan>>);
+
+    fn lowered_plans() -> Vec<MakePlan> {
+        vec![
+            (
+                "single",
+                Box::new(|| single(AggregateMode::Single, true, input(1, false)?)),
+            ),
+            (
+                "single ungrouped",
+                Box::new(|| single(AggregateMode::Single, false, input(1, false)?)),
+            ),
+            (
+                "single partitioned",
+                Box::new(|| {
+                    let input = hash_repartition(input(2, false)?)?;
+                    single(AggregateMode::SinglePartitioned, true, input)
+                }),
+            ),
+            (
+                "final partitioned",
+                Box::new(|| {
+                    let states = hash_repartition(partial(true, input(4, false)?)?)?;
+                    last(AggregateMode::FinalPartitioned, true, states)
+                }),
+            ),
+            (
+                "final",
+                Box::new(|| {
+                    let states = coalesce(partial(true, input(4, false)?)?);
+                    last(AggregateMode::Final, true, states)
+                }),
+            ),
+            (
+                "final ungrouped",
+                Box::new(|| {
+                    let states = coalesce(partial(false, input(4, false)?)?);
+                    last(AggregateMode::Final, false, states)
+                }),
+            ),
+            (
+                "final of one partition",
+                Box::new(|| {
+                    let states = partial(true, input(1, false)?)?;
+                    last(AggregateMode::Final, true, states)
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn lowering_of_aggregations() -> Result<()> {
+        for (name, make) in lowered_plans() {
+            let plan = make()?;
+            let aggregate = try_lower(&plan)?.unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(aggregate.schema(), plan.schema(), "{name}");
+            assert_eq!(aggregate.is_ungrouped(), name.ends_with("ungrouped"));
+            assert_eq!(aggregate.aggregates().count(), 2);
+            assert!(aggregate.is_sink() && aggregate.parallel_sink());
+            assert!(aggregate.is_source() && aggregate.parallel_source());
+            // The input of the stage that consumes the rows is lowered.
+            let bridge = aggregate.input().downcast_ref::<BridgeOperator>().unwrap();
+            let raw = if name.starts_with("single") {
+                plan.children()[0]
+            } else {
+                partial_aggregate(plan.children()[0]).unwrap().input()
+            };
+            assert!(Arc::ptr_eq(bridge.plan(), raw), "{name}");
+        }
+        let description = try_lower(&lowered_plans()[0].1()?)?.unwrap().description();
+        assert_eq!(
+            description,
+            "PhysicalHashAggregate: gby=[k@0 as k], aggr=[count(*), sum(v)]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregations_that_are_not_lowered() -> Result<()> {
+        let not_lowered: Vec<(&str, Plan)> = vec![
+            ("not an aggregation", input(1, false)?),
+            ("partial", partial(true, input(4, false)?)?),
+            (
+                "final without partial",
+                last(AggregateMode::Final, true, coalesce(input(4, false)?))?,
+            ),
+            (
+                "clustered input",
+                single(AggregateMode::Single, true, input(1, true)?)?,
+            ),
+            (
+                "input without partitions",
+                single(AggregateMode::Single, false, input(0, false)?)?,
+            ),
+            (
+                "partial input without partitions",
+                last(
+                    AggregateMode::Final,
+                    false,
+                    coalesce(partial(false, input(0, false)?)?),
+                )?,
+            ),
+            (
+                "single stage of several partitions",
+                single(AggregateMode::Single, true, input(2, false)?)?,
+            ),
+            (
+                "ungrouped single stage of several partitions",
+                single(AggregateMode::Single, false, input(2, false)?)?,
+            ),
+            (
+                "final stage of states that are not partitioned by key",
+                last(
+                    AggregateMode::FinalPartitioned,
+                    true,
+                    Arc::new(RepartitionExec::try_new(
+                        partial(true, input(2, false)?)?,
+                        Partitioning::RoundRobinBatch(3),
+                    )?),
+                )?,
+            ),
+            (
+                "single stage with grouping sets of several partitions",
+                Arc::new(AggregateExec::try_new(
+                    AggregateMode::SinglePartitioned,
+                    PhysicalGroupBy::new(
+                        vec![(col("k", &input_schema())?, "k".into())],
+                        vec![(lit(ScalarValue::Utf8(None)), "k".into())],
+                        vec![vec![false], vec![true]],
+                        true,
+                    ),
+                    aggregates(&input_schema())?,
+                    vec![None, None],
+                    hash_repartition(input(2, false)?)?,
+                    input_schema(),
+                )?),
+            ),
+            (
+                "stale partitions",
+                lowered_plans()[0].1()?.replace_children(
+                    vec![input(3, false)?],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+                )?,
+            ),
+            (
+                "limited partial states",
+                last(
+                    AggregateMode::Final,
+                    true,
+                    Arc::new(
+                        CoalescePartitionsExec::new(partial(true, input(4, false)?)?)
+                            .with_fetch(Some(3)),
+                    ),
+                )?,
+            ),
+        ];
+        for (name, plan) in &not_lowered {
+            assert!(try_lower(plan)?.is_none(), "{name}");
+        }
+        let clustered = not_lowered
+            .iter()
+            .find(|(name, _)| *name == "clustered input")
+            .and_then(|(_, plan)| plan.downcast_ref::<AggregateExec>())
+            .unwrap();
+        assert_eq!(
+            clustered.group_clustering_mode(),
+            &GroupClusteringMode::Full
+        );
+
+        // A final aggregation of the states of another aggregation.
+        let states = coalesce(partial(true, input(4, false)?)?);
+        let other = Arc::new(AggregateExec::try_new(
+            AggregateMode::Final,
+            group_by(false)?.as_final(),
+            aggregates(&input_schema())?,
+            vec![None, None],
+            states,
+            input_schema(),
+        )?);
+        assert!(!is_final_of(
+            &other,
+            partial_aggregate(other.input()).unwrap()
+        ));
+        assert!(try_lower(&(other as Plan))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn lowered_input_must_have_the_input_schema() -> Result<()> {
+        let plan = lowered_plans()[0].1()?;
+        let err = PhysicalHashAggregate::try_lower(&plan, |_| {
+            Ok(Arc::new(BridgeOperator::new(Arc::clone(&plan))))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("has schema"), "{err}");
+
+        // The constructors check the modes of the aggregations.
+        let aggregate = plan.downcast_ref::<AggregateExec>().unwrap();
+        let bridge = Arc::new(BridgeOperator::new(input(1, false)?));
+        let err = PhysicalHashAggregate::try_new_two_stage(
+            aggregate,
+            aggregate,
+            Arc::clone(&bridge) as _,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires a Partial"), "{err}");
+        let states = partial(true, input(1, false)?)?;
+        let partial = states.downcast_ref::<AggregateExec>().unwrap();
+        let err = PhysicalHashAggregate::try_new_single_stage(partial, bridge as _)
+            .unwrap_err();
+        assert!(err.to_string().contains("requires a Single"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lowered_aggregations_produce_the_results_of_datafusion() -> Result<()> {
+        for threads in [1, 2, 4, 16] {
+            let task_ctx = Arc::new(TaskContext::default().with_session_config(
+                test_session_config().with_target_partitions(threads),
+            ));
+            for (name, make) in lowered_plans() {
+                let root = assert_lowered_plan_byte_eq(
+                    &make,
+                    lower,
+                    Arc::clone(&task_ctx),
+                    false,
+                )
+                .await;
+                assert!(root.is::<PhysicalHashAggregate>(), "{name}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_can_be_executed_again() -> Result<()> {
+        for (name, make) in lowered_plans() {
+            let plan = make()?;
+            let expected = datafusion_physical_plan::collect(
+                make()?,
+                Arc::new(TaskContext::default()),
+            )
+            .await?;
+            let root = lower(&plan)?;
+            let canonical = |batches: &[RecordBatch]| {
+                canonical_batch(&plan.schema(), batches, false).unwrap()
+            };
+            for threads in [4, 1, 4] {
+                let actual = Executor::collect(
+                    Arc::clone(&root),
+                    Arc::new(TaskContext::default()),
+                    threads,
+                )
+                .await?;
+                assert_eq!(canonical(&actual), canonical(&expected), "{name}");
+            }
+        }
+        Ok(())
     }
 }
