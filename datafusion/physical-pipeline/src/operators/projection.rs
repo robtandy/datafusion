@@ -21,12 +21,13 @@
 //!   is compacted. Input columns that are not referenced are never touched.
 //!
 //! So an expression fails exactly when it fails in `ProjectionExec` for the
-//! same rows. (DataFusion evaluates the right side of an `OR` only on the
-//! rows where the left side is `false` if at most 20% of the rows of the
-//! batch are; the projection decides the same per chunk. So
-//! `x = 0 OR 10 / x > 1` fails like in DataFusion as long as DataFusion's
-//! batches are not split into several chunks, see
-//! [`PhysicalFilter`](super::filter::PhysicalFilter) for the same caveat.)
+//! same rows. The projection evaluates its expressions on chunks, not on the
+//! batches `ProjectionExec` sees (e.g. the batches a `FilterExec` coalesces
+//! its output into), so [`PhysicalProjection::try_from_projection_exec`] only
+//! lowers expressions whose errors do not depend on the batches (see
+//! [`depends_on_batches`]): `x = 0 OR 10 / x > 1`, whose right side DataFusion
+//! evaluates on all rows of a batch unless at most 20% of them have `x <> 0`,
+//! must be evaluated by DataFusion, on the batches of its input plan.
 //!
 //! The evaluation of expressions on some of the rows of a chunk (`BoundExprs`)
 //! is shared with [`PhysicalFilter`](super::filter::PhysicalFilter).
@@ -37,7 +38,7 @@ use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{Result, internal_datafusion_err, internal_err};
+use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{Column, LambdaExpr, LambdaVariable};
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
@@ -46,6 +47,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
+use super::adaptive_filter::depends_on_batches;
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -88,13 +90,40 @@ impl PhysicalProjection {
         Self::try_new_with_schema(input, exprs, schema)
     }
 
+    /// Whether [`Self::try_from_projection_exec`] can lower `exec` with
+    /// exactly its semantics, including its errors: whether none of its
+    /// expressions has errors that depend on how DataFusion splits the rows
+    /// into batches (see [`depends_on_batches`]).
+    ///
+    /// Below a limit that stops the execution early (e.g. a
+    /// `GlobalLimitExec`), the expressions are evaluated on fewer rows when
+    /// the limit is reached than in DataFusion, which evaluates whole
+    /// batches: a planner should only lower the projections whose
+    /// expressions cannot fail there (see
+    /// [`fallibility`](super::adaptive_filter::fallibility)).
+    pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
+        let input_schema = exec.input().schema();
+        !exec
+            .expr()
+            .iter()
+            .any(|projection| depends_on_batches(&projection.expr, input_schema.as_ref()))
+    }
+
     /// Lower a DataFusion [`ProjectionExec`]: evaluate its expressions on the
     /// chunks of `input` (the lowered input of `exec`) and produce exactly
     /// its output schema.
+    ///
+    /// Fails if `exec` is not supported, see
+    /// [`Self::supports_projection_exec`].
     pub fn try_from_projection_exec(
         exec: &ProjectionExec,
         input: Arc<dyn PhysicalOperator>,
     ) -> Result<Self> {
+        if !Self::supports_projection_exec(exec) {
+            return not_impl_err!(
+                "PhysicalProjection cannot lower this ProjectionExec: the errors of one of its expressions depend on DataFusion's batches"
+            );
+        }
         check_lowered_input(exec.input().schema().as_ref(), input.as_ref())?;
         let exprs = exec
             .expr()
@@ -820,29 +849,115 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_projection_errors_match_datafusion() {
-        for (sql, fails) in [
+        // Whether a native projection is used, and whether the query fails
+        // (in both engines).
+        for (sql, native, fails) in [
             // No guard: `x = 0` on half of the rows.
-            ("SELECT id, 10 / x AS q FROM dense", true),
+            ("SELECT id, 10 / x AS q FROM dense", true, true),
             // Guarded by the filter, or by `CASE`.
-            ("SELECT id, 10 / x AS q FROM dense WHERE x <> 0", false),
             (
-                "SELECT id, CASE WHEN x <> 0 THEN 10 / x END AS q FROM dense",
+                "SELECT id, 10 / x AS q FROM dense WHERE x <> 0",
+                true,
                 false,
             ),
-            // `OR` divides all rows unless at most 20% have `x <> 0`.
-            ("SELECT id, x = 0 OR 10 / x > 1 AS b FROM dense", true),
-            ("SELECT id, x = 0 OR 10 / x > 1 AS b FROM sparse", false),
+            (
+                "SELECT id, CASE WHEN x <> 0 THEN 10 / x END AS q FROM dense",
+                true,
+                false,
+            ),
+            // `OR` divides all rows of a batch unless at most 20% have
+            // `x <> 0`: the errors depend on the batches, so these projections
+            // stay in DataFusion.
+            (
+                "SELECT id, x = 0 OR 10 / x > 1 AS b FROM dense",
+                false,
+                true,
+            ),
+            (
+                "SELECT id, x = 0 OR 10 / x > 1 AS b FROM sparse",
+                false,
+                false,
+            ),
             // The filter keeps the rows with `b = 0`.
-            ("SELECT id, 10 / b AS q FROM nulls WHERE a IS NULL", true),
+            (
+                "SELECT id, 10 / b AS q FROM nulls WHERE a IS NULL",
+                true,
+                true,
+            ),
             (
                 "SELECT id, 10 / b AS q FROM nulls_ok WHERE a IS NULL",
+                true,
                 false,
             ),
         ] {
             let (error, operators) =
                 assert_native_parity_with_setup(sql, guard_tables).await;
-            assert!(operators.projections > 0, "{sql}");
+            assert_eq!(operators.projections > 0, native, "{sql}");
             assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_dependent_projections_see_datafusion_batches() {
+        // Two batches of 2048 rows: 1848 zeros then 200 ones, and 2048 ones.
+        // `FilterExec` coalesces them into one batch, in which 55% of the rows
+        // have `x <> 0`: DataFusion divides all of them by `x` and fails. On
+        // the chunks of a pipeline, 10% of the rows of the first chunk have
+        // `x <> 0`, so only these would be divided.
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = |zeros: usize| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from_iter_values(
+                    (0..2048).map(|i| i32::from(i >= zeros)),
+                ))],
+            )
+            .unwrap()
+        };
+        let batches = vec![batch(1848), batch(0)];
+        let setup = async |ctx: &SessionContext| {
+            register_partitions(ctx, "coalesced", vec![batches.clone()])
+        };
+        let sql = "SELECT x = 0 OR 10 / x > 1 AS b FROM coalesced WHERE x >= 0";
+        let (error, operators) = assert_native_parity_with_setup(sql, setup).await;
+        assert!(error.unwrap().contains("Divide by zero"));
+        // The projection stays in DataFusion, with the filter below it.
+        assert_eq!(operators.projections + operators.filters, 0);
+
+        let exec = ProjectionExec::try_new(
+            [ProjectionExpr::new(
+                physical_expr("x = 0 OR 10 / x > 1", &schema),
+                "b",
+            )],
+            MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(&exec));
+        let err = PhysicalProjection::try_from_projection_exec(
+            &exec,
+            source(Arc::clone(&schema), vec![]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("depend on DataFusion's batches"),
+            "{err}"
+        );
+        // On the chunks, the projection does not fail.
+        let projection = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(
+                physical_expr("x = 0 OR 10 / x > 1", &schema),
+                "b".to_owned(),
+            )],
+        )
+        .unwrap();
+        for batch in batches {
+            assert!(project(&projection, &DataChunk::from(batch)).is_ok());
         }
     }
 

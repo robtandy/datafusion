@@ -32,7 +32,17 @@
 //! are those that no conjunct of the segment rejects, whatever their order.
 //! DuckDB is stricter and does not reorder at all if a conjunct can fail. A
 //! conjunct is considered infallible only if it is built from expressions
-//! that are known to never fail, see [`is_infallible`].
+//! that are known to never fail, see [`fallibility`].
+//!
+//! # Errors that depend on DataFusion's batches
+//!
+//! DataFusion decides per batch, from the share of rows that are left, on
+//! which rows it evaluates the conjuncts after the first one of an `AND`, and
+//! the right side of an `OR` (see `BinaryExpr::evaluate_conjunction` and
+//! `check_short_circuit`). If such an operand can fail on some rows and not on
+//! others, whether a query fails depends on how the rows are split into
+//! batches, which differs between DataFusion and a pipeline: see
+//! [`depends_on_batches`].
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
@@ -43,10 +53,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::Schema;
-use datafusion_common::Result;
+use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
+    BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr,
+    Literal, NotExpr,
 };
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
@@ -72,7 +83,7 @@ const MIN_COST_NANOS: f64 = 1e-3;
 #[derive(Debug, Clone)]
 pub struct FilterConjunct {
     expr: Arc<dyn PhysicalExpr>,
-    fallible: bool,
+    fallibility: Fallibility,
 }
 
 impl FilterConjunct {
@@ -81,9 +92,14 @@ impl FilterConjunct {
         &self.expr
     }
 
-    /// Whether evaluating the conjunct can fail (see [`is_infallible`]).
+    /// How evaluating the conjunct can fail (see [`fallibility`]).
+    pub fn fallibility(&self) -> Fallibility {
+        self.fallibility
+    }
+
+    /// Whether evaluating the conjunct can fail (see [`fallibility`]).
     pub fn is_fallible(&self) -> bool {
-        self.fallible
+        self.fallibility != Fallibility::Infallible
     }
 }
 
@@ -112,13 +128,11 @@ impl AdaptiveFilter {
     ) -> Result<Self> {
         let conjuncts = split_conjunction(predicate)
             .into_iter()
-            .map(|expr| {
-                Ok(FilterConjunct {
-                    expr: Arc::clone(expr),
-                    fallible: !is_infallible(expr, input_schema)?,
-                })
+            .map(|expr| FilterConjunct {
+                expr: Arc::clone(expr),
+                fallibility: fallibility(expr, input_schema),
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         let volatile = conjuncts.iter().any(|conjunct| is_volatile(&conjunct.expr));
         let segments = if volatile {
             vec![]
@@ -169,7 +183,7 @@ fn infallible_runs(conjuncts: &[FilterConjunct]) -> Vec<Range<usize>> {
     let mut runs = vec![];
     let mut start = 0;
     for end in 0..=conjuncts.len() {
-        if end == conjuncts.len() || conjuncts[end].fallible {
+        if end == conjuncts.len() || conjuncts[end].is_fallible() {
             if end - start >= 2 {
                 runs.push(start..end);
             }
@@ -312,51 +326,170 @@ impl AdaptiveFilterState {
     }
 }
 
-/// Whether evaluating `expr` (on `schema`) can never fail, whatever the
-/// values of its input rows.
+/// How evaluating an expression can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fallibility {
+    /// It never fails.
+    Infallible,
+    /// It fails on all rows or on none: whether it fails only depends on
+    /// whether it is evaluated at all (on some rows), e.g. `s LIKE 'a%'`,
+    /// which only fails if its pattern is invalid.
+    Uniform,
+    /// It may fail on some rows and not on others, e.g. `10 / x`.
+    PerRow,
+}
+
+/// How evaluating `expr` (on `schema`) can fail: the most fallible of its
+/// nodes.
 ///
-/// This is conservative: only columns, literals, comparisons, `AND`, `OR`,
-/// `NOT`, `IS [NOT] NULL`, `IN` lists and widening casts are infallible
-/// (with infallible inputs). DataFusion considers all of them cheap and
-/// infallible too (`is_cheap_and_infallible` in its `BinaryExpr`), so it
-/// never removes rejected rows before evaluating them. Arithmetic may fail
-/// on overflow (whether a `BinaryExpr` checks for overflow is not visible),
-/// division on zero, and functions or `CASE` are not inspected, so they are
-/// all considered fallible.
-pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<bool> {
-    let node_is_infallible = if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+/// This is conservative. Only columns, literals, comparisons, `AND`, `OR`,
+/// `NOT`, `IS [NOT] NULL`, `IN` lists, widening casts, arithmetic on numbers
+/// that wraps on overflow (DataFusion's default) and divisions of numbers by
+/// a constant that is neither `0` nor `-1` are infallible; `LIKE` and regular
+/// expressions with a constant pattern fail uniformly. Everything else,
+/// functions and `CASE` included, may fail on some rows.
+pub fn fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
+    expr.children()
+        .into_iter()
+        .map(|child| fallibility(child, schema))
+        .fold(node_fallibility(expr, schema), Ord::max)
+}
+
+/// Whether evaluating `expr` (on `schema`) can never fail, whatever the
+/// values of its input rows (see [`fallibility`]).
+pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    fallibility(expr, schema) == Fallibility::Infallible
+}
+
+/// How `expr` itself (not its children) can fail.
+fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
+    use Fallibility::*;
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         use Operator::*;
-        matches!(
-            binary.op(),
-            Eq | NotEq
-                | Lt
-                | LtEq
-                | Gt
-                | GtEq
-                | IsDistinctFrom
-                | IsNotDistinctFrom
-                | And
-                | Or
-        )
-    } else if let Some(cast) = expr.downcast_ref::<CastExpr>() {
-        cast.is_bigger_cast(&cast.expr().data_type(schema)?)
-    } else {
-        expr.is::<Column>()
-            || expr.is::<Literal>()
-            || expr.is::<NotExpr>()
-            || expr.is::<IsNullExpr>()
-            || expr.is::<IsNotNullExpr>()
-            || expr.is::<InListExpr>()
-    };
-    if !node_is_infallible {
-        return Ok(false);
+        return match binary.op() {
+            Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom
+            | And | Or => Infallible,
+            Plus | Minus | Multiply
+                if wraps_on_overflow(binary) && is_number(binary, schema) =>
+            {
+                Infallible
+            }
+            Divide | Modulo if is_safe_division(binary, schema) => Infallible,
+            LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch | RegexMatch
+            | RegexIMatch | RegexNotMatch | RegexNotIMatch
+                if binary.right().is::<Literal>() =>
+            {
+                Uniform
+            }
+            _ => PerRow,
+        };
     }
-    for child in expr.children() {
-        if !is_infallible(child, schema)? {
-            return Ok(false);
+    if let Some(like) = expr.downcast_ref::<LikeExpr>() {
+        return if like.pattern().is::<Literal>() {
+            Uniform
+        } else {
+            PerRow
+        };
+    }
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        return match cast.expr().data_type(schema) {
+            Ok(from) if cast.is_bigger_cast(&from) => Infallible,
+            _ => PerRow,
+        };
+    }
+    if expr.is::<Column>()
+        || expr.is::<Literal>()
+        || expr.is::<NotExpr>()
+        || expr.is::<IsNullExpr>()
+        || expr.is::<IsNotNullExpr>()
+        || expr.is::<InListExpr>()
+    {
+        Infallible
+    } else {
+        PerRow
+    }
+}
+
+/// Whether `binary` wraps on overflow instead of failing (DataFusion's
+/// default). The flag is not public, but takes part in the equality of
+/// `BinaryExpr`s.
+fn wraps_on_overflow(binary: &BinaryExpr) -> bool {
+    let wrapping = BinaryExpr::new(
+        Arc::clone(binary.left()),
+        *binary.op(),
+        Arc::clone(binary.right()),
+    );
+    *binary == wrapping
+}
+
+/// Whether both operands of `binary` are integers or floating point numbers.
+fn is_number(binary: &BinaryExpr, schema: &Schema) -> bool {
+    [binary.left(), binary.right()].into_iter().all(|operand| {
+        operand
+            .data_type(schema)
+            .is_ok_and(|data_type| data_type.is_integer() || data_type.is_floating())
+    })
+}
+
+/// Whether the division (or remainder) `binary` cannot fail: of floating
+/// point numbers, which never fails, or of integers by a constant that is
+/// neither `0` (division by zero) nor `-1` (overflow of the minimum value).
+fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
+    let (Ok(left), Ok(right)) = (
+        binary.left().data_type(schema),
+        binary.right().data_type(schema),
+    ) else {
+        return false;
+    };
+    if left.is_floating() && right.is_floating() {
+        return true;
+    }
+    let Some(divisor) = binary.right().downcast_ref::<Literal>() else {
+        return false;
+    };
+    let divisor = divisor.value();
+    left.is_integer()
+        && right.is_integer()
+        && !ScalarValue::new_zero(&right).is_ok_and(|zero| *divisor == zero)
+        && !ScalarValue::new_negative_one(&right)
+            .is_ok_and(|minus_one| *divisor == minus_one)
+}
+
+/// Whether the errors of `expr` (on `schema`) may depend on how its input
+/// rows are split into batches.
+///
+/// DataFusion evaluates the conjuncts after the first one of an `AND` only on
+/// the rows that are left if at most 20% of the rows of the batch are, and on
+/// all rows otherwise, and the right side of an `OR` only on the rows for
+/// which the left side is `false` if at most 20% of them are (and not at all
+/// if none is). If such an operand may fail on some rows and not on others
+/// ([`Fallibility::PerRow`]), whether it fails depends on the batches: e.g.
+/// `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not on a
+/// batch with 85% of them. Native operators evaluate expressions on chunks,
+/// not on DataFusion's batches, so they only lower expressions for which this
+/// is `false`.
+pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        match binary.op() {
+            Operator::And => {
+                let conjuncts = split_conjunction(expr);
+                return conjuncts.iter().skip(1).any(|conjunct| {
+                    fallibility(conjunct, schema) == Fallibility::PerRow
+                }) || conjuncts
+                    .iter()
+                    .any(|conjunct| depends_on_batches(conjunct, schema));
+            }
+            Operator::Or
+                if fallibility(binary.right(), schema) == Fallibility::PerRow =>
+            {
+                return true;
+            }
+            _ => {}
         }
     }
-    Ok(true)
+    expr.children()
+        .into_iter()
+        .any(|child| depends_on_batches(child, schema))
 }
 
 #[cfg(test)]
@@ -373,6 +506,7 @@ mod tests {
             Field::new("b", DataType::Int64, true),
             Field::new("s", DataType::Utf8, true),
             Field::new("e", DataType::Boolean, true),
+            Field::new("c", DataType::Float64, true),
         ]))
     }
 
@@ -381,7 +515,7 @@ mod tests {
         AdaptiveFilter::try_new(&physical_expr(predicate, &schema), &schema).unwrap()
     }
 
-    fn fallibility(predicate: &str) -> Vec<bool> {
+    fn fallible_conjuncts(predicate: &str) -> Vec<bool> {
         adaptive_filter(predicate)
             .conjuncts()
             .iter()
@@ -396,7 +530,11 @@ mod tests {
         let conjuncts_of_filter = (0..conjuncts.len())
             .map(|c| FilterConjunct {
                 expr: physical_expr("true", &schema()),
-                fallible: fallible.contains(&c),
+                fallibility: if fallible.contains(&c) {
+                    Fallibility::PerRow
+                } else {
+                    Fallibility::Infallible
+                },
             })
             .collect::<Vec<_>>();
         let filter = AdaptiveFilter {
@@ -443,34 +581,103 @@ mod tests {
 
     #[test]
     fn classifies_fallible_conjuncts() {
-        for (predicate, fallible) in [
-            ("a > 1", false),
-            ("a IS NULL", false),
-            ("a IS NOT NULL", false),
-            ("NOT (a = 1)", false),
-            ("a IN (1, 2, 3)", false),
-            ("a > 1 OR b < 2 OR s IS NULL", false),
-            ("e", false),
-            ("true", false),
-            ("a <> b", false),
+        use Fallibility::*;
+        let schema = schema();
+        for (predicate, expected) in [
+            ("a > 1", Infallible),
+            ("a IS NULL", Infallible),
+            ("a IS NOT NULL", Infallible),
+            ("NOT (a = 1)", Infallible),
+            ("a IN (1, 2, 3)", Infallible),
+            ("a > 1 OR b < 2 OR s IS NULL", Infallible),
+            ("e", Infallible),
+            ("true", Infallible),
+            ("a <> b", Infallible),
             // A widening cast cannot fail.
-            ("CAST(a AS BIGINT) = b", false),
-            ("a + 1 > 2", true),
-            ("10 / a > 1", true),
-            ("b % 3 = 0", true),
-            ("CAST(s AS INT) > 1", true),
-            ("CAST(b AS INT) > 1", true),
-            ("upper(s) = 'X'", true),
-            ("s LIKE 'x%'", true),
-            ("CASE WHEN a > 0 THEN b > 1 ELSE false END", true),
-            ("a > 1 OR 10 / a > 1", true),
+            ("CAST(a AS BIGINT) = b", Infallible),
+            // Arithmetic wraps on overflow.
+            ("a + 1 > 2", Infallible),
+            ("b * b - a > 2", Infallible),
+            ("c * 2.0 > 1.0", Infallible),
+            // Divisions by constants other than 0 and -1, and of floats.
+            ("b % 3 = 0", Infallible),
+            ("b / 7 > 1", Infallible),
+            ("c / c > 1.0", Infallible),
+            ("10 / a > 1", PerRow),
+            ("b / 0 > 1", PerRow),
+            ("b % -1 = 0", PerRow),
+            ("b / a > 1", PerRow),
+            // Patterns that are constant fail on every row or on none.
+            ("s LIKE 'x%'", Uniform),
+            ("s NOT ILIKE 'x%'", Uniform),
+            ("s ~ '^a'", Uniform),
+            ("s LIKE s", PerRow),
+            ("CAST(s AS INT) > 1", PerRow),
+            ("CAST(b AS INT) > 1", PerRow),
+            ("upper(s) = 'X'", PerRow),
+            ("CASE WHEN a > 0 THEN b > 1 ELSE false END", PerRow),
+            ("a > 1 OR 10 / a > 1", PerRow),
         ] {
-            assert_eq!(fallibility(predicate), vec![fallible], "{predicate}");
+            let expr = physical_expr(predicate, &schema);
+            assert_eq!(fallibility(&expr, &schema), expected, "{predicate}");
+            assert_eq!(
+                is_infallible(&expr, &schema),
+                expected == Infallible,
+                "{predicate}"
+            );
         }
         assert_eq!(
-            fallibility("a <> 0 AND 10 / a > 1 AND b < 2"),
-            vec![false, true, false]
+            fallible_conjuncts("a <> 0 AND 10 / a > 1 AND b < 2 AND s LIKE 'x'"),
+            vec![false, true, false, true]
         );
+
+        // Arithmetic that fails on overflow can fail.
+        let checked: Arc<dyn PhysicalExpr> = Arc::new(
+            BinaryExpr::new(
+                physical_expr("b", &schema),
+                Operator::Plus,
+                physical_expr("b", &schema),
+            )
+            .with_fail_on_overflow(true),
+        );
+        assert_eq!(fallibility(&checked, &schema), PerRow);
+        let wrapping: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            physical_expr("b", &schema),
+            Operator::Plus,
+            physical_expr("b", &schema),
+        ));
+        assert_eq!(fallibility(&wrapping, &schema), Infallible);
+    }
+
+    #[test]
+    fn finds_errors_that_depend_on_batches() {
+        let schema = schema();
+        for (predicate, expected) in [
+            // DataFusion decides per batch on which rows it evaluates the
+            // conjuncts after the first one, and the right side of `OR`.
+            ("a <> 0 AND 10 / a > 1", true),
+            ("a = 0 OR 10 / a > 1", true),
+            ("a > 0 AND upper(s) = 'X'", true),
+            ("(a > 0 AND 10 / a > 1) OR e", true),
+            ("e OR (a > 0 AND 10 / a > 1)", true),
+            ("CASE WHEN a > 0 AND 10 / a > 1 THEN 1 ELSE 0 END = 1", true),
+            ("a > 0 AND s LIKE s", true),
+            // The first conjunct and the left side of `OR` are evaluated on all
+            // rows.
+            ("10 / a > 1 AND b = 1", false),
+            ("10 / a > 1 OR b = 1", false),
+            ("upper(s) = 'X' AND a > 0", false),
+            // Uniform and infallible operands.
+            ("a > 0 AND s LIKE 'x%'", false),
+            ("a = 1 OR s LIKE 'x%'", false),
+            ("a > 0 AND b % 3 = 0 AND b + 1 > 0", false),
+            // `CASE` evaluates its branches on the rows they are for.
+            ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
+            ("a > 0 AND b > 0", false),
+        ] {
+            let expr = physical_expr(predicate, &schema);
+            assert_eq!(depends_on_batches(&expr, &schema), expected, "{predicate}");
+        }
     }
 
     #[test]
