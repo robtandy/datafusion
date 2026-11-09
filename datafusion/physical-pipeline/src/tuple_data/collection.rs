@@ -190,36 +190,17 @@ impl TupleDataBlock {
     }
 }
 
-/// A reference to a stored row and to the heap of its block.
+/// A reference to the bytes of a stored row.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowRef<'a> {
     pub(crate) row: &'a [u8],
-    pub(crate) heap: &'a [u8],
 }
 
-impl<'a> RowRef<'a> {
+impl RowRef<'_> {
     /// Returns `true` if the value of column `column` is valid.
     #[inline]
     pub(crate) fn is_valid(&self, column: usize) -> bool {
         self.row[column >> 3] & (1 << (column & 7)) != 0
-    }
-
-    /// The length of the variable-length value whose slot is at `offset`.
-    #[inline]
-    pub(crate) fn var_len_size(&self, offset: usize) -> usize {
-        read_u32(self.row, offset) as usize
-    }
-
-    /// The bytes of the variable-length value whose slot is at `offset`.
-    #[inline]
-    pub(crate) fn var_len(&self, offset: usize) -> &'a [u8] {
-        let len = self.var_len_size(offset);
-        if len <= MAX_INLINE_LEN {
-            &self.row[offset + 4..offset + 4 + len]
-        } else {
-            let start = read_u64(self.row, offset + 8) as usize;
-            &self.heap[start..start + len]
-        }
     }
 
     /// The hash stored at `offset`.
@@ -408,13 +389,6 @@ impl<'a> ValidityBits<'a> {
     pub(crate) fn is_valid(self, i: usize) -> bool {
         self.bit(i) != 0
     }
-}
-
-#[inline]
-fn read_u32(bytes: &[u8], offset: usize) -> u32 {
-    let mut value = [0; 4];
-    value.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_le_bytes(value)
 }
 
 #[inline]
@@ -709,7 +683,6 @@ impl TupleDataCollection {
     fn try_row_ref(&self, location: RowLocation, row_width: usize) -> Option<RowRef<'_>> {
         Some(RowRef {
             row: self.try_row(location, row_width)?,
-            heap: &self.blocks[location.block()].heap,
         })
     }
 
@@ -733,19 +706,9 @@ impl TupleDataCollection {
 
     /// Resolve `locations` to their rows.
     pub(crate) fn row_refs(&self, locations: &[RowLocation]) -> Result<Vec<RowRef<'_>>> {
-        self.row_refs_of(locations.iter().copied(), locations.len())
-    }
-
-    /// Resolve the `len` locations of `locations` to their rows.
-    #[inline]
-    pub(crate) fn row_refs_of(
-        &self,
-        locations: impl Iterator<Item = RowLocation>,
-        len: usize,
-    ) -> Result<Vec<RowRef<'_>>> {
         let row_width = self.layout.row_width();
-        let mut rows = Vec::with_capacity(len);
-        for location in locations {
+        let mut rows = Vec::with_capacity(locations.len());
+        for &location in locations {
             match self.try_row_ref(location, row_width) {
                 Some(row) => rows.push(row),
                 None => return Err(self.invalid_location(location)),
