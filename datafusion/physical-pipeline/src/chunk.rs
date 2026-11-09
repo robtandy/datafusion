@@ -552,9 +552,9 @@ enum Order {
 /// On a chunk of 2048 rows with 10 columns (4 `Int64`, 2 `Float64`, 2 `Utf8`
 /// and 2 `Utf8View`), this is 1.1x to 1.3x faster than gathering every column
 /// with `take` if 60% to 75% of the rows are selected, 1.5x if 85% are, 1.6x
-/// to 1.8x if 92% are and 1.9x if 99% are, within 5% of `filter_record_batch`
-/// with a ready mask; and 1.4x to 1.7x faster on a single column of strings
-/// if more than 85% of its rows are selected.
+/// to 1.8x if 92% are and 1.8x to 2x if 99% are, within 10% of
+/// `filter_record_batch` with a ready mask; and 1.4x to 1.7x faster on a
+/// single column of strings if more than 85% of its rows are selected.
 #[derive(Debug)]
 pub struct Gather {
     strategy: GatherStrategy,
