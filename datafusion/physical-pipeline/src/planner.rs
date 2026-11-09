@@ -89,7 +89,10 @@
 //!   too: which of them fails first depends on the batches. For a sort, also
 //!   above an input that may fail (expressions, native or not, or sources):
 //!   DataFusion evaluates the keys of a sort once it read all of its input,
-//!   the native sort whenever it sorts a run of rows of its input.
+//!   the native sort whenever it sorts a run of rows of its input. And a sort
+//!   of values that address more than their memory (run-end encoded values,
+//!   lists of nulls), which DataFusion's sort may fail to concatenate in a few
+//!   bytes, and the native sort to interleave, with another error.
 //! * A hash join with a build key that may fail: DataFusion evaluates the
 //!   build keys once it collected its build side, all keys on a build batch
 //!   before the next, the last batch first, the native join on its chunks as
@@ -574,6 +577,22 @@ impl Lowering<'_> {
         };
         let keys = Judgement::of_ordering(sort.expr(), &sort.input().schema());
         if !keys.evaluates_like_datafusion() {
+            return Ok(None);
+        }
+        // DataFusion's sort concatenates the batches of a partition while they
+        // occupy fewer bytes than `sort_in_place_threshold_bytes`, which the
+        // native sort accounts for the values whose concatenations their
+        // memory bounds (see `crate::sort::try_lower`). Values that address
+        // more than their memory may fail to concatenate in a few bytes (see
+        // `addresses_more_than_their_memory`), and the native sort, which
+        // interleaves them, fails otherwise: such sorts are left to DataFusion.
+        if sort
+            .input()
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| addresses_more_than_their_memory(field.data_type()))
+        {
             return Ok(None);
         }
         let input_may_fail = || subtree_failing_parts(sort.input()) > 0;
@@ -1330,6 +1349,40 @@ fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
         .into_iter()
         .map(subtree_failing_parts)
         .fold(own, usize::saturating_add)
+}
+
+/// Whether arrays of `data_type` can address more values than their memory
+/// holds, so that concatenating a few bytes of them can overflow: run-end
+/// encoded arrays with run ends of fewer than 64 bits (which address as many
+/// rows as their last run end says), and lists and maps with 32-bit offsets
+/// of nulls (which occupy no memory) or of such arrays, at any depth.
+fn addresses_more_than_their_memory(data_type: &DataType) -> bool {
+    fn addresses(data_type: &DataType, in_32_bit_offsets: bool) -> bool {
+        match data_type {
+            DataType::Null => in_32_bit_offsets,
+            DataType::RunEndEncoded(run_ends, values) => {
+                run_ends.data_type() != &DataType::Int64
+                    || addresses(values.data_type(), in_32_bit_offsets)
+            }
+            DataType::List(field)
+            | DataType::ListView(field)
+            | DataType::Map(field, _) => addresses(field.data_type(), true),
+            DataType::LargeList(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _) => {
+                addresses(field.data_type(), in_32_bit_offsets)
+            }
+            DataType::Dictionary(_, values) => addresses(values, in_32_bit_offsets),
+            DataType::Struct(fields) => fields
+                .iter()
+                .any(|field| addresses(field.data_type(), in_32_bit_offsets)),
+            DataType::Union(fields, _) => fields
+                .iter()
+                .any(|(_, field)| addresses(field.data_type(), in_32_bit_offsets)),
+            _ => false,
+        }
+    }
+    addresses(data_type, false)
 }
 
 /// Whether a node of `plan` consumes the dynamic filter with id `filter`: e.g.
@@ -3174,6 +3227,67 @@ mod tests {
             let root = assert_plan_outcome(make_plan, config.clone(), error).await;
             assert_eq!(count::<PhysicalFilter>(&root), 0, "{coalescing}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_values_that_address_more_than_their_memory_stay_in_datafusion()
+    -> Result<()> {
+        use arrow::array::{Array, LargeListArray, NullArray, RunArray};
+        use arrow::buffer::OffsetBuffer;
+
+        // DataFusion's sort concatenates the batches of a partition while they
+        // occupy fewer bytes than `sort_in_place_threshold_bytes`. Two one-row
+        // batches whose `LargeList<RunEndEncoded(Int32, Null)>` lists hold
+        // `1 << 30` nulls each occupy a few bytes, but need more run ends than
+        // 32 bits hold together: DataFusion fails to concatenate them, a native
+        // sort fails to interleave them, with another error.
+        let list = || -> Result<arrow::array::ArrayRef> {
+            let values = RunArray::<arrow::datatypes::Int32Type>::try_new(
+                &Int32Array::from(vec![1 << 30]),
+                &NullArray::new(1),
+            )?;
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            Ok(Arc::new(LargeListArray::try_new(
+                field,
+                OffsetBuffer::new(vec![0, 1 << 30].into()),
+                Arc::new(values),
+                None,
+            )?))
+        };
+        let row = |k: i32| -> Result<RecordBatch> {
+            Ok(RecordBatch::try_from_iter([
+                (
+                    "k",
+                    Arc::new(Int32Array::from(vec![k])) as arrow::array::ArrayRef,
+                ),
+                ("l", list()?),
+            ])?)
+        };
+        let batches = vec![row(2)?, row(1)?];
+        let schema = batches[0].schema();
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let source = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )
+            .unwrap();
+            let k = col("k", &schema).unwrap();
+            Arc::new(SortExec::new(
+                LexOrdering::new(vec![PhysicalSortExpr::new_default(k)]).unwrap(),
+                source,
+            ))
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(config.clone()));
+        let error = collect(make_plan(), task_ctx)
+            .await
+            .expect_err("DataFusion fails")
+            .to_string();
+        let root = assert_plan_outcome(make_plan, config, Some(&error)).await;
+        assert_eq!(count::<PhysicalSort>(&root), 0);
         Ok(())
     }
 
