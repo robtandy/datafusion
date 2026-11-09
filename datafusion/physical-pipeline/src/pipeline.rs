@@ -17,6 +17,13 @@
 //! pipeline breaker depends on the child meta pipeline of that breaker and
 //! only starts once that child is finalized.
 //!
+//! The pipelines of a meta pipeline can also be made to wait for a meta
+//! pipeline that is not their child (see
+//! [`MetaPipelineBuilder::build_with_dependency`], DuckDB's
+//! `MetaPipeline::AddRecursiveDependencies`): the pipeline breakers of the
+//! probe side of a hash join only run once its build side is finalized, as
+//! the join reads its probe side only then.
+//!
 //! The decomposition is driven by [`PhysicalOperator::build_pipelines`],
 //! modelled after DuckDB's `PhysicalOperator::BuildPipelines`, through the
 //! [`MetaPipelineBuilder`] API.
@@ -79,8 +86,11 @@ impl Pipeline {
         &self.dependencies
     }
 
-    /// Child meta pipelines that must be finalized before this pipeline
-    /// starts.
+    /// Meta pipelines that must be finalized before this pipeline starts:
+    /// the child meta pipelines of the pipeline breakers it reads from, and
+    /// the meta pipelines it waits for without reading from them, e.g. the
+    /// build side of a hash join whose probe side this pipeline is part of
+    /// (see [`MetaPipelineBuilder::build_with_dependency`]).
     pub fn meta_dependencies(&self) -> &[MetaPipelineId] {
         &self.meta_dependencies
     }
@@ -309,6 +319,19 @@ impl GraphBuilder {
         (meta, base)
     }
 
+    /// Whether meta pipeline `meta` is below meta pipeline `ancestor` (one of
+    /// its descendants, not `ancestor` itself).
+    fn is_below(&self, meta: MetaPipelineId, ancestor: MetaPipelineId) -> bool {
+        let mut parent = self.meta_pipelines.get(meta).and_then(|meta| meta.parent);
+        while let Some(id) = parent {
+            if id == ancestor {
+                return true;
+            }
+            parent = self.meta_pipelines[id].parent;
+        }
+        false
+    }
+
     fn new_pipeline(&mut self, meta: MetaPipelineId) -> PipelineBuilder {
         let id = self.pipelines.len();
         self.pipelines.push(PipelineState {
@@ -417,6 +440,57 @@ impl MetaPipelineBuilder<'_> {
         let result = operator.build_pipelines(current, self);
         self.graph.visiting.pop();
         result
+    }
+
+    /// Continue building `current` with `operator`, like [`Self::build`], and
+    /// make every pipeline that this continues or creates wait for the meta
+    /// pipeline `dependency` to be finalized: `current`, the pipelines that
+    /// it adds to this meta pipeline, and all pipelines of the meta pipelines
+    /// that it creates for the pipeline breakers below `operator`,
+    /// recursively (DuckDB's `MetaPipeline::AddRecursiveDependencies`).
+    ///
+    /// A hash join builds its probe side with the child meta pipeline of its
+    /// build side as `dependency`: DataFusion reads the probe side of a join
+    /// only once its build side is complete, so the pipeline breakers of the
+    /// probe side (e.g. the build side of a join below) must not run before.
+    /// If the join then cannot produce output, or is canceled, the pipelines
+    /// of its probe side are skipped, and the meta pipelines whose output
+    /// only these read are canceled before they start: their sinks are
+    /// finalized without any input, as DataFusion does not execute them
+    /// either (see [`crate::operator::SinkFinalize::NoOutputPossible`]).
+    ///
+    /// `dependency` must be a meta pipeline below this one whose pipelines
+    /// are built, e.g. a child meta pipeline created with
+    /// [`Self::create_child_meta_pipeline`] (whose builder was dropped).
+    pub fn build_with_dependency(
+        &mut self,
+        current: &mut PipelineBuilder,
+        operator: &Arc<dyn PhysicalOperator>,
+        dependency: MetaPipelineId,
+    ) -> Result<()> {
+        self.check_pipeline(current)?;
+        if !self.graph.is_below(dependency, self.meta) {
+            return internal_err!(
+                "The pipelines of meta pipeline {} cannot wait for meta pipeline {dependency}: it is not below it",
+                self.meta
+            );
+        }
+        // Pipelines get increasing ids: the pipelines created while building
+        // `operator` are those of this meta pipeline that it creates and all
+        // pipelines of the meta pipelines that it creates, which are below
+        // this one (only builders of this meta pipeline and of the meta
+        // pipelines below it can be used meanwhile).
+        let created = self.graph.pipelines.len();
+        self.build(current, operator)?;
+        let pipelines =
+            std::iter::once(current.id).chain(created..self.graph.pipelines.len());
+        for pipeline in pipelines {
+            let dependencies = &mut self.graph.pipelines[pipeline].meta_dependencies;
+            if !dependencies.contains(&dependency) {
+                dependencies.push(dependency);
+            }
+        }
+        Ok(())
     }
 
     /// Set the source of `current`.
@@ -780,5 +854,173 @@ fn single_child(operator: &dyn PhysicalOperator) -> Result<Arc<dyn PhysicalOpera
             operator.name(),
             children.len()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::datatypes::{Schema, SchemaRef};
+
+    /// What a [`TestOperator`] does in [`PhysicalOperator::build_pipelines`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        /// [`MetaPipelineBuilder::build_default`]: a source (without
+        /// children), a pipeline breaker (a sink), or a streaming operator.
+        Default,
+        /// Like a hash join: an operator of the pipeline of its second child
+        /// (its probe side), and the sink of its first child (its build side),
+        /// whose meta pipeline its second child waits for.
+        Join,
+        /// Like a join, but its second child waits for the meta pipeline
+        /// `MetaPipelineId` instead.
+        JoinWaitingFor(MetaPipelineId),
+    }
+
+    #[derive(Debug)]
+    struct TestOperator {
+        name: &'static str,
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        sink: bool,
+        role: Role,
+    }
+
+    fn operator(
+        name: &'static str,
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        sink: bool,
+        role: Role,
+    ) -> Arc<dyn PhysicalOperator> {
+        Arc::new(TestOperator {
+            name,
+            children,
+            sink,
+            role,
+        })
+    }
+
+    fn source(name: &'static str) -> Arc<dyn PhysicalOperator> {
+        operator(name, vec![], false, Role::Default)
+    }
+
+    fn breaker(
+        name: &'static str,
+        input: Arc<dyn PhysicalOperator>,
+    ) -> Arc<dyn PhysicalOperator> {
+        operator(name, vec![input], true, Role::Default)
+    }
+
+    fn join(
+        name: &'static str,
+        build: Arc<dyn PhysicalOperator>,
+        probe: Arc<dyn PhysicalOperator>,
+    ) -> Arc<dyn PhysicalOperator> {
+        operator(name, vec![build, probe], true, Role::Join)
+    }
+
+    impl PhysicalOperator for TestOperator {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::empty())
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_source(&self) -> bool {
+            self.children.is_empty() || self.sink
+        }
+
+        fn is_sink(&self) -> bool {
+            self.sink
+        }
+
+        fn build_pipelines(
+            &self,
+            current: &mut PipelineBuilder,
+            meta: &mut MetaPipelineBuilder<'_>,
+        ) -> Result<()> {
+            let dependency = match self.role {
+                Role::Default => return meta.build_default(current),
+                Role::Join => None,
+                Role::JoinWaitingFor(dependency) => Some(dependency),
+            };
+            let this = meta.current_operator()?;
+            meta.add_operator(current, Arc::clone(&this))?;
+            let (mut build, mut build_pipeline) =
+                meta.create_child_meta_pipeline(current, this)?;
+            let build_meta = build.id();
+            build.build(&mut build_pipeline, &self.children[0])?;
+            meta.build_with_dependency(
+                current,
+                &self.children[1],
+                dependency.unwrap_or(build_meta),
+            )
+        }
+    }
+
+    fn graph(root: Arc<dyn PhysicalOperator>) -> Result<PipelineGraph> {
+        PipelineGraph::try_new(breaker("Root", root))
+    }
+
+    #[test]
+    fn pipeline_breakers_of_the_probe_side_wait_for_the_build_side() -> Result<()> {
+        // `Outer` joins `a` with the probe side `Inner`, which joins the
+        // aggregation of `b` with the aggregation of `c`. All pipelines of
+        // the meta pipelines created for the probe side of `Outer` (those of
+        // `Inner` and of the aggregations) wait for its build side (meta
+        // pipeline 1); those created for the probe side of `Inner` (the
+        // aggregation of `c`) also for the build side of `Inner` (meta
+        // pipeline 2).
+        let inner = join(
+            "Inner",
+            breaker("AggregateB", source("b")),
+            breaker("AggregateC", source("c")),
+        );
+        let outer = join("Outer", source("a"), inner);
+        let graph = graph(outer)?;
+        assert_eq!(
+            graph.to_string(),
+            "MetaPipeline 0 (sink: Root) children: [1, 2, 4]\n  \
+             Pipeline 0: AggregateC -> Inner -> Outer -> Root depends on meta pipelines [1, 2, 4]\n\
+             MetaPipeline 1 (sink: Outer)\n  \
+             Pipeline 1: a -> Outer\n\
+             MetaPipeline 2 (sink: Inner) children: [3]\n  \
+             Pipeline 2: AggregateB -> Inner depends on meta pipelines [3, 1]\n\
+             MetaPipeline 3 (sink: AggregateB)\n  \
+             Pipeline 3: b -> AggregateB depends on meta pipelines [1]\n\
+             MetaPipeline 4 (sink: AggregateC)\n  \
+             Pipeline 4: c -> AggregateC depends on meta pipelines [2, 1]\n"
+        );
+        // The meta pipelines created before the probe side do not wait.
+        assert!(graph.pipeline(1).meta_dependencies().is_empty());
+        assert_eq!(graph.meta_pipeline(4).parent(), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn pipelines_wait_only_for_meta_pipelines_below_theirs() {
+        // Waiting for the meta pipeline of the join itself (or one above it,
+        // or one that does not exist) would wait for itself.
+        for dependency in [0, 7] {
+            let join = operator(
+                "Join",
+                vec![source("a"), breaker("Aggregate", source("b"))],
+                true,
+                Role::JoinWaitingFor(dependency),
+            );
+            let err = graph(join).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!(
+                    "cannot wait for meta pipeline {dependency}: it is not below it"
+                )),
+                "{err}"
+            );
+        }
     }
 }
