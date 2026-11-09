@@ -1751,8 +1751,10 @@ mod tests {
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_execution::TaskContext;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, col};
+    use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+    use datafusion_physical_optimizer::PhysicalOptimizerRule;
+    use datafusion_physical_optimizer::filter_pushdown::FilterPushdown;
     use datafusion_physical_plan::collect;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::joins::HashJoinExecBuilder;
@@ -2445,7 +2447,7 @@ mod tests {
                 Arc::new(BinaryExpr::new(
                     col(name, &schema).unwrap(),
                     Operator::Modulo,
-                    datafusion_physical_expr::expressions::lit(n),
+                    lit(n),
                 ))
             };
             JoinFilter::new(
@@ -3265,7 +3267,7 @@ mod tests {
             Arc::new(BinaryExpr::new(
                 col("rv", &filter_schema)?,
                 Operator::Lt,
-                datafusion_physical_expr::expressions::lit(0_i64),
+                lit(0_i64),
             )),
             vec![ColumnIndex {
                 index: 1,
@@ -3363,7 +3365,7 @@ mod tests {
         };
         let probe = scan("r");
         let inverse = Arc::new(BinaryExpr::new(
-            datafusion_physical_expr::expressions::lit(1_i32),
+            lit(1_i32),
             Operator::Divide,
             col("rd", &probe.schema())?,
         ));
@@ -3468,6 +3470,52 @@ mod tests {
         assert_eq!(count_rows(&expected.batches), 1);
         // The join is left to DataFusion, with the same result.
         assert_join_parity_with_setup(sql, config.clone(), &setup, 0).await;
+
+        // DataFusion computes `1 / d` in the scan above. The same join over a
+        // `ProjectionExec` of `1 / d`, below which `FilterPushdown` pushes the
+        // dynamic filter of every new plan into the scan.
+        let scan = ctx.sql("SELECT k, d FROM p").await?;
+        let scan = scan.create_physical_plan().await?;
+        let build = ctx.sql("SELECT k FROM b").await?;
+        let build = build.create_physical_plan().await?;
+        let options = config.options().clone();
+        let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let schema = scan.schema();
+            let one_over_d = Arc::new(BinaryExpr::new(
+                lit(1_i64),
+                Operator::Divide,
+                col("d", &schema)?,
+            ));
+            let probe: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+                [
+                    (col("k", &schema)?, "k".to_string()),
+                    (one_over_d as _, "inv".to_string()),
+                ],
+                Arc::clone(&scan),
+            )?);
+            let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+            let join = HashJoinExec::try_new(
+                Arc::clone(&build),
+                probe,
+                on,
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?;
+            FilterPushdown::new_post_optimization().optimize(Arc::new(join), &options)
+        };
+        let plan = make_plan()?;
+        assert_eq!(plan.dynamic_expressions_produced().len(), 1);
+        let probe = Arc::clone(plan.children()[1]);
+        assert!(probe.is::<ProjectionExec>(), "{probe:?}");
+        let batches = collect(make_plan()?, ctx.task_ctx()).await?;
+        assert_eq!(count_rows(&batches), 1);
+        let root =
+            assert_lowered_plan_byte_eq(make_plan, lower, ctx.task_ctx(), false).await;
+        assert!(root.is::<BridgeOperator>());
 
         // Without the dynamic filter, the join is native and both engines
         // divide by zero.
