@@ -78,7 +78,7 @@
 //! so too, below a sort (see [`PhysicalWindow::try_lower`]).
 
 use std::collections::VecDeque;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -97,6 +97,7 @@ use datafusion_common::{
 };
 use datafusion_execution::memory_pool::MemoryLimit;
 use datafusion_execution::runtime_env::RuntimeEnv;
+use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::window::{
     PlainAggregateWindowExpr, SlidingAggregateWindowExpr, StandardWindowExpr, WindowExpr,
@@ -109,7 +110,9 @@ use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
+use datafusion_physical_plan::windows::{
+    BoundedWindowAggExec, WindowAggExec, WindowUDFExpr,
+};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use parking_lot::Mutex;
 
@@ -564,6 +567,18 @@ impl PhysicalWindow {
     ///   under a limit, one of them could fail where the other does not.
     ///   Window expressions of other types than DataFusion's (standard,
     ///   aggregate and sliding aggregate ones) are left to DataFusion too;
+    /// * windows with a window function whose evaluation can fail on some
+    ///   rows: all functions but DataFusion's window functions (`row_number`,
+    ///   `rank`, `lag`, `nth_value`, ...) and its aggregates `count`, `sum`,
+    ///   `min`, `max` and `avg` of floating-point values (an average of
+    ///   decimals fails where it does not fit its type), which only fail on
+    ///   invalid literal arguments, on the first window partition. E.g. a
+    ///   user-defined function: `BoundedWindowAggExec` evaluates it as it
+    ///   reads its rows, and a limit above it can stop it before a row that
+    ///   fails, while the native window evaluates whole window partitions.
+    ///   The functions are recognized by their name and the name of the type
+    ///   that implements them (see `is_builtin`), so a function registered
+    ///   under the name of one of DataFusion's is left to DataFusion too;
     /// * windows whose rows of a single partition must be in an order that
     ///   does not start with the partition keys (a `BoundedWindowAggExec` in
     ///   `Linear` or `PartiallySorted` mode with a single partition): the
@@ -1052,22 +1067,113 @@ fn same_keys(previous: &[ArrayRef], keys: &[ArrayRef]) -> Result<bool> {
 
 /// Whether evaluating `expr` on rows with schema `schema` cannot fail: it is
 /// a standard, aggregate or sliding aggregate window expression (of
-/// DataFusion) without `FILTER`, whose arguments, partition keys and order
+/// DataFusion) without `FILTER`, of a window function whose evaluation cannot
+/// fail (see [`INFALLIBLE_WINDOW_FUNCTIONS`] and
+/// [`aggregate_cannot_fail`]), and whose arguments, partition keys and order
 /// keys cannot fail (see [`is_infallible`]).
 fn window_expr_cannot_fail(expr: &Arc<dyn WindowExpr>, schema: &Schema) -> bool {
     let any = expr.as_any();
-    let known = any.is::<StandardWindowExpr>()
-        || ((any.is::<PlainAggregateWindowExpr>()
-            || any.is::<SlidingAggregateWindowExpr>())
-            && !has_filter(expr));
+    let function_cannot_fail = if let Some(standard) =
+        any.downcast_ref::<StandardWindowExpr>()
+    {
+        standard
+            .get_standard_func_expr()
+            .as_any()
+            .downcast_ref::<WindowUDFExpr>()
+            .is_some_and(|udwf| {
+                let fun = udwf.fun();
+                is_builtin(fun.name(), fun.inner(), &INFALLIBLE_WINDOW_FUNCTIONS)
+            })
+    } else if let Some(aggregate) = any.downcast_ref::<PlainAggregateWindowExpr>() {
+        !has_filter(expr) && aggregate_cannot_fail(aggregate.get_aggregate_expr(), schema)
+    } else if let Some(aggregate) = any.downcast_ref::<SlidingAggregateWindowExpr>() {
+        !has_filter(expr) && aggregate_cannot_fail(aggregate.get_aggregate_expr(), schema)
+    } else {
+        false
+    };
     let expressions = expr.all_expressions();
-    known
+    function_cannot_fail
         && expressions
             .args
             .iter()
             .chain(&expressions.partition_by_exprs)
             .chain(&expressions.order_by_exprs)
             .all(|expr| is_infallible(expr, schema))
+}
+
+/// DataFusion's window functions whose evaluation cannot fail on some rows
+/// only, by their name and the name of the type that implements them (see
+/// [`is_builtin`]): they only fail on invalid literal arguments (e.g.
+/// `NTILE(0)`), which they reject when they create their evaluator, i.e. on
+/// the first window partition, before any row is emitted (in DataFusion and
+/// natively).
+///
+/// The evaluation of other window functions (e.g. user-defined ones) could
+/// fail on some rows only: DataFusion's `BoundedWindowAggExec` evaluates its
+/// rows as it reads them (so that a limit above it can stop it before such a
+/// row), and `WindowAggExec` evaluates all window partitions before it emits
+/// any row, while the native window evaluates every window partition (all of
+/// its rows at once) only as it emits it.
+const INFALLIBLE_WINDOW_FUNCTIONS: [(&str, &str); 11] = [
+    ("row_number", "RowNumber"),
+    ("rank", "Rank"),
+    ("dense_rank", "Rank"),
+    ("percent_rank", "Rank"),
+    ("cume_dist", "CumeDist"),
+    ("ntile", "Ntile"),
+    ("lag", "WindowShift"),
+    ("lead", "WindowShift"),
+    ("first_value", "NthValue"),
+    ("last_value", "NthValue"),
+    ("nth_value", "NthValue"),
+];
+
+/// DataFusion's aggregate functions whose accumulators cannot fail on some
+/// rows only (see [`INFALLIBLE_WINDOW_FUNCTIONS`] and [`is_builtin`]): `sum`
+/// wraps on overflow, `count`, `min` and `max` only fail on types they do not
+/// support, when they create their accumulator.
+const INFALLIBLE_AGGREGATE_FUNCTIONS: [(&str, &str); 4] = [
+    ("count", "Count"),
+    ("sum", "Sum"),
+    ("min", "Min"),
+    ("max", "Max"),
+];
+
+/// Whether the accumulators of `aggregate` (with arguments of schema
+/// `schema`) cannot fail on some rows only: those of the aggregate functions
+/// [`INFALLIBLE_AGGREGATE_FUNCTIONS`], and of `avg` of floating-point values
+/// (DataFusion casts integers to `Float64` for it). An average of decimals
+/// fails where it does not fit its type.
+fn aggregate_cannot_fail(aggregate: &AggregateFunctionExpr, schema: &Schema) -> bool {
+    let fun = aggregate.fun();
+    is_builtin(fun.name(), fun.inner(), &INFALLIBLE_AGGREGATE_FUNCTIONS)
+        || (is_builtin(fun.name(), fun.inner(), &[("avg", "Avg")])
+            && aggregate.expressions().iter().all(|arg| {
+                arg.data_type(schema)
+                    .is_ok_and(|data_type| data_type.is_floating())
+            }))
+}
+
+/// Whether the function of name `name`, implemented by `implementation`, is
+/// one of `builtins`, by its name and the name of the type that implements it
+/// (which the `Debug` representation of `implementation` starts with). A
+/// function registered under the name of a DataFusion function (which replaces
+/// it) is another type. (The native window cannot compare the functions
+/// themselves, as DataFusion's optimizer does: it does not depend on
+/// DataFusion's function crates.)
+fn is_builtin(
+    name: &str,
+    implementation: &dyn fmt::Debug,
+    builtins: &[(&str, &str)],
+) -> bool {
+    let debug = format!("{implementation:?}");
+    let type_name = debug
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or_default();
+    builtins
+        .iter()
+        .any(|&(builtin, builtin_type)| name == builtin && type_name == builtin_type)
 }
 
 /// Whether an aggregate window expression has a `FILTER`. Its filter is not
@@ -1920,7 +2026,10 @@ mod tests {
             "SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
             "SELECT id, SUM(b) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
             "SELECT id, SUM(c) OVER (PARTITION BY d ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS s FROM t1",
-            "SELECT id, AVG(g) OVER (PARTITION BY e ORDER BY id ROWS UNBOUNDED PRECEDING) AS a FROM t1",
+            // (Averages of floating-point values; integers are cast to
+            // `Float64`.)
+            "SELECT id, AVG(c) OVER (PARTITION BY e ORDER BY id ROWS UNBOUNDED PRECEDING) AS a FROM t1",
+            "SELECT id, AVG(a) OVER (PARTITION BY d ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS a, AVG(DISTINCT a) OVER (PARTITION BY e) AS d FROM t1",
             "SELECT id, MIN(h) OVER (PARTITION BY d ORDER BY id ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS mn, MAX(ts) OVER (PARTITION BY d ORDER BY id ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS mx FROM t1",
             "SELECT id, COUNT(c) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 10 FOLLOWING) AS n FROM t1",
             // `RANGE` frames, with peers and with offsets.
@@ -2167,10 +2276,12 @@ mod tests {
             false,
         )
         .await;
-        // Arguments that can fail, and a `FILTER`.
+        // Arguments that can fail, a `FILTER`, and an average of decimals,
+        // which fails where it does not fit its type.
         for sql in [
             "SELECT id, SUM(10 / (a + 51)) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
             "SELECT id, SUM(a) FILTER (WHERE a > 0) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
+            "SELECT id, AVG(g) OVER (PARTITION BY e ORDER BY id ROWS UNBOUNDED PRECEDING) AS a FROM t1",
         ] {
             assert_windows_with_config(sql, test_session_config(), false).await;
         }
@@ -2179,6 +2290,234 @@ mod tests {
             "SELECT id, SUM(a * 2 + 1) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
         )
         .await;
+    }
+
+    /// A user-defined window function that returns its argument, and fails on
+    /// values from 10 on: DataFusion's `BoundedWindowAggExec` evaluates it
+    /// row by row, as it reads its input.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct Checked {
+        name: &'static str,
+        signature: datafusion_expr::Signature,
+    }
+
+    /// The error of [`Checked`] and [`CheckedSum`].
+    const CHECKED_FAILURE: &str = "is not checked";
+
+    impl Checked {
+        fn udwf(name: &'static str) -> datafusion_expr::WindowUDF {
+            datafusion_expr::WindowUDF::from(Self {
+                name,
+                signature: datafusion_expr::Signature::exact(
+                    vec![DataType::Int64],
+                    datafusion_expr::Volatility::Immutable,
+                ),
+            })
+        }
+    }
+
+    impl datafusion_expr::WindowUDFImpl for Checked {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn partition_evaluator(
+            &self,
+            _args: datafusion_expr::function::PartitionEvaluatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::PartitionEvaluator>> {
+            Ok(Box::new(CheckedEvaluator))
+        }
+
+        fn field(
+            &self,
+            field_args: datafusion_expr::function::WindowUDFFieldArgs,
+        ) -> Result<arrow::datatypes::FieldRef> {
+            Ok(Arc::new(Field::new(
+                field_args.name(),
+                DataType::Int64,
+                true,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CheckedEvaluator;
+
+    /// `value`, or an error if it is 10 or more.
+    fn checked(value: i64) -> Result<i64> {
+        if value >= 10 {
+            return datafusion_common::exec_err!("{value} {CHECKED_FAILURE}");
+        }
+        Ok(value)
+    }
+
+    impl datafusion_expr::PartitionEvaluator for CheckedEvaluator {
+        fn supports_bounded_execution(&self) -> bool {
+            true
+        }
+
+        fn evaluate(
+            &mut self,
+            values: &[ArrayRef],
+            range: &Range<usize>,
+        ) -> Result<datafusion_common::ScalarValue> {
+            let value = values[0].as_primitive::<Int64Type>().value(range.start);
+            Ok(datafusion_common::ScalarValue::Int64(Some(checked(value)?)))
+        }
+    }
+
+    /// A user-defined aggregate: the sum of values below 10, which fails on
+    /// values from 10 on.
+    #[derive(Debug, Default)]
+    struct CheckedSum(i64);
+
+    impl datafusion_expr::Accumulator for CheckedSum {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            for value in values[0].as_primitive::<Int64Type>().iter().flatten() {
+                self.0 += checked(value)?;
+            }
+            Ok(())
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
+            Ok(datafusion_common::ScalarValue::Int64(Some(self.0)))
+        }
+
+        fn size(&self) -> usize {
+            size_of_val(self)
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
+            Ok(vec![self.evaluate()?])
+        }
+
+        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+            self.update_batch(states)
+        }
+    }
+
+    /// A session with the table `t` of the values `0..15` of `x` (in another
+    /// order, in batches of 2 rows), the window function [`Checked`] (as
+    /// `checked`, and as `lag`, which it replaces), and the aggregate
+    /// [`CheckedSum`] (as `checked_sum`).
+    async fn checked_setup(ctx: &SessionContext) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let values = [7, 3, 14, 0, 9, 12, 1, 5, 11, 2, 8, 13, 4, 10, 6];
+        let batches = values
+            .chunks(2)
+            .map(|values| {
+                let values = Int64Array::from_iter_values(values.iter().copied());
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![batches])?))?;
+        ctx.register_udwf(Checked::udwf("checked"));
+        ctx.register_udwf(Checked::udwf("lag"));
+        ctx.register_udaf(datafusion_expr::create_udaf(
+            "checked_sum",
+            vec![DataType::Int64],
+            Arc::new(DataType::Int64),
+            datafusion_expr::Volatility::Immutable,
+            Arc::new(|_| Ok(Box::new(CheckedSum::default()))),
+            Arc::new(vec![DataType::Int64]),
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn user_defined_window_functions_are_left_to_datafusion() -> Result<()> {
+        use crate::bridge::PipelineRootExec;
+        use crate::test_utils::run_sql;
+        let config = || test_session_config().with_batch_size(2);
+        // DataFusion sorts the rows, and then evaluates the functions on the
+        // sorted batches as it reads them: the limit stops it before the
+        // first value that fails. The native window would evaluate all rows
+        // of the window partition.
+        for sql in [
+            "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
+            // A user-defined function registered under the name of one of
+            // DataFusion's.
+            "SELECT x, lag(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
+            "SELECT x, checked_sum(x) OVER (ORDER BY x) AS s FROM t ORDER BY x LIMIT 1",
+        ] {
+            let root =
+                assert_native_parity_with_setup(sql, config(), checked_setup).await;
+            assert_eq!(count::<PhysicalWindow>(&root), 0, "query: {sql}");
+        }
+        // Without a limit, both fail.
+        for sql in [
+            "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t",
+            "SELECT x, checked_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) AS s FROM t",
+        ] {
+            let ctx = datafusion_context(config());
+            checked_setup(&ctx).await?;
+            let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
+            assert!(error.to_string().contains(CHECKED_FAILURE), "{error}");
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let root = lower(&plan)?;
+            assert_eq!(count::<PhysicalWindow>(&root), 0, "query: {sql}");
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let error = datafusion_physical_plan::collect(exec, ctx.task_ctx())
+                .await
+                .expect_err("the pipeline engine fails");
+            assert!(error.to_string().contains(CHECKED_FAILURE), "{error}");
+        }
+        // DataFusion's functions stay native, also with these batches.
+        let root = assert_native_parity_with_setup(
+            "SELECT x, row_number() OVER (ORDER BY x) AS r, sum(x) OVER (ORDER BY x) AS s FROM t ORDER BY x LIMIT 3",
+            config(),
+            checked_setup,
+        )
+        .await;
+        assert_eq!(count::<PhysicalWindow>(&root), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn datafusion_functions_that_cannot_fail_are_recognized() {
+        // All of DataFusion's window functions only fail on invalid literal
+        // arguments.
+        for udwf in datafusion::functions_window::all_default_window_functions() {
+            assert!(
+                is_builtin(udwf.name(), udwf.inner(), &INFALLIBLE_WINDOW_FUNCTIONS),
+                "{}",
+                udwf.name()
+            );
+        }
+        let aggregates =
+            datafusion::functions_aggregate::all_default_aggregate_functions();
+        let recognized = aggregates
+            .iter()
+            .filter(|udaf| {
+                is_builtin(udaf.name(), udaf.inner(), &INFALLIBLE_AGGREGATE_FUNCTIONS)
+            })
+            .map(|udaf| udaf.name())
+            .collect::<Vec<_>>();
+        let mut expected = INFALLIBLE_AGGREGATE_FUNCTIONS
+            .map(|(name, _)| name)
+            .to_vec();
+        expected.sort_unstable();
+        let mut recognized = recognized;
+        recognized.sort_unstable();
+        assert_eq!(recognized, expected);
+        assert!(
+            aggregates
+                .iter()
+                .any(|udaf| { is_builtin(udaf.name(), udaf.inner(), &[("avg", "Avg")]) })
+        );
+        // Other functions under these names are not.
+        for name in ["row_number", "lag", "nth_value"] {
+            let udwf = Checked::udwf(name);
+            assert!(!is_builtin(
+                name,
+                udwf.inner(),
+                &INFALLIBLE_WINDOW_FUNCTIONS
+            ));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
