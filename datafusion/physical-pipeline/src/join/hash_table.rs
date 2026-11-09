@@ -1332,6 +1332,55 @@ mod tests {
     }
 
     #[test]
+    fn collisions_of_string_keys() {
+        // String keys, all with the same hash: one chain per key.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let words = ["a", "b", "a string longer than twelve bytes", "", "c"];
+        let batch = |keys: Vec<Option<&str>>| {
+            let values = Int64Array::from_iter_values(0..keys.len() as i64);
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringViewArray::from(keys)), Arc::new(values)],
+            )
+            .unwrap()
+        };
+        let build = vec![batch(
+            (0..40)
+                .map(|i| (i % 7 != 6).then_some(words[i % 5]))
+                .collect(),
+        )];
+        let probe_batch = batch(vec![Some("a"), None, Some("x"), Some(""), Some("c")]);
+        let same_hash = |b: &RecordBatch| vec![7; b.num_rows()];
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            let table = table(&build, 1, null_equality, 1, 3, same_hash);
+            let actual = probe(&table, &probe_batch, 1, same_hash(&probe_batch), 9);
+            let build_keys = build[0].column(0).as_string_view();
+            let probe_keys = probe_batch.column(0).as_string_view();
+            let mut expected = vec![];
+            for row in 0..probe_batch.num_rows() {
+                for i in 0..build[0].num_rows() {
+                    let equal = match (probe_keys.is_valid(row), build_keys.is_valid(i)) {
+                        (true, true) => probe_keys.value(row) == build_keys.value(i),
+                        (false, false) => null_equality == NullEquality::NullEqualsNull,
+                        _ => false,
+                    };
+                    if equal {
+                        expected.push((row as u32, i as i64));
+                    }
+                }
+            }
+            assert!(expected.len() > 10);
+            assert_eq!(sorted(actual), sorted(expected), "{null_equality:?}");
+        }
+    }
+
+    #[test]
     fn multi_column_keys_and_matched_rows() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("f", DataType::Float64, true),
