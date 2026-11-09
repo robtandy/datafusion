@@ -93,7 +93,7 @@ use arrow::array::{
     new_null_array,
 };
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
@@ -182,6 +182,13 @@ struct JoinSpec {
     /// For every column of the build side, its column in the layout, if the
     /// join needs it: a key that is that column, or a payload column.
     build_columns: Vec<Option<usize>>,
+    /// Whether DataFusion evaluates the build keys only once its whole build
+    /// side is collected, when it builds its hash table. It evaluates them on
+    /// every build batch as it collects them only to compute their bounds:
+    /// for a dynamic filter (which the joins lowered to native joins do not
+    /// have), or for a single key of an integer type, a candidate for its
+    /// perfect hash join (`ArrayMap`).
+    defers_build_key_errors: bool,
 }
 
 impl JoinSpec {
@@ -322,6 +329,20 @@ impl JoinSpec {
             Arc::new(Schema::new(fields)),
             true,
         )?);
+        let defers_build_key_errors = match on.as_slice() {
+            [(key, _)] => !matches!(
+                key.data_type(build_schema)?,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+            ),
+            _ => true,
+        };
         Ok(Self {
             join_type,
             on,
@@ -336,6 +357,7 @@ impl JoinSpec {
             key_schema: Arc::new(Schema::new(key_fields)),
             payload,
             build_columns,
+            defers_build_key_errors,
         })
     }
 
@@ -504,12 +526,12 @@ impl PhysicalHashJoin {
     /// raising the same errors. Other `RepartitionExec`s are kept, so that
     /// DataFusion evaluates their expressions.
     ///
-    /// The probe side of a join whose join type produces no output without
-    /// build rows (`empty_build_side_produces_empty_result`) is left to
-    /// DataFusion (bridged) if its lowered form has pipeline breakers, e.g. a
-    /// join or an aggregation: their pipelines run independently of the build
-    /// side of this join, while DataFusion reads the probe side only once the
-    /// build side is collected, and not at all if it is empty, so that they
+    /// The probe side of a join is left to DataFusion (bridged) if its
+    /// lowered form has pipeline breakers, e.g. a join or an aggregation:
+    /// their pipelines run independently of the build side of this join,
+    /// while DataFusion reads the probe side only once the build side is
+    /// collected (not if it never completes, e.g. before a limit above
+    /// cancels the join, nor if the join cannot produce output), so that they
     /// would compute (and raise errors) where DataFusion does not. A bridged
     /// probe side is executed by DataFusion when the native join reads it.
     pub fn try_lower<F>(
@@ -608,16 +630,14 @@ impl PhysicalHashJoin {
                 );
             }
             // DataFusion reads the probe side only once the build side is
-            // collected, and not at all if the join cannot produce output.
-            // The pipelines of the pipeline breakers of a native probe side
-            // (e.g. the build side of a join below) do not wait for the build
-            // side, so they would compute (and raise errors) where DataFusion
-            // does not: such a probe side is left to DataFusion, which
-            // executes it only once the native join reads it.
-            if children.len() == 1
-                && spec.join_type.empty_build_side_produces_empty_result()
-                && has_pipeline_breakers(&lowered)
-            {
+            // collected: not if the build side never completes (e.g. before a
+            // limit above cancels the join), nor if the join cannot produce
+            // output. The pipelines of the pipeline breakers of a native probe
+            // side (e.g. the build side of a join below) do not wait for the
+            // build side, so they would compute (and raise errors) where
+            // DataFusion does not: such a probe side is left to DataFusion,
+            // which executes it only once the native join reads it.
+            if children.len() == 1 && has_pipeline_breakers(&lowered) {
                 lowered = Arc::new(BridgeOperator::new(Arc::clone(input)));
             }
             children.push(lowered);
@@ -1322,6 +1342,10 @@ struct JoinState {
     /// [`PhysicalHashJoin::create_probe_streams`]), or the error of creating
     /// them.
     probe_streams: OnceLock<std::result::Result<(), Arc<DataFusionError>>>,
+    /// The first error of evaluating the build keys, if DataFusion raises it
+    /// only once the whole build side is collected (see
+    /// `JoinSpec::defers_build_key_errors`): in `finalize`.
+    deferred_build_error: Mutex<Option<DataFusionError>>,
     /// The memory of the build rows.
     reservation: MemoryReservation,
 }
@@ -1548,6 +1572,7 @@ impl PhysicalOperator for PhysicalHashJoin {
             probe_has_rows: AtomicBool::new(false),
             probe_has_null_key: AtomicBool::new(false),
             probe_streams: OnceLock::new(),
+            deferred_build_error: Mutex::new(None),
             reservation,
         }))
     }
@@ -1583,13 +1608,25 @@ impl PhysicalOperator for PhysicalHashJoin {
         let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
         let local =
             downcast_state_mut::<BuildLocalState>(lstate.as_any_mut(), self.name())?;
+        // Once the build keys failed, and DataFusion raises that only when
+        // the build side is complete, the build rows are not needed any more.
+        if spec.defers_build_key_errors && state.deferred_build_error.lock().is_some() {
+            return Ok(SinkResult::NeedMoreInput);
+        }
         // Evaluate the keys on the logical rows only.
         let batch = input.compact()?;
         let num_rows = batch.num_rows();
-        let keys = evaluate_expressions_to_arrays(
+        let keys = match evaluate_expressions_to_arrays(
             spec.on.iter().map(|(build, _)| build),
             &batch,
-        )?;
+        ) {
+            Ok(keys) => keys,
+            Err(e) if spec.defers_build_key_errors => {
+                state.deferred_build_error.lock().get_or_insert(e);
+                return Ok(SinkResult::NeedMoreInput);
+            }
+            Err(e) => return Err(e),
+        };
         state.build_rows.fetch_add(num_rows, Ordering::Relaxed);
         let valid = spec.valid_keys(&keys);
         if let Some(valid) = &valid {
@@ -1673,6 +1710,11 @@ impl PhysicalOperator for PhysicalHashJoin {
         // builds its table (nor reserves its memory).
         if ctx.registry().is_sink_finished(self) {
             return Ok(SinkFinalize::NoOutputPossible);
+        }
+        // An error of the build keys that DataFusion raises once the whole
+        // build side is collected (and not if the join is canceled before).
+        if let Some(error) = state.deferred_build_error.lock().take() {
+            return Err(error);
         }
         let build_empty = state.build_rows.load(Ordering::Relaxed) == 0;
         // DataFusion evaluates the build keys on its whole build side, also
@@ -2019,8 +2061,8 @@ mod tests {
     use crate::join::hash_table::hashes_are_forced_to_collide;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        TestSource, UNREGISTERED_STORE, assert_lowered_plan_byte_eq,
-        assert_lowered_plan_fails_like_datafusion, count, pending_plan,
+        AfterBatch, TestSource, UNREGISTERED_STORE, assert_lowered_plan_byte_eq,
+        assert_lowered_plan_fails_like_datafusion, batch_plan, count, pending_plan,
         unregistered_store_scan,
     };
     use crate::sources::test_harness::write_parquet;
@@ -2918,22 +2960,25 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_multiple_joins_and_partitionings() {
         for (sql, lowered) in [
-            // A join below the probe side of an inner join: the probe side is
-            // left to DataFusion, which reads it only once the build side is
-            // collected (see `PhysicalHashJoin::try_lower`).
+            // A join below the probe side of a join (inner, `Right` as
+            // DataFusion plans these `LEFT JOIN`s, or `Full`): the probe side
+            // is left to DataFusion, which reads it only once the build side
+            // is collected (see `PhysicalHashJoin::try_lower`).
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON t1.a = y.k AND x.w = y.w",
                 1,
             ),
-            // Below the probe side of joins that read their probe side
-            // anyway (`Right`, as DataFusion plans these `LEFT JOIN`s, and
-            // `Full`): both joins are native.
             (
                 "SELECT t1.id, x.name FROM t1 LEFT JOIN t2 x ON t1.a = x.k LEFT JOIN t2 y ON x.w = y.w",
-                2,
+                1,
             ),
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k FULL JOIN t2 y ON x.w = y.w",
+                1,
+            ),
+            // A join below the build side of a join: both are native.
+            (
+                "SELECT t1.id, u.name FROM t1 JOIN (SELECT x.k, x.name FROM t2 x JOIN t2 y ON x.k = y.k AND x.w = y.w) u ON t1.a = u.k",
                 2,
             ),
         ] {
@@ -4401,7 +4446,7 @@ mod tests {
         assert!(probe.plan().is::<HashJoinExec>());
 
         // A `Right` join reads its probe side also if its build side is
-        // empty: both joins are native, and both engines divide by zero.
+        // empty, once it is collected: both engines divide by zero then.
         let root = assert_lowered_plan_fails_like_datafusion(
             || make_plan(JoinType::Right),
             lower,
@@ -4409,7 +4454,8 @@ mod tests {
             "Divide by zero",
         )
         .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 2);
+        let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
+        assert!(join.probe_side().is::<BridgeOperator>());
         Ok(())
     }
 
@@ -4523,6 +4569,172 @@ mod tests {
         let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
         let probe = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
         assert!(probe.plan().is::<RepartitionExec>());
+        Ok(())
+    }
+
+    /// A partition that produces `batch` after `delay`.
+    #[derive(Debug)]
+    struct DelayedBatch {
+        batch: RecordBatch,
+        delay: Duration,
+    }
+
+    impl PartitionStream for DelayedBatch {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let (batch, delay) = (self.batch.clone(), self.delay);
+            let stream = futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+                Ok(batch)
+            });
+            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
+        }
+    }
+
+    /// A limit of one row over a union of `branch` (of [`int32_k_schema`])
+    /// and of a branch that produces the row 42 after 200 ms: once the limit
+    /// has that row, `branch` is canceled.
+    fn limit_over_delayed_42(
+        branch: Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let row = partition_plan(DelayedBatch {
+            batch: RecordBatch::try_new(
+                int32_k_schema(),
+                vec![Arc::new(Int32Array::from(vec![42]))],
+            )?,
+            delay: Duration::from_millis(200),
+        })?;
+        let union = UnionExec::try_new(vec![branch, row])?;
+        Ok(Arc::new(
+            CoalescePartitionsExec::new(union).with_fetch(Some(1)),
+        ))
+    }
+
+    /// [`lower`], also of a limit at the root.
+    fn lower_with_limit(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        use crate::operators::limit::PhysicalLimit;
+        match PhysicalLimit::try_lower(plan, lower)? {
+            Some(limit) => Ok(Arc::new(limit)),
+            None => lower(plan),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_sides_wait_for_the_build_side_of_every_join_type() -> Result<()> {
+        // A `RightAnti` join, whose build side never produces anything, over
+        // a join whose build key `1 / k` divides by zero, under a limit that
+        // is reached after 200 ms. DataFusion never reads the probe side of
+        // the outer join, as its build side never completes, so it never
+        // collects the build side of the inner join: neither engine fails.
+        let make_plan = || {
+            let one_over_k = Arc::new(BinaryExpr::new(
+                lit(1_i32),
+                Operator::Divide,
+                col("k", &int32_k_schema())?,
+            ));
+            let build = int32_k_scan(vec![Some(0)])?;
+            let probe = int32_k_scan(vec![Some(1)])?;
+            let on = vec![(one_over_k as _, col("k", &probe.schema())?)];
+            let nested: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                on,
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            let join = join_on_k(
+                pending_plan(int32_k_schema(), 1)?,
+                nested,
+                JoinType::RightAnti,
+            )?;
+            limit_over_delayed_42(join)
+        };
+        let root =
+            assert_lowered_plan_byte_eq(make_plan, lower_with_limit, task_ctx(), false)
+                .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_key_errors_are_raised_when_datafusion_raises_them() -> Result<()> {
+        // A `RightSemi` join on `(1 / k, k)` whose build side produces `k = 0`
+        // (and then nothing), under a limit that is reached after 200 ms.
+        // DataFusion evaluates these keys once its whole build side is
+        // collected: never, so neither engine fails.
+        let join = |keys: usize, build_ends: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let zero = RecordBatch::try_new(
+                int32_k_schema(),
+                vec![Arc::new(Int32Array::from(vec![0]))],
+            )?;
+            let after = if build_ends {
+                AfterBatch::End
+            } else {
+                AfterBatch::Idle
+            };
+            let build = batch_plan(zero, after)?;
+            let probe = int32_k_scan(vec![Some(1)])?;
+            let (k, probe_k) = (col("k", &build.schema())?, col("k", &probe.schema())?);
+            let one_over_k = Arc::new(BinaryExpr::new(
+                lit(1_i32),
+                Operator::Divide,
+                Arc::clone(&k),
+            ));
+            let mut on = vec![(one_over_k as _, Arc::clone(&probe_k))];
+            if keys == 2 {
+                on.push((k, probe_k));
+            }
+            Ok(Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                on,
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?))
+        };
+        let root = assert_lowered_plan_byte_eq(
+            || limit_over_delayed_42(join(2, false)?),
+            lower_with_limit,
+            task_ctx(),
+            false,
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+
+        // Once the build side is complete, both engines fail.
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || join(2, true),
+            lower,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        assert!(root.is::<PhysicalHashJoin>());
+
+        // The bounds of a single key of an integer type (a candidate for a
+        // perfect hash join) are computed on every build batch, as it is
+        // collected: both engines fail right away.
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || limit_over_delayed_42(join(1, false)?),
+            lower_with_limit,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
         Ok(())
     }
 
