@@ -28,8 +28,11 @@
 //!   and emit the rows with their window values in chunks of at most
 //!   [`DEFAULT_VECTOR_SIZE`](crate::chunk::DEFAULT_VECTOR_SIZE) rows.
 //!
-//! See [`window_op`] for the details and [`PhysicalWindow::try_lower`] for
-//! the plans it lowers.
+//! Window nodes that DataFusion stacks on each other without a sort in
+//! between are evaluated as *stages* of one window operator, on the same
+//! sorted rows, so that they read the rows in the same order as in
+//! DataFusion. See [`window_op`] for the details and
+//! [`PhysicalWindow::try_lower`] for the plans it lowers.
 
 pub mod window_op;
 
