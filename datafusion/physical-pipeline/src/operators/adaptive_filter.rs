@@ -3785,6 +3785,21 @@ mod tests {
                 .names()
                 .is_empty()
         );
+        // Nor can a session trust functions by setting the extension (e.g. with
+        // `SET`), whose entries only tell the trusted ones.
+        let mut options = ConfigOptions::default();
+        options.extensions.insert(TrustedFunctions::default());
+        assert!(
+            options
+                .set("pipeline_trusted_functions.functions", "abs")
+                .is_err()
+        );
+        let entries = trusting_options.entries();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == "pipeline_trusted_functions.functions")
+            .unwrap();
+        assert!(entry.value.as_deref().unwrap().contains("date_part"));
         // Nor are any in the sessions that do not trust them.
         let untrusted = physical_expr_in(
             &datafusion::prelude::SessionContext::new(),
