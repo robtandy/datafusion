@@ -531,12 +531,15 @@ impl PhysicalHashJoin {
     ///   of its probe side, cannot reproduce;
     /// * a null-aware join with several keys or a filter (a correlated or
     ///   multi-column `NOT IN`), or with `NullEqualsNull`;
-    /// * a join that stores build columns of dictionaries with keys of 8 or
-    ///   16 bits: the row store encodes the dictionary columns it gathers
-    ///   again, with the distinct values of the gathered rows (which more
-    ///   than 128 or 256 of them in a chunk overflow), while DataFusion takes
-    ///   them from its whole (concatenated) build side, whose concatenation
-    ///   overflows the keys if they cannot hold all its distinct values;
+    /// * a join whose build side (or build keys) has dictionaries with keys of
+    ///   8 or 16 bits, or run-end encoded arrays with run ends of 16 bits:
+    ///   DataFusion concatenates its whole build side (all its columns),
+    ///   which overflows the keys or run ends if they cannot hold all its
+    ///   distinct values or rows, while the row store does not; and the row
+    ///   store encodes the dictionary columns it gathers again, with the
+    ///   distinct values of the gathered rows (which more than 128 or 256 of
+    ///   them in a chunk overflow), while DataFusion takes them from its whole
+    ///   build side;
     /// * a join whose keys have different types on the two sides, or whose
     ///   build columns the [`TupleDataLayout`] cannot store.
     ///
@@ -663,20 +666,22 @@ impl PhysicalHashJoin {
         // an empty one, which the native join, called with the non-empty
         // chunks of its build side, does not see: keys that fail without any
         // row are left to DataFusion.
-        // The row store encodes the dictionary columns it gathers (for the
-        // output or the filter) again, with the distinct values of the
-        // gathered rows, so that more distinct values than keys of 8 bits
-        // hold in a chunk fail, where DataFusion takes them from its whole
-        // build side; and DataFusion fails to concatenate a build side with
-        // more distinct values than keys of 8 or 16 bits hold, where the row
-        // store does not. Joins that store such dictionaries of the build
-        // side are left to DataFusion.
-        if spec
-            .layout
+        // DataFusion concatenates its whole build side (all its columns, also
+        // those the join does not need), which fails if a dictionary needs
+        // more keys, or run-end encoded values more run ends, than their types
+        // hold; the row store does not. And it encodes the dictionaries it
+        // gathers (for the output or the filter) again, with the distinct
+        // values of the gathered rows, so that more of them than keys of 8
+        // bits hold in a chunk fail, where DataFusion takes them from its
+        // whole build side. Joins with such columns on the build side (or such
+        // build keys) are left to DataFusion.
+        if join
+            .left()
             .schema()
             .fields()
             .iter()
-            .any(|field| has_narrow_dictionary_keys(field.data_type()))
+            .chain(spec.layout.schema().fields())
+            .any(|field| concatenation_can_overflow(field.data_type()))
         {
             return Ok(None);
         }
@@ -1504,30 +1509,35 @@ fn partitions_by_keys(
     }
 }
 
-/// Whether `data_type` is or has a dictionary with keys of 8 or 16 bits.
-fn has_narrow_dictionary_keys(data_type: &DataType) -> bool {
+/// Whether concatenating arrays of `data_type`, as DataFusion concatenates
+/// its build side, can overflow the type for realistic numbers of rows: with
+/// dictionary keys of 8 or 16 bits (more distinct values than they hold), or
+/// run ends of 16 bits (more rows than they count). (The 32-bit offsets of
+/// strings or lists overflow beyond 2 GiB of data, which is not considered.)
+fn concatenation_can_overflow(data_type: &DataType) -> bool {
     match data_type {
         DataType::Dictionary(keys, values) => {
             matches!(
                 keys.as_ref(),
                 DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
-            ) || has_narrow_dictionary_keys(values)
+            ) || concatenation_can_overflow(values)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            matches!(run_ends.data_type(), DataType::Int16)
+                || concatenation_can_overflow(values.data_type())
         }
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
         | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => has_narrow_dictionary_keys(field.data_type()),
+        | DataType::Map(field, _) => concatenation_can_overflow(field.data_type()),
         DataType::Struct(fields) => fields
             .iter()
-            .any(|field| has_narrow_dictionary_keys(field.data_type())),
+            .any(|field| concatenation_can_overflow(field.data_type())),
         DataType::Union(fields, _) => fields
             .iter()
-            .any(|(_, field)| has_narrow_dictionary_keys(field.data_type())),
-        DataType::RunEndEncoded(_, values) => {
-            has_narrow_dictionary_keys(values.data_type())
-        }
+            .any(|(_, field)| concatenation_can_overflow(field.data_type())),
         _ => false,
     }
 }
@@ -3479,7 +3489,7 @@ mod tests {
             .zip(all_types.columns())
             .map(|(field, column)| match field.data_type() {
                 DataType::Dictionary(_, values)
-                    if has_narrow_dictionary_keys(field.data_type()) =>
+                    if concatenation_can_overflow(field.data_type()) =>
                 {
                     let wide =
                         DataType::Dictionary(Box::new(DataType::Int32), values.clone());
@@ -3496,7 +3506,7 @@ mod tests {
             !schema
                 .fields()
                 .iter()
-                .any(|field| has_narrow_dictionary_keys(field.data_type()))
+                .any(|field| concatenation_can_overflow(field.data_type()))
         );
         let (supported, others): (Vec<usize>, Vec<usize>) = (0..all_types.num_columns())
             .partition(|&i| {
@@ -5296,26 +5306,93 @@ mod tests {
             assert_eq!(count::<PhysicalHashJoin>(&root), 0);
         }
 
-        // A `CollectLeft` join probing the key 0 only: DataFusion fails to
+        // `CollectLeft` joins probing the key 0 only: DataFusion fails to
         // concatenate the build batches, whose dictionaries need more keys
-        // than 8 bits hold together, while the row store would not.
-        let collect_left = || {
-            join_on_k(
-                narrow_dictionary_build()?,
-                int32_k_scan(vec![Some(0)])?,
-                JoinType::Inner,
+        // than 8 bits hold together, while the row store would not; also if
+        // the join does not need the dictionary at all (projected away, or a
+        // `RightSemi` join).
+        for (join_type, projection) in [
+            (JoinType::Inner, None),
+            (JoinType::Inner, Some(vec![0])),
+            (JoinType::RightSemi, None),
+        ] {
+            let collect_left = || -> Result<Arc<dyn ExecutionPlan>> {
+                let build = narrow_dictionary_build()?;
+                let probe = int32_k_scan(vec![Some(0)])?;
+                let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+                Ok(Arc::new(HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &join_type,
+                    projection.clone(),
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?))
+            };
+            let error = collect(collect_left()?, task_ctx()).await.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("Dictionary key bigger than the key type"),
+                "{message}"
+            );
+            let root = assert_lowered_plan_fails_like_datafusion(
+                collect_left,
+                lower,
+                test_session_config(),
+                &message,
             )
+            .await;
+            assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{join_type}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_run_ends_of_16_bits_are_left_to_datafusion() -> Result<()> {
+        // Two build batches of 20,000 rows with a column run-end encoded with
+        // run ends of 16 bits: DataFusion fails to concatenate them (40,000
+        // rows), while the row store would not.
+        let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = |start: i32| -> Result<RecordBatch> {
+                let run_ends = arrow::array::Int16Array::from_iter_values(
+                    (1..=200).map(|run| run * 100),
+                );
+                let values = StringArray::from_iter_values(
+                    (0..200).map(|run| format!("r{}", start + run)),
+                );
+                let runs =
+                    arrow::array::RunArray::<arrow::datatypes::Int16Type>::try_new(
+                        &run_ends, &values,
+                    )?;
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int32, true),
+                    Field::new("r", runs.data_type().clone(), true),
+                ]));
+                Ok(RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(Int32Array::from_iter_values(start..start + 20_000)),
+                        Arc::new(runs),
+                    ],
+                )?)
+            };
+            let batches = vec![batch(0)?, batch(20_000)?];
+            let schema = batches[0].schema();
+            let build: Arc<dyn ExecutionPlan> =
+                MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+            join_on_k(build, int32_k_scan(vec![Some(0)])?, JoinType::Inner)
         };
-        let error = collect(collect_left()?, task_ctx()).await.unwrap_err();
-        let message = error.to_string();
         let root = assert_lowered_plan_fails_like_datafusion(
-            collect_left,
+            make_plan,
             lower,
             test_session_config(),
-            &message,
+            "Run end index bigger than the run-end type",
         )
         .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{message}");
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
         Ok(())
     }
 
