@@ -25,7 +25,8 @@
 //!    every column of its result has non-null values, so that the parity
 //!    holds on real data;
 //! 3. the pipeline engine runs the TPC-H queries with native operators only,
-//!    without falling back to a `BridgeOperator` (on both sources).
+//!    without falling back to a `BridgeOperator` (on both sources), except
+//!    for the nodes listed in [`EXPECTED_FALLBACKS`].
 //!
 //! The third assertion (`tpch_queries_run_without_bridge_operator`) is
 //! deferred while `PipelineQueryPlanner` does not lower plans to native
@@ -33,7 +34,10 @@
 //! in a single `BridgeOperator`, which the test detects (no operator of any
 //! TPC-H plan is native) and reports on stderr. As soon as any operator of any
 //! TPC-H plan is native, the test enforces that all 22 queries run natively
-//! over both sources, and lists every fallback of every query otherwise.
+//! over both sources, except for the fallbacks of [`EXPECTED_FALLBACKS`] (the
+//! nodes that the native operators leave to DataFusion to keep its results
+//! and errors exact), and lists every other fallback of every query, and
+//! every expected fallback that no longer happens, otherwise.
 //!
 //! The benchmark `benches/pipeline_vs_default.rs` includes this file as a
 //! module to reuse the data generator and the queries.
@@ -2181,12 +2185,106 @@ impl ZeroFallback {
     }
 }
 
-/// No TPC-H query falls back to a `BridgeOperator`, over both sources: every
-/// node of every plan runs on a native pipeline operator.
+/// Why the native operators leave a node of a TPC-H plan to DataFusion: as
+/// they handle it today, running it natively would not keep DataFusion's
+/// results and errors exact.
+#[derive(Debug)]
+enum Why {
+    /// The arguments of its aggregates have more than one part that may fail
+    /// (decimal arithmetic), whose errors could come in another order than in
+    /// DataFusion (see `PipelineQueryPlanner`).
+    AggregateArguments,
+    /// `PhysicalProjection::supports_projection_exec` refuses the projection
+    /// (`date_part`, decimal arithmetic with more than one part that may
+    /// fail).
+    Projection,
+    /// There is no native operator for `ScalarSubqueryExec`.
+    ScalarSubquery,
+    /// The probe side of a native hash join, which has pipeline breakers:
+    /// they would run before the join reads its probe side (see
+    /// `PhysicalHashJoin::try_lower`).
+    ProbeSide,
+    /// A hash join with a filter that may fail (see
+    /// `PhysicalHashJoin::try_lower`).
+    JoinFilter,
+    /// A hash join whose dynamic filter a Parquet scan uses (see
+    /// `PhysicalHashJoin::try_lower`).
+    JoinDynamicFilter,
+    /// A TopK whose dynamic filter a Parquet scan uses.
+    TopKDynamicFilter,
+    /// A `FilterExec`, which pulls later batches of its input before it passes
+    /// on its rows, below a node that may fail, over a source that may fail
+    /// (see `PipelineQueryPlanner`).
+    FilterOrder,
+}
+
+/// A query (by number) that falls back to `BridgeOperator`s: the roots of its
+/// bridged plans, each with why the native operators leave it to DataFusion.
+type Fallback = (usize, &'static [(&'static str, Why)]);
+
+/// The TPC-H plans that still run parts in `BridgeOperator`s once
+/// `PipelineQueryPlanner` lowers plans, for every source.
+///
+/// The zero-fallback check fails on any other fallback, and on any of these
+/// that no longer happens: when an operator learns to run one of them, its
+/// entry must be removed, so that the list only shrinks.
+#[rustfmt::skip]
+const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
+    ("MemTable", &[
+        (1, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, &[("HashJoinExec", Why::ProbeSide), ("ProjectionExec", Why::ProbeSide)]),
+        (3, &[("AggregateExec", Why::AggregateArguments)]),
+        (5, &[("AggregateExec", Why::AggregateArguments)]),
+        (7, &[("ProjectionExec", Why::Projection)]),
+        (8, &[("ProjectionExec", Why::Projection)]),
+        (9, &[("ProjectionExec", Why::Projection)]),
+        (10, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (14, &[("ProjectionExec", Why::Projection)]),
+        (15, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, &[("HashJoinExec", Why::ProbeSide)]),
+        (17, &[("HashJoinExec", Why::JoinFilter)]),
+        (18, &[("FilterExec", Why::ProbeSide)]),
+        (19, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, &[("HashJoinExec", Why::ProbeSide)]),
+        (21, &[("HashJoinExec", Why::ProbeSide)]),
+        (22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+    ]),
+    ("Parquet", &[
+        (1, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, &[("HashJoinExec", Why::JoinDynamicFilter), ("ProjectionExec", Why::ProbeSide)]),
+        (3, &[("AggregateExec", Why::AggregateArguments)]),
+        (4, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (5, &[("AggregateExec", Why::AggregateArguments)]),
+        (6, &[("FilterExec", Why::FilterOrder)]),
+        (7, &[("ProjectionExec", Why::Projection)]),
+        (8, &[("ProjectionExec", Why::Projection)]),
+        (9, &[("ProjectionExec", Why::Projection)]),
+        (10, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (13, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (14, &[("ProjectionExec", Why::Projection)]),
+        (15, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (18, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
+        (19, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+    ]),
+];
+
+/// No TPC-H query falls back to a `BridgeOperator`, over both sources, other
+/// than as [`EXPECTED_FALLBACKS`] lists: every other node of every plan runs
+/// on a native pipeline operator.
 ///
 /// The check is deferred while `PipelineQueryPlanner` does not lower plans,
 /// and enforced on Q1 to Q22 over both sources as soon as any operator of
-/// any TPC-H plan is native (see [`ZeroFallback::judge`]).
+/// any TPC-H plan is native (see [`ZeroFallback::judge`]). It fails on the
+/// fallbacks that [`EXPECTED_FALLBACKS`] does not list (by the roots of the
+/// bridged plans of a query), and on the listed ones that no longer happen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
     let mut lowerings = vec![];
@@ -2204,12 +2302,60 @@ async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
                  yet (every plan runs in a single BridgeOperator)"
             )?;
         }
-        ZeroFallback::Enforced(fallbacks) => assert!(
-            fallbacks.is_empty(),
-            "{} TPC-H plans fall back to BridgeOperator:\n{}",
-            fallbacks.len(),
-            fallbacks.join("\n")
-        ),
+        ZeroFallback::Enforced(fallbacks) => {
+            let mut unexpected = vec![];
+            let mut happened = vec![];
+            for (source, queries) in &lowerings {
+                let expected = EXPECTED_FALLBACKS
+                    .iter()
+                    .find(|(name, _)| name == source)
+                    .map_or(&[][..], |(_, expected)| expected);
+                for (i, lowering) in queries.iter().enumerate() {
+                    if lowering.bridged.is_empty() {
+                        continue;
+                    }
+                    let roots = lowering
+                        .bridged
+                        .iter()
+                        .map(|line| line.split(':').next().unwrap_or(line));
+                    let listed = expected.iter().any(|(query, bridged)| {
+                        *query == i + 1
+                            && bridged.iter().map(|(root, _)| *root).eq(roots.clone())
+                    });
+                    if listed {
+                        happened.push((*source, i + 1));
+                    } else {
+                        unexpected.push(format!(
+                            "Q{} over {source}: {} of {} operators are \
+                             BridgeOperators, which run\n  {}",
+                            i + 1,
+                            lowering.bridged.len(),
+                            lowering.operators,
+                            lowering.bridged.join("\n  ")
+                        ));
+                    }
+                }
+            }
+            let gone = EXPECTED_FALLBACKS
+                .iter()
+                .flat_map(|(source, expected)| {
+                    expected.iter().map(move |entry| (*source, entry))
+                })
+                .filter(|(source, (query, _))| !happened.contains(&(*source, *query)))
+                .map(|(source, (query, bridged))| {
+                    format!("Q{query} over {source}: {bridged:?}")
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                unexpected.is_empty() && gone.is_empty(),
+                "{} TPC-H plans fall back to BridgeOperator. Not in \
+                 EXPECTED_FALLBACKS:\n{}\nIn EXPECTED_FALLBACKS, but no longer \
+                 happen (remove them):\n{}",
+                fallbacks.len(),
+                unexpected.join("\n"),
+                gone.join("\n")
+            );
+        }
     }
     Ok(())
 }
