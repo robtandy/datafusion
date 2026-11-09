@@ -1786,3 +1786,260 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tpch {
+    //! The 22 TPC-H queries (of `benchmarks/queries`), on small generated
+    //! tables: complex plans of many joins, aggregations, sorts and
+    //! subqueries.
+
+    use std::sync::Arc;
+
+    use arrow::array::RecordBatch;
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::SchemaRef;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionContext;
+    use datafusion_common::Result;
+
+    use crate::bridge::{PipelineRootExec, bridged_plans};
+    use crate::explain::format_operator_tree;
+    use crate::test_utils::{
+        compare_outputs, datafusion_context, run_engines, test_session_config,
+    };
+
+    /// The SQL that generates every TPC-H table. Every row is a function of
+    /// its keys, with the values that the predicates of the queries select.
+    const TABLES: &[(&str, &str)] = &[
+        (
+            "region",
+            "SELECT * FROM (VALUES (0, 'AFRICA', 'lar deposits'), \
+             (1, 'AMERICA', 'hs use ironic'), (2, 'ASIA', 'ges. thinly even'), \
+             (3, 'EUROPE', 'ly final courts'), (4, 'MIDDLE EAST', 'uickly special')) \
+             AS r(r_regionkey, r_name, r_comment)",
+        ),
+        (
+            "nation",
+            "SELECT * FROM (VALUES (0, 'ALGERIA', 0, 'c0'), (1, 'ARGENTINA', 1, 'c1'), \
+             (2, 'BRAZIL', 1, 'c2'), (3, 'CANADA', 1, 'c3'), (4, 'EGYPT', 4, 'c4'), \
+             (5, 'ETHIOPIA', 0, 'c5'), (6, 'FRANCE', 3, 'c6'), (7, 'GERMANY', 3, 'c7'), \
+             (8, 'INDIA', 2, 'c8'), (9, 'INDONESIA', 2, 'c9'), (10, 'IRAN', 4, 'c10'), \
+             (11, 'IRAQ', 4, 'c11'), (12, 'JAPAN', 2, 'c12'), (13, 'JORDAN', 4, 'c13'), \
+             (14, 'KENYA', 0, 'c14'), (15, 'MOROCCO', 0, 'c15'), \
+             (16, 'MOZAMBIQUE', 0, 'c16'), (17, 'PERU', 1, 'c17'), (18, 'CHINA', 2, 'c18'), \
+             (19, 'ROMANIA', 3, 'c19'), (20, 'SAUDI ARABIA', 4, 'c20'), \
+             (21, 'VIETNAM', 2, 'c21'), (22, 'RUSSIA', 3, 'c22'), \
+             (23, 'UNITED KINGDOM', 3, 'c23'), (24, 'UNITED STATES', 1, 'c24')) \
+             AS n(n_nationkey, n_name, n_regionkey, n_comment)",
+        ),
+        (
+            "supplier",
+            "SELECT value AS s_suppkey, \
+             'Supplier#' || lpad(CAST(value AS VARCHAR), 9, '0') AS s_name, \
+             'address ' || CAST(value * 31 % 97 AS VARCHAR) AS s_address, \
+             nationkey AS s_nationkey, \
+             CAST(10 + nationkey AS VARCHAR) || '-' \
+               || lpad(CAST(value * 13 % 1000 AS VARCHAR), 3, '0') || '-' \
+               || lpad(CAST(value * 17 % 10000 AS VARCHAR), 4, '0') AS s_phone, \
+             CAST(value * 7919 % 1099999 / 100.0 - 999.99 AS DECIMAL(15, 2)) AS s_acctbal, \
+             CASE WHEN value % 23 = 0 THEN 'blithely Customer quickly Complaints' \
+               ELSE 'final requests ' || CAST(value % 7 AS VARCHAR) END AS s_comment \
+             FROM (SELECT value, (value * 7 + value / 25) % 25 AS nationkey \
+               FROM generate_series(1, 100))",
+        ),
+        (
+            "part",
+            "SELECT value AS p_partkey, \
+             CASE value % 5 WHEN 0 THEN 'forest green ' WHEN 1 THEN 'blush green ' \
+               WHEN 2 THEN 'forest ivory ' WHEN 3 THEN 'navy chiffon ' \
+               ELSE 'lavender red ' END || CAST(value AS VARCHAR) AS p_name, \
+             'Manufacturer#' || CAST(1 + value % 5 AS VARCHAR) AS p_mfgr, \
+             'Brand#' || CAST(1 + value % 5 AS VARCHAR) \
+               || CAST(1 + value / 5 % 5 AS VARCHAR) AS p_brand, \
+             CASE value % 6 WHEN 0 THEN 'STANDARD POLISHED BRASS' \
+               WHEN 1 THEN 'PROMO BURNISHED COPPER' WHEN 2 THEN 'MEDIUM POLISHED TIN' \
+               WHEN 3 THEN 'ECONOMY ANODIZED STEEL' WHEN 4 THEN 'PROMO PLATED BRASS' \
+               ELSE 'LARGE BRUSHED NICKEL' END AS p_type, \
+             CAST(1 + value * 7 % 50 AS INT) AS p_size, \
+             CASE value % 8 WHEN 0 THEN 'SM CASE' WHEN 1 THEN 'SM BOX' \
+               WHEN 2 THEN 'MED BAG' WHEN 3 THEN 'MED BOX' WHEN 4 THEN 'LG CASE' \
+               WHEN 5 THEN 'LG BOX' WHEN 6 THEN 'SM PACK' ELSE 'LG PKG' END AS p_container, \
+             CAST(900 + value % 200 + value / 1000.0 AS DECIMAL(15, 2)) AS p_retailprice, \
+             'part comment ' || CAST(value % 11 AS VARCHAR) AS p_comment \
+             FROM generate_series(1, 200)",
+        ),
+        (
+            "partsupp",
+            "SELECT p.value AS ps_partkey, (p.value + s.value * 25) % 100 + 1 AS ps_suppkey, \
+             CAST(1 + (p.value * 31 + s.value * 17) % 9999 AS INT) AS ps_availqty, \
+             CAST((1 + (p.value * 97 + s.value * 13) % 100000) / 100.0 AS DECIMAL(15, 2)) \
+               AS ps_supplycost, \
+             'partsupp comment ' || CAST((p.value + s.value) % 13 AS VARCHAR) AS ps_comment \
+             FROM generate_series(1, 200) AS p CROSS JOIN generate_series(0, 3) AS s",
+        ),
+        (
+            "customer",
+            "SELECT value AS c_custkey, \
+             'Customer#' || lpad(CAST(value AS VARCHAR), 9, '0') AS c_name, \
+             'address ' || CAST(value * 17 % 101 AS VARCHAR) AS c_address, \
+             value * 11 % 25 AS c_nationkey, \
+             CAST(10 + value * 11 % 25 AS VARCHAR) || '-' \
+               || lpad(CAST(value * 13 % 1000 AS VARCHAR), 3, '0') || '-' \
+               || lpad(CAST(value * 7 % 10000 AS VARCHAR), 4, '0') AS c_phone, \
+             CAST(value * 7907 % 1100000 / 100.0 - 999.99 AS DECIMAL(15, 2)) AS c_acctbal, \
+             CASE value % 5 WHEN 0 THEN 'BUILDING' WHEN 1 THEN 'AUTOMOBILE' \
+               WHEN 2 THEN 'MACHINERY' WHEN 3 THEN 'HOUSEHOLD' \
+               ELSE 'FURNITURE' END AS c_mktsegment, \
+             'customer comment ' || CAST(value % 7 AS VARCHAR) AS c_comment \
+             FROM generate_series(1, 300)",
+        ),
+        (
+            "orders",
+            "SELECT value AS o_orderkey, \
+             CASE WHEN (1 + value * 37 % 299) % 3 = 0 THEN 2 + value * 37 % 299 \
+               ELSE 1 + value * 37 % 299 END AS o_custkey, \
+             CASE value % 3 WHEN 0 THEN 'F' WHEN 1 THEN 'O' ELSE 'P' END AS o_orderstatus, \
+             CAST(1000 + value * 7919 % 400000 + value / 100.0 AS DECIMAL(15, 2)) \
+               AS o_totalprice, \
+             arrow_cast(CAST(8035 + value * 13 % 2405 AS INT), 'Date32') AS o_orderdate, \
+             CASE value % 5 WHEN 0 THEN '1-URGENT' WHEN 1 THEN '2-HIGH' \
+               WHEN 2 THEN '3-MEDIUM' WHEN 3 THEN '4-NOT SPECIFIED' \
+               ELSE '5-LOW' END AS o_orderpriority, \
+             'Clerk#' || lpad(CAST(1 + value % 50 AS VARCHAR), 9, '0') AS o_clerk, \
+             CAST(0 AS INT) AS o_shippriority, \
+             CASE WHEN value % 13 = 0 THEN 'carefully special packages requests' \
+               ELSE 'final deposits ' || CAST(value % 9 AS VARCHAR) END AS o_comment \
+             FROM generate_series(1, 3000)",
+        ),
+        (
+            "lineitem",
+            "WITH lines AS (SELECT o.value AS o, l.value AS l, \
+               1 + (o.value * 7 + l.value * 13) % 200 AS partkey, \
+               8035 + o.value * 13 % 2405 AS orderdate \
+               FROM generate_series(1, 3000) AS o CROSS JOIN generate_series(1, 7) AS l \
+               WHERE l.value <= CASE WHEN o.value % 101 = 4 THEN 7 \
+                 ELSE 1 + o.value * 5 % 7 END), \
+             shipped AS (SELECT *, orderdate + 1 + (o + l * 7) % 121 AS shipdate, \
+               CASE WHEN o % 101 = 4 THEN 49 + l % 2 ELSE 1 + (o * 3 + l * 7) % 50 END \
+                 AS quantity FROM lines) \
+             SELECT o AS l_orderkey, partkey AS l_partkey, \
+             (partkey + (o + l) % 4 * 25) % 100 + 1 AS l_suppkey, \
+             CAST(l AS INT) AS l_linenumber, \
+             CAST(quantity AS DECIMAL(15, 2)) AS l_quantity, \
+             CAST(quantity * (900 + partkey % 200 + partkey / 1000.0) AS DECIMAL(15, 2)) \
+               AS l_extendedprice, \
+             CAST((o + l) % 11 / 100.0 AS DECIMAL(15, 2)) AS l_discount, \
+             CAST((o * 3 + l) % 9 / 100.0 AS DECIMAL(15, 2)) AS l_tax, \
+             CASE WHEN shipdate + 1 + (o + l) % 30 <= 9298 \
+               THEN CASE WHEN (o + l) % 2 = 0 THEN 'R' ELSE 'A' END \
+               ELSE 'N' END AS l_returnflag, \
+             CASE WHEN shipdate > 9298 THEN 'O' ELSE 'F' END AS l_linestatus, \
+             arrow_cast(CAST(shipdate AS INT), 'Date32') AS l_shipdate, \
+             arrow_cast(CAST(orderdate + 30 + (o * 3 + l) % 61 AS INT), 'Date32') \
+               AS l_commitdate, \
+             arrow_cast(CAST(shipdate + 1 + (o + l) % 30 AS INT), 'Date32') AS l_receiptdate, \
+             CASE (o + l) % 4 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'COLLECT COD' \
+               WHEN 2 THEN 'NONE' ELSE 'TAKE BACK RETURN' END AS l_shipinstruct, \
+             CASE (o * 3 + l) % 7 WHEN 0 THEN 'REG AIR' WHEN 1 THEN 'AIR' \
+               WHEN 2 THEN 'RAIL' WHEN 3 THEN 'SHIP' WHEN 4 THEN 'TRUCK' \
+               WHEN 5 THEN 'MAIL' ELSE 'FOB' END AS l_shipmode, \
+             'line comment ' || CAST((o + l) % 17 AS VARCHAR) AS l_comment \
+             FROM shipped",
+        ),
+    ];
+
+    /// The TPC-H tables, generated by DataFusion, in 3 partitions of
+    /// different sizes.
+    async fn tables() -> Result<Vec<(&'static str, SchemaRef, Vec<Vec<RecordBatch>>)>> {
+        let ctx = datafusion_context(test_session_config());
+        let mut tables = vec![];
+        for &(name, sql) in TABLES {
+            let df = ctx.sql(sql).await?;
+            let schema = Arc::clone(df.schema().inner());
+            let batch = concat_batches(&schema, &df.collect().await?)?;
+            let rows = batch.num_rows();
+            let partitions = vec![
+                vec![batch.slice(0, rows / 2)],
+                vec![batch.slice(rows / 2, rows / 8)],
+                vec![batch.slice(rows / 2 + rows / 8, rows - rows / 2 - rows / 8)],
+            ];
+            tables.push((name, schema, partitions));
+        }
+        Ok(tables)
+    }
+
+    /// The query `q{number}.sql` of `benchmarks/queries`, and the statements
+    /// to execute before it (the view of query 15).
+    fn query(number: usize) -> (String, Vec<String>) {
+        let path = format!(
+            "{}/../../benchmarks/queries/q{number}.sql",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let sql =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut statements = sql
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| {
+                !statement.is_empty() && !statement.to_lowercase().starts_with("drop")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let query = statements.pop().unwrap();
+        (query, statements)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tpch_queries_match_datafusion() -> Result<()> {
+        let tables = tables().await?;
+        let mut native = vec![];
+        for number in 1..=22 {
+            let (sql, statements) = query(number);
+            let setup = async |ctx: &SessionContext| {
+                for (name, schema, partitions) in &tables {
+                    let table =
+                        MemTable::try_new(Arc::clone(schema), partitions.clone())?;
+                    ctx.register_table(*name, Arc::new(table))?;
+                }
+                for statement in &statements {
+                    ctx.sql(statement).await?.collect().await?;
+                }
+                Ok(())
+            };
+            let (expected, actual) = run_engines(&sql, test_session_config(), setup)
+                .await
+                .unwrap_or_else(|e| panic!("Q{number} failed: {e}"));
+            let root = actual
+                .plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator();
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!(
+                    "Q{number}: results differ: {message}\nlowered: {}",
+                    format_operator_tree(root)
+                );
+            }
+            let rows = actual
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>();
+            assert!(rows > 0, "Q{number} selects no rows");
+            if bridged_plans(root).is_empty() {
+                native.push(number);
+            }
+        }
+        // The other queries leave parts to DataFusion that the native
+        // operators do not reproduce exactly: e.g. scalar subqueries, TopKs
+        // of strings, joins whose probe side has pipeline breakers, or
+        // decimal arithmetic in projections.
+        for number in [3, 6, 13] {
+            assert!(
+                native.contains(&number),
+                "Q{number} is not native: {native:?}"
+            );
+        }
+        Ok(())
+    }
+}
