@@ -77,6 +77,13 @@
 //!   expression of an operator on a whole batch before the next one, the
 //!   native operators on their chunks. (The native filters and projections
 //!   refuse such expressions themselves.)
+//! * On several threads (a `target_partitions` above 1, or lowering without
+//!   a session), a filter, projection, aggregation or sort with a part that
+//!   may fail: the threads of a pipeline evaluate the chunks of a partition of
+//!   DataFusion, also of a single batch, in parallel, so which of the rows on
+//!   which it fails fails first depends on them, while DataFusion fails on
+//!   the first of them in its partition (and casts and overflows name the
+//!   value that fails).
 //! * A filter, projection, aggregation or sort with a part that may fail
 //!   above native operators of the same pipeline that have parts that may fail
 //!   too: which of them fails first depends on the batches. For a sort, also
