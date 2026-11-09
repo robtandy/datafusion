@@ -61,6 +61,41 @@
 //!   the unmatched ones (the matched ones for `LeftSemi`, all of them with
 //!   their mark for `LeftMark`).
 //!
+//! The probe side of a join may have pipeline breakers of its own, e.g. the
+//! build side of a join below (as in the joins of TPC-H, which DataFusion
+//! plans as chains of joins whose probe side is the next join). DataFusion
+//! reads the probe side of a join only once its build side is collected, so
+//! the pipelines of these breakers wait for the build side of the join
+//! (they depend on its meta pipeline, see
+//! [`MetaPipelineBuilder::build_with_dependency`]): if the join cannot
+//! produce output, or is canceled (e.g. by a limit above) before its build
+//! side completes, they are canceled before they start. For
+//! `t1 JOIN (t2 JOIN t3 ON ...) ON ...`:
+//!
+//! ```text
+//! MetaPipeline 0 (sink: ...) children: [1, 2]
+//!   Pipeline 0: Scan(t3) -> PhysicalHashJoin -> PhysicalHashJoin -> ... depends on meta pipelines [1, 2]
+//! MetaPipeline 1 (sink: PhysicalHashJoin)
+//!   Pipeline 1: Scan(t1) -> PhysicalHashJoin
+//!   Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]
+//! MetaPipeline 2 (sink: PhysicalHashJoin)
+//!   Pipeline 3: Scan(t2) -> PhysicalHashJoin depends on meta pipelines [1]
+//!   Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]
+//! ```
+//!
+//! # Dynamic filters
+//!
+//! DataFusion pushes a dynamic filter of the probe keys of a join into the
+//! nodes of its probe side that can prune rows with it (e.g. Parquet scans,
+//! which skip whole files and row groups), and sets it once the build side is
+//! collected (see `HashJoinExec::dynamic_expressions_produced`). A
+//! [`PhysicalHashJoin`] lowered from such a join leaves the filter `true`: its
+//! probe side sees all rows, and the join drops those that the filter would
+//! prune, so the result is the same as long as no expression of the probe
+//! side can fail on them (which [`PhysicalHashJoin::try_lower`] checks). It
+//! marks the filter complete when its build side is finalized, so that the
+//! readers of the filter do not wait for an update that never comes.
+//!
 //! # Semantics
 //!
 //! Join keys are equal with DataFusion's join key equality (see
@@ -84,6 +119,7 @@
 //! `NOT IN` key without filter (the correlated and multi-column forms are
 //! left to DataFusion).
 
+use std::any::Any;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -97,6 +133,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::ScalarValue;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_datafusion_err,
     internal_err, not_impl_err, plan_err,
@@ -107,27 +146,32 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
-    Literal, NotExpr, TryCastExpr,
+    BinaryExpr, CaseExpr, CastExpr, Column, DynamicFilterPhysicalExpr, InListExpr,
+    IsNotNullExpr, IsNullExpr, Literal, NotExpr, TryCastExpr,
 };
+use datafusion_physical_expr::utils::conjunction;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
+use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::reset_plan_states;
+use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
 };
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::memory::LazyMemoryExec;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, displayable,
 };
 use parking_lot::Mutex;
 
-use crate::bridge::BridgeOperator;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::join::hash_table::{
     ChainScan, JoinHashTable, JoinHashTableBuilder, hash_join_keys,
@@ -139,6 +183,7 @@ use crate::operator::{
     SinkFinalize, SinkResult, SourceResult, TaskInterrupt, downcast_state,
     downcast_state_mut,
 };
+use crate::operators::adaptive_filter::is_infallible;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::tuple_data::{PartitionedTupleData, RowLocation, TupleDataLayout};
 
@@ -158,6 +203,11 @@ pub struct PhysicalHashJoin {
     /// join creates them too (see [`Self::create_probe_streams`]), to raise
     /// the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
+    /// The dynamic filters of the `HashJoinExec` the join was lowered from
+    /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
+    /// its probe side read: the join leaves them `true`, and marks them
+    /// complete when its build side is finalized.
+    dynamic_filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
 }
 
 /// Everything about a join that does not depend on its inputs, only on
@@ -190,9 +240,9 @@ struct JoinSpec {
     /// Whether DataFusion evaluates the build keys only once its whole build
     /// side is collected, when it builds its hash table. It evaluates them on
     /// every build batch as it collects them only to compute their bounds:
-    /// for a dynamic filter (which the joins lowered to native joins do not
-    /// have), or for a single key of an integer type, a candidate for its
-    /// perfect hash join (`ArrayMap`).
+    /// for a dynamic filter (see [`PhysicalHashJoin::try_lower`], which
+    /// clears this for the joins that have one), or for a single key of an
+    /// integer type, a candidate for its perfect hash join (`ArrayMap`).
     defers_build_key_errors: bool,
 }
 
@@ -464,6 +514,7 @@ impl PhysicalHashJoin {
             children: vec![build, probe],
             spec,
             probe_plan: None,
+            dynamic_filters: vec![],
         })
     }
 
@@ -478,18 +529,24 @@ impl PhysicalHashJoin {
     ///   above the join makes its `fetch` redundant can lower the join
     ///   without it, `HashJoinExec::with_fetch(None)`);
     /// * a join that produces a dynamic filter (see
-    ///   `ExecutionPlan::dynamic_expressions_produced`), which DataFusion
-    ///   attaches to a join when a node of its probe side, such as a Parquet
-    ///   scan, reads the filter. Once the build side is collected, DataFusion
-    ///   sets the filter to a predicate of the build keys (bounds, an `IN`
-    ///   list or a hash table lookup, depending on the size of the build
-    ///   side), with which that node skips probe rows (or whole row groups)
-    ///   that cannot match, so the nodes between it and the join never
-    ///   evaluate their expressions on those rows. A [`PhysicalHashJoin`]
-    ///   leaves the filter `true`, so they would see all rows (and could
-    ///   raise errors on them, like a division by zero). Joins without one
-    ///   are lowered, e.g. with
-    ///   `datafusion.optimizer.enable_join_dynamic_filter_pushdown` off;
+    ///   `ExecutionPlan::dynamic_expressions_produced`) whose probe input has
+    ///   a node that evaluates an expression that may fail (see
+    ///   `evaluates_only_infallible_expressions`). DataFusion attaches the
+    ///   filter to a join when a node of its probe side, such as a Parquet
+    ///   scan, reads it. Once the build side is collected, DataFusion sets
+    ///   the filter to a predicate of the build keys (bounds, an `IN` list or
+    ///   a hash table lookup, depending on the size of the build side), with
+    ///   which that node skips probe rows (or whole files and row groups) that
+    ///   cannot match, so that the nodes above it never evaluate their
+    ///   expressions on those rows (nor the probe sides of the joins whose
+    ///   build side it empties). A [`PhysicalHashJoin`] leaves the filter
+    ///   `true` (and marks it complete once its build side is finalized): its
+    ///   probe side sees all rows, and the join drops the extra ones (they
+    ///   cannot match), which makes no difference unless an expression of the
+    ///   probe side fails on them (like a division by zero). Joins without a
+    ///   dynamic filter are lowered like any other, e.g. with
+    ///   `datafusion.optimizer.enable_join_dynamic_filter_pushdown` off, or
+    ///   over scans that do not read it (e.g. of memory);
     /// * a join with a prepared build side, whose left input is not
     ///   executed, and the joins DataFusion does not execute: in
     ///   `PartitionMode::Auto`, in `PartitionMode::CollectLeft` with several
@@ -522,10 +579,14 @@ impl PhysicalHashJoin {
     ///   chunk and emits as it goes, so that it could stop (e.g. under a
     ///   limit) before it evaluates them on rows on which DataFusion fails;
     /// * a join whose single build key of an integer type can fail on some
-    ///   rows (e.g. `1 / k`): DataFusion evaluates such a key on every whole
-    ///   build batch as it collects them (to compute its bounds), also on an
-    ///   empty one, while a native join evaluates it chunk by chunk, so that
-    ///   it could stop (e.g. canceled by a limit above) before it reaches the
+    ///   rows (e.g. `1 / k`), or with a dynamic filter, whose build keys can
+    ///   fail on some rows or have a type whose bounds may fail to be computed
+    ///   (but numbers, temporal types, booleans, strings and binaries, see
+    ///   `has_bounds`): DataFusion evaluates such keys on every
+    ///   whole build batch as it collects them (to compute their bounds, for
+    ///   its perfect hash join or for its dynamic filter), also on an empty
+    ///   one, while a native join evaluates them chunk by chunk, so that it
+    ///   could stop (e.g. canceled by a limit above) before it reaches the
     ///   rows on which DataFusion fails;
     /// * a join whose probe keys fail without any row (e.g. `1 / 0`):
     ///   DataFusion evaluates them on every batch of its probe side, also on
@@ -557,14 +618,13 @@ impl PhysicalHashJoin {
     /// raises their errors right away, while the join may raise errors of its
     /// build keys only once its build side is complete).
     ///
-    /// The probe side of a join is left to DataFusion (bridged) if its
-    /// lowered form has pipeline breakers, e.g. a join or an aggregation:
-    /// their pipelines run independently of the build side of this join,
-    /// while DataFusion reads the probe side only once the build side is
-    /// collected (not if it never completes, e.g. before a limit above
-    /// cancels the join, nor if the join cannot produce output), so that they
-    /// would compute (and raise errors) where DataFusion does not. A bridged
-    /// probe side is executed by DataFusion when the native join reads it.
+    /// The probe side of a join may have pipeline breakers, e.g. a join or
+    /// an aggregation (as in the chains of joins of TPC-H): DataFusion reads
+    /// the probe side only once the build side is collected (not if it never
+    /// completes, e.g. before a limit above cancels the join, nor if the join
+    /// cannot produce output), so their pipelines wait for the build side of
+    /// the join (see [`MetaPipelineBuilder::build_with_dependency`]), and do
+    /// not compute (nor raise errors) where DataFusion does not.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -590,12 +650,23 @@ impl PhysicalHashJoin {
         if !executable
             || join.fetch().is_some()
             || has_prepared_build(plan)
-            || !plan.dynamic_expressions_produced().is_empty()
             || !probe_streams_can_be_replayed(join.right())
         {
             return Ok(None);
         }
-        let spec = match JoinSpec::try_new(
+        // The dynamic filters that nodes of the probe side read and prune
+        // rows with (in DataFusion): the native join leaves them `true`, which
+        // changes which rows the probe side evaluates its expressions on, so
+        // these must not fail on any row.
+        let Some(dynamic_filters) = dynamic_filters(plan) else {
+            return Ok(None);
+        };
+        if !dynamic_filters.is_empty()
+            && !evaluates_only_infallible_expressions(join.right())
+        {
+            return Ok(None);
+        }
+        let mut spec = match JoinSpec::try_new(
             &join.left().schema(),
             &join.right().schema(),
             join.on().to_vec(),
@@ -622,6 +693,22 @@ impl PhysicalHashJoin {
         }
         let build_keys = join.on().iter().map(|(build, _)| build).collect::<Vec<_>>();
         let probe_keys = join.on().iter().map(|(_, probe)| probe).collect::<Vec<_>>();
+        // For its dynamic filter, DataFusion computes the bounds of the build
+        // keys (their minimum and maximum) as it collects its build side: it
+        // evaluates them on every build batch (see
+        // `JoinSpec::defers_build_key_errors`), and accumulates them with the
+        // `MIN` and `MAX` aggregates, which fail on the types they do not
+        // support. Only keys of the types they support are lowered.
+        let build_schema = join.left().schema();
+        if !dynamic_filters.is_empty() {
+            spec.defers_build_key_errors = false;
+            if !build_keys.iter().all(|key| {
+                key.data_type(&build_schema)
+                    .is_ok_and(|data_type| has_bounds(&data_type))
+            }) {
+                return Ok(None);
+            }
+        }
         // A partition of a `Partitioned` join whose build partition cannot
         // produce output does not read its probe partition, whose nodes then
         // do not run on its rows. All threads of a native join read the whole
@@ -681,16 +768,18 @@ impl PhysicalHashJoin {
         // chunks of its build side, so that it could stop (e.g. when a limit
         // above cancels the join) before it evaluates them on rows on which
         // DataFusion fails. Such keys that can fail are left to DataFusion.
-        let build_schema = join.left().schema();
         if !spec.defers_build_key_errors
             && build_keys.iter().any(|key| can_fail(key, &build_schema))
         {
             return Ok(None);
         }
+        // The pipeline breakers of a native probe side (e.g. the build side
+        // of a join below) wait for the build side of the join, see
+        // `build_pipelines`.
         let mut children = Vec::with_capacity(2);
         for (input, keys) in [(join.left(), build_keys), (join.right(), probe_keys)] {
             let input = without_redistribution(input, &keys);
-            let mut lowered = lower_input(input)?;
+            let lowered = lower_input(input)?;
             if lowered.schema() != input.schema() {
                 return internal_err!(
                     "The lowered input {} of a HashJoinExec has schema {:?}, expected {:?}",
@@ -699,23 +788,13 @@ impl PhysicalHashJoin {
                     input.schema()
                 );
             }
-            // DataFusion reads the probe side only once the build side is
-            // collected: not if the build side never completes (e.g. before a
-            // limit above cancels the join), nor if the join cannot produce
-            // output. The pipelines of the pipeline breakers of a native probe
-            // side (e.g. the build side of a join below) do not wait for the
-            // build side, so they would compute (and raise errors) where
-            // DataFusion does not: such a probe side is left to DataFusion,
-            // which executes it only once the native join reads it.
-            if children.len() == 1 && has_pipeline_breakers(&lowered) {
-                lowered = Arc::new(BridgeOperator::new(Arc::clone(input)));
-            }
             children.push(lowered);
         }
         Ok(Some(Self {
             children,
             spec,
             probe_plan: Some(Arc::clone(join.right())),
+            dynamic_filters,
         }))
     }
 
@@ -1443,11 +1522,234 @@ fn cast_cannot_fail(cast: &CastExpr, schema: &Schema) -> bool {
     }
 }
 
-/// Whether `operator`, or an operator below it, is a pipeline breaker (a
-/// sink, e.g. a join or an aggregation), whose input runs in pipelines of its
-/// own. A bridged plan is a source: DataFusion executes it when it is read.
-fn has_pipeline_breakers(operator: &Arc<dyn PhysicalOperator>) -> bool {
-    operator.is_sink() || operator.children().iter().any(has_pipeline_breakers)
+/// The dynamic filters that `plan` produces (see
+/// `ExecutionPlan::dynamic_expressions_produced`), `None` if one of them is
+/// not a [`DynamicFilterPhysicalExpr`].
+fn dynamic_filters(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Vec<Arc<DynamicFilterPhysicalExpr>>> {
+    plan.dynamic_expressions_produced()
+        .into_iter()
+        .map(|filter| {
+            let filter: Arc<dyn Any + Send + Sync> = filter;
+            filter.downcast::<DynamicFilterPhysicalExpr>().ok()
+        })
+        .collect()
+}
+
+/// Whether DataFusion computes the bounds of the build keys of a join of
+/// `data_type` (for its dynamic filter) with its `MIN` and `MAX` aggregates
+/// without failing: numbers, dates, times, durations and intervals, booleans,
+/// strings and binaries, and dictionaries of these.
+fn has_bounds(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, values) => has_bounds(values),
+        data_type => {
+            data_type.is_primitive()
+                || matches!(
+                    data_type,
+                    DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Utf8View
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                        | DataType::BinaryView
+                        | DataType::FixedSizeBinary(_)
+                )
+        }
+    }
+}
+
+/// Whether every node of `plan` (the probe input of a join that produces a
+/// dynamic filter), and every node below it, only evaluates expressions that
+/// cannot fail, whatever rows they are evaluated on (see [`is_infallible`]):
+/// then which rows of `plan` the dynamic filter prunes makes no difference
+/// but to which rows reach the join.
+///
+/// In DataFusion, the rows that a node of `plan` prunes with the filter (once
+/// it is set, see [`PhysicalHashJoin::try_lower`]) are not evaluated by the
+/// nodes above that node, nor by the probe sides of the joins whose build
+/// side the pruning empties, while the probe side of a native join, which
+/// leaves the filter `true`, evaluates them all.
+///
+/// Only the nodes whose expressions are known qualify (see
+/// [`evaluated_expressions`]), and the aggregations of aggregate functions
+/// that cannot fail (see [`aggregate_functions_cannot_fail`]): DataFusion
+/// pushes a dynamic filter through an aggregation on its group keys only, so
+/// that it prunes whole groups, which the native engine aggregates too. The
+/// dynamic filters that nodes of `plan` read (which their producers may set
+/// during the execution) are classified by their children, see
+/// [`is_infallible_with_dynamic_filters`].
+fn evaluates_only_infallible_expressions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    evaluated_expressions(plan).is_some_and(|expressions| {
+        expressions
+            .iter()
+            .all(|(expr, schema)| is_infallible_with_dynamic_filters(expr, schema))
+    }) && aggregate_functions_cannot_fail(plan)
+        && plan
+            .children()
+            .into_iter()
+            .all(evaluates_only_infallible_expressions)
+}
+
+/// Whether the aggregate functions of `plan`, if it is an aggregation, cannot
+/// fail on the values they aggregate: counts, minimums and maximums, first and
+/// last values, boolean conjunctions and disjunctions, sums (which wrap on
+/// overflow), and averages of integers and floating point numbers (the
+/// average of decimals fails if it overflows the precision of its result).
+fn aggregate_functions_cannot_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let Some(aggregation) = plan.downcast_ref::<AggregateExec>() else {
+        return true;
+    };
+    // The schema of the input rows, also of an aggregation of partial states.
+    let schema = aggregation.input_schema();
+    aggregation
+        .aggr_expr()
+        .iter()
+        .all(|aggregate| match aggregate.fun().name() {
+            "count" | "min" | "max" | "first_value" | "last_value" | "bool_and"
+            | "bool_or" | "sum" => true,
+            "avg" => aggregate.expressions().iter().all(|argument| {
+                argument.data_type(&schema).is_ok_and(|data_type| {
+                    data_type.is_integer() || data_type.is_floating()
+                })
+            }),
+            _ => false,
+        })
+}
+
+/// The expressions that `plan` itself evaluates on rows, each with the
+/// schema of the rows it is evaluated on, but the dynamic filters that a join
+/// or an aggregation produces (which the nodes that read them evaluate).
+/// `None` if they are not known: for a node with expressions that is not a
+/// hash join, an aggregation, a scan of files, a filter, a projection, a
+/// repartitioning or a sort (e.g. a window aggregation, or an extension
+/// node).
+fn evaluated_expressions(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<Vec<(PhysicalExprRef, SchemaRef)>> {
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        let (left, right) = (join.left().schema(), join.right().schema());
+        let keys = join.on().iter().flat_map(|(left_key, right_key)| {
+            [
+                (Arc::clone(left_key), Arc::clone(&left)),
+                (Arc::clone(right_key), Arc::clone(&right)),
+            ]
+        });
+        let filter = join
+            .filter()
+            .map(|filter| (Arc::clone(filter.expression()), Arc::clone(filter.schema())));
+        return Some(keys.chain(filter).collect());
+    }
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        let mut expressions = aggregate.group_expr().input_exprs();
+        // The aggregations of input rows evaluate the arguments (and the
+        // orderings and filters) of their aggregates; the aggregations of
+        // partial states (`Final`, `FinalPartitioned`, `PartialReduce`) only
+        // read the states, by position.
+        if matches!(
+            aggregate.mode(),
+            AggregateMode::Partial
+                | AggregateMode::Single
+                | AggregateMode::SinglePartitioned
+        ) {
+            for aggregate in aggregate.aggr_expr() {
+                let all = aggregate.all_expressions();
+                expressions.extend(all.args);
+                expressions.extend(all.order_by_exprs);
+            }
+            expressions.extend(aggregate.filter_expr().iter().flatten().cloned());
+        }
+        let input = aggregate.input().schema();
+        return Some(
+            expressions
+                .into_iter()
+                .map(|expr| (expr, Arc::clone(&input)))
+                .collect(),
+        );
+    }
+    if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+    {
+        // The filter (e.g. the predicate of a Parquet scan) and the
+        // projection of a file source are in terms of the table schema.
+        let source = config.file_source();
+        let projection = source
+            .projection()
+            .into_iter()
+            .flat_map(|projection| projection.iter().map(|expr| Arc::clone(&expr.expr)));
+        let schema = source.table_schema().table_schema();
+        return Some(
+            source
+                .filter()
+                .into_iter()
+                .chain(projection)
+                .map(|expr| (expr, Arc::clone(schema)))
+                .collect(),
+        );
+    }
+    // Any other node: the expressions that it evaluates or updates.
+    let mut expressions = vec![];
+    plan.apply_expressions(&mut |expr| {
+        expressions.push(Arc::clone(expr));
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .ok()?;
+    if expressions.is_empty() {
+        return Some(vec![]);
+    }
+    // These evaluate their expressions on the rows of their input (a `TopK`
+    // also updates its dynamic filter, a predicate of its sort keys).
+    let on_input = plan.is::<FilterExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<SortExec>()
+        || plan.is::<SortPreservingMergeExec>();
+    match plan.children().as_slice() {
+        [input] if on_input => Some(
+            expressions
+                .into_iter()
+                .map(|expr| (expr, input.schema()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether evaluating `expr` on rows of `schema` cannot fail (see
+/// [`is_infallible`]), the dynamic filters of `expr` included: a dynamic
+/// filter evaluates a predicate of its children, the keys of the node that
+/// produces it (bounds, an `IN` list or a hash table lookup of them, for a
+/// join; comparisons of its sort keys, for a `TopK`), or `true`, so it cannot
+/// fail if its children cannot.
+fn is_infallible_with_dynamic_filters(expr: &PhysicalExprRef, schema: &Schema) -> bool {
+    // The columns of `expr` must be those of `schema`, the schema of the rows
+    // that `expr` is evaluated on.
+    let other_columns = expr.exists(|expr| {
+        Ok(expr.downcast_ref::<Column>().is_some_and(|column| {
+            schema
+                .fields()
+                .get(column.index())
+                .is_none_or(|field| field.name() != column.name())
+        }))
+    });
+    if other_columns.unwrap_or(true) {
+        return false;
+    }
+    let without_dynamic_filters = Arc::clone(expr).transform_up(|expr| {
+        let Some(filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() else {
+            return Ok(Transformed::no(expr));
+        };
+        // Evaluates its children (and nothing that can fail).
+        let children = filter.children().into_iter().map(|child| {
+            Arc::new(IsNotNullExpr::new(Arc::clone(child))) as PhysicalExprRef
+        });
+        Ok(Transformed::yes(conjunction(children)))
+    });
+    without_dynamic_filters
+        .data()
+        .is_ok_and(|expr| is_infallible(&expr, schema))
 }
 
 /// Whether a `HashJoinExec` has a prepared build side attached, whose left
@@ -1942,6 +2244,11 @@ impl PhysicalOperator for PhysicalHashJoin {
     ) -> Result<SinkFinalize> {
         let spec = &self.spec;
         let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
+        // The join leaves its dynamic filters `true` (see `try_lower`): they
+        // will not change any more, whatever the build side turned out to be.
+        for filter in &self.dynamic_filters {
+            filter.mark_complete();
+        }
         // The output of a canceled join is not needed any more: its build
         // pipelines stopped or did not run, and the pipelines that read its
         // output are skipped. DataFusion does not collect the build side of a
@@ -2088,11 +2395,12 @@ impl PhysicalOperator for PhysicalHashJoin {
         let Some(last_pipeline) = meta.pipelines().last().copied() else {
             return internal_err!("A meta pipeline without pipelines");
         };
-        {
+        let build_meta = {
             // The build side sinks into the join, in a child meta pipeline,
             // whose last pipeline builds the pointer tables in parallel.
             let (mut build, mut build_pipeline) =
                 meta.create_child_meta_pipeline(current, Arc::clone(&this))?;
+            let build_meta = build.id();
             let finalize_pipeline =
                 build.create_union_pipeline(&build_pipeline, false)?;
             build.set_source(
@@ -2118,9 +2426,14 @@ impl PhysicalOperator for PhysicalHashJoin {
                     build.add_dependency(&finalize_pipeline, &pipeline)?;
                 }
             }
-        }
-        // The probe side continues the current pipeline.
-        meta.build(current, self.probe_side())?;
+            build_meta
+        };
+        // The probe side continues the current pipeline. DataFusion reads it
+        // only once the build side is collected: the pipelines of its
+        // pipeline breakers (e.g. the build side of a join below) wait for
+        // the build side to be finalized, so that they do not run (nor fail)
+        // if the join cannot produce output, or is canceled before.
+        meta.build_with_dependency(current, self.probe_side(), build_meta)?;
         // The build rows emitted after probing, in a pipeline that runs once
         // all the pipelines of the probe side completed.
         if self.spec.emits_final_build_rows() {
@@ -2294,7 +2607,7 @@ mod tests {
     use datafusion_physical_plan::union::UnionExec;
     use futures::StreamExt;
 
-    use crate::bridge::{BridgeOperator, PipelineRootExec};
+    use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::join::hash_table::hashes_are_forced_to_collide;
@@ -3200,20 +3513,41 @@ mod tests {
     async fn differential_multiple_joins_and_partitionings() {
         for (sql, lowered) in [
             // A join below the probe side of a join (inner, `Right` as
-            // DataFusion plans these `LEFT JOIN`s, or `Full`): the probe side
-            // is left to DataFusion, which reads it only once the build side
-            // is collected (see `PhysicalHashJoin::try_lower`).
+            // DataFusion plans these `LEFT JOIN`s, or `Full`): both are
+            // native, the build side of the join below waits for the build
+            // side of the join above (see `PhysicalHashJoin::try_lower`).
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON t1.a = y.k AND x.w = y.w",
-                1,
+                2,
             ),
             (
                 "SELECT t1.id, x.name FROM t1 LEFT JOIN t2 x ON t1.a = x.k LEFT JOIN t2 y ON x.w = y.w",
-                1,
+                2,
             ),
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k FULL JOIN t2 y ON x.w = y.w",
-                1,
+                2,
+            ),
+            // Chains of three and four joins, of every side.
+            (
+                "SELECT t1.id, x.name, y.w, z.k FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON x.w = y.w JOIN t2 z ON y.k = z.k",
+                3,
+            ),
+            (
+                "SELECT t1.id, x.name, y.w, z.k FROM t1 LEFT JOIN t2 x ON t1.a = x.k RIGHT JOIN t2 y ON x.w = y.w FULL JOIN t2 z ON y.k = z.k AND z.w > 10",
+                3,
+            ),
+            (
+                "SELECT a.id, b.id, c.id, d.id FROM t1 a JOIN t1 b ON a.id = b.id + 1 JOIN t1 c ON b.id = c.id + 1 JOIN t1 d ON c.id = d.id + 1 WHERE a.id % 3 = 0",
+                3,
+            ),
+            (
+                "SELECT t2.k, t2.name FROM t2 WHERE k IN (SELECT a FROM t1 WHERE a IN (SELECT k FROM t2 WHERE w > 3)) AND NOT EXISTS (SELECT 1 FROM t1 WHERE t1.a = t2.k AND t1.b > t2.w)",
+                3,
+            ),
+            (
+                "SELECT t1.id, u.k, v.name, w.w FROM t1 JOIN t2 u ON t1.a = u.k JOIN (SELECT k, name FROM t2 WHERE w % 2 = 0) v ON u.k = v.k JOIN t2 w ON v.name = w.name AND t1.b < w.w + 5000 JOIN t2 x ON w.k = x.k",
+                4,
             ),
             // A join below the build side of a join: both are native.
             (
@@ -3255,13 +3589,311 @@ mod tests {
             assert!(display.contains("mode=Partitioned"), "{display}");
             let root = assert_join_parity_with_config(sql, partitioned_config(), 1).await;
             assert!(
-                crate::bridge::bridged_plans(&root)
+                bridged_plans(&root)
                     .iter()
                     .all(|plan| !plan.is::<RepartitionExec>()),
                 "{}",
                 format_operator_tree(&root)
             );
         }
+    }
+
+    /// The tables of TPC-H that the joins of [`TPCH_JOIN_CHAINS`] read, small
+    /// and with keys spread so that every chain has matches.
+    const TPCH_TABLES: [(&str, &str); 8] = [
+        (
+            "region",
+            "SELECT column1 AS r_regionkey, column2 AS r_name FROM (VALUES \
+             (0, 'AFRICA'), (1, 'AMERICA'), (2, 'ASIA'), (3, 'EUROPE'), (4, 'MIDDLE EAST'))",
+        ),
+        (
+            "nation",
+            "SELECT column1 AS n_nationkey, column2 AS n_name, column3 AS n_regionkey FROM (VALUES \
+             (0, 'ALGERIA', 0), (1, 'ARGENTINA', 1), (2, 'BRAZIL', 1), (3, 'CANADA', 1), \
+             (4, 'EGYPT', 4), (5, 'ETHIOPIA', 0), (6, 'FRANCE', 3), (7, 'GERMANY', 3), \
+             (8, 'INDIA', 2), (9, 'INDONESIA', 2), (10, 'IRAN', 4), (11, 'IRAQ', 4), \
+             (12, 'JAPAN', 2), (13, 'JORDAN', 4), (14, 'KENYA', 0), (15, 'MOROCCO', 0), \
+             (16, 'MOZAMBIQUE', 0), (17, 'PERU', 1), (18, 'CHINA', 2), (19, 'ROMANIA', 3), \
+             (20, 'SAUDI ARABIA', 4), (21, 'VIETNAM', 2), (22, 'RUSSIA', 3), \
+             (23, 'UNITED KINGDOM', 3), (24, 'UNITED STATES', 1))",
+        ),
+        (
+            "supplier",
+            "SELECT value AS s_suppkey, concat('Supplier#', value) AS s_name, \
+             value % 25 AS s_nationkey, CAST(value * 37 % 1000 AS DECIMAL(15, 2)) AS s_acctbal \
+             FROM generate_series(1, 50)",
+        ),
+        (
+            "customer",
+            "SELECT value AS c_custkey, concat('Customer#', value) AS c_name, \
+             value % 25 AS c_nationkey, CAST(value * 13 % 997 AS DECIMAL(15, 2)) AS c_acctbal, \
+             CASE value % 5 WHEN 0 THEN 'BUILDING' WHEN 1 THEN 'AUTOMOBILE' \
+             WHEN 2 THEN 'MACHINERY' WHEN 3 THEN 'HOUSEHOLD' ELSE 'FURNITURE' END AS c_mktsegment \
+             FROM generate_series(1, 150)",
+        ),
+        (
+            "part",
+            "SELECT value AS p_partkey, \
+             concat(CASE value % 3 WHEN 0 THEN 'forest green ' WHEN 1 THEN 'navy ' ELSE 'red ' END, value) AS p_name, \
+             CASE value % 4 WHEN 0 THEN 'ECONOMY ANODIZED STEEL' WHEN 1 THEN 'STANDARD POLISHED BRASS' \
+             WHEN 2 THEN 'PROMO BRUSHED BRASS' ELSE 'LARGE PLATED TIN' END AS p_type, \
+             value % 20 + 1 AS p_size FROM generate_series(1, 100)",
+        ),
+        (
+            "partsupp",
+            "SELECT value / 4 + 1 AS ps_partkey, (value / 4 + value % 4 * 13) % 50 + 1 AS ps_suppkey, \
+             CAST(value * 17 % 500 + 1 AS DECIMAL(15, 2)) AS ps_supplycost FROM generate_series(0, 399)",
+        ),
+        (
+            "orders",
+            "SELECT value AS o_orderkey, value * 7 % 150 + 1 AS o_custkey, \
+             CASE value % 3 WHEN 0 THEN 'F' WHEN 1 THEN 'O' ELSE 'P' END AS o_orderstatus, \
+             arrow_cast(arrow_cast(8035 + value * 11 % 2400, 'Int32'), 'Date32') AS o_orderdate \
+             FROM generate_series(1, 600)",
+        ),
+        (
+            "lineitem",
+            "SELECT value / 4 + 1 AS l_orderkey, value * 13 % 100 + 1 AS l_partkey, \
+             (value / 4 + value % 4 * 13) * 13 % 50 + 1 AS l_suppkey, value % 4 + 1 AS l_linenumber, \
+             CAST(value % 50 + 1 AS DECIMAL(15, 2)) AS l_quantity, \
+             CAST(value * 31 % 10000 AS DECIMAL(15, 2)) AS l_extendedprice, \
+             CAST(value % 11 AS DECIMAL(15, 2)) AS l_discount, \
+             CASE value % 4 WHEN 0 THEN 'R' WHEN 1 THEN 'A' ELSE 'N' END AS l_returnflag, \
+             arrow_cast(arrow_cast(8035 + value * 3 % 2500, 'Int32'), 'Date32') AS l_shipdate, \
+             arrow_cast(arrow_cast(8045 + value * 3 % 2500, 'Int32'), 'Date32') AS l_commitdate, \
+             arrow_cast(arrow_cast(8035 + value * 3 % 2500 + CASE WHEN value % 5 = 0 THEN 20 ELSE 5 END, \
+             'Int32'), 'Date32') AS l_receiptdate \
+             FROM generate_series(0, 2399)",
+        ),
+    ];
+
+    /// The joins of TPC-H queries 2, 3, 5, 7, 8, 9, 10 and 21, chains of 3 to
+    /// 8 tables whose probe sides are joins (with the predicates of the
+    /// queries, adapted to the data of [`TPCH_TABLES`], and the joined
+    /// columns instead of the aggregations): DataFusion plans them as chains
+    /// of `HashJoinExec`s, the probe side of every join is the next join.
+    const TPCH_JOIN_CHAINS: [(&str, &str); 8] = [
+        (
+            "Q2",
+            "SELECT s_acctbal, s_name, n_name, p_partkey, ps_supplycost \
+             FROM part, supplier, partsupp, nation, region \
+             WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size > 5 \
+             AND p_type LIKE '%BRASS' AND s_nationkey = n_nationkey \
+             AND n_regionkey = r_regionkey AND r_name = 'EUROPE'",
+        ),
+        (
+            "Q3",
+            "SELECT l_orderkey, l_extendedprice, l_discount, o_orderdate \
+             FROM customer, orders, lineitem \
+             WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey \
+             AND l_orderkey = o_orderkey AND o_orderdate < DATE '1995-03-15' \
+             AND l_shipdate > DATE '1995-03-15'",
+        ),
+        (
+            "Q5",
+            "SELECT n_name, l_extendedprice, l_discount \
+             FROM customer, orders, lineitem, supplier, nation, region \
+             WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey \
+             AND l_suppkey = s_suppkey AND c_nationkey = s_nationkey \
+             AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey \
+             AND r_name = 'AMERICA' AND o_orderdate >= DATE '1993-01-01' \
+             AND o_orderdate < DATE '1997-01-01'",
+        ),
+        (
+            "Q7",
+            "SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation, l_shipdate, l_extendedprice \
+             FROM supplier, lineitem, orders, customer, nation n1, nation n2 \
+             WHERE s_suppkey = l_suppkey AND o_orderkey = l_orderkey AND c_custkey = o_custkey \
+             AND s_nationkey = n1.n_nationkey AND c_nationkey = n2.n_nationkey \
+             AND ((n1.n_regionkey = 3 AND n2.n_name = 'BRAZIL') \
+             OR (n1.n_name = 'BRAZIL' AND n2.n_regionkey = 3)) \
+             AND l_shipdate BETWEEN DATE '1993-01-01' AND DATE '1997-12-31'",
+        ),
+        (
+            "Q8",
+            "SELECT o_orderdate, l_extendedprice, l_discount, n2.n_name AS nation \
+             FROM part, supplier, lineitem, orders, customer, nation n1, nation n2, region \
+             WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey AND l_orderkey = o_orderkey \
+             AND o_custkey = c_custkey AND c_nationkey = n1.n_nationkey \
+             AND n1.n_regionkey = r_regionkey AND r_name = 'AMERICA' \
+             AND s_nationkey = n2.n_nationkey \
+             AND o_orderdate BETWEEN DATE '1993-01-01' AND DATE '1997-12-31' \
+             AND p_type = 'ECONOMY ANODIZED STEEL'",
+        ),
+        (
+            "Q9",
+            "SELECT n_name AS nation, o_orderdate, l_extendedprice, l_discount, ps_supplycost, l_quantity \
+             FROM part, supplier, lineitem, partsupp, orders, nation \
+             WHERE s_suppkey = l_suppkey AND ps_suppkey = l_suppkey AND ps_partkey = l_partkey \
+             AND p_partkey = l_partkey AND o_orderkey = l_orderkey \
+             AND s_nationkey = n_nationkey AND p_name LIKE '%green%'",
+        ),
+        (
+            "Q10",
+            "SELECT c_custkey, c_name, l_extendedprice, l_discount, c_acctbal, n_name \
+             FROM customer, orders, lineitem, nation \
+             WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey \
+             AND o_orderdate >= DATE '1993-10-01' AND o_orderdate < DATE '1995-01-01' \
+             AND l_returnflag = 'R' AND c_nationkey = n_nationkey",
+        ),
+        (
+            "Q21",
+            "SELECT s_name, l1.l_orderkey FROM supplier, lineitem l1, orders, nation \
+             WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey \
+             AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate \
+             AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey \
+             AND l2.l_suppkey <> l1.l_suppkey) \
+             AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey \
+             AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate) \
+             AND s_nationkey = n_nationkey \
+             AND n_name IN ('SAUDI ARABIA', 'GERMANY', 'PERU', 'CHINA', 'FRANCE')",
+        ),
+    ];
+
+    /// Register the tables of [`TPCH_TABLES`] in `ctx`, as `MemTable`s.
+    async fn register_tpch_memtables(ctx: &SessionContext) -> Result<()> {
+        for (table, query) in TPCH_TABLES {
+            ctx.sql(&format!("CREATE TABLE {table} AS {query}"))
+                .await?
+                .collect()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Write the tables of [`TPCH_TABLES`] as Parquet files to `dir`, every
+    /// table in three files of row groups of 64 rows, sorted by its first
+    /// column, so that the dynamic filters of the joins prune row groups.
+    async fn write_tpch_parquet(dir: &std::path::Path) -> Result<()> {
+        let ctx = SessionContext::new();
+        register_tpch_memtables(&ctx).await?;
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(64))
+            .build();
+        for (table, _) in TPCH_TABLES {
+            let df = ctx
+                .sql(&format!("SELECT * FROM {table} ORDER BY 1"))
+                .await?;
+            let schema = Arc::clone(df.schema().inner());
+            let batches = df.collect().await?;
+            let batch = arrow::compute::concat_batches(&schema, &batches)?;
+            let rows = batch.num_rows();
+            for (file, start) in [0, rows / 3, rows * 2 / 3].into_iter().enumerate() {
+                let end = [rows / 3, rows * 2 / 3, rows][file];
+                let path = dir.join(table).join(format!("part-{file}.parquet"));
+                let slice = batch.slice(start, end - start);
+                write_parquet(
+                    &path,
+                    Arc::clone(&schema),
+                    &[slice],
+                    Some(properties.clone()),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of `HashJoinExec`s of `plan`.
+    fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        usize::from(plan.is::<HashJoinExec>())
+            + plan
+                .children()
+                .into_iter()
+                .map(count_hash_joins)
+                .sum::<usize>()
+    }
+
+    /// Assert that the chain of joins `sql` produces byte-identical results on
+    /// DataFusion and on the pipeline engine (see
+    /// [`assert_join_parity_with_setup`]), and runs natively from top to
+    /// bottom: every `HashJoinExec` of DataFusion's plan is lowered to a
+    /// [`PhysicalHashJoin`], and no `BridgeOperator` is left. Returns the
+    /// number of rows of the result.
+    async fn assert_native_join_chain<F>(
+        name: &str,
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> usize
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await.expect("setup");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("planning")
+            .create_physical_plan()
+            .await
+            .expect("physical planning");
+        let joins = count_hash_joins(&plan);
+        assert!(joins >= 2, "{name}: {joins} joins");
+        let root = assert_join_parity_with_setup(sql, config, setup, joins).await;
+        let bridged = bridged_plans(&root);
+        assert!(
+            bridged.is_empty(),
+            "{name} falls back to BridgeOperator: {}",
+            format_operator_tree(&root)
+        );
+        let expected = run_sql(&ctx, sql).await.expect("DataFusion");
+        count_rows(&expected.batches)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_tpch_join_chains_over_memtables() {
+        let setup = async |ctx: &SessionContext| register_tpch_memtables(ctx).await;
+        for (name, sql) in TPCH_JOIN_CHAINS {
+            let rows =
+                assert_native_join_chain(name, sql, test_session_config(), &setup).await;
+            assert!(rows > 0, "{name} has no rows");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_tpch_join_chains_over_parquet() {
+        // DataFusion attaches dynamic filters to the joins, which the Parquet
+        // scans of their probe sides read: the native joins leave them `true`.
+        let dir = tempfile::tempdir().unwrap();
+        write_tpch_parquet(dir.path()).await.unwrap();
+        let setup = async |ctx: &SessionContext| {
+            for (table, _) in TPCH_TABLES {
+                let path = dir.path().join(table);
+                let path = path.to_str().expect("a UTF-8 path");
+                ctx.register_parquet(table, path, ParquetReadOptions::default())
+                    .await?;
+            }
+            Ok(())
+        };
+        for pushdown_filters in [false, true] {
+            let mut config = test_session_config();
+            config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
+            for (name, sql) in TPCH_JOIN_CHAINS {
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await.unwrap();
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .unwrap()
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
+                assert!(
+                    has_dynamic_filters(&plan),
+                    "{name}: {}",
+                    displayable(plan.as_ref()).indent(true)
+                );
+                let rows =
+                    assert_native_join_chain(name, sql, config.clone(), &setup).await;
+                assert!(rows > 0, "{name} has no rows");
+            }
+        }
+    }
+
+    /// Whether a `HashJoinExec` of `plan` produces a dynamic filter.
+    fn has_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        (plan.is::<HashJoinExec>() && !plan.dynamic_expressions_produced().is_empty())
+            || plan.children().into_iter().any(has_dynamic_filters)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3738,6 +4370,100 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn pipelines_of_joins_on_the_probe_side() -> Result<()> {
+        // `t1 JOIN (t2 JOIN t3)`: the build side of the inner join (meta
+        // pipeline 2) waits for the build side of the outer join (1).
+        let inner = join_of(
+            source(data_schema("l"), vec![]) as _,
+            source(data_schema("r"), vec![]) as _,
+            JoinType::Inner,
+        )?;
+        let outer = join_of(
+            source(data_schema("l"), vec![]) as _,
+            inner,
+            JoinType::Inner,
+        )?;
+        assert_eq!(
+            format_pipelines(&outer)?,
+            "MetaPipeline 0 (sink: ResultSink) children: [1, 2]\n  \
+             Pipeline 0: TestSource -> PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on meta pipelines [1, 2]\n\
+             MetaPipeline 1 (sink: PhysicalHashJoin)\n  \
+             Pipeline 1: TestSource -> PhysicalHashJoin\n  \
+             Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]\n\
+             MetaPipeline 2 (sink: PhysicalHashJoin)\n  \
+             Pipeline 3: TestSource -> PhysicalHashJoin depends on meta pipelines [1]\n  \
+             Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]\n"
+        );
+        // The scan of the unmatched build rows of an inner `Full` join, in the
+        // meta pipeline of the outer join, runs after its probe pipeline.
+        let inner = join_of(
+            source(data_schema("l"), vec![]) as _,
+            source(data_schema("r"), vec![]) as _,
+            JoinType::Full,
+        )?;
+        let outer = join_of(
+            source(data_schema("l"), vec![]) as _,
+            inner,
+            JoinType::Inner,
+        )?;
+        assert_eq!(
+            format_pipelines(&outer)?,
+            "MetaPipeline 0 (sink: ResultSink) children: [1, 2]\n  \
+             Pipeline 0: TestSource -> PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on meta pipelines [1, 2]\n  \
+             Pipeline 5: PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on pipelines [0] depends on meta pipelines [1]\n\
+             MetaPipeline 1 (sink: PhysicalHashJoin)\n  \
+             Pipeline 1: TestSource -> PhysicalHashJoin\n  \
+             Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]\n\
+             MetaPipeline 2 (sink: PhysicalHashJoin)\n  \
+             Pipeline 3: TestSource -> PhysicalHashJoin depends on meta pipelines [1]\n  \
+             Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_breakers_of_the_probe_side_wait_for_the_build_side() -> Result<()> {
+        // A join of an empty build side and of the probe side `inner`, a
+        // join of two non-empty inputs. If the outer join cannot produce
+        // output without build rows, DataFusion does not read its probe side,
+        // and so neither input of `inner`: the build pipelines of `inner`
+        // wait for the build side of the outer join, and are canceled.
+        for (join_type, executed) in [
+            (JoinType::Inner, false),
+            (JoinType::LeftSemi, false),
+            (JoinType::RightSemi, false),
+            (JoinType::LeftMark, false),
+            (JoinType::Right, true),
+            (JoinType::RightAnti, true),
+            (JoinType::Full, true),
+        ] {
+            for build_rows in [0, 50] {
+                let nested_build =
+                    source(data_schema("l"), vec![data_batch("l", 0..100, 0)]);
+                let nested_probe =
+                    source(data_schema("r"), vec![data_batch("r", 0..100, 0)]);
+                let inner = join_of(
+                    Arc::clone(&nested_build) as _,
+                    Arc::clone(&nested_probe) as _,
+                    JoinType::Inner,
+                )?;
+                let batches = if build_rows == 0 {
+                    vec![]
+                } else {
+                    vec![data_batch("l", 0..build_rows, 0)]
+                };
+                let root =
+                    join_of(source(data_schema("l"), batches) as _, inner, join_type)?;
+                with_timeout(Executor::collect(root, task_ctx(), 4)).await?;
+                let executed = executed || build_rows > 0;
+                assert_eq!(nested_build.produced() > 0, executed, "{join_type}");
+                assert_eq!(nested_probe.produced() > 0, executed, "{join_type}");
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_can_be_executed_again() -> Result<()> {
         // The build side with 6000 rows in many blocks and partitions.
@@ -4026,11 +4752,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn joins_that_produce_dynamic_filters_are_left_to_datafusion() -> Result<()> {
+    async fn dynamic_filters_over_fallible_probe_sides_are_left_to_datafusion()
+    -> Result<()> {
         // The probe side `(k, d)` of `(1, 1), (2, 0)` is a Parquet file, whose
         // scan reads the dynamic filter of the join by `k`. Once DataFusion has
         // collected the build key 1, the scan skips the row of key 2 (with
-        // `pushdown_filters`) before `1 / d` divides by its zero.
+        // `pushdown_filters`) before `1 / d` divides by its zero, while the
+        // probe side of a native join, which leaves the filter `true`, would
+        // divide by zero.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p.parquet");
         let probe = RecordBatch::try_from_iter([
@@ -4128,6 +4857,198 @@ mod tests {
             .await
             .expect_err("the pipeline engine fails");
         assert!(error.to_string().contains("Divide by zero"), "{error}");
+        Ok(())
+    }
+
+    /// Write the Parquet table `p` of `(k, d, s, m)` to `dir`: two files of
+    /// 2,000 rows in row groups of 100 rows, sorted by `k`, so that the
+    /// dynamic filter of a join by `k` prunes most row groups (and with
+    /// `pushdown_filters`, rows).
+    fn write_parquet_table_p(dir: &std::path::Path) -> Result<()> {
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        for (file, keys) in [("a", 0..2000), ("b", 2000..4000)] {
+            let k = Int64Array::from_iter_values(keys.clone());
+            let d = Int64Array::from_iter(
+                keys.clone().map(|k| (k % 7 != 3).then_some(k % 5)),
+            );
+            let s = StringArray::from_iter_values(
+                keys.clone().map(|k| format!("s{}", k % 13)),
+            );
+            let m =
+                Decimal128Array::from_iter_values(keys.map(|k| i128::from(k % 89) * 25))
+                    .with_precision_and_scale(15, 2)?;
+            let batch = RecordBatch::try_from_iter([
+                ("k", Arc::new(k) as ArrayRef),
+                ("d", Arc::new(d) as ArrayRef),
+                ("s", Arc::new(s) as ArrayRef),
+                ("m", Arc::new(m) as ArrayRef),
+            ])?;
+            let path = dir.join("p").join(format!("{file}.parquet"));
+            write_parquet(&path, batch.schema(), &[batch], Some(properties.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Register the Parquet table `p` of [`write_parquet_table_p`] in `dir`,
+    /// and the memory table `b` of the keys `10, 20, ..., 300` (with a NULL
+    /// key and a duplicate), with `w`.
+    async fn register_tables_p_and_b(
+        ctx: &SessionContext,
+        dir: &std::path::Path,
+    ) -> Result<()> {
+        let keys = (1..=30)
+            .map(|i| Some(i * 10))
+            .chain([None, Some(150)])
+            .collect::<Vec<_>>();
+        let w = (0..keys.len() as i64).collect::<Vec<_>>();
+        let build = RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from(keys)) as ArrayRef),
+            ("w", Arc::new(Int64Array::from(w)) as ArrayRef),
+        ])?;
+        ctx.register_batch("b", build)?;
+        let path = dir.join("p");
+        ctx.register_parquet(
+            "p",
+            path.to_str().expect("a UTF-8 path"),
+            ParquetReadOptions::default(),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_that_produce_dynamic_filters_are_native() -> Result<()> {
+        // Joins of the memory table `b` (the build side) with the Parquet
+        // table `p`, whose scans read the dynamic filters of the joins. The
+        // probe sides only evaluate expressions that cannot fail, so the joins
+        // are native: they leave the filters `true`, and mark them complete.
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_p(dir.path())?;
+        let setup =
+            async |ctx: &SessionContext| register_tables_p_and_b(ctx, dir.path()).await;
+        let queries = [
+            "SELECT b.k, b.w, p.d, p.s FROM b JOIN p ON b.k = p.k",
+            "SELECT b.w, x.v FROM b JOIN (SELECT k, d + 1 AS v FROM p WHERE s <> 's3') x ON b.k = x.k",
+            "SELECT b.k, p.d FROM b JOIN p ON b.k = p.k AND p.d < b.w WHERE p.s LIKE 's1%'",
+            "SELECT b.k, b.w, p.d FROM b LEFT JOIN p ON b.k = p.k AND p.d > 1",
+            "SELECT b.k, b.w FROM b WHERE b.k IN (SELECT k FROM p WHERE s <> 's2')",
+            "SELECT b.k, b.w FROM b WHERE EXISTS (SELECT 1 FROM p WHERE p.k = b.k AND p.d = 2)",
+            "SELECT b.k, b.w FROM b WHERE NOT EXISTS (SELECT 1 FROM p WHERE p.k = b.k AND p.d = 4)",
+            // No build rows: the join does not read its probe side.
+            "SELECT b.k, p.d FROM b JOIN p ON b.k = p.k WHERE b.w > 1000",
+        ];
+        for pushdown_filters in [false, true] {
+            let mut config = test_session_config();
+            config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
+            // `b` is the build side, although it is not smaller than `p`.
+            config.options_mut().optimizer.join_reordering = false;
+            for sql in queries {
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let join = find_hash_join(&plan).expect("a hash join");
+                let filters = dynamic_filters(&join).expect("dynamic filters");
+                assert_eq!(filters.len(), 1, "{sql}");
+                assert!(!filters[0].is_complete(), "{sql}");
+                // Native from top to bottom, also the Parquet scan.
+                let root = lower(&plan)?;
+                assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{sql}");
+                assert!(
+                    bridged_plans(&root).is_empty(),
+                    "{sql}\n{}",
+                    format_operator_tree(&root)
+                );
+                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                with_timeout(collect(exec, ctx.task_ctx())).await?;
+                assert!(filters[0].is_complete(), "{sql}");
+                assert_eq!(filters[0].current()?.to_string(), "true", "{sql}");
+
+                assert_join_parity_with_setup(sql, config.clone(), &setup, 1).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_sides_that_dynamic_filters_cannot_change() -> Result<()> {
+        // Which probe inputs of a join with a dynamic filter only evaluate
+        // expressions that cannot fail (see
+        // `evaluates_only_infallible_expressions`), on the plans of joins of
+        // `b` with `p` (or `b`).
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_p(dir.path())?;
+        let mut config = test_session_config();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        config.options_mut().optimizer.join_reordering = false;
+        let ctx = datafusion_context(config);
+        register_tables_p_and_b(&ctx, dir.path()).await?;
+        for (probe, infallible) in [
+            // A scan of memory or of a Parquet file (whose predicate has the
+            // dynamic filter of the join).
+            ("SELECT k FROM b", true),
+            ("SELECT k, d FROM p", true),
+            // Filters and projections.
+            (
+                "SELECT k, d + 1 AS d FROM p WHERE s = 's1' OR d IS NULL",
+                true,
+            ),
+            ("SELECT k, d / 2 AS d FROM p WHERE s LIKE '%7'", true),
+            (
+                "SELECT k, d FROM p WHERE NOT (d = 1) AND k IN (1, 2, 3)",
+                true,
+            ),
+            ("SELECT k, 10 / d AS d FROM p", false),
+            ("SELECT k, d FROM p WHERE 10 / d > 1", false),
+            ("SELECT k, CAST(s AS INT) AS d FROM p", false),
+            ("SELECT k, upper(s) AS d FROM p", false),
+            // Aggregations: of input rows, and of partial states.
+            ("SELECT k, COUNT(*) AS d FROM p GROUP BY k", true),
+            ("SELECT k, MAX(d + 1) AS d FROM p GROUP BY k", true),
+            ("SELECT k, SUM(10 / d) AS d FROM p GROUP BY k", false),
+            (
+                "SELECT k, SUM(d) AS d, SUM(m) AS m, MIN(s) AS s FROM p GROUP BY k",
+                true,
+            ),
+            // The average of decimals may overflow.
+            ("SELECT k, AVG(m) AS d FROM p GROUP BY k", false),
+            ("SELECT k, string_agg(s, ',') AS d FROM p GROUP BY k", false),
+            // Joins: their keys and filters.
+            ("SELECT p.k, b.w AS d FROM p JOIN b ON p.k = b.k + 1", true),
+            (
+                "SELECT p.k, b.w AS d FROM p JOIN b ON p.k = b.k AND p.d < b.w",
+                true,
+            ),
+            (
+                "SELECT p.k, b.w AS d FROM p JOIN b ON p.k = b.k AND 10 / p.d < b.w",
+                false,
+            ),
+            // Sorts.
+            ("SELECT k, d FROM p ORDER BY d, k", true),
+            ("SELECT k, d FROM p ORDER BY 10 / d, k", false),
+            // A window aggregation, whose expressions are not classified.
+            (
+                "SELECT k, ROW_NUMBER() OVER (ORDER BY k) AS d FROM p",
+                false,
+            ),
+        ] {
+            let plan = ctx.sql(probe).await?.create_physical_plan().await?;
+            assert_eq!(
+                evaluates_only_infallible_expressions(&plan),
+                infallible,
+                "{probe}\n{}",
+                displayable(plan.as_ref()).indent(true)
+            );
+        }
+        // The probe input of a join with a dynamic filter, with the filter in
+        // the predicate of its scan.
+        let sql =
+            "SELECT b.k, x.d FROM b JOIN (SELECT k, d + 1 AS d FROM p) x ON b.k = x.k";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let join = find_hash_join(&plan).expect("a hash join");
+        assert_eq!(join.dynamic_expressions_produced().len(), 1);
+        let probe = Arc::clone(join.children()[1]);
+        assert!(evaluates_only_infallible_expressions(&probe));
         Ok(())
     }
 
@@ -4720,15 +5641,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn probe_sides_with_pipeline_breakers_are_left_to_datafusion() -> Result<()> {
+    async fn probe_sides_with_pipeline_breakers_wait_for_the_build_side() -> Result<()> {
         // An inner join whose build side ends empty after a while, over a join
-        // whose non-empty build side has the key `1 / 0`. DataFusion reads
-        // the probe side of the outer join only once its build side is
-        // collected: never, as it is empty, so it never collects the build
-        // side of the inner join. The pipelines of that build side would not
-        // wait for the outer build side: the probe side is left to DataFusion.
+        // on `(1 / 0, k) = (k, k)` whose build side is not empty, and whose
+        // keys DataFusion evaluates once its build side is collected.
+        // DataFusion reads the probe side of the outer join only once its
+        // build side is collected: never, as it is empty, so it never collects
+        // the build side of the inner join (nor divides by zero). Both joins
+        // are native: the pipelines of the build side of the inner join wait
+        // for the build side of the outer join, and are canceled with it.
         let make_plan = |join_type: JoinType| -> Result<Arc<dyn ExecutionPlan>> {
-            let nested = join_on_one_over_zero(
+            let nested = join_on_one_over_zero_and_k(
                 int32_k_scan(vec![Some(1)])?,
                 int32_k_scan(vec![Some(1)])?,
                 JoinType::RightSemi,
@@ -4740,30 +5663,33 @@ mod tests {
             })?;
             join_on_k(build, nested, join_type)
         };
-        let root = assert_lowered_plan_byte_eq(
-            || make_plan(JoinType::Inner),
-            lower,
-            task_ctx(),
-            false,
-        )
-        .await;
-        let join = root
-            .downcast_ref::<PhysicalHashJoin>()
-            .expect("a native join");
-        let probe = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
-        assert!(probe.plan().is::<HashJoinExec>());
+        for join_type in [JoinType::Inner, JoinType::LeftSemi, JoinType::RightSemi] {
+            let root = assert_lowered_plan_byte_eq(
+                || make_plan(join_type),
+                lower,
+                task_ctx(),
+                false,
+            )
+            .await;
+            let join = root
+                .downcast_ref::<PhysicalHashJoin>()
+                .expect("a native join");
+            assert!(join.probe_side().is::<PhysicalHashJoin>(), "{join_type}");
+        }
 
         // A `Right` join reads its probe side also if its build side is
         // empty, once it is collected: both engines divide by zero then.
-        let root = assert_lowered_plan_fails_like_datafusion(
-            || make_plan(JoinType::Right),
-            lower,
-            test_session_config(),
-            "Divide by zero",
-        )
-        .await;
-        let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
-        assert!(join.probe_side().is::<BridgeOperator>());
+        for join_type in [JoinType::Right, JoinType::RightAnti, JoinType::Full] {
+            let root = assert_lowered_plan_fails_like_datafusion(
+                || make_plan(join_type),
+                lower,
+                test_session_config(),
+                "Divide by zero",
+            )
+            .await;
+            let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
+            assert!(join.probe_side().is::<PhysicalHashJoin>(), "{join_type}");
+        }
         Ok(())
     }
 
@@ -4934,20 +5860,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn probe_sides_wait_for_the_build_side_of_every_join_type() -> Result<()> {
-        // A `RightAnti` join, whose build side never produces anything, over
-        // a join whose build key `1 / k` divides by zero, under a limit that
-        // is reached after 200 ms. DataFusion never reads the probe side of
-        // the outer join, as its build side never completes, so it never
-        // collects the build side of the inner join: neither engine fails.
-        let make_plan = || {
+        // A join, whose build side never produces anything, over a join whose
+        // build keys `(1 / k, k)` divide by zero, under a limit that is
+        // reached after 200 ms. DataFusion never reads the probe side of the
+        // outer join, as its build side never completes, so it never collects
+        // the build side of the inner join: neither engine fails. With a
+        // single build key `1 / k`, which DataFusion evaluates on every build
+        // batch as it collects them, the inner join is left to DataFusion.
+        let make_plan = |join_type: JoinType, keys: usize| {
+            let k = col("k", &int32_k_schema())?;
             let one_over_k = Arc::new(BinaryExpr::new(
                 lit(1_i32),
                 Operator::Divide,
-                col("k", &int32_k_schema())?,
+                Arc::clone(&k),
             ));
             let build = int32_k_scan(vec![Some(0)])?;
             let probe = int32_k_scan(vec![Some(1)])?;
-            let on = vec![(one_over_k as _, col("k", &probe.schema())?)];
+            let probe_k = col("k", &probe.schema())?;
+            let mut on = vec![(one_over_k as _, Arc::clone(&probe_k))];
+            if keys == 2 {
+                on.push((k, probe_k));
+            }
             let nested: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
                 build,
                 probe,
@@ -4959,17 +5892,35 @@ mod tests {
                 NullEquality::NullEqualsNothing,
                 false,
             )?);
-            let join = join_on_k(
-                pending_plan(int32_k_schema(), 1)?,
+            // Only the first column (`k` of either side), for the union with
+            // the row 42.
+            let build = pending_plan(int32_k_schema(), 1)?;
+            let on = vec![(col("k", &build.schema())?, col("k", &nested.schema())?)];
+            let join = HashJoinExec::try_new(
+                build,
                 nested,
-                JoinType::RightAnti,
+                on,
+                None,
+                &join_type,
+                Some(vec![0]),
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
             )?;
-            limit_over_delayed_42(join)
+            limit_over_delayed_42(Arc::new(join))
         };
-        let root =
-            assert_lowered_plan_byte_eq(make_plan, lower_with_limit, task_ctx(), false)
+        for join_type in ALL_JOIN_TYPES {
+            for keys in [1, 2] {
+                let root = assert_lowered_plan_byte_eq(
+                    || make_plan(join_type, keys),
+                    lower_with_limit,
+                    task_ctx(),
+                    false,
+                )
                 .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+                assert_eq!(count::<PhysicalHashJoin>(&root), keys, "{join_type}");
+            }
+        }
         Ok(())
     }
 
@@ -5093,6 +6044,87 @@ mod tests {
         fn reserved(&self) -> usize {
             self.reserved.load(Ordering::Relaxed)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_keys_of_joins_with_dynamic_filters_are_evaluated_eagerly() -> Result<()>
+    {
+        // A `RightSemi` join on `(1 / k, k)` whose build side produces `k = 0`
+        // (and then nothing), over a Parquet scan of `k`, under a limit that
+        // is reached after 200 ms. Without a dynamic filter, DataFusion
+        // evaluates these keys once its whole build side is collected: never,
+        // so neither engine fails. With the dynamic filter of the join, which
+        // the scan reads, DataFusion computes the bounds of the keys as it
+        // collects the build side, and divides by zero right away: the join is
+        // left to DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("k.parquet");
+        let rows = RecordBatch::try_new(
+            int32_k_schema(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        write_parquet(&path, int32_k_schema(), &[rows], None)?;
+        let ctx = datafusion_context(test_session_config());
+        let path = path.to_str().expect("a UTF-8 path");
+        ctx.register_parquet("probe", path, ParquetReadOptions::default())
+            .await?;
+        let scan = ctx.sql("SELECT k FROM probe").await?;
+        let scan = scan.create_physical_plan().await?;
+        assert_eq!(scan.schema(), int32_k_schema());
+        let options = test_session_config().options().clone();
+        let make_plan = |dynamic_filter: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let zero = RecordBatch::try_new(
+                int32_k_schema(),
+                vec![Arc::new(Int32Array::from(vec![0]))],
+            )?;
+            let build = batch_plan(zero, AfterBatch::Idle)?;
+            let k = col("k", &build.schema())?;
+            let probe_k = col("k", &scan.schema())?;
+            let one_over_k = Arc::new(BinaryExpr::new(
+                lit(1_i32),
+                Operator::Divide,
+                Arc::clone(&k),
+            ));
+            let on = vec![(one_over_k as _, Arc::clone(&probe_k)), (k, probe_k)];
+            let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                build,
+                Arc::clone(&scan),
+                on,
+                None,
+                &JoinType::RightSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            let join = if dynamic_filter {
+                FilterPushdown::new_post_optimization().optimize(join, &options)?
+            } else {
+                join
+            };
+            assert_eq!(
+                join.dynamic_expressions_produced().len(),
+                usize::from(dynamic_filter)
+            );
+            limit_over_delayed_42(join)
+        };
+        let root = assert_lowered_plan_byte_eq(
+            || make_plan(false),
+            lower_with_limit,
+            task_ctx(),
+            false,
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || make_plan(true),
+            lower_with_limit,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
