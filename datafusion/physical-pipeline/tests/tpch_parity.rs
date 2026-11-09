@@ -2212,14 +2212,11 @@ enum Why {
     Projection,
     /// There is no native operator for `ScalarSubqueryExec`.
     ScalarSubquery,
-    /// The probe side of a native hash join, which has pipeline breakers:
-    /// they would run before the join reads its probe side (see
-    /// `PhysicalHashJoin::try_lower`).
-    ProbeSide,
     /// A hash join with a filter that may fail (see
     /// `PhysicalHashJoin::try_lower`).
     JoinFilter,
-    /// A hash join whose dynamic filter a Parquet scan uses (see
+    /// A hash join whose dynamic filter a Parquet scan uses, where the rows
+    /// that the filter prunes could make a node below the join fail (see
     /// `PhysicalHashJoin::try_lower`).
     JoinDynamicFilter,
     /// A TopK whose dynamic filter a Parquet scan uses.
@@ -2250,7 +2247,6 @@ type Fallback = (usize, usize, &'static [(&'static str, Why)]);
 const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
     ("MemTable", &[
         (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, 25, &[("HashJoinExec", Why::ProbeSide), ("ProjectionExec", Why::ProbeSide)]),
         (3, 13, &[("AggregateExec", Why::AggregateArguments)]),
         (5, 21, &[("AggregateExec", Why::AggregateArguments)]),
         (7, 22, &[("ProjectionExec", Why::Projection)]),
@@ -2260,22 +2256,13 @@ const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
         (11, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
         (14, 10, &[("ProjectionExec", Why::Projection)]),
         (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, 5, &[("HashJoinExec", Why::ProbeSide)]),
         (17, 12, &[("HashJoinExec", Why::JoinFilter)]),
-        (18, 5, &[("FilterExec", Why::ProbeSide)]),
         (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
-        (20, 13, &[("HashJoinExec", Why::ProbeSide)]),
-        (21, 9, &[("HashJoinExec", Why::ProbeSide)]),
         (22, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
     ("Parquet", &[
         (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, 32, &[
-            ("HashJoinExec", Why::JoinDynamicFilter),
-            ("ProjectionExec", Why::ProbeSide),
-        ]),
         (3, 14, &[("AggregateExec", Why::AggregateArguments)]),
-        (4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (5, 22, &[("AggregateExec", Why::AggregateArguments)]),
         (6, 2, &[("FilterExec", Why::FilterOrder)]),
         (7, 23, &[("ProjectionExec", Why::Projection)]),
@@ -2283,16 +2270,12 @@ const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
         (9, 18, &[("ProjectionExec", Why::Projection)]),
         (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
         (11, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (12, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (13, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (14, 10, &[("ProjectionExec", Why::Projection)]),
         (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (17, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (17, 12, &[("HashJoinExec", Why::JoinFilter)]),
         (18, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
         (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
         (20, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (21, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (22, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
 ];
