@@ -101,7 +101,9 @@
 //!   side may fail below a node of the same pipeline that may fail:
 //!   DataFusion's join coalesces its output, like `FilterExec`. And one with
 //!   a dynamic filter whose probe side may fail (e.g. a scan of files):
-//!   DataFusion's scans skip the reads that the filter rejects.
+//!   DataFusion's scans skip the reads that the filter rejects. So do they
+//!   for the dynamic filter of a TopK: a TopK whose dynamic filter a node of
+//!   its input consumes is left to DataFusion if its input may fail.
 //! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
 //!   or a `RepartitionExec` over a bounded input, which coalesces the batches
 //!   of its output partitions, also below a hash join, which removes the
@@ -181,7 +183,7 @@ use async_trait::async_trait;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::format::ExplainFormat;
-use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::LogicalPlan;
@@ -574,6 +576,25 @@ impl Lowering<'_> {
         }
         let input_may_fail = || subtree_failing_parts(sort.input()) > 0;
         if keys.failing_parts > 0 && (input_may_fail() || !self.evaluates_in_order()) {
+            return Ok(None);
+        }
+        // DataFusion pushes the dynamic filter of a TopK (its threshold) into
+        // the scans of its input, which skip the files, row groups and rows
+        // that it rejects as it tightens; a native TopK publishes its threshold
+        // at other times, so that it does not skip the same reads. So a TopK
+        // whose dynamic filter a node of its input consumes is left to
+        // DataFusion if its input may fail (e.g. a scan of files, whose values
+        // may fail to read or to cast to the types of the table). (The native
+        // sort itself leaves to DataFusion the TopKs whose pruned rows the
+        // expressions of their input may fail on.)
+        if sort.fetch().is_some()
+            && let Some(filter) = sort
+                .dynamic_expressions_produced()
+                .iter()
+                .find_map(|expr| expr.expression_id())
+            && consumes_dynamic_filter(sort.input(), filter)
+            && input_may_fail()
+        {
             return Ok(None);
         }
         let input = Context::below_breaker(keys.failing_parts);
@@ -1299,6 +1320,25 @@ fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
         .into_iter()
         .map(subtree_failing_parts)
         .fold(own, usize::saturating_add)
+}
+
+/// Whether a node of `plan` consumes the dynamic filter with id `filter`: e.g.
+/// a scan, which skips the rows that the filter rejects.
+fn consumes_dynamic_filter(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
+    let mut consumes = false;
+    let _ = plan.apply(|node| {
+        let _ = node.apply_expressions(&mut |expr| {
+            expr.apply(|expr| {
+                consumes |= expr.expression_id() == Some(filter);
+                Ok(TreeNodeRecursion::Continue)
+            })
+        });
+        Ok(match consumes {
+            true => TreeNodeRecursion::Stop,
+            false => TreeNodeRecursion::Continue,
+        })
+    });
+    consumes
 }
 
 /// Whether DataFusion may fail to combine the batches of `plan`, a node that
@@ -3322,6 +3362,64 @@ mod tests {
         assert_eq!(produced, 1, "{}", displayable(plan.as_ref()).indent(false));
         let root = assert_parity_with(sql, config, &setup).await;
         assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    -> Result<()> {
+        // A table `k INT, v INT` of two Parquet files: 100 rows `k = 0, v =
+        // 100`, and 10 rows `k = 1` of strings that fail to cast to `INT` when
+        // they are read. The TopK of `ORDER BY k LIMIT 1` reads the first file,
+        // whose rows tighten its threshold to `k <= 0`, and DataFusion's scan
+        // prunes the second file with its dynamic filter: it never reads it. A
+        // native TopK does not prune the same reads, so that it would fail to
+        // cast.
+        let dir = tempfile::tempdir()?;
+        let first = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![0; 100])) as arrow::array::ArrayRef,
+            ),
+            ("v", Arc::new(Int32Array::from(vec![100; 100])) as _),
+        ])?;
+        let second = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![1; 10])) as arrow::array::ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
+                    as _,
+            ),
+        ])?;
+        let path = dir.path().join("p");
+        write_parquet(&path.join("0.parquet"), first.schema(), &[first], None)?;
+        write_parquet(&path.join("1.parquet"), second.schema(), &[second], None)?;
+        let path = path.to_str().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]);
+        let setup = async |ctx: &SessionContext| {
+            register_view_tables(ctx)?;
+            ctx.register_parquet(
+                "p",
+                path,
+                ParquetReadOptions::default().schema(&schema),
+            )
+            .await?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT k, v FROM p ORDER BY k LIMIT 1";
+        let root = assert_parity_with(sql, config.clone(), &setup).await;
+        assert_eq!(count::<PhysicalTopK>(&root), 0);
+        // Over a scan of memory, which cannot fail, the TopK is native.
+        let sql = "SELECT id, a FROM t1 ORDER BY a, id LIMIT 3";
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalTopK>(&root), 1);
         Ok(())
     }
 
