@@ -978,19 +978,64 @@ fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
 /// not more memory: whether it fails depends on how many rows it is evaluated
 /// on together.
 fn expands_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    !expr.is::<Column>()
-        && expr
-            .data_type(schema)
-            .is_ok_and(|data_type| contains_byte_offsets(&data_type))
-        && expr.children().iter().any(|child| {
-            if is_constant_tree(child) {
-                is_broadcast_constant(child, schema)
-            } else {
-                child
-                    .data_type(schema)
-                    .is_ok_and(|data_type| shares_values(&data_type))
-            }
-        })
+    if expr.is::<Column>() {
+        return false;
+    }
+    let into_byte_offsets = expr
+        .data_type(schema)
+        .is_ok_and(|data_type| contains_byte_offsets(&data_type));
+    // `IS [NOT] NULL` reads the validity of its operand, not its values.
+    let reads_values = !expr.is::<IsNullExpr>() && !expr.is::<IsNotNullExpr>();
+    expr.children().iter().any(|child| {
+        if is_constant_tree(child) {
+            into_byte_offsets && is_broadcast_constant(child, schema)
+        } else {
+            child.data_type(schema).is_ok_and(|data_type| {
+                (into_byte_offsets && shares_values(&data_type))
+                    || (reads_values && copies_shared_payloads(&data_type))
+            })
+        }
+    })
+}
+
+/// Whether arrays of `data_type` contain, at any depth, values that rows
+/// share, which Arrow copies for every row that has them in their own type
+/// when it extracts or expands them (e.g. to cast them into any type), and
+/// whose 32-bit offsets (see [`has_32_bit_offsets`]) may then overflow: the
+/// children of dense unions, the values of runs, and those of list views.
+fn copies_shared_payloads(data_type: &DataType) -> bool {
+    let payload = |data_type: &DataType| {
+        has_32_bit_offsets(data_type) || copies_shared_payloads(data_type)
+    };
+    match data_type {
+        DataType::Union(fields, UnionMode::Dense) => {
+            fields.iter().any(|(_, field)| payload(field.data_type()))
+        }
+        DataType::RunEndEncoded(_, field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field) => payload(field.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => copies_shared_payloads(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| copies_shared_payloads(field.data_type())),
+        DataType::Union(fields, UnionMode::Sparse) => fields
+            .iter()
+            .any(|(_, field)| copies_shared_payloads(field.data_type())),
+        DataType::Dictionary(_, values) => copies_shared_payloads(values),
+        _ => false,
+    }
+}
+
+/// Whether arrays of `data_type` contain, at any depth, 32-bit offsets or run
+/// ends that add up the lengths of their values, which overflow beyond as
+/// many bytes or values as they count: of strings and binaries (see
+/// [`contains_byte_offsets`]), of lists and maps, and of runs (see
+/// [`contains_narrow_lengths`]).
+pub(crate) fn has_32_bit_offsets(data_type: &DataType) -> bool {
+    contains_byte_offsets(data_type) || contains_narrow_lengths(data_type)
 }
 
 /// Whether `expr` is a constant (see `is_constant_tree`) whose value may have
@@ -1026,7 +1071,8 @@ fn is_constant_tree(expr: &Arc<dyn PhysicalExpr>) -> bool {
 }
 
 /// Whether arrays of `data_type` contain, at any depth, values that several
-/// rows may share: dictionaries, run-end encoded arrays, and views.
+/// rows may share: dictionaries, run-end encoded arrays, views, and dense
+/// unions (whose rows may point to the same value of a child).
 fn shares_values(data_type: &DataType) -> bool {
     match data_type {
         DataType::Dictionary(..)
@@ -1034,7 +1080,8 @@ fn shares_values(data_type: &DataType) -> bool {
         | DataType::Utf8View
         | DataType::BinaryView
         | DataType::ListView(_)
-        | DataType::LargeListView(_) => true,
+        | DataType::LargeListView(_)
+        | DataType::Union(_, UnionMode::Dense) => true,
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::FixedSizeList(field, _)
@@ -1685,6 +1732,20 @@ mod tests {
     #[test]
     fn finds_expansions_of_values() {
         use Fallibility::*;
+        // A union of `Int32` and of `data_type`.
+        let union = |data_type: DataType, mode: UnionMode| {
+            DataType::Union(
+                arrow::datatypes::UnionFields::try_new(
+                    [0, 1],
+                    [
+                        Field::new("i", DataType::Int32, true),
+                        Field::new("v", data_type, true),
+                    ],
+                )
+                .unwrap(),
+                mode,
+            )
+        };
         let strings = Arc::new(Field::new("values", DataType::Utf8, true));
         let dictionary =
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
@@ -1706,6 +1767,9 @@ mod tests {
             ),
             Field::new("s", DataType::Utf8, true),
             Field::new("e", DataType::Boolean, true),
+            Field::new("du", union(DataType::Utf8, UnionMode::Dense), false),
+            Field::new("su", union(DataType::Utf8, UnionMode::Sparse), false),
+            Field::new("di", union(DataType::Float64, UnionMode::Dense), false),
         ]));
         let cast = |name: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
             Arc::new(CastExpr::new(physical_expr(name, &schema), to, None))
@@ -1724,7 +1788,22 @@ mod tests {
                 ),
                 (PerRow, true),
             ),
-            // But not into 64-bit offsets or views, nor into the values of a
+            // Extracting the strings of a dense union, or expanding runs,
+            // copies them in their own type first, whatever the type it casts
+            // them into.
+            (cast("du", DataType::Utf8), (PerRow, true)),
+            (cast("du", DataType::LargeUtf8), (PerRow, true)),
+            (cast("du", DataType::Utf8View), (PerRow, true)),
+            (cast("r", DataType::LargeUtf8), (PerRow, true)),
+            // But not for `IS NULL`, nor for sparse unions, whose rows do not
+            // share values, nor for unions of values without offsets.
+            (
+                Arc::new(IsNullExpr::new(physical_expr("du", &schema))),
+                (Infallible, false),
+            ),
+            (cast("su", DataType::Utf8), (PerRow, false)),
+            (cast("di", DataType::Float64), (PerRow, false)),
+            // Nor into 64-bit offsets or views, nor into the values of a
             // dictionary, which Arrow casts once.
             (cast("d", DataType::LargeUtf8), (Infallible, false)),
             (cast("d", DataType::Utf8View), (Infallible, false)),

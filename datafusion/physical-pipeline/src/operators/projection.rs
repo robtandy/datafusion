@@ -38,7 +38,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
 use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
@@ -52,7 +52,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
-use super::adaptive_filter::{depends_on_batches, failing_parts};
+use super::adaptive_filter::{depends_on_batches, failing_parts, has_32_bit_offsets};
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -515,7 +515,8 @@ pub(crate) fn takes_little_memory(data_type: &DataType) -> bool {
 /// bits, which count at most 512 MiB of booleans), and whose cost is
 /// proportional to the number of values. DataFusion filters such arrays
 /// without copying their values. Nor run-end encoded arrays whose child fields
-/// are not Arrow's, which Arrow's `filter` renames.
+/// are not Arrow's, which Arrow's `filter` renames, nor dense unions with
+/// children with 32-bit offsets, whose values rows may share.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(field)
@@ -528,6 +529,16 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
         }
         DataType::Struct(fields) => {
             fields.iter().all(|field| can_gather(field.data_type()))
+        }
+        // Rows of a dense union may point to the same value of a child, which
+        // `take` (and DataFusion's `filter`) copy for every row, so the 32-bit
+        // offsets of the child may overflow on some batches and not others.
+        DataType::Union(fields, UnionMode::Dense)
+            if fields
+                .iter()
+                .any(|(_, field)| has_32_bit_offsets(field.data_type())) =>
+        {
+            false
         }
         DataType::Union(fields, _) => fields
             .iter()
@@ -1514,6 +1525,20 @@ mod tests {
         let list = |values: DataType, size: i32| {
             DataType::FixedSizeList(Arc::new(Field::new_list_field(values, true)), size)
         };
+        // A union of `Int32` and of `data_type`.
+        let union = |data_type: DataType, mode: UnionMode| {
+            DataType::Union(
+                arrow::datatypes::UnionFields::try_new(
+                    [0, 1],
+                    [
+                        Field::new("i", DataType::Int32, true),
+                        Field::new("v", data_type, true),
+                    ],
+                )
+                .unwrap(),
+                mode,
+            )
+        };
         let runs = DataType::RunEndEncoded(
             Arc::new(Field::new("run_ends", DataType::Int64, false)),
             Arc::new(Field::new("values", DataType::Int32, true)),
@@ -1551,6 +1576,16 @@ mod tests {
                 false,
             ),
             (list(DataType::Struct(Vec::<Field>::new().into()), 4), false),
+            // Rows of dense unions may share the strings of a child, but not
+            // those of sparse unions, nor values without offsets.
+            (union(DataType::Utf8, UnionMode::Dense), false),
+            (union(list(DataType::Int32, 2), UnionMode::Dense), true),
+            (
+                union(DataType::new_list(DataType::Int8, true), UnionMode::Dense),
+                false,
+            ),
+            (union(DataType::Utf8, UnionMode::Sparse), true),
+            (union(DataType::Float64, UnionMode::Dense), true),
             // An empty list or binary, a boolean or a run-end encoded column
             // has one value per row (and binaries of a byte take a byte).
             (list(DataType::Int32, 0), true),
@@ -1631,6 +1666,45 @@ mod tests {
                 assert_same_outcome_in_datafusion(plan(), task_ctx).await,
                 Ok(0),
                 "{data_type}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+        // Casting a dense union extracts its child of strings first, copying a
+        // string of 2 MiB for each of the 1200 rows of the batch of
+        // `ProjectionExec` that point to it, whose 32-bit offsets overflow,
+        // whatever the type it casts into, but not for the 600 rows of a chunk
+        // (see `filters_of_dense_unions_of_shared_strings_stay_in_datafusion`).
+        let batch = dense_union_of_a_large_string();
+        let schema = batch.schema();
+        for to in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                let cast =
+                    Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+                        physical_expr("u", &schema),
+                        to.clone(),
+                        None,
+                    ));
+                Arc::new(
+                    ProjectionExec::try_new(
+                        [ProjectionExpr::new(cast as Arc<dyn PhysicalExpr>, "c")],
+                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let projection_plan = plan();
+            let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+            assert!(!PhysicalProjection::supports_projection_exec(exec), "{to}");
+            let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+            let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|error| error.to_lowercase().contains("overflow")),
+                "{to}: {outcome:?}"
             );
         }
     }

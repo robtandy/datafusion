@@ -2054,6 +2054,52 @@ pub(crate) mod test_support {
             .collect()
     }
 
+    /// A batch of 4096 rows of `id` (`Int32`, the row number) and of `u`, a
+    /// dense union of a string of 2 MiB and of integers: 600 rows of each half
+    /// of the batch (2048 rows) point to the string.
+    pub(crate) fn dense_union_of_a_large_string() -> RecordBatch {
+        let rows = 4096;
+        let big = |row: i32| row % 2048 < 600;
+        let type_ids = (0..rows).map(|row| i8::from(!big(row))).collect();
+        let mut integers = 0;
+        let offsets = (0..rows)
+            .map(|row| {
+                if big(row) {
+                    0
+                } else {
+                    integers += 1;
+                    integers - 1
+                }
+            })
+            .collect();
+        let fields = arrow::datatypes::UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("s", DataType::Utf8, true),
+                Field::new("i", DataType::Int32, true),
+            ],
+        )
+        .unwrap();
+        let u = arrow::array::UnionArray::try_new(
+            fields,
+            type_ids,
+            Some(offsets),
+            vec![
+                Arc::new(StringArray::from(vec!["x".repeat(2 << 20)])),
+                Arc::new(Int32Array::from_iter_values(0..rows)),
+            ],
+        )
+        .unwrap();
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..rows)) as ArrayRef,
+            ),
+            ("u", Arc::new(u) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
     /// The types of times that Arrow has no arrays of: of microseconds or
     /// nanoseconds in 32 bits, of seconds or milliseconds in 64 bits.
     pub(crate) fn times_without_arrays() -> Vec<DataType> {
@@ -4172,6 +4218,49 @@ mod tests {
             let input = format!("{predicate} on {} batches", batches.len());
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 1, "{input}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+        // Rows of a dense union may point to the same value of a child, which
+        // Arrow copies for every row when it extracts the child (casting the
+        // union) or filters the union: the 32-bit offsets of 1200 copies of a
+        // string of 2 MiB overflow on the batch of `FilterExec`, but not those
+        // of 600 copies on the chunks of the native filter.
+        let batch = dense_union_of_a_large_string();
+        let schema = batch.schema();
+        let cast = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+            Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+                physical_expr("u", &schema),
+                DataType::Utf8,
+                None,
+            )),
+        )) as Arc<dyn PhysicalExpr>;
+        for predicate in [cast, physical_expr("id > 0", &schema)] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    FilterExec::try_new(
+                        Arc::clone(&predicate),
+                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                    )
+                    .unwrap(),
+                )
+            };
+            let filter_plan = plan();
+            let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let outcome = assert_same_outcome_in_datafusion(
+                plan(),
+                Arc::new(TaskContext::default()),
+            )
+            .await;
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_err_and(|error| error.to_lowercase().contains("overflow")),
+                "{predicate}: {outcome:?}"
+            );
         }
     }
 
