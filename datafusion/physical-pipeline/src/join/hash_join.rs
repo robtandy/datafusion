@@ -242,6 +242,30 @@ impl JoinSpec {
         }
         let num_keys = key_fields.len();
 
+        // The filter reads columns of the inputs, one per field of its
+        // intermediate batch.
+        if let Some(filter) = &filter {
+            let columns = filter.column_indices();
+            if columns.len() != filter.schema().fields().len() {
+                return plan_err!(
+                    "The filter of a PhysicalHashJoin reads {} columns, but its schema has {} fields",
+                    columns.len(),
+                    filter.schema().fields().len()
+                );
+            }
+            if let Some(column) = columns.iter().find(|column| match column.side {
+                JoinSide::Left => column.index >= build_schema.fields().len(),
+                JoinSide::Right => column.index >= probe_schema.fields().len(),
+                JoinSide::None => true,
+            }) {
+                return plan_err!(
+                    "The filter of a PhysicalHashJoin reads column {} of side {:?}, which its input does not have",
+                    column.index,
+                    column.side
+                );
+            }
+        }
+
         // The build columns the join needs: those it outputs and those its
         // filter reads.
         let mut needed = column_indices
@@ -3693,6 +3717,51 @@ mod tests {
         .unwrap();
         assert_eq!(inner.payload, vec![4]);
         assert!(inner.build_column(0).is_err());
+        // Filters must read columns that the inputs have.
+        let valid = join_filter("v", Operator::Eq, "v");
+        for (index, side) in [
+            (7, JoinSide::Left),
+            (7, JoinSide::Right),
+            (0, JoinSide::None),
+        ] {
+            let mut columns = valid.column_indices().to_vec();
+            columns[usize::from(side != JoinSide::Left)] = ColumnIndex { index, side };
+            let filter = JoinFilter::new(
+                Arc::clone(valid.expression()),
+                columns,
+                Arc::clone(valid.schema()),
+            );
+            let err = JoinSpec::try_new(
+                &build,
+                &probe,
+                on("lk", "rk"),
+                Some(filter),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap_err();
+            assert!(matches!(err, DataFusionError::Plan(_)), "{err}");
+        }
+        let missing_column = JoinFilter::new(
+            Arc::clone(valid.expression()),
+            valid.column_indices()[..1].to_vec(),
+            Arc::clone(valid.schema()),
+        );
+        assert!(
+            JoinSpec::try_new(
+                &build,
+                &probe,
+                on("lk", "rk"),
+                Some(missing_column),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .is_err()
+        );
         assert!(!inner.emits_final_build_rows() && !inner.emits_unmatched_build_rows());
     }
 }
