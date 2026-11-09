@@ -102,6 +102,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use parking_lot::Mutex;
@@ -823,13 +824,17 @@ fn analyze(
     Ok(Some((spec, rows)))
 }
 
-/// Whether the rows of `plan` are in an order that a sort established: it is
-/// a `SortExec` (with a fetch, which the window does not replace), or a
-/// `SortPreservingMergeExec` of such rows.
+/// Whether the rows of `plan` are in an order that sorts established: it is
+/// a `SortExec` (e.g. with a fetch, which the window does not replace), or a
+/// `SortPreservingMergeExec` or a `UnionExec` of such rows (DataFusion pushes
+/// sorts below unions).
 fn sorted_by_a_sort(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    match plan.downcast_ref::<SortPreservingMergeExec>() {
-        Some(merge) => sorted_by_a_sort(merge.input()),
-        None => plan.is::<SortExec>(),
+    if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
+        sorted_by_a_sort(merge.input())
+    } else if let Some(union) = plan.downcast_ref::<UnionExec>() {
+        !union.inputs().is_empty() && union.inputs().iter().all(sorted_by_a_sort)
+    } else {
+        plan.is::<SortExec>()
     }
 }
 
@@ -1904,6 +1909,10 @@ mod tests {
             "SELECT e, f, COUNT(*) AS n, ROW_NUMBER() OVER (PARTITION BY e ORDER BY f) AS rn FROM t1 GROUP BY e, f",
             "SELECT t1.id, t2.name, ROW_NUMBER() OVER (PARTITION BY t2.name ORDER BY t1.id, t2.w) AS rn FROM t1 JOIN t2 ON t1.a = t2.k",
             "SELECT k, w, SUM(w) OVER (PARTITION BY k ORDER BY w, name) AS s FROM t2 UNION ALL SELECT a, b, b + 1 FROM t1 WHERE id < 10",
+            // A window over a union, and computed sort keys.
+            "SELECT x, RANK() OVER (ORDER BY x) AS r FROM (SELECT id AS x FROM t1 UNION ALL SELECT CAST(k AS BIGINT) FROM t2)",
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY e ORDER BY a + b, id) AS rn FROM t1",
+            "SELECT id, LAG(id) OVER (ORDER BY b * 2 DESC, id) AS p FROM t1",
         ] {
             assert_windows(sql).await;
         }
@@ -2473,5 +2482,55 @@ mod tests {
         .await;
         assert_eq!(count::<PhysicalWindow>(&root), 1);
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dictionary_partition_keys() {
+        // Keys of 32 bits (narrower ones are left to DataFusion), with
+        // different dictionaries in the partitions of the table.
+        let setup = async |ctx: &SessionContext| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    "s",
+                    DataType::Dictionary(
+                        Box::new(DataType::Int32),
+                        Box::new(DataType::Utf8),
+                    ),
+                    true,
+                ),
+            ]));
+            let partitions = (0..3)
+                .map(|p| {
+                    let ids = Int64Array::from_iter_values((0..500).map(|i| p * 500 + i));
+                    let values = (0..500)
+                        .map(|i| {
+                            (i % 11 != 3).then(|| format!("value {}", (p * 7 + i) % 40))
+                        })
+                        .collect::<Vec<_>>();
+                    let strings = values
+                        .iter()
+                        .map(Option::as_deref)
+                        .collect::<arrow::array::DictionaryArray<
+                        arrow::datatypes::Int32Type,
+                    >>();
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(ids), Arc::new(strings)],
+                    )?;
+                    Ok(vec![batch])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ctx.register_table("dict", Arc::new(MemTable::try_new(schema, partitions)?))?;
+            Ok(())
+        };
+        for sql in [
+            "SELECT id, s, ROW_NUMBER() OVER (PARTITION BY s ORDER BY id) AS rn FROM dict",
+            "SELECT id, s, FIRST_VALUE(s) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS f FROM dict",
+        ] {
+            let root =
+                assert_native_parity_with_setup(sql, test_session_config(), setup).await;
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "query: {sql}");
+        }
     }
 }

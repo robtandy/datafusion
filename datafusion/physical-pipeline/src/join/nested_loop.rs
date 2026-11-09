@@ -2099,8 +2099,26 @@ mod tests {
             "SELECT t1.id, t2.k FROM t_empty t1 JOIN t2 ON t1.a < t2.k",
             "SELECT t1.id, t2.k FROM t_empty t1 RIGHT JOIN t2 ON t1.a < t2.k",
             "SELECT t1.id, t2.k FROM t1 LEFT JOIN t2 ON t1.a < t2.k AND t2.k > 1000 WHERE t1.id < 50",
+            // A union on the build side.
+            "SELECT t1.id, u.k FROM t1 JOIN (SELECT k FROM t2 UNION ALL SELECT a FROM t1 WHERE id < 5) u ON t1.a < u.k WHERE t1.id < 30",
         ] {
             assert_joins(sql, 1, 0).await;
+        }
+        // Several joins: those on the probe side of another one are left to
+        // DataFusion with that probe side.
+        for sql in [
+            "SELECT a.id, b.k, c.k FROM t1 a JOIN t2 b ON a.a < b.k JOIN t2 c ON b.w > c.w WHERE a.id < 4",
+            "SELECT a.k, b.k, c.k FROM t2 a CROSS JOIN t2 b CROSS JOIN t2 c WHERE a.w < -20 AND b.w < 0",
+        ] {
+            let root = assert_native_parity(sql).await;
+            let joins = count::<PhysicalNestedLoopJoin>(&root)
+                + count::<PhysicalCrossJoin>(&root);
+            assert!(
+                joins >= 1,
+                "query: {sql}
+lowered: {}",
+                format_operator_tree(&root)
+            );
         }
         for sql in [
             "SELECT a.k, b.k FROM t2 a CROSS JOIN t2 b WHERE a.w < 0",
