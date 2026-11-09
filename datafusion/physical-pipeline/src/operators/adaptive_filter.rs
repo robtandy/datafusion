@@ -60,16 +60,24 @@
 //!
 //! Functions are opaque, but for the built-in scalar functions of DataFusion
 //! whose implementations are known (e.g. `date_part`, `substr` or `abs`, see
-//! `BuiltinFunction`): they fail on the values of a row independently of
+//! `BuiltinFunction`) in the sessions that trust them (see
+//! [`TrustedFunctions`]): they fail on the values of a row independently of
 //! the other rows, if at all, and only build strings from the bytes of their
-//! arguments (see `function_fallibility`). They are identified by their names
-//! and by the types that implement them, so that a user-defined function
-//! that shadows one (e.g. Spark's `abs`) stays opaque.
+//! arguments (see `function_fallibility`). They are identified by the types
+//! that implement them, which the sessions register, so that a user-defined
+//! function that shadows one (e.g. Spark's `abs`) stays opaque.
+//!
+//! String constants are copied for every row of a batch by whoever evaluates
+//! them, so they overflow the 32-bit offsets of strings on batches of enough
+//! rows: constants of a few bytes are only evaluated natively if the plan
+//! bounds the rows of the batches of DataFusion (see
+//! [`depends_on_batches_with_rows`]).
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
 //! it is evaluated.
 
+use std::any::{Any, TypeId};
 use std::fmt::{self, Write as _};
 use std::ops::Range;
 use std::sync::Arc;
@@ -77,8 +85,9 @@ use std::time::Duration;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
+use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::tree_node::TreeNode;
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, config_err};
 use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
@@ -86,6 +95,8 @@ use datafusion_physical_expr::expressions::{
 };
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
+
+use crate::chunk::DEFAULT_VECTOR_SIZE;
 
 /// Number of chunks a thread evaluates in the order of the predicate, to
 /// collect statistics, before it reorders the conjuncts for the first time.
@@ -376,8 +387,9 @@ pub enum Fallibility {
 /// out of dictionaries, see `cast_fallibility`), arithmetic on integers and
 /// floating point numbers that wraps on overflow (DataFusion's default),
 /// divisions of numbers by a constant that is neither `0` nor `-1`, and the
-/// built-in functions that cannot fail on values (e.g. `date_part` or
-/// `strpos`, see `function_fallibility`) are infallible, if Arrow supports
+/// built-in functions that cannot fail on values, in the sessions that trust
+/// them (e.g. `date_part` or `strpos`, see `function_fallibility` and
+/// [`TrustedFunctions`]) are infallible, if Arrow supports
 /// the types of their operands: they fail uniformly otherwise (e.g. `NOT` of
 /// an integer, or a comparison of dictionaries of dictionaries, see
 /// `fails_on_operand_types`). `LIKE` and regular expressions with a constant
@@ -387,12 +399,25 @@ pub enum Fallibility {
 /// uniformly otherwise (see `constant_pattern_fallibility` for
 /// case-insensitive `LIKE`s). Everything else, other functions, decimal
 /// arithmetic (which fails on overflows) and `CASE` included, may fail on
-/// some rows.
+/// some rows, as may the built-in functions that copy string or binary
+/// constants for every row of the batch (e.g. `strpos(s, 'x')`, see
+/// `function_fallibility`), which overflow on batches of enough rows.
 pub fn fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
+    fallibility_with(expr, schema, 0)
+}
+
+/// How evaluating `expr` can fail (see [`fallibility`]), if it may copy
+/// string and binary constants of at most `bytes` bytes for every row of the
+/// batches it is evaluated on (see `constant_bytes`).
+fn fallibility_with(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> Fallibility {
     expr.children()
         .into_iter()
-        .map(|child| fallibility(child, schema))
-        .fold(node_fallibility(expr, schema), Ord::max)
+        .map(|child| fallibility_with(child, schema, bytes))
+        .fold(node_fallibility(expr, schema, bytes), Ord::max)
 }
 
 /// Whether evaluating `expr` (on `schema`) can never fail, whatever the
@@ -401,9 +426,15 @@ pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     fallibility(expr, schema) == Fallibility::Infallible
 }
 
-/// How `expr` itself (not its children) can fail.
-fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
-    match value_fallibility(expr, schema) {
+/// How `expr` itself (not its children) can fail, if it may copy string and
+/// binary constants of at most `bytes` bytes for every row of the batches it is
+/// evaluated on (see [`depends_on_batches_with_rows`]).
+fn node_fallibility(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> Fallibility {
+    match value_fallibility(expr, schema, bytes) {
         // An expression that cannot fail on the values of its operands may
         // fail on their types, whatever the values (e.g. `NOT` of an integer,
         // a comparison of dictionaries of dictionaries, or a cast of booleans
@@ -413,7 +444,8 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
         }
         // Or on the number of rows it is evaluated on together.
         Fallibility::Infallible
-            if expands_values(expr, schema) || builds_byte_offsets(expr, schema) =>
+            if expands_values(expr, schema, bytes)
+                || builds_byte_offsets(expr, schema, bytes) =>
         {
             Fallibility::PerRow
         }
@@ -422,8 +454,12 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
 }
 
 /// How `expr` itself can fail on the values of its operands, if Arrow
-/// supports their types.
-fn value_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
+/// supports their types (and copies constants of at most `bytes` bytes).
+fn value_fallibility(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> Fallibility {
     use Fallibility::*;
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         use Operator::*;
@@ -456,7 +492,7 @@ fn value_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibili
         return cast_fallibility(cast, schema);
     }
     if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        return function_fallibility(function, schema).unwrap_or(PerRow);
+        return function_fallibility(function, schema, bytes).unwrap_or(PerRow);
     }
     if expr.is::<Column>()
         || expr.is::<Literal>()
@@ -636,14 +672,16 @@ fn decimal_parts(data_type: &DataType) -> Option<(u8, u8, i8)> {
 
 /// The built-in scalar functions of DataFusion (of `datafusion-functions`)
 /// whose implementations the classification knows (see
-/// [`function_fallibility`]).
+/// [`function_fallibility`]), in the sessions that trust them (see
+/// [`TrustedFunctions`]).
 ///
-/// They are identified by their names and by the names of the types that
-/// implement them (see [`implementation_name`]): a user-defined function may
-/// shadow a built-in one under its name, e.g. the `abs` of `datafusion-spark`
-/// (`SparkAbs`), which fails on overflows in ANSI mode, and stays opaque.
-/// (This crate does not depend on `datafusion-functions`, whose types would
-/// identify them.)
+/// A function is one of them only if it is implemented by the very type of a
+/// built-in function that the session that planned it trusts: a user-defined
+/// function may shadow a built-in one under its name, e.g. the `abs` of
+/// `datafusion-spark` (`SparkAbs`), which fails on overflows in ANSI mode, also
+/// with a type of the same name (but of another crate), and stays opaque.
+/// (This crate does not depend on `datafusion-functions`, so it cannot name
+/// their types: the sessions register them.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinFunction {
     Abs,
@@ -711,12 +749,27 @@ impl BuiltinFunction {
         (Self::Upper, "upper", "UpperFunc"),
     ];
 
-    /// The built-in function that `function` calls, if it is one of them.
+    /// The built-in function that `function` calls, if the session that
+    /// planned it (whose configuration it holds) trusts the type that
+    /// implements it (see [`TrustedFunctions`]).
     fn of(function: &ScalarFunctionExpr) -> Option<Self> {
         let udf = function.fun();
-        let &(builtin, _, implementation) =
-            Self::ALL.iter().find(|(_, name, _)| *name == udf.name())?;
-        (implementation_name(udf) == implementation).then_some(builtin)
+        let &(builtin, ..) = Self::ALL.iter().find(|(_, name, _)| *name == udf.name())?;
+        let trusted = function
+            .config_options()
+            .extensions
+            .get::<TrustedFunctions>()?;
+        trusted
+            .trusts(builtin, implementation_type(udf))
+            .then_some(builtin)
+    }
+
+    /// The name of the function.
+    fn name(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(builtin, ..)| *builtin == self)
+            .map_or("", |(_, name, _)| name)
     }
 
     /// Whether every value of the function is (a part of) the value of its
@@ -729,11 +782,44 @@ impl BuiltinFunction {
             Self::Substr | Self::BTrim | Self::LTrim | Self::RTrim | Self::NullIf
         )
     }
+
+    /// Whether argument `index` of a call with `args` is a parameter that the
+    /// function reads as a scalar if it is a constant, and neither copies for
+    /// every row of the batch nor returns, so that it may have any number of
+    /// bytes (see `function_fallibility`): the part of `date_part` and the
+    /// granularity of `date_trunc` (which must be scalars), the formats of
+    /// `to_timestamp`, the characters to trim (see `Hint::AcceptsSingular`),
+    /// the second argument of `nullif`, the arguments of `starts_with` and
+    /// `ends_with` (which make arrays of a single row of scalars), and the
+    /// pattern and the flags of `regexp_like` if both are constants. Not, e.g.,
+    /// the substring that `strpos` searches, which it copies for every row of
+    /// the batch (see `make_scalar_function`).
+    fn is_parameter(self, index: usize, args: &[Arc<dyn PhysicalExpr>]) -> bool {
+        match self {
+            Self::DatePart | Self::DateTrunc => index == 0,
+            Self::ToTimestamp
+            | Self::BTrim
+            | Self::LTrim
+            | Self::RTrim
+            | Self::NullIf => index > 0,
+            Self::StartsWith | Self::EndsWith => true,
+            Self::RegexpLike => index > 0 && args[1..].iter().all(is_constant),
+            _ => false,
+        }
+    }
+}
+
+/// The type that implements `udf`.
+fn implementation_type(udf: &ScalarUDF) -> TypeId {
+    let implementation: &dyn Any = udf.inner().as_ref();
+    implementation.type_id()
 }
 
 /// The name of the type that implements `udf`, which its `Debug` output
 /// starts with (the built-in functions of DataFusion derive `Debug`), e.g.
-/// `UpperFunc`.
+/// `UpperFunc`: [`TrustedFunctions::new`] only trusts functions implemented
+/// by types of the names of the built-in ones (it does not identify them, see
+/// [`BuiltinFunction::of`]).
 fn implementation_name(udf: &ScalarUDF) -> String {
     /// Collects the identifier that the output written to it starts with, and
     /// stops the formatting at the first other character.
@@ -759,6 +845,112 @@ fn implementation_name(udf: &ScalarUDF) -> String {
     name.0
 }
 
+/// The built-in scalar functions of DataFusion whose implementations a
+/// session trusts the native operators to know: a configuration extension of
+/// the session (see `BuiltinFunction` for the functions that they know).
+///
+/// The classification knows the built-in functions by the types that
+/// implement them, which this crate cannot name (it does not depend on
+/// `datafusion-functions`), so a session registers the built-in functions
+/// that it plans with: they are known in the plans of the session, and in no
+/// other (where every function is opaque, see [`depends_on_batches`]). Their
+/// calls hold the configuration of the session that planned them.
+///
+/// ```
+/// use datafusion::prelude::{SessionConfig, SessionContext};
+/// use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
+///
+/// // The built-in functions of DataFusion, which a session registers by default.
+/// let functions = datafusion::functions::all_default_functions();
+/// let trusted = TrustedFunctions::new(&functions);
+/// assert!(trusted.names().contains(&"date_part"));
+/// let config = SessionConfig::new().with_option_extension(trusted);
+/// let ctx = SessionContext::new_with_config(config);
+/// ```
+///
+/// A call is known only if its function is implemented by the type of a
+/// trusted function of its name: a user-defined function that shadows a
+/// built-in one under its name stays opaque, also if its type has the name of
+/// the built-in one. [`Self::new`] only trusts functions of the names, and
+/// implemented by types of the names, of the built-in ones (so that a
+/// session whose registry has, e.g., Spark's `abs`, of `SparkAbs`, does not
+/// trust it): the caller vouches that they are DataFusion's.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedFunctions {
+    /// The trusted functions, and the types that implement them.
+    implementations: Vec<(BuiltinFunction, TypeId)>,
+}
+
+impl TrustedFunctions {
+    /// Trust `functions`, the built-in scalar functions of DataFusion (e.g.
+    /// `datafusion::functions::all_default_functions()`): those that the
+    /// classification knows, and whose types have the names of the types of
+    /// DataFusion that implement them.
+    pub fn new(functions: &[Arc<ScalarUDF>]) -> Self {
+        let mut implementations: Vec<(BuiltinFunction, TypeId)> = vec![];
+        for function in functions {
+            let Some(&(builtin, _, type_name)) = BuiltinFunction::ALL
+                .iter()
+                .find(|(_, name, _)| *name == function.name())
+            else {
+                continue;
+            };
+            let implementation = (builtin, implementation_type(function));
+            if implementation_name(function) == type_name
+                && !implementations.contains(&implementation)
+            {
+                implementations.push(implementation);
+            }
+        }
+        Self { implementations }
+    }
+
+    /// The names of the trusted functions.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.implementations
+            .iter()
+            .map(|(builtin, _)| builtin.name())
+            .collect()
+    }
+
+    /// Whether `function`, implemented by `implementation`, is trusted.
+    fn trusts(&self, function: BuiltinFunction, implementation: TypeId) -> bool {
+        self.implementations.contains(&(function, implementation))
+    }
+}
+
+impl ExtensionOptions for TrustedFunctions {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, key: &str, _value: &str) -> Result<()> {
+        config_err!(
+            "{key} cannot be set: functions are trusted with `TrustedFunctions::new`"
+        )
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        vec![ConfigEntry {
+            key: format!("{}.functions", Self::PREFIX),
+            value: Some(self.names().join(",")),
+            description: "The built-in scalar functions whose implementations the native operators of the pipeline engine know",
+        }]
+    }
+}
+
+impl ConfigExtension for TrustedFunctions {
+    const PREFIX: &'static str = "pipeline_trusted_functions";
+}
+
 /// How a call of a built-in function that the classification knows (see
 /// [`BuiltinFunction`]) can fail on the values of its arguments, if
 /// DataFusion supports their types (see [`fails_on_operand_types`]), or
@@ -770,9 +962,17 @@ fn implementation_name(udf: &ScalarUDF) -> String {
 ///   they are called on, also those that no row references, or decode them
 ///   (e.g. `substr` decides per batch whether it decodes a dictionary), so
 ///   their errors and the sizes of what they build depend on the batches;
+/// * or may evaluate to scalars on some batches and to arrays on others (see
+///   [`may_change_shape`], e.g. a `CASE` returns the value of a branch as is
+///   if all rows take it): functions evaluate scalars and arrays differently,
+///   e.g. `regexp_like` compiles a scalar pattern even if all strings are
+///   null, but the patterns of an array only for strings that are not null,
+///   and `to_timestamp` of a scalar string fails with an array of formats;
 /// * or are constants that they may copy for every row of the batch (e.g.
 ///   `make_scalar_function` pads scalar arguments to the rows of the batch),
-///   see [`is_broadcast_constant`];
+///   see [`is_broadcast_constant`], but for parameters that they read as
+///   scalars (e.g. the part of `date_part`, see
+///   `BuiltinFunction::is_parameter`);
 /// * or, for some of them, are not constants, see below.
 ///
 /// The known functions compute the value of a row from the values of its
@@ -809,6 +1009,7 @@ fn implementation_name(udf: &ScalarUDF) -> String {
 fn function_fallibility(
     function: &ScalarFunctionExpr,
     schema: &Schema,
+    bytes: usize,
 ) -> Option<Fallibility> {
     use BuiltinFunction::*;
     use Fallibility::*;
@@ -820,7 +1021,11 @@ fn function_fallibility(
         .collect::<Result<Vec<_>>>()
         .ok()?;
     if !types.iter().all(is_flat)
-        || args.iter().any(|arg| is_broadcast_constant(arg, schema))
+        || args.iter().any(may_change_shape)
+        || args.iter().enumerate().any(|(index, arg)| {
+            !builtin.is_parameter(index, args)
+                && is_broadcast_constant(arg, schema, bytes)
+        })
     {
         return None;
     }
@@ -1107,13 +1312,15 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   whether it fails depends on the number of rows of the batches;
 /// * a part of `expr` other than a column copies values that its operands
 ///   share between rows (the values of dictionaries and of runs, and what
-///   views point to), or a constant (that is not null, nor a string or
-///   binary of at most [`MAX_CONSTANT_BYTES`] bytes, see
-///   `has_bounded_bytes`), into strings or binaries with 32-bit offsets (at
-///   any depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a single
-///   string of 2 MiB, which 1024 rows, but not 1023, overflow, without taking
-///   more memory than one row, and `CASE WHEN x THEN '…' END` copies a
-///   constant of 2 MiB for every row with `x`;
+///   views point to), or a constant (that is not null, nor an empty string or
+///   binary, nor, if the batches are known to have few enough rows, a string
+///   or binary of at most [`MAX_CONSTANT_BYTES`] bytes, see
+///   [`depends_on_batches_with_rows`]), into strings or binaries with 32-bit
+///   offsets (at any depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a
+///   single string of 2 MiB, which 1024 rows, but not 1023, overflow, without
+///   taking more memory than one row, `CASE WHEN x THEN '…' END` copies a
+///   constant of 2 MiB for every row with `x`, and a constant of 1 KiB
+///   overflows on a batch of 2^21 rows;
 /// * `expr` is such a constant (e.g. a string that a projection outputs),
 ///   which whoever evaluates it copies for every row of the batch;
 /// * a part of `expr` other than a column builds strings or binaries with
@@ -1122,7 +1329,8 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   not on a chunk of a quarter of its rows (but for casts into the type of
 ///   their operand, functions that return parts of the values of their first
 ///   argument, e.g. `substr`, and `CASE` expressions whose values come from a
-///   single column of their type, or are all bounded constants, e.g.
+///   single column of their type, or are all constants that the batches can
+///   hold for each of their rows, see [`depends_on_batches_with_rows`], e.g.
 ///   `CASE WHEN x THEN '1-URGENT' ELSE '2-HIGH' END`);
 /// * a part of `expr` negates an operand that may evaluate to a scalar on some
 ///   batches and to an array on others (e.g. a `CASE`, which returns the
@@ -1157,14 +1365,34 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if must_not_be_evaluated(expr) || failures(expr, schema).order_matters() {
+    depends_on_batches_with_rows(expr, schema, None)
+}
+
+/// Whether the errors of `expr` (on `schema`) may depend on how its input
+/// rows are split into batches, empty batches included (see
+/// [`depends_on_batches`]), knowing that DataFusion evaluates `expr` on
+/// batches of at most `max_rows` rows (if known): then string and binary
+/// constants of at most [`MAX_CONSTANT_BYTES`] bytes, of which these batches
+/// (and the chunks of the native operators) can hold a copy for each of their
+/// rows, do not depend on the batches. Otherwise, only null and empty ones do
+/// not, but for the parameters of functions that they do not copy (e.g. the
+/// part of `date_part`, see `function_fallibility`): e.g. a constant of 1 KiB
+/// overflows the 32-bit offsets of strings on a batch of 2^21 rows, which a
+/// batch without columns has without memory.
+pub fn depends_on_batches_with_rows(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    max_rows: Option<usize>,
+) -> bool {
+    let bytes = constant_bytes(max_rows);
+    if must_not_be_evaluated(expr) || failures_with(expr, schema, bytes).order_matters() {
         return true;
     }
-    let (fallibility, depends_on_batches) = analyze(expr, schema);
+    let (fallibility, depends_on_batches) = analyze(expr, schema, bytes);
     depends_on_batches
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
         // Whoever evaluates it copies it for every row of the batch.
-        || is_broadcast_constant(expr, schema)
+        || is_broadcast_constant(expr, schema, bytes)
 }
 
 /// Whether `expr` must not be evaluated before the execution (to classify
@@ -1274,10 +1502,31 @@ impl Failures {
 /// on all rows of a batch before the next one, while a pipeline evaluates each
 /// part on a chunk. A `CASE` does not fail itself, but its branches may.
 pub fn failures(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Failures {
+    failures_with(expr, schema, 0)
+}
+
+/// The parts of `expr` that may fail (see [`failures`]), knowing that
+/// DataFusion evaluates `expr` on batches of at most `max_rows` rows (if
+/// known, see [`depends_on_batches_with_rows`]).
+pub fn failures_with_rows(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    max_rows: Option<usize>,
+) -> Failures {
+    failures_with(expr, schema, constant_bytes(max_rows))
+}
+
+/// The parts of `expr` that may fail, if it may copy constants of at most
+/// `bytes` bytes for every row.
+fn failures_with(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> Failures {
     let itself = if expr.is::<CaseExpr>() {
         Failures::NONE
     } else {
-        match node_fallibility(expr, schema) {
+        match node_fallibility(expr, schema, bytes) {
             Fallibility::Infallible => Failures::NONE,
             Fallibility::PerRow if fails_only_on_overflows(expr, schema) => {
                 Failures::OVERFLOW
@@ -1287,7 +1536,7 @@ pub fn failures(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Failures {
     };
     expr.children()
         .into_iter()
-        .map(|child| failures(child, schema))
+        .map(|child| failures_with(child, schema, bytes))
         .fold(itself, Failures::and)
 }
 
@@ -1338,12 +1587,16 @@ fn fails_only_on_overflows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
 /// The fallibility of `expr` (see [`fallibility`]), and whether its errors
 /// depend on the batches it is evaluated on, but for failures on empty
 /// batches (see [`depends_on_batches`]). Each node is classified once.
-fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool) {
-    let node = node_fallibility(expr, schema);
+fn analyze(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> (Fallibility, bool) {
+    let node = node_fallibility(expr, schema, bytes);
     let children = expr.children();
     let analyzed = children
         .iter()
-        .map(|child| analyze(child, schema))
+        .map(|child| analyze(child, schema, bytes))
         .collect::<Vec<_>>();
     let fallibility = analyzed
         .iter()
@@ -1375,13 +1628,13 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
         // It copies values that its operands share between rows, or a
         // constant, into arrays whose 32-bit offsets overflow beyond 2 GiB of
         // bytes, or builds such arrays from more bytes than an operand has.
-        || expands_values(expr, schema)
-        || builds_byte_offsets(expr, schema)
+        || expands_values(expr, schema, bytes)
+        || builds_byte_offsets(expr, schema, bytes)
         // It is opaque (e.g. a function): whatever it returns, its
         // implementation may fail depending on the rows it is evaluated on
         // together (e.g. on the size of the values it builds, which
         // DataFusion may limit per batch, or which overflow their offsets).
-        || is_opaque(expr, schema)
+        || is_opaque(expr, schema, bytes)
         // `-` negates a scalar with overflow checks, but an array wrapping
         // (see `NegativeExpr`): of an operand that may be a scalar on some
         // batches and an array on others, whether it fails depends on them.
@@ -1420,9 +1673,9 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
 /// [`function_fallibility`]), which apply Arrow's kernels to their operands,
 /// e.g. another function, whose implementation it cannot know (e.g. a
 /// function that returns integers may build strings to compute them).
-fn is_opaque(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+fn is_opaque(expr: &Arc<dyn PhysicalExpr>, schema: &Schema, bytes: usize) -> bool {
     if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        return function_fallibility(function, schema).is_none();
+        return function_fallibility(function, schema, bytes).is_none();
     }
     !(expr.is::<Column>()
         || expr.is::<Literal>()
@@ -1623,7 +1876,7 @@ fn can_build_nulls(data_type: &DataType, len: usize) -> bool {
 /// 2 MiB, copied for 1024 rows), which the input reaches with more rows, but
 /// not more memory: whether it fails depends on how many rows it is evaluated
 /// on together.
-fn expands_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+fn expands_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema, bytes: usize) -> bool {
     if expr.is::<Column>() {
         return false;
     }
@@ -1634,7 +1887,7 @@ fn expands_values(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     let reads_values = !expr.is::<IsNullExpr>() && !expr.is::<IsNotNullExpr>();
     expr.children().iter().any(|child| {
         if is_constant_tree(child) {
-            into_byte_offsets && is_broadcast_constant(child, schema)
+            into_byte_offsets && is_broadcast_constant(child, schema, bytes)
         } else {
             child.data_type(schema).is_ok_and(|data_type| {
                 (into_byte_offsets && shares_values(&data_type))
@@ -1687,12 +1940,16 @@ pub(crate) fn has_32_bit_offsets(data_type: &DataType) -> bool {
 /// Whether `expr` is a constant (see `is_constant_tree`) whose value may have
 /// more bytes with 32-bit offsets (see [`contains_byte_offsets`]) than
 /// whoever evaluates it may copy for every row of a batch: not a literal
-/// null, nor a string or binary of at most [`MAX_CONSTANT_BYTES`] bytes (see
+/// null, nor a string or binary of at most `bytes` bytes (see
 /// `has_bounded_bytes`). E.g. `ProjectionExec` outputs it as a column, and
 /// `CASE WHEN x THEN '…' END` copies it for every row with `x`.
-fn is_broadcast_constant(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+fn is_broadcast_constant(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> bool {
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        return !has_bounded_bytes(expr)
+        return !has_bounded_bytes(expr, bytes)
             && contains_byte_offsets(&literal.value().data_type());
     }
     is_constant_tree(expr)
@@ -1702,31 +1959,46 @@ fn is_broadcast_constant(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool 
 }
 
 /// The most bytes of a string or binary constant with 32-bit offsets that
-/// the native operators evaluate, although it may be copied for every row
-/// (see `has_bounded_bytes`): 1 KiB, far more than the constants of
-/// analytical queries (e.g. `'1-URGENT'`), of which a chunk of 2048 rows
-/// holds at most 2 MiB.
+/// the native operators evaluate although it may be copied for every row of a
+/// batch: 1 KiB, far more than the constants of analytical queries (e.g.
+/// `'1-URGENT'`), of which a chunk of 2048 rows holds at most 2 MiB.
 ///
-/// Copied for every row of a batch of DataFusion, such a constant overflows
-/// the 32-bit offsets of strings (2 GiB) only on a batch of more than 2^21
-/// rows, 256 times DataFusion's default batch size (8192 rows, which hold at
-/// most 8 MiB of the constant), which its batches are assumed not to reach
-/// (unlike larger constants: a string of 2 MiB overflows on 1024 rows).
+/// Copied for every row of a batch, a constant overflows the 32-bit offsets of
+/// strings (2 GiB) on batches of enough rows, e.g. a constant of 1 KiB on a
+/// batch of 2^21 rows (which a batch without columns has without memory), but
+/// not on the chunks of a pipeline. So the native operators only evaluate
+/// such constants (but null or empty ones) if the plan bounds the rows of the
+/// batches of DataFusion, and only as many bytes as these batches hold for
+/// each of their rows (see `constant_bytes` and
+/// [`depends_on_batches_with_rows`]).
 pub const MAX_CONSTANT_BYTES: usize = 1024;
 
+/// The most bytes of a string or binary constant that an expression may copy
+/// for every row of batches of at most `max_rows` rows without depending on
+/// them (see [`depends_on_batches_with_rows`]): none if `max_rows` is not
+/// known, otherwise at most [`MAX_CONSTANT_BYTES`], and few enough for the
+/// 32-bit offsets of strings (`i32::MAX` bytes) of `max_rows` copies, and of
+/// the copies for the rows of a chunk (at most [`DEFAULT_VECTOR_SIZE`] rows).
+fn constant_bytes(max_rows: Option<usize>) -> usize {
+    max_rows.map_or(0, |rows| {
+        let rows = rows.max(DEFAULT_VECTOR_SIZE);
+        (i32::MAX as usize / rows).min(MAX_CONSTANT_BYTES)
+    })
+}
+
 /// Whether `expr` is a literal of bounded size: a null, or a string or binary
-/// of at most [`MAX_CONSTANT_BYTES`] bytes, which a batch can hold for each of
-/// its rows (but for batches of millions of rows, see `MAX_CONSTANT_BYTES`),
-/// so that copying it for every row does not depend on the batches.
-fn has_bounded_bytes(expr: &Arc<dyn PhysicalExpr>) -> bool {
+/// of at most `bytes` bytes (see `constant_bytes`), which the batches it is
+/// evaluated on can hold for each of their rows, so that copying it for every
+/// row does not depend on the batches.
+fn has_bounded_bytes(expr: &Arc<dyn PhysicalExpr>, bytes: usize) -> bool {
     expr.downcast_ref::<Literal>()
         .is_some_and(|literal| match literal.value() {
-            ScalarValue::Utf8(value) => value
-                .as_deref()
-                .is_none_or(|value| value.len() <= MAX_CONSTANT_BYTES),
-            ScalarValue::Binary(value) => value
-                .as_deref()
-                .is_none_or(|value| value.len() <= MAX_CONSTANT_BYTES),
+            ScalarValue::Utf8(value) => {
+                value.as_deref().is_none_or(|value| value.len() <= bytes)
+            }
+            ScalarValue::Binary(value) => {
+                value.as_deref().is_none_or(|value| value.len() <= bytes)
+            }
             value => value.is_null(),
         })
 }
@@ -1752,11 +2024,14 @@ fn has_no_bytes(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// a built-in function that returns parts of the values of its first argument
 /// (of its type, e.g. `substr`, see `BuiltinFunction::selects_bytes`), nor a
 /// `CASE` whose values are, but for literals without bytes, those of a single
-/// column of its type, which it selects for each row, or literals of bounded
-/// sizes (see `has_bounded_bytes`), of which it builds at most
-/// [`MAX_CONSTANT_BYTES`] per row, e.g.
-/// `CASE WHEN x THEN '1-URGENT' ELSE '2-HIGH' END`.
-fn builds_byte_offsets(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+/// column of its type, which it selects for each row, or literals of at most
+/// `bytes` bytes (see `has_bounded_bytes`), of which it builds at most `bytes`
+/// per row, e.g. `CASE WHEN x THEN '1-URGENT' ELSE '2-HIGH' END`.
+fn builds_byte_offsets(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+    bytes: usize,
+) -> bool {
     if expr.is::<Column>() || expr.is::<Literal>() {
         return false;
     }
@@ -1788,7 +2063,7 @@ fn builds_byte_offsets(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
             .map(|(_, then)| then)
             .chain(case.else_expr())
             .collect::<Vec<_>>();
-        if values.iter().all(|value| has_bounded_bytes(value)) {
+        if values.iter().all(|value| has_bounded_bytes(value, bytes)) {
             return false;
         }
         let mut values = values.into_iter().filter(|value| !has_no_bytes(value));
@@ -1892,7 +2167,24 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, SchemaRef};
 
-    use crate::operators::filter::test_support::{dynamic_filter, physical_expr};
+    use crate::operators::filter::test_support::{
+        dynamic_filter, physical_expr, physical_expr_in, trusting,
+    };
+
+    /// The most rows of the batches of DataFusion in the tests that know them
+    /// (DataFusion's default batch size), which hold a constant of
+    /// `MAX_CONSTANT_BYTES` bytes for each of their rows.
+    const ROWS: Option<usize> = Some(8192);
+
+    /// Whether the errors of `expr` depend on batches of at most `ROWS` rows.
+    fn depends(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+        depends_on_batches_with_rows(expr, schema, ROWS)
+    }
+
+    /// How `expr` can fail on batches of at most `ROWS` rows.
+    fn fallibility_on_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
+        fallibility_with(expr, schema, constant_bytes(ROWS))
+    }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2333,8 +2625,13 @@ mod tests {
             ("a > 0 AND b > 0", false),
         ] {
             let expr = physical_expr(predicate, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), expected, "{predicate}");
+            assert_eq!(depends(&expr, &schema), expected, "{predicate}");
         }
+        // On batches of unknown sizes, `strpos` copies the substring it
+        // searches for every row of a batch, which may overflow (see
+        // `constants_need_batches_of_known_sizes`).
+        let expr = physical_expr("a > 0 AND strpos(u, 'x') > 1", &schema);
+        assert!(depends_on_batches(&expr, &schema));
     }
 
     #[test]
@@ -2721,7 +3018,9 @@ mod tests {
         }
 
         // Constants of more than `MAX_CONSTANT_BYTES` bytes, which are copied
-        // for every row.
+        // for every row, on batches of at most `ROWS` rows, and constants of
+        // any bytes on batches of unknown sizes (see
+        // `constants_need_batches_of_known_sizes`).
         let constant = |value: ScalarValue| -> Arc<dyn PhysicalExpr> {
             Arc::new(Literal::new(value))
         };
@@ -2738,38 +3037,52 @@ mod tests {
         let string = |value: &str| ScalarValue::Utf8(Some(value.to_string()));
         let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
         let bounded = "x".repeat(MAX_CONSTANT_BYTES);
-        for (expr, depends) in [
-            (case(string(&large)), true),
+        for (expr, expected) in [
+            (case(string(&large)), (true, true)),
             (
                 case(ScalarValue::Binary(Some(vec![1; MAX_CONSTANT_BYTES + 1]))),
-                true,
+                (true, true),
             ),
-            (constant(string(&large)), true),
+            (constant(string(&large)), (true, true)),
             (
                 Arc::new(IsNullExpr::new(case(string(&large)))) as Arc<dyn PhysicalExpr>,
-                true,
+                (true, true),
             ),
-            // Unless they are null or of bounded sizes (which a batch holds for
-            // each of its rows), with 64-bit offsets or views, or compared.
-            (case(string("abc")), false),
-            (case(string(&bounded)), false),
-            (case(ScalarValue::Binary(Some(vec![1]))), false),
-            (constant(string("abc")), false),
-            (constant(string(&bounded)), false),
+            // Unless they are of bounded sizes (which a batch of at most `ROWS`
+            // rows holds for each of its rows).
+            (case(string("abc")), (false, true)),
+            (case(string(&bounded)), (false, true)),
+            (case(ScalarValue::Binary(Some(vec![1]))), (false, true)),
+            (constant(string("abc")), (false, true)),
+            (constant(string(&bounded)), (false, true)),
             (
                 Arc::new(IsNullExpr::new(case(string("abc")))) as Arc<dyn PhysicalExpr>,
-                false,
+                (false, true),
             ),
-            (case(string("")), false),
-            (case(ScalarValue::Utf8(None)), false),
-            (constant(string("")), false),
-            (case(ScalarValue::LargeUtf8(Some(large.clone()))), false),
-            (case(ScalarValue::Utf8View(Some(large.clone()))), false),
-            (case(ScalarValue::Int64(Some(1))), false),
-            (physical_expr("s = 'abc'", &schema), false),
-            (physical_expr(&format!("s = '{large}'"), &schema), false),
+            // Or null or empty, with 64-bit offsets or views, or compared.
+            (case(string("")), (false, false)),
+            (case(ScalarValue::Utf8(None)), (false, false)),
+            (constant(string("")), (false, false)),
+            (
+                case(ScalarValue::LargeUtf8(Some(large.clone()))),
+                (false, false),
+            ),
+            (
+                case(ScalarValue::Utf8View(Some(large.clone()))),
+                (false, false),
+            ),
+            (case(ScalarValue::Int64(Some(1))), (false, false)),
+            (physical_expr("s = 'abc'", &schema), (false, false)),
+            (
+                physical_expr(&format!("s = '{large}'"), &schema),
+                (false, false),
+            ),
         ] {
-            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+            assert_eq!(
+                (depends(&expr, &schema), depends_on_batches(&expr, &schema)),
+                expected,
+                "{expr}"
+            );
         }
     }
 
@@ -3219,7 +3532,7 @@ mod tests {
         use Fallibility::*;
         let schema = tpch_schema();
         let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
-        for (expr, expected, depends) in [
+        for (expr, expected, depends_on) in [
             // Infallible built-in functions (but for the types and the
             // constant arguments they do not support).
             (
@@ -3295,10 +3608,31 @@ mod tests {
             ("btrim(s, s)".to_owned(), PerRow, true),
             (format!("strpos(s, '{large}')"), PerRow, true),
             (format!("strpos(s, '{}')", &large[1..]), Infallible, false),
+            // Nor of arguments that may be scalars on some batches and arrays
+            // on others, which they evaluate differently (`to_timestamp` of a
+            // scalar fails with an array of formats).
+            (
+                "to_timestamp(CASE WHEN n > 0 THEN '2020-01-01' END, s)".to_owned(),
+                PerRow,
+                true,
+            ),
+            (
+                "regexp_like(s, CASE WHEN n > 0 THEN '[' ELSE 'a' END)".to_owned(),
+                PerRow,
+                true,
+            ),
+            (
+                "regexp_like(s, 'a', CASE WHEN n > 0 THEN 'i' END)".to_owned(),
+                PerRow,
+                true,
+            ),
+            ("abs(CASE WHEN n > 0 THEN x END)".to_owned(), PerRow, true),
+            // But calls of functions of columns are arrays.
+            ("abs(abs(x))".to_owned(), Infallible, false),
         ] {
             let expr = physical_expr(&expr, &schema);
-            assert_eq!(fallibility(&expr, &schema), expected, "{expr}");
-            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+            assert_eq!(fallibility_on_rows(&expr, &schema), expected, "{expr}");
+            assert_eq!(depends(&expr, &schema), depends_on, "{expr}");
         }
         // After other conjuncts, those that may fail on some rows depend on
         // the batches, the others do not.
@@ -3353,82 +3687,202 @@ mod tests {
         }
     }
 
+    /// A user-defined function named `abs`, which shadows the built-in one,
+    /// and whose type has the name of the type of the built-in one.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct AbsFunc {
+        signature: datafusion_expr::Signature,
+    }
+
+    impl datafusion_expr::ScalarUDFImpl for AbsFunc {
+        fn name(&self) -> &str {
+            "abs"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+            Ok(arg_types[0].clone())
+        }
+
+        fn invoke_with_args(
+            &self,
+            args: datafusion_expr::ScalarFunctionArgs,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            Ok(args.args[0].clone())
+        }
+    }
+
     #[test]
     fn builtin_functions_are_identified_by_their_implementations() {
+        use datafusion_common::config::ConfigOptions;
         // Every known function is the built-in function of its name, which a
-        // session registers by default.
+        // session registers by default, in the sessions that trust it.
         let ctx = datafusion::prelude::SessionContext::new();
+        let trusted =
+            TrustedFunctions::new(&datafusion::functions::all_default_functions());
+        assert_eq!(trusted.names().len(), BuiltinFunction::ALL.len());
+        let mut trusting_options = ConfigOptions::default();
+        trusting_options.extensions.insert(trusted);
+        let trusting_options = Arc::new(trusting_options);
         for (builtin, name, implementation) in BuiltinFunction::ALL {
             let udf = datafusion::execution::FunctionRegistry::udf(&ctx, name)
                 .unwrap_or_else(|_| panic!("no built-in function {name}"));
             assert_eq!(udf.name(), name);
+            assert_eq!(builtin.name(), name);
             assert_eq!(implementation_name(&udf), implementation, "{name}");
-            let call = ScalarFunctionExpr::new(
-                name,
-                Arc::clone(&udf),
-                vec![],
-                Arc::new(Field::new(name, DataType::Int64, true)),
-                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            let call = |options: &Arc<ConfigOptions>| {
+                ScalarFunctionExpr::new(
+                    name,
+                    Arc::clone(&udf),
+                    vec![],
+                    Arc::new(Field::new(name, DataType::Int64, true)),
+                    Arc::clone(options),
+                )
+            };
+            assert_eq!(
+                BuiltinFunction::of(&call(&trusting_options)),
+                Some(builtin),
+                "{name}"
             );
-            assert_eq!(BuiltinFunction::of(&call), Some(builtin), "{name}");
+            // Not in a session that does not trust it.
+            let untrusting_options = Arc::new(ConfigOptions::default());
+            assert_eq!(BuiltinFunction::of(&call(&untrusting_options)), None);
         }
-        // A function that shadows a built-in one under its name is opaque.
+        // A function that shadows a built-in one under its name is opaque in
+        // a session that trusts the built-in one, also if its type has the
+        // name of the type of the built-in one.
         let schema = tpch_schema();
-        let udf = ScalarUDF::new_from_impl(ShadowingAbs {
-            signature: datafusion_expr::Signature::any(
-                1,
-                datafusion_expr::Volatility::Immutable,
-            ),
+        let session = datafusion::prelude::SessionContext::new_with_config(trusting(
+            datafusion::prelude::SessionConfig::new(),
+        ));
+        let builtin = physical_expr_in(&session, "abs(x)", &schema);
+        assert!(!depends(&builtin, &schema));
+        assert_eq!(fallibility(&builtin, &schema), Fallibility::Infallible);
+        let signature =
+            datafusion_expr::Signature::any(1, datafusion_expr::Volatility::Immutable);
+        let shadowing = ScalarUDF::new_from_impl(ShadowingAbs {
+            signature: signature.clone(),
         });
-        assert_eq!(implementation_name(&udf), "ShadowingAbs");
-        let shadowing: Arc<dyn PhysicalExpr> = Arc::new(
-            ScalarFunctionExpr::try_new(
-                Arc::new(udf),
-                vec![physical_expr("x", &schema)],
-                &schema,
-                Arc::new(datafusion_common::config::ConfigOptions::default()),
-            )
-            .unwrap(),
+        assert_eq!(implementation_name(&shadowing), "ShadowingAbs");
+        let same_name = ScalarUDF::new_from_impl(AbsFunc { signature });
+        assert_eq!(implementation_name(&same_name), "AbsFunc");
+        for udf in [shadowing.clone(), same_name] {
+            session.register_udf(udf);
+            let call = physical_expr_in(&session, "abs(x)", &schema);
+            assert_eq!(call.to_string(), builtin.to_string());
+            let function = call.downcast_ref::<ScalarFunctionExpr>().unwrap();
+            assert_eq!(BuiltinFunction::of(function), None);
+            assert!(depends(&call, &schema));
+            assert_eq!(fallibility(&call, &schema), Fallibility::PerRow);
+        }
+        // The functions of the names of built-in ones whose types do not have
+        // the names of theirs are not trusted.
+        assert!(
+            TrustedFunctions::new(&[Arc::new(shadowing)])
+                .names()
+                .is_empty()
         );
-        let builtin = physical_expr("abs(x)", &schema);
-        assert_eq!(builtin.to_string(), shadowing.to_string());
-        assert!(!depends_on_batches(&builtin, &schema));
-        assert!(depends_on_batches(&shadowing, &schema));
-        assert_eq!(fallibility(&shadowing, &schema), Fallibility::PerRow);
+        // Nor are any in the sessions that do not trust them.
+        let untrusted = physical_expr_in(
+            &datafusion::prelude::SessionContext::new(),
+            "abs(x)",
+            &schema,
+        );
+        assert!(depends(&untrusted, &schema));
+        assert_eq!(fallibility(&untrusted, &schema), Fallibility::PerRow);
     }
 
     #[test]
     fn bounded_constants_do_not_depend_on_batches() {
         let schema = tpch_schema();
         let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
-        for (expr, depends) in [
+        // Whether the errors depend on batches of at most `ROWS` rows, and on
+        // batches of unknown sizes.
+        for (expr, expected) in [
             (
                 "CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' \
                  THEN '1-URGENT' ELSE '2-HIGH' END"
                     .to_owned(),
-                false,
+                (false, true),
             ),
             (
                 "CASE WHEN n > 0 THEN 'HIGH' WHEN n < 0 THEN 'LOW' END".to_owned(),
-                false,
+                (false, true),
             ),
-            ("CASE WHEN n > 0 THEN 'HIGH' END = 'HIGH'".to_owned(), false),
-            ("'1-URGENT'".to_owned(), false),
-            (format!("'{}'", &large[1..]), false),
+            (
+                "CASE WHEN n > 0 THEN 'HIGH' END = 'HIGH'".to_owned(),
+                (false, true),
+            ),
+            ("'1-URGENT'".to_owned(), (false, true)),
+            (format!("'{}'", &large[1..]), (false, true)),
             // Constants of more bytes may overflow the 32-bit offsets of a
             // batch of DataFusion, but not of a chunk.
             (
                 format!("CASE WHEN n > 0 THEN '{large}' ELSE 'LOW' END"),
-                true,
+                (true, true),
             ),
-            (format!("'{large}'"), true),
+            (format!("'{large}'"), (true, true)),
             // A column and a constant build strings of more bytes than the
             // column has.
-            ("CASE WHEN n > 0 THEN s ELSE 'LOW' END".to_owned(), true),
-            ("CASE WHEN n > 0 THEN s END".to_owned(), false),
+            (
+                "CASE WHEN n > 0 THEN s ELSE 'LOW' END".to_owned(),
+                (true, true),
+            ),
+            ("CASE WHEN n > 0 THEN s END".to_owned(), (false, false)),
+            // Constants without bytes, and compared ones, are not copied.
+            ("CASE WHEN n > 0 THEN '' END".to_owned(), (false, false)),
+            ("o_orderpriority = '1-URGENT'".to_owned(), (false, false)),
         ] {
             let expr = physical_expr(&expr, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+            assert_eq!(
+                (depends(&expr, &schema), depends_on_batches(&expr, &schema)),
+                expected,
+                "{expr}"
+            );
+        }
+    }
+
+    #[test]
+    fn constants_need_batches_of_known_sizes() {
+        // The bytes of the constants that batches of at most so many rows
+        // hold for each of their rows, and the chunks of the pipeline.
+        for (rows, bytes) in [
+            (None, 0),
+            (Some(0), MAX_CONSTANT_BYTES),
+            (ROWS, MAX_CONSTANT_BYTES),
+            (Some((1 << 21) - 1), MAX_CONSTANT_BYTES),
+            (Some(1 << 21), MAX_CONSTANT_BYTES - 1),
+            (Some(1 << 30), 1),
+            (Some(usize::MAX), 0),
+        ] {
+            assert_eq!(constant_bytes(rows), bytes, "{rows:?}");
+        }
+        // Built-in functions copy their constant arguments for every row of
+        // the batch (e.g. `strpos` pads them, see `make_scalar_function`),
+        // but for the parameters that they read as scalars.
+        let schema = tpch_schema();
+        for (expr, depends_on) in [
+            ("extract(year from o_orderdate)", false),
+            ("date_trunc('month', ts)", false),
+            ("to_timestamp(s, '%Y-%m-%d', '%d/%m/%Y')", false),
+            ("ltrim(c_phone, '1')", false),
+            ("nullif(c_phone, '10')", false),
+            ("starts_with(s, 'abc')", false),
+            ("ends_with('abc', s)", false),
+            ("regexp_like(s, '^a', 'i')", false),
+            ("strpos(c_phone, '1')", true),
+            ("nullif('10', s)", true),
+            // Of views, which have no offsets to overflow.
+            ("nullif('10', c_phone)", false),
+            ("substr('abc', n)", true),
+            ("regexp_like(s, c_phone, 'i')", true),
+            ("strpos(c_phone, '')", false),
+        ] {
+            let expr = physical_expr(expr, &schema);
+            assert_eq!(depends_on_batches(&expr, &schema), depends_on, "{expr}");
         }
     }
 

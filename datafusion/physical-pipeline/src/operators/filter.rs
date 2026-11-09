@@ -88,10 +88,12 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use itertools::Itertools;
 
 use super::adaptive_filter::{
-    AdaptiveFilter, AdaptiveFilterState, depends_on_batches, is_infallible,
+    AdaptiveFilter, AdaptiveFilterState, depends_on_batches,
+    depends_on_batches_with_rows, is_infallible,
 };
 use super::projection::{
-    BoundExprs, can_gather, check_lowered_input, logical_rows, takes_little_memory,
+    BoundExprs, can_gather, check_lowered_input, logical_rows, max_batch_rows,
+    takes_little_memory,
 };
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
@@ -157,7 +159,10 @@ impl PhysicalFilter {
     ///   rows into batches, empty ones included (see [`depends_on_batches`]),
     ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
     ///   DataFusion must evaluate it on the batches of the input plan of
-    ///   `exec`;
+    ///   `exec`. String constants, which the predicate may copy for every row
+    ///   (e.g. `CASE WHEN x THEN 'HIGH' ELSE 'LOW' END = 'HIGH'`), only do not
+    ///   if the plan bounds the rows of these batches (see
+    ///   [`depends_on_batches_with_rows`]);
     /// * the input of `exec` has lists of values that take less than a byte
     ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans, or empty
     ///   lists or binaries), which the native operators cannot gather with
@@ -360,7 +365,8 @@ impl PhysicalFilter {
 /// [`PhysicalFilter::supports_filter_exec`].
 fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
     let input_schema = exec.input().schema();
-    if depends_on_batches(exec.predicate(), input_schema.as_ref()) {
+    let max_rows = max_batch_rows(exec.input());
+    if depends_on_batches_with_rows(exec.predicate(), input_schema.as_ref(), max_rows) {
         return Some(format!(
             "the errors of its predicate {} depend on DataFusion's batches",
             exec.predicate()
@@ -1020,7 +1026,9 @@ pub(crate) mod test_support {
         ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
         OperatorState, PhysicalOperator,
     };
-    use crate::operators::adaptive_filter::{Failures, depends_on_batches, failures};
+    use crate::operators::adaptive_filter::{
+        Failures, TrustedFunctions, depends_on_batches, failures,
+    };
     use crate::operators::caching::CachingOperator;
     use crate::operators::projection::PhysicalProjection;
     use crate::test_utils::{
@@ -1408,6 +1416,7 @@ pub(crate) mod test_support {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
+        let config = trusting(config);
         let datafusion = datafusion_context(config.clone());
         setup(&datafusion).await?;
         let native = datafusion_context(config);
@@ -1606,6 +1615,7 @@ pub(crate) mod test_support {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
+        let config = trusting(config);
         let datafusion = datafusion_context(config.clone());
         setup(&datafusion).await.unwrap();
         let native = datafusion_context(config);
@@ -1665,10 +1675,32 @@ pub(crate) mod test_support {
     /// Parse the SQL expression `sql` on `schema` into a physical expression,
     /// with DataFusion's type coercion.
     pub(crate) fn physical_expr(sql: &str, schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
-        let ctx = SessionContext::new();
+        physical_expr_in(
+            &SessionContext::new_with_config(trusting(SessionConfig::new())),
+            sql,
+            schema,
+        )
+    }
+
+    /// Like [`physical_expr`], in the session of `ctx`, which may not trust
+    /// the built-in functions of DataFusion (see [`trusting`]).
+    pub(crate) fn physical_expr_in(
+        ctx: &SessionContext,
+        sql: &str,
+        schema: &SchemaRef,
+    ) -> Arc<dyn PhysicalExpr> {
         let df_schema = DFSchema::try_from(schema.as_ref().clone()).unwrap();
         let expr = ctx.parse_sql_expr(sql, &df_schema).unwrap();
-        ctx.create_physical_expr(expr, &df_schema).unwrap()
+        // The state of a query, whose configuration the calls of functions hold.
+        ctx.state().create_physical_expr(expr, &df_schema).unwrap()
+    }
+
+    /// `config`, trusting the built-in functions of DataFusion, which the
+    /// sessions of the tests register (see [`TrustedFunctions`]).
+    pub(crate) fn trusting(config: SessionConfig) -> SessionConfig {
+        config.with_option_extension(TrustedFunctions::new(
+            &datafusion::functions::all_default_functions(),
+        ))
     }
 
     /// A batch of the columns `x` and `y` (`Int32`) and `s` (`Utf8`, `"a"` on
