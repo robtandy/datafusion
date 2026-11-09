@@ -649,9 +649,15 @@ impl PhysicalWindow {
 
     /// Sort the rows of `input`, the rows of a bucket, and find its groups.
     fn sort_bucket(&self, input: BucketInput) -> Result<SortedBucket> {
+        let mut runs = input.runs;
+        runs.retain(|run| run.num_rows() > 0);
         let batches = match &self.spec.keys {
+            // The rows of a single run are sorted already.
+            Some(_) if runs.len() == 1 => {
+                runs.into_iter().map(SortedRun::into_batch).collect()
+            }
             Some(_) => {
-                let mut merger = RunMerger::new(self.input().schema(), input.runs, None);
+                let mut merger = RunMerger::new(self.input().schema(), runs, None);
                 let mut batches = vec![];
                 while let Some(batch) = merger.next_batch(usize::MAX)? {
                     batches.push(batch);
@@ -1766,6 +1772,9 @@ mod tests {
         for sql in [
             // Sliding and cumulative `ROWS` frames.
             "SELECT id, SUM(b) OVER (PARTITION BY a ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
+            // (`b` has ties within the partitions: `id` orders them.)
+            "SELECT id, SUM(c) OVER (PARTITION BY a ORDER BY b, id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
+            "SELECT a, b, SUM(b) OVER (PARTITION BY a ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
             "SELECT id, SUM(b) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
             "SELECT id, SUM(c) OVER (PARTITION BY d ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS s FROM t1",
             "SELECT id, AVG(g) OVER (PARTITION BY e ORDER BY id ROWS UNBOUNDED PRECEDING) AS a FROM t1",
@@ -2300,6 +2309,146 @@ mod tests {
         };
         assert_eq!(rows(&first), 5000);
         assert_eq!(rows(&second), 5000);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Hand-built plans
+    // ---------------------------------------------------------------------
+
+    /// A scan of the rows of `t1` (in its 4 partitions).
+    fn t1_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        let partitions = test_table_t1()?;
+        let schema = partitions[0][0].schema();
+        Ok(
+            datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+                &partitions,
+                schema,
+                None,
+            )?,
+        )
+    }
+
+    /// `ROW_NUMBER() OVER (PARTITION BY d ORDER BY id)` over the rows of
+    /// `input` (of the schema of `t1`), in the window node of `mode`.
+    fn row_number_plan(
+        input: Arc<dyn ExecutionPlan>,
+        mode: Option<datafusion_physical_plan::InputOrderMode>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let id = PhysicalSortExpr::new_default(col("id", &schema)?);
+        let window_expr = datafusion_physical_plan::windows::create_window_expr(
+            &datafusion_expr::WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            "rn".to_string(),
+            &[],
+            &[col("d", &schema)?],
+            std::slice::from_ref(&id),
+            Arc::new(datafusion_expr::WindowFrame::new(Some(true))),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        Ok(match mode {
+            Some(mode) => Arc::new(BoundedWindowAggExec::try_new(
+                vec![window_expr],
+                input,
+                mode,
+                true,
+            )?),
+            None => Arc::new(WindowAggExec::try_new(vec![window_expr], input, true)?),
+        })
+    }
+
+    fn sort_exec(
+        input: Arc<dyn ExecutionPlan>,
+        keys: &[&str],
+        preserve_partitioning: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let ordering = LexOrdering::new(
+            keys.iter()
+                .map(|key| Ok(PhysicalSortExpr::new_default(col(key, &schema)?)))
+                .collect::<Result<Vec<_>>>()?,
+        )
+        .expect("sort keys");
+        Ok(Arc::new(
+            SortExec::new(ordering, input)
+                .with_preserve_partitioning(preserve_partitioning),
+        ))
+    }
+
+    fn hash_repartition(input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let d = col("d", &input.schema())?;
+        Ok(Arc::new(RepartitionExec::try_new(
+            input,
+            Partitioning::Hash(vec![d], 4),
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_of_all_input_order_modes() -> Result<()> {
+        use crate::operators::union::test_support::assert_lowered_plan_byte_eq;
+        use datafusion_physical_plan::InputOrderMode;
+        let task_ctx = || {
+            Arc::new(TaskContext::default().with_session_config(test_session_config()))
+        };
+        // Partitioned by `d`, sorted by `d` and `id` (`Sorted`) or by `id` only
+        // (`Linear`, `PartiallySorted` is the same here): the native window
+        // sorts the rows of each partition by `d` and `id`.
+        for (mode, keys) in [
+            (Some(InputOrderMode::Sorted), vec!["d", "id"]),
+            (None, vec!["d", "id"]),
+            (Some(InputOrderMode::Linear), vec!["id"]),
+        ] {
+            let make = || {
+                let sorted = sort_exec(hash_repartition(t1_scan()?)?, &keys, true)?;
+                row_number_plan(sorted, mode.clone())
+            };
+            let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), false).await;
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "{mode:?}");
+        }
+        // In a single partition, the rows are emitted in the order of the
+        // input: the native window does not reproduce it if it does not start
+        // with the partition keys.
+        for (mode, keys, native) in [
+            (Some(InputOrderMode::Sorted), vec!["d", "id"], 1),
+            (Some(InputOrderMode::Linear), vec!["id"], 0),
+        ] {
+            let make = || {
+                let coalesced = Arc::new(CoalescePartitionsExec::new(t1_scan()?));
+                row_number_plan(sort_exec(coalesced, &keys, false)?, mode.clone())
+            };
+            let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), true).await;
+            assert_eq!(count::<PhysicalWindow>(&root), native, "{mode:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_of_the_input_are_raised() -> Result<()> {
+        use crate::operators::union::test_support::{
+            AfterBatch, INJECTED_FAILURE, assert_lowered_plan_fails_like_datafusion,
+            batch_plan,
+        };
+        let make = || {
+            let batch = test_table_t1()?[0][0].clone();
+            let input = batch_plan(batch, AfterBatch::Fail)?;
+            row_number_plan(
+                sort_exec(input, &["d", "id"], false)?,
+                Some(datafusion_physical_plan::InputOrderMode::Sorted),
+            )
+        };
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make,
+            lower,
+            test_session_config(),
+            INJECTED_FAILURE,
+        )
+        .await;
+        assert_eq!(count::<PhysicalWindow>(&root), 1);
         Ok(())
     }
 }

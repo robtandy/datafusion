@@ -16,7 +16,7 @@
 //! * **Sink**: every thread distributes the rows of the chunks it pushes over
 //!   radix *buckets*, by the hash of their `PARTITION BY` keys (all rows of a
 //!   window partition are in the same bucket), and sorts the rows of each
-//!   bucket into sorted runs (see [`SortKeys`](crate::sort::SortKeys)).
+//!   bucket into sorted runs (see [`SortedRun`](crate::sort::SortedRun)).
 //! * **Finalize**: the threads of a `WindowPartitionSort` pipeline, which
 //!   runs once all input pipelines completed, merge the runs of the buckets
 //!   in parallel, one bucket at a time, and find the window partitions of

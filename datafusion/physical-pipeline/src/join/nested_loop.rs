@@ -1004,7 +1004,7 @@ fn take_rows(array: &ArrayRef, indices: &UInt32Array) -> Result<ArrayRef> {
 #[derive(Clone, Copy)]
 enum BuildRowsRef<'a> {
     /// Rows of the build side, by their global index.
-    Global(&'a BuildRows, &'a [usize]),
+    Global(&'a SegmentedBatch, &'a [usize]),
     /// Rows of one segment of the build side.
     Segment(&'a RecordBatch, &'a UInt32Array),
 }
@@ -1177,14 +1177,15 @@ fn has_narrow_encoding(data_type: &DataType) -> bool {
 
 /// The rows of the build side, in the batches (*segments*) in which the
 /// threads of the build pipelines collected them, addressed by a global row
-/// index: segment `i` holds the rows `offsets[i]..offsets[i + 1]`.
+/// index (like DataFusion's `LogicalBatch`): segment `i` holds the rows
+/// `offsets[i]..offsets[i + 1]`. Nothing is copied or concatenated.
 #[derive(Debug)]
-struct BuildRows {
+struct SegmentedBatch {
     segments: Vec<RecordBatch>,
     offsets: Vec<usize>,
 }
 
-impl BuildRows {
+impl SegmentedBatch {
     fn new(batches: Vec<RecordBatch>) -> Self {
         let segments = batches
             .into_iter()
@@ -1265,7 +1266,7 @@ impl MatchedRows {
 /// The build side of a join once it is finalized, shared by all threads.
 #[derive(Debug)]
 struct BuildSide {
-    rows: BuildRows,
+    rows: SegmentedBatch,
     /// The build rows that matched, for the joins that emit build rows at the
     /// end.
     matched: Option<MatchedRows>,
@@ -1490,7 +1491,7 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
         if ctx.registry().is_sink_finished(self) {
             return Ok(SinkFinalize::NoOutputPossible);
         }
-        let rows = BuildRows::new(std::mem::take(&mut *state.batches.lock()));
+        let rows = SegmentedBatch::new(std::mem::take(&mut *state.batches.lock()));
         let num_rows = rows.num_rows();
         let matched = if self.spec.emits_final_build_rows() {
             state.reserve(MatchedRows::memory_size(num_rows))?;
