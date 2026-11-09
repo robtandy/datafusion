@@ -1212,9 +1212,10 @@ mod tests {
 
     use arrow::array::{
         AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
-        Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
-        TimestampNanosecondArray,
+        Float64Array, Int32Array, Int64Array, ListArray, RunArray, StringArray,
+        StringViewArray, StructArray, TimestampNanosecondArray,
     };
+    use arrow::buffer::OffsetBuffer;
     use arrow::compute::{SortOptions, concat_batches};
     use arrow::datatypes::{Field, Int32Type, Int64Type};
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
@@ -2197,7 +2198,7 @@ mod tests {
         let ree = DataType::RunEndEncoded(Arc::clone(&run_ends), Arc::clone(&values));
         let schema = Arc::new(Schema::new(vec![Field::new("v", ree, true)]));
         let batch = |value: f64, len: i32| {
-            let array = arrow::array::RunArray::<Int32Type>::try_new(
+            let array = RunArray::<Int32Type>::try_new(
                 &Int32Array::from(vec![len]),
                 &Float64Array::from(vec![value]),
             )
@@ -2284,83 +2285,117 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sorts_of_large_values_emit_batches_that_fit_into_arrays() -> Result<()> {
         // Two partitions of 512 rows with interleaving keys and a constant,
-        // distinct, run-end encoded 2 MiB string each. DataFusion merges them
-        // into batches of 64 rows (128 MiB of values each); a sorted run or
-        // chunk of all 1024 rows needs 2 GiB of values, more than the 32-bit
-        // offsets of `Utf8` address. The native sort splits such runs and
-        // chunks into smaller ones.
-        let values = Arc::new(Field::new("values", DataType::Utf8, true));
-        let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
-        let ree = DataType::RunEndEncoded(run_ends, values);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("p", ree, true),
-        ]));
-        let partition = |first: i64, letter: &str| {
-            let keys = Int64Array::from_iter_values((0..512).map(|i| i * 2 + first));
-            let payload = arrow::array::RunArray::<Int32Type>::try_new(
-                &Int32Array::from(vec![512]),
-                &StringArray::from(vec![letter.repeat(2 << 20)]),
-            )
-            .unwrap();
-            vec![
-                RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![Arc::new(keys), Arc::new(payload)],
+        // distinct, run-end encoded 2 MiB string each, also in a list (of one
+        // element per row) in a struct. DataFusion merges them into batches of
+        // 64 rows (128 MiB of values each); a sorted run or chunk of all 1024
+        // rows needs 2 GiB of values, more than the 32-bit offsets of `Utf8`
+        // address. The native sort splits such runs and chunks into smaller
+        // ones (on one worker both). The nested payloads run on one worker
+        // only: on four, the run of each thread takes one string per row, 1
+        // GiB, as DataFusion's sort of each partition does.
+        let run_end_encoded = |letter: &str| -> ArrayRef {
+            Arc::new(
+                RunArray::<Int32Type>::try_new(
+                    &Int32Array::from(vec![512]),
+                    &StringArray::from(vec![letter.repeat(2 << 20)]),
                 )
                 .unwrap(),
-            ]
+            )
         };
-        let partitions = [partition(0, "x"), partition(1, "y")];
-        let make = || -> Result<Arc<dyn ExecutionPlan>> {
-            let scan =
-                MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-            Ok(merge(
-                sort_exec(scan, &[("k", false)], true, None),
-                &[("k", false)],
-                None,
-            ))
+        let nested = |payload: ArrayRef| -> ArrayRef {
+            let item = Arc::new(Field::new("item", payload.data_type().clone(), true));
+            let offsets =
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, payload.len()));
+            let list: ArrayRef = Arc::new(ListArray::new(item, offsets, payload, None));
+            let field = Arc::new(Field::new("l", list.data_type().clone(), true));
+            Arc::new(StructArray::new(vec![field].into(), vec![list], None))
         };
-        /// The key, the first letter and the length of the payload of every
-        /// row of `plan` (whose batches hold 2 GiB: they are streamed, and
-        /// their bytes are not compared).
-        async fn rows(
-            plan: Arc<dyn ExecutionPlan>,
-            config: SessionConfig,
-        ) -> Result<Vec<(i64, u8, usize)>> {
-            let schema = plan.schema();
-            let task_ctx = Arc::new(
-                datafusion_execution::TaskContext::default().with_session_config(config),
-            );
-            let mut stream = execute_stream(plan, task_ctx)?;
-            let mut rows = vec![];
-            while let Some(batch) = stream.next().await {
-                let batch = batch?;
-                assert_eq!(batch.schema(), schema);
-                let keys = batch.column(0).as_primitive::<Int64Type>();
-                let payload = batch.column(1).as_run::<Int32Type>();
-                let values = payload.values().as_string::<i32>();
-                for row in 0..batch.num_rows() {
-                    let value = values.value(payload.get_physical_index(row));
-                    rows.push((keys.value(row), value.as_bytes()[0], value.len()));
-                }
-            }
-            Ok(rows)
-        }
-        let config = test_session_config().with_batch_size(64);
-        let expected = rows(make()?, config.clone()).await?;
-        assert_eq!(expected.len(), 1024);
-        for threads in [1, 4] {
-            let plan = make()?;
-            let root = lower(&plan)?;
-            assert!(root.is::<PhysicalSort>());
-            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
-            let output = rows(exec, config.clone().with_target_partitions(threads))
+        for (nest, workers) in [(false, &[1, 4][..]), (true, &[1][..])] {
+            let payloads = ["x", "y"].map(|letter| match nest {
+                false => run_end_encoded(letter),
+                true => nested(run_end_encoded(letter)),
+            });
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("p", payloads[0].data_type().clone(), true),
+            ]));
+            let partitions = payloads
+                .iter()
+                .zip([0, 1])
+                .map(|(payload, first)| {
+                    let keys =
+                        Int64Array::from_iter_values((0..512).map(|i| i * 2 + first));
+                    let columns = vec![Arc::new(keys) as ArrayRef, Arc::clone(payload)];
+                    vec![RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()]
+                })
+                .collect::<Vec<_>>();
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    &partitions,
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                Ok(merge(
+                    sort_exec(scan, &[("k", false)], true, None),
+                    &[("k", false)],
+                    None,
+                ))
+            };
+            let config = test_session_config().with_batch_size(64);
+            let expected = large_value_rows(make()?, config.clone()).await?;
+            assert_eq!(expected.len(), 1024);
+            for &threads in workers {
+                let plan = make()?;
+                let root = lower(&plan)?;
+                assert!(root.is::<PhysicalSort>());
+                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                let output = large_value_rows(
+                    exec,
+                    config.clone().with_target_partitions(threads),
+                )
                 .await
-                .map_err(|e| e.context(format!("{threads} threads")))?;
-            assert_eq!(output, expected, "{threads} threads");
+                .map_err(|e| e.context(format!("{threads} threads, {nest}")))?;
+                assert_eq!(output, expected, "{threads} threads, nested: {nest}");
+            }
         }
         Ok(())
+    }
+
+    /// The key, the first letter and the length of the run-end encoded string
+    /// (also in lists and structs) of every row of `plan`, whose batches hold
+    /// 2 GiB: they are streamed, and their bytes are not compared.
+    async fn large_value_rows(
+        plan: Arc<dyn ExecutionPlan>,
+        config: SessionConfig,
+    ) -> Result<Vec<(i64, u8, usize)>> {
+        let schema = plan.schema();
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        let mut stream = execute_stream(plan, task_ctx)?;
+        let mut rows = vec![];
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            assert_eq!(batch.schema(), schema);
+            let keys = batch.column(0).as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                let mut value = batch.column(1).slice(row, 1);
+                loop {
+                    value = match value.data_type() {
+                        DataType::Struct(_) => Arc::clone(value.as_struct().column(0)),
+                        DataType::List(_) => value.as_list::<i32>().value(0),
+                        _ => break,
+                    };
+                }
+                let run = value.as_run::<Int32Type>();
+                let string = run
+                    .values()
+                    .as_string::<i32>()
+                    .value(run.get_physical_index(0));
+                rows.push((keys.value(row), string.as_bytes()[0], string.len()));
+            }
+        }
+        Ok(rows)
     }
 
     /// A scan of the rows `(a, b)` of `partitions`, a list of batches per
