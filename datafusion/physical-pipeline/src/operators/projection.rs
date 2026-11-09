@@ -1659,6 +1659,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn matches_of_patterns_that_may_be_scalars_stay_in_datafusion() {
+        // `ProjectionExec` matches the strings with the array of patterns that
+        // `CASE` returns on its batch, which Arrow compiles, and one is too
+        // big, but a pipeline with the scalar that it returns on the first
+        // chunk, which Arrow matches with ASCII strings without compiling it
+        // (see the test of the same name for filters).
+        let batch = guarded_patterns();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(guarded_pattern_match(&schema), "m")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let error = error.unwrap();
+        assert!(error.contains("Unable to build regex"), "{error}");
+        assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn negations_of_values_that_may_be_scalars_stay_in_datafusion() {
         // `ProjectionExec` negates the array that `CASE` returns on its batch,
         // wrapping, but a pipeline the scalar that it returns on the first

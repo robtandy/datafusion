@@ -786,6 +786,13 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   overflow checks, but an array wrapping, so
 ///   `-(CASE WHEN x THEN y ELSE -9223372036854775808 END)` fails on a chunk
 ///   whose rows all take the `ELSE` branch, not on a batch with others;
+/// * a part of `expr` matches strings with patterns (`LIKE` or a regular
+///   expression) that may evaluate to a scalar on some batches and to an
+///   array on others (or such strings): Arrow compiles the case-insensitive
+///   patterns of an array, but may match a scalar one with ASCII strings
+///   without compiling it, so `s ILIKE CASE WHEN x THEN 'sss…' ELSE p END`
+///   fails on a batch with rows of both branches (the pattern is too big to
+///   compile), not on a chunk whose rows all take the first one;
 /// * a part of `expr` is opaque to the classification (e.g. a function):
 ///   whatever it returns, its implementation may fail depending on the rows
 ///   it is evaluated on together, e.g. `repeat` fails on more than 4 GiB of
@@ -888,6 +895,13 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
         || expr
             .downcast_ref::<NegativeExpr>()
             .is_some_and(|negative| may_change_shape(negative.arg()))
+        // Arrow matches a scalar pattern and an array of patterns differently
+        // (it compiles case-insensitive patterns of an array, but may match a
+        // scalar one with ASCII strings without compiling it, and compiles a
+        // scalar pattern even without rows): of operands that may be a scalar
+        // on some batches and an array on others, whether it fails depends on
+        // them.
+        || (matches_patterns(expr) && expr.children().into_iter().any(may_change_shape))
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -930,6 +944,26 @@ fn may_change_shape(expr: &Arc<dyn PhysicalExpr>) -> bool {
             }))
     })
     .unwrap_or(true)
+}
+
+/// Whether `expr` matches strings with patterns: `LIKE` and the regular
+/// expression operators.
+fn matches_patterns(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    use Operator::*;
+    expr.is::<LikeExpr>()
+        || expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
+            matches!(
+                binary.op(),
+                LikeMatch
+                    | ILikeMatch
+                    | NotLikeMatch
+                    | NotILikeMatch
+                    | RegexMatch
+                    | RegexIMatch
+                    | RegexNotMatch
+                    | RegexNotIMatch
+            )
+        })
 }
 
 /// The operands of `expr` that DataFusion evaluates on rows that depend on
@@ -1670,6 +1704,13 @@ mod tests {
             ("-(a + 1) > 0", false),
             ("-(CASE WHEN a > 0 THEN b ELSE 0 END) > 0", true),
             ("-(CASE WHEN a > 0 THEN b END) IS NULL", true),
+            // So does Arrow match scalar patterns and arrays of patterns
+            // differently (also of strings).
+            ("s ILIKE s", false),
+            ("s LIKE CASE WHEN a > 0 THEN 'x%' ELSE s END", true),
+            ("s ILIKE CASE WHEN a > 0 THEN 'x%' ELSE s END", true),
+            ("CASE WHEN a > 0 THEN s ELSE 'x' END LIKE 'y%'", true),
+            ("s ~ CASE WHEN a > 0 THEN 'x' ELSE s END", true),
             // But functions are opaque: whatever they return, they may fail
             // depending on the rows they are evaluated on together (e.g.
             // `repeat` limits the size of its strings).

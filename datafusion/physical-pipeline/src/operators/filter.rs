@@ -2178,6 +2178,45 @@ pub(crate) mod test_support {
         LARGE.lock().await
     }
 
+    /// A batch of 4096 rows of `x` (`Boolean`), `true` on the first 2048 rows
+    /// and `false` on the others, and of `s` and `p` (`Utf8View`), `"a"`.
+    pub(crate) fn guarded_patterns() -> RecordBatch {
+        let x =
+            arrow::array::BooleanArray::from_iter((0..4096).map(|row| Some(row < 2048)));
+        let a = || Arc::new(StringViewArray::from(vec!["a"; 4096])) as ArrayRef;
+        RecordBatch::try_from_iter([
+            ("x", Arc::new(x) as ArrayRef),
+            ("s", a()),
+            ("p", a()),
+        ])
+        .unwrap()
+    }
+
+    /// `s ILIKE CASE WHEN x THEN 'sss…' ELSE p END`, with 100000 `s` (see
+    /// [`guarded_patterns`]): `CASE` returns the pattern as is (a scalar) if
+    /// all rows take its branch, which Arrow matches with the ASCII strings
+    /// without compiling it, but compiles it in an array of patterns, into a
+    /// regular expression that is too big.
+    pub(crate) fn guarded_pattern_match(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        let pattern = datafusion_physical_expr::expressions::CaseExpr::try_new(
+            None,
+            vec![(
+                physical_expr("x", schema),
+                Arc::new(datafusion_physical_expr::expressions::Literal::new(
+                    datafusion_common::ScalarValue::Utf8View(Some("s".repeat(100_000))),
+                )),
+            )],
+            Some(physical_expr("p", schema)),
+        )
+        .unwrap();
+        Arc::new(datafusion_physical_expr::expressions::LikeExpr::new(
+            false,
+            true,
+            physical_expr("s", schema),
+            Arc::new(pattern),
+        ))
+    }
+
     /// A batch of 4096 rows of `x` (`Boolean`), `false` on the first 2048
     /// rows and `true` on the others, and of `y` (`Int64`), `1`.
     pub(crate) fn guarded_minimums() -> RecordBatch {
@@ -3857,6 +3896,38 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn matches_of_patterns_that_may_be_scalars_stay_in_datafusion() {
+        // On the batch of `FilterExec`, `CASE` returns an array of patterns,
+        // which Arrow compiles, and the pattern of 100000 `s` (each `[sSſ]`)
+        // is too big. On the first chunk of the native filter, all rows take
+        // the first branch, whose pattern `CASE` returns as is, a scalar, which
+        // Arrow matches with the ASCII strings without compiling it.
+        let batch = guarded_patterns();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                FilterExec::try_new(guarded_pattern_match(&schema), scan(&batch))
+                    .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let error = error.unwrap();
+        assert!(error.contains("Unable to build regex"), "{error}");
+        assert_eq!(operators.filters, 0);
+        // A pattern that is a column is always an array.
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec("s ILIKE p", scan(&batch), None),
+            false,
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
