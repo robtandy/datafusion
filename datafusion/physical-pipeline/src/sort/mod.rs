@@ -179,7 +179,11 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   input: nodes that advertise a different number of partitions than their
 ///   input has, merges of no partitions, and sorts of several partitions that
 ///   are not merged;
-/// * sort keys that the Arrow row format does not support;
+/// * sort keys that the Arrow row format does not support, and keys of unions
+///   (also inside other values): the native sort orders keys by the row
+///   format (unless the sort kernel sorts them), which orders unions unlike
+///   DataFusion's sort, e.g. the values of each type in ascending order for a
+///   descending key;
 /// * rows with dictionaries with keys of fewer than 32 bits, or run-end
 ///   encodings with run ends of fewer than 32 bits (also in nested types): the
 ///   native sort materializes runs (of up to [`SORT_RUN_ROWS`] rows) and
@@ -517,7 +521,10 @@ impl SortPlan {
         // only so many: the native sort evaluates its keys on each chunk, while
         // DataFusion evaluates the keys of its sort on its batches, or on all
         // rows of a small partition at once (which it sorts together), and the
-        // keys of its merges on their batches.
+        // keys of its merges on their batches. And keys of unions (also inside
+        // other values): the native sort orders them by the row format, which
+        // orders unions unlike DataFusion's sort (`make_comparator`), e.g. the
+        // values of a type in ascending order for a descending key.
         let keys = [
             (&ordering, input.schema()),
             (sort.expr(), sort_input.schema()),
@@ -530,7 +537,9 @@ impl SortPlan {
         );
         for (ordering, schema) in keys {
             for sort_expr in ordering.iter() {
-                if computes_limited_values(&sort_expr.expr, &schema)? {
+                if computes_limited_values(&sort_expr.expr, &schema)?
+                    || has_union(&sort_expr.expr.data_type(&schema)?)
+                {
                     return Ok(None);
                 }
             }
@@ -808,6 +817,25 @@ fn has_32_bit_offsets(data_type: &DataType) -> bool {
         DataType::Union(fields, _) => fields
             .iter()
             .any(|(_, field)| has_32_bit_offsets(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether values of `data_type` are unions, or have unions inside them.
+fn has_union(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(_, _) => true,
+        DataType::Dictionary(_, values) => has_union(values),
+        DataType::RunEndEncoded(_, values) => has_union(values.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_union(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| has_union(field.data_type()))
+        }
         _ => false,
     }
 }
@@ -1394,11 +1422,15 @@ mod tests {
 
     use arrow::array::{
         AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
-        Float64Array, Int32Array, Int64Array, LargeStringArray, RunArray, StringArray,
-        StringViewArray, TimestampNanosecondArray,
+        FixedSizeListArray, Float64Array, Int32Array, Int64Array, LargeListArray,
+        LargeStringArray, ListArray, ListViewArray, MapArray, RunArray, StringArray,
+        StringViewArray, StructArray, TimestampNanosecondArray, UnionArray,
     };
+    use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow::compute::{SortOptions, concat_batches};
-    use arrow::datatypes::{Field, Int32Type, Int64Type};
+    use arrow::datatypes::{Field, Int32Type, Int64Type, UnionFields};
+    use arrow_ord::ord::make_comparator;
+    use arrow_row::{RowConverter, SortField};
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
@@ -1591,6 +1623,192 @@ mod tests {
             assert!(sort_keys.sort(&schema, &[], None)?.is_empty());
         }
         Ok(())
+    }
+
+    #[test]
+    fn the_row_format_orders_nested_keys_like_datafusion() {
+        // The native sort orders keys that the sort kernel does not sort by the
+        // row format; DataFusion's sort orders them with `make_comparator`.
+        // Both orders agree for the nested and encoded keys that the native
+        // sort accepts, for every sort option (keys of unions, which they order
+        // differently, are left to DataFusion).
+        let mut rng = StdRng::seed_from_u64(42);
+        let item = |data_type: DataType| Arc::new(Field::new("item", data_type, true));
+        let int = |rng: &mut StdRng, n: usize| -> ArrayRef {
+            Arc::new(Int32Array::from_iter(
+                (0..n).map(|_| rng.random_bool(0.8).then(|| rng.random_range(0..4))),
+            ))
+        };
+        let string = |rng: &mut StdRng, n: usize| -> ArrayRef {
+            Arc::new(StringArray::from_iter((0..n).map(|_| {
+                rng.random_bool(0.8)
+                    .then(|| ["", "a", "ab", "b"][rng.random_range(0..4)])
+            })))
+        };
+        let nulls = |rng: &mut StdRng, n: usize| {
+            Some(NullBuffer::from_iter((0..n).map(|_| rng.random_bool(0.85))))
+        };
+        let lengths = |rng: &mut StdRng, n: usize| {
+            (0..n)
+                .map(|_| rng.random_range(0..4))
+                .collect::<Vec<usize>>()
+        };
+        let structs = |rng: &mut StdRng, n: usize| -> ArrayRef {
+            let fields = vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Utf8, true),
+            ];
+            let children = vec![int(rng, n), string(rng, n)];
+            Arc::new(StructArray::new(fields.into(), children, nulls(rng, n)))
+        };
+        let list = |rng: &mut StdRng,
+                    n: usize,
+                    values: &dyn Fn(&mut StdRng, usize) -> ArrayRef| {
+            let lengths = lengths(rng, n);
+            let values = values(rng, lengths.iter().sum());
+            let item = item(values.data_type().clone());
+            let offsets = OffsetBuffer::from_lengths(lengths);
+            Arc::new(ListArray::new(item, offsets, values, nulls(rng, n))) as ArrayRef
+        };
+        let dictionary = |rng: &mut StdRng, n: usize| {
+            let keys =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+            arrow::compute::cast(&string(rng, n), &keys).unwrap()
+        };
+        type Generate<'a> = Box<dyn Fn(&mut StdRng, usize) -> ArrayRef + 'a>;
+        let generators: Vec<(&str, Generate)> = vec![
+            ("struct", Box::new(structs)),
+            ("list", Box::new(|rng, n| list(rng, n, &int))),
+            ("list of structs", Box::new(|rng, n| list(rng, n, &structs))),
+            (
+                "struct of a list",
+                Box::new(|rng, n| {
+                    let list = list(rng, n, &int);
+                    let field = Field::new("l", list.data_type().clone(), true);
+                    Arc::new(StructArray::new(
+                        vec![field].into(),
+                        vec![list],
+                        nulls(rng, n),
+                    ))
+                }),
+            ),
+            (
+                "large list",
+                Box::new(|rng, n| {
+                    let lengths = lengths(rng, n);
+                    let values = int(rng, lengths.iter().sum());
+                    let offsets = OffsetBuffer::from_lengths(lengths);
+                    let item = item(DataType::Int32);
+                    Arc::new(LargeListArray::new(item, offsets, values, nulls(rng, n)))
+                }),
+            ),
+            (
+                "fixed-size list",
+                Box::new(|rng, n| {
+                    let values = int(rng, 2 * n);
+                    let item = item(DataType::Int32);
+                    Arc::new(FixedSizeListArray::new(item, 2, values, nulls(rng, n)))
+                }),
+            ),
+            (
+                "list view",
+                Box::new(|rng, n| {
+                    let lengths = lengths(rng, n);
+                    let values = int(rng, lengths.iter().sum());
+                    let mut offset = 0;
+                    let offsets = lengths.iter().map(|&length| {
+                        offset += length as i32;
+                        offset - length as i32
+                    });
+                    let offsets = ScalarBuffer::from_iter(offsets);
+                    let sizes =
+                        ScalarBuffer::from_iter(lengths.iter().map(|&l| l as i32));
+                    let item = item(DataType::Int32);
+                    Arc::new(ListViewArray::new(
+                        item,
+                        offsets,
+                        sizes,
+                        values,
+                        nulls(rng, n),
+                    ))
+                }),
+            ),
+            ("dictionary", Box::new(dictionary)),
+            (
+                "list of dictionaries",
+                Box::new(|rng, n| list(rng, n, &dictionary)),
+            ),
+            (
+                "run-end encoded",
+                Box::new(|rng, n| {
+                    let mut run_ends = vec![];
+                    let mut end = 0;
+                    while end < n {
+                        end = (end + rng.random_range(1..4)).min(n);
+                        run_ends.push(end as i32);
+                    }
+                    let values = int(rng, run_ends.len());
+                    let run_ends = Int32Array::from(run_ends);
+                    Arc::new(RunArray::<Int32Type>::try_new(&run_ends, &values).unwrap())
+                }),
+            ),
+            (
+                "map",
+                Box::new(|rng, n| {
+                    let lengths = lengths(rng, n);
+                    let entries = lengths.iter().sum();
+                    let keys = StringArray::from_iter_values(
+                        (0..entries).map(|_| ["a", "b", "c"][rng.random_range(0..3)]),
+                    );
+                    let fields = vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int32, true),
+                    ];
+                    let children = vec![Arc::new(keys) as ArrayRef, int(rng, entries)];
+                    let entries = StructArray::new(fields.into(), children, None);
+                    let field = Arc::new(Field::new(
+                        "entries",
+                        entries.data_type().clone(),
+                        false,
+                    ));
+                    let offsets = OffsetBuffer::from_lengths(lengths);
+                    Arc::new(MapArray::new(field, offsets, entries, nulls(rng, n), false))
+                }),
+            ),
+        ];
+        for (name, generate) in &generators {
+            for _ in 0..4 {
+                let array = generate(&mut rng, 200);
+                for (descending, nulls_first) in
+                    [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let options = SortOptions::new(descending, nulls_first);
+                    let field =
+                        SortField::new_with_options(array.data_type().clone(), options);
+                    assert!(RowConverter::supports_fields(std::slice::from_ref(&field)));
+                    let rows = RowConverter::new(vec![field])
+                        .unwrap()
+                        .convert_columns(&[Arc::clone(&array)])
+                        .unwrap();
+                    let compare = make_comparator(&array, &array, options).unwrap();
+                    let mut by_rows = (0..array.len()).collect::<Vec<_>>();
+                    by_rows.sort_by(|&a, &b| rows.row(a).cmp(&rows.row(b)));
+                    let mut by_comparator = (0..array.len()).collect::<Vec<_>>();
+                    by_comparator.sort_by(|&a, &b| compare(a, b));
+                    let case = format!("{name}, {options:?}");
+                    assert!(
+                        by_rows.windows(2).all(|w| compare(w[0], w[1]).is_le()),
+                        "{case}"
+                    );
+                    assert!(
+                        by_comparator
+                            .windows(2)
+                            .all(|w| rows.row(w[0]) <= rows.row(w[1])),
+                        "{case}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2852,6 +3070,130 @@ mod tests {
             Ok(Arc::new(coalesce))
         })?;
         assert!(try_lower_bridged(&plan).is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_by_union_keys_are_left_to_datafusion() -> Result<()> {
+        // The row format orders unions unlike DataFusion's sort: for the dense
+        // union rows `(type id, value)` `[(0, 1), (0, 2), (1, 3), (1, 4)]` with
+        // the ids `0..4`, `ORDER BY u DESC, id` returned the ids `[2, 3, 0, 1]`
+        // natively and `[3, 2, 1, 0]` in DataFusion, and nulls came elsewhere.
+        // Sorts by union keys, also inside structs and lists, are left to
+        // DataFusion, for every sort option; other nested keys stay native.
+        let fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("b", DataType::Int32, true),
+            ],
+        )?;
+        let rows = [
+            (0, Some(1)),
+            (0, Some(2)),
+            (1, Some(3)),
+            (1, Some(4)),
+            (0, None),
+            (1, None),
+        ];
+        let type_ids =
+            ScalarBuffer::from(rows.map(|(type_id, _)| type_id as i8).to_vec());
+        let values = |type_id| {
+            Int32Array::from_iter(rows.map(|(t, v)| v.filter(|_| t == type_id)))
+        };
+        let dense = || -> Result<ArrayRef> {
+            let mut counts = [0; 2];
+            let offsets = rows.map(|(type_id, _)| {
+                counts[type_id] += 1;
+                counts[type_id] - 1
+            });
+            let children = [0, 1].map(|type_id| {
+                let values = rows.iter().filter(|(t, _)| *t == type_id).map(|(_, v)| *v);
+                Arc::new(Int32Array::from_iter(values)) as ArrayRef
+            });
+            Ok(Arc::new(UnionArray::try_new(
+                fields.clone(),
+                type_ids.clone(),
+                Some(ScalarBuffer::from(offsets.to_vec())),
+                children.to_vec(),
+            )?))
+        };
+        let sparse = || -> Result<ArrayRef> {
+            let children = vec![Arc::new(values(0)) as ArrayRef, Arc::new(values(1))];
+            Ok(Arc::new(UnionArray::try_new(
+                fields.clone(),
+                type_ids.clone(),
+                None,
+                children,
+            )?))
+        };
+        let in_struct = |union: ArrayRef| -> ArrayRef {
+            let field = Field::new("u", union.data_type().clone(), true);
+            Arc::new(StructArray::new(vec![field].into(), vec![union], None))
+        };
+        let in_list = |union: ArrayRef| -> ArrayRef {
+            let item = Arc::new(Field::new("item", union.data_type().clone(), true));
+            let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(1, union.len()));
+            Arc::new(ListArray::new(item, offsets, union, None))
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        for (name, keys) in [
+            ("dense", dense()?),
+            ("sparse", sparse()?),
+            ("dense in a struct", in_struct(dense()?)),
+            ("sparse in a list", in_list(sparse()?)),
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("u", keys.data_type().clone(), true),
+            ]));
+            let ids = Int64Array::from_iter_values(0..rows.len() as i64);
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), keys])?;
+            for (descending, nulls_first, fetch) in [
+                (false, false, None),
+                (false, true, None),
+                (true, false, None),
+                (true, true, None),
+                (true, false, Some(3)),
+            ] {
+                let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                    let scan = MemorySourceConfig::try_new_exec(
+                        &[vec![batch.clone()]],
+                        Arc::clone(&schema),
+                        None,
+                    )?;
+                    let options = SortOptions::new(descending, nulls_first);
+                    let ordering = LexOrdering::new([
+                        PhysicalSortExpr::new(col("u", &schema)?, options),
+                        PhysicalSortExpr::new_default(col("id", &schema)?),
+                    ])
+                    .unwrap();
+                    Ok(Arc::new(SortExec::new(ordering, scan).with_fetch(fetch)))
+                };
+                let root =
+                    assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                        .await;
+                let case =
+                    format!("{name}, descending {descending}, nulls first {nulls_first}");
+                assert_eq!(sorts(&root), 0, "{case}, fetch {fetch:?}");
+            }
+            // Also merges of sorted partitions.
+            let scan = MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()], vec![batch]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let sort = sort_exec(scan, &[("u", true), ("id", false)], true, None);
+            let merged = merge(sort, &[("u", true), ("id", false)], None);
+            assert!(try_lower_bridged(&merged).is_none(), "{name}");
+        }
+        // A struct key without unions stays native.
+        let sort = sort_exec(t1_scan(1), &[("id", false)], false, None);
+        assert!(try_lower_bridged(&sort).is_some());
         Ok(())
     }
 
