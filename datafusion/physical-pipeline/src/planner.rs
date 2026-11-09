@@ -92,7 +92,9 @@
 //!   every probe batch, also on an empty one, the native join on the rows of
 //!   its chunks. And one whose output may fail to concatenate, or whose probe
 //!   side may fail below a node of the same pipeline that may fail:
-//!   DataFusion's join coalesces its output, like `FilterExec`.
+//!   DataFusion's join coalesces its output, like `FilterExec`. And one with
+//!   a dynamic filter whose probe side may fail (e.g. a scan of files):
+//!   DataFusion's scans skip the reads that the filter rejects.
 //! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
 //!   or a `RepartitionExec` over a bounded input, which coalesces the batches
 //!   of its output partitions, also below a hash join, which removes the
@@ -202,6 +204,7 @@ use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
 use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
+use crate::explain::{AnalyzedPipelineExec, MetricSelection};
 use crate::join::PhysicalHashJoin;
 use crate::operator::PhysicalOperator;
 use crate::operators::adaptive_filter::{depends_on_batches, failing_parts};
@@ -272,7 +275,8 @@ impl PipelineQueryPlanner {
     }
 
     /// The plan of `EXPLAIN ANALYZE`: DataFusion's `AnalyzeExec`, executing
-    /// (and showing the metrics of) the plan of the pipeline engine.
+    /// (and showing the metrics of) the plan of the pipeline engine, with the
+    /// metrics that the statement selects (see [`AnalyzedPipelineExec`]).
     async fn create_analyze_plan(
         &self,
         logical_plan: &LogicalPlan,
@@ -285,11 +289,19 @@ impl PipelineQueryPlanner {
         let Some(analyze) = plan.downcast_ref::<AnalyzeExec>() else {
             return Ok(plan);
         };
-        let root: Arc<dyn ExecutionPlan> = create_pipeline_plan_with_options(
+        let root = create_pipeline_plan_with_options(
             Arc::clone(analyze.input()),
             session.config_options(),
         )?;
-        Arc::clone(&plan).replace_children(vec![root], recompute())
+        // Shown with the metrics of its operators that the statement selects.
+        let input: Arc<dyn ExecutionPlan> = match logical_plan {
+            LogicalPlan::Analyze(statement) => Arc::new(AnalyzedPipelineExec::new(
+                root,
+                MetricSelection::of_analyze(statement, session.config_options()),
+            )),
+            _ => root,
+        };
+        Arc::clone(&plan).replace_children(vec![input], recompute())
     }
 }
 
@@ -394,10 +406,13 @@ pub fn lower_execution_plan_with_options(
 /// Options for which the lowering lowers what it lowers for every session:
 /// DataFusion's sort concatenates the batches of a partition, which can
 /// overflow 32-bit offsets, while they occupy fewer bytes than
-/// `sort_in_place_threshold_bytes` (see [`crate::sort::try_lower`]).
+/// `sort_in_place_threshold_bytes` (see [`crate::sort::try_lower`]), and the
+/// pipelines may run on several threads (see
+/// `Lowering::evaluates_in_order`).
 fn any_session_options() -> ConfigOptions {
     let mut options = ConfigOptions::default();
     options.execution.sort_in_place_threshold_bytes = usize::MAX;
+    options.execution.target_partitions = usize::MAX;
     options
 }
 
@@ -430,6 +445,19 @@ struct Lowering<'a> {
 }
 
 impl Lowering<'_> {
+    /// Whether the native operators evaluate the rows of every partition of
+    /// DataFusion in order, as DataFusion does: if the pipelines run on a
+    /// single thread. The executor runs a pipeline on up to
+    /// `target_partitions` threads, which evaluate the chunks of a partition,
+    /// and of a batch, in parallel: then which of the rows on which an
+    /// expression fails fails first depends on the threads, while DataFusion
+    /// fails on the first of them in its partition. So a native operator with
+    /// a part that may fail (see [`failing_parts`]) is only lowered if the
+    /// pipelines run on a single thread.
+    fn evaluates_in_order(&self) -> bool {
+        self.options.execution.target_partitions <= 1
+    }
+
     /// Lower `plan`, falling back to DataFusion if a native operator cannot
     /// be created (see [`lower_execution_plan_with_options`]). Never fails;
     /// returns a `Result` for the `try_lower` functions of the operators.
@@ -538,7 +566,7 @@ impl Lowering<'_> {
             return Ok(None);
         }
         let input_may_fail = || subtree_failing_parts(sort.input()) > 0;
-        if keys.failing_parts > 0 && input_may_fail() {
+        if keys.failing_parts > 0 && (input_may_fail() || !self.evaluates_in_order()) {
             return Ok(None);
         }
         let input = Context::below_breaker(keys.failing_parts);
@@ -551,7 +579,8 @@ impl Lowering<'_> {
         // the projections below it, if any).
         let native_keys = native_sort_keys(&lowered);
         if !native_keys.evaluates_like_datafusion()
-            || (native_keys.failing_parts > 0 && input_may_fail())
+            || (native_keys.failing_parts > 0
+                && (input_may_fail() || !self.evaluates_in_order()))
         {
             return Ok(None);
         }
@@ -596,6 +625,9 @@ impl Lowering<'_> {
             return Ok(None);
         }
         let own = judgement.failing_parts;
+        if own > 0 && !self.evaluates_in_order() {
+            return Ok(None);
+        }
         let input = Context::below_breaker(own);
         let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, |plan| {
             self.lower(without_ordering_sort(raw, own, plan), input)
@@ -668,6 +700,17 @@ impl Lowering<'_> {
         {
             return Ok(None);
         }
+        // DataFusion pushes the dynamic filter of the join into the scans of
+        // its probe side, which skip the files, row groups and rows that the
+        // filter rejects once the build side is collected; a native join does
+        // not skip the same reads. So a join with a dynamic filter whose probe
+        // side may fail (e.g. a scan of files, whose values may fail to read or
+        // to cast to the types of the table) is left to DataFusion.
+        if !plan.dynamic_expressions_produced().is_empty()
+            && subtree_failing_parts(join.right()) > 0
+        {
+            return Ok(None);
+        }
         // The join removes the redistributions of its inputs: a repartitioning
         // that coalesces batches (see `coalesces_batches`) of types whose
         // concatenation may fail is left to DataFusion, with the join.
@@ -717,6 +760,9 @@ impl Lowering<'_> {
         }
         if PhysicalFilter::supports_filter_exec(filter) {
             let own = failing_parts(filter.predicate(), &filter.input().schema());
+            if own > 0 && !self.evaluates_in_order() {
+                return Ok(bridge(plan));
+            }
             let input = self.lower(
                 filter.input(),
                 Context {
@@ -749,6 +795,9 @@ impl Lowering<'_> {
                 .iter()
                 .map(|expr| failing_parts(&expr.expr, &input_schema))
                 .fold(0, usize::saturating_add);
+            if own > 0 && !self.evaluates_in_order() {
+                return Ok(bridge(plan));
+            }
             let input = self.lower(
                 projection.input(),
                 Context {
@@ -2226,8 +2275,9 @@ mod tests {
         config: SessionConfig,
         error: Option<&str>,
     ) -> Arc<dyn PhysicalOperator> {
+        let root =
+            create_pipeline_plan_with_options(make_plan(), config.options()).unwrap();
         let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
-        let root = create_pipeline_plan(make_plan()).unwrap();
         let operator = Arc::clone(root.operator());
         let tree = format_operator_tree(&operator);
         let expected = collect(make_plan(), Arc::clone(&task_ctx)).await;
@@ -2519,10 +2569,11 @@ mod tests {
             assert!(!error.contains("Divide by zero"), "{sql}: {error}");
             assert_fails_like_datafusion(sql, config.clone(), &setup, &error).await;
         }
-        // Over a source that cannot fail, the filter is native.
+        // Over a source that cannot fail, the filter is native (on one thread,
+        // on which the native operators evaluate the rows in order).
         let root = lowered(
             "SELECT 10 / a AS x FROM t1 WHERE a >= 0",
-            test_session_config(),
+            test_session_config().with_target_partitions(1),
             setup_test_tables,
         )
         .await;
@@ -2566,9 +2617,10 @@ mod tests {
         let root = lowered(sql, config, &setup).await;
         assert_eq!(count::<PhysicalSort>(&root), 0);
         // Over an input that cannot fail, the sort is native (and `a + 100` is
-        // never 0).
+        // never 0), on one thread, on which it evaluates its keys in order.
         let sql = "SELECT a FROM t1 ORDER BY 10 / (a + 100), id";
-        let root = assert_parity(sql).await;
+        let config = test_session_config().with_target_partitions(1);
+        let root = assert_parity_with(sql, config, setup_test_tables).await;
         assert_native(sql, &root);
         assert_eq!(count::<PhysicalSort>(&root), 1);
         Ok(())
@@ -3200,6 +3252,120 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    -> Result<()> {
+        // A table `k INT, v INT` of two Parquet files: 100 rows `k = 1` of
+        // integers, and rows `k = 0` of strings that fail to cast to `INT`
+        // when they are read. DataFusion pushes the dynamic filter of the join
+        // (`k = 1`, from its build side) into the scan, which prunes the
+        // second file: it never reads it. A native join does not prune the same
+        // reads, so that it would fail to cast.
+        let dir = tempfile::tempdir()?;
+        let good = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![1; 100])) as arrow::array::ArrayRef,
+            ),
+            ("v", Arc::new(Int32Array::from_iter_values(0..100)) as _),
+        ])?;
+        let bad = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![0; 10])) as arrow::array::ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
+                    as _,
+            ),
+        ])?;
+        let path = dir.path().join("p");
+        write_parquet(&path.join("0.parquet"), good.schema(), &[good], None)?;
+        write_parquet(&path.join("1.parquet"), bad.schema(), &[bad], None)?;
+        let path = path.to_str().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]);
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet(
+                "p",
+                path,
+                ParquetReadOptions::default().schema(&schema),
+            )
+            .await?;
+            ctx.sql("CREATE TABLE b AS SELECT 1 AS x")
+                .await?
+                .collect()
+                .await?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT b.x, COUNT(p.v) AS n FROM b JOIN p ON b.x = p.k GROUP BY b.x";
+        let plan = datafusion_context(config.clone());
+        setup(&plan).await?;
+        let plan = plan.sql(sql).await?.create_physical_plan().await?;
+        let mut produced = 0;
+        plan.apply(|node| {
+            if node.is::<HashJoinExec>() {
+                produced += node.dynamic_expressions_produced().len();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(produced, 1, "{}", displayable(plan.as_ref()).indent(false));
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fallible_operators_on_several_threads_are_left_to_datafusion() -> Result<()>
+    {
+        // One batch of 8192 rows: `CAST(s AS INT)` fails on row 0, a string of a
+        // million zeros and `x` (slow to parse), and on row 2048, `y`.
+        // DataFusion evaluates the rows of a batch in order, so it fails on row
+        // 0. On several threads, the native operators evaluate the chunks of
+        // the batch in parallel, and the thread of row 2048 would fail first.
+        let mut s = vec!["1".to_string(); 8192];
+        s[0] = format!("{}x", "0".repeat(1_000_000));
+        s[2048] = "y".to_string();
+        let batch = RecordBatch::try_from_iter([(
+            "s",
+            Arc::new(arrow::array::StringArray::from(s)) as arrow::array::ArrayRef,
+        )])?;
+        let setup = single_batch_table("f", batch);
+        let error = "Cannot cast string '0000000000";
+        // The queries, with the number of native operators that evaluate the
+        // cast.
+        let casts = |root: &Arc<dyn PhysicalOperator>, operator: &str| match operator {
+            "projection" => count::<PhysicalProjection>(root),
+            "aggregation" => count::<PhysicalHashAggregate>(root),
+            _ => count::<PhysicalSort>(root),
+        };
+        for (sql, operator) in [
+            ("SELECT CAST(s AS INT) AS x FROM f", "projection"),
+            ("SELECT SUM(CAST(s AS INT)) AS x FROM f", "aggregation"),
+            ("SELECT s FROM f ORDER BY CAST(s AS INT)", "sort"),
+        ] {
+            let config = test_session_config();
+            assert_fails_like_datafusion(sql, config.clone(), &setup, error).await;
+            let root = lowered(sql, config, &setup).await;
+            assert_eq!(
+                casts(&root, operator),
+                0,
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+            // On one thread, they evaluate the rows in order, natively.
+            let config = test_session_config().with_target_partitions(1);
+            assert_fails_like_datafusion(sql, config.clone(), &setup, error).await;
+            let root = lowered(sql, config, &setup).await;
+            assert!(bridged_plans(&root).is_empty(), "{sql}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn redistributions_are_removed() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
         let batch = |values: std::ops::Range<i32>| {
@@ -3510,6 +3676,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn explain_analyze_selects_the_metrics_of_every_operator() {
+        // A native sort of a bridged plan (a window), whose nodes have metrics
+        // too.
+        let query = "SELECT e, rn FROM (SELECT e, \
+                     ROW_NUMBER() OVER (PARTITION BY e ORDER BY id) AS rn FROM t1) \
+                     ORDER BY rn DESC, e";
+        let analyzed = async |options: &str| {
+            let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
+            let plan = plan_of(&explained, "Plan with Metrics").to_string();
+            assert!(plan.contains("PhysicalSort"), "{plan}");
+            assert!(plan.contains("BoundedWindowAggExec"), "{plan}");
+            plan
+        };
+        // Without metrics, of the native operators and of the bridged nodes.
+        let plan = analyzed("ANALYZE, METRICS 'none'").await;
+        assert!(plan.matches("metrics=[]").count() > 4, "{plan}");
+        assert_eq!(
+            plan.matches("metrics=[").count(),
+            plan.matches("metrics=[]").count(),
+            "{plan}"
+        );
+        // Without the timing metrics.
+        let plan = analyzed("ANALYZE, METRICS 'rows', TIMING OFF").await;
+        assert!(plan.contains("output_rows="), "{plan}");
+        assert!(plan.contains("sink_rows="), "{plan}");
+        assert!(!plan.contains("elapsed_compute"), "{plan}");
+        // Without the development metrics.
+        let plan = analyzed("ANALYZE, LEVEL summary").await;
+        assert!(plan.contains("output_rows="), "{plan}");
+        assert!(plan.contains("elapsed_compute="), "{plan}");
+        for metric in ["output_chunks", "sink_rows", "output_batches"] {
+            assert!(!plan.contains(metric), "{metric}: {plan}");
+        }
+        // All of them, by default.
+        let plan = analyzed("ANALYZE").await;
+        for metric in [
+            "output_rows",
+            "output_chunks",
+            "sink_rows",
+            "elapsed_compute",
+        ] {
+            assert!(plan.contains(metric), "{metric}: {plan}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_shows_the_metrics_of_every_operator() {
         let explained = explain(
             "EXPLAIN ANALYZE SELECT e, COUNT(*) AS n FROM t1 WHERE a > 0 GROUP BY e",
@@ -3805,15 +4017,10 @@ mod tpch {
         }
         // The other queries leave parts to DataFusion that the native
         // operators do not reproduce exactly: e.g. scalar subqueries, TopKs
-        // of strings, joins whose probe side has pipeline breakers, or
-        // decimal arithmetic in projections and aggregations (with several
-        // parts that may fail).
-        for number in [6, 13] {
-            assert!(
-                native.contains(&number),
-                "Q{number} is not native: {native:?}"
-            );
-        }
+        // of strings, or decimal arithmetic (which may fail) in projections
+        // and aggregations, which the native operators would evaluate in
+        // parallel on several threads (e.g. the `SUM` of Q6).
+        assert!(native.contains(&13), "Q13 is not native: {native:?}");
         Ok(())
     }
 }

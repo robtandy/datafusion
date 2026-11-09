@@ -14,6 +14,14 @@
 //!   tree and the pipelines it decomposes into.
 //! * [`root_metrics`] provides the metrics reported by
 //!   [`ExecutionPlan::metrics`] for `EXPLAIN ANALYZE`.
+//! * `EXPLAIN ANALYZE` shows the metrics that the statement (or the session)
+//!   selects, by type (`LEVEL`, `datafusion.explain.analyze_level`) and by
+//!   category (`METRICS` and `TIMING`,
+//!   `datafusion.explain.analyze_categories`). DataFusion applies the
+//!   selection to the metrics of the nodes of the plan it shows, of which
+//!   the operators of the pipeline engine are not: the planner shows the
+//!   plan through an `AnalyzedPipelineExec`, which applies it to them, and
+//!   to the nodes of the bridged plans.
 //!
 //! For example, `EXPLAIN ANALYZE SELECT d, COUNT(*) FROM t GROUP BY d` shows
 //!
@@ -44,19 +52,23 @@ use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use datafusion_common::Result;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::display::human_readable::{
     human_readable_count, human_readable_duration,
 };
 use datafusion_common::display::{PlanType, StringifiedPlan};
 use datafusion_common::format::ExplainFormat;
-use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
-use datafusion_expr::logical_plan::Explain;
+use datafusion_common::format::{ExplainAnalyzeCategories, MetricCategory, MetricType};
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{Result, internal_err};
+use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion_expr::logical_plan::{Analyze, Explain};
 use datafusion_physical_plan::display::DisplayableExecutionPlan;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::metrics::{BaselineMetrics, MetricsSet};
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, displayable,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+    ReplaceChildrenOptions, displayable,
 };
 use datafusion_session::Session;
 use futures::{Stream, StreamExt};
@@ -68,12 +80,74 @@ use crate::pipeline::{PipelineGraph, PipelineId};
 
 impl DisplayAs for PipelineRootExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let explained = ExplainedTree::new(self.operator(), self.execution_metrics());
-        match t {
-            DisplayFormatType::Default => explained.fmt_indent(f, false),
-            DisplayFormatType::Verbose => explained.fmt_indent(f, true),
-            DisplayFormatType::TreeRender => explained.fmt_tree_render(f),
+        fmt_root(self, &MetricSelection::default(), t, f)
+    }
+}
+
+/// Render `root` as `t`, with the metrics of its last execution (if any)
+/// that `selection` selects.
+fn fmt_root(
+    root: &PipelineRootExec,
+    selection: &MetricSelection,
+    t: DisplayFormatType,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
+    let explained =
+        ExplainedTree::new(root.operator(), root.execution_metrics(), selection);
+    match t {
+        DisplayFormatType::Default => explained.fmt_indent(f, false),
+        DisplayFormatType::Verbose => explained.fmt_indent(f, true),
+        DisplayFormatType::TreeRender => explained.fmt_tree_render(f),
+    }
+}
+
+/// The metrics that `EXPLAIN ANALYZE` shows: of the types and the categories
+/// that the statement selects, or else the session (see
+/// `datafusion.explain.analyze_level` and
+/// `datafusion.explain.analyze_categories`), all by default.
+#[derive(Debug, Clone)]
+pub(crate) struct MetricSelection {
+    types: Vec<MetricType>,
+    /// The categories, or `None` for all of them.
+    categories: Option<Vec<MetricCategory>>,
+}
+
+impl Default for MetricSelection {
+    fn default() -> Self {
+        Self {
+            types: MetricType::Dev.included_types(),
+            categories: None,
         }
+    }
+}
+
+impl MetricSelection {
+    /// The selection of `analyze` in a session with the options `options`,
+    /// as DataFusion's planner computes it for its `AnalyzeExec`.
+    pub(crate) fn of_analyze(analyze: &Analyze, options: &ConfigOptions) -> Self {
+        let level = analyze
+            .analyze_level
+            .unwrap_or(options.explain.analyze_level);
+        let categories = analyze
+            .analyze_categories
+            .clone()
+            .unwrap_or_else(|| options.explain.analyze_categories.clone());
+        Self {
+            types: level.included_types(),
+            categories: match categories {
+                ExplainAnalyzeCategories::All => None,
+                ExplainAnalyzeCategories::Only(categories) => Some(categories),
+            },
+        }
+    }
+
+    /// Whether a metric of `metric_type` and `category` is shown.
+    fn shows(&self, metric_type: MetricType, category: MetricCategory) -> bool {
+        self.types.contains(&metric_type)
+            && self
+                .categories
+                .as_ref()
+                .is_none_or(|categories| categories.contains(&category))
     }
 }
 
@@ -87,12 +161,15 @@ struct ExplainedTree<'a> {
     pipelines: HashMap<usize, Vec<PipelineId>>,
     /// The metrics of the last execution, if any.
     metrics: Option<Arc<ExecutionMetrics>>,
+    /// The metrics that are shown.
+    selection: &'a MetricSelection,
 }
 
 impl<'a> ExplainedTree<'a> {
     fn new(
         root: &'a Arc<dyn PhysicalOperator>,
         metrics: Option<Arc<ExecutionMetrics>>,
+        selection: &'a MetricSelection,
     ) -> Self {
         let graph = pipeline_graph(root, "CollectorSink").map_err(|e| e.to_string());
         let mut pipelines: HashMap<usize, Vec<PipelineId>> = HashMap::new();
@@ -116,6 +193,7 @@ impl<'a> ExplainedTree<'a> {
             graph,
             pipelines,
             metrics,
+            selection,
         }
     }
 
@@ -175,7 +253,7 @@ impl<'a> ExplainedTree<'a> {
             write!(
                 f,
                 ", metrics=[{}]",
-                format_operator_metrics(operator, metrics)
+                format_operator_metrics(operator, metrics, self.selection)
             )?;
         }
         if let Some(bridge) = bridge {
@@ -183,7 +261,9 @@ impl<'a> ExplainedTree<'a> {
             // nodes once it was executed.
             let plan = bridge.plan().as_ref();
             let displayable = match self.metrics {
-                Some(_) => DisplayableExecutionPlan::with_metrics(plan),
+                Some(_) => DisplayableExecutionPlan::with_metrics(plan)
+                    .set_metric_types(self.selection.types.clone())
+                    .set_metric_categories(self.selection.categories.clone()),
                 None => DisplayableExecutionPlan::new(plan),
             };
             let nested = "  ".repeat(depth + 1);
@@ -217,31 +297,59 @@ impl<'a> ExplainedTree<'a> {
     }
 }
 
-/// The metrics of `operator` in an execution, for `EXPLAIN ANALYZE`: the
-/// rows and chunks it produced (as a source or an operator), consumed (as a
-/// sink), and the time spent in it, summed over all threads.
+/// The metrics of `operator` in an execution, for `EXPLAIN ANALYZE`, that
+/// `selection` selects: the rows and chunks it produced (as a source or an
+/// operator) and consumed (as a sink), and the time spent in it, summed over
+/// all threads. Their types and categories are those of the corresponding
+/// metrics of DataFusion: `output_rows` and `elapsed_compute` are summary
+/// metrics, the others development metrics, like `output_batches`.
 fn format_operator_metrics(
     operator: &Arc<dyn PhysicalOperator>,
     metrics: &OperatorMetrics,
+    selection: &MetricSelection,
 ) -> String {
-    let mut out = format!(
-        "output_rows={}, output_chunks={}",
-        human_readable_count(metrics.output_rows()),
-        human_readable_count(metrics.output_chunks())
-    );
+    let count = |value: usize| human_readable_count(value);
+    let mut shown = vec![(
+        "output_rows",
+        count(metrics.output_rows()),
+        MetricType::Summary,
+        MetricCategory::Rows,
+    )];
+    shown.push((
+        "output_chunks",
+        count(metrics.output_chunks()),
+        MetricType::Dev,
+        MetricCategory::Rows,
+    ));
     if operator.is_sink() {
-        let _ = write!(
-            out,
-            ", sink_rows={}, sink_chunks={}",
-            human_readable_count(metrics.sink_rows()),
-            human_readable_count(metrics.sink_chunks())
-        );
+        shown.push((
+            "sink_rows",
+            count(metrics.sink_rows()),
+            MetricType::Dev,
+            MetricCategory::Rows,
+        ));
+        shown.push((
+            "sink_chunks",
+            count(metrics.sink_chunks()),
+            MetricType::Dev,
+            MetricCategory::Rows,
+        ));
     }
-    let _ = write!(
-        out,
-        ", elapsed_compute={}",
-        human_readable_duration(metrics.elapsed_nanos())
-    );
+    shown.push((
+        "elapsed_compute",
+        human_readable_duration(metrics.elapsed_nanos()),
+        MetricType::Summary,
+        MetricCategory::Timing,
+    ));
+    let mut out = String::new();
+    for (name, value, metric_type, category) in shown {
+        if selection.shows(metric_type, category) {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{name}={value}");
+        }
+    }
     out
 }
 
@@ -289,6 +397,97 @@ pub(crate) fn explain_pipeline_plan(
         })
         .collect();
     ExplainExec::new(exec.schema(), plans, exec.verbose())
+}
+
+/// The plan that the pipeline engine executes for an `EXPLAIN ANALYZE`, the
+/// input of its `AnalyzeExec`: a [`PipelineRootExec`], shown with the metrics
+/// of its operators, and of the nodes of its bridged plans, that `selection`
+/// selects (see the [module documentation](self)). It executes, and reports
+/// the metrics of, the [`PipelineRootExec`].
+#[derive(Debug)]
+pub(crate) struct AnalyzedPipelineExec {
+    /// The [`PipelineRootExec`].
+    root: Arc<dyn ExecutionPlan>,
+    selection: MetricSelection,
+}
+
+impl AnalyzedPipelineExec {
+    pub(crate) fn new(root: Arc<PipelineRootExec>, selection: MetricSelection) -> Self {
+        Self {
+            root: root as Arc<dyn ExecutionPlan>,
+            selection,
+        }
+    }
+}
+
+impl DisplayAs for AnalyzedPipelineExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.root.downcast_ref::<PipelineRootExec>() {
+            Some(root) => fmt_root(root, &self.selection, t, f),
+            None => self.root.fmt_as(t, f),
+        }
+    }
+}
+
+impl ExecutionPlan for AnalyzedPipelineExec {
+    fn name(&self) -> &str {
+        self.root.name()
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.root.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("AnalyzedPipelineExec does not have children");
+        }
+        Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("AnalyzedPipelineExec does not have children");
+        }
+        Ok(self)
+    }
+
+    fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            root: Arc::clone(&self.root).reset_state()?,
+            selection: self.selection.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.root.execute(partition, context)
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        self.root.metrics()
+    }
 }
 
 /// Render an operator tree on one line, e.g.
