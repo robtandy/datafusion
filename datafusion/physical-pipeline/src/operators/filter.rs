@@ -90,7 +90,9 @@ use itertools::Itertools;
 use super::adaptive_filter::{
     AdaptiveFilter, AdaptiveFilterState, depends_on_batches, is_infallible,
 };
-use super::projection::{BoundExprs, can_gather, check_lowered_input, logical_rows};
+use super::projection::{
+    BoundExprs, can_gather, check_lowered_input, logical_rows, takes_little_memory,
+};
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -162,15 +164,18 @@ impl PhysicalFilter {
     ///   `take`, or run-end encoded arrays whose child fields are not Arrow's
     ///   (see `can_gather`);
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
-    ///   (or run ends of less than 32 bits), or lists with 32-bit offsets, at
-    ///   any depth: `FilterExec` coalesces its output batches, merging the
-    ///   dictionaries of distinct batches, which fails if they have more values
-    ///   than the keys can index (e.g. two batches of 100 distinct values, with
-    ///   `Int8` keys), and adding up the offsets of lists, which fails beyond
-    ///   `i32::MAX` values (e.g. two lists of `1 << 30` nulls). Whether it
-    ///   fails depends on the batches of the input plan, and the native filter
-    ///   does not coalesce its output. Nor run-end encoded arrays whose child
-    ///   fields are not Arrow's, which Arrow's `filter` renames;
+    ///   or of values that take less than a byte each (e.g. nulls), run ends of
+    ///   less than 32 bits, or lists with 32-bit offsets, at any depth:
+    ///   `FilterExec` coalesces its output batches, merging the dictionaries
+    ///   of distinct batches, which fails if they have more values than the
+    ///   keys can index (e.g. two batches of 100 distinct values, with `Int8`
+    ///   keys, or dictionaries of `1 << 30` and `(1 << 30) + 1` nulls, which
+    ///   take no memory and which Arrow does not merge, with `Int32` keys), and
+    ///   adding up the offsets of lists, which fails beyond `i32::MAX` values
+    ///   (e.g. two lists of `1 << 30` nulls). Whether it fails depends on the
+    ///   batches of the input plan, and the native filter does not coalesce
+    ///   its output. Nor run-end encoded arrays whose child fields are not
+    ///   Arrow's, which Arrow's `filter` renames;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -389,7 +394,9 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
 /// Whether `FilterExec` may fail to coalesce batches of `data_type`, at any
 /// depth: it concatenates the arrays of the batches it coalesces, which
 /// merges the dictionaries of distinct batches, and fails when their keys
-/// cannot index all of their values (keys of less than 32 bits), adds up run
+/// cannot index all of their values (keys of less than 32 bits, or values that
+/// take less than a byte each, e.g. nulls, which Arrow does not merge, and
+/// of which any number takes no memory), adds up run
 /// ends (run ends of less than 32 bits), and the offsets of lists (32-bit
 /// offsets, which lists of nulls overflow without memory). The 32-bit offsets
 /// of strings and binaries overflow too, but on more than 2 GiB of data. And
@@ -404,7 +411,7 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
     };
     match data_type {
         DataType::Dictionary(keys, values) => {
-            narrow(keys) || may_fail_to_coalesce(values)
+            narrow(keys) || takes_little_memory(values) || may_fail_to_coalesce(values)
         }
         // Arrow's `filter` rebuilds run-end encoded arrays with its own fields
         // (see `RunArray::try_new`), so the output would not have its type.
@@ -3839,6 +3846,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_dictionaries_of_values_without_memory_stay_in_datafusion() {
+        // `FilterExec` concatenates the dictionaries of the batches it
+        // coalesces: Arrow cannot merge dictionaries of nulls, which take no
+        // memory, so it adds up their values, here `(1 << 31) + 1`, more than
+        // `Int32` keys can index. The native filter does not coalesce.
+        let batch = |values: usize| {
+            let d =
+                arrow::array::DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+                    Int32Array::from(vec![0]),
+                    Arc::new(arrow::array::NullArray::new(values)),
+                )
+                .unwrap();
+            RecordBatch::try_from_iter([
+                ("x", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+                ("d", Arc::new(d) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let batches = [batch(1 << 30), batch((1 << 30) + 1)];
+        let schema = batches[0].schema();
+        let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome.as_ref().is_err_and(
+                |error| error.contains("Dictionary key bigger than the key type")
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_whose_output_dictionaries_may_overflow_stay_in_datafusion() {
         // One partition of two batches of 100 rows, with 100 distinct values
         // each, in dictionaries with `Int8` keys. `FilterExec` coalesces them
@@ -3915,6 +3958,33 @@ mod tests {
             (utf8(DataType::UInt16), true),
             (utf8(DataType::Int32), false),
             (utf8(DataType::UInt64), false),
+            // Dictionaries of values that take less than a byte each may have
+            // more values than any keys index, which Arrow concatenates.
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Null)),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::UInt64),
+                    Box::new(DataType::Boolean),
+                ),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int64),
+                    Box::new(DataType::FixedSizeBinary(0)),
+                ),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::FixedSizeBinary(1)),
+                ),
+                false,
+            ),
             (DataType::List(field(utf8(DataType::Int8))), true),
             // Lists of more than `i32::MAX` values overflow their offsets (lists
             // of nulls take no memory).

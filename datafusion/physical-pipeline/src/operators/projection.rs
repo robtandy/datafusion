@@ -486,6 +486,25 @@ fn remap_columns(
     .data()
 }
 
+/// Whether values of `data_type` may take less than a byte each: nulls,
+/// booleans, run-end encoded values (one run stands for any number of
+/// values), empty fixed-size lists of any type or binaries, and structs or
+/// fixed-size lists of such values. Arrays of them may have more values than
+/// 32-bit offsets, indices or keys count without taking gigabytes (or any
+/// memory).
+pub(crate) fn takes_little_memory(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null | DataType::Boolean | DataType::RunEndEncoded(..) => true,
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| takes_little_memory(field.data_type())),
+        // Empty lists have no value, whatever their type.
+        DataType::FixedSizeList(_, 0) | DataType::FixedSizeBinary(0) => true,
+        DataType::FixedSizeList(field, _) => takes_little_memory(field.data_type()),
+        _ => false,
+    }
+}
+
 /// Whether the native operators can gather rows of arrays of `data_type`
 /// (with [`gather`], or `DataChunk::compact`): not if they contain, at any
 /// depth, lists whose values may take less than a byte each (nulls, booleans,
@@ -498,19 +517,6 @@ fn remap_columns(
 /// without copying their values. Nor run-end encoded arrays whose child fields
 /// are not Arrow's, which Arrow's `filter` renames.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
-    fn takes_little_memory(data_type: &DataType) -> bool {
-        match data_type {
-            // One run stands for any number of values.
-            DataType::Null | DataType::Boolean | DataType::RunEndEncoded(..) => true,
-            DataType::Struct(fields) => fields
-                .iter()
-                .all(|field| takes_little_memory(field.data_type())),
-            // Empty lists have no value, whatever their type.
-            DataType::FixedSizeList(_, 0) | DataType::FixedSizeBinary(0) => true,
-            DataType::FixedSizeList(field, _) => takes_little_memory(field.data_type()),
-            _ => false,
-        }
-    }
     match data_type {
         DataType::List(field)
         | DataType::LargeList(field)
