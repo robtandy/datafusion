@@ -780,6 +780,12 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   not on a chunk of a quarter of its rows (but for casts into the type of
 ///   their operand, and `CASE` expressions whose values come from a single
 ///   column of their type);
+/// * a part of `expr` negates an operand that may evaluate to a scalar on some
+///   batches and to an array on others (e.g. a `CASE`, which returns the
+///   value of a branch as is if all rows take it): `-` negates a scalar with
+///   overflow checks, but an array wrapping, so
+///   `-(CASE WHEN x THEN y ELSE -9223372036854775808 END)` fails on a chunk
+///   whose rows all take the `ELSE` branch, not on a batch with others;
 /// * a part of `expr` is opaque to the classification (e.g. a function):
 ///   whatever it returns, its implementation may fail depending on the rows
 ///   it is evaluated on together, e.g. `repeat` fails on more than 4 GiB of
@@ -876,6 +882,12 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
         // together (e.g. on the size of the values it builds, which
         // DataFusion may limit per batch, or which overflow their offsets).
         || is_opaque(expr)
+        // `-` negates a scalar with overflow checks, but an array wrapping
+        // (see `NegativeExpr`): of an operand that may be a scalar on some
+        // batches and an array on others, whether it fails depends on them.
+        || expr
+            .downcast_ref::<NegativeExpr>()
+            .is_some_and(|negative| may_change_shape(negative.arg()))
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -904,6 +916,20 @@ fn is_opaque(expr: &Arc<dyn PhysicalExpr>) -> bool {
         || expr.is::<IsNotNullExpr>()
         || expr.is::<InListExpr>()
         || expr.is::<CaseExpr>())
+}
+
+/// Whether `expr` may evaluate to a scalar on some batches and to an array
+/// on others: `CASE` returns the value of a branch as is if all rows take it,
+/// and `AND` and `OR` a constant when they short-circuit, as may any
+/// expression that has one of them as a part.
+fn may_change_shape(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.exists(|expr| {
+        Ok(expr.is::<CaseExpr>()
+            || expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
+                matches!(binary.op(), Operator::And | Operator::Or)
+            }))
+    })
+    .unwrap_or(true)
 }
 
 /// The operands of `expr` that DataFusion evaluates on rows that depend on
@@ -1638,6 +1664,12 @@ mod tests {
             ("10 / a > 1 AND b = 1", false),
             ("10 / a > 1 OR b = 1", false),
             ("CAST(s AS INT) = 1 AND a > 0", false),
+            // `-` negates a scalar with overflow checks, but an array
+            // wrapping: an operand that may be either depends on the batches.
+            ("-a > 0", false),
+            ("-(a + 1) > 0", false),
+            ("-(CASE WHEN a > 0 THEN b ELSE 0 END) > 0", true),
+            ("-(CASE WHEN a > 0 THEN b END) IS NULL", true),
             // But functions are opaque: whatever they return, they may fail
             // depending on the rows they are evaluated on together (e.g.
             // `repeat` limits the size of its strings).

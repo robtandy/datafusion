@@ -2178,6 +2178,38 @@ pub(crate) mod test_support {
         LARGE.lock().await
     }
 
+    /// A batch of 4096 rows of `x` (`Boolean`), `false` on the first 2048
+    /// rows and `true` on the others, and of `y` (`Int64`), `1`.
+    pub(crate) fn guarded_minimums() -> RecordBatch {
+        let x =
+            arrow::array::BooleanArray::from_iter((0..4096).map(|row| Some(row >= 2048)));
+        RecordBatch::try_from_iter([
+            ("x", Arc::new(x) as ArrayRef),
+            ("y", Arc::new(Int64Array::from(vec![1; 4096])) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// `-(CASE WHEN x THEN y ELSE -9223372036854775808 END)` (see
+    /// [`guarded_minimums`]): `CASE` returns its `ELSE` value as is if all
+    /// rows take it, a scalar, which `-` negates with overflow checks, but an
+    /// array, which `-` negates wrapping, otherwise.
+    pub(crate) fn negated_case(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        let case = datafusion_physical_expr::expressions::CaseExpr::try_new(
+            None,
+            vec![(physical_expr("x", schema), physical_expr("y", schema))],
+            Some(Arc::new(
+                datafusion_physical_expr::expressions::Literal::new(
+                    datafusion_common::ScalarValue::Int64(Some(i64::MIN)),
+                ),
+            )),
+        )
+        .unwrap();
+        Arc::new(datafusion_physical_expr::expressions::NegativeExpr::new(
+            Arc::new(case),
+        ))
+    }
+
     /// A batch of 8192 rows of `id` (`Int32`) and of `s` (`Utf8`), strings of
     /// 128 KiB: 1 GiB of strings, and 256 MiB on a chunk of 2048 rows.
     pub(crate) fn large_strings() -> RecordBatch {
@@ -3825,6 +3857,42 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn negations_of_values_that_may_be_scalars_stay_in_datafusion() {
+        // On the batch of `FilterExec`, `CASE` returns an array, which `-`
+        // negates wrapping: `-(-9223372036854775808)` is
+        // `-9223372036854775808`. On the first chunk of the native filter,
+        // all rows take the `ELSE` branch, whose value `CASE` returns as is, a
+        // scalar, which `-` negates with overflow checks, and fails.
+        let batch = guarded_minimums();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let predicate =
+                Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                    negated_case(&schema),
+                    datafusion_expr::Operator::Eq,
+                    Arc::new(datafusion_physical_expr::expressions::Literal::new(
+                        ScalarValue::Int64(Some(i64::MIN)),
+                    )),
+                ));
+            Arc::new(FilterExec::try_new(predicate, scan(&batch)).unwrap())
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 0);
+        // The negation of a column is always that of an array.
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec("-y < 0", scan(&batch), None),
+            false,
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

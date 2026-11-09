@@ -1659,6 +1659,31 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn negations_of_values_that_may_be_scalars_stay_in_datafusion() {
+        // `ProjectionExec` negates the array that `CASE` returns on its batch,
+        // wrapping, but a pipeline the scalar that it returns on the first
+        // chunk, all of whose rows take the `ELSE` branch, with overflow checks
+        // (see the test of the same name for filters).
+        let batch = guarded_minimums();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(negated_case(&schema), "n")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn functions_stay_in_datafusion() {
         let _large = one_large_test_at_a_time().await;
         // `ProjectionExec` evaluates `concat_length(s)`, which builds `s || s`,
