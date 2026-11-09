@@ -299,7 +299,16 @@ pub fn create_pipeline_plan_with_options(
     options: &ConfigOptions,
 ) -> Result<Arc<PipelineRootExec>> {
     let root = lower_execution_plan_with_options(&plan, options)?;
-    Ok(Arc::new(PipelineRootExec::try_new(root, plan)?))
+    let root = match PipelineRootExec::try_new(root, Arc::clone(&plan)) {
+        Ok(root) => root,
+        Err(error) => {
+            log::warn!(
+                "Executing the plan with DataFusion, its lowering failed: {error}"
+            );
+            PipelineRootExec::try_new(bridge(&plan), plan)?
+        }
+    };
+    Ok(Arc::new(root))
 }
 
 /// Lower a DataFusion [`ExecutionPlan`] tree into a [`PhysicalOperator`]
@@ -325,6 +334,11 @@ pub fn lower_execution_plan(
 /// [`BridgeOperator`], together with its whole subtree. See the
 /// [module documentation](self) for the native operators and the plans that
 /// are left to DataFusion.
+///
+/// A node whose native operator fails to be created (the native operators
+/// report the nodes they do not reproduce without an error, so this is not
+/// expected) is executed by DataFusion too, with a warning: the lowering
+/// never fails, as DataFusion can execute every plan it created.
 pub fn lower_execution_plan_with_options(
     plan: &Arc<dyn ExecutionPlan>,
     options: &ConfigOptions,
@@ -371,7 +385,24 @@ struct Lowering<'a> {
 }
 
 impl Lowering<'_> {
+    /// Lower `plan`, falling back to DataFusion if a native operator cannot
+    /// be created (see [`lower_execution_plan_with_options`]). Never fails;
+    /// returns a `Result` for the `try_lower` functions of the operators.
     fn lower(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        ctx: Context,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        self.lower_natively(plan, ctx).or_else(|error| {
+            log::warn!(
+                "Executing {} with DataFusion, its native lowering failed: {error}",
+                plan.name()
+            );
+            Ok(bridge(plan))
+        })
+    }
+
+    fn lower_natively(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
         ctx: Context,
@@ -1139,6 +1170,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plans_whose_native_operators_fail_are_bridged() -> Result<()> {
+        // A limit whose input was replaced by an input with another schema,
+        // without recomputing its properties: the native limit refuses an
+        // input of another schema, DataFusion executes it.
+        let schema = |name: &str| {
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]))
+        };
+        let batch = RecordBatch::try_new(
+            schema("b"),
+            vec![Arc::new(Int32Array::from_iter_values(0..10))],
+        )?;
+        let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let limit: Arc<dyn ExecutionPlan> =
+                Arc::new(datafusion_physical_plan::limit::GlobalLimitExec::new(
+                    MemorySourceConfig::try_new_exec(&[vec![]], schema("a"), None)?,
+                    2,
+                    Some(3),
+                ));
+            let input = MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()]],
+                schema("b"),
+                None,
+            )?;
+            limit.replace_children(
+                vec![input],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+            )
+        };
+        let plan = make_plan()?;
+        assert_eq!(plan.schema(), schema("a"));
+        assert!(PhysicalLimit::try_lower(&plan, lower_execution_plan).is_err());
+        let root = lower_execution_plan(&plan)?;
+        let bridge = root.downcast_ref::<BridgeOperator>().expect("a bridge");
+        assert!(Arc::ptr_eq(bridge.plan(), &plan));
+
+        let task_ctx = Arc::new(TaskContext::default());
+        let expected = collect(make_plan()?, Arc::clone(&task_ctx)).await?;
+        let root: Arc<dyn ExecutionPlan> = create_pipeline_plan(make_plan()?)?;
+        let actual = collect(root, task_ctx).await?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_stage_aggregations_are_one_operator() {
         // The queries, the number of `AggregateExec`s DataFusion plans for
         // them (two stages per aggregation of several partitions) and the
@@ -1441,9 +1517,90 @@ mod tests {
                 "SELECT id FROM t1 ORDER BY 10 / (a - a), id",
                 Some("Divide by zero"),
             ),
+            // DataFusion filters the rows of a batch before the aggregation
+            // sees them, a pipeline evaluates both on every chunk: the
+            // aggregation is left to DataFusion, which fails to cast first.
+            (
+                "SELECT SUM(10 / a) AS x FROM t1 WHERE CAST(d AS INT) > 0",
+                Some("Cannot cast string"),
+            ),
+            (
+                "SELECT d, SUM(10 / a) AS x FROM t1 WHERE CAST(d AS INT) > 0 GROUP BY d",
+                Some("Cannot cast string"),
+            ),
+            // Below a limit.
+            (
+                "SELECT 10 / (a - a) AS x FROM t1 LIMIT 3",
+                Some("Divide by zero"),
+            ),
         ] {
             assert_outcome(sql, error).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_of_the_operators_of_a_pipeline_come_in_datafusion_order() -> Result<()>
+    {
+        // One batch of 3000 rows: `10 / a` fails on row 100, `CAST(s AS INT)`
+        // on row 2100. DataFusion filters the whole batch first, and fails to
+        // cast. A pipeline (on a single thread, which reads the chunks in
+        // order) of a native filter and a native projection (or aggregation)
+        // would evaluate both on the first chunk of 2048 rows, and divide by
+        // zero first: these operators are left to DataFusion.
+        let config = test_session_config().with_target_partitions(1);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    (0..3000).map(|i| i32::from(i != 100)),
+                )),
+                Arc::new(arrow::array::StringViewArray::from_iter_values(
+                    (0..3000).map(|i| if i == 2100 { "x" } else { "1" }),
+                )),
+            ],
+        )?;
+        let setup = async |ctx: &SessionContext| {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch.clone()]],
+            )?;
+            ctx.register_table("f", Arc::new(table))?;
+            Ok::<_, datafusion_common::DataFusionError>(())
+        };
+        for sql in [
+            "SELECT 10 / a AS x FROM f WHERE CAST(s AS INT) > 0",
+            "SELECT SUM(10 / a) AS x FROM f WHERE CAST(s AS INT) > 0",
+        ] {
+            for ctx in [
+                datafusion_context(config.clone()),
+                pipeline_context(config.clone()),
+            ] {
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let error = collect(plan, ctx.task_ctx()).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("Cannot cast string 'x'"),
+                    "{sql}: {error}"
+                );
+            }
+        }
+        // The filter alone, and the projection without the filter, are
+        // native.
+        for sql in [
+            "SELECT a FROM f WHERE CAST(s AS INT) > 0",
+            "SELECT 10 / a AS x FROM f",
+        ] {
+            let ctx = pipeline_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let root = plan.downcast_ref::<PipelineRootExec>().unwrap().operator();
+            assert_native(sql, root);
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
