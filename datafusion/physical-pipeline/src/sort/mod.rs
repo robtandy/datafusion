@@ -181,7 +181,12 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   native sort materializes runs (of up to [`SORT_RUN_ROWS`] rows) and
 ///   chunks of more rows than DataFusion's batches, whose dictionaries can
 ///   need more values, and whose runs more rows, than such keys and run ends
-///   address, where DataFusion's batches fit.
+///   address, where DataFusion's batches fit;
+/// * sort keys that evaluate to such encodings (also inside the key, e.g.
+///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`): the native sort
+///   evaluates its keys on each chunk, DataFusion on its batches, or on all
+///   rows of a small partition at once, so one of them can fail where the
+///   other does not.
 ///
 /// [`SORT_RUN_ROWS`]: sort_sink::SORT_RUN_ROWS
 ///
@@ -441,6 +446,14 @@ impl SortPlan {
         {
             return Ok(None);
         }
+        // For the same reason, keys that evaluate to such encodings: the native
+        // sort evaluates them on each chunk, DataFusion on its batches, or on
+        // all rows of a small partition at once (which it sorts together).
+        for sort_expr in ordering.iter() {
+            if evaluates_narrow_encoding(&sort_expr.expr, &input.schema())? {
+                return Ok(None);
+            }
+        }
 
         let dynamic_filter = match topk {
             true => dynamic_filter(sort, &ordering, &projections)?,
@@ -689,6 +702,25 @@ fn has_narrow_encoding(data_type: &DataType) -> bool {
             .any(|(_, field)| has_narrow_encoding(field.data_type())),
         _ => false,
     }
+}
+
+/// Whether `expr`, or an expression it evaluates, evaluates to values with a
+/// narrow encoding (see [`has_narrow_encoding`]) on rows with schema
+/// `schema`: then whether evaluating it fails depends on how many rows it is
+/// evaluated on at once.
+fn evaluates_narrow_encoding(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Result<bool> {
+    if has_narrow_encoding(&expr.data_type(schema)?) {
+        return Ok(true);
+    }
+    for child in expr.children() {
+        if evaluates_narrow_encoding(child, schema)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the values of `data_type` are floats (possibly dictionary or
@@ -1223,7 +1255,7 @@ mod tests {
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::PhysicalSortExpr;
-    use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
+    use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, col, lit};
     use datafusion_physical_plan::repartition::RepartitionExec;
     use datafusion_physical_plan::{Partitioning, execute_stream};
     use futures::StreamExt;
@@ -2187,6 +2219,130 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_by_computed_narrow_dictionaries_are_left_to_datafusion() -> Result<()>
+    {
+        // DataFusion sorts the three 64-row batches of a small partition at
+        // once, so it evaluates the key `CAST(s AS Dictionary(Int8, Utf8))` on
+        // all 192 rows, whose 192 distinct values do not fit in `Int8` keys.
+        // The native sort evaluates its keys on each chunk, of 64 rows here,
+        // and returned the rows. Sorts by keys that evaluate to narrow
+        // encodings (also inside the key) are left to DataFusion; `Int32` keys
+        // stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batches = (0..3_i64)
+            .map(|batch| {
+                let id = (0..64).map(|i| batch * 64 + i).collect::<Vec<_>>();
+                let s = id
+                    .iter()
+                    .map(|id| format!("value {id}"))
+                    .collect::<Vec<_>>();
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from(id)),
+                    Arc::new(StringArray::from(s)),
+                ];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let dictionary = |keys: DataType| {
+            DataType::Dictionary(Box::new(keys), Box::new(DataType::Utf8))
+        };
+        let cast =
+            |expr: Arc<dyn PhysicalExpr>, data_type: DataType| -> Arc<dyn PhysicalExpr> {
+                Arc::new(CastExpr::new(expr, data_type, None))
+            };
+        let s = col("s", &schema)?;
+        let keys = [
+            // (key, DataFusion fails, native)
+            (
+                cast(Arc::clone(&s), dictionary(DataType::Int8)),
+                true,
+                false,
+            ),
+            (
+                cast(
+                    cast(Arc::clone(&s), dictionary(DataType::Int8)),
+                    DataType::Utf8,
+                ),
+                true,
+                false,
+            ),
+            (
+                cast(Arc::clone(&s), dictionary(DataType::Int16)),
+                false,
+                false,
+            ),
+            (
+                cast(Arc::clone(&s), dictionary(DataType::Int32)),
+                false,
+                true,
+            ),
+        ];
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        for (key, fails, native) in keys {
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let ordering = LexOrdering::new([
+                    PhysicalSortExpr::new_default(Arc::clone(&key)),
+                    PhysicalSortExpr::new_default(col("id", &schema)?),
+                ])
+                .unwrap();
+                Ok(Arc::new(SortExec::new(ordering, scan)))
+            };
+            let root = match fails {
+                true => {
+                    assert_lowered_plan_fails_like_datafusion(
+                        make,
+                        lower,
+                        config.clone(),
+                        "Dictionary key bigger than the key type",
+                    )
+                    .await
+                }
+                false => {
+                    let task_ctx = Arc::new(
+                        datafusion_execution::TaskContext::default()
+                            .with_session_config(config.clone()),
+                    );
+                    assert_lowered_plan_byte_eq(make, lower, task_ctx, true).await
+                }
+            };
+            assert_eq!(sorts(&root) == 1, native, "{key}");
+        }
+        // The same sorts in SQL, where DataFusion simplifies `arrow_cast` into
+        // a cast.
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = MemTable::try_new(Arc::clone(&schema), vec![batches.clone()])?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        };
+        for (keys, fails, native) in [
+            (
+                "Int8",
+                Some("Dictionary key bigger than the key type"),
+                false,
+            ),
+            ("Int32", None, true),
+        ] {
+            let sql = format!(
+                "SELECT id, s FROM t ORDER BY arrow_cast(s, 'Dictionary({keys}, Utf8)'), id"
+            );
+            let root =
+                assert_outcome_like_datafusion(&sql, config.clone(), &setup, fails).await;
+            assert_eq!(sorts(&root) == 1, native, "{sql}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn merges_with_a_fetch_of_sorts_of_run_end_encoded_floats_keep_negative_zeros()
     {
         // A merge with a fetch of a sort of run-end encoded floats keeps the
@@ -2902,28 +3058,25 @@ mod tests {
     }
 
     /// Assert that `sql` (on sessions configured with `config` and set up
-    /// with `setup`) fails with a division by zero in DataFusion and lowered
-    /// with [`lower`] if `fails`, and produces the same bytes otherwise.
-    /// Returns the lowered operator tree.
+    /// with `setup`) fails with an error containing `fails` in DataFusion and
+    /// lowered with [`lower`], or produces the same bytes if `fails` is
+    /// `None`. Returns the lowered operator tree.
     async fn assert_outcome_like_datafusion<F>(
         sql: &str,
         config: SessionConfig,
         setup: F,
-        fails: bool,
+        fails: Option<&str>,
     ) -> Arc<dyn PhysicalOperator>
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        if !fails {
+        let Some(message) = fails else {
             return assert_native_byte_eq(sql, config, setup).await;
-        }
+        };
         let ctx = datafusion_context(config);
         setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
-        assert!(
-            error.to_string().contains("Divide by zero"),
-            "DataFusion: {error}"
-        );
+        assert!(error.to_string().contains(message), "DataFusion: {error}");
         let plan = ctx
             .sql(sql)
             .await
@@ -2936,10 +3089,7 @@ mod tests {
         let error = collect(exec, ctx.task_ctx())
             .await
             .expect_err("the lowered plan fails");
-        assert!(
-            error.to_string().contains("Divide by zero"),
-            "native: {error}"
-        );
+        assert!(error.to_string().contains(message), "native: {error}");
         root
     }
 
@@ -2988,6 +3138,7 @@ mod tests {
             // the threshold is known).
             ("SELECT a FROM p WHERE 10 / b > 1 ORDER BY a LIMIT 1", true),
         ] {
+            let fails = fails.then_some("Divide by zero");
             let root =
                 assert_outcome_like_datafusion(sql, config.clone(), &setup, fails).await;
             assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
