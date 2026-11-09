@@ -261,6 +261,13 @@ fn owned_rows(chunk: &DataChunk) -> Result<RecordBatch> {
 ///   of nulls, booleans, or empty lists or binaries), which `take` cannot
 ///   copy, are not cached, nor run-end encoded arrays whose child fields are
 ///   not Arrow's.
+/// * Strings, binaries, lists and maps with 32-bit offsets (`Utf8`,
+///   `Binary`, `List`, `Map`, at any depth) are not cached: their offsets
+///   overflow beyond 2 GiB of bytes (or `i32::MAX` values) in the cache,
+///   which chunks that share their buffers reach without memory (e.g. 1024
+///   rows that share a string of 2 MiB), while DataFusion may pass them on
+///   as they are (e.g. a `FilterExec` with batches of one row). Their large
+///   types are cached.
 pub fn can_cache(data_type: &DataType) -> bool {
     can_gather(data_type) && can_cache_nested(data_type, false)
 }
@@ -271,11 +278,16 @@ fn can_cache_nested(data_type: &DataType, nested: bool) -> bool {
         | DataType::RunEndEncoded(_, _)
         | DataType::ListView(_)
         | DataType::LargeListView(_) => false,
+        // Their 32-bit offsets overflow beyond 2 GiB of bytes (or `i32::MAX`
+        // values) in the cache, which the chunks it concatenates reach without
+        // memory if they share their buffers.
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(..) => {
+            false
+        }
         DataType::Utf8View | DataType::BinaryView => !nested,
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => can_cache_nested(field.data_type(), true),
+        DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            can_cache_nested(field.data_type(), true)
+        }
         DataType::Struct(fields) => fields
             .iter()
             .all(|field| can_cache_nested(field.data_type(), true)),
@@ -515,10 +527,36 @@ mod tests {
         // The coalescer compacts view arrays, but not nested ones.
         assert!(can_cache(&DataType::Utf8View));
         assert!(!can_cache(&DataType::new_list(DataType::Utf8View, true)));
-        assert!(can_cache(&DataType::new_list(DataType::Utf8, true)));
+        assert!(can_cache(&DataType::new_large_list(
+            DataType::LargeUtf8,
+            true
+        )));
         assert!(can_cache(&DataType::Struct(Fields::from(vec![
             Field::new("s", DataType::LargeUtf8, true)
         ]))));
+        // Nor strings, binaries, lists or maps with 32-bit offsets, which
+        // concatenating the rows of many chunks may overflow.
+        for data_type in [
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::new_list(DataType::Int32, true),
+            DataType::new_large_list(DataType::Utf8, true),
+            DataType::Struct(Fields::from(vec![Field::new("s", DataType::Binary, true)])),
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Int32, false),
+                        Field::new("value", DataType::Int32, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+        ] {
+            assert!(!can_cache(&data_type), "{data_type}");
+        }
+        assert!(can_cache(&DataType::LargeBinary));
         // Nor lists of values that take less than a byte each: copying them
         // with `take` overflows the 32-bit indices of the values of fixed-size
         // lists.
@@ -577,20 +615,21 @@ mod tests {
     fn cached_rows_do_not_keep_the_buffers_of_their_chunks() {
         // Chunks of 2048 strings of 128 bytes (a 262144-byte buffer), of which
         // one row is selected: a contiguous selection, which `compact` would
-        // slice without copying.
+        // slice without copying. (Strings and lists with 64-bit offsets: those
+        // with 32-bit offsets are not cached.)
+        let list = DataType::new_large_list(DataType::LargeUtf8, true);
         let schema = Arc::new(Schema::new(vec![
-            Field::new("s", DataType::Utf8, false),
-            Field::new("l", DataType::new_list(DataType::Utf8, true), true),
+            Field::new("s", DataType::LargeUtf8, false),
+            Field::new("l", list.clone(), true),
         ]));
         let chunk = |i: usize| {
             let strings = (0..2048).map(|j| format!("{:0128}", i * 2048 + j));
-            let s = StringArray::from_iter_values(strings.clone());
+            let s = arrow::array::LargeStringArray::from_iter_values(strings.clone());
             let l = arrow::array::ListArray::from_iter_primitive::<Int32Type, _, _>(
                 (0..2048).map(|j: i32| Some(vec![Some(j)])),
             );
             // A list of strings instead of integers.
-            let l = arrow::compute::cast(&l, &DataType::new_list(DataType::Utf8, true))
-                .unwrap();
+            let l = arrow::compute::cast(&l, &list).unwrap();
             let batch =
                 RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s), l]).unwrap();
             DataChunk::from_record_batch(batch)
@@ -629,7 +668,7 @@ mod tests {
             .final_execute(&ctx, &mut output, gstate.as_ref(), lstate.as_mut())
             .unwrap();
         assert_eq!(output.len(), 100);
-        let strings = output.column(0).as_string::<i32>();
+        let strings = output.column(0).as_string::<i64>();
         assert_eq!(strings.value(1), format!("{:0128}", 2048 + 7));
     }
 
@@ -663,6 +702,45 @@ mod tests {
                 .map(|b| batch(b * 10_000..(b + 1) * 10_000))
                 .collect(),
         ]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn strings_with_32_bit_offsets_are_not_cached() {
+        let _large = one_large_test_at_a_time().await;
+        // A `FilterExec` with batches of one row passes on the 1024 rows of
+        // its input as they are, which share a string of 2 MiB: the cache would
+        // concatenate them into 2 GiB of strings, whose 32-bit offsets
+        // overflow.
+        let batch = RecordBatch::try_from_iter([
+            ("x", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+            (
+                "s",
+                Arc::new(StringArray::from(vec!["x".repeat(2 << 20)])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let batches = vec![batch; 1024];
+        let schema = batches[0].schema();
+        let plan = || -> Arc<dyn datafusion_physical_plan::ExecutionPlan> {
+            Arc::new(
+                datafusion_physical_plan::filter::FilterExecBuilder::new(
+                    physical_expr("x > 0", &schema),
+                    scan_batches(&schema, &batches),
+                )
+                .with_batch_size(1)
+                .build()
+                .unwrap(),
+            )
+        };
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let expected = outcome(plan(), Arc::clone(&task_ctx)).await;
+        assert_eq!(expected, Ok(1024));
+        let cache =
+            CachingOperator::new(Arc::new(crate::bridge::BridgeOperator::new(plan())));
+        assert!(!cache.caching_supported());
+        let root =
+            crate::bridge::PipelineRootExec::try_new(Arc::new(cache), plan()).unwrap();
+        assert_eq!(outcome(Arc::new(root), task_ctx).await, expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
