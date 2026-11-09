@@ -1154,9 +1154,18 @@ pub(crate) mod test_support {
         };
         let mut batch_dependent = false;
         let mut parts = 0_usize;
+        // The dynamic filters that `plan` produces (e.g. the threshold of a
+        // TopK) compare the values of its own expressions (e.g. its sort
+        // keys), which are judged; those it is given are judged dynamic.
+        let produced = plan.dynamic_expressions_produced();
         plan.apply_expressions(&mut |expr| {
-            batch_dependent |= depends_on_batches(expr, &schema);
-            parts = parts.saturating_add(failing_parts(expr, &schema));
+            if !produced
+                .iter()
+                .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
+            {
+                batch_dependent |= depends_on_batches(expr, &schema);
+                parts = parts.saturating_add(failing_parts(expr, &schema));
+            }
             Ok(TreeNodeRecursion::Continue)
         })?;
         Ok(batch_dependent || parts > 1)
@@ -2105,6 +2114,25 @@ pub(crate) mod test_support {
             ("u", Arc::new(u) as ArrayRef),
         ])
         .unwrap()
+    }
+
+    /// `predicate` (on `schema`) in a `DynamicFilterPhysicalExpr`, whose
+    /// children are the columns that `predicate` reads (as DataFusion builds
+    /// them), not `predicate`.
+    pub(crate) fn dynamic_filter(
+        predicate: &str,
+        schema: &SchemaRef,
+    ) -> Arc<dyn PhysicalExpr> {
+        let inner = physical_expr(predicate, schema);
+        let children = datafusion_physical_expr::utils::collect_columns(&inner)
+            .into_iter()
+            .map(|column| Arc::new(column) as Arc<dyn PhysicalExpr>)
+            .collect();
+        Arc::new(
+            datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr::new(
+                children, inner,
+            ),
+        )
     }
 
     /// The types of times that Arrow has no arrays of: of microseconds or
@@ -3691,6 +3719,42 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_predicates_stay_in_datafusion() {
+        // The children of a `DynamicFilterPhysicalExpr` are the columns it
+        // reads, not the predicate it evaluates, which may change during the
+        // execution: here `x <> 0 AND 10 / x > 1`, whose errors depend on the
+        // batches (see `batch_dependent_predicates_stay_in_datafusion`),
+        // alone, or in another predicate.
+        let batch = runs(&[(0, 1848), (1, 2248)]);
+        let schema = batch.schema();
+        let dynamic = dynamic_filter("x <> 0 AND 10 / x > 1", &schema);
+        let nested: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                physical_expr("x >= 0", &schema),
+                datafusion_expr::Operator::And,
+                Arc::clone(&dynamic),
+            ));
+        for predicate in [dynamic, nested] {
+            let plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    FilterExec::try_new(Arc::clone(&predicate), scan(&batch)).unwrap(),
+                )
+            };
+            let filter_plan = plan();
+            let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(
+                error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("Divide by zero")),
+                "{predicate}: {error:?}"
+            );
+            assert_eq!(operators.filters, 0, "{predicate}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

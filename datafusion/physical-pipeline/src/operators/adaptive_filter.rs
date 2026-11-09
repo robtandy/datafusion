@@ -59,6 +59,7 @@ use std::time::Duration;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{
@@ -719,6 +720,10 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///
 /// * `expr` is volatile: it may observe how often it is evaluated, e.g. a
 ///   function that counts its calls. It is never evaluated here either;
+/// * a part of `expr` is dynamic (see `PhysicalExpr::snapshot`), e.g. a
+///   `DynamicFilterPhysicalExpr`, which a `TopK` or a join updates during the
+///   execution: its children are the columns it reads, not the expression it
+///   evaluates, which is not known before the execution;
 /// * several parts of `expr` may fail (see [`failing_parts`]): which error
 ///   DataFusion raises first depends on its batches, e.g. on a batch of
 ///   `("1", 0)` then `("invalid", 1)` rows, `CAST(s AS INT) + 10 / x` fails
@@ -773,7 +778,7 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if is_volatile(expr) || failing_parts(expr, schema) > 1 {
+    if is_volatile(expr) || is_dynamic(expr) || failing_parts(expr, schema) > 1 {
         return true;
     }
     let (fallibility, depends_on_batches) = analyze(expr, schema);
@@ -781,6 +786,15 @@ pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
         // Whoever evaluates it copies it for every row of the batch.
         || is_broadcast_constant(expr, schema)
+}
+
+/// Whether a part of `expr` is dynamic: it has a snapshot (see
+/// `PhysicalExpr::snapshot`), the expression it currently evaluates, which
+/// may change during the execution, and which its children do not show (or
+/// it fails to take one).
+fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.exists(|expr| Ok(!matches!(expr.snapshot(), Ok(None))))
+        .unwrap_or(true)
 }
 
 /// The number of the parts of `expr` that may fail (on some rows or on all of
@@ -1147,7 +1161,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, SchemaRef};
 
-    use crate::operators::filter::test_support::physical_expr;
+    use crate::operators::filter::test_support::{dynamic_filter, physical_expr};
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1727,6 +1741,24 @@ mod tests {
             state.end_chunk();
         }
         assert_eq!(state.permutation(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn dynamic_expressions_depend_on_batches() {
+        // Whatever they evaluate, also in other expressions.
+        let schema = schema();
+        let dynamic = dynamic_filter("a > 0", &schema);
+        assert!(!depends_on_batches(
+            &physical_expr("a > 0", &schema),
+            &schema
+        ));
+        assert!(depends_on_batches(&dynamic, &schema));
+        let nested: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            physical_expr("b > 0", &schema),
+            Operator::Or,
+            dynamic,
+        ));
+        assert!(depends_on_batches(&nested, &schema));
     }
 
     #[test]

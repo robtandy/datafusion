@@ -1634,6 +1634,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_expressions_stay_in_datafusion() {
+        // `ProjectionExec` evaluates `x <> 0 AND 10 / x > 1` on the batch of
+        // 1848 zeros then 2248 ones, more than 20% of which pass `x <> 0`, so
+        // it divides all rows, and fails, but a pipeline on chunks of 2048
+        // rows, the first of which has fewer than 20% of ones: a dynamic
+        // expression, whose children are not the expression it evaluates,
+        // stays in DataFusion (see `dynamic_predicates_stay_in_datafusion`).
+        let x = Int32Array::from_iter_values(
+            std::iter::repeat_n(0, 1848).chain(std::iter::repeat_n(1, 2248)),
+        );
+        let batch = RecordBatch::try_from_iter([("x", Arc::new(x) as ArrayRef)]).unwrap();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        dynamic_filter("x <> 0 AND 10 / x > 1", &schema),
+                        "b",
+                    )],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Divide by zero")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_of_types_without_arrays_stay_in_datafusion() {
         // The classification probes `u IS NULL` on a null of the type of `u`,
         // which Arrow cannot build for types it has no arrays of (but a schema
