@@ -67,6 +67,12 @@
 //! create their probe streams before they read their build side, so that the
 //! same errors are raised (e.g. of a scan of an object store that is not
 //! registered).
+//!
+//! The build rows are charged to the memory pool. DataFusion charges the
+//! batches of its build side as its input produces them (and
+//! `NestedLoopJoinExec` spills them when the pool is exhausted), so the joins
+//! are only lowered for memory pools without a limit, in which this makes no
+//! difference.
 
 use std::fmt::{self, Write};
 use std::marker::PhantomData;
@@ -89,7 +95,8 @@ use datafusion_common::{
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
+use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::reset_plan_states;
@@ -174,9 +181,6 @@ pub struct LoopJoin<K: LoopJoinKind> {
     /// reads its build side: the join creates them too (see
     /// [`LoopJoin::create_probe_streams`]), to raise the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
-    /// The number of partitions of the probe input of the DataFusion join,
-    /// which decides whether DataFusion can spill its build side.
-    probe_partitions: usize,
     kind: PhantomData<K>,
 }
 
@@ -395,10 +399,22 @@ impl PhysicalNestedLoopJoin {
     }
 
     /// Lower a DataFusion `NestedLoopJoinExec` to a [`PhysicalNestedLoopJoin`]
-    /// with the same semantics and schema. `lower_input` lowers the inputs of
-    /// the join. Returns `Ok(None)` for any other node, and for the joins that
-    /// are left to DataFusion:
+    /// with the same semantics and schema, for an execution with the runtime
+    /// `runtime`. `lower_input` lowers the inputs of the join. Returns
+    /// `Ok(None)` for any other node, and for the joins that are left to
+    /// DataFusion:
     ///
+    /// * all joins if the memory pool of `runtime` has a limit (or an unknown
+    ///   one): DataFusion charges the memory of the batches of its build side
+    ///   as its input produces them (and spills it when the pool is
+    ///   exhausted), the native join the memory of the chunks it collects,
+    ///   which are other rows (and does not spill), so that one of them could
+    ///   fail where the other does not;
+    /// * a join whose probe input cannot be copied with its own state (see
+    ///   [`PhysicalCrossJoin::try_lower`]): `NestedLoopJoinExec::execute`
+    ///   creates the streams of its probe input right away, before it reads
+    ///   its build side, which the native join does on such a copy, to raise
+    ///   the same errors, also if its build side never completes;
     /// * the joins DataFusion does not execute as a join of all rows of both
     ///   inputs: with a left input of another number of partitions than one
     ///   (DataFusion fails to execute it), and without probe partitions (the
@@ -426,6 +442,7 @@ impl PhysicalNestedLoopJoin {
     /// raise errors) where DataFusion does not.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
+        runtime: &RuntimeEnv,
         mut lower_input: F,
     ) -> Result<Option<Self>>
     where
@@ -434,7 +451,9 @@ impl PhysicalNestedLoopJoin {
         let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() else {
             return Ok(None);
         };
-        if !executes_all_rows(join.left(), join.right())
+        if !unbounded_memory(runtime)
+            || !executes_all_rows(join.left(), join.right())
+            || !probe_streams_can_be_replayed(join.right())
             || !plan.dynamic_expressions_produced().is_empty()
             || join.filter().is_some_and(|filter| {
                 !is_infallible(filter.expression(), filter.schema())
@@ -478,10 +497,12 @@ impl PhysicalCrossJoin {
     }
 
     /// Lower a DataFusion `CrossJoinExec` to a [`PhysicalCrossJoin`] with the
-    /// same semantics and schema. `lower_input` lowers the inputs of the join.
-    /// Returns `Ok(None)` for any other node, and for the joins that are left
-    /// to DataFusion: those it does not execute as a join of all rows of both
-    /// inputs, and those with narrow dictionaries or run-end encodings (see
+    /// same semantics and schema, for an execution with the runtime `runtime`.
+    /// `lower_input` lowers the inputs of the join. Returns `Ok(None)` for any
+    /// other node, and for the joins that are left to DataFusion: all joins if
+    /// the memory pool of `runtime` has a limit (or an unknown one), those it
+    /// does not execute as a join of all rows of both inputs, those with
+    /// narrow dictionaries or run-end encodings (see
     /// [`PhysicalNestedLoopJoin::try_lower`]), and those whose probe input
     /// cannot be copied with its own state (see `reset_plan_states`): with a
     /// leaf other than a scan of files or of memory, or of no rows (e.g. a
@@ -496,6 +517,7 @@ impl PhysicalCrossJoin {
     /// [`PhysicalNestedLoopJoin::try_lower`].
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
+        runtime: &RuntimeEnv,
         mut lower_input: F,
     ) -> Result<Option<Self>>
     where
@@ -504,7 +526,8 @@ impl PhysicalCrossJoin {
         let Some(join) = plan.downcast_ref::<CrossJoinExec>() else {
             return Ok(None);
         };
-        if !executes_all_rows(&join.left, &join.right)
+        if !unbounded_memory(runtime)
+            || !executes_all_rows(&join.left, &join.right)
             || has_narrow_encodings(&join.left, &join.right)
             || !probe_streams_can_be_replayed(&join.right)
         {
@@ -520,6 +543,14 @@ impl PhysicalCrossJoin {
         }
         Self::lower_inputs(spec, &join.left, &join.right, &mut lower_input)
     }
+}
+
+/// Whether the memory pool of `runtime` has no limit: DataFusion's joins and
+/// the native joins charge the memory of their build sides differently (see
+/// [`PhysicalNestedLoopJoin::try_lower`]), which only makes no difference
+/// without a limit.
+fn unbounded_memory(runtime: &RuntimeEnv) -> bool {
+    matches!(runtime.memory_pool.memory_limit(), MemoryLimit::Infinite)
 }
 
 /// Whether DataFusion executes a join of `left` and `right` (a
@@ -560,7 +591,6 @@ impl<K: LoopJoinKind> LoopJoin<K> {
             children: vec![build, probe],
             spec,
             probe_plan: None,
-            probe_partitions: 1,
             kind: PhantomData,
         }
     }
@@ -590,8 +620,7 @@ impl<K: LoopJoinKind> LoopJoin<K> {
             probe = Arc::new(BridgeOperator::new(Arc::clone(right)));
         }
         let mut join = Self::with_spec(build, probe, spec);
-        join.probe_plan = probe_streams_can_be_replayed(right).then(|| Arc::clone(right));
-        join.probe_partitions = right.output_partitioning().partition_count();
+        join.probe_plan = Some(Arc::clone(right));
         Ok(Some(join))
     }
 
@@ -642,30 +671,6 @@ impl<K: LoopJoinKind> LoopJoin<K> {
             drop(probe.execute(partition, Arc::clone(&ctx.task_ctx))?);
         }
         Ok(())
-    }
-
-    /// Whether the memory of the build side may exceed the memory pool, as
-    /// DataFusion then spills it. A `CrossJoinExec` never spills (it fails
-    /// with `ResourcesExhausted` like the native join), a
-    /// `NestedLoopJoinExec` spills its build side when the disk manager can
-    /// create temporary files, unless the coordinated fallback is disabled
-    /// for a join that emits build rows at the end over several probe
-    /// partitions. The native join does not spill: where DataFusion would, it
-    /// keeps the build side in memory beyond the limit of the pool rather than
-    /// failing.
-    fn build_may_exceed_memory_pool(&self, ctx: &ExecutionContext) -> bool {
-        if K::CROSS {
-            return false;
-        }
-        let task_ctx = &ctx.task_ctx;
-        let fallback_disabled = !task_ctx
-            .session_config()
-            .options()
-            .execution
-            .enable_nlj_coordinated_fallback
-            && self.spec.emits_final_build_rows()
-            && self.probe_partitions > 1;
-        task_ctx.runtime_env().disk_manager.tmp_files_enabled() && !fallback_disabled
     }
 
     /// Join the rows of the current probe chunk of `state` with the next
@@ -1308,9 +1313,6 @@ struct JoinState {
     batches: Mutex<Vec<RecordBatch>>,
     /// The build side, once the join is finalized.
     build: OnceLock<Arc<BuildSide>>,
-    /// Whether the memory of the build side may exceed the memory pool (see
-    /// [`LoopJoin::build_may_exceed_memory_pool`]).
-    may_exceed_memory_pool: bool,
     /// The memory of the build side.
     reservation: MemoryReservation,
     /// Whether the streams of the DataFusion probe input were created (see
@@ -1323,12 +1325,7 @@ impl GlobalSinkState for JoinState {}
 impl JoinState {
     /// Account for `bytes` more bytes of the build side.
     fn reserve(&self, bytes: usize) -> Result<()> {
-        if self.may_exceed_memory_pool {
-            self.reservation.grow(bytes);
-            Ok(())
-        } else {
-            self.reservation.try_grow(bytes)
-        }
+        self.reservation.try_grow(bytes)
     }
 
     fn build(&self, operator: &str) -> Result<Arc<BuildSide>> {
@@ -1454,7 +1451,6 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
         Ok(Arc::new(JoinState {
             batches: Mutex::new(vec![]),
             build: OnceLock::new(),
-            may_exceed_memory_pool: self.build_may_exceed_memory_pool(ctx),
             reservation,
             probe_streams: OnceLock::new(),
         }))
@@ -1743,6 +1739,7 @@ mod tests {
     };
     use arrow::datatypes::{Field, Int32Type, TimeUnit};
     use datafusion_execution::TaskContext;
+    use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
@@ -1755,7 +1752,7 @@ mod tests {
     };
     use crate::test_utils::test_session_config;
     use crate::window::test_support::{
-        assert_native_parity, assert_native_parity_with_config, lower,
+        assert_native_parity, assert_native_parity_with_config, lower, lower_for,
     };
 
     const ALL_JOIN_TYPES: [JoinType; 10] = [
@@ -2501,6 +2498,14 @@ lowered: {}",
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_that_differ_from_datafusion_are_left_to_it() -> Result<()> {
+        let runtime = RuntimeEnv::default();
+        let lower_nested_loop = |plan: &Arc<dyn ExecutionPlan>| {
+            PhysicalNestedLoopJoin::try_lower(plan, &runtime, lower)
+                .map(|join| join.is_some())
+        };
+        let lower_cross = |plan: &Arc<dyn ExecutionPlan>| {
+            PhysicalCrossJoin::try_lower(plan, &runtime, lower).map(|join| join.is_some())
+        };
         // A filter that can fail on some pairs (`lk / rk`).
         let fallible = join_filter(&["lk", "rk"], |schema| {
             Arc::new(BinaryExpr::new(
@@ -2515,7 +2520,7 @@ lowered: {}",
         });
         let plan =
             nested_loop_plan(JoinType::RightSemi, Some(fallible.clone()), None, 10, 10)?;
-        assert!(PhysicalNestedLoopJoin::try_lower(&plan, lower)?.is_none());
+        assert!(!lower_nested_loop(&plan)?);
         // Dictionaries with narrow keys.
         let schema = Arc::new(Schema::new(vec![Field::new(
             "n",
@@ -2527,7 +2532,7 @@ lowered: {}",
             Arc::new(CoalescePartitionsExec::new(data_scan("l", 3, 0))),
             narrow,
         ));
-        assert!(PhysicalCrossJoin::try_lower(&plan, lower)?.is_none());
+        assert!(!lower_cross(&plan)?);
         // A left input of several partitions, which DataFusion fails to
         // execute, and a right input without partitions, of which DataFusion
         // executes nothing.
@@ -2535,7 +2540,7 @@ lowered: {}",
             data_scan("l", 3, 0),
             data_scan("r", 3, 0),
         ));
-        assert!(PhysicalCrossJoin::try_lower(&plan, lower)?.is_none());
+        assert!(!lower_cross(&plan)?);
         let empty = MemorySourceConfig::try_new_exec(&[], data_schema("r"), None)?;
         let plan: Arc<dyn ExecutionPlan> = Arc::new(NestedLoopJoinExec::try_new(
             Arc::new(CoalescePartitionsExec::new(data_scan("l", 3, 0))),
@@ -2544,15 +2549,14 @@ lowered: {}",
             &JoinType::Left,
             None,
         )?);
-        assert!(PhysicalNestedLoopJoin::try_lower(&plan, lower)?.is_none());
-        // A probe input whose streams cannot be created on a copy: a cross
-        // join is left to DataFusion, a nested loop join does not create them.
+        assert!(!lower_nested_loop(&plan)?);
+        // A probe input whose streams cannot be created on a copy.
         let pending = pending_plan(data_schema("r"), 2)?;
         let plan: Arc<dyn ExecutionPlan> = Arc::new(CrossJoinExec::new(
             Arc::new(CoalescePartitionsExec::new(data_scan("l", 3, 0))),
             Arc::clone(&pending),
         ));
-        assert!(PhysicalCrossJoin::try_lower(&plan, lower)?.is_none());
+        assert!(!lower_cross(&plan)?);
         let plan: Arc<dyn ExecutionPlan> = Arc::new(NestedLoopJoinExec::try_new(
             Arc::new(CoalescePartitionsExec::new(data_scan("l", 3, 0))),
             pending,
@@ -2560,8 +2564,11 @@ lowered: {}",
             &JoinType::Left,
             None,
         )?);
-        let join = PhysicalNestedLoopJoin::try_lower(&plan, lower)?.unwrap();
-        assert!(join.probe_plan.is_none());
+        assert!(!lower_nested_loop(&plan)?);
+        // The same joins are native over a replayable probe input.
+        let plan = nested_loop_plan(JoinType::Left, None, None, 3, 3)?;
+        assert!(lower_nested_loop(&plan)?);
+        assert!(lower_cross(&cross_plan(3, 3)?)?);
         // Such joins behave like DataFusion's (bridged): here, both divide by
         // zero.
         let make =
@@ -2581,9 +2588,9 @@ lowered: {}",
     // Memory and limits
     // ---------------------------------------------------------------------
 
-    /// A task context with a memory pool of `limit` bytes, which can spill
-    /// (to the temporary directory of the OS) if `spill`.
-    fn limited_context(limit: usize, spill: bool) -> Result<Arc<TaskContext>> {
+    /// A runtime with a memory pool of `limit` bytes, whose disk manager can
+    /// create temporary files (to spill) if `spill`.
+    fn limited_runtime(limit: usize, spill: bool) -> Result<Arc<RuntimeEnv>> {
         use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
         use datafusion_execution::runtime_env::RuntimeEnvBuilder;
         let mut runtime = RuntimeEnvBuilder::new().with_memory_limit(limit, 1.0);
@@ -2592,73 +2599,234 @@ lowered: {}",
                 DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
             );
         }
-        Ok(Arc::new(
-            TaskContext::default()
-                .with_session_config(test_session_config())
-                .with_runtime(runtime.build_arc()?),
-        ))
+        runtime.build_arc()
     }
 
-    /// Assert that the plan `make` creates fails with an error containing
-    /// `message` in DataFusion and natively, both executed with the task
-    /// context `context` creates.
-    async fn assert_both_fail(
+    fn context_of(runtime: &Arc<RuntimeEnv>) -> Arc<TaskContext> {
+        Arc::new(
+            TaskContext::default()
+                .with_session_config(test_session_config())
+                .with_runtime(Arc::clone(runtime)),
+        )
+    }
+
+    /// Execute the plan `make` creates in DataFusion and lowered for (and
+    /// executed with) the runtime `runtime` creates (one per engine: an
+    /// executed plan may keep its reservations), and assert that both return
+    /// the same rows, or both fail with an error containing `message` if
+    /// there is one. Returns the lowered operator tree.
+    async fn assert_same_outcome(
         make: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
-        context: impl Fn() -> Result<Arc<TaskContext>>,
-        message: &str,
-    ) -> Result<()> {
+        runtime: impl Fn() -> Result<Arc<RuntimeEnv>>,
+        message: Option<&str>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        use crate::test_utils::{EngineOutput, compare_outputs};
         use datafusion_physical_plan::collect;
-        let error = collect(make()?, context()?)
-            .await
-            .expect_err("DataFusion fails");
-        assert!(error.to_string().contains(message), "DataFusion: {error}");
+        let expected_plan = make()?;
+        let expected = collect(Arc::clone(&expected_plan), context_of(&runtime()?)).await;
+        let runtime = runtime()?;
         let plan = make()?;
-        let root = lower(&plan)?;
-        let exec = Arc::new(crate::bridge::PipelineRootExec::try_new(root, plan)?);
-        let error = collect(exec, context()?)
-            .await
-            .expect_err("the native join fails");
-        assert!(error.to_string().contains(message), "native: {error}");
-        Ok(())
+        let root = lower_for(&plan, &runtime)?;
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            crate::bridge::PipelineRootExec::try_new(Arc::clone(&root), plan)?,
+        );
+        let actual = collect(Arc::clone(&exec), context_of(&runtime)).await;
+        match message {
+            Some(message) => {
+                let error = expected.expect_err("DataFusion fails");
+                assert!(error.to_string().contains(message), "DataFusion: {error}");
+                let error = actual.expect_err("the pipeline engine fails");
+                assert!(
+                    error.to_string().contains(message),
+                    "pipeline engine: {error}"
+                );
+            }
+            None => {
+                let expected = EngineOutput {
+                    schema: expected_plan.schema(),
+                    plan: expected_plan,
+                    batches: expected?,
+                    ordered: false,
+                };
+                let actual = EngineOutput {
+                    schema: exec.schema(),
+                    plan: exec,
+                    batches: actual?,
+                    ordered: false,
+                };
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\n{}", format_operator_tree(&root));
+                }
+            }
+        }
+        Ok(root)
+    }
+
+    /// A cross join of a single batch of `rows` rows of an `Int64` column
+    /// (the build side) and 3 such rows (the probe side).
+    fn int64_cross_join(rows: i64) -> Result<Arc<dyn ExecutionPlan>> {
+        let (left, right) = (int64_scan(rows)?, int64_scan(3)?);
+        Ok(Arc::new(CrossJoinExec::new(
+            Arc::new(CoalescePartitionsExec::new(left)),
+            right,
+        )))
+    }
+
+    fn int64_batch(rows: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let values = Int64Array::from_iter_values(0..rows);
+        RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap()
+    }
+
+    fn int64_scan(rows: i64) -> Result<Arc<dyn ExecutionPlan>> {
+        let batch = int64_batch(rows);
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch.clone()]],
+            batch.schema(),
+            None,
+        )?)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn build_sides_are_charged_to_the_memory_pool() -> Result<()> {
-        // A cross join does not spill: in a small pool, both fail.
-        let cross = || cross_plan(2000, 3);
-        assert_both_fail(
-            cross,
-            || limited_context(64 * 1024, true),
-            "Resources exhausted",
-        )
-        .await?;
-        // DataFusion's nested loop join spills its build side when it can:
-        // both succeed (the native join keeps its build side in memory).
+    async fn joins_with_a_memory_limit_are_left_to_datafusion() -> Result<()> {
+        // DataFusion charges the memory of the batches of its build side (32
+        // rows of `Int64`: their buffer and the array), the native join the
+        // memory of the chunks it collects: with a memory limit, the joins
+        // are left to DataFusion, also at the limit, and for build batches
+        // that the native join would collect in several chunks (3000 rows).
+        for rows in [32, 3000] {
+            let charged = int64_batch(rows).get_array_memory_size();
+            for (limit, message) in
+                [(charged - 1, Some("Resources exhausted")), (charged, None)]
+            {
+                let root = assert_same_outcome(
+                    || int64_cross_join(rows),
+                    || limited_runtime(limit, true),
+                    message,
+                )
+                .await?;
+                assert_eq!(count::<PhysicalCrossJoin>(&root), 0, "{rows} rows");
+            }
+        }
+        // DataFusion's nested loop join spills its build side when it can, or
+        // fails.
         let filter = Some(compare("lk", Operator::Lt, "rk"));
         let join = || nested_loop_plan(JoinType::Left, filter.clone(), None, 2000, 30);
-        assert_lowered_plan_byte_eq(
-            join,
-            lower,
-            limited_context(64 * 1024, true)?,
-            false,
-        )
-        .await;
-        // Without temporary files, it cannot: both fail.
-        assert_both_fail(
-            join,
-            || limited_context(64 * 1024, false),
-            "Resources exhausted",
-        )
-        .await?;
-        // With enough memory, both succeed.
-        assert_lowered_plan_byte_eq(
-            cross,
-            lower,
-            limited_context(64 * 1024 * 1024, false)?,
-            false,
-        )
-        .await;
+        for (spill, message) in [(true, None), (false, Some("Resources exhausted"))] {
+            let root =
+                assert_same_outcome(join, || limited_runtime(64 * 1024, spill), message)
+                    .await?;
+            assert_eq!(count::<PhysicalNestedLoopJoin>(&root), 0);
+        }
+        // Without a limit, the joins are native.
+        let unlimited = || Ok(Arc::new(RuntimeEnv::default()));
+        let root =
+            assert_same_outcome(|| int64_cross_join(3000), unlimited, None).await?;
+        assert_eq!(count::<PhysicalCrossJoin>(&root), 1);
+        let root = assert_same_outcome(join, unlimited, None).await?;
+        assert_eq!(count::<PhysicalNestedLoopJoin>(&root), 1);
         Ok(())
+    }
+
+    /// A plan of one partition whose `execute` fails: its streams cannot be
+    /// created on a copy (see `probe_streams_can_be_replayed`).
+    #[derive(Debug)]
+    struct FailingExec {
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
+    }
+
+    /// The error of executing a [`FailingExec`].
+    const EXECUTE_FAILURE: &str = "the plan fails when it is executed";
+
+    impl FailingExec {
+        fn new(schema: SchemaRef) -> Self {
+            use datafusion_physical_expr::EquivalenceProperties;
+            use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+            let properties = datafusion_physical_plan::PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            );
+            Self {
+                properties: Arc::new(properties),
+            }
+        }
+    }
+
+    impl datafusion_physical_plan::DisplayAs for FailingExec {
+        fn fmt_as(
+            &self,
+            _t: datafusion_physical_plan::DisplayFormatType,
+            f: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(f, "FailingExec")
+        }
+    }
+
+    impl ExecutionPlan for FailingExec {
+        fn name(&self) -> &str {
+            "FailingExec"
+        }
+
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            )
+                -> Result<datafusion_common::tree_node::TreeNodeRecursion>,
+        ) -> Result<datafusion_common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<datafusion_execution::SendableRecordBatchStream> {
+            datafusion_common::exec_err!("{EXECUTE_FAILURE}")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_inputs_that_cannot_be_copied_are_left_to_datafusion() {
+        // `NestedLoopJoinExec::execute` executes its probe input right away:
+        // with a build side that never completes, DataFusion fails at once.
+        // The probe streams of a probe input that cannot be copied cannot be
+        // created on a copy when the execution starts, so the join is left to
+        // DataFusion (natively, it would wait for its build side forever).
+        for join_type in [JoinType::Inner, JoinType::Left, JoinType::RightAnti] {
+            let make = || {
+                let pending = pending_plan(data_schema("l"), 1)?;
+                let failing = Arc::new(FailingExec::new(data_schema("r")));
+                Ok(Arc::new(NestedLoopJoinExec::try_new(
+                    pending, failing, None, &join_type, None,
+                )?) as Arc<dyn ExecutionPlan>)
+            };
+            let root = assert_lowered_plan_fails_like_datafusion(
+                make,
+                lower,
+                test_session_config(),
+                EXECUTE_FAILURE,
+            )
+            .await;
+            assert_eq!(count::<PhysicalNestedLoopJoin>(&root), 0, "{join_type}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
