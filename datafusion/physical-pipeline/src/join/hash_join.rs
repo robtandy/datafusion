@@ -1121,7 +1121,7 @@ struct JoinState {
     /// saw: rows, and a NULL key.
     probe_has_rows: AtomicBool,
     probe_has_null_key: AtomicBool,
-    /// The memory used by the build side.
+    /// The memory of the build rows.
     reservation: MemoryReservation,
 }
 
@@ -1129,11 +1129,19 @@ impl GlobalSinkState for JoinState {}
 
 enum BuildPhase {
     /// The rows combined by the threads of the build pipelines.
-    Collecting(PartitionedTupleData),
+    Collecting(Box<BuildRows>),
     /// The pointer tables are being built.
     Building(Arc<JoinHashTableBuilder>),
     /// The table is built.
     Done,
+}
+
+/// The build rows combined by the threads of the build pipelines.
+struct BuildRows {
+    data: PartitionedTupleData,
+    /// The reservation of the memory of the hash table that will index the
+    /// rows.
+    index_reservation: MemoryReservation,
 }
 
 impl JoinState {
@@ -1142,11 +1150,16 @@ impl JoinState {
     fn start_build(&self, spec: &JoinSpec) -> Result<Arc<JoinHashTableBuilder>> {
         let mut build = self.build.lock();
         match std::mem::replace(&mut *build, BuildPhase::Done) {
-            BuildPhase::Collecting(data) => {
+            BuildPhase::Collecting(rows) => {
+                let BuildRows {
+                    data,
+                    index_reservation,
+                } = *rows;
                 let builder = Arc::new(JoinHashTableBuilder::try_new(
                     data,
                     spec.num_keys(),
                     spec.null_equality,
+                    index_reservation,
                 )?);
                 *build = BuildPhase::Building(Arc::clone(&builder));
                 Ok(builder)
@@ -1167,7 +1180,6 @@ impl JoinState {
             internal_datafusion_err!("The hash table of the join is still being built")
         })?;
         let table = Arc::new(builder.finish(spec.emits_final_build_rows())?);
-        self.reservation.try_grow(table.index_memory_size())?;
         self.table
             .set(Arc::clone(&table))
             .map_err(|_| internal_datafusion_err!("The join was finalized twice"))?;
@@ -1319,10 +1331,15 @@ impl PhysicalOperator for PhysicalHashJoin {
         let radix_bits = radix_bits_for_threads(ctx.num_threads);
         let data =
             PartitionedTupleData::try_new(Arc::clone(&self.spec.layout), radix_bits)?;
-        let reservation =
-            MemoryConsumer::new("PhysicalHashJoin").register(ctx.task_ctx.memory_pool());
+        let pool = ctx.task_ctx.memory_pool();
+        let reservation = MemoryConsumer::new("PhysicalHashJoin").register(pool);
+        // The hash table reserves its memory before it allocates it.
+        let index_reservation = MemoryConsumer::new("JoinHashTable").register(pool);
         Ok(Arc::new(JoinState {
-            build: Mutex::new(BuildPhase::Collecting(data)),
+            build: Mutex::new(BuildPhase::Collecting(Box::new(BuildRows {
+                data,
+                index_reservation,
+            }))),
             table: OnceLock::new(),
             radix_bits,
             build_rows: AtomicUsize::new(0),
@@ -1423,7 +1440,7 @@ impl PhysicalOperator for PhysicalHashJoin {
             return Ok(());
         };
         match &mut *state.build.lock() {
-            BuildPhase::Collecting(global) => global.combine(data),
+            BuildPhase::Collecting(rows) => rows.data.combine(data),
             _ => internal_err!("PhysicalHashJoin received build rows after its build"),
         }
     }
@@ -3365,6 +3382,110 @@ mod tests {
                 .unwrap();
             assert!(bridged.plan().is::<DataSourceExec>());
         }
+        Ok(())
+    }
+
+    /// A memory pool without limit that records the peak memory reserved by
+    /// every consumer (by name).
+    #[derive(Debug, Default)]
+    struct PeakPool {
+        /// By consumer: the memory reserved now, and its peak.
+        reserved: Mutex<std::collections::HashMap<String, (usize, usize)>>,
+    }
+
+    impl PeakPool {
+        fn record(&self, reservation: &MemoryReservation, grown: usize, shrunk: usize) {
+            let mut reserved = self.reserved.lock();
+            let (now, peak) = reserved
+                .entry(reservation.consumer().name().to_string())
+                .or_default();
+            *now = *now + grown - shrunk;
+            *peak = (*peak).max(*now);
+        }
+
+        fn peak(&self, consumer: &str) -> usize {
+            self.reserved
+                .lock()
+                .get(consumer)
+                .map_or(0, |&(_, peak)| peak)
+        }
+    }
+
+    impl fmt::Display for PeakPool {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "PeakPool")
+        }
+    }
+
+    impl datafusion_execution::memory_pool::MemoryPool for PeakPool {
+        fn name(&self) -> &str {
+            "PeakPool"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.record(reservation, additional, 0);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.record(reservation, 0, shrink);
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> Result<()> {
+            self.grow(reservation, additional);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.reserved.lock().values().map(|&(now, _)| now).sum()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hash_tables_that_do_not_fit_the_memory_pool_are_not_allocated() -> Result<()>
+    {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        let build_batches = (0..20)
+            .map(|i| data_batch("l", i * 1000..(i + 1) * 1000, 0))
+            .collect::<Vec<_>>();
+        // A single thread, so that the memory used is deterministic.
+        let run = |pool: Arc<dyn MemoryPool>| {
+            let build_batches = build_batches.clone();
+            async move {
+                let join = join_of(
+                    source(data_schema("l"), build_batches) as _,
+                    source(data_schema("r"), vec![data_batch("r", 0..100, 0)]) as _,
+                    JoinType::Left,
+                )?;
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_memory_pool(pool)
+                    .build_arc()?;
+                let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+                with_timeout(Executor::collect(join, task_ctx, 1)).await
+            }
+        };
+        let peaks = Arc::new(PeakPool::default());
+        run(Arc::clone(&peaks) as _).await?;
+        let (rows, index) = (peaks.peak("PhysicalHashJoin"), peaks.peak("JoinHashTable"));
+        // Tables of at least twice the rows, chains and matched rows.
+        assert!(index >= 20_000 * 3 * 8 + 20_000 / 8, "{index}");
+        assert!(rows > index, "{rows}");
+        assert_eq!(peaks.reserved(), 0);
+        // The rows fit, the hash table does not: it is not allocated.
+        let err = run(Arc::new(GreedyMemoryPool::new(rows + index / 2)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("JoinHashTable"), "{err}");
+        let err = run(Arc::new(GreedyMemoryPool::new(rows + index - 1)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("JoinHashTable"), "{err}");
+        // Both fit.
+        run(Arc::new(GreedyMemoryPool::new(rows + index))).await?;
         Ok(())
     }
 

@@ -77,6 +77,7 @@ use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{
     NullEquality, Result, exec_err, internal_err, resources_datafusion_err,
 };
+use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::tuple_data::{
@@ -241,7 +242,10 @@ fn zeroed(len: usize, what: &str) -> Result<Vec<u64>> {
 }
 
 /// Build the pointer table of the partition `range` of `collection`, whose
-/// keys `matcher` compares (`key_schema` is the schema of the keys).
+/// keys `matcher` compares (`key_schema` is the schema of the keys). The
+/// memory of the table and of its chains is reserved in `reservation`
+/// before they are allocated; the scratch space of the build is bounded,
+/// it holds [`DEFAULT_VECTOR_SIZE`] rows at most.
 ///
 /// The rows are inserted in reverse order and prepended to their chain, so
 /// that the rows of a chain are in the order of the collection. A row whose
@@ -256,6 +260,7 @@ fn build_partition(
     range: &PartitionRange,
     matcher: &RowMatcher,
     key_schema: &SchemaRef,
+    reservation: &MemoryReservation,
 ) -> Result<PartitionTable> {
     let num_rows = range.rows.len();
     if num_rows == 0 {
@@ -269,120 +274,115 @@ fn build_partition(
     };
     let num_keys = matcher.key_columns().len();
     let null_equality = matcher.null_equality();
-    let mut locations = Vec::new();
-    let mut hashes = Vec::new();
-    // The rows to insert (by index in the partition).
-    let mut inserted = Vec::new();
-    locations
-        .try_reserve_exact(num_rows)
-        .and_then(|()| hashes.try_reserve_exact(num_rows))
-        .and_then(|()| inserted.try_reserve_exact(num_rows))
-        .map_err(|e| {
-            resources_datafusion_err!("Failed to allocate a JoinHashTable partition: {e}")
+    // Room for every row: the rows with a NULL key that cannot match are only
+    // skipped while they are inserted.
+    let capacity = num_rows
+        .checked_mul(2)
+        .and_then(usize::checked_next_power_of_two)
+        .map(|capacity| capacity.max(MIN_CAPACITY))
+        .ok_or_else(|| {
+            resources_datafusion_err!(
+                "JoinHashTable partition with {num_rows} rows is too large"
+            )
         })?;
-    for block in range.blocks.clone() {
-        let start = locations.len();
-        locations.extend(
-            (0..collection.block_len(block)).map(|row| RowLocation::new(block, row)),
-        );
-        for (i, row) in collection.row_refs(&locations[start..])?.iter().enumerate() {
-            hashes.push(row.hash(hash_offset));
-            // Under `NullEqualsNothing`, rows with a NULL key never match:
-            // they are kept (e.g. for the unmatched rows of an outer join),
-            // but not looked up.
-            if null_equality == NullEquality::NullEqualsNull
-                || (0..num_keys).all(|key| row.is_valid(key))
-            {
-                inserted.push(start + i);
-            }
-        }
-    }
-    if locations.len() != num_rows {
-        return internal_err!(
-            "JoinHashTable partition has {} rows, expected {num_rows}",
-            locations.len()
-        );
-    }
-    let num_entries = inserted.len();
-    let capacity = if num_entries == 0 {
-        0
-    } else {
-        num_entries
-            .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or_else(|| {
-                resources_datafusion_err!(
-                    "JoinHashTable partition with {num_entries} rows is too large"
-                )
-            })?
-            .max(MIN_CAPACITY)
-    };
+    reservation.try_grow((capacity + num_rows) * size_of::<u64>())?;
     let mut entries = zeroed(capacity, "a JoinHashTable")?;
     let mut next = zeroed(num_rows, "the chains of a JoinHashTable")?;
-    let mask = capacity.wrapping_sub(1);
+    let mask = capacity - 1;
     let key_columns = (0..num_keys).collect::<Vec<_>>();
-    inserted.reverse();
-    // The rows of the current round, with the slot at which they continue.
-    let mut pending = Vec::new();
+    let mut num_entries = 0;
+    // The rows of the current batch, their hashes, and the rows of the
+    // batch to insert in the current round, with the slot at which they
+    // continue.
+    let mut locations = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
+    let mut hashes = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
+    let mut pending = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
     // The rows that stopped at an entry with their salt, with that entry,
     // and the first row of its chain.
     let mut compared = Vec::new();
     let mut heads = Vec::new();
     let mut no_match = Vec::new();
-    for batch in inserted.chunks(DEFAULT_VECTOR_SIZE) {
-        pending.clear();
-        pending.extend(batch.iter().map(|&row| (row, hashes[row] as usize & mask)));
-        while !pending.is_empty() {
-            compared.clear();
-            heads.clear();
-            for &(row, mut slot) in &pending {
-                let salt = salt(hashes[row]);
-                loop {
-                    let current = entries[slot];
-                    if current == 0 {
-                        // The first row of a new chain.
-                        entries[slot] = entry(salt, locations[row]);
-                        break;
-                    }
-                    if entry_salt(current) == salt {
-                        compared.push((row, slot));
-                        heads.push(entry_location(current));
-                        break;
-                    }
-                    slot = (slot + 1) & mask;
+    // The rows in reverse order: the blocks in reverse order, and the rows of
+    // every block in reverse order, in batches.
+    for block in range.blocks.clone().rev() {
+        // The index in the partition of the first row of the block.
+        let first_row =
+            collection.row_index(RowLocation::new(block, 0)) - range.rows.start;
+        let mut end = collection.block_len(block);
+        while end > 0 {
+            let start = end.saturating_sub(DEFAULT_VECTOR_SIZE);
+            // The row `i` of the batch is the row `end - 1 - i` of the block.
+            locations.clear();
+            locations.extend((start..end).rev().map(|row| RowLocation::new(block, row)));
+            hashes.clear();
+            pending.clear();
+            for (i, row) in collection.row_refs(&locations)?.iter().enumerate() {
+                let hash = row.hash(hash_offset);
+                hashes.push(hash);
+                // Under `NullEqualsNothing`, rows with a NULL key never match:
+                // they are kept (e.g. for the unmatched rows of an outer
+                // join), but not inserted.
+                if null_equality == NullEquality::NullEqualsNull
+                    || (0..num_keys).all(|key| row.is_valid(key))
+                {
+                    pending.push((i, hash as usize & mask));
                 }
             }
-            if compared.is_empty() {
-                break;
+            num_entries += pending.len();
+            while !pending.is_empty() {
+                compared.clear();
+                heads.clear();
+                for &(i, mut slot) in &pending {
+                    let salt = salt(hashes[i]);
+                    loop {
+                        let current = entries[slot];
+                        if current == 0 {
+                            // The first row of a new chain.
+                            entries[slot] = entry(salt, locations[i]);
+                            break;
+                        }
+                        if entry_salt(current) == salt {
+                            compared.push((i, slot));
+                            heads.push(entry_location(current));
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
+                    }
+                }
+                if compared.is_empty() {
+                    break;
+                }
+                let rows = compared
+                    .iter()
+                    .map(|&(i, _)| locations[i])
+                    .collect::<Vec<_>>();
+                let keys = collection.gather_columns(&rows, &key_columns)?;
+                let keys = DataChunk::try_new(Arc::clone(key_schema), keys, None)?;
+                let prepared = matcher.prepare(&keys)?;
+                let mut matched = (0..compared.len() as u32).collect::<Vec<_>>();
+                no_match.clear();
+                matcher.match_prepared(
+                    &prepared,
+                    &mut matched,
+                    &heads,
+                    collection,
+                    Some(&mut no_match),
+                )?;
+                for &pair in &matched {
+                    // Prepend the row to the chain of the entry, whose first
+                    // row may have changed in this round, to a row with equal
+                    // keys.
+                    let (i, slot) = compared[pair as usize];
+                    next[first_row + end - 1 - i] = pack(entry_location(entries[slot]));
+                    entries[slot] = entry(salt(hashes[i]), locations[i]);
+                }
+                pending.clear();
+                pending.extend(no_match.iter().map(|&pair| {
+                    let (i, slot) = compared[pair as usize];
+                    (i, (slot + 1) & mask)
+                }));
             }
-            let rows = compared
-                .iter()
-                .map(|&(row, _)| locations[row])
-                .collect::<Vec<_>>();
-            let keys = collection.gather_columns(&rows, &key_columns)?;
-            let keys = DataChunk::try_new(Arc::clone(key_schema), keys, None)?;
-            let prepared = matcher.prepare(&keys)?;
-            let mut matched = (0..compared.len() as u32).collect::<Vec<_>>();
-            no_match.clear();
-            matcher.match_prepared(
-                &prepared,
-                &mut matched,
-                &heads,
-                collection,
-                Some(&mut no_match),
-            )?;
-            for &pair in &matched {
-                // Prepend the row to the chain of the entry, whose first row
-                // may have changed in this round, to a row with equal keys.
-                let (row, slot) = compared[pair as usize];
-                next[row] = pack(entry_location(entries[slot]));
-                entries[slot] = entry(salt(hashes[row]), locations[row]);
-            }
-            pending.clear();
-            pending.extend(no_match.iter().map(|&pair| {
-                let (row, slot) = compared[pair as usize];
-                (row, (slot + 1) & mask)
-            }));
+            end = start;
         }
     }
     Ok(PartitionTable {
@@ -412,6 +412,9 @@ pub struct JoinHashTableBuilder {
     /// The number of partitions claimed by [`Self::build_next_partition`].
     claimed: AtomicUsize,
     built: Vec<OnceLock<PartitionTable>>,
+    /// The memory of the pointer tables, the chains and the matched rows,
+    /// reserved before they are allocated.
+    reservation: MemoryReservation,
 }
 
 impl fmt::Debug for JoinHashTableBuilder {
@@ -429,10 +432,16 @@ impl JoinHashTableBuilder {
     /// columns are the join keys, compared with `null_equality`. The layout
     /// of the rows must have a hash slot holding the hash of the keys (see
     /// [`hash_join_keys`]), by which the rows were partitioned.
+    ///
+    /// The memory of the pointer tables, of the chains and of the matched
+    /// rows is reserved in `reservation` before it is allocated (the memory
+    /// of the rows is not: the caller accounts for it). The table keeps the
+    /// reservation as long as it lives.
     pub fn try_new(
         data: PartitionedTupleData,
         num_keys: usize,
         null_equality: NullEquality,
+        reservation: MemoryReservation,
     ) -> Result<Self> {
         let layout = data.layout();
         if !layout.has_hash() {
@@ -481,6 +490,7 @@ impl JoinHashTableBuilder {
             partitions,
             claimed: AtomicUsize::new(0),
             built,
+            reservation,
         })
     }
 
@@ -518,6 +528,7 @@ impl JoinHashTableBuilder {
                 range,
                 &self.matcher,
                 &self.key_schema,
+                &self.reservation,
             )?;
             if self.built[partition].set(table).is_err() {
                 return internal_err!(
@@ -540,18 +551,25 @@ impl JoinHashTableBuilder {
             partitions,
             built,
             claimed: _,
+            reservation,
         } = self;
         let tables = built
             .into_iter()
             .zip(&partitions)
             .map(|(built, range)| match built.into_inner() {
                 Some(table) => Ok(table),
-                None => build_partition(&collection, range, &matcher, &key_schema),
+                None => build_partition(
+                    &collection,
+                    range,
+                    &matcher,
+                    &key_schema,
+                    &reservation,
+                ),
             })
             .collect::<Result<Vec<_>>>()?;
         let num_entries = tables.iter().map(|table| table.num_entries).sum();
         let matched = track_matches
-            .then(|| MatchedRows::try_new(collection.len()))
+            .then(|| MatchedRows::try_new(collection.len(), &reservation))
             .transpose()?;
         Ok(JoinHashTable {
             collection,
@@ -560,6 +578,7 @@ impl JoinHashTableBuilder {
             partitions: tables,
             num_entries,
             matched,
+            reservation,
         })
     }
 }
@@ -571,8 +590,11 @@ struct MatchedRows {
 }
 
 impl MatchedRows {
-    fn try_new(num_rows: usize) -> Result<Self> {
+    /// The bitset of `num_rows` rows, whose memory is reserved in
+    /// `reservation` before it is allocated.
+    fn try_new(num_rows: usize, reservation: &MemoryReservation) -> Result<Self> {
         let num_words = num_rows.div_ceil(64);
+        reservation.try_grow(num_words * size_of::<AtomicU64>())?;
         let mut words = Vec::new();
         words.try_reserve_exact(num_words).map_err(|e| {
             resources_datafusion_err!(
@@ -618,6 +640,8 @@ pub struct JoinHashTable {
     num_entries: usize,
     /// The rows that found a match, if tracked.
     matched: Option<MatchedRows>,
+    /// The memory of the pointer tables, the chains and the matched rows.
+    reservation: MemoryReservation,
 }
 
 impl fmt::Debug for JoinHashTable {
@@ -639,8 +663,9 @@ impl JoinHashTable {
         num_keys: usize,
         null_equality: NullEquality,
         track_matches: bool,
+        reservation: MemoryReservation,
     ) -> Result<Self> {
-        JoinHashTableBuilder::try_new(data, num_keys, null_equality)?
+        JoinHashTableBuilder::try_new(data, num_keys, null_equality, reservation)?
             .finish(track_matches)
     }
 
@@ -688,6 +713,13 @@ impl JoinHashTable {
     /// Whether the table tracks the rows that found a match.
     pub fn tracks_matches(&self) -> bool {
         self.matched.is_some()
+    }
+
+    /// The memory reserved for the pointer tables, the chains and the
+    /// matched rows, i.e. for the table without its rows (see
+    /// [`TupleDataCollection::memory_size`]).
+    pub fn reserved_memory(&self) -> usize {
+        self.reservation.size()
     }
 
     /// The memory used by the pointer tables, the chains and the matched
@@ -1046,6 +1078,15 @@ mod tests {
         StringViewArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema, SchemaRef};
+    use datafusion_execution::memory_pool::{
+        GreedyMemoryPool, MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+    };
+
+    /// A reservation of a pool without limit.
+    fn reservation() -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("JoinHashTable").register(&pool)
+    }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1123,7 +1164,8 @@ mod tests {
             global.combine(local).unwrap();
         }
         let builder =
-            JoinHashTableBuilder::try_new(global, num_keys, null_equality).unwrap();
+            JoinHashTableBuilder::try_new(global, num_keys, null_equality, reservation())
+                .unwrap();
         // Build a partition "in parallel", the others in `finish`.
         builder.build_next_partition().unwrap();
         builder.finish(true).unwrap()
@@ -1516,12 +1558,95 @@ mod tests {
     }
 
     #[test]
+    fn the_index_memory_is_reserved_before_it_is_allocated() {
+        // 20,000 rows in 8 partitions, NULL keys included.
+        let batches = (0..10)
+            .map(|b| {
+                let keys = (0..2000)
+                    .map(|i| (i % 13 != 0).then_some(b * 2000 + i))
+                    .collect();
+                batch_with_values(keys, i64::from(b) * 2000)
+            })
+            .collect::<Vec<_>>();
+        let data = || {
+            let layout = layout(schema(), 512);
+            let mut data = PartitionedTupleData::try_new(layout, 3).unwrap();
+            for batch in &batches {
+                let chunk = DataChunk::from_record_batch(batch.clone());
+                data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+            }
+            data
+        };
+        let builder = |pool: &Arc<dyn MemoryPool>| {
+            let reservation = MemoryConsumer::new("JoinHashTable").register(pool);
+            JoinHashTableBuilder::try_new(
+                data(),
+                1,
+                NullEquality::NullEqualsNothing,
+                reservation,
+            )
+            .unwrap()
+        };
+
+        // Without limit, the reservation holds exactly the memory of the
+        // pointer tables, the chains and the matched rows, until the table
+        // is dropped.
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let unlimited = builder(&pool);
+        assert!(unlimited.build_next_partition().unwrap());
+        let table = unlimited.finish(true).unwrap();
+        let index = table.index_memory_size();
+        // Tables of at least twice the rows, chains and matched rows.
+        assert!(index >= 20_000 * 3 * 8 + 20_000 / 8, "{index}");
+        assert_eq!(table.reserved_memory(), index);
+        assert_eq!(pool.reserved(), index);
+        drop(table);
+        assert_eq!(pool.reserved(), 0);
+
+        // With a limit, the build fails before it allocates more than the
+        // limit allows, while building the partitions in parallel or when
+        // finishing the table.
+        for limit in [0, 1000, index / 2, index - 1] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let limited = builder(&pool);
+            let mut result = Ok(true);
+            while matches!(result, Ok(true)) {
+                result = limited.build_next_partition();
+                assert!(pool.reserved() <= limit);
+            }
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => limited.finish(true).unwrap_err(),
+            };
+            assert!(
+                matches!(
+                    err,
+                    datafusion_common::DataFusionError::ResourcesExhausted(_)
+                ),
+                "{err}"
+            );
+            assert!(err.to_string().contains("JoinHashTable"), "{err}");
+            assert!(pool.reserved() <= limit);
+        }
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(index));
+        assert_eq!(
+            builder(&pool).finish(true).unwrap().reserved_memory(),
+            index
+        );
+    }
+
+    #[test]
     fn empty_tables_and_invalid_builders() {
         let layout = layout(schema(), 16);
         let data = PartitionedTupleData::try_new(Arc::clone(&layout), 3).unwrap();
-        let table =
-            JoinHashTable::try_new(data, 1, NullEquality::NullEqualsNothing, false)
-                .unwrap();
+        let table = JoinHashTable::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            false,
+            reservation(),
+        )
+        .unwrap();
         assert!(table.is_empty());
         assert_eq!(table.num_rows(), 0);
         assert!(!table.tracks_matches());
@@ -1538,9 +1663,13 @@ mod tests {
         let nulls = batch(vec![None, None, None]);
         let chunk = DataChunk::from_record_batch(nulls.clone());
         data.append_chunk(&chunk, &hashes(&nulls, 1)).unwrap();
-        let builder =
-            JoinHashTableBuilder::try_new(data, 1, NullEquality::NullEqualsNothing)
-                .unwrap();
+        let builder = JoinHashTableBuilder::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            reservation(),
+        )
+        .unwrap();
         assert_eq!(builder.num_rows(), 3);
         assert_eq!(builder.num_partitions(), 4);
         assert_eq!(builder.num_partitions_with_rows(), 1);
@@ -1555,8 +1684,13 @@ mod tests {
         let without_hash = Arc::new(TupleDataLayout::try_new(schema(), false).unwrap());
         let data = PartitionedTupleData::try_new(without_hash, 0).unwrap();
         assert!(
-            JoinHashTableBuilder::try_new(data, 1, NullEquality::NullEqualsNothing)
-                .is_err()
+            JoinHashTableBuilder::try_new(
+                data,
+                1,
+                NullEquality::NullEqualsNothing,
+                reservation()
+            )
+            .is_err()
         );
         for num_keys in [0, 3] {
             let data = PartitionedTupleData::try_new(Arc::clone(&layout), 0).unwrap();
@@ -1564,6 +1698,7 @@ mod tests {
                 data,
                 num_keys,
                 NullEquality::NullEqualsNothing,
+                reservation(),
             );
             assert!(builder.is_err(), "{num_keys} keys");
         }
