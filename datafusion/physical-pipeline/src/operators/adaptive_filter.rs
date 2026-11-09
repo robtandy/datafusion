@@ -801,6 +801,11 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   without compiling it, so `s ILIKE CASE WHEN x THEN 'sss…' ELSE p END`
 ///   fails on a batch with rows of both branches (the pattern is too big to
 ///   compile), not on a chunk whose rows all take the first one;
+/// * a `CASE` of `expr` returns unions (at any depth): it merges the values of
+///   its branches with nulls for the rows that none takes, which Arrow cannot
+///   do with unions without nullable fields, so
+///   `CASE b WHEN true THEN u END` fails on a batch with rows of both kinds,
+///   not on chunks whose rows all take the branch, or none;
 /// * a part of `expr` is opaque to the classification (e.g. a function):
 ///   whatever it returns, its implementation may fail depending on the rows
 ///   it is evaluated on together, e.g. `repeat` fails on more than 4 GiB of
@@ -918,6 +923,15 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
         // on some batches and an array on others, whether it fails depends on
         // them.
         || (matches_patterns(expr) && expr.children().into_iter().any(may_change_shape))
+        // `CASE` merges the values of its branches with nulls for the rows
+        // that none takes, which Arrow cannot do with unions without nullable
+        // fields (a union has no nulls of its own): whether it merges any
+        // depends on the batch (all rows of a chunk may take a branch, or
+        // none).
+        || (expr.is::<CaseExpr>()
+            && expr
+                .data_type(schema)
+                .is_ok_and(|data_type| contains_unions(&data_type)))
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -960,6 +974,25 @@ fn may_change_shape(expr: &Arc<dyn PhysicalExpr>) -> bool {
             }))
     })
     .unwrap_or(true)
+}
+
+/// Whether arrays of `data_type` contain unions, at any depth.
+fn contains_unions(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(..) => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_unions(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_unions(field.data_type())),
+        DataType::Dictionary(_, values) => contains_unions(values),
+        DataType::RunEndEncoded(_, values) => contains_unions(values.data_type()),
+        _ => false,
+    }
 }
 
 /// Whether `expr` matches strings with patterns: `LIKE` and the regular
@@ -1927,6 +1960,44 @@ mod tests {
             state.end_chunk();
         }
         assert_eq!(state.permutation(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn cases_of_unions_depend_on_batches() {
+        let union = DataType::Union(
+            arrow::datatypes::UnionFields::try_new(
+                [0],
+                [Field::new("i", DataType::Int32, false)],
+            )
+            .unwrap(),
+            UnionMode::Dense,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Boolean, true),
+            Field::new("u", union.clone(), false),
+            Field::new(
+                "t",
+                DataType::Struct(vec![Field::new("u", union, false)].into()),
+                true,
+            ),
+        ]));
+        let case = |then: &str| -> Arc<dyn PhysicalExpr> {
+            Arc::new(
+                CaseExpr::try_new(
+                    None,
+                    vec![(physical_expr("b", &schema), physical_expr(then, &schema))],
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        assert!(depends_on_batches(&case("u"), &schema));
+        assert!(depends_on_batches(&case("t"), &schema));
+        assert!(!depends_on_batches(&case("1"), &schema));
+        assert!(!depends_on_batches(
+            &physical_expr("u IS NULL", &schema),
+            &schema
+        ));
     }
 
     #[test]

@@ -1668,6 +1668,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cases_of_unions_stay_in_datafusion() {
+        // `ProjectionExec` evaluates `CASE b WHEN true THEN u END` on the
+        // batch, which merges unions without nullable fields with nulls, and
+        // fails, but a pipeline on chunks whose rows all take the branch, or
+        // none does (see the test of the same name for filters).
+        let batch = unions_without_nulls();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(case_of_unions(&schema), "c")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome.as_ref().is_err_and(|error| error
+                .contains("Cannot extend a union with no nullable fields with nulls")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn projections_above_filters_between_failures_keep_their_errors() {
         // `FilterExec(x >= 0)` pulls both batches of its input, and the cast of
         // the second one fails, before the projection above it divides by zero

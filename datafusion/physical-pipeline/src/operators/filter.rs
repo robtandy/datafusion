@@ -2334,6 +2334,45 @@ pub(crate) mod test_support {
         LARGE.lock().await
     }
 
+    /// A batch of 4096 rows of `b` (`Boolean`), `true` on the first 2048 rows
+    /// and `false` on the others, and of `u`, a dense union of a single field
+    /// of integers that is not nullable: a union without nulls.
+    pub(crate) fn unions_without_nulls() -> RecordBatch {
+        let b =
+            arrow::array::BooleanArray::from_iter((0..4096).map(|row| Some(row < 2048)));
+        let fields = arrow::datatypes::UnionFields::try_new(
+            [0],
+            [Field::new("i", DataType::Int32, false)],
+        )
+        .unwrap();
+        let u = arrow::array::UnionArray::try_new(
+            fields,
+            vec![0_i8; 4096].into(),
+            Some((0..4096).collect()),
+            vec![Arc::new(Int32Array::from_iter_values(0..4096))],
+        )
+        .unwrap();
+        RecordBatch::try_from_iter([
+            ("b", Arc::new(b) as ArrayRef),
+            ("u", Arc::new(u) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// `CASE b WHEN true THEN u END` (see [`unions_without_nulls`]): `CASE`
+    /// merges `u` with nulls for the other rows, which Arrow cannot do with a
+    /// union without nullable fields.
+    pub(crate) fn case_of_unions(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            datafusion_physical_expr::expressions::CaseExpr::try_new(
+                Some(physical_expr("b", schema)),
+                vec![(physical_expr("true", schema), physical_expr("u", schema))],
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
     /// One partition of two batches of 2048 rows, `(x, s) = (0, "1")` then
     /// `(0, "invalid")`, projected by `x, CAST(s AS BIGINT) AS c, length(s) AS
     /// l` (which stays in DataFusion: `length` is a function), and filtered by
@@ -4077,6 +4116,34 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cases_of_unions_stay_in_datafusion() {
+        // On the batch of `FilterExec`, `CASE` merges the unions of the rows
+        // with `b` with nulls for the others, and fails: their union has no
+        // nullable field. On the chunks of the native filter, all rows take
+        // the branch, or none does: `CASE` merges nothing.
+        let batch = unions_without_nulls();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let predicate =
+                Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
+                    case_of_unions(&schema),
+                ));
+            Arc::new(FilterExec::try_new(predicate, scan(&batch)).unwrap())
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome.as_ref().is_err_and(|error| error
+                .contains("Cannot extend a union with no nullable fields with nulls")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
