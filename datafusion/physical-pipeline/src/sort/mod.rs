@@ -70,14 +70,23 @@ use arrow::compute::{SortColumn, concat, lexsort_to_indices, take, take_arrays};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{RowConverter, SortField};
 use arrow_select::interleave::interleave;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, exec_datafusion_err, internal_err};
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_expr::Operator;
 use datafusion_physical_expr::LexOrdering;
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, IsNotNullExpr, IsNullExpr, Literal,
+    NotExpr,
+};
 use datafusion_physical_expr::projection::update_expr;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
     ReplaceChildrenOptions,
@@ -146,6 +155,12 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   its threshold does not discard entirely, and its threshold compares
 ///   `-0.0 = 0.0` while it sorts `-0.0` first, so which keys it evaluates and
 ///   which rows it returns depend on the order of its batches;
+/// * TopKs whose dynamic filter DataFusion pushed into a node below them (e.g.
+///   a Parquet scan), if that node or a node between it and the TopK
+///   evaluates an expression that can fail, or is not a scan, projection,
+///   filter, union, merge or repartition of partitions: the filter prunes the
+///   rows of that node as the threshold tightens, which happens at other
+///   times in DataFusion than natively, so these nodes process other rows;
 /// * merges over projections whose keys, or the keys of whose sort, can fail
 ///   to evaluate: the native sort evaluates only the keys of the top merge;
 /// * merges without projections with a key that can fail to evaluate and is
@@ -346,6 +361,19 @@ impl SortPlan {
         {
             return Ok(None);
         }
+        // The dynamic filter of DataFusion's TopK prunes the rows of the nodes
+        // that consume it as the threshold tightens, at other times than the
+        // native TopK does: such TopKs are left to DataFusion if the work on
+        // the pruned rows can fail.
+        if sort.fetch().is_some()
+            && let Some(filter_id) = sort
+                .dynamic_expressions_produced()
+                .iter()
+                .find_map(|expr| expr.expression_id())
+            && pruned_work_cannot_fail(sort_input, filter_id)? == Some(false)
+        {
+            return Ok(None);
+        }
         // Over a sort without fetch, a merge with a fetch reads the sorted rows
         // of all of the input, whose keys are all evaluated: the native operator
         // is a TopK, which discards rows before it evaluates their keys, only if
@@ -514,9 +542,79 @@ fn dynamic_filter(
     Ok(Some(TopKDynamicFilter::new(filter, keys)))
 }
 
-/// Whether `expr` cannot fail to evaluate: a column or a literal.
+/// Whether `expr` cannot fail to evaluate: a column, a literal, a dynamic
+/// filter (which compares columns with literals), or a comparison, boolean
+/// combination, negation or null check of such expressions.
 fn cannot_fail_to_evaluate(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    expr.is::<Column>() || expr.is::<Literal>()
+    if expr.is::<Column>()
+        || expr.is::<Literal>()
+        || expr.is::<DynamicFilterPhysicalExpr>()
+    {
+        return true;
+    }
+    let infallible = match expr.downcast_ref::<BinaryExpr>() {
+        Some(binary) => matches!(
+            binary.op(),
+            Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq
+                | Operator::IsDistinctFrom
+                | Operator::IsNotDistinctFrom
+                | Operator::And
+                | Operator::Or
+        ),
+        None => {
+            expr.is::<NotExpr>() || expr.is::<IsNullExpr>() || expr.is::<IsNotNullExpr>()
+        }
+    };
+    infallible && expr.children().into_iter().all(cannot_fail_to_evaluate)
+}
+
+/// How the dynamic filter with id `filter_id` of a TopK whose input is `plan`
+/// affects `plan`: the nodes that consume the filter (e.g. a Parquet scan)
+/// skip the rows that it rejects, so which rows they, and the nodes between
+/// them and the TopK, process depends on when the threshold of the TopK
+/// tightens, which differs between DataFusion and the native TopK.
+///
+/// Returns `None` if no node of `plan` consumes the filter, `Some(true)` if
+/// the nodes that consume it and the nodes above them only pass rows through
+/// (scans, projections, filters, unions, merges and repartitions of
+/// partitions) and only evaluate expressions that cannot fail, so that
+/// skipping rows makes no difference but in speed, and `Some(false)`
+/// otherwise.
+fn pruned_work_cannot_fail(
+    plan: &Arc<dyn ExecutionPlan>,
+    filter_id: u64,
+) -> Result<Option<bool>> {
+    let mut consumes = false;
+    let mut cannot_fail = true;
+    plan.apply_expressions(&mut |expr| {
+        expr.apply(|expr| {
+            consumes |= expr.expression_id() == Some(filter_id);
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        cannot_fail &= cannot_fail_to_evaluate(expr);
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let mut below = None;
+    for child in plan.children() {
+        if let Some(safe) = pruned_work_cannot_fail(child, filter_id)? {
+            below = Some(below.unwrap_or(true) && safe);
+        }
+    }
+    if !consumes && below.is_none() {
+        return Ok(None);
+    }
+    let passes_rows = plan.is::<DataSourceExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<RepartitionExec>();
+    Ok(Some(below.unwrap_or(true) && passes_rows && cannot_fail))
 }
 
 /// Whether no key of `ordering` can fail to evaluate.
@@ -1034,8 +1132,11 @@ mod tests {
     };
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::{data_batch, data_schema, write_parquet};
-    use crate::test_utils::{datafusion_context, test_session_config, test_table_t1};
+    use crate::test_utils::{
+        datafusion_context, run_sql, test_session_config, test_table_t1,
+    };
     use datafusion::datasource::MemTable;
+    use datafusion::prelude::SessionConfig;
     use datafusion_physical_plan::collect;
 
     // ---------------------------------------------------------------------
@@ -2140,6 +2241,8 @@ mod tests {
             "SELECT * FROM t1 ORDER BY b, id LIMIT 5000",
             "SELECT * FROM t1 ORDER BY b, id LIMIT 6000",
             "SELECT id, a + b AS s FROM t1 ORDER BY s DESC, id LIMIT 33",
+            // Keys that cannot fail although they are not columns.
+            "SELECT id, a FROM t1 ORDER BY a > 0 DESC, a IS NULL, id LIMIT 30",
             // Ties of rows that are identical in the output.
             "SELECT a, e FROM t1 ORDER BY a, e LIMIT 1000",
             "SELECT d FROM t1 ORDER BY d DESC LIMIT 2600",
@@ -2224,6 +2327,8 @@ mod tests {
             "SELECT d AS x, SUM(b) AS s FROM t1 GROUP BY d ORDER BY x DESC",
             "SELECT e, f, COUNT(DISTINCT a) AS da FROM t1 GROUP BY e, f ORDER BY f, e",
             "SELECT a, SUM(b) AS s FROM t1 GROUP BY a ORDER BY s DESC, a LIMIT 20",
+            // A projection that cannot fail although it computes a value.
+            "SELECT d, COUNT(*) > 800 AS big, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
         ] {
             let root = assert_parity(sql).await;
             let tree = format_operator_tree(&root);
@@ -2388,6 +2493,113 @@ mod tests {
         .await;
         assert_eq!(sorts(&root), 1);
         let _ = values_schema();
+    }
+
+    /// Assert that `sql` (on sessions configured with `config` and set up
+    /// with `setup`) fails with a division by zero in DataFusion and lowered
+    /// with [`lower`] if `fails`, and produces the same bytes otherwise.
+    /// Returns the lowered operator tree.
+    async fn assert_outcome_like_datafusion<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        fails: bool,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        if !fails {
+            return assert_native_byte_eq(sql, config, setup).await;
+        }
+        let ctx = datafusion_context(config);
+        setup(&ctx).await.expect("setup");
+        let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
+        assert!(
+            error.to_string().contains("Divide by zero"),
+            "DataFusion: {error}"
+        );
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let root = lower(&plan).unwrap();
+        let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan).unwrap());
+        let error = collect(exec, ctx.task_ctx())
+            .await
+            .expect_err("the lowered plan fails");
+        assert!(
+            error.to_string().contains("Divide by zero"),
+            "native: {error}"
+        );
+        root
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_dynamic_filter_prunes_work_that_can_fail_are_left_to_datafusion()
+    -> Result<()> {
+        // 20 Parquet files of 500 rows `(a, b)`, in order of `a`, with `b = 1`
+        // but `b = 0` for one row of the second file. The dynamic filter of the
+        // TopK prunes the files that its threshold rules out: DataFusion's
+        // TopK, on a single partition, tightens it after the first file, so
+        // its scan never evaluates `10 / b` on the second one. The native TopK
+        // tightens it later (and its scan reads files on several threads), so
+        // which rows the scan evaluates `10 / b` on differs: such TopKs are
+        // left to DataFusion.
+        let dir = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        for file in 0..20_i64 {
+            let a = (file * 500..(file + 1) * 500).collect::<Vec<_>>();
+            let b = a.iter().map(|&a| i64::from(a != 750)).collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(a)), Arc::new(Int64Array::from(b))],
+            )?;
+            let path = dir.path().join(format!("p/{file:02}.parquet"));
+            write_parquet(&path, Arc::clone(&schema), &[batch], None)?;
+        }
+        let path = dir
+            .path()
+            .join("p")
+            .to_str()
+            .expect("a UTF-8 path")
+            .to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        let config = test_session_config().with_target_partitions(1);
+        for (sql, fails) in [
+            // `10 / b` is pushed into the scan: DataFusion never evaluates it on
+            // the second file.
+            ("SELECT a, 10 / b AS q FROM p ORDER BY a LIMIT 1", false),
+            // DataFusion's filter evaluates it on the second file (read before
+            // the threshold is known).
+            ("SELECT a FROM p WHERE 10 / b > 1 ORDER BY a LIMIT 1", true),
+        ] {
+            let root =
+                assert_outcome_like_datafusion(sql, config.clone(), &setup, fails).await;
+            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+        }
+        // Work that cannot fail: the native TopK updates the dynamic filter.
+        for sql in [
+            "SELECT a, b FROM p ORDER BY a LIMIT 1",
+            "SELECT a FROM p WHERE b > 0 AND a IS NOT NULL ORDER BY a DESC LIMIT 3",
+        ] {
+            let root = assert_native_byte_eq(sql, config.clone(), &setup).await;
+            assert_eq!(
+                count::<PhysicalTopK>(&root),
+                1,
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

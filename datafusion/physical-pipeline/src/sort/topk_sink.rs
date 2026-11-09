@@ -37,9 +37,12 @@
 //! The rows that the threshold discards are never sorted, so their sort keys
 //! are only evaluated by the threshold predicate.
 //! [`try_lower`](super::try_lower) therefore lowers to a TopK only if its sort
-//! keys cannot fail to evaluate (columns and literals): which rows' keys
+//! keys cannot fail to evaluate (e.g. columns and literals): which rows' keys
 //! DataFusion evaluates differs, and a key that fails on a discarded row
-//! would fail in one engine but not in the other.
+//! would fail in one engine but not in the other. Likewise, the dynamic filter
+//! prunes rows of the scans below the TopK at other times than DataFusion's
+//! TopK does: the TopK is lowered only if the work on the rows it prunes
+//! cannot fail.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
