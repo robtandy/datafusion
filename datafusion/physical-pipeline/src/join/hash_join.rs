@@ -521,10 +521,12 @@ impl PhysicalHashJoin {
     ///   emits any of their rows, while a native join evaluates them chunk by
     ///   chunk and emits as it goes, so that it could stop (e.g. under a
     ///   limit) before it evaluates them on rows on which DataFusion fails;
-    /// * a join whose single build key of an integer type fails without any
-    ///   row (e.g. `1 / 0`): DataFusion evaluates such a key on every build
-    ///   batch as it collects them (to compute its bounds), also on an empty
-    ///   one, which a native join does not see;
+    /// * a join whose single build key of an integer type can fail on some
+    ///   rows (e.g. `1 / k`): DataFusion evaluates such a key on every whole
+    ///   build batch as it collects them (to compute its bounds), also on an
+    ///   empty one, while a native join evaluates it chunk by chunk, so that
+    ///   it could stop (e.g. canceled by a limit above) before it reaches the
+    ///   rows on which DataFusion fails;
     /// * a join whose probe keys fail without any row (e.g. `1 / 0`):
     ///   DataFusion evaluates them on every batch of its probe side, also on
     ///   an empty one, which a native join, called with the non-empty chunks
@@ -661,11 +663,6 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        // DataFusion evaluates the build keys that it does not defer (see
-        // `JoinSpec::defers_build_key_errors`) on every build batch, also on
-        // an empty one, which the native join, called with the non-empty
-        // chunks of its build side, does not see: keys that fail without any
-        // row are left to DataFusion.
         // DataFusion concatenates its whole build side (all its columns, also
         // those the join does not need), which fails if a dictionary needs
         // more keys, or run-end encoded values more run ends, than their types
@@ -685,10 +682,16 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        let empty_build = RecordBatch::new_empty(join.left().schema());
+        // DataFusion evaluates the build keys that it does not defer (see
+        // `JoinSpec::defers_build_key_errors`) on every build batch as it
+        // collects it (to compute their bounds): on whole batches, also on
+        // empty ones, while a native join evaluates them on the non-empty
+        // chunks of its build side, so that it could stop (e.g. when a limit
+        // above cancels the join) before it evaluates them on rows on which
+        // DataFusion fails. Such keys that can fail are left to DataFusion.
+        let build_schema = join.left().schema();
         if !spec.defers_build_key_errors
-            && evaluate_expressions_to_arrays(build_keys.iter().copied(), &empty_build)
-                .is_err()
+            && build_keys.iter().any(|key| can_fail(key, &build_schema))
         {
             return Ok(None);
         }
@@ -5028,7 +5031,8 @@ mod tests {
 
         // The bounds of a single key of an integer type (a candidate for a
         // perfect hash join) are computed on every build batch, as it is
-        // collected: both engines fail right away.
+        // collected: both engines fail right away (the join is left to
+        // DataFusion, see `eagerly_evaluated_build_keys_that_can_fail`).
         let root = assert_lowered_plan_fails_like_datafusion(
             || limit_over_delayed_42(join(1, false)?),
             lower_with_limit,
@@ -5036,7 +5040,139 @@ mod tests {
             "Divide by zero",
         )
         .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    /// A memory pool without limit that signals `signal` when a reservation
+    /// of the consumer `consumer` grows for the first time.
+    #[derive(Debug)]
+    struct SignalingPool {
+        consumer: &'static str,
+        signal: Arc<tokio::sync::Notify>,
+        signaled: AtomicBool,
+        reserved: AtomicUsize,
+    }
+
+    impl fmt::Display for SignalingPool {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "SignalingPool")
+        }
+    }
+
+    impl MemoryPool for SignalingPool {
+        fn name(&self) -> &str {
+            "SignalingPool"
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            if reservation.consumer().name() == self.consumer
+                && !self.signaled.swap(true, Ordering::Relaxed)
+            {
+                self.signal.notify_one();
+            }
+            self.reserved.fetch_add(additional, Ordering::Relaxed);
+        }
+
+        fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
+            self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+        }
+
+        fn try_grow(
+            &self,
+            reservation: &MemoryReservation,
+            additional: usize,
+        ) -> Result<()> {
+            self.grow(reservation, additional);
+            Ok(())
+        }
+
+        fn reserved(&self) -> usize {
+            self.reserved.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn eagerly_evaluated_build_keys_that_can_fail_are_left_to_datafusion()
+    -> Result<()> {
+        // A `RightSemi` join on `1 / k`, whose build side is a single batch of
+        // 500,000 rows of `k = 1` but row 300,000 (`k = 0`), under a limit of
+        // one row over a union whose other branch produces 42 as soon as the
+        // native join reserves memory for its first build rows, on one thread.
+        // DataFusion evaluates the key on the whole batch as it collects it,
+        // and divides by zero, while a native join, which evaluates it chunk
+        // by chunk, would be canceled before it reaches row 300,000.
+        let make_plan =
+            |signal: Arc<tokio::sync::Notify>| -> Result<Arc<dyn ExecutionPlan>> {
+                let k = Int32Array::from_iter_values(
+                    (0..500_000).map(|i| i32::from(i != 300_000)),
+                );
+                let rows = RecordBatch::try_new(int32_k_schema(), vec![Arc::new(k)])?;
+                let build: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+                    &[vec![rows]],
+                    int32_k_schema(),
+                    None,
+                )?;
+                let probe = int32_k_scan(vec![Some(1)])?;
+                let one_over_k = Arc::new(BinaryExpr::new(
+                    lit(1_i32),
+                    Operator::Divide,
+                    col("k", &build.schema())?,
+                ));
+                let on = vec![(one_over_k as _, col("k", &probe.schema())?)];
+                let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::RightSemi,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?);
+                let row = partition_plan(BatchWhenSignaled {
+                    batch: RecordBatch::try_new(
+                        int32_k_schema(),
+                        vec![Arc::new(Int32Array::from(vec![42]))],
+                    )?,
+                    ready: signal,
+                })?;
+                let union = UnionExec::try_new(vec![join, row])?;
+                Ok(Arc::new(
+                    CoalescePartitionsExec::new(union).with_fetch(Some(1)),
+                ))
+            };
+        let run = |native: bool| async move {
+            let signal = Arc::new(tokio::sync::Notify::new());
+            let pool = Arc::new(SignalingPool {
+                consumer: "PhysicalHashJoin",
+                signal: Arc::clone(&signal),
+                signaled: AtomicBool::new(false),
+                reserved: AtomicUsize::new(0),
+            });
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .build_arc()?;
+            let task_ctx = Arc::new(
+                TaskContext::default()
+                    .with_session_config(test_session_config().with_target_partitions(1))
+                    .with_runtime(runtime),
+            );
+            let plan = make_plan(signal)?;
+            if native {
+                let root = lower_with_limit(&plan)?;
+                assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                with_timeout(collect(exec, task_ctx)).await
+            } else {
+                with_timeout(collect(plan, task_ctx)).await
+            }
+        };
+        for native in [false, true] {
+            let error = run(native).await.expect_err("the join fails");
+            assert!(error.to_string().contains("Divide by zero"), "{error}");
+        }
         Ok(())
     }
 
