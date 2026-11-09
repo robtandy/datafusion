@@ -99,7 +99,9 @@
 //!   every probe batch, also on an empty one, the native join on the rows of
 //!   its chunks. And one whose output may fail to concatenate, or whose probe
 //!   side may fail below a node of the same pipeline that may fail:
-//!   DataFusion's join coalesces its output, like `FilterExec`. And one with
+//!   DataFusion's join coalesces its output, like `FilterExec`. And one whose
+//!   build side (all of its columns) may fail to concatenate, which
+//!   DataFusion's join does with its whole build side. And one with
 //!   a dynamic filter whose probe side may fail (e.g. a scan of files):
 //!   DataFusion's scans skip the reads that the filter rejects. So do they
 //!   for the dynamic filter of a TopK: a TopK whose dynamic filter a node of
@@ -726,6 +728,14 @@ impl Lowering<'_> {
         if concatenation_may_fail(&join.schema())
             || (ctx.fallible_above && subtree_failing_parts(join.right()) > 0)
         {
+            return Ok(None);
+        }
+        // DataFusion concatenates its whole build side, all of its columns
+        // (also those that the output of the join does not have), which may
+        // fail for their types (e.g. run ends that 32 bits do not hold, also in
+        // a list): such joins are left to DataFusion, as the native join does
+        // not concatenate its build side.
+        if concatenation_may_fail(&join.left().schema()) {
             return Ok(None);
         }
         // DataFusion pushes the dynamic filter of the join into the scans of
@@ -3164,6 +3174,90 @@ mod tests {
             let root = assert_plan_outcome(make_plan, config.clone(), error).await;
             assert_eq!(count::<PhysicalFilter>(&root), 0, "{coalescing}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_build_side_may_fail_to_concatenate_are_left_to_datafusion()
+    -> Result<()> {
+        use arrow::array::{Array, LargeListArray, NullArray, RunArray};
+        use arrow::buffer::OffsetBuffer;
+        use datafusion_common::{JoinType, NullEquality};
+
+        // DataFusion concatenates all columns of the build side of a join,
+        // also those that its output does not have: two one-row build batches
+        // whose `LargeList<RunEndEncoded(Int32, Null)>` lists hold `1 << 30`
+        // nulls each need more run ends than 32 bits hold together. A native
+        // join does not concatenate them.
+        let list = || -> Result<arrow::array::ArrayRef> {
+            let values = RunArray::<arrow::datatypes::Int32Type>::try_new(
+                &Int32Array::from(vec![1 << 30]),
+                &NullArray::new(1),
+            )?;
+            let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+            Ok(Arc::new(LargeListArray::try_new(
+                field,
+                OffsetBuffer::new(vec![0, 1 << 30].into()),
+                Arc::new(values),
+                None,
+            )?))
+        };
+        let row = || -> Result<RecordBatch> {
+            Ok(RecordBatch::try_from_iter([
+                (
+                    "k",
+                    Arc::new(Int32Array::from(vec![1])) as arrow::array::ArrayRef,
+                ),
+                ("l", list()?),
+            ])?)
+        };
+        let build = vec![row()?, row()?];
+        let build_schema = build[0].schema();
+        let probe_schema =
+            Arc::new(Schema::new(vec![Field::new("p", DataType::Int32, false)]));
+        let probe = RecordBatch::try_new(
+            Arc::clone(&probe_schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                HashJoinExec::try_new(
+                    MemorySourceConfig::try_new_exec(
+                        std::slice::from_ref(&build),
+                        Arc::clone(&build_schema),
+                        None,
+                    )
+                    .unwrap(),
+                    MemorySourceConfig::try_new_exec(
+                        &[vec![probe.clone()]],
+                        Arc::clone(&probe_schema),
+                        None,
+                    )
+                    .unwrap(),
+                    vec![(
+                        col("k", &build_schema).unwrap(),
+                        col("p", &probe_schema).unwrap(),
+                    )],
+                    None,
+                    &JoinType::Inner,
+                    // Only the probe key: `k`, `l`, then `p`.
+                    Some(vec![2]),
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(config.clone()));
+        let error = collect(make_plan(), task_ctx)
+            .await
+            .expect_err("DataFusion fails")
+            .to_string();
+        let root = assert_plan_outcome(make_plan, config, Some(&error)).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
         Ok(())
     }
 
