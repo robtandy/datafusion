@@ -39,7 +39,10 @@
 //!   the shared, read-only [`JoinHashTable`]. If the join cannot produce any
 //!   output (e.g. an inner join with an empty build side), `finalize` returns
 //!   [`SinkFinalize::NoOutputPossible`], so that the probe side is not
-//!   executed at all, as DataFusion does not execute it either.
+//!   executed at all, as DataFusion does not read it either. (DataFusion
+//!   still creates the streams of its probe side without polling them, so
+//!   only DataFusion raises the errors of creating them, e.g. for a scan of
+//!   an object store that is not registered.)
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
 //!   table concurrently: neither side is shuffled
