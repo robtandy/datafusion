@@ -90,7 +90,9 @@
 //!   without rows, e.g. a cast that their types do not support), or whose
 //!   errors depend on the batches: DataFusion evaluates the probe keys on
 //!   every probe batch, also on an empty one, the native join on the rows of
-//!   its chunks.
+//!   its chunks. And one whose output may fail to concatenate, or whose probe
+//!   side may fail below a node of the same pipeline that may fail:
+//!   DataFusion's join coalesces its output, like `FilterExec`.
 //! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
 //!   or a `RepartitionExec` over a bounded input, which coalesces the batches
 //!   of its output partitions, also below a hash join, which removes the
@@ -653,21 +655,28 @@ impl Lowering<'_> {
         if probe.batch_dependent || probe.failing_parts > 0 {
             return Ok(None);
         }
+        // DataFusion's join coalesces its output, up to `batch_size` rows,
+        // before it emits it; a native join passes its output on at once. So
+        // DataFusion may fail to concatenate output types whose concatenation
+        // may fail, and it pulls later probe batches, whose errors it raises,
+        // before the nodes above it see the rows of the earlier ones: such
+        // joins are left to DataFusion, as are those whose probe side (which
+        // continues the pipeline of the nodes above the join) may fail below a
+        // node above that may fail.
+        if concatenation_may_fail(&join.schema())
+            || (ctx.fallible_above && subtree_failing_parts(join.right()) > 0)
+        {
+            return Ok(None);
+        }
         // The join removes the redistributions of its inputs: a repartitioning
-        // that coalesces batches (see `coalesces_batches`) is left to
-        // DataFusion, with the join, if the concatenation may fail, or, on the
-        // probe side, which continues the pipeline of the nodes above the
-        // join, if its input may fail below a node above that may fail.
-        for (side, probe) in [(join.left(), false), (join.right(), true)] {
-            for repartition in top_repartitions(side) {
-                if coalesces_batches(repartition)
-                    && (concatenation_may_fail(&repartition.schema())
-                        || (probe
-                            && ctx.fallible_above
-                            && subtree_failing_parts(repartition.children()[0]) > 0))
-                {
-                    return Ok(None);
-                }
+        // that coalesces batches (see `coalesces_batches`) of types whose
+        // concatenation may fail is left to DataFusion, with the join.
+        for side in [join.left(), join.right()] {
+            if top_repartitions(side).into_iter().any(|repartition| {
+                coalesces_batches(repartition)
+                    && concatenation_may_fail(&repartition.schema())
+            }) {
+                return Ok(None);
             }
         }
         let build = Context::below_breaker(0);
@@ -3056,6 +3065,137 @@ mod tests {
             let root = assert_plan_outcome(make_plan, config.clone(), error).await;
             assert_eq!(count::<PhysicalFilter>(&root), 0, "{coalescing}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_output_coalescing_may_differ_are_left_to_datafusion()
+    -> Result<()> {
+        use datafusion_common::{JoinType, NullEquality};
+
+        // DataFusion's hash join coalesces its output, up to `batch_size`
+        // rows, before it emits it. A native join passes its output on at
+        // once.
+        let config = test_session_config().with_target_partitions(1);
+        let build_schema =
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+        let build = RecordBatch::try_new(
+            Arc::clone(&build_schema),
+            vec![Arc::new(Int32Array::from(vec![0]))],
+        )?;
+        let join = |probe: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            let k = col("k", &probe.schema()).unwrap();
+            Arc::new(
+                HashJoinExec::try_new(
+                    MemorySourceConfig::try_new_exec(
+                        &[vec![build.clone()]],
+                        Arc::clone(&build_schema),
+                        None,
+                    )
+                    .unwrap(),
+                    probe,
+                    vec![(col("b", &build_schema).unwrap(), k)],
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+
+        // It may fail to concatenate the output batches of two probe batches
+        // of 100 rows whose `Dictionary(Int8, Utf8)` values are disjoint.
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("d", dictionary, false),
+        ]));
+        let batch = |prefix: &str| {
+            let strings = (0..100).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>();
+            let d: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+                strings.iter().map(String::as_str).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![0; 100])), Arc::new(d)],
+            )
+        };
+        let batches = vec![batch("x")?, batch("y")?];
+        let make_plan = || {
+            join(
+                MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let error = Some("Dictionary key bigger than the key type");
+        let root = assert_plan_outcome(make_plan, config.clone(), error).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+
+        // `10 / k` above the join of a CSV file, on one thread: its first batch
+        // of 8192 rows holds 1000 zeros (that join) and 7192 `-1`s, its next
+        // batch a value that does not parse. The join pulls the parse error
+        // before it emits the zeros, so DataFusion raises it; a native join
+        // would pass the zeros on at once, and the projection divide by zero
+        // first.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("f.csv");
+        let mut csv = String::from("k\n");
+        csv.push_str(&"0\n".repeat(1000));
+        csv.push_str(&"-1\n".repeat(7192));
+        csv.push_str("x\n");
+        std::fs::write(&path, csv)?;
+        let ctx = SessionContext::new_with_config(config.clone());
+        let schema = Schema::new(vec![Field::new("k", DataType::Int32, true)]);
+        ctx.register_csv(
+            "f",
+            path.to_str().unwrap(),
+            CsvReadOptions::new().schema(&schema),
+        )
+        .await?;
+        let scan = ctx.table("f").await?.create_physical_plan().await?;
+        let make_plan = |divide: bool| {
+            // A copy with its own state: a scan shares the files it reads
+            // between its executions.
+            let joined = join(
+                datafusion_physical_plan::execution_plan::reset_plan_states(Arc::clone(
+                    &scan,
+                ))
+                .unwrap(),
+            );
+            let k = col("k", &joined.schema()).unwrap();
+            let expr: Arc<dyn PhysicalExpr> = if divide {
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                        10,
+                    )))),
+                    datafusion_expr::Operator::Divide,
+                    k,
+                ))
+            } else {
+                k
+            };
+            Arc::new(
+                ProjectionExec::try_new(vec![(expr, "x".to_string())], joined).unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let error = collect(make_plan(true), ctx.task_ctx())
+            .await
+            .expect_err("DataFusion fails")
+            .to_string();
+        assert!(!error.contains("Divide by zero"), "{error}");
+        let root =
+            assert_plan_outcome(|| make_plan(true), config.clone(), Some(&error)).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        // Without a part that may fail above it, the join is native.
+        let root = assert_plan_outcome(|| make_plan(false), config, Some(&error)).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
         Ok(())
     }
 
