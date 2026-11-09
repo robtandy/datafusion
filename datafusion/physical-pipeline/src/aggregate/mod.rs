@@ -471,26 +471,53 @@ pub(crate) mod test_support {
 
     /// Assert that `sql` fails with an error that contains `message`, both on
     /// DataFusion and with the plan lowered by [`lower`], in which at least
-    /// one aggregation is a [`PhysicalHashAggregate`].
+    /// one aggregation is a [`PhysicalHashAggregate`]. The query can use the
+    /// tables of [`register_test_tables`].
     pub(crate) async fn assert_aggregate_fails_like_datafusion(sql: &str, message: &str) {
-        let ctx = datafusion_context(test_session_config());
-        register_test_tables(&ctx).expect("setup");
+        assert_aggregate_fails_like_datafusion_with_setup(
+            sql,
+            test_session_config(),
+            async |ctx: &SessionContext| register_test_tables(ctx),
+            message,
+        )
+        .await
+    }
+
+    /// [`assert_aggregate_fails_like_datafusion`] with a custom session
+    /// configuration, and `setup` registering the tables of the query. The
+    /// lowered plan runs with the default and with tiny thread-local tables.
+    pub(crate) async fn assert_aggregate_fails_like_datafusion_with_setup<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        message: &str,
+    ) where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config);
+        setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
         assert!(error.to_string().contains(message), "DataFusion: {error}");
-        let plan = ctx
-            .sql(sql)
-            .await
-            .expect("planning")
-            .create_physical_plan()
-            .await
-            .expect("physical planning");
-        let root = lower(&plan).expect("lowering");
-        assert!(count::<PhysicalHashAggregate>(&root) > 0, "{sql}");
-        let exec: Arc<dyn ExecutionPlan> =
-            Arc::new(PipelineRootExec::try_new(root, plan).expect("root"));
-        match collect(exec, ctx.task_ctx()).await {
-            Ok(_) => panic!("The pipeline engine succeeds, DataFusion fails: {error}"),
-            Err(e) => assert!(e.to_string().contains(message), "pipeline engine: {e}"),
+        for lower in [lower as fn(&_) -> _, lower_with_tiny_tables] {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("planning")
+                .create_physical_plan()
+                .await
+                .expect("physical planning");
+            let root = lower(&plan).expect("lowering");
+            assert!(count::<PhysicalHashAggregate>(&root) > 0, "{sql}");
+            let exec: Arc<dyn ExecutionPlan> =
+                Arc::new(PipelineRootExec::try_new(root, plan).expect("root"));
+            match collect(exec, ctx.task_ctx()).await {
+                Ok(_) => panic!(
+                    "The pipeline engine succeeds, DataFusion fails: {error}\nquery: {sql}"
+                ),
+                Err(e) => {
+                    assert!(e.to_string().contains(message), "pipeline engine: {e}")
+                }
+            }
         }
     }
 
@@ -1019,6 +1046,74 @@ mod tests {
                 assert_eq!(count::<PhysicalHashAggregate>(&root), 1, "{sql}");
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn grouping_ids_of_many_columns_like_datafusion() {
+        // `__grouping_id` holds a bit per group column and the ordinal of a
+        // repeated grouping set, in at most 64 bits. Without input rows, the
+        // native aggregation computes it for the grouping sets without
+        // columns itself.
+        let keys = |n: usize| {
+            (0..n)
+                .map(|i| format!("k{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        for rows in [0, 3] {
+            let setup = async |ctx: &SessionContext| register_wide_table(ctx, rows);
+            let config = test_session_config();
+            for (columns, sets, error) in [
+                // 64 columns and the ordinal 1 need 65 bits.
+                (64, "(), ()", Some("require 65 bits, which exceeds 64")),
+                (65, "()", Some("Grouping sets with more than 64 columns")),
+                // At the boundary.
+                (63, "(), ()", None),
+                (64, "()", None),
+            ] {
+                let sql = format!(
+                    "SELECT COUNT(*), SUM(k0) FROM wide GROUP BY GROUPING SETS (({}), {sets})",
+                    keys(columns)
+                );
+                match error {
+                    Some(error) => {
+                        assert_aggregate_fails_like_datafusion_with_setup(
+                            &sql,
+                            config.clone(),
+                            &setup,
+                            error,
+                        )
+                        .await
+                    }
+                    None => {
+                        assert_aggregate_parity_with_setup(&sql, config.clone(), &setup)
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Register table `wide`: `rows` rows of 65 integer columns `k0` to
+    /// `k64`.
+    fn register_wide_table(ctx: &SessionContext, rows: i32) -> Result<()> {
+        let schema = Arc::new(Schema::new(
+            (0..65)
+                .map(|i| Field::new(format!("k{i}"), DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let columns = (0..65)
+            .map(|i| {
+                Arc::new(Int32Array::from_iter_values((0..rows).map(|r| r * i)))
+                    as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+        ctx.register_table(
+            "wide",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

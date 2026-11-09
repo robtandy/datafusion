@@ -34,7 +34,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
 use arrow::compute::prep_null_mask_filter;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, not_impl_err};
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
@@ -218,6 +218,7 @@ impl GroupedHashTable {
         }
         let num_exprs = group_by.expr().len();
         let grouping_id_type = spec.group_schema.field(num_exprs).data_type();
+        let max_ordinal = max_duplicate_ordinal(group_by.groups());
         let mut ordinals = HashMap::<&[bool], usize>::new();
         let mut added = false;
         for group in group_by.groups() {
@@ -234,7 +235,7 @@ impl GroupedHashTable {
                 .take(num_exprs)
                 .map(|field| new_null_array(field.data_type(), 1))
                 .collect::<Vec<_>>();
-            let grouping_id = grouping_id(group, current);
+            let grouping_id = grouping_id(group, current, max_ordinal)?;
             keys.push(
                 ScalarValue::UInt64(Some(grouping_id))
                     .cast_to(grouping_id_type)?
@@ -297,19 +298,48 @@ fn compact_group_indices(
 }
 
 /// The value of the `__grouping_id` column of the grouping set `group` (its
-/// `ordinal`-th occurrence, from 0) in DataFusion's encoding
-/// (`group_id_array`): the low bits flag the `NULL` group columns (the last
-/// column in the lowest bit), the high bits hold the ordinal of a repeated
-/// grouping set. The type of the column is wide enough for both.
-fn grouping_id(group: &[bool], ordinal: usize) -> u64 {
+/// `ordinal`-th occurrence, from 0) of grouping sets whose repeated sets have
+/// ordinals up to `max_ordinal`, exactly like DataFusion's `group_id_array`:
+/// the low bits flag the `NULL` group columns (the last column in the lowest
+/// bit), the high bits hold the ordinal of a repeated grouping set. Fails
+/// like `group_id_array` if the two do not fit into 64 bits. (The type of the
+/// column, `Aggregate::grouping_id_type`, is wide enough for both if they
+/// do.)
+fn grouping_id(group: &[bool], ordinal: usize, max_ordinal: usize) -> Result<u64> {
+    let n = group.len();
+    if n > 64 {
+        return not_impl_err!(
+            "Grouping sets with more than 64 columns are not supported"
+        );
+    }
+    let ordinal_bits = usize::BITS as usize - max_ordinal.leading_zeros() as usize;
+    let total_bits = n + ordinal_bits;
+    if total_bits > 64 {
+        return not_impl_err!(
+            "Grouping sets with {n} columns and a maximum duplicate ordinal of \
+             {max_ordinal} require {total_bits} bits, which exceeds 64"
+        );
+    }
     let semantic_id = group
         .iter()
         .fold(0u64, |id, &is_null| (id << 1) | u64::from(is_null));
-    if ordinal == 0 {
+    // A zero ordinal needs no high bits (and `n` may be 64).
+    Ok(if ordinal == 0 {
         semantic_id
     } else {
-        semantic_id | ((ordinal as u64) << group.len())
+        semantic_id | ((ordinal as u64) << n)
+    })
+}
+
+/// The highest ordinal of a repeated grouping set: `0` if no grouping set is
+/// repeated, `k - 1` if one appears `k` times (DataFusion's
+/// `max_duplicate_ordinal`).
+fn max_duplicate_ordinal(groups: &[Vec<bool>]) -> usize {
+    let mut counts = HashMap::<&[bool], usize>::new();
+    for group in groups {
+        *counts.entry(group.as_slice()).or_insert(0) += 1;
     }
+    counts.into_values().max().unwrap_or(0).saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -319,6 +349,7 @@ mod tests {
     use arrow::array::{AsArray, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion::functions_aggregate::count::count_udaf;
+    use datafusion_common::DataFusionError;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::{col, lit};
     use datafusion_physical_plan::aggregates::{
@@ -404,13 +435,59 @@ mod tests {
             let mut ordinals = HashMap::<&[bool], usize>::new();
             for (group, keys) in groups.iter().zip(&expected) {
                 let ordinal = ordinals.entry(group).or_insert(0);
-                let id = ScalarValue::UInt64(Some(grouping_id(group, *ordinal)))
-                    .cast_to(&grouping_id_type)?;
+                let max_ordinal = max_duplicate_ordinal(&groups);
+                let id =
+                    ScalarValue::UInt64(Some(grouping_id(group, *ordinal, max_ordinal)?))
+                        .cast_to(&grouping_id_type)?;
                 *ordinal += 1;
                 assert_eq!(keys[2].data_type(), &grouping_id_type);
                 assert_eq!(ScalarValue::try_from_array(&keys[2], 0)?, id, "{group:?}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn grouping_ids_fit_into_64_bits() -> Result<()> {
+        let all_null = |n: usize| vec![true; n];
+        // 64 columns and no repeated grouping set: all 64 bits are columns.
+        assert_eq!(grouping_id(&all_null(64), 0, 0)?, u64::MAX);
+        // 63 columns and the ordinal 1 of a repeated grouping set.
+        assert_eq!(grouping_id(&all_null(63), 1, 1)?, u64::MAX);
+        assert_eq!(grouping_id(&all_null(63), 0, 1)?, u64::MAX >> 1);
+        // More bits fail like DataFusion, also for the first occurrence.
+        for (n, ordinal, max_ordinal, message) in [
+            (
+                64,
+                0,
+                1,
+                "64 columns and a maximum duplicate ordinal of 1 require 65 bits",
+            ),
+            (
+                62,
+                0,
+                4,
+                "62 columns and a maximum duplicate ordinal of 4 require 65 bits",
+            ),
+            (
+                65,
+                0,
+                0,
+                "Grouping sets with more than 64 columns are not supported",
+            ),
+        ] {
+            let error = grouping_id(&all_null(n), ordinal, max_ordinal).unwrap_err();
+            assert!(
+                matches!(error, DataFusionError::NotImplemented(_)),
+                "{error}"
+            );
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        assert_eq!(max_duplicate_ordinal(&[]), 0);
+        assert_eq!(
+            max_duplicate_ordinal(&[vec![true], vec![false], vec![true], vec![true]]),
+            2
+        );
         Ok(())
     }
 
