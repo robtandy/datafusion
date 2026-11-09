@@ -41,12 +41,12 @@
 //!   single partition, e.g. a `CoalescePartitionsExec`, which the native sort
 //!   replaces: it sorts all partitions of its input);
 //! * a `SortPreservingMergeExec` over a `SortExec` that sorts every
-//!   partition, possibly through `ProjectionExec`s (DataFusion plans the
-//!   projection of `GROUP BY ... ORDER BY` between them) and merges of the
-//!   single partition below them (as for `SELECT b FROM t ORDER BY a LIMIT
-//!   k`). The native sort sorts all rows of the input of the `SortExec` by
-//!   the order of the top merge, above the projections, which are lowered
-//!   with the input.
+//!   partition, possibly through `ProjectionExec`s of columns and literals
+//!   (DataFusion plans the projection of `GROUP BY ... ORDER BY` between them)
+//!   and merges of the single partition below them (as for `SELECT b FROM t
+//!   ORDER BY a LIMIT k`). The native sort sorts all rows of the input of the
+//!   `SortExec` by the order of the top merge, above the projections, which
+//!   are lowered with the input.
 //!
 //! The result keeps `fetch` rows if the `SortExec` or a merge has a fetch:
 //! that is a [`PhysicalTopK`], whose threshold updates the
@@ -116,8 +116,9 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   merge produces all rows of the input of the `SortExec` in its order, as
 ///   the native sort does. Without projections, the native sort sorts by the
 ///   keys of the `SortExec`, and evaluates them on all rows as DataFusion
-///   does. With projections, it sorts the projected rows (the projections are
-///   lowered with the input) by the keys of the top merge.
+///   does. With projections, which must project columns and literals only, it
+///   sorts the projected rows (the projections are lowered with the input) by
+///   the keys of the top merge.
 ///
 /// A fetch of the `SortExec` (a TopK of every partition) and the fetches of
 /// the merges keep the smallest number of rows, if that is a top-k of the
@@ -149,9 +150,12 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   to evaluate: the native sort evaluates only the keys of the top merge;
 /// * merges without projections with a key that can fail to evaluate and is
 ///   not the key of the sort at its position;
-/// * projections that compute a value above a sort or a merge with a fetch:
-///   DataFusion evaluates them on the rows that are kept only, the native
-///   operators on all rows (and a computation can fail);
+/// * projections between the merges and the sort that compute a value (other
+///   than a column or a literal): DataFusion evaluates them lazily, on the
+///   sorted rows that the merges read, which read the first batches of every
+///   partition and stop with their fetch, or when a node above them stops
+///   reading (e.g. a limit). The native sort projects all rows before it
+///   sorts them, and a computation can fail;
 /// * plans that DataFusion does not execute as a sort of all rows of the
 ///   input: nodes that advertise a different number of partitions than their
 ///   input has, merges of no partitions, and sorts of several partitions that
@@ -348,23 +352,23 @@ impl SortPlan {
         // its keys cannot fail. Otherwise it is a sort with a fetch.
         let topk = fetch.is_some() && cannot_fail(&ordering);
 
-        // DataFusion evaluates a projection above a TopK or a merge with a
-        // fetch on the rows they keep only; the native operator evaluates the
-        // projections on all rows, which makes no difference for projections
-        // that cannot fail.
-        let mut limited = sort.fetch().is_some();
-        for node in chain.iter().rev() {
-            if let Some(merge) = node.downcast_ref::<SortPreservingMergeExec>() {
-                limited |= merge.fetch().is_some();
-            } else if let Some(projection) = node.downcast_ref::<ProjectionExec>()
-                && limited
-                && projection
-                    .expr()
-                    .iter()
-                    .any(|expr| !expr.expr.is::<Column>() && !expr.expr.is::<Literal>())
-            {
-                return Ok(None);
-            }
+        // DataFusion evaluates the projections between the merges and the sort
+        // lazily, on the sorted rows that are read: the merges read the first
+        // batches of every partition, and stop with their fetch or when a node
+        // above them (e.g. a limit) stops reading. The native sort projects all
+        // rows before it sorts them, which only makes no difference for
+        // projections that cannot fail (of columns and literals).
+        let projections = chain
+            .iter()
+            .filter_map(|node| node.downcast_ref::<ProjectionExec>())
+            .collect::<Vec<_>>();
+        if projections.iter().any(|projection| {
+            projection
+                .expr()
+                .iter()
+                .any(|expr| !cannot_fail_to_evaluate(&expr.expr))
+        }) {
+            return Ok(None);
         }
 
         // The rows to sort: the input of the sort, without a merge of its
@@ -376,11 +380,11 @@ impl SortPlan {
         {
             input = Arc::clone(coalesce.input());
         }
-        let projections = chain
+        for projection in chain
             .iter()
+            .rev()
             .filter(|node| node.is::<ProjectionExec>())
-            .collect::<Vec<_>>();
-        for projection in projections.iter().rev() {
+        {
             input = Arc::clone(projection).replace_children(
                 vec![input],
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
@@ -471,7 +475,7 @@ impl SortPlan {
 fn dynamic_filter(
     sort: &SortExec,
     ordering: &LexOrdering,
-    projections: &[&&Arc<dyn ExecutionPlan>],
+    projections: &[&ProjectionExec],
 ) -> Result<Option<TopKDynamicFilter>> {
     let Some(filter) = sort
         .dynamic_expressions_produced()
@@ -489,9 +493,6 @@ fn dynamic_filter(
     for (sort_expr, sort_key) in ordering.iter().zip(sort.expr().iter()) {
         let mut expr = Some(Arc::clone(&sort_expr.expr));
         for projection in projections {
-            let Some(projection) = projection.downcast_ref::<ProjectionExec>() else {
-                return Ok(None);
-            };
             expr = match expr {
                 Some(expr) => update_expr(&expr, projection.expr(), true)?,
                 None => None,
@@ -1020,6 +1021,8 @@ mod tests {
     use super::test_support::{
         assert_native_byte_eq, assert_parity, assert_parity_with_config, lower,
     };
+    use datafusion_physical_plan::limit::GlobalLimitExec;
+
     use crate::aggregate::PhysicalHashAggregate;
     use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::explain::format_operator_tree;
@@ -1598,27 +1601,22 @@ mod tests {
                 assert_eq!(topk.dynamic_filter().unwrap().keys()[0].to_string(), "id@0");
             }
         }
-        // A computed projection is evaluated on all rows, which is what
-        // DataFusion does without a fetch, but not with one.
-        let plan = merge(
-            project(sort_exec(t1_scan(4), &id, true, None), true),
-            &[("x", true)],
-            None,
-        );
-        let (sort, _) = try_lower_bridged(&plan).expect("a sort");
-        assert_eq!(lowered_ordering(&sort), "x@0 DESC");
-        let plan = merge(
-            project(sort_exec(t1_scan(4), &id, true, None), true),
-            &[("x", true)],
-            Some(5),
-        );
-        assert_eq!(lowered_fetch(&try_lower_bridged(&plan).unwrap().0), Some(5));
-        let plan = merge(
-            project(sort_exec(t1_scan(4), &id, true, Some(5)), true),
-            &[("x", true)],
-            Some(5),
-        );
-        assert!(try_lower_bridged(&plan).is_none());
+        // DataFusion evaluates a computed projection lazily, on the sorted
+        // rows that the merge (and the nodes above it) reads, with or without
+        // fetches: it is left to DataFusion.
+        for (sort_fetch, merge_fetch) in
+            [(None, None), (None, Some(5)), (Some(5), Some(5))]
+        {
+            let plan = merge(
+                project(sort_exec(t1_scan(4), &id, true, sort_fetch), true),
+                &[("x", true)],
+                merge_fetch,
+            );
+            assert!(
+                try_lower_bridged(&plan).is_none(),
+                "{sort_fetch:?} / {merge_fetch:?}"
+            );
+        }
     }
 
     #[test]
@@ -1667,26 +1665,21 @@ mod tests {
                 }
             }
         }
-        // A computed projection above a merge with a fetch is evaluated on the
-        // rows the merge keeps only.
-        let plan = merge(
-            project(
-                merge(sort_exec(t1_scan(4), &id, true, None), &id, Some(3)),
-                true,
-            ),
-            &[("x", true)],
-            None,
-        );
-        assert!(try_lower_bridged(&plan).is_none());
-        let plan = merge(
-            project(
-                merge(sort_exec(t1_scan(4), &id, true, None), &id, None),
-                true,
-            ),
-            &[("x", true)],
-            Some(3),
-        );
-        assert_eq!(lowered_fetch(&try_lower_bridged(&plan).unwrap().0), Some(3));
+        // A computed projection between the merges is evaluated lazily too.
+        for (inner_fetch, top_fetch) in [(Some(3), None), (None, Some(3)), (None, None)] {
+            let plan = merge(
+                project(
+                    merge(sort_exec(t1_scan(4), &id, true, None), &id, inner_fetch),
+                    true,
+                ),
+                &[("x", true)],
+                top_fetch,
+            );
+            assert!(
+                try_lower_bridged(&plan).is_none(),
+                "{inner_fetch:?} / {top_fetch:?}"
+            );
+        }
     }
 
     #[test]
@@ -1996,6 +1989,79 @@ mod tests {
         let sort = Arc::new(SortExec::new(keys, scan).with_preserve_partitioning(true));
         let plan = merge(rename(sort, "b", "c"), &[("a", false)], None);
         assert!(try_lower_bridged(&plan).is_none());
+    }
+
+    /// The rows `a = 0..10_000`, in `partitions` partitions of consecutive
+    /// values, each in reverse order, with `b = 1`, but `b = 0` for the last
+    /// row of the sort, `a = 9999`.
+    fn reversed_ab_scan(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let size = 10_000 / partitions as i64;
+        let partitions = (0..partitions as i64)
+            .map(|partition| {
+                let a = (partition * size..(partition + 1) * size)
+                    .rev()
+                    .collect::<Vec<_>>();
+                let b = a.iter().map(|&a| i64::from(a != 9999)).collect();
+                vec![(a, b)]
+            })
+            .collect::<Vec<_>>();
+        ab_scan(&partitions)
+    }
+
+    /// A projection of `a` and `10 / b AS q` over `input`.
+    fn project_ten_over_b(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let ten_over_b =
+            BinaryExpr::new(lit(10_i64), Operator::Divide, col("b", &schema).unwrap());
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+            (col("a", &schema).unwrap(), "a".to_string()),
+            (Arc::new(ten_over_b), "q".to_string()),
+        ];
+        Arc::new(ProjectionExec::try_new(exprs, input).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computed_projections_above_sorts_are_left_to_datafusion() -> Result<()> {
+        // DataFusion evaluates a projection between a merge and a sort lazily,
+        // on the sorted rows that are read: with a fetch of 1 (of the merge, or
+        // of a limit above it), on the first batches of every partition only.
+        // `10 / b` fails only for the last row of the sort, `a = 9999`, which
+        // DataFusion never projects, so it returns `(0, 10)`. The native sort
+        // would project all rows before sorting them.
+        let config = test_session_config().with_batch_size(1024);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        type Make = Box<dyn Fn() -> Result<Arc<dyn ExecutionPlan>>>;
+        for partitions in [1, 4] {
+            let sorted = move || {
+                let scan = reversed_ab_scan(partitions);
+                project_ten_over_b(sort_exec(scan, &[("a", false)], true, None))
+            };
+            let plans: [Make; 2] = [
+                // `SPM(fetch=1) -> Projection[a, 10 / b] -> SortExec[a]`.
+                Box::new(move || Ok(merge(sorted(), &[("a", false)], Some(1)))),
+                // `GlobalLimitExec(1) -> SPM -> Projection[a, 10 / b] ->
+                // SortExec[a]`.
+                Box::new(move || {
+                    let merged = merge(sorted(), &[("a", false)], None);
+                    Ok(Arc::new(GlobalLimitExec::new(merged, 0, Some(1))))
+                }),
+            ];
+            for make in plans {
+                let output = collect(make()?, Arc::clone(&task_ctx)).await?;
+                let row = (
+                    output[0].column(0).as_primitive::<Int64Type>().value(0),
+                    output[0].column(1).as_primitive::<Int64Type>().value(0),
+                );
+                assert_eq!(row, (0, 10), "DataFusion's result");
+                let root =
+                    assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                        .await;
+                assert_eq!(sorts(&root), 0, "{}", format_operator_tree(&root));
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
