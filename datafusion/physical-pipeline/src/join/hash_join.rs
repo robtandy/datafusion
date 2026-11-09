@@ -531,6 +531,12 @@ impl PhysicalHashJoin {
     ///   of its probe side, cannot reproduce;
     /// * a null-aware join with several keys or a filter (a correlated or
     ///   multi-column `NOT IN`), or with `NullEqualsNull`;
+    /// * a join that stores build columns of dictionaries with keys of 8 or
+    ///   16 bits: the row store encodes the dictionary columns it gathers
+    ///   again, with the distinct values of the gathered rows (which more
+    ///   than 128 or 256 of them in a chunk overflow), while DataFusion takes
+    ///   them from its whole (concatenated) build side, whose concatenation
+    ///   overflows the keys if they cannot hold all its distinct values;
     /// * a join whose keys have different types on the two sides, or whose
     ///   build columns the [`TupleDataLayout`] cannot store.
     ///
@@ -539,10 +545,12 @@ impl PhysicalHashJoin {
     /// the join has a single build side shared by all threads, which read the
     /// probe side directly. These are the `CoalescePartitionsExec`s without a
     /// limit and the `RepartitionExec`s that do not preserve the order and
-    /// evaluate nothing but join keys of their side (round robin, or hash
-    /// partitioning by join keys), which the join evaluates on all rows too,
-    /// raising the same errors. Other `RepartitionExec`s are kept, so that
-    /// DataFusion evaluates their expressions.
+    /// evaluate nothing but join keys of their side that cannot fail (round
+    /// robin, or hash partitioning by such join keys), which the join
+    /// evaluates on all rows too. Other `RepartitionExec`s are kept, so that
+    /// DataFusion evaluates their expressions as their rows arrive (and
+    /// raises their errors right away, while the join may raise errors of its
+    /// build keys only once its build side is complete).
     ///
     /// The probe side of a join is left to DataFusion (bridged) if its
     /// lowered form has pipeline breakers, e.g. a join or an aggregation:
@@ -655,6 +663,23 @@ impl PhysicalHashJoin {
         // an empty one, which the native join, called with the non-empty
         // chunks of its build side, does not see: keys that fail without any
         // row are left to DataFusion.
+        // The row store encodes the dictionary columns it gathers (for the
+        // output or the filter) again, with the distinct values of the
+        // gathered rows, so that more distinct values than keys of 8 bits
+        // hold in a chunk fail, where DataFusion takes them from its whole
+        // build side; and DataFusion fails to concatenate a build side with
+        // more distinct values than keys of 8 or 16 bits hold, where the row
+        // store does not. Joins that store such dictionaries of the build
+        // side are left to DataFusion.
+        if spec
+            .layout
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| has_narrow_dictionary_keys(field.data_type()))
+        {
+            return Ok(None);
+        }
         let empty_build = RecordBatch::new_empty(join.left().schema());
         if !spec.defers_build_key_errors
             && evaluate_expressions_to_arrays(build_keys.iter().copied(), &empty_build)
@@ -1437,7 +1462,11 @@ fn without_redistribution<'a>(
     loop {
         if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
             && !repartition.preserve_order()
-            && partitions_by_keys(repartition.partitioning(), keys)
+            && partitions_by_keys(
+                repartition.partitioning(),
+                keys,
+                &repartition.input().schema(),
+            )
         {
             plan = repartition.input();
         } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
@@ -1452,18 +1481,53 @@ fn without_redistribution<'a>(
     }
 }
 
-/// Whether distributing the rows of an input of a join with `partitioning`
-/// evaluates nothing but join keys of that input (`keys`): round robin
-/// partitioning, or hash partitioning by join keys. As the join evaluates
-/// (and hashes) its keys on all rows of its inputs too, it then raises the
-/// errors that distributing the rows would raise. Any other expression,
-/// e.g. a division by zero, is left to DataFusion.
-fn partitions_by_keys(partitioning: &Partitioning, keys: &[&PhysicalExprRef]) -> bool {
+/// Whether distributing the rows of an input of a join (of `schema`) with
+/// `partitioning` evaluates nothing but join keys of that input (`keys`)
+/// that cannot fail (see [`can_fail`]): round robin partitioning, or hash
+/// partitioning by such keys, which the join evaluates on all rows too. Any
+/// other expression, e.g. a division by zero, is left to DataFusion: a
+/// repartitioning evaluates it on every batch as it arrives, and the errors
+/// of the build keys of the join may only be raised once its whole build
+/// side is collected (see `JoinSpec::defers_build_key_errors`).
+fn partitions_by_keys(
+    partitioning: &Partitioning,
+    keys: &[&PhysicalExprRef],
+    schema: &Schema,
+) -> bool {
     match partitioning {
         Partitioning::RoundRobinBatch(_) => true,
-        Partitioning::Hash(exprs, _) => exprs
+        Partitioning::Hash(exprs, _) => exprs.iter().all(|expr| {
+            keys.iter().any(|key| key.as_ref() == expr.as_ref())
+                && !can_fail(expr, schema)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `data_type` is or has a dictionary with keys of 8 or 16 bits.
+fn has_narrow_dictionary_keys(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(keys, values) => {
+            matches!(
+                keys.as_ref(),
+                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
+            ) || has_narrow_dictionary_keys(values)
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_narrow_dictionary_keys(field.data_type()),
+        DataType::Struct(fields) => fields
             .iter()
-            .all(|expr| keys.iter().any(|key| key.as_ref() == expr.as_ref())),
+            .any(|field| has_narrow_dictionary_keys(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_narrow_dictionary_keys(field.data_type())),
+        DataType::RunEndEncoded(_, values) => {
+            has_narrow_dictionary_keys(values.data_type())
+        }
         _ => false,
     }
 }
@@ -3404,7 +3468,36 @@ mod tests {
         // the rows bit for bit: it sorts the rows of the other types by their
         // display, which does not tell apart NaNs with different payloads.)
         let all_types = crate::tuple_data::test_data::all_types_batch(300);
+        // Joins of dictionaries with keys of 8 or 16 bits are left to
+        // DataFusion (see
+        // `build_dictionaries_with_narrow_keys_are_left_to_datafusion`): the
+        // same values, in dictionaries with keys of 32 bits.
+        let (fields, columns): (Vec<_>, Vec<_>) = all_types
+            .schema()
+            .fields()
+            .iter()
+            .zip(all_types.columns())
+            .map(|(field, column)| match field.data_type() {
+                DataType::Dictionary(_, values)
+                    if has_narrow_dictionary_keys(field.data_type()) =>
+                {
+                    let wide =
+                        DataType::Dictionary(Box::new(DataType::Int32), values.clone());
+                    let column = arrow::compute::cast(column, &wide).unwrap();
+                    (field.as_ref().clone().with_data_type(wide), column)
+                }
+                _ => (field.as_ref().clone(), Arc::clone(column)),
+            })
+            .unzip();
+        let all_types =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
         let schema = all_types.schema();
+        assert!(
+            !schema
+                .fields()
+                .iter()
+                .any(|field| has_narrow_dictionary_keys(field.data_type()))
+        );
         let (supported, others): (Vec<usize>, Vec<usize>) = (0..all_types.num_columns())
             .partition(|&i| {
                 let field =
@@ -5092,6 +5185,211 @@ mod tests {
             ),
         ] {
             assert_eq!(can_fail(&expr, &schema), fails, "{expr}");
+        }
+        Ok(())
+    }
+
+    /// A build side of `k` (`Int32`) and `d` (`Dictionary(Int8, Utf8)`): two
+    /// batches of 100 rows, of keys `0..200`, whose dictionaries hold the 100
+    /// distinct values of their rows: together more than keys of 8 bits hold.
+    fn narrow_dictionary_build() -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+        let batch = |start: i32| -> Result<RecordBatch> {
+            let values = (start..start + 100)
+                .map(|v| format!("v{v}"))
+                .collect::<Vec<_>>();
+            let d = values
+                .iter()
+                .map(String::as_str)
+                .collect::<arrow::array::DictionaryArray<arrow::datatypes::Int8Type>>();
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(start..start + 100)),
+                    Arc::new(d),
+                ],
+            )?)
+        };
+        Ok(MemorySourceConfig::try_new_exec(
+            &[vec![batch(0)?, batch(100)?]],
+            schema,
+            None,
+        )?)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_dictionaries_with_narrow_keys_are_left_to_datafusion() -> Result<()> {
+        // A `Partitioned` inner join of 4 partitions, of the 200 build rows
+        // with the probe keys `0..200`: in DataFusion, every partition holds
+        // fewer distinct values of `d` than keys of 8 bits, while the row
+        // store would encode all 200 of a chunk again, as output column or
+        // only for the filter `d <> 'x'`.
+        let partitioned = |filter_only: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let by_k = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let k = col("k", &input.schema())?;
+                Ok(Arc::new(RepartitionExec::try_new(
+                    input,
+                    Partitioning::Hash(vec![k], 4),
+                )?))
+            };
+            let build = by_k(narrow_dictionary_build()?)?;
+            let probe = by_k(int32_k_scan((0..200).map(Some).collect())?)?;
+            let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+            let (filter, projection) = if filter_only {
+                let schema = Arc::new(Schema::new(vec![build.schema().field(1).clone()]));
+                let not_x = Arc::new(BinaryExpr::new(
+                    col("d", &schema)?,
+                    Operator::NotEq,
+                    lit("x"),
+                ));
+                let column = ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                };
+                (
+                    Some(JoinFilter::new(not_x, vec![column], schema)),
+                    Some(vec![0, 2]),
+                )
+            } else {
+                (None, None)
+            };
+            Ok(Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                on,
+                filter,
+                &JoinType::Inner,
+                projection,
+                PartitionMode::Partitioned,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?))
+        };
+        for filter_only in [false, true] {
+            let root = if hashes_are_forced_to_collide() {
+                // All rows are in one partition: its build side does not fit.
+                assert_lowered_plan_fails_like_datafusion(
+                    || partitioned(filter_only),
+                    lower,
+                    test_session_config(),
+                    "Dictionary key bigger than the key type",
+                )
+                .await
+            } else {
+                let batches = collect(partitioned(filter_only)?, task_ctx()).await?;
+                assert_eq!(count_rows(&batches), 200);
+                assert_lowered_plan_byte_eq(
+                    || partitioned(filter_only),
+                    lower,
+                    task_ctx(),
+                    false,
+                )
+                .await
+            };
+            assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        }
+
+        // A `CollectLeft` join probing the key 0 only: DataFusion fails to
+        // concatenate the build batches, whose dictionaries need more keys
+        // than 8 bits hold together, while the row store would not.
+        let collect_left = || {
+            join_on_k(
+                narrow_dictionary_build()?,
+                int32_k_scan(vec![Some(0)])?,
+                JoinType::Inner,
+            )
+        };
+        let error = collect(collect_left()?, task_ctx()).await.unwrap_err();
+        let message = error.to_string();
+        let root = assert_lowered_plan_fails_like_datafusion(
+            collect_left,
+            lower,
+            test_session_config(),
+            &message,
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{message}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fallible_build_repartitionings_are_kept() -> Result<()> {
+        // A `RightSemi` join on `(1 / k, k) = (k, k)` whose build side is
+        // repartitioned by its keys, and produces `k = 0` and then nothing,
+        // under a limit reached after 200 ms. The repartitioning evaluates
+        // `1 / k` on the row as it arrives, so that DataFusion fails right
+        // away: it is kept (bridged), although the join itself evaluates its
+        // keys too (and defers their errors until its build side is
+        // complete).
+        for mode in [PartitionMode::Partitioned, PartitionMode::CollectLeft] {
+            let make_plan = || {
+                let zero = RecordBatch::try_new(
+                    int32_k_schema(),
+                    vec![Arc::new(Int32Array::from(vec![0]))],
+                )?;
+                let source = batch_plan(zero, AfterBatch::Idle)?;
+                let k = col("k", &int32_k_schema())?;
+                let one_over_k: PhysicalExprRef = Arc::new(BinaryExpr::new(
+                    lit(1_i32),
+                    Operator::Divide,
+                    Arc::clone(&k),
+                ));
+                let build_keys = vec![one_over_k, k];
+                let repartitioned: Arc<dyn ExecutionPlan> =
+                    Arc::new(RepartitionExec::try_new(
+                        source,
+                        Partitioning::Hash(build_keys.clone(), 4),
+                    )?);
+                let probe = int32_k_scan(vec![Some(1)])?;
+                let probe_k = col("k", &probe.schema())?;
+                let (build, probe): (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) =
+                    match mode {
+                        PartitionMode::Partitioned => (
+                            repartitioned,
+                            Arc::new(RepartitionExec::try_new(
+                                probe,
+                                Partitioning::Hash(
+                                    vec![Arc::clone(&probe_k), Arc::clone(&probe_k)],
+                                    4,
+                                ),
+                            )?),
+                        ),
+                        _ => {
+                            (Arc::new(CoalescePartitionsExec::new(repartitioned)), probe)
+                        }
+                    };
+                let on = build_keys
+                    .into_iter()
+                    .zip([Arc::clone(&probe_k), probe_k])
+                    .collect();
+                let join = HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::RightSemi,
+                    None,
+                    mode,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?;
+                limit_over_delayed_42(Arc::new(join))
+            };
+            let root = assert_lowered_plan_fails_like_datafusion(
+                make_plan,
+                lower_with_limit,
+                test_session_config(),
+                "Divide by zero",
+            )
+            .await;
+            assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{mode:?}");
         }
         Ok(())
     }
