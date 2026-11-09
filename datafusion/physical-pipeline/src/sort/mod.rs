@@ -184,11 +184,13 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   address, where DataFusion's batches fit. This includes columns of the
 ///   `SortExec` that projections above it remove: DataFusion sorts them,
 ///   and whether it fails depends on its batches;
-/// * sort keys that evaluate to such encodings (also inside the key, e.g.
-///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`): the native sort
-///   evaluates its keys on each chunk, DataFusion on its batches, or on all
-///   rows of a small partition at once, so one of them can fail where the
-///   other does not;
+/// * sort keys (of the sort or of a merge) that evaluate to such encodings,
+///   or that compute values with 32-bit offsets, also inside the key (e.g.
+///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`, `upper(d)` or
+///   `CAST(repeat(s, 12582912) AS Utf8)`, but not a column of such values):
+///   the native sort evaluates its keys on each chunk, DataFusion on its
+///   batches, or on all rows of a small partition at once, so one of them
+///   can fail where the other does not;
 /// * TopKs of more than one row whose rows have values with 32-bit offsets
 ///   (`Utf8`, `Binary`, lists, maps, also inside dictionaries, run-end
 ///   encodings and structs), and sorts of run-end encoded values with 32-bit
@@ -480,12 +482,26 @@ impl SortPlan {
         if narrow(sort.schema()) || narrow(input.schema()) {
             return Ok(None);
         }
-        // For the same reason, keys that evaluate to such encodings: the native
-        // sort evaluates them on each chunk, DataFusion on its batches, or on
-        // all rows of a small partition at once (which it sorts together).
-        for sort_expr in ordering.iter() {
-            if evaluates_narrow_encoding(&sort_expr.expr, &input.schema())? {
-                return Ok(None);
+        // For the same reason, keys that compute values of which an array holds
+        // only so many: the native sort evaluates its keys on each chunk, while
+        // DataFusion evaluates the keys of its sort on its batches, or on all
+        // rows of a small partition at once (which it sorts together), and the
+        // keys of its merges on their batches.
+        let keys = [
+            (&ordering, input.schema()),
+            (sort.expr(), sort_input.schema()),
+        ]
+        .into_iter()
+        .chain(
+            merges
+                .iter()
+                .map(|merge| (merge.expr(), merge.input().schema())),
+        );
+        for (ordering, schema) in keys {
+            for sort_expr in ordering.iter() {
+                if computes_limited_values(&sort_expr.expr, &schema)? {
+                    return Ok(None);
+                }
             }
         }
 
@@ -786,19 +802,26 @@ fn has_run_end_encoded_offsets(data_type: &DataType) -> bool {
     }
 }
 
-/// Whether `expr`, or an expression it evaluates, evaluates to values with a
-/// narrow encoding (see [`has_narrow_encoding`]) on rows with schema
-/// `schema`: then whether evaluating it fails depends on how many rows it is
-/// evaluated on at once.
-fn evaluates_narrow_encoding(
+/// Whether evaluating `expr` on rows with schema `schema` computes values of
+/// which an array holds only so many: values with a narrow encoding (see
+/// [`has_narrow_encoding`]), or values with 32-bit offsets (see
+/// [`has_32_bit_offsets`]) that `expr` or an expression in it computes, such
+/// as `CAST(repeat(s, 12582912) AS Utf8)` (2 GiB in 171 rows) or a literal
+/// string (repeated for every row). A column computes nothing: its values
+/// are those of its input. Whether evaluating such an expression fails
+/// depends on how many rows it is evaluated on at once.
+fn computes_limited_values(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
 ) -> Result<bool> {
-    if has_narrow_encoding(&expr.data_type(schema)?) {
+    let data_type = expr.data_type(schema)?;
+    if has_narrow_encoding(&data_type)
+        || (!expr.is::<Column>() && has_32_bit_offsets(&data_type))
+    {
         return Ok(true);
     }
     for child in expr.children() {
-        if evaluates_narrow_encoding(child, schema)? {
+        if computes_limited_values(child, schema)? {
             return Ok(true);
         }
     }
@@ -1326,8 +1349,8 @@ mod tests {
 
     use arrow::array::{
         AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
-        Float64Array, Int32Array, Int64Array, RunArray, StringArray, StringViewArray,
-        TimestampNanosecondArray,
+        Float64Array, Int32Array, Int64Array, LargeStringArray, RunArray, StringArray,
+        StringViewArray, TimestampNanosecondArray,
     };
     use arrow::compute::{SortOptions, concat_batches};
     use arrow::datatypes::{Field, Int32Type, Int64Type};
@@ -2411,7 +2434,7 @@ mod tests {
         // The native sort evaluates its keys on each chunk, of 64 rows here,
         // and returned the rows. Sorts by keys that evaluate to narrow
         // encodings (also inside the key) are left to DataFusion; `Int32` keys
-        // stay native.
+        // of `LargeUtf8` values stay native.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("s", DataType::Utf8, false),
@@ -2458,8 +2481,21 @@ mod tests {
                 false,
                 false,
             ),
+            // `Utf8` values have 32-bit offsets too, see
+            // `sorts_by_computed_keys_with_32_bit_offsets_are_left_to_datafusion`.
             (
                 cast(Arc::clone(&s), dictionary(DataType::Int32)),
+                false,
+                false,
+            ),
+            (
+                cast(
+                    Arc::clone(&s),
+                    DataType::Dictionary(
+                        Box::new(DataType::Int32),
+                        Box::new(DataType::LargeUtf8),
+                    ),
+                ),
                 false,
                 true,
             ),
@@ -2510,18 +2546,74 @@ mod tests {
         };
         for (keys, fails, native) in [
             (
-                "Int8",
+                "Int8, Utf8",
                 Some("Dictionary key bigger than the key type"),
                 false,
             ),
-            ("Int32", None, true),
+            ("Int32, Utf8", None, false),
+            ("Int32, LargeUtf8", None, true),
         ] {
             let sql = format!(
-                "SELECT id, s FROM t ORDER BY arrow_cast(s, 'Dictionary({keys}, Utf8)'), id"
+                "SELECT id, s FROM t ORDER BY arrow_cast(s, 'Dictionary({keys})'), id"
             );
             let root =
                 assert_outcome_like_datafusion(&sql, config.clone(), &setup, fails).await;
             assert_eq!(sorts(&root) == 1, native, "{sql}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_by_computed_keys_with_32_bit_offsets_are_left_to_datafusion()
+    -> Result<()> {
+        // DataFusion sorts the three 64-row batches of a small partition at
+        // once, so it evaluates the key `CAST(repeat(s, 12582912) AS Utf8)`
+        // on all 192 rows: 2.25 GiB of `LargeUtf8` values, more than `Utf8`
+        // addresses. The native sort evaluates its keys on each chunk, of 64
+        // rows here, and returned the rows. Sorts by keys that compute values
+        // with 32-bit offsets (also inside the key) are left to DataFusion.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::LargeUtf8, false),
+        ]));
+        let batches = (0..3_i64)
+            .map(|batch| {
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..64).map(|i| batch * 64 + i),
+                    )),
+                    Arc::new(LargeStringArray::from(vec!["x"; 64])),
+                ];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = MemTable::try_new(Arc::clone(&schema), vec![batches.clone()])?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT id FROM t ORDER BY id, arrow_cast(repeat(s, 12582912), 'Utf8')";
+        let message = "LargeString array too large to cast to String array";
+        let root =
+            assert_outcome_like_datafusion(sql, config, &setup, Some(message)).await;
+        assert_eq!(sorts(&root), 0);
+
+        // Columns compute nothing, and other values stay native.
+        for (sql, native) in [
+            ("SELECT id, d FROM t1 ORDER BY d, id", true),
+            ("SELECT id, d FROM t1 ORDER BY upper(d), id", false),
+            ("SELECT id, d FROM t1 ORDER BY length(upper(d)), id", false),
+            (
+                "SELECT id, d FROM t1 ORDER BY arrow_cast(d, 'LargeUtf8'), id",
+                true,
+            ),
+            ("SELECT id, d FROM t1 ORDER BY length(d), id", true),
+            ("SELECT id, a FROM t1 ORDER BY a + b, id", true),
+        ] {
+            let root = assert_parity(sql).await;
+            let tree = format_operator_tree(&root);
+            assert_eq!(sorts(&root) == 1, native, "{sql}\n{tree}");
         }
         Ok(())
     }
