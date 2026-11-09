@@ -2206,25 +2206,23 @@ enum Why {
     /// (decimal arithmetic), whose errors could come in another order than in
     /// DataFusion (see `PipelineQueryPlanner`).
     AggregateArguments,
+    /// An operator with a part that may fail (decimal arithmetic), which the
+    /// native operators would evaluate on the chunks of a partition in
+    /// parallel, on several threads, so that another row than in DataFusion
+    /// could fail first (see `PipelineQueryPlanner`).
+    ParallelErrors,
     /// `PhysicalProjection::supports_projection_exec` refuses the projection
     /// (`date_part`, decimal arithmetic with more than one part that may
     /// fail).
     Projection,
     /// There is no native operator for `ScalarSubqueryExec`.
     ScalarSubquery,
-    /// A hash join with a filter that may fail (see
-    /// `PhysicalHashJoin::try_lower`).
-    JoinFilter,
-    /// A hash join whose dynamic filter a Parquet scan uses, where the rows
-    /// that the filter prunes could make a node below the join fail (see
-    /// `PhysicalHashJoin::try_lower`).
+    /// A hash join whose dynamic filter a Parquet scan of its probe side
+    /// uses: the scan skips the reads that the filter rejects, a native join
+    /// does not, and the reads of files may fail (see `PipelineQueryPlanner`).
     JoinDynamicFilter,
     /// A TopK whose dynamic filter a Parquet scan uses.
     TopKDynamicFilter,
-    /// A `FilterExec`, which pulls later batches of its input before it passes
-    /// on its rows, below a node that may fail, over a source that may fail
-    /// (see `PipelineQueryPlanner`).
-    FilterOrder,
 }
 
 /// A query (by number) that falls back to `BridgeOperator`s: the number of
@@ -2249,33 +2247,44 @@ const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
         (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
         (3, 13, &[("AggregateExec", Why::AggregateArguments)]),
         (5, 21, &[("AggregateExec", Why::AggregateArguments)]),
+        (6, 5, &[("AggregateExec", Why::ParallelErrors)]),
         (7, 22, &[("ProjectionExec", Why::Projection)]),
-        (8, 27, &[("ProjectionExec", Why::Projection)]),
+        (8, 31, &[("ProjectionExec", Why::ParallelErrors)]),
         (9, 19, &[("ProjectionExec", Why::Projection)]),
         (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
         (11, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
         (14, 10, &[("ProjectionExec", Why::Projection)]),
         (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (17, 12, &[("HashJoinExec", Why::JoinFilter)]),
+        (17, 16, &[("ProjectionExec", Why::ParallelErrors)]),
         (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, 6, &[("ProjectionExec", Why::ParallelErrors)]),
         (22, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
     ("Parquet", &[
         (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, 28, &[
+            ("HashJoinExec", Why::JoinDynamicFilter),
+            ("HashJoinExec", Why::JoinDynamicFilter),
+        ]),
         (3, 14, &[("AggregateExec", Why::AggregateArguments)]),
+        (4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (5, 22, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, 2, &[("FilterExec", Why::FilterOrder)]),
+        (6, 5, &[("AggregateExec", Why::ParallelErrors)]),
         (7, 23, &[("ProjectionExec", Why::Projection)]),
-        (8, 29, &[("ProjectionExec", Why::Projection)]),
+        (8, 33, &[("ProjectionExec", Why::ParallelErrors)]),
         (9, 18, &[("ProjectionExec", Why::Projection)]),
         (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
         (11, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (12, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (13, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (14, 10, &[("ProjectionExec", Why::Projection)]),
         (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (17, 12, &[("HashJoinExec", Why::JoinFilter)]),
+        (16, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (17, 16, &[("ProjectionExec", Why::ParallelErrors)]),
         (18, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
         (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
         (20, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (21, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (22, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
 ];
