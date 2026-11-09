@@ -163,11 +163,14 @@ impl PhysicalFilter {
     ///   lists or binaries), which the native operators cannot gather with
     ///   `take`, or run-end encoded arrays whose child fields are not Arrow's
     ///   (see `can_gather`);
-    /// * the output of `exec` has dictionaries with keys of less than 32 bits
-    ///   or of values that take less than a byte each (e.g. nulls), run ends of
-    ///   less than 32 bits, or lists, strings or binaries with 32-bit offsets
-    ///   (`Utf8`, `Binary`, but not their large or view types), at any depth,
-    ///   also as the values of dictionaries: `FilterExec` coalesces its output
+    /// * the output of `exec` has dictionaries with keys of less than 32 bits,
+    ///   of values that take less than a byte each (e.g. nulls), or with keys
+    ///   of less than 64 bits and values that Arrow does not merge but adds up
+    ///   (other than strings, binaries and primitive values, e.g. fixed-size
+    ///   binaries, which may share their storage), run ends of less than 32
+    ///   bits, or lists, strings or binaries with 32-bit offsets (`Utf8`,
+    ///   `Binary`, but not their large or view types), at any depth, also as
+    ///   the values of dictionaries: `FilterExec` coalesces its output
     ///   batches, merging the dictionaries of distinct batches, which fails if
     ///   they have more values than the keys can index (e.g. two batches of
     ///   100 distinct values, with `Int8` keys, or dictionaries of `1 << 30`
@@ -412,7 +415,9 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
 /// merges the dictionaries of distinct batches, and fails when their keys
 /// cannot index all of their values (keys of less than 32 bits, or values that
 /// take less than a byte each, e.g. nulls, which Arrow does not merge, and of
-/// which any number takes no memory), adds up run ends (run ends of less than
+/// which any number takes no memory, or keys of less than 64 bits and values
+/// that Arrow does not merge, but adds up, which may share their storage,
+/// see [`merges_dictionary_values`]), adds up run ends (run ends of less than
 /// 32 bits), and the offsets of lists (32-bit offsets, which lists of nulls
 /// overflow without memory), and of strings and binaries (32-bit offsets,
 /// which overflow beyond 2 GiB of bytes, which batches that share their
@@ -428,7 +433,13 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
     };
     match data_type {
         DataType::Dictionary(keys, values) => {
-            narrow(keys) || takes_little_memory(values) || may_fail_to_coalesce(values)
+            narrow(keys)
+                || takes_little_memory(values)
+                // Arrow adds up the values of the dictionaries it does not
+                // merge, which may share their storage.
+                || (!matches!(keys.as_ref(), DataType::Int64 | DataType::UInt64)
+                    && !merges_dictionary_values(values))
+                || may_fail_to_coalesce(values)
         }
         // Arrow's `filter` rebuilds run-end encoded arrays with its own fields
         // (see `RunArray::try_new`), so the output would not have its type.
@@ -456,6 +467,18 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
             .any(|(_, field)| may_fail_to_coalesce(field.data_type())),
         _ => false,
     }
+}
+
+/// Whether Arrow merges (deduplicating their values) the dictionaries of
+/// `values` that it concatenates (see `should_merge_dictionary_values`):
+/// strings, binaries and primitive values. It adds up the values of others,
+/// which more than `i32::MAX` may be without taking more memory, if the
+/// dictionaries share their storage (e.g. slices of one array).
+fn merges_dictionary_values(values: &DataType) -> bool {
+    matches!(
+        values,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    ) || values.is_primitive()
 }
 
 /// The global state of a [`PhysicalFilter`]: the rows it may still produce.
@@ -4484,6 +4507,51 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_dictionaries_of_values_that_arrow_does_not_merge_stay_in_datafusion()
+     {
+        let _large = one_large_test_at_a_time().await;
+        // `FilterExec` concatenates the dictionaries of the batches it
+        // coalesces: Arrow merges those of strings, binaries and primitive
+        // values, but adds up the values of others, here `(1 << 31) + 1`
+        // fixed-size binaries, more than `Int32` keys can index, though they
+        // share their storage (1 GiB). The native filter does not coalesce.
+        let values = arrow::array::FixedSizeBinaryArray::try_new(
+            1,
+            arrow::buffer::Buffer::from_vec(vec![0_u8; (1 << 30) + 1]),
+            None,
+        )
+        .unwrap();
+        let batch = |len: usize| {
+            let d =
+                arrow::array::DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+                    Int32Array::from(vec![0]),
+                    Arc::new(values.slice(0, len)),
+                )
+                .unwrap();
+            RecordBatch::try_from_iter([
+                ("x", Arc::new(Int32Array::from(vec![1])) as ArrayRef),
+                ("d", Arc::new(d) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let batches = [batch(1 << 30), batch((1 << 30) + 1)];
+        let schema = batches[0].schema();
+        let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome.as_ref().is_err_and(
+                |error| error.contains("Dictionary key bigger than the key type")
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_of_dictionaries_of_values_without_memory_stay_in_datafusion() {
         // `FilterExec` concatenates the dictionaries of the batches it
         // coalesces: Arrow cannot merge dictionaries of nulls, which take no
@@ -4630,10 +4698,47 @@ mod tests {
                 ),
                 true,
             ),
+            // And those of values that Arrow does not merge, but adds up, with
+            // keys of less than 64 bits: they may share their storage.
             (
                 DataType::Dictionary(
                     Box::new(DataType::Int32),
                     Box::new(DataType::FixedSizeBinary(1)),
+                ),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::UInt32),
+                    Box::new(DataType::Struct(
+                        vec![Field::new("i", DataType::Int8, true)].into(),
+                    )),
+                ),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::Utf8View),
+                ),
+                true,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int64),
+                    Box::new(DataType::FixedSizeBinary(1)),
+                ),
+                false,
+            ),
+            // Arrow merges primitive values (and strings and binaries).
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int8)),
+                false,
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::UInt32),
+                    Box::new(DataType::Decimal128(10, 2)),
                 ),
                 false,
             ),
