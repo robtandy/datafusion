@@ -13,9 +13,84 @@
 //! a [`PhysicalOperator`] tree by [`lower_execution_plan`], and wrapped in a
 //! [`PipelineRootExec`] that runs it with the pipeline engine.
 //!
-//! Nodes that have no native pipeline operator yet are wrapped in a
-//! [`BridgeOperator`], which executes the whole subtree with DataFusion's own
-//! implementation, so every plan can be executed.
+//! # Lowering
+//!
+//! The lowering walks the plan from its root and replaces every node, or
+//! chain of nodes, that a native operator reproduces exactly by that
+//! operator, whose inputs are lowered in turn:
+//!
+//! | DataFusion plan                                                                                     | Native operator                                                   |
+//! | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+//! | `SortPreservingMergeExec -> SortExec`, `SortExec`                                                   | [`PhysicalSort`], or [`PhysicalTopK`] with a fetch                |
+//! | `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)`, `AggregateExec(Single)` | [`PhysicalHashAggregate`]                                         |
+//! | `HashJoinExec` (`CollectLeft` or `Partitioned`)                                                     | [`PhysicalHashJoin`]                                              |
+//! | `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch                          | [`PhysicalLimit`]                                                 |
+//! | `UnionExec`, `InterleaveExec`                                                                       | [`PhysicalUnion`]                                                 |
+//! | `PlaceholderRowExec`                                                                                | [`PhysicalPlaceholderRow`]                                        |
+//! | `FilterExec`                                                                                        | [`PhysicalFilter`], wrapped in a [`CachingOperator`]              |
+//! | `ProjectionExec`                                                                                    | [`PhysicalProjection`]                                            |
+//! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                                                | the native scan sources of [`try_create_scan_source`]             |
+//! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                                  | removed                                                           |
+//!
+//! The nodes that only distribute rows over partitions or change the size of
+//! batches are removed: all threads of a pipeline read the chunks of its
+//! source directly (scans hand out morsels, the pipeline breakers are shared
+//! by all threads and finalize in parallel, and the [`CachingOperator`]s
+//! coalesce small chunks), so no rows are shuffled through channels. For the
+//! same reason, a two-stage aggregation (`Partial`, the `RepartitionExec` or
+//! `CoalescePartitionsExec` that distributes its states, possibly
+//! `CoalesceBatchesExec`s and `PartialReduce` stages, and `Final` /
+//! `FinalPartitioned`) becomes a single [`PhysicalHashAggregate`], a hash join
+//! in either partition mode a single [`PhysicalHashJoin`] (without the
+//! repartitioning of its inputs), and a sort with the merge of its sorted
+//! partitions a single [`PhysicalSort`].
+//!
+//! Every native operator documents (in its `try_lower` or `supports_*`
+//! function) which nodes it reproduces exactly, including their errors; any
+//! other node, such as a window aggregation, a nested loop or cross join, a
+//! sort-merge join, a recursive query or a custom node, is executed by
+//! DataFusion: it is wrapped, with its whole subtree, in a [`BridgeOperator`],
+//! so that every plan can be executed. Native operators above a bridged plan
+//! read its output as the source of their pipeline.
+//!
+//! # Plans that DataFusion must execute
+//!
+//! DataFusion evaluates every node on whole batches before the node above it
+//! sees them, a pipeline evaluates all of its operators on a chunk before the
+//! next chunk, so which rows are evaluated, and which error comes first, can
+//! differ. To keep DataFusion's results and errors exactly, the lowering also
+//! leaves these plans to DataFusion:
+//!
+//! * The plan below a limit that stops the execution early: the input of a
+//!   native limit, and the input of a filter with a fetch (unless it is a sort
+//!   that reads all of its input, which is lowered natively, with its input).
+//!   DataFusion pulls the input of a limit lazily, batch by batch, so the rows
+//!   that are evaluated before the limit is reached (and their errors) depend
+//!   on its batches (see [`PhysicalFilter::supports_filter_exec`]).
+//! * A filter, projection, aggregation or sort with a part that may fail (see
+//!   [`failing_parts`]) above native operators of the same pipeline that have
+//!   parts that may fail too: which of them fails first depends on the
+//!   batches.
+//! * A `FilterExec` whose plan has parts that may fail, below a node of the
+//!   same pipeline that has a part that may fail too: `FilterExec` coalesces
+//!   its output, so it raises the errors of later batches of its input before
+//!   the nodes above it see the rows of the earlier ones.
+//! * An aggregation that produces a dynamic filter (for `MIN` / `MAX`, which
+//!   DataFusion pushes into scans) above nodes that have parts that may fail:
+//!   the native aggregation does not update the filter, so these nodes see rows
+//!   that DataFusion prunes.
+//! * A hash repartitioning by expressions that may fail, which DataFusion
+//!   evaluates on every batch, and a `CoalesceBatchesExec` of types whose
+//!   concatenation may fail.
+//!
+//! Which expressions of a single operator it reproduces exactly, including
+//! their errors, is up to the operator (e.g. a projection or filter only lowers
+//! expressions whose errors do not depend on the batches, see
+//! [`depends_on_batches`]).
+//!
+//! The pipeline breakers that read all of their input before they produce any
+//! output (sorts, aggregations and the build side of hash joins) separate
+//! these concerns: nothing above them runs before their input is exhausted.
 //!
 //! # Example
 //!
@@ -39,18 +114,47 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! [`PhysicalSort`]: crate::sort::PhysicalSort
+//! [`PhysicalTopK`]: crate::sort::PhysicalTopK
 
 use std::fmt;
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion_common::Result;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::LogicalPlan;
-use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::aggregates::{
+    AggregateExec, AggregateInputMode, AggregateMode,
+};
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    ReplaceChildrenOptions,
+};
 use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
+use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
+use crate::join::PhysicalHashJoin;
 use crate::operator::PhysicalOperator;
+use crate::operators::adaptive_filter::{depends_on_batches, failing_parts};
+use crate::operators::caching::CachingOperator;
+use crate::operators::filter::PhysicalFilter;
+use crate::operators::limit::PhysicalLimit;
+use crate::operators::placeholder_row::PhysicalPlaceholderRow;
+use crate::operators::projection::PhysicalProjection;
+use crate::operators::union::PhysicalUnion;
+use crate::sources::try_create_scan_source;
 
 /// A [`QueryPlanner`] that executes queries with the pipeline engine.
 ///
@@ -90,12 +194,14 @@ impl QueryPlanner for PipelineQueryPlanner {
             .physical_planner
             .create_physical_plan(logical_plan, session)
             .await?;
-        let plan: Arc<dyn ExecutionPlan> = create_pipeline_plan(plan)?;
+        let plan: Arc<dyn ExecutionPlan> =
+            create_pipeline_plan_with_options(plan, session.config_options())?;
         Ok(plan)
     }
 }
 
-/// Lower `plan` and wrap it into a [`PipelineRootExec`].
+/// Lower `plan` and wrap it into a [`PipelineRootExec`], for any session
+/// (see [`lower_execution_plan`]).
 pub fn create_pipeline_plan(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<PipelineRootExec>> {
@@ -103,30 +209,842 @@ pub fn create_pipeline_plan(
     Ok(Arc::new(PipelineRootExec::try_new(root, plan)?))
 }
 
-/// Lower a DataFusion [`ExecutionPlan`] tree into a [`PhysicalOperator`] tree.
+/// Lower `plan`, to be executed in a session with the options `options`, and
+/// wrap it into a [`PipelineRootExec`] (see
+/// [`lower_execution_plan_with_options`]).
+pub fn create_pipeline_plan_with_options(
+    plan: Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
+) -> Result<Arc<PipelineRootExec>> {
+    let root = lower_execution_plan_with_options(&plan, options)?;
+    Ok(Arc::new(PipelineRootExec::try_new(root, plan)?))
+}
+
+/// Lower a DataFusion [`ExecutionPlan`] tree into a [`PhysicalOperator`]
+/// tree that can be executed in any session.
 ///
-/// Every node without a native pipeline operator is executed by a
-/// [`BridgeOperator`], together with its whole subtree. No node is lowered
-/// natively yet: the native operators (scans, filters, projections, joins,
-/// aggregates, sorts, ...) are wired in here as they are implemented.
+/// Whether some nodes can be lowered depends on the options of the session
+/// that executes them (e.g. a sort of strings, if DataFusion concatenates
+/// more than 2 GiB of them, see [`crate::sort::try_lower`]): this lowers them
+/// as if the session had the options for which the fewest nodes can be
+/// lowered. The planner lowers with the options of its session, see
+/// [`lower_execution_plan_with_options`].
 pub fn lower_execution_plan(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn PhysicalOperator>> {
-    Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
+    lower_execution_plan_with_options(plan, &any_session_options())
+}
+
+/// Lower a DataFusion [`ExecutionPlan`] tree, to be executed in a session
+/// with the options `options`, into a [`PhysicalOperator`] tree.
+///
+/// Every node (or chain of nodes) that a native operator reproduces exactly
+/// is replaced by that operator, and every other node is executed by a
+/// [`BridgeOperator`], together with its whole subtree. See the
+/// [module documentation](self) for the native operators and the plans that
+/// are left to DataFusion.
+pub fn lower_execution_plan_with_options(
+    plan: &Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
+) -> Result<Arc<dyn PhysicalOperator>> {
+    Lowering { options }.lower(plan, Context::default())
+}
+
+/// Options for which the lowering lowers what it lowers for every session:
+/// DataFusion's sort concatenates the batches of a partition, which can
+/// overflow 32-bit offsets, while they occupy fewer bytes than
+/// `sort_in_place_threshold_bytes` (see [`crate::sort::try_lower`]).
+fn any_session_options() -> ConfigOptions {
+    let mut options = ConfigOptions::default();
+    options.execution.sort_in_place_threshold_bytes = usize::MAX;
+    options
+}
+
+/// Where in the plan a node is lowered.
+#[derive(Debug, Clone, Copy, Default)]
+struct Context {
+    /// The node is below a limit that stops the execution early: it is left
+    /// to DataFusion, unless it is a sort that reads all of its input.
+    limited: bool,
+    /// A node above the node, before the next pipeline breaker that reads all
+    /// of its input, has a part that may fail (see [`failing_parts`]).
+    fallible_above: bool,
+}
+
+impl Context {
+    /// The context of the input of a pipeline breaker that reads all of its
+    /// input before it produces any output, and whose own expressions have
+    /// `failing_parts` parts that may fail.
+    fn below_breaker(failing_parts: usize) -> Self {
+        Self {
+            limited: false,
+            fallible_above: failing_parts > 0,
+        }
+    }
+}
+
+/// Lowers the nodes of a plan, see [`lower_execution_plan_with_options`].
+struct Lowering<'a> {
+    options: &'a ConfigOptions,
+}
+
+impl Lowering<'_> {
+    fn lower(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        ctx: Context,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        // A native sort reads all of its input, also below a limit.
+        if let Some(sort) = self.try_lower_sort(plan)? {
+            return Ok(sort);
+        }
+        if ctx.limited {
+            return Ok(bridge(plan));
+        }
+        if let Some(aggregate) = self.try_lower_aggregate(plan)? {
+            return Ok(aggregate);
+        }
+        if let Some(join) = self.try_lower_hash_join(plan, ctx)? {
+            return Ok(join);
+        }
+        let limited = Context {
+            limited: true,
+            ..ctx
+        };
+        if let Some(limit) =
+            PhysicalLimit::try_lower(plan, |input| self.lower(input, limited))?
+        {
+            return Ok(Arc::new(limit));
+        }
+        if let Some(union) =
+            PhysicalUnion::try_lower(plan, |input| self.lower(input, ctx))?
+        {
+            return Ok(Arc::new(union));
+        }
+        if let Some(placeholder) = PhysicalPlaceholderRow::try_lower(plan)? {
+            return Ok(Arc::new(placeholder));
+        }
+        if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+            return self.lower_filter(plan, filter, ctx);
+        }
+        if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+            return self.lower_projection(plan, projection, ctx);
+        }
+        if let Some(scan) = try_create_scan_source(plan)? {
+            return Ok(scan);
+        }
+        if let Some(input) = redistributed_input(plan) {
+            let lowered = self.lower(input, ctx)?;
+            // DataFusion executes a bridged input anyway: keep a
+            // repartitioning that spreads it over more partitions, which the
+            // threads of the pipeline read in parallel.
+            if lowered.is::<BridgeOperator>() && spreads_partitions(plan) {
+                return Ok(bridge(plan));
+            }
+            return Ok(lowered);
+        }
+        Ok(bridge(plan))
+    }
+
+    /// Lower a sort (a `SortPreservingMergeExec -> SortExec` chain, or a
+    /// `SortExec`) with [`crate::sort::try_lower`]. A sort with a key that may
+    /// fail above native operators of the same pipeline that may fail too is
+    /// left to DataFusion.
+    fn try_lower_sort(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(sort) = sort_of_chain(plan) else {
+            return Ok(None);
+        };
+        let own = sort_key_failing_parts(sort);
+        let input = Context::below_breaker(own);
+        let Some(lowered) =
+            crate::sort::try_lower(plan, self.options, |plan| self.lower(plan, input))?
+        else {
+            return Ok(None);
+        };
+        if own > 0
+            && lowered
+                .children()
+                .iter()
+                .any(|input| native_failing_parts(input) > 0)
+        {
+            return Ok(None);
+        }
+        Ok(Some(lowered))
+    }
+
+    /// Lower an aggregation with [`PhysicalHashAggregate::try_lower`], after
+    /// removing the `CoalesceBatchesExec`s and `PartialReduce` stages between
+    /// its final and its partial `AggregateExec`, and the sort that only orders
+    /// its input for its ordered aggregates (see [`without_ordering_sort`]).
+    /// An aggregation with a part that may fail above native operators of the
+    /// same pipeline that may fail too is left to DataFusion, as is an
+    /// aggregation that produces a dynamic filter (which the native
+    /// aggregation does not update) above nodes that may fail on the rows that
+    /// DataFusion would prune with it.
+    fn try_lower_aggregate(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        if !plan.is::<AggregateExec>() {
+            return Ok(None);
+        }
+        let plan = &without_intermediate_aggregation_stages(plan)?
+            .unwrap_or_else(|| Arc::clone(plan));
+        let Some(raw) = raw_aggregate(plan) else {
+            return Ok(None);
+        };
+        if !raw.dynamic_expressions_produced().is_empty()
+            && subtree_failing_parts(raw.input()) > 0
+        {
+            return Ok(None);
+        }
+        let own = own_failing_parts(raw);
+        let input = Context::below_breaker(own);
+        let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, |plan| {
+            self.lower(without_ordering_sort(raw, plan), input)
+        })?
+        else {
+            return Ok(None);
+        };
+        if own > 0 && native_failing_parts(aggregate.input()) > 0 {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(aggregate)))
+    }
+
+    /// Lower a hash join with [`PhysicalHashJoin::try_lower`].
+    ///
+    /// The join reads all of its build side before it probes, and raises the
+    /// errors of build keys that may fail only then, as DataFusion does: its
+    /// build side is lowered like the input of a pipeline breaker. Its probe
+    /// side continues the pipeline of the nodes above the join (the keys and
+    /// the filter of a native join cannot fail).
+    fn try_lower_hash_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        ctx: Context,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
+            return Ok(None);
+        };
+        let build = Context::below_breaker(0);
+        let probe = Context {
+            limited: false,
+            fallible_above: ctx.fallible_above,
+        };
+        let lowered = PhysicalHashJoin::try_lower(plan, |input| {
+            // The join lowers its inputs without the nodes that distribute
+            // their rows over partitions.
+            let side =
+                if distributes(join.left(), input) && !distributes(join.right(), input) {
+                    build
+                } else {
+                    probe
+                };
+            self.lower(input, side)
+        })?;
+        Ok(lowered.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>))
+    }
+
+    /// Lower a `FilterExec` to a [`PhysicalFilter`] wrapped in a
+    /// [`CachingOperator`], if that keeps its results and errors exactly, see
+    /// [`PhysicalFilter::supports_filter_exec`] and the
+    /// [module documentation](self).
+    fn lower_filter(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        filter: &FilterExec,
+        ctx: Context,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        // `FilterExec` coalesces its output: it pulls later batches of its
+        // input, whose errors it raises, before the nodes above it see the
+        // rows of earlier ones, which the native filter passes on at once.
+        if ctx.fallible_above && subtree_failing_parts(plan) > 0 {
+            return Ok(bridge(plan));
+        }
+        if PhysicalFilter::supports_filter_exec(filter) {
+            let own = failing_parts(filter.predicate(), &filter.input().schema());
+            let input = self.lower(
+                filter.input(),
+                Context {
+                    limited: filter.fetch().is_some(),
+                    fallible_above: ctx.fallible_above || own > 0,
+                },
+            )?;
+            if own == 0 || native_failing_parts(&input) == 0 {
+                let filter = PhysicalFilter::try_from_filter_exec(filter, input)?;
+                return Ok(Arc::new(CachingOperator::new(Arc::new(filter))));
+            }
+        }
+        Ok(bridge(plan))
+    }
+
+    /// Lower a `ProjectionExec` to a [`PhysicalProjection`], if that keeps
+    /// its results and errors exactly, see
+    /// [`PhysicalProjection::supports_projection_exec`] and the
+    /// [module documentation](self).
+    fn lower_projection(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        projection: &ProjectionExec,
+        ctx: Context,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        if PhysicalProjection::supports_projection_exec(projection) {
+            let input_schema = projection.input().schema();
+            let own = projection
+                .expr()
+                .iter()
+                .map(|expr| failing_parts(&expr.expr, &input_schema))
+                .fold(0, usize::saturating_add);
+            let input = self.lower(
+                projection.input(),
+                Context {
+                    limited: false,
+                    fallible_above: ctx.fallible_above || own > 0,
+                },
+            )?;
+            if own == 0 || native_failing_parts(&input) == 0 {
+                return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
+                    projection, input,
+                )?));
+            }
+        }
+        Ok(bridge(plan))
+    }
+}
+
+/// Replace the children of a plan, recomputing its properties.
+fn recompute() -> ReplaceChildrenOptions {
+    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute)
+}
+
+/// `plan`, with its whole subtree, executed by DataFusion.
+fn bridge(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn PhysicalOperator> {
+    Arc::new(BridgeOperator::new(Arc::clone(plan)))
+}
+
+/// The input of `plan`, if `plan` only distributes the rows of its input over
+/// partitions or changes the size of its batches, without changing them: the
+/// pipeline engine has no partitions, and sizes its chunks itself. These are
+///
+/// * a `CoalescePartitionsExec` without a fetch (with a fetch it is a limit;
+///   without input partitions, DataFusion fails to execute it);
+/// * a `RepartitionExec` (round robin or by hash) that does not preserve the
+///   order, of at least one partition, whose hash expressions cannot fail
+///   (any other is left to DataFusion, which evaluates it on every batch);
+/// * a `CoalesceBatchesExec` without a fetch, of types whose concatenation
+///   cannot fail.
+fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    let input = plan.children().into_iter().next()?;
+    if input.output_partitioning().partition_count() == 0 {
+        return None;
+    }
+    if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
+        return coalesce.fetch().is_none().then_some(input);
+    }
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
+        let schema = input.schema();
+        let infallible = match repartition.partitioning() {
+            Partitioning::RoundRobinBatch(_) => true,
+            Partitioning::Hash(exprs, _) => exprs.iter().all(|expr| {
+                !depends_on_batches(expr, &schema) && failing_parts(expr, &schema) == 0
+            }),
+            _ => false,
+        };
+        return (infallible && !repartition.preserve_order()).then_some(input);
+    }
+    if is_coalesce_batches(plan) {
+        let concatenates = plan
+            .schema()
+            .fields()
+            .iter()
+            .all(|field| !may_fail_to_concatenate(field.data_type()));
+        return (plan.fetch().is_none() && concatenates).then_some(input);
+    }
+    None
+}
+
+/// Whether `plan` is a `CoalesceBatchesExec` (which DataFusion does not plan
+/// any more, but which other planners may).
+#[expect(deprecated)]
+fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+}
+
+/// Whether concatenating arrays of `data_type`, as `CoalesceBatchesExec`
+/// does, may fail: it merges the values of dictionaries, which may overflow
+/// their keys, adds up run ends, and the offsets of lists, strings and
+/// binaries with 32-bit offsets (which lists of nulls, and batches that
+/// share large strings, overflow without memory), at any depth.
+fn may_fail_to_concatenate(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(..)
+        | DataType::RunEndEncoded(..)
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::Map(..)
+        | DataType::Utf8
+        | DataType::Binary => true,
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => may_fail_to_concatenate(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| may_fail_to_concatenate(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| may_fail_to_concatenate(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether `plan`, a node whose input is removed (see
+/// [`redistributed_input`]), spreads its input over more partitions.
+fn spreads_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.is::<RepartitionExec>()
+        && plan.children().iter().all(|input| {
+            input.output_partitioning().partition_count()
+                < plan.output_partitioning().partition_count()
+        })
+}
+
+/// Whether `input` is `side`, or a node below `side` that only nodes that
+/// distribute rows over partitions (`RepartitionExec`s and
+/// `CoalescePartitionsExec`s) separate from it.
+fn distributes(side: &Arc<dyn ExecutionPlan>, input: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut node = side;
+    loop {
+        if Arc::ptr_eq(node, input) {
+            return true;
+        }
+        if !(node.is::<RepartitionExec>() || node.is::<CoalescePartitionsExec>()) {
+            return false;
+        }
+        match node.children().as_slice() {
+            [child] => node = child,
+            _ => return false,
+        }
+    }
+}
+
+/// The `SortExec` of `plan`, if `plan` is a `SortExec`, or a chain of
+/// `SortPreservingMergeExec`s (and projections between them) above a
+/// `SortExec`, as [`crate::sort::try_lower`] lowers them.
+fn sort_of_chain(plan: &Arc<dyn ExecutionPlan>) -> Option<&SortExec> {
+    let mut node = plan;
+    let mut merged = false;
+    while node.is::<SortPreservingMergeExec>() || (merged && node.is::<ProjectionExec>())
+    {
+        merged = true;
+        node = node.children().into_iter().next()?;
+    }
+    node.downcast_ref::<SortExec>()
+}
+
+/// The `AggregateExec` that consumes the input rows of the aggregation
+/// `plan`: `plan` itself in `Single` or `SinglePartitioned` mode, or the
+/// `Partial` aggregation below `plan` in `Final` or `FinalPartitioned` mode,
+/// through the nodes that distribute its states.
+fn raw_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
+    let aggregate = plan.downcast_ref::<AggregateExec>()?;
+    match aggregate.mode() {
+        AggregateMode::Single | AggregateMode::SinglePartitioned => Some(aggregate),
+        AggregateMode::Final | AggregateMode::FinalPartitioned => {
+            let mut node = aggregate.input();
+            loop {
+                if let Some(partial) = node.downcast_ref::<AggregateExec>() {
+                    return (partial.mode() == &AggregateMode::Partial)
+                        .then_some(partial);
+                }
+                if !(node.is::<RepartitionExec>() || node.is::<CoalescePartitionsExec>())
+                {
+                    return None;
+                }
+                node = node.children().into_iter().next()?;
+            }
+        }
+        AggregateMode::Partial | AggregateMode::PartialReduce => None,
+    }
+}
+
+/// The input of `plan`, the input of `raw`, the aggregation that consumes the
+/// input rows, if `plan` is a sort that DataFusion added to order these rows
+/// for the ordered aggregates of `raw` (e.g. `ARRAY_AGG(x ORDER BY y)`), and
+/// otherwise `plan`. The native aggregation orders the values of these
+/// aggregates itself: it uses accumulators that do not rely on the order of
+/// their input, and sorts the rows of every thread for the aggregates that
+/// require it (see [`PhysicalHashAggregate`]). The sort is removed if it sorts
+/// every partition of its input, without a fetch, by keys that cannot fail
+/// (DataFusion evaluates them on all rows, the native aggregation evaluates
+/// them on the rows that pass the filters of the aggregates).
+fn without_ordering_sort<'a>(
+    raw: &AggregateExec,
+    plan: &'a Arc<dyn ExecutionPlan>,
+) -> &'a Arc<dyn ExecutionPlan> {
+    let Some(sort) = plan.downcast_ref::<SortExec>() else {
+        return plan;
+    };
+    let orders_aggregates = raw
+        .required_input_ordering()
+        .first()
+        .is_some_and(Option::is_some)
+        && raw
+            .aggr_expr()
+            .iter()
+            .any(|aggregate| !aggregate.order_bys().is_empty());
+    let sorts_partitions = sort.input().output_partitioning().partition_count()
+        == plan.output_partitioning().partition_count();
+    if orders_aggregates
+        && sorts_partitions
+        && sort.fetch().is_none()
+        && sort_key_failing_parts(sort) == 0
+    {
+        sort.input()
+    } else {
+        plan
+    }
+}
+
+/// `plan`, an aggregation in `Final` or `FinalPartitioned` mode, without the
+/// stages between it and its `Partial` aggregation that do not distribute
+/// the partial states, which [`PhysicalHashAggregate::try_lower`] does not
+/// look through: `CoalesceBatchesExec`s without a fetch, and `PartialReduce`
+/// aggregations (with their input schema), which merge partial states into
+/// partial states, as the final aggregation does. Returns `None` if there are
+/// none, or if `plan` is not such a chain.
+fn without_intermediate_aggregation_stages(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
+        return Ok(None);
+    };
+    if !matches!(
+        aggregate.mode(),
+        AggregateMode::Final | AggregateMode::FinalPartitioned
+    ) {
+        return Ok(None);
+    }
+    match states_without_intermediate_stages(aggregate.input())? {
+        Some((input, true)) => Ok(Some(
+            Arc::clone(plan).replace_children(vec![input], recompute())?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// The partial states `plan` (the input of a final aggregation, or a node
+/// below it) without the intermediate stages that
+/// [`without_intermediate_aggregation_stages`] removes, and whether there
+/// were any. `None` if `plan` does not lead to a `Partial` aggregation
+/// through nodes that distribute states and intermediate stages.
+fn states_without_intermediate_stages(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<(Arc<dyn ExecutionPlan>, bool)>> {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        return match aggregate.mode() {
+            AggregateMode::Partial => Ok(Some((Arc::clone(plan), false))),
+            AggregateMode::PartialReduce
+                if aggregate.input().schema() == aggregate.schema() =>
+            {
+                Ok(states_without_intermediate_stages(aggregate.input())?
+                    .map(|(input, _)| (input, true)))
+            }
+            _ => Ok(None),
+        };
+    }
+    let Some(input) = plan.children().into_iter().next() else {
+        return Ok(None);
+    };
+    if is_coalesce_batches(plan) && plan.fetch().is_none() {
+        return Ok(
+            states_without_intermediate_stages(input)?.map(|(input, _)| (input, true))
+        );
+    }
+    let distributes_states = plan
+        .downcast_ref::<RepartitionExec>()
+        .is_some_and(|repartition| !repartition.preserve_order())
+        || plan
+            .downcast_ref::<CoalescePartitionsExec>()
+            .is_some_and(|coalesce| coalesce.fetch().is_none());
+    if !distributes_states {
+        return Ok(None);
+    }
+    match states_without_intermediate_stages(input)? {
+        Some((new_input, true)) => Ok(Some((
+            Arc::clone(plan).replace_children(vec![new_input], recompute())?,
+            true,
+        ))),
+        Some((_, false)) => Ok(Some((Arc::clone(plan), false))),
+        None => Ok(None),
+    }
+}
+
+/// The parts that may fail (see [`failing_parts`]) of the expressions that
+/// `plan` evaluates on its input: judged on the schema of its input if it has
+/// a single child, and without schema otherwise, which is conservative
+/// (expressions that may fail then fail on empty batches). The aggregations
+/// that merge partial states evaluate no expression on their input (the
+/// arguments of their aggregate functions are those of the partial
+/// aggregations), and the dynamic filters that `plan` produces (e.g. the
+/// threshold of a TopK) compare the values of its own expressions, which are
+/// judged. Expressions that cannot be listed may fail.
+fn own_failing_parts(plan: &dyn ExecutionPlan) -> usize {
+    if plan
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|aggregate| {
+            aggregate.mode().input_mode() == AggregateInputMode::Partial
+        })
+    {
+        return 0;
+    }
+    let schema = match plan.children().as_slice() {
+        [child] => child.schema(),
+        _ => Arc::new(Schema::empty()),
+    };
+    let produced = plan.dynamic_expressions_produced();
+    let mut parts = 0_usize;
+    let listed = plan.apply_expressions(&mut |expr| {
+        if !produced
+            .iter()
+            .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
+        {
+            parts = parts.saturating_add(failing_parts(expr, &schema));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if listed.is_err() { usize::MAX } else { parts }
+}
+
+/// The parts that may fail of the keys of `sort`, on the schema of its
+/// input.
+fn sort_key_failing_parts(sort: &SortExec) -> usize {
+    let schema = sort.input().schema();
+    sort.expr()
+        .iter()
+        .map(|key| failing_parts(&key.expr, &schema))
+        .fold(0, usize::saturating_add)
+}
+
+/// The parts that may fail of the expressions of all nodes of `plan` (see
+/// [`own_failing_parts`]), sources included.
+fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    plan.children()
+        .into_iter()
+        .map(subtree_failing_parts)
+        .fold(own_failing_parts(plan.as_ref()), usize::saturating_add)
+}
+
+/// The parts that may fail (see [`failing_parts`]) of the native filters and
+/// projections that evaluate the chunks of the pipeline of `operator`, from
+/// `operator` down to the source of the pipeline: through the operators that
+/// pass on the chunks of their inputs (caching, limits, unions, and the probe
+/// side of hash joins, whose keys and filters cannot fail), down to the
+/// sources and pipeline breakers, which belong to other pipelines (and
+/// bridged plans, which DataFusion evaluates on whole batches).
+fn native_failing_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
+    if let Some(join) = operator.downcast_ref::<PhysicalHashJoin>() {
+        return native_failing_parts(join.probe_side());
+    }
+    if operator.is_source() || operator.is_sink() {
+        return 0;
+    }
+    let input_schema = || operator.children()[0].schema();
+    let own = if let Some(filter) = operator.downcast_ref::<PhysicalFilter>() {
+        failing_parts(filter.predicate(), &input_schema())
+    } else if let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
+        let input_schema = input_schema();
+        projection
+            .exprs()
+            .iter()
+            .map(|(expr, _)| failing_parts(expr, &input_schema))
+            .fold(0, usize::saturating_add)
+    } else {
+        0
+    };
+    operator
+        .children()
+        .iter()
+        .map(native_failing_parts)
+        .fold(own, usize::saturating_add)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::{
+        CsvReadOptions, ParquetReadOptions, SessionConfig, SessionContext,
+    };
+    use datafusion_common::tree_node::TreeNode;
     use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_execution::TaskContext;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Literal, col};
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::joins::PartitionMode;
+    use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
+    use datafusion_physical_plan::{PhysicalExpr, collect, displayable};
+
+    use crate::bridge::bridged_plans;
+    use crate::explain::format_operator_tree;
+    use crate::sort::{PhysicalSort, PhysicalTopK};
+    use crate::sources::test_harness::{write_csv, write_parquet};
+    use crate::sources::{CsvScanSource, MemoryScanSource, ParquetScanSource};
+    use crate::test_utils::{
+        compare_outputs, datafusion_context, pipeline_context, register_test_tables,
+        run_engines, test_session_config, test_table_t1,
+    };
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    /// The number of operators of type `T` in the operator tree `operator`.
+    fn count<T: PhysicalOperator>(operator: &Arc<dyn PhysicalOperator>) -> usize {
+        usize::from(operator.is::<T>())
+            + operator.children().iter().map(count::<T>).sum::<usize>()
+    }
+
+    /// The number of nodes named `name` in the plan `plan`.
+    fn count_nodes(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+        let mut nodes = 0;
+        plan.apply(|node| {
+            nodes += usize::from(node.name() == name);
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        nodes
+    }
+
+    async fn setup_test_tables(ctx: &SessionContext) -> Result<()> {
+        register_test_tables(ctx)
+    }
+
+    /// The plan of `sql` in default DataFusion, in a session configured with
+    /// `config` with the tables of [`register_test_tables`].
+    async fn datafusion_plan(sql: &str, config: SessionConfig) -> Arc<dyn ExecutionPlan> {
+        let ctx = datafusion_context(config);
+        register_test_tables(&ctx).unwrap();
+        ctx.sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// Assert that `sql` produces byte-identical results through the
+    /// [`PipelineQueryPlanner`] and on default DataFusion (see
+    /// `assert_byte_eq_with_datafusion`), in sessions configured with `config`
+    /// and set up with `setup`. Returns the operator tree of the pipeline
+    /// engine.
+    async fn assert_parity_with<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let (expected, actual) =
+            run_engines(sql, config, setup).await.unwrap_or_else(|e| {
+                panic!("Failed to run query on both engines: {e}\n{sql}")
+            });
+        let root = actual
+            .plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan")
+            .operator();
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!(
+                "Results differ: {message}\nquery: {sql}\nlowered: {}",
+                format_operator_tree(root)
+            );
+        }
+        Arc::clone(root)
+    }
+
+    /// [`assert_parity_with`] with the default tables and configuration.
+    async fn assert_parity(sql: &str) -> Arc<dyn PhysicalOperator> {
+        assert_parity_with(sql, test_session_config(), setup_test_tables).await
+    }
+
+    /// Assert that no part of the operator tree `root` of `sql` is executed by
+    /// DataFusion: every node is native, so nothing is shuffled through
+    /// `RepartitionExec`s either.
+    fn assert_native(sql: &str, root: &Arc<dyn PhysicalOperator>) {
+        let bridged = bridged_plans(root);
+        assert!(
+            bridged.is_empty(),
+            "Parts of the plan are left to DataFusion\nquery: {sql}\nlowered: {}",
+            format_operator_tree(root)
+        );
+    }
+
+    /// Assert that `sql` either produces byte-identical results through the
+    /// [`PipelineQueryPlanner`] and on default DataFusion (if `error` is
+    /// `None`), or fails on both with an error that contains `error`.
+    async fn assert_outcome(sql: &str, error: Option<&str>) {
+        let Some(error) = error else {
+            assert_parity(sql).await;
+            return;
+        };
+        for ctx in [
+            datafusion_context(test_session_config()),
+            pipeline_context(test_session_config()),
+        ] {
+            register_test_tables(&ctx).unwrap();
+            let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await;
+            let outcome = match plan {
+                Ok(plan) => collect(plan, ctx.task_ctx()).await,
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(_) => panic!("{sql} succeeds, expected an error: {error}"),
+                Err(e) => assert!(e.to_string().contains(error), "{sql}: {e}"),
+            }
+        }
+    }
+
+    /// A `CoalesceBatchesExec` of `input` (which DataFusion does not plan any
+    /// more), with a limit of `fetch` rows.
+    #[expect(deprecated)]
+    fn coalesce_batches(
+        input: Arc<dyn ExecutionPlan>,
+        fetch: Option<usize>,
+    ) -> datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec {
+        datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec::new(input, 8192)
+            .with_fetch(fetch)
+    }
+
+    /// A configuration with which DataFusion plans `Partitioned` hash joins,
+    /// with a `RepartitionExec(Hash)` on both sides.
+    fn partitioned_config() -> SessionConfig {
+        let mut config = test_session_config();
+        let optimizer = &mut config.options_mut().optimizer;
+        optimizer.hash_join_single_partition_threshold = 0;
+        optimizer.hash_join_single_partition_threshold_rows = 0;
+        config
+    }
+
+    // ---------------------------------------------------------------------
+    // Lowering of the native operators
+    // ---------------------------------------------------------------------
 
     #[test]
     fn unsupported_plans_are_bridged() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let plan: Arc<dyn ExecutionPlan> =
+        let scan: Arc<dyn ExecutionPlan> =
             MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
+        let ordering =
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("a", &schema)?)])
+                .unwrap();
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(PartialSortExec::new(ordering, scan, 1));
         let operator = lower_execution_plan(&plan)?;
         let bridge = operator.downcast_ref::<BridgeOperator>().unwrap();
         assert!(Arc::ptr_eq(bridge.plan(), &plan));
@@ -135,6 +1053,500 @@ mod tests {
         assert_eq!(root.schema(), schema);
         assert!(Arc::ptr_eq(root.input(), &plan));
         assert!(root.operator().is::<BridgeOperator>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_stage_aggregations_are_one_operator() {
+        // The queries, the number of `AggregateExec`s DataFusion plans for
+        // them (two stages per aggregation of several partitions) and the
+        // number of native aggregations.
+        for (sql, stages, aggregations) in [
+            (
+                "SELECT COUNT(*), COUNT(a), SUM(b), MIN(c), MAX(d), AVG(g) FROM t1",
+                2,
+                1,
+            ),
+            (
+                "SELECT d, COUNT(*) AS n, SUM(a) AS sa, MIN(h) AS mh, MAX(f) AS mf \
+                 FROM t1 GROUP BY d",
+                2,
+                1,
+            ),
+            ("SELECT DISTINCT d, e FROM t1", 2, 1),
+            (
+                "SELECT a, COUNT(*) AS n FROM t1 GROUP BY a HAVING COUNT(*) > 50",
+                2,
+                1,
+            ),
+            (
+                "SELECT d, e, SUM(g) AS sg, COUNT(*) AS n FROM t1 GROUP BY ROLLUP (d, e)",
+                2,
+                1,
+            ),
+            // `COUNT(DISTINCT)` is an aggregation of an aggregation.
+            (
+                "SELECT e, f, COUNT(DISTINCT a) AS da FROM t1 GROUP BY e, f",
+                4,
+                2,
+            ),
+            (
+                "SELECT n, COUNT(*) AS groups FROM \
+                 (SELECT a, COUNT(*) AS n FROM t1 GROUP BY a) GROUP BY n",
+                4,
+                2,
+            ),
+            // Ordered aggregates: the native aggregation orders the values
+            // itself, without the sort DataFusion plans below it.
+            (
+                "SELECT d, ARRAY_AGG(id ORDER BY id) AS ids, \
+                 FIRST_VALUE(a ORDER BY id DESC) AS last_a, \
+                 STRING_AGG(h, ',' ORDER BY id) AS hs FROM t1 GROUP BY d",
+                2,
+                1,
+            ),
+            // A single partition is aggregated in a single stage.
+            ("SELECT COUNT(*), SUM(a) FROM t_empty", 1, 1),
+        ] {
+            let plan = datafusion_plan(sql, test_session_config()).await;
+            assert_eq!(
+                count_nodes(&plan, "AggregateExec"),
+                stages,
+                "{sql}\n{}",
+                displayable(plan.as_ref()).indent(false)
+            );
+            let root = assert_parity(sql).await;
+            assert_native(sql, &root);
+            assert_eq!(
+                count::<PhysicalHashAggregate>(&root),
+                aggregations,
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hash_joins_are_one_operator_in_both_partition_modes() {
+        for (config, mode) in [
+            (test_session_config(), PartitionMode::CollectLeft),
+            (partitioned_config(), PartitionMode::Partitioned),
+        ] {
+            for sql in [
+                "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k",
+                "SELECT t1.id, t2.w FROM t1 LEFT JOIN t2 ON t1.a = t2.k AND t2.w > 100",
+                "SELECT t1.id, t2.k, t2.w FROM t1 RIGHT JOIN t2 ON t1.a = t2.k",
+                "SELECT t1.id, t2.k FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.k",
+                "SELECT t2.k, t2.name FROM t2 WHERE k IN (SELECT a FROM t1 WHERE e)",
+                "SELECT t2.k FROM t2 WHERE NOT EXISTS (SELECT 1 FROM t1 WHERE t1.a = t2.k)",
+            ] {
+                let plan = datafusion_plan(sql, config.clone()).await;
+                let mut modes = vec![];
+                plan.apply(|node| {
+                    if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+                        modes.push(*join.partition_mode());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .unwrap();
+                assert_eq!(modes, vec![mode], "{sql}");
+                if mode == PartitionMode::Partitioned {
+                    // Both inputs are shuffled by hash in DataFusion.
+                    assert_eq!(count_nodes(&plan, "RepartitionExec"), 2, "{sql}");
+                }
+                let root =
+                    assert_parity_with(sql, config.clone(), setup_test_tables).await;
+                assert_native(sql, &root);
+                assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{sql}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_and_merges_are_one_operator() {
+        for (sql, sorts, topks, limits) in [
+            ("SELECT * FROM t1 ORDER BY id", 1, 0, 0),
+            ("SELECT id, c FROM t1 ORDER BY c NULLS FIRST, id", 1, 0, 0),
+            ("SELECT id, d FROM t1 ORDER BY length(d), id", 1, 0, 0),
+            (
+                "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
+                1,
+                0,
+                0,
+            ),
+            ("SELECT id, a FROM t1 ORDER BY id DESC LIMIT 25", 0, 1, 0),
+            (
+                "SELECT id, h FROM t1 ORDER BY h DESC NULLS LAST, id LIMIT 100 OFFSET 7",
+                0,
+                1,
+                1,
+            ),
+        ] {
+            // DataFusion sorts every partition and merges the sorted
+            // partitions.
+            let plan = datafusion_plan(sql, test_session_config()).await;
+            assert_eq!(count_nodes(&plan, "SortPreservingMergeExec"), 1, "{sql}");
+            let root = assert_parity(sql).await;
+            assert_native(sql, &root);
+            let tree = format_operator_tree(&root);
+            assert_eq!(count::<PhysicalSort>(&root), sorts, "{sql}\n{tree}");
+            assert_eq!(count::<PhysicalTopK>(&root), topks, "{sql}\n{tree}");
+            assert_eq!(count::<PhysicalLimit>(&root), limits, "{sql}\n{tree}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_projections_unions_and_placeholders_are_native() {
+        for sql in [
+            "SELECT id, a + b AS s, c * 2 AS c2, NOT e AS ne FROM t1 \
+             WHERE a > 10 AND d <> 'beta'",
+            "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2",
+            "SELECT 1 AS one, 2 AS two",
+            "SELECT * FROM t1 WHERE false",
+        ] {
+            let root = assert_parity(sql).await;
+            assert_native(sql, &root);
+        }
+        let sql = "SELECT id, a FROM t1 WHERE a > 10";
+        let root = assert_parity(sql).await;
+        assert_native(sql, &root);
+        // The native filter is wrapped in a `CachingOperator`.
+        let caching = root.downcast_ref::<CachingOperator>().expect("a cache");
+        assert!(caching.children()[0].is::<PhysicalFilter>());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn complex_queries_run_natively() {
+        for sql in [
+            // A join, a filter, an aggregation and a sort.
+            "SELECT t2.name, COUNT(*) AS n, SUM(t1.b) AS sb, MIN(t1.h) AS mh \
+             FROM t1 JOIN t2 ON t1.a = t2.k WHERE t1.e GROUP BY t2.name ORDER BY t2.name",
+            // Three joins, an aggregation and a sort.
+            "SELECT a.k, b.name, COUNT(*) AS n, SUM(t1.b) AS sb FROM t2 a \
+             JOIN t2 b ON a.k = b.k JOIN t1 ON t1.a = a.k \
+             GROUP BY a.k, b.name ORDER BY a.k, b.name",
+            // A join with a residual filter and an aggregation of a join.
+            "SELECT t1.d, t2.name, COUNT(*) AS n, MAX(t1.ts) AS last \
+             FROM t1 JOIN t2 ON t1.a = t2.k AND t1.b > t2.w GROUP BY t1.d, t2.name",
+            "SELECT t2.k, COUNT(t1.id) AS n FROM t2 LEFT JOIN t1 ON t1.a = t2.k AND t1.e \
+             GROUP BY t2.k ORDER BY t2.k",
+            // Aggregations of aggregations, and of unions.
+            "SELECT n, COUNT(*) AS groups, SUM(n) AS total FROM \
+             (SELECT a, COUNT(*) AS n FROM t1 GROUP BY a) GROUP BY n ORDER BY n",
+            "SELECT k, COUNT(*) AS n, COUNT(DISTINCT w) AS dw FROM \
+             (SELECT a AS k, b AS w FROM t1 UNION ALL SELECT k, w FROM t2) \
+             GROUP BY k ORDER BY k",
+            // A semi join, a TopK and a limit.
+            "SELECT id, a, h FROM t1 WHERE a IN (SELECT k FROM t2 WHERE w > 1000) \
+             ORDER BY h DESC NULLS LAST, id LIMIT 20 OFFSET 3",
+            // Ordered aggregates of a join, without the sort of their input.
+            "SELECT t1.e, ARRAY_AGG(t2.w ORDER BY t2.w DESC NULLS LAST, t1.id) AS ws \
+             FROM t1 JOIN t2 ON t1.a = t2.k GROUP BY t1.e",
+        ] {
+            let root = assert_parity(sql).await;
+            assert_native(sql, &root);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn complex_queries_with_other_partitionings() {
+        for target_partitions in [1, 3, 16] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for sql in [
+                "SELECT t2.name, COUNT(*) AS n, SUM(t1.b) AS sb FROM t1 \
+                 JOIN t2 ON t1.a = t2.k GROUP BY t2.name ORDER BY t2.name",
+                "SELECT e, f, COUNT(DISTINCT a) AS da FROM t1 GROUP BY e, f",
+                "SELECT id, a FROM t1 ORDER BY id DESC LIMIT 25",
+            ] {
+                let root =
+                    assert_parity_with(sql, config.clone(), setup_test_tables).await;
+                assert_native(sql, &root);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Plans left to DataFusion
+    // ---------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_and_nested_loop_joins_are_bridged() {
+        // There is no native window or nested loop join (yet): DataFusion
+        // executes them with their inputs, below native operators.
+        for (sql, bridged) in [
+            (
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1",
+                "BoundedWindowAggExec",
+            ),
+            (
+                "SELECT id, SUM(b) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS s FROM t1",
+                "BoundedWindowAggExec",
+            ),
+            (
+                "SELECT t1.id, t2.k FROM t1 JOIN t2 ON t1.a < t2.k WHERE t1.id < 20",
+                "NestedLoopJoinExec",
+            ),
+        ] {
+            let root = assert_parity(sql).await;
+            let plans = bridged_plans(&root);
+            let names = plans.iter().map(|plan| plan.name()).collect::<Vec<_>>();
+            assert_eq!(
+                names,
+                vec![bridged],
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+        // The aggregation above a window is native.
+        let sql = "SELECT e, COUNT(*) AS n, MAX(rn) AS m FROM \
+                   (SELECT e, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1) \
+                   GROUP BY e";
+        let root = assert_parity(sql).await;
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+        assert_eq!(bridged_plans(&root).len(), 1);
+        // And windows of native aggregations and joins.
+        for sql in [
+            "SELECT d, n, RANK() OVER (ORDER BY n DESC, d) AS r FROM \
+             (SELECT d, COUNT(*) AS n FROM t1 GROUP BY d)",
+            "SELECT a.k, b.k, a.w FROM t2 a CROSS JOIN t2 b WHERE a.w < 0",
+        ] {
+            assert_parity(sql).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plans_below_limits_are_left_to_datafusion() {
+        // DataFusion reads the input of a limit lazily: what it evaluates
+        // before the limit is reached depends on its batches.
+        let sql = "SELECT COUNT(*) AS n FROM (SELECT * FROM t1 LIMIT 5)";
+        let root = assert_parity(sql).await;
+        let limit = root.children()[0].children()[0]
+            .downcast_ref::<PhysicalLimit>()
+            .unwrap_or_else(|| panic!("{}", format_operator_tree(&root)));
+        assert!(limit.input().is::<BridgeOperator>());
+        // Unless a sort that reads all of its input is in between.
+        let sql = "SELECT id, a FROM t1 ORDER BY id LIMIT 10 OFFSET 5";
+        let root = assert_parity(sql).await;
+        assert_native(sql, &root);
+        let limit = root.downcast_ref::<PhysicalLimit>().expect("a limit");
+        assert!(limit.input().is::<PhysicalTopK>());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_are_those_of_datafusion() {
+        for (sql, error) in [
+            // The filter removes the rows that would fail.
+            ("SELECT 10 / a AS x FROM t1 WHERE a <> 0", None),
+            ("SELECT SUM(10 / a) AS x FROM t1 WHERE a <> 0", None),
+            (
+                "SELECT d, SUM(1000 / a) AS x FROM t1 WHERE a > 0 GROUP BY d ORDER BY d",
+                None,
+            ),
+            ("SELECT 10 / (a - a) AS x FROM t1", Some("Divide by zero")),
+            (
+                "SELECT COUNT(*) AS n FROM t1 WHERE 10 / a > 1",
+                Some("Divide by zero"),
+            ),
+            (
+                "SELECT d, SUM(10 / (a - a)) AS x FROM t1 GROUP BY d",
+                Some("Divide by zero"),
+            ),
+            (
+                "SELECT t1.id, 100 / t2.k AS x FROM t1 JOIN t2 ON t1.a = t2.k",
+                Some("Divide by zero"),
+            ),
+            (
+                "SELECT id FROM t1 ORDER BY 10 / (a - a), id",
+                Some("Divide by zero"),
+            ),
+        ] {
+            assert_outcome(sql, error).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redistributions_are_removed() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
+        let batch = |values: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from_iter_values(values))],
+            )
+            .unwrap()
+        };
+        let scan = || -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(MemorySourceConfig::try_new_exec(
+                &[vec![batch(0..3000)], vec![], vec![batch(3000..3010)]],
+                Arc::clone(&schema),
+                None,
+            )?)
+        };
+        let v = col("v", &schema)?;
+        let fallible: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                10,
+            )))),
+            datafusion_expr::Operator::Divide,
+            Arc::clone(&v),
+        ));
+        let plans: Vec<(Arc<dyn ExecutionPlan>, bool)> = vec![
+            (
+                Arc::new(RepartitionExec::try_new(
+                    Arc::new(CoalescePartitionsExec::new(scan()?)),
+                    Partitioning::RoundRobinBatch(4),
+                )?),
+                true,
+            ),
+            (
+                Arc::new(RepartitionExec::try_new(
+                    scan()?,
+                    Partitioning::Hash(vec![Arc::clone(&v)], 4),
+                )?),
+                true,
+            ),
+            (Arc::new(coalesce_batches(scan()?, None)), true),
+            // DataFusion evaluates the hash expressions on every batch.
+            (
+                Arc::new(RepartitionExec::try_new(
+                    scan()?,
+                    Partitioning::Hash(vec![fallible], 4),
+                )?),
+                false,
+            ),
+            // A coalescing with a limit.
+            (Arc::new(coalesce_batches(scan()?, Some(5))), false),
+        ];
+        for (plan, removed) in plans {
+            let description = displayable(plan.as_ref()).indent(false).to_string();
+            let root = lower_execution_plan(&plan)?;
+            if removed {
+                assert!(root.is::<MemoryScanSource>(), "{description}");
+            } else {
+                assert!(root.is::<BridgeOperator>(), "{description}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn intermediate_aggregation_stages_are_removed() -> Result<()> {
+        // `Final -> CoalesceBatches -> Repartition -> PartialReduce ->
+        // Repartition -> Partial`, from DataFusion's `Final -> Repartition ->
+        // Partial`.
+        let sql =
+            "SELECT d, COUNT(*) AS n, SUM(a) AS sa, MIN(h) AS mh FROM t1 GROUP BY d";
+        let make_plan = || async {
+            let plan = datafusion_plan(sql, test_session_config()).await;
+            plan.transform_down(|node| {
+                let Some(last) = node.downcast_ref::<AggregateExec>() else {
+                    return Ok(datafusion_common::tree_node::Transformed::no(node));
+                };
+                if last.mode() != &AggregateMode::FinalPartitioned {
+                    return Ok(datafusion_common::tree_node::Transformed::no(node));
+                }
+                let repartition = Arc::clone(last.input());
+                let partial = Arc::clone(repartition.children()[0]);
+                let reduce: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+                    AggregateMode::PartialReduce,
+                    last.group_expr().clone(),
+                    last.aggr_expr().to_vec(),
+                    last.filter_expr().to_vec(),
+                    Arc::clone(&partial),
+                    last.input_schema(),
+                )?);
+                assert_eq!(reduce.schema(), partial.schema());
+                let below = Arc::clone(&repartition)
+                    .replace_children(vec![reduce], recompute())?;
+                let above = repartition.replace_children(vec![below], recompute())?;
+                let coalesce: Arc<dyn ExecutionPlan> =
+                    Arc::new(coalesce_batches(above, None));
+                let plan =
+                    Arc::clone(&node).replace_children(vec![coalesce], recompute())?;
+                Ok(datafusion_common::tree_node::Transformed::yes(plan))
+            })
+            .unwrap()
+            .data
+        };
+        let plan = make_plan().await;
+        assert_eq!(count_nodes(&plan, "AggregateExec"), 3);
+        let root = lower_execution_plan(&plan)?;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(test_session_config()));
+        let expected = collect(make_plan().await, Arc::clone(&task_ctx)).await?;
+        let root: Arc<dyn ExecutionPlan> = create_pipeline_plan(make_plan().await)?;
+        let actual = collect(Arc::clone(&root), task_ctx).await?;
+        let output =
+            |plan: &Arc<dyn ExecutionPlan>, batches| crate::test_utils::EngineOutput {
+                schema: plan.schema(),
+                plan: Arc::clone(plan),
+                batches,
+                ordered: false,
+            };
+        compare_outputs(&output(&plan, expected), &output(&root, actual))
+            .unwrap_or_else(|message| panic!("Results differ: {message}"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scans_of_files_are_native() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let batches = test_table_t1()?.into_iter().flatten().collect::<Vec<_>>();
+        let (parquet, csv) = (dir.path().join("p"), dir.path().join("c"));
+        for (i, batches) in batches.chunks(2).enumerate() {
+            let schema = batches[0].schema();
+            write_parquet(&parquet.join(format!("{i}.parquet")), schema, batches, None)?;
+            let columns = [0, 1, 2, 7];
+            let projected = batches
+                .iter()
+                .map(|batch| batch.project(&columns))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            write_csv(&csv.join(format!("{i}.csv")), &projected)?;
+        }
+        let (parquet, csv) = (parquet.to_str().unwrap(), csv.to_str().unwrap());
+        let setup = async |ctx: &SessionContext| {
+            register_test_tables(ctx)?;
+            ctx.register_parquet("p", parquet, ParquetReadOptions::default())
+                .await?;
+            ctx.register_csv("c", csv, CsvReadOptions::new()).await?;
+            Ok(())
+        };
+        let config = test_session_config();
+        for (sql, source) in [
+            (
+                "SELECT d, COUNT(*) AS n, SUM(a) AS sa FROM p GROUP BY d ORDER BY d",
+                "ParquetScanSource",
+            ),
+            (
+                "SELECT a, COUNT(*) AS n, MAX(g) AS mg FROM c GROUP BY a",
+                "CsvScanSource",
+            ),
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_native(sql, &root);
+            let sources =
+                count::<ParquetScanSource>(&root) + count::<CsvScanSource>(&root);
+            assert_eq!(sources, 1, "{sql}");
+            assert!(format_operator_tree(&root).contains(source), "{sql}");
+        }
+
+        // DataFusion pushes the dynamic filter of a hash join into the Parquet
+        // scan of its probe side, which the native join does not update: the
+        // join is left to DataFusion, unless the filter is disabled.
+        let sql =
+            "SELECT t2.name, COUNT(*) AS n FROM p JOIN t2 ON p.a = t2.k GROUP BY t2.name";
+        let root = assert_parity_with(sql, config.clone(), &setup).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        let mut config = config;
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = false;
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
         Ok(())
     }
 }
