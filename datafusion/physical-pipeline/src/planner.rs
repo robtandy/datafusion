@@ -68,10 +68,18 @@
 //!   DataFusion pulls the input of a limit lazily, batch by batch, so the rows
 //!   that are evaluated before the limit is reached (and their errors) depend
 //!   on its batches (see [`PhysicalFilter::supports_filter_exec`]).
-//! * A filter, projection, aggregation or sort with a part that may fail (see
-//!   [`failing_parts`]) above native operators of the same pipeline that have
-//!   parts that may fail too: which of them fails first depends on the
-//!   batches.
+//! * An aggregation or a sort with an expression (a group key, an argument or
+//!   a filter of an aggregate, a sort key) whose errors depend on the batches
+//!   it is evaluated on (see [`depends_on_batches`]), e.g. the right side of
+//!   `a <> 0 AND 10 / a > 1`, which DataFusion evaluates on all rows of a
+//!   batch unless at most 20% of them are left, or with more than one part
+//!   that may fail (see [`failing_parts`]): DataFusion evaluates every
+//!   expression of an operator on a whole batch before the next one, the
+//!   native operators on their chunks. (The native filters and projections
+//!   refuse such expressions themselves.)
+//! * A filter, projection, aggregation or sort with a part that may fail
+//!   above native operators of the same pipeline that have parts that may fail
+//!   too: which of them fails first depends on the batches.
 //! * A `FilterExec` whose plan has parts that may fail, below a node of the
 //!   same pipeline that has a part that may fail too: `FilterExec` coalesces
 //!   its output, so it raises the errors of later batches of its input before
@@ -84,10 +92,9 @@
 //!   evaluates on every batch, and a `CoalesceBatchesExec` of types whose
 //!   concatenation may fail.
 //!
-//! Which expressions of a single operator it reproduces exactly, including
-//! their errors, is up to the operator (e.g. a projection or filter only lowers
-//! expressions whose errors do not depend on the batches, see
-//! [`depends_on_batches`]).
+//! Which other nodes a native operator reproduces exactly, including their
+//! errors, is up to the operator (see its `try_lower` or `supports_*`
+//! function).
 //!
 //! The pipeline breakers that read all of their input before they produce any
 //! output (sorts, aggregations and the build side of hash joins) separate
@@ -138,6 +145,7 @@ use datafusion_common::format::ExplainFormat;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Explain;
+use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateInputMode, AggregateMode,
 };
@@ -152,7 +160,7 @@ use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    ReplaceChildrenOptions,
+    PhysicalExpr, ReplaceChildrenOptions,
 };
 use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
@@ -461,9 +469,16 @@ impl Lowering<'_> {
     }
 
     /// Lower a sort (a `SortPreservingMergeExec -> SortExec` chain, or a
-    /// `SortExec`) with [`crate::sort::try_lower`]. A sort with a key that may
-    /// fail above native operators of the same pipeline that may fail too is
-    /// left to DataFusion.
+    /// `SortExec`) with [`crate::sort::try_lower`].
+    ///
+    /// DataFusion evaluates the keys of a sort on its batches, the native sort
+    /// on its chunks: a sort whose keys have errors that depend on the batches
+    /// they are evaluated on (see [`depends_on_batches`]), e.g. the right side
+    /// of `a <> 0 AND 10 / a > 1`, which DataFusion evaluates on all rows of a
+    /// batch unless at most 20% of them are left, or more than one part that
+    /// may fail (which error comes first depends on the batches) is left to
+    /// DataFusion, as is a sort with a key that may fail above native operators
+    /// of the same pipeline that may fail too.
     fn try_lower_sort(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -471,13 +486,23 @@ impl Lowering<'_> {
         let Some(sort) = sort_of_chain(plan) else {
             return Ok(None);
         };
-        let own = sort_key_failing_parts(sort);
-        let input = Context::below_breaker(own);
+        let keys = Judgement::of_ordering(sort.expr(), &sort.input().schema());
+        if !keys.evaluates_like_datafusion() {
+            return Ok(None);
+        }
+        let input = Context::below_breaker(keys.failing_parts);
         let Some(lowered) =
             crate::sort::try_lower(plan, self.options, |plan| self.lower(plan, input))?
         else {
             return Ok(None);
         };
+        // The keys that the native sort evaluates (those of the top merge, over
+        // the projections below it, if any).
+        let native_keys = native_sort_keys(&lowered);
+        if !native_keys.evaluates_like_datafusion() {
+            return Ok(None);
+        }
+        let own = keys.failing_parts.max(native_keys.failing_parts);
         if own > 0
             && lowered
                 .children()
@@ -493,11 +518,16 @@ impl Lowering<'_> {
     /// removing the `CoalesceBatchesExec`s and `PartialReduce` stages between
     /// its final and its partial `AggregateExec`, and the sort that only orders
     /// its input for its ordered aggregates (see [`without_ordering_sort`]).
-    /// An aggregation with a part that may fail above native operators of the
-    /// same pipeline that may fail too is left to DataFusion, as is an
-    /// aggregation that produces a dynamic filter (which the native
-    /// aggregation does not update) above nodes that may fail on the rows that
-    /// DataFusion would prune with it.
+    ///
+    /// DataFusion evaluates the group keys, the arguments and the filters of
+    /// the aggregates on its batches, one after the other, the native
+    /// aggregation on its chunks: an aggregation with an expression whose
+    /// errors depend on the batches (see [`depends_on_batches`]) or with more
+    /// than one part that may fail is left to DataFusion, as is an aggregation
+    /// with a part that may fail above native operators of the same pipeline
+    /// that may fail too, and an aggregation that produces a dynamic filter
+    /// (which the native aggregation does not update) above nodes that may fail
+    /// on the rows that DataFusion would prune with it.
     fn try_lower_aggregate(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -510,12 +540,16 @@ impl Lowering<'_> {
         let Some(raw) = raw_aggregate(plan) else {
             return Ok(None);
         };
+        let judgement = Judgement::of_plan(raw);
+        if !judgement.evaluates_like_datafusion() {
+            return Ok(None);
+        }
         if !raw.dynamic_expressions_produced().is_empty()
             && subtree_failing_parts(raw.input()) > 0
         {
             return Ok(None);
         }
-        let own = own_failing_parts(raw);
+        let own = judgement.failing_parts;
         let input = Context::below_breaker(own);
         let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, |plan| {
             self.lower(without_ordering_sort(raw, plan), input)
@@ -812,10 +846,12 @@ fn without_ordering_sort<'a>(
             .any(|aggregate| !aggregate.order_bys().is_empty());
     let sorts_partitions = sort.input().output_partitioning().partition_count()
         == plan.output_partitioning().partition_count();
+    let keys = Judgement::of_ordering(sort.expr(), &sort.input().schema());
     if orders_aggregates
         && sorts_partitions
         && sort.fetch().is_none()
-        && sort_key_failing_parts(sort) == 0
+        && !keys.batch_dependent
+        && keys.failing_parts == 0
     {
         sort.input()
     } else {
@@ -897,59 +933,116 @@ fn states_without_intermediate_stages(
     }
 }
 
-/// The parts that may fail (see [`failing_parts`]) of the expressions that
-/// `plan` evaluates on its input: judged on the schema of its input if it has
-/// a single child, and without schema otherwise, which is conservative
-/// (expressions that may fail then fail on empty batches). The aggregations
-/// that merge partial states evaluate no expression on their input (the
-/// arguments of their aggregate functions are those of the partial
-/// aggregations), and the dynamic filters that `plan` produces (e.g. the
-/// threshold of a TopK) compare the values of its own expressions, which are
-/// judged. Expressions that cannot be listed may fail.
-fn own_failing_parts(plan: &dyn ExecutionPlan) -> usize {
-    if plan
-        .downcast_ref::<AggregateExec>()
-        .is_some_and(|aggregate| {
-            aggregate.mode().input_mode() == AggregateInputMode::Partial
-        })
-    {
-        return 0;
-    }
-    let schema = match plan.children().as_slice() {
-        [child] => child.schema(),
-        _ => Arc::new(Schema::empty()),
-    };
-    let produced = plan.dynamic_expressions_produced();
-    let mut parts = 0_usize;
-    let listed = plan.apply_expressions(&mut |expr| {
-        if !produced
-            .iter()
-            .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
-        {
-            parts = parts.saturating_add(failing_parts(expr, &schema));
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    if listed.is_err() { usize::MAX } else { parts }
+/// How the expressions that a node evaluates on the rows of its input can
+/// fail.
+#[derive(Debug, Clone, Copy, Default)]
+struct Judgement {
+    /// Whether the errors of an expression depend on the batches it is
+    /// evaluated on (see [`depends_on_batches`]).
+    batch_dependent: bool,
+    /// The number of the parts of the expressions that may fail (see
+    /// [`failing_parts`]).
+    failing_parts: usize,
 }
 
-/// The parts that may fail of the keys of `sort`, on the schema of its
-/// input.
-fn sort_key_failing_parts(sort: &SortExec) -> usize {
-    let schema = sort.input().schema();
-    sort.expr()
-        .iter()
-        .map(|key| failing_parts(&key.expr, &schema))
-        .fold(0, usize::saturating_add)
+impl Judgement {
+    /// The judgement of the expressions that `plan` evaluates on its input:
+    /// judged on the schema of its input if it has a single child, and without
+    /// schema otherwise, which is conservative (expressions that may fail then
+    /// fail on empty batches). The aggregations that merge partial states
+    /// evaluate no expression on their input (the arguments of their aggregate
+    /// functions are those of the partial aggregations), and the dynamic
+    /// filters that `plan` produces (e.g. the threshold of a TopK) compare the
+    /// values of its own expressions, which are judged. Expressions that cannot
+    /// be listed may fail, depending on the batches.
+    fn of_plan(plan: &dyn ExecutionPlan) -> Self {
+        let mut judgement = Self::default();
+        if plan
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|aggregate| {
+                aggregate.mode().input_mode() == AggregateInputMode::Partial
+            })
+        {
+            return judgement;
+        }
+        let schema = match plan.children().as_slice() {
+            [child] => child.schema(),
+            _ => Arc::new(Schema::empty()),
+        };
+        let produced = plan.dynamic_expressions_produced();
+        let listed = plan.apply_expressions(&mut |expr| {
+            if !produced
+                .iter()
+                .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
+            {
+                judgement.add(expr, &schema);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        if listed.is_err() {
+            judgement.batch_dependent = true;
+            judgement.failing_parts = usize::MAX;
+        }
+        judgement
+    }
+
+    /// The judgement of the keys of `ordering`, on rows of `schema`.
+    fn of_ordering(ordering: &LexOrdering, schema: &Schema) -> Self {
+        let mut judgement = Self::default();
+        for key in ordering.iter() {
+            judgement.add(&key.expr, schema);
+        }
+        judgement
+    }
+
+    fn add(&mut self, expr: &Arc<dyn PhysicalExpr>, schema: &Schema) {
+        self.batch_dependent |= depends_on_batches(expr, schema);
+        self.failing_parts = self
+            .failing_parts
+            .saturating_add(failing_parts(expr, schema));
+    }
+
+    /// Whether a native operator that evaluates these expressions on its
+    /// chunks, rather than on DataFusion's batches, produces the results and
+    /// raises the errors of DataFusion: no expression has errors that depend
+    /// on the batches, and at most one part may fail (DataFusion evaluates
+    /// every expression on a whole batch before the next one, so which of
+    /// several errors comes first depends on its batches).
+    fn evaluates_like_datafusion(&self) -> bool {
+        !self.batch_dependent && self.failing_parts <= 1
+    }
+}
+
+/// The judgement of the keys that `sort`, a [`PhysicalSort`] or a
+/// [`PhysicalTopK`], evaluates on the rows of its input.
+///
+/// [`PhysicalSort`]: crate::sort::PhysicalSort
+/// [`PhysicalTopK`]: crate::sort::PhysicalTopK
+fn native_sort_keys(sort: &Arc<dyn PhysicalOperator>) -> Judgement {
+    let ordering = if let Some(sort) = sort.downcast_ref::<crate::sort::PhysicalSort>() {
+        sort.ordering()
+    } else if let Some(topk) = sort.downcast_ref::<crate::sort::PhysicalTopK>() {
+        topk.ordering()
+    } else {
+        // Conservatively: unknown keys may fail, depending on the batches.
+        return Judgement {
+            batch_dependent: true,
+            failing_parts: usize::MAX,
+        };
+    };
+    let Some(input) = sort.children().first() else {
+        return Judgement::default();
+    };
+    Judgement::of_ordering(ordering, &input.schema())
 }
 
 /// The parts that may fail of the expressions of all nodes of `plan` (see
-/// [`own_failing_parts`]), sources included.
+/// [`Judgement::of_plan`]), sources included.
 fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    plan.children()
-        .into_iter()
-        .map(subtree_failing_parts)
-        .fold(own_failing_parts(plan.as_ref()), usize::saturating_add)
+    plan.children().into_iter().map(subtree_failing_parts).fold(
+        Judgement::of_plan(plan.as_ref()).failing_parts,
+        usize::saturating_add,
+    )
 }
 
 /// The parts that may fail (see [`failing_parts`]) of the native filters and
@@ -998,11 +1091,11 @@ mod tests {
     use datafusion_common::tree_node::TreeNode;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
+    use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal, col};
-    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion_physical_plan::joins::PartitionMode;
     use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
-    use datafusion_physical_plan::{PhysicalExpr, collect, displayable};
+    use datafusion_physical_plan::{collect, displayable};
 
     use crate::bridge::bridged_plans;
     use crate::explain::format_operator_tree;
@@ -1261,7 +1354,7 @@ mod tests {
             (
                 "SELECT d, ARRAY_AGG(id ORDER BY id) AS ids, \
                  FIRST_VALUE(a ORDER BY id DESC) AS last_a, \
-                 STRING_AGG(h, ',' ORDER BY id) AS hs FROM t1 GROUP BY d",
+                 NTH_VALUE(h, 2 ORDER BY id) AS second_h FROM t1 GROUP BY d",
                 2,
                 1,
             ),
@@ -1327,7 +1420,7 @@ mod tests {
         for (sql, sorts, topks, limits) in [
             ("SELECT * FROM t1 ORDER BY id", 1, 0, 0),
             ("SELECT id, c FROM t1 ORDER BY c NULLS FIRST, id", 1, 0, 0),
-            ("SELECT id, d FROM t1 ORDER BY length(d), id", 1, 0, 0),
+            ("SELECT id, a FROM t1 ORDER BY a + b, id", 1, 0, 0),
             (
                 "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
                 1,
@@ -1603,6 +1696,185 @@ mod tests {
             assert_native(sql, root);
         }
         Ok(())
+    }
+
+    /// A setup that registers the table `name` of a single batch, `batch`.
+    fn single_batch_table(
+        name: &'static str,
+        batch: RecordBatch,
+    ) -> impl AsyncFn(&SessionContext) -> Result<()> {
+        async move |ctx: &SessionContext| {
+            let table = datafusion::datasource::MemTable::try_new(
+                batch.schema(),
+                vec![vec![batch.clone()]],
+            )?;
+            ctx.register_table(name, Arc::new(table))?;
+            Ok(())
+        }
+    }
+
+    /// Assert that `sql` fails with an error that contains `message`, both in
+    /// DataFusion and through the [`PipelineQueryPlanner`], in sessions
+    /// configured with `config` and set up with `setup`.
+    async fn assert_fails_like_datafusion<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        message: &str,
+    ) where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        for ctx in [
+            datafusion_context(config.clone()),
+            pipeline_context(config.clone()),
+        ] {
+            setup(&ctx).await.unwrap();
+            let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await;
+            let outcome = match plan {
+                Ok(plan) => collect(plan, ctx.task_ctx()).await,
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(_) => panic!("{sql} succeeds, expected an error: {message}"),
+                Err(e) => assert!(e.to_string().contains(message), "{sql}: {e}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_sensitive_aggregates_and_sort_keys_are_left_to_datafusion() {
+        // One batch of 3000 rows: 600 rows with `a = 1`, then 2400 with
+        // `a = 0`. DataFusion evaluates the right side of
+        // `a <> 0 AND 10 / a > 1` only on the rows that the left side selects
+        // if at most 20% of the rows of the batch are left (600 of 3000): it
+        // never divides by zero. On the first chunk of 2048 rows, 29% of the
+        // rows are left, so a native aggregation or sort, evaluating it on
+        // every chunk, would divide by zero.
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(
+                (0..3000).map(|i| i32::from(i < 600)),
+            ))],
+        )
+        .unwrap();
+        let setup = single_batch_table("g", batch);
+        let config = test_session_config().with_target_partitions(1);
+        for sql in [
+            "SELECT SUM(CAST(a <> 0 AND 10 / a > 1 AS INT)) AS n FROM g",
+            "SELECT a, SUM(CAST(a <> 0 AND 10 / a > 1 AS INT)) AS n FROM g GROUP BY a",
+            "SELECT a FROM g ORDER BY CAST(a <> 0 AND 10 / a > 1 AS INT), a",
+            "SELECT a FROM g ORDER BY CAST(a <> 0 AND 10 / a > 1 AS INT), a LIMIT 5",
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_no_native_sort_or_aggregate(sql, &root);
+        }
+        // Their native forms, without the expressions whose errors depend on
+        // the batches.
+        for sql in [
+            "SELECT SUM(CAST(a <> 0 AS INT)) AS n FROM g",
+            "SELECT a FROM g ORDER BY CAST(a <> 0 AS INT), a",
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_native(sql, &root);
+        }
+        // Functions (opaque to the classification of errors, see
+        // `depends_on_batches`) and string literals (broadcast to the rows of a
+        // batch, e.g. the separator of `STRING_AGG`) are batch-sensitive too.
+        for sql in [
+            "SELECT id, d FROM t1 ORDER BY length(d), id",
+            "SELECT e, STRING_AGG(h, ',' ORDER BY id) AS hs FROM t1 GROUP BY e",
+            "SELECT upper(d) AS u, COUNT(*) AS n FROM t1 GROUP BY upper(d)",
+        ] {
+            let root = assert_parity(sql).await;
+            assert_no_native_sort_or_aggregate(sql, &root);
+        }
+    }
+
+    /// Assert that the operator tree `root` of `sql` has no native sort or
+    /// aggregation.
+    fn assert_no_native_sort_or_aggregate(sql: &str, root: &Arc<dyn PhysicalOperator>) {
+        let natives = count::<PhysicalSort>(root)
+            + count::<PhysicalTopK>(root)
+            + count::<PhysicalHashAggregate>(root);
+        assert_eq!(natives, 0, "{sql}\n{}", format_operator_tree(root));
+    }
+
+    /// The operator tree that `sql` is lowered to, in a session configured
+    /// with `config` and set up with `setup`.
+    async fn lowered<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = pipeline_context(config);
+        setup(&ctx).await.unwrap();
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        Arc::clone(plan.downcast_ref::<PipelineRootExec>().unwrap().operator())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_of_the_expressions_of_an_operator_come_in_datafusion_order() {
+        // One batch of 3000 rows: `10 / a` fails on row 100, `CAST(s AS INT)`
+        // on row 2100. DataFusion evaluates every expression of an
+        // aggregation or a sort on the whole batch before the next one, so it
+        // fails to cast first; a native operator evaluating both on the first
+        // chunk of 2048 rows would divide by zero first.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    (0..3000).map(|i| i32::from(i != 100)),
+                )),
+                Arc::new(arrow::array::StringViewArray::from_iter_values(
+                    (0..3000).map(|i| if i == 2100 { "x" } else { "1" }),
+                )),
+            ],
+        )
+        .unwrap();
+        let setup = single_batch_table("f", batch);
+        let config = test_session_config().with_target_partitions(1);
+        for sql in [
+            "SELECT SUM(CAST(s AS INT)) AS x, SUM(10 / a) AS y FROM f",
+            "SELECT a, SUM(CAST(s AS INT)) AS x, SUM(10 / a) AS y FROM f GROUP BY a",
+            "SELECT a FROM f ORDER BY CAST(s AS INT), 10 / a",
+        ] {
+            assert_fails_like_datafusion(
+                sql,
+                config.clone(),
+                &setup,
+                "Cannot cast string 'x'",
+            )
+            .await;
+            let root = lowered(sql, config.clone(), &setup).await;
+            assert_no_native_sort_or_aggregate(sql, &root);
+        }
+        // With a single part that may fail, they are native, and fail like
+        // DataFusion.
+        for (sql, message) in [
+            (
+                "SELECT SUM(CAST(s AS INT)) AS x FROM f",
+                "Cannot cast string 'x'",
+            ),
+            ("SELECT a FROM f ORDER BY 10 / a, a", "Divide by zero"),
+        ] {
+            assert_fails_like_datafusion(sql, config.clone(), &setup, message).await;
+            let root = lowered(sql, config.clone(), &setup).await;
+            assert_native(sql, &root);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2192,8 +2464,9 @@ mod tpch {
         // The other queries leave parts to DataFusion that the native
         // operators do not reproduce exactly: e.g. scalar subqueries, TopKs
         // of strings, joins whose probe side has pipeline breakers, or
-        // decimal arithmetic in projections.
-        for number in [3, 6, 13] {
+        // decimal arithmetic in projections and aggregations (with several
+        // parts that may fail).
+        for number in [6, 13] {
             assert!(
                 native.contains(&number),
                 "Q{number} is not native: {native:?}"
