@@ -721,6 +721,25 @@ mod tests {
     }
 
     #[test]
+    fn expressions_with_opaque_leaves_are_bound_to_all_columns() {
+        // `opaque(b)` reads `b` without a `Column` child: bound to the columns
+        // that the expressions reference, it would read another column.
+        let schema = schema();
+        let bound = BoundExprs::try_new(
+            [opaque_column("b", &schema), physical_expr("a + 1", &schema)],
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(
+            bound.columns,
+            (0..schema.fields().len()).collect::<Vec<_>>()
+        );
+        assert_eq!(bound.schema.as_ref(), schema.as_ref());
+        assert_eq!(bound.exprs()[0].to_string(), "opaque(b@1)");
+        assert_eq!(bound.exprs()[1].to_string(), "CAST(a@0 AS Int64) + 1");
+    }
+
+    #[test]
     fn expressions_are_bound_to_the_columns_they_reference() {
         let schema = schema();
         let bound = BoundExprs::try_new(
@@ -931,7 +950,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_projections_over_filtered_chunks() {
         assert_all_native_byte_eq(&[
-            "SELECT id, a + b AS s, c * 2 AS c2, length(d) AS u, NOT e AS ne FROM t1 WHERE a > 10",
+            "SELECT id, a + b AS s, c * 2 AS c2, d = 'beta' AS u, NOT e AS ne FROM t1 WHERE a > 10",
             "SELECT a AS x, id, h, a AS y FROM t1 WHERE a > 10 AND d <> 'beta'",
             "SELECT id, CASE WHEN a IS NULL THEN 0 WHEN a < 0 THEN -1 ELSE 1 END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, '' AS s FROM t1 WHERE a > 0",
@@ -954,6 +973,7 @@ mod tests {
         assert_all_projections_in_datafusion(&[
             "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
             "SELECT id, a + b AS s, upper(d) AS u FROM t1 WHERE a > 10",
+            "SELECT id, a + b AS s, length(d) AS u FROM t1 WHERE a > 10",
             "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day FROM t1",
             "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
@@ -1178,7 +1198,10 @@ mod tests {
     async fn opaque_columns_see_all_input_columns() {
         // `opaque(x)` reads `x` without a `Column` child: bound to the columns
         // that the expressions reference (`y`, or none), it would read `y` as
-        // `x`, or no column at all.
+        // `x`, or no column at all. An opaque expression may also fail
+        // depending on the rows it is evaluated on together, so it stays in
+        // DataFusion (see `expressions_with_opaque_leaves_are_bound_to_all_columns`
+        // for the binding).
         let batch = xys(&[((0, 1), 100), ((2, 2), 100), ((3, 0), 100)]);
         let schema = batch.schema();
         let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
@@ -1207,7 +1230,7 @@ mod tests {
             };
             let (error, operators) = assert_native_plan_parity(plan, false).await;
             assert!(error.is_none(), "{error:?}");
-            assert_eq!(operators.projections, 1);
+            assert_eq!(operators.projections, 0);
         }
     }
 
@@ -1636,6 +1659,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn functions_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
+        // `ProjectionExec` evaluates `concat_length(s)`, which builds `s || s`,
+        // on the batch of 8192 rows, 2 GiB of strings, whose 32-bit offsets
+        // overflow, but a pipeline on chunks of 2048 rows (see the test of the
+        // same name for filters).
+        let batch = large_strings();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(concat_length(&schema), "n")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Offset overflow error: 2147483648")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concatenations_of_strings_stay_in_datafusion() {
         let _large = one_large_test_at_a_time().await;
         // `ProjectionExec` evaluates `s || s` on the batch of 8192 rows, 2 GiB
@@ -2000,17 +2054,17 @@ mod tests {
     async fn differential_projections_of_views_and_dictionaries() {
         assert_all_native_byte_eq(&[
             "SELECT d8, sv, d32 AS d FROM vd WHERE d32 = 'k1'",
-            "SELECT i, character_length(sv) AS c FROM vd WHERE i % 5 = 0",
             "SELECT CAST(d32 AS VARCHAR) || '!' AS x FROM vd WHERE sv IS NOT NULL",
-            "SELECT i, sv, strpos(sv, 'g') AS g FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT d8 AS d, i + 1 AS j FROM vd WHERE d8 IS NOT NULL",
         ])
         .await;
-        // `upper` takes the dictionary itself, and may evaluate all of its
-        // values, which depend on DataFusion's batches; `||` and `length` may
-        // both fail; `concat` and `substr` build strings, whose sizes
-        // DataFusion may limit per batch.
+        // Functions are opaque: whatever they return, they may fail depending
+        // on the rows they are evaluated on together (e.g. `upper` takes the
+        // dictionary itself, and may evaluate all of its values, which depend
+        // on DataFusion's batches).
         assert_all_projections_in_datafusion(&[
+            "SELECT i, character_length(sv) AS c FROM vd WHERE i % 5 = 0",
+            "SELECT i, sv, strpos(sv, 'g') AS g FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
             "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
             "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",

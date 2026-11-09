@@ -1729,6 +1729,59 @@ pub(crate) mod test_support {
         )
     }
 
+    /// An immutable function of strings `s` that returns the lengths of
+    /// `s || s`, an intermediate of strings with 32-bit offsets: it returns
+    /// integers, but fails on more than 1 GiB of strings in a batch.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    pub(crate) struct ConcatLength {
+        signature: Signature,
+    }
+
+    impl ScalarUDFImpl for ConcatLength {
+        fn name(&self) -> &str {
+            "concat_length"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int32)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let strings = args.args[0].to_array(args.number_rows)?;
+            let strings = strings
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("strings");
+            let twice = arrow::compute::kernels::concat_elements::concat_elements_utf8(
+                strings, strings,
+            )?;
+            Ok(ColumnarValue::Array(
+                arrow::compute::kernels::length::length(&twice)?,
+            ))
+        }
+    }
+
+    /// `concat_length(s)` (see [`ConcatLength`]) of the column `s` of
+    /// `schema`.
+    pub(crate) fn concat_length(schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        let udf = ScalarUDF::new_from_impl(ConcatLength {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        });
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(udf),
+                vec![Arc::new(Column::new_with_schema("s", schema).unwrap())],
+                schema,
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
+    }
+
     /// A batch of 2048 rows of `x` (`Int32`), alternately `0` and `1`, and of
     /// `s` (`Utf8`), `"a"` but on the first row, which is null, above the
     /// bytes of `"é"`, which are not ASCII.
@@ -3443,19 +3496,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_fallible_conjuncts() {
         // A fallible first conjunct is evaluated on all rows, whatever the
-        // batches: these filters are native. (DataFusion's optimizer moves
-        // function calls and `LIKE` after the cheap conjuncts.)
+        // batches: these filters are native.
         assert_all_native_byte_eq(&[
             "SELECT id, x FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
-            "SELECT id, x FROM fallible WHERE length(s) <> 3",
-            "SELECT id, x FROM fallible WHERE length(s) <> 3 AND s LIKE '%1%'",
             "SELECT id, x FROM fallible WHERE 10 / (x + 100) < 1 AND x <> 0",
         ])
         .await;
-        // Functions that build strings may fail depending on how many rows
-        // they are evaluated on together (DataFusion may limit their sizes
-        // per batch).
+        // Functions are opaque: whatever they return, they may fail depending
+        // on how many rows they are evaluated on together (e.g. DataFusion
+        // limits the sizes of the strings of `repeat` per batch).
         assert_all_byte_eq_in_datafusion(&[
+            "SELECT id, x FROM fallible WHERE length(s) <> 3",
+            "SELECT id, x FROM fallible WHERE length(s) <> 3 AND s LIKE '%1%'",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X'",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X' AND s LIKE '%1%'",
         ])
@@ -3776,6 +3828,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn functions_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
+        // A function is opaque: whatever it returns, its implementation may
+        // fail depending on the rows it is evaluated on together. Here
+        // `concat_length(s)` builds `s || s`, 2 GiB of strings on the batch of
+        // 8192 rows of `FilterExec`, whose 32-bit offsets overflow, but
+        // 512 MiB on the chunks of the native filter (whose output is `id`).
+        let batch = large_strings();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let predicate =
+                Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                    concat_length(&schema),
+                    datafusion_expr::Operator::Gt,
+                    Arc::new(datafusion_physical_expr::expressions::Literal::new(
+                        ScalarValue::Int32(Some(0)),
+                    )),
+                ));
+            Arc::new(
+                datafusion_physical_plan::filter::FilterExecBuilder::new(
+                    predicate,
+                    scan(&batch),
+                )
+                .apply_projection(Some(vec![0]))
+                .unwrap()
+                .build()
+                .unwrap(),
+            )
+        };
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Offset overflow error: 2147483648")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concatenations_of_strings_stay_in_datafusion() {
         let _large = one_large_test_at_a_time().await;
         // `s || s` builds 2 GiB of strings on the batch of 8192 rows of
@@ -3819,14 +3915,15 @@ mod tests {
                 .is_err_and(|error| error.contains("string size overflow on repeat")),
             "{outcome:?}"
         );
-        // A function that builds values of fixed widths is lowered.
+        // Nor is one that returns values of fixed widths lowered: its
+        // implementation may build anything (see `functions_stay_in_datafusion`).
         let (error, operators) = assert_native_plan_parity(
             || filter_exec_without_strings("abs(n) > 0", scan(&batch)),
             false,
         )
         .await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.filters, 1);
+        assert_eq!(operators.filters, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3914,7 +4011,10 @@ mod tests {
     async fn opaque_columns_see_all_input_columns() {
         // `opaque(x)` reads `x` without a `Column` child: bound to the columns
         // that the predicate references (`y`, or none), it would read `y` as
-        // `x`, or no column at all.
+        // `x`, or no column at all. An opaque expression may also fail
+        // depending on the rows it is evaluated on together, so it stays in
+        // DataFusion (the native operators bind all columns for it, see
+        // `BoundExprs`).
         let batch = xys(&[((0, 1), 100), ((2, 2), 100), ((3, 0), 100)]);
         let schema = batch.schema();
         let one: Arc<dyn PhysicalExpr> =
@@ -3952,7 +4052,7 @@ mod tests {
             };
             let (error, operators) = assert_native_plan_parity(plan, false).await;
             assert!(error.is_none(), "{predicate}: {error:?}");
-            assert_eq!(operators.filters, 1, "{predicate}");
+            assert_eq!(operators.filters, 0, "{predicate}");
         }
     }
 
@@ -4476,6 +4576,18 @@ mod tests {
             // Functions may fail on empty batches too.
             ("regexp_like(s, 'a{1000000}')", vec![empty.clone()], true),
             ("regexp_like(s, 'a{1000000}')", vec![], false),
+            // (`regexp_count` only compiles its pattern if there are rows, but
+            // functions are opaque, see `functions_stay_in_datafusion`.)
+            (
+                "regexp_count(s, 'a{1000000}') > 0",
+                vec![empty.clone()],
+                false,
+            ),
+            (
+                "regexp_count(s, 'a{1000000}') > 0",
+                vec![empty.clone(), zeros.clone()],
+                true,
+            ),
         ] {
             let plan = || filter_exec(predicate, scan_batches(&schema, &batches), None);
             let filter_plan = plan();
@@ -4486,26 +4598,11 @@ mod tests {
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
             assert_eq!(operators.filters, 0, "{input}");
         }
-        // A pattern that compiles cannot fail, with or without empty batches,
-        // and `regexp_count` only compiles its pattern if there are rows.
+        // A pattern that compiles cannot fail, with or without empty batches.
         for (predicate, batches, fails) in [
-            (
-                "x = 0 OR s ~ 'a+'",
-                vec![empty.clone(), zeros.clone()],
-                false,
-            ),
-            ("x = 0 OR s ~ 'a+'", vec![zeros.clone()], false),
+            ("x = 0 OR s ~ 'a+'", vec![empty, zeros.clone()], false),
+            ("x = 0 OR s ~ 'a+'", vec![zeros], false),
             ("x = 0 OR s ~ 'a+'", vec![], false),
-            (
-                "regexp_count(s, 'a{1000000}') > 0",
-                vec![empty.clone()],
-                false,
-            ),
-            (
-                "regexp_count(s, 'a{1000000}') > 0",
-                vec![empty, zeros],
-                true,
-            ),
         ] {
             let (error, operators) = assert_native_plan_parity(
                 || {
