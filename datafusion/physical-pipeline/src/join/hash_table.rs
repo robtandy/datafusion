@@ -276,16 +276,22 @@ fn build_partition(
     let null_equality = matcher.null_equality();
     // Room for every row: the rows with a NULL key that cannot match are only
     // skipped while they are inserted.
+    let too_large = || {
+        resources_datafusion_err!(
+            "JoinHashTable partition with {num_rows} rows is too large"
+        )
+    };
     let capacity = num_rows
         .checked_mul(2)
         .and_then(usize::checked_next_power_of_two)
         .map(|capacity| capacity.max(MIN_CAPACITY))
-        .ok_or_else(|| {
-            resources_datafusion_err!(
-                "JoinHashTable partition with {num_rows} rows is too large"
-            )
-        })?;
-    reservation.try_grow((capacity + num_rows) * size_of::<u64>())?;
+        .ok_or_else(too_large)?;
+    // The table and the chains, reserved before they are allocated.
+    let table_bytes = capacity
+        .checked_add(num_rows)
+        .and_then(|entries| entries.checked_mul(size_of::<u64>()))
+        .ok_or_else(too_large)?;
+    reservation.try_grow(table_bytes)?;
     let mut entries = zeroed(capacity, "a JoinHashTable")?;
     let mut next = zeroed(num_rows, "the chains of a JoinHashTable")?;
     let mask = capacity - 1;
