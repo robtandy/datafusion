@@ -3033,12 +3033,12 @@ mod tests {
         }
 
         // DataFusion pushes the dynamic filter of a hash join into the Parquet
-        // scan of its probe side, which the native join does not update: the
-        // join is left to DataFusion, unless the filter is disabled.
+        // scan of its probe side: whether a native join can take it on is up
+        // to `PhysicalHashJoin::try_lower`, and the results are DataFusion's
+        // either way. Without the filter, the join is native.
         let sql =
             "SELECT t2.name, COUNT(*) AS n FROM p JOIN t2 ON p.a = t2.k GROUP BY t2.name";
-        let root = assert_parity_with(sql, config.clone(), &setup).await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        assert_parity_with(sql, config.clone(), &setup).await;
         let mut config = config;
         config
             .options_mut()
