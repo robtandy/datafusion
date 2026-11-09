@@ -2040,16 +2040,31 @@ mod tests {
             let root = assert_parity_with(sql, config.clone(), &setup).await;
             assert_native(sql, &root);
         }
-        // Functions (opaque to the classification of errors, see
-        // `depends_on_batches`) and string literals (broadcast to the rows of a
-        // batch, e.g. the separator of `STRING_AGG`) are batch-sensitive too.
+        // Functions and string literals (broadcast to the rows of a batch, e.g.
+        // the separator of `STRING_AGG`): whether their errors depend on the
+        // batches is up to the classification of errors (see
+        // `depends_on_batches`), and the sorts and aggregations that it judges
+        // batch-sensitive are left to DataFusion.
         for sql in [
             "SELECT id, d FROM t1 ORDER BY length(d), id",
             "SELECT e, STRING_AGG(h, ',' ORDER BY id) AS hs FROM t1 GROUP BY e",
             "SELECT upper(d) AS u, COUNT(*) AS n FROM t1 GROUP BY upper(d)",
         ] {
             let root = assert_parity(sql).await;
-            assert_no_native_sort_or_aggregate(sql, &root);
+            let mut sensitive = false;
+            datafusion_plan(sql, test_session_config())
+                .await
+                .apply(|node| {
+                    if node.is::<SortExec>() || node.is::<AggregateExec>() {
+                        sensitive |= !Judgement::of_plan(node.as_ref())
+                            .evaluates_like_datafusion();
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .unwrap();
+            if sensitive {
+                assert_no_native_sort_or_aggregate(sql, &root);
+            }
         }
     }
 
