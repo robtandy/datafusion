@@ -37,14 +37,15 @@
 //!   `JoinHashTableBuild` pipeline build the pointer tables of the radix
 //!   partitions in parallel, one partition at a time; `finalize` assembles
 //!   the shared, read-only [`JoinHashTable`]. Like DataFusion, it evaluates
-//!   the build keys on an empty build side, unless the join was canceled
-//!   (its output is not needed). If the join cannot produce any
-//!   output (e.g. an inner join with an empty build side), `finalize` returns
-//!   [`SinkFinalize::NoOutputPossible`], so that the probe side is not
-//!   executed at all, as DataFusion does not read it either. (DataFusion
-//!   still creates the streams of its probe side without polling them, so
-//!   only DataFusion raises the errors of creating them, e.g. for a scan of
-//!   an object store that is not registered.)
+//!   the build keys on an empty build side. A canceled join (whose output is
+//!   not needed any more) does neither, nor builds its table. If the join
+//!   cannot produce any output (e.g. an inner join with an empty build
+//!   side), `finalize` returns [`SinkFinalize::NoOutputPossible`], so that
+//!   the probe side is not executed, as DataFusion does not read it either.
+//!   DataFusion still creates the streams of its probe side, so a join
+//!   lowered from a `HashJoinExec` creates the DataFusion streams of that
+//!   probe input too, without polling them, to raise the same errors (e.g.
+//!   of a scan of an object store that is not registered).
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
 //!   table concurrently: neither side is shuffled
@@ -138,6 +139,11 @@ pub struct PhysicalHashJoin {
     /// The build side (the left input) and the probe side (the right input).
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: JoinSpec,
+    /// The probe input of the `HashJoinExec` the join was lowered from, whose
+    /// streams `HashJoinExec::execute` creates also when the join cannot
+    /// produce any output and does not read them: the join creates them too
+    /// then (see [`PhysicalOperator::finalize`]), to raise the same errors.
+    probe_plan: Option<Arc<dyn ExecutionPlan>>,
 }
 
 /// Everything about a join that does not depend on its inputs, only on
@@ -421,6 +427,7 @@ impl PhysicalHashJoin {
         Ok(Self {
             children: vec![build, probe],
             spec,
+            probe_plan: None,
         })
     }
 
@@ -574,7 +581,26 @@ impl PhysicalHashJoin {
             }
             children.push(lowered);
         }
-        Ok(Some(Self { children, spec }))
+        Ok(Some(Self {
+            children,
+            spec,
+            probe_plan: Some(Arc::clone(join.right())),
+        }))
+    }
+
+    /// Create the streams of all partitions of the probe input of the
+    /// `HashJoinExec` the join was lowered from and drop them without polling
+    /// them, as `HashJoinExec::execute` creates the probe stream of its
+    /// partition also when it does not read it: the same errors (e.g. of a
+    /// scan of an object store that is not registered), nothing read.
+    fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
+        let Some(probe) = &self.probe_plan else {
+            return Ok(());
+        };
+        for partition in 0..probe.output_partitioning().partition_count() {
+            drop(probe.execute(partition, Arc::clone(&ctx.task_ctx))?);
+        }
+        Ok(())
     }
 
     /// The build side (DataFusion's left input).
@@ -1538,14 +1564,19 @@ impl PhysicalOperator for PhysicalHashJoin {
     ) -> Result<SinkFinalize> {
         let spec = &self.spec;
         let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
+        // The output of a canceled join is not needed any more: its build
+        // pipelines stopped or did not run, and the pipelines that read its
+        // output are skipped. DataFusion does not collect the build side of a
+        // join that is not read, so the join neither evaluates its keys nor
+        // builds its table (nor reserves its memory).
+        if ctx.registry().is_sink_finished(self) {
+            return Ok(SinkFinalize::NoOutputPossible);
+        }
         let build_empty = state.build_rows.load(Ordering::Relaxed) == 0;
         // DataFusion evaluates the build keys on its whole build side, also
         // when it is empty, which raises the errors of keys that fail without
-        // any row (e.g. `1 / 0`). Not for a join whose output is not needed
-        // any more (canceled, so that its build pipelines stopped or did not
-        // run): DataFusion does not collect the build side of a join that is
-        // not read, nor reports its errors.
-        if build_empty && !ctx.registry().is_sink_finished(self) {
+        // any row (e.g. `1 / 0`).
+        if build_empty {
             let batch = RecordBatch::new_empty(self.build_side().schema());
             evaluate_expressions_to_arrays(
                 spec.on.iter().map(|(build, _)| build),
@@ -1553,10 +1584,12 @@ impl PhysicalOperator for PhysicalHashJoin {
             )?;
         }
         let table = state.finish_build(spec)?;
-        // Like DataFusion, which then does not read its probe side either.
+        // Like DataFusion, which then does not read its probe side either (but
+        // creates its streams).
         if (build_empty && spec.join_type.empty_build_side_produces_empty_result())
             || (table.is_empty() && spec.join_type.empty_map_produces_empty_result())
         {
+            self.create_probe_streams(ctx)?;
             return Ok(SinkFinalize::NoOutputPossible);
         }
         Ok(SinkFinalize::Ready)
@@ -1802,9 +1835,16 @@ mod tests {
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{DataType, Int64Type, TimeUnit};
     use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+    use datafusion_datasource::PartitionedFile;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
+    use datafusion_datasource_csv::source::CsvSource;
+    use datafusion_execution::SendableRecordBatchStream;
     use datafusion_execution::TaskContext;
+    use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
@@ -1815,7 +1855,10 @@ mod tests {
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::joins::HashJoinExecBuilder;
     use datafusion_physical_plan::projection::ProjectionExec;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use datafusion_physical_plan::union::UnionExec;
+    use futures::StreamExt;
 
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::executor::Executor;
@@ -1823,8 +1866,9 @@ mod tests {
     use crate::join::hash_table::hashes_are_forced_to_collide;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        TestSource, assert_lowered_plan_byte_eq,
+        TestSource, UNREGISTERED_STORE, assert_lowered_plan_byte_eq,
         assert_lowered_plan_fails_like_datafusion, count, pending_plan,
+        unregistered_store_scan,
     };
     use crate::sources::test_harness::write_parquet;
     use crate::test_utils::{
@@ -3869,6 +3913,247 @@ mod tests {
         Ok(())
     }
 
+    /// A join of `build` and `probe` (of [`int32_k_schema`]) on `k = k`.
+    fn join_on_k(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<dyn ExecutionPlan>,
+        join_type: JoinType,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+        Ok(Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?))
+    }
+
+    /// A plan of a single partition of `partition`.
+    fn partition_plan(
+        partition: impl PartitionStream + 'static,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = Arc::clone(partition.schema());
+        Ok(Arc::new(StreamingTableExec::try_new(
+            schema,
+            vec![Arc::new(partition)],
+            None,
+            vec![],
+            false,
+            None,
+        )?))
+    }
+
+    /// A partition that produces `batch`, then signals `consumed` once it is
+    /// polled again (its batch was consumed), and then never produces
+    /// anything again.
+    #[derive(Debug)]
+    struct SignalAfterBatch {
+        batch: RecordBatch,
+        consumed: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartitionStream for SignalAfterBatch {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let consumed = Arc::clone(&self.consumed);
+            let after = futures::stream::once(async move {
+                consumed.notify_one();
+                futures::future::pending::<Result<RecordBatch>>().await
+            });
+            let stream = futures::stream::iter([Ok(self.batch.clone())]).chain(after);
+            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
+        }
+    }
+
+    /// A partition that produces `batch` once `ready` is signaled.
+    #[derive(Debug)]
+    struct BatchWhenSignaled {
+        batch: RecordBatch,
+        ready: Arc<tokio::sync::Notify>,
+    }
+
+    impl PartitionStream for BatchWhenSignaled {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let ready = Arc::clone(&self.ready);
+            let batch = self.batch.clone();
+            let stream = futures::stream::once(async move {
+                ready.notified().await;
+                Ok(batch)
+            });
+            Box::pin(RecordBatchStreamAdapter::new(self.batch.schema(), stream))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn canceled_joins_do_not_build_their_table() -> Result<()> {
+        use crate::operators::limit::PhysicalLimit;
+        // A limit of one row over a union of a join whose build side produces
+        // 20,000 rows and then nothing, and of a branch that produces its row
+        // once those rows are consumed. Once the limit has its row, the join
+        // is not needed: DataFusion never builds its hash table, and in a
+        // pool of 500,000 bytes, its index would not fit next to its rows.
+        let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let consumed = Arc::new(tokio::sync::Notify::new());
+            let rows = (0..20_000).map(Some).collect::<Vec<_>>();
+            let build = partition_plan(SignalAfterBatch {
+                batch: RecordBatch::try_new(
+                    int32_k_schema(),
+                    vec![Arc::new(Int32Array::from(rows))],
+                )?,
+                consumed: Arc::clone(&consumed),
+            })?;
+            let join =
+                join_on_k(build, int32_k_scan(vec![Some(1)])?, JoinType::RightSemi)?;
+            let row = partition_plan(BatchWhenSignaled {
+                batch: RecordBatch::try_new(
+                    int32_k_schema(),
+                    vec![Arc::new(Int32Array::from(vec![42]))],
+                )?,
+                ready: consumed,
+            })?;
+            let union = UnionExec::try_new(vec![join, row])?;
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(union).with_fetch(Some(1)),
+            ))
+        };
+        let lower_limit = |plan: &Arc<dyn ExecutionPlan>| match PhysicalLimit::try_lower(
+            plan, lower,
+        )? {
+            Some(limit) => Ok(Arc::new(limit) as Arc<dyn PhysicalOperator>),
+            None => lower(plan),
+        };
+        let task_ctx = |pool: Arc<dyn MemoryPool>| -> Result<Arc<TaskContext>> {
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(pool)
+                .build_arc()?;
+            Ok(Arc::new(
+                TaskContext::default()
+                    .with_session_config(test_session_config())
+                    .with_runtime(runtime),
+            ))
+        };
+        // The canceled join collects its rows, but reserves no memory for its
+        // table.
+        let peaks = Arc::new(PeakPool::default());
+        let root = assert_lowered_plan_byte_eq(
+            make_plan,
+            lower_limit,
+            task_ctx(Arc::clone(&peaks) as _)?,
+            false,
+        )
+        .await;
+        assert!(root.is::<PhysicalLimit>());
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        assert!(peaks.peak("PhysicalHashJoin") > 0);
+        assert_eq!(peaks.peak("JoinHashTable"), 0);
+        // In a pool in which everything else fits, but not the index of
+        // 20,000 rows (at least 20 bytes per row: a slot of 8 bytes for every
+        // other row and a chain link of 4 bytes), both engines return 42.
+        let limit = peaks.sum_of_peaks() + 200_000;
+        assert_lowered_plan_byte_eq(
+            make_plan,
+            lower_limit,
+            task_ctx(Arc::new(GreedyMemoryPool::new(limit)))?,
+            false,
+        )
+        .await;
+        Ok(())
+    }
+
+    /// A CSV scan of `k` of a file in an object store that is not registered:
+    /// creating its stream fails.
+    fn unregistered_csv_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("unregistered://store")?,
+            Arc::new(CsvSource::new(int32_k_schema())),
+        )
+        .with_file(PartitionedFile::new("data.csv", 10))
+        .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
+    /// A partition of `k` that counts the streams created of it, and records
+    /// whether one is polled (it never produces anything).
+    #[derive(Debug)]
+    struct TrackedPartition {
+        schema: SchemaRef,
+        created: Arc<AtomicUsize>,
+        polled: Arc<AtomicBool>,
+    }
+
+    impl PartitionStream for TrackedPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            self.created.fetch_add(1, Ordering::Relaxed);
+            let polled = Arc::clone(&self.polled);
+            let stream = futures::stream::once(async move {
+                polled.store(true, Ordering::Relaxed);
+                futures::future::pending::<Result<RecordBatch>>().await
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_without_output_create_their_probe_streams() -> Result<()> {
+        // `HashJoinExec::execute` creates the stream of its probe side, also
+        // when its build side is empty and it does not read it: creating the
+        // stream of a scan of an object store that is not registered fails,
+        // whether the scan is native (CSV) or bridged (JSON).
+        type MakePlan = fn() -> Result<Arc<dyn ExecutionPlan>>;
+        let probes: [MakePlan; 2] = [unregistered_csv_scan, || {
+            unregistered_store_scan(int32_k_schema())
+        }];
+        for probe in probes {
+            for join_type in [JoinType::Inner, JoinType::LeftSemi, JoinType::RightSemi] {
+                let make_plan = || join_on_k(int32_k_scan(vec![])?, probe()?, join_type);
+                let root = assert_lowered_plan_fails_like_datafusion(
+                    make_plan,
+                    lower,
+                    test_session_config(),
+                    UNREGISTERED_STORE,
+                )
+                .await;
+                assert!(root.is::<PhysicalHashJoin>(), "{join_type}");
+            }
+        }
+
+        // The streams are created, by both engines, but not polled.
+        let created = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::new(AtomicBool::new(false));
+        let make_plan = || {
+            let probe = partition_plan(TrackedPartition {
+                schema: int32_k_schema(),
+                created: Arc::clone(&created),
+                polled: Arc::clone(&polled),
+            })?;
+            join_on_k(int32_k_scan(vec![])?, probe, JoinType::Inner)
+        };
+        let root = assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
+        assert!(root.is::<PhysicalHashJoin>());
+        assert_eq!(created.load(Ordering::Relaxed), 2);
+        assert!(!polled.load(Ordering::Relaxed));
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_without_probe_partitions_are_left_to_datafusion() -> Result<()> {
         // A join without probe partitions has no output partitions:
@@ -3922,6 +4207,12 @@ mod tests {
             *peak = (*peak).max(*now);
         }
 
+        /// The sum of the peaks of all consumers: at least the peak of their
+        /// total.
+        fn sum_of_peaks(&self) -> usize {
+            self.reserved.lock().values().map(|&(_, peak)| peak).sum()
+        }
+
         fn peak(&self, consumer: &str) -> usize {
             self.reserved
                 .lock()
@@ -3936,7 +4227,7 @@ mod tests {
         }
     }
 
-    impl datafusion_execution::memory_pool::MemoryPool for PeakPool {
+    impl MemoryPool for PeakPool {
         fn name(&self) -> &str {
             "PeakPool"
         }
@@ -3966,8 +4257,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn hash_tables_that_do_not_fit_the_memory_pool_are_not_allocated() -> Result<()>
     {
-        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
         let build_batches = (0..20)
             .map(|i| data_batch("l", i * 1000..(i + 1) * 1000, 0))
             .collect::<Vec<_>>();
