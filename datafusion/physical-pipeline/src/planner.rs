@@ -86,16 +86,21 @@
 //! * A hash join with a build key that may fail: DataFusion evaluates the
 //!   build keys once it collected its build side, all keys on a build batch
 //!   before the next, the last batch first, the native join on its chunks as
-//!   they arrive.
+//!   they arrive. And one with a probe key or a filter that may fail (also
+//!   without rows, e.g. a cast that their types do not support), or whose
+//!   errors depend on the batches: DataFusion evaluates the probe keys on
+//!   every probe batch, also on an empty one, the native join on the rows of
+//!   its chunks.
 //! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
 //!   or a `RepartitionExec` over a bounded input, which coalesces the batches
 //!   of its output partitions, also below a hash join, which removes the
 //!   redistribution of its inputs), whose plan has parts that may fail
-//!   (expressions, or sources that may fail to read or decode their rows, e.g.
-//!   a CSV file with a value that does not parse), below a node of the same
-//!   pipeline that has a part that may fail too: they coalesce their output,
-//!   so they raise the errors of later batches of their input before the
-//!   nodes above them see the rows of the earlier ones.
+//!   (expressions, sources that may fail to read or decode their rows, e.g. a
+//!   CSV file with a value that does not parse, or nodes that may fail to
+//!   combine their batches, e.g. a repartitioning that merges dictionaries),
+//!   below a node of the same pipeline that has a part that may fail too: they
+//!   coalesce their output, so they raise the errors of later batches of their
+//!   input before the nodes above them see the rows of the earlier ones.
 //! * An aggregation that produces a dynamic filter (for `MIN` / `MAX`, which
 //!   DataFusion pushes into scans) above nodes that have parts that may fail:
 //!   the native aggregation does not update the filter, so these nodes see rows
@@ -180,11 +185,13 @@ use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     PhysicalExpr, ReplaceChildrenOptions,
@@ -627,6 +634,23 @@ impl Lowering<'_> {
             build_keys.add(key, &build_schema);
         }
         if build_keys.batch_dependent || build_keys.failing_parts > 0 {
+            return Ok(None);
+        }
+        // DataFusion evaluates the probe keys on every probe batch, also on an
+        // empty one, and the filter on the candidate pairs of a probe batch, a
+        // native join on the rows of its chunks: probe keys and a filter that
+        // may fail (also without rows, e.g. a cast that their types do not
+        // support), or whose errors depend on the batches, are left to
+        // DataFusion. (The native join refuses some of them itself.)
+        let probe_schema = join.right().schema();
+        let mut probe = Judgement::default();
+        for (_, key) in join.on() {
+            probe.add(key, &probe_schema);
+        }
+        if let Some(filter) = join.filter() {
+            probe.add(filter.expression(), filter.schema());
+        }
+        if probe.batch_dependent || probe.failing_parts > 0 {
             return Ok(None);
         }
         // The join removes the redistributions of its inputs: a repartitioning
@@ -1197,16 +1221,47 @@ fn native_sort_keys(sort: &Arc<dyn PhysicalOperator>) -> Judgement {
 }
 
 /// The parts that may fail of all nodes of `plan`: the parts of their
-/// expressions that may fail (see [`Judgement::of_plan`]), and the sources
-/// that may fail to read or decode their rows (see [`source_may_fail`]).
+/// expressions that may fail (see [`Judgement::of_plan`]), the sources that
+/// may fail to read or decode their rows (see [`source_may_fail`]), and the
+/// nodes that may fail to combine their batches (see
+/// [`may_fail_to_combine`]).
 fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
     let own = Judgement::of_plan(plan.as_ref())
         .failing_parts
-        .saturating_add(usize::from(source_may_fail(plan)));
+        .saturating_add(usize::from(source_may_fail(plan)))
+        .saturating_add(usize::from(may_fail_to_combine(plan)));
     plan.children()
         .into_iter()
         .map(subtree_failing_parts)
         .fold(own, usize::saturating_add)
+}
+
+/// Whether DataFusion may fail to combine the batches of `plan`, a node that
+/// it may execute. Every node but those that pass their batches on one by
+/// one (projections, merges of partitions, unions, limits, and the leaves,
+/// see [`source_may_fail`]) may concatenate, coalesce, merge or interleave
+/// batches: e.g. `FilterExec` and `RepartitionExec` coalesce their output, a
+/// sort merges its sorted runs, and a hash join concatenates its build side.
+/// That may fail for types whose concatenation may fail (see
+/// [`may_fail_to_concatenate`]): of the output of a `FilterExec`, which
+/// coalesces it after its projection, and of the output or an input of any
+/// other such node.
+fn may_fail_to_combine(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.children().is_empty()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<GlobalLimitExec>()
+        || plan.is::<LocalLimitExec>()
+    {
+        return false;
+    }
+    concatenation_may_fail(&plan.schema())
+        || (!plan.is::<FilterExec>()
+            && plan
+                .children()
+                .iter()
+                .any(|child| concatenation_may_fail(&child.schema())))
 }
 
 /// Whether `plan` is a source that may fail to read or decode its rows: every
@@ -1512,12 +1567,11 @@ mod tests {
             vec![Arc::new(Int32Array::from_iter_values(0..10))],
         )?;
         let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
-            let limit: Arc<dyn ExecutionPlan> =
-                Arc::new(datafusion_physical_plan::limit::GlobalLimitExec::new(
-                    MemorySourceConfig::try_new_exec(&[vec![]], schema("a"), None)?,
-                    2,
-                    Some(3),
-                ));
+            let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(
+                MemorySourceConfig::try_new_exec(&[vec![]], schema("a"), None)?,
+                2,
+                Some(3),
+            ));
             let input = MemorySourceConfig::try_new_exec(
                 &[vec![batch.clone()]],
                 schema("b"),
@@ -2843,6 +2897,166 @@ mod tests {
         assert_eq!(count::<PhysicalSort>(&root), 0);
         assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
         assert!(bridged_plans(&root).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_with_probe_keys_that_may_fail_are_left_to_datafusion() -> Result<()> {
+        use datafusion_common::{JoinType, NullEquality};
+        use datafusion_physical_expr::expressions::TryCastExpr;
+
+        // DataFusion evaluates the probe keys of a join on every probe batch,
+        // also on an empty one, on which casting to a dictionary of booleans
+        // fails (even with `TRY_CAST`). A native join evaluates them on the
+        // rows of its chunks: none.
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Boolean));
+        let build_schema =
+            Arc::new(Schema::new(vec![Field::new("d", dictionary.clone(), true)]));
+        let values: arrow::array::DictionaryArray<arrow::datatypes::Int32Type> =
+            arrow::array::DictionaryArray::try_new(
+                Int32Array::from(vec![0, 1]),
+                Arc::new(arrow::array::BooleanArray::from(vec![true, false])),
+            )?;
+        let build =
+            RecordBatch::try_new(Arc::clone(&build_schema), vec![Arc::new(values)])?;
+        let probe_schema =
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, true)]));
+        let probe = RecordBatch::new_empty(Arc::clone(&probe_schema));
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let key: Arc<dyn PhysicalExpr> = Arc::new(TryCastExpr::new(
+                col("b", &probe_schema).unwrap(),
+                dictionary.clone(),
+            ));
+            Arc::new(
+                HashJoinExec::try_new(
+                    MemorySourceConfig::try_new_exec(
+                        &[vec![build.clone()]],
+                        Arc::clone(&build_schema),
+                        None,
+                    )
+                    .unwrap(),
+                    MemorySourceConfig::try_new_exec(
+                        &[vec![probe.clone()]],
+                        Arc::clone(&probe_schema),
+                        None,
+                    )
+                    .unwrap(),
+                    vec![(col("d", &build_schema).unwrap(), key)],
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let error = Some("Unsupported output type for dictionary packing");
+        let root = assert_plan_outcome(make_plan, config, error).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_over_nodes_that_may_fail_to_coalesce_stay_in_datafusion()
+    -> Result<()> {
+        // `10 / a` above a filter `a >= 0`, over a node that coalesces its
+        // input: 8192 rows (1000 zeros) that it passes on, then two batches of
+        // 100 rows whose `Dictionary(Int8, Utf8)` values are disjoint, which
+        // it fails to merge. `FilterExec` pulls that error before it emits the
+        // zeros, so DataFusion raises it; a native filter would pass the zeros
+        // on at once, and the projection divide by zero first.
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("d", dictionary, false),
+        ]));
+        let batch = |a: Vec<i32>, d: Vec<String>| {
+            let d: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+                d.iter().map(String::as_str).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(a)), Arc::new(d)],
+            )
+        };
+        let mut a = vec![0; 1000];
+        a.extend(std::iter::repeat_n(-1, 7192));
+        let disjoint = |prefix: &str| {
+            batch(
+                vec![-1; 100],
+                (0..100).map(|i| format!("{prefix}{i}")).collect(),
+            )
+        };
+        let batches = vec![
+            batch(a, vec!["c".to_string(); 8192])?,
+            disjoint("x")?,
+            disjoint("y")?,
+        ];
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(8192);
+        let error = Some("Dictionary key bigger than the key type");
+        let a = col("a", &schema)?;
+        for coalescing in ["round robin", "hash", "CoalesceBatchesExec"] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                let source = MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )
+                .unwrap();
+                let coalesced: Arc<dyn ExecutionPlan> = match coalescing {
+                    "round robin" => Arc::new(
+                        RepartitionExec::try_new(
+                            source,
+                            Partitioning::RoundRobinBatch(1),
+                        )
+                        .unwrap(),
+                    ),
+                    "hash" => Arc::new(
+                        RepartitionExec::try_new(
+                            source,
+                            Partitioning::Hash(vec![Arc::clone(&a)], 1),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => Arc::new(coalesce_batches(source, None)),
+                };
+                let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    Arc::clone(&a),
+                    datafusion_expr::Operator::GtEq,
+                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                        0,
+                    )))),
+                ));
+                let filter: Arc<dyn ExecutionPlan> = Arc::new(
+                    datafusion_physical_plan::filter::FilterExecBuilder::new(
+                        predicate, coalesced,
+                    )
+                    .apply_projection(Some(vec![0]))
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                );
+                let divide: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                        10,
+                    )))),
+                    datafusion_expr::Operator::Divide,
+                    col("a", &filter.schema()).unwrap(),
+                ));
+                Arc::new(
+                    ProjectionExec::try_new(vec![(divide, "x".to_string())], filter)
+                        .unwrap(),
+                )
+            };
+            let root = assert_plan_outcome(make_plan, config.clone(), error).await;
+            assert_eq!(count::<PhysicalFilter>(&root), 0, "{coalescing}");
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
