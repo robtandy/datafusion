@@ -1115,6 +1115,11 @@ mod tests {
             rows.clone()
                 .map(|i| valid(i, 13).then(|| (0..i % 4).map(Some).collect::<Vec<_>>())),
         );
+        let timestamps = arrow::array::TimestampNanosecondArray::from_iter(
+            rows.clone()
+                .map(|i| valid(i, 14).then_some(i * 1_000_000_007)),
+        )
+        .with_timezone("+01:00");
         let structs = StructArray::from(vec![(
             Arc::new(Field::new("x", DataType::Int32, true)),
             Arc::new(ints.clone()) as ArrayRef,
@@ -1130,6 +1135,7 @@ mod tests {
             Arc::new(decimals),
             Arc::new(dictionary),
             Arc::new(lists),
+            Arc::new(timestamps),
             Arc::new(structs),
         ];
         RecordBatch::try_from_iter(
