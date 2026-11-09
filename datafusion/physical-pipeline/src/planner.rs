@@ -3331,7 +3331,7 @@ mod tests {
         s[2048] = "y".to_string();
         let batch = RecordBatch::try_from_iter([(
             "s",
-            Arc::new(arrow::array::StringArray::from(s)) as arrow::array::ArrayRef,
+            Arc::new(arrow::array::StringViewArray::from(s)) as arrow::array::ArrayRef,
         )])?;
         let setup = single_batch_table("f", batch);
         let error = "Cannot cast string '0000000000";
@@ -3339,11 +3339,13 @@ mod tests {
         // cast.
         let casts = |root: &Arc<dyn PhysicalOperator>, operator: &str| match operator {
             "projection" => count::<PhysicalProjection>(root),
+            "filter" => count::<PhysicalFilter>(root),
             "aggregation" => count::<PhysicalHashAggregate>(root),
             _ => count::<PhysicalSort>(root),
         };
         for (sql, operator) in [
             ("SELECT CAST(s AS INT) AS x FROM f", "projection"),
+            ("SELECT s FROM f WHERE CAST(s AS INT) > 0", "filter"),
             ("SELECT SUM(CAST(s AS INT)) AS x FROM f", "aggregation"),
             ("SELECT s FROM f ORDER BY CAST(s AS INT)", "sort"),
         ] {
@@ -3361,6 +3363,7 @@ mod tests {
             assert_fails_like_datafusion(sql, config.clone(), &setup, error).await;
             let root = lowered(sql, config, &setup).await;
             assert!(bridged_plans(&root).is_empty(), "{sql}");
+            assert_eq!(casts(&root, operator), 1, "{sql}");
         }
         Ok(())
     }
@@ -3718,6 +3721,23 @@ mod tests {
             "elapsed_compute",
         ] {
             assert!(plan.contains(metric), "{metric}: {plan}");
+        }
+        // In both renderings of `EXPLAIN ANALYZE VERBOSE`, for the native
+        // operators and the nodes of the bridged plan.
+        let sql =
+            format!("EXPLAIN (ANALYZE, VERBOSE, METRICS 'rows', TIMING OFF) {query}");
+        let explained = explain(&sql).await;
+        for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
+            let plan = plan_of(&explained, rendering);
+            for node in ["PhysicalSort", "BoundedWindowAggExec"] {
+                let line = plan
+                    .lines()
+                    .find(|line| line.trim_start().starts_with(node))
+                    .unwrap_or_else(|| panic!("no {node}: {plan}"));
+                assert!(line.contains("output_rows="), "{rendering}: {line}");
+                assert!(!line.contains("elapsed_compute"), "{rendering}: {line}");
+            }
+            assert!(!plan.contains("elapsed_compute"), "{rendering}: {plan}");
         }
     }
 
