@@ -61,6 +61,28 @@
 //!   the unmatched ones (the matched ones for `LeftSemi`, all of them with
 //!   their mark for `LeftMark`).
 //!
+//! The probe side of a join may have pipeline breakers of its own, e.g. the
+//! build side of a join below (as in the joins of TPC-H, which DataFusion
+//! plans as chains of joins whose probe side is the next join). DataFusion
+//! reads the probe side of a join only once its build side is collected, so
+//! the pipelines of these breakers wait for the build side of the join
+//! (they depend on its meta pipeline, see
+//! [`MetaPipelineBuilder::build_with_dependency`]): if the join cannot
+//! produce output, or is canceled (e.g. by a limit above) before its build
+//! side completes, they are canceled before they start. For
+//! `t1 JOIN (t2 JOIN t3 ON ...) ON ...`:
+//!
+//! ```text
+//! MetaPipeline 0 (sink: ...) children: [1, 2]
+//!   Pipeline 0: Scan(t3) -> PhysicalHashJoin -> PhysicalHashJoin -> ... depends on meta pipelines [1, 2]
+//! MetaPipeline 1 (sink: PhysicalHashJoin)
+//!   Pipeline 1: Scan(t1) -> PhysicalHashJoin
+//!   Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]
+//! MetaPipeline 2 (sink: PhysicalHashJoin)
+//!   Pipeline 3: Scan(t2) -> PhysicalHashJoin depends on meta pipelines [1]
+//!   Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]
+//! ```
+//!
 //! # Semantics
 //!
 //! Join keys are equal with DataFusion's join key equality (see
@@ -127,7 +149,6 @@ use datafusion_physical_plan::{
 };
 use parking_lot::Mutex;
 
-use crate::bridge::BridgeOperator;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::join::hash_table::{
     ChainScan, JoinHashTable, JoinHashTableBuilder, hash_join_keys,
@@ -557,14 +578,13 @@ impl PhysicalHashJoin {
     /// raises their errors right away, while the join may raise errors of its
     /// build keys only once its build side is complete).
     ///
-    /// The probe side of a join is left to DataFusion (bridged) if its
-    /// lowered form has pipeline breakers, e.g. a join or an aggregation:
-    /// their pipelines run independently of the build side of this join,
-    /// while DataFusion reads the probe side only once the build side is
-    /// collected (not if it never completes, e.g. before a limit above
-    /// cancels the join, nor if the join cannot produce output), so that they
-    /// would compute (and raise errors) where DataFusion does not. A bridged
-    /// probe side is executed by DataFusion when the native join reads it.
+    /// The probe side of a join may have pipeline breakers, e.g. a join or
+    /// an aggregation (as in the chains of joins of TPC-H): DataFusion reads
+    /// the probe side only once the build side is collected (not if it never
+    /// completes, e.g. before a limit above cancels the join, nor if the join
+    /// cannot produce output), so their pipelines wait for the build side of
+    /// the join (see [`MetaPipelineBuilder::build_with_dependency`]), and do
+    /// not compute (nor raise errors) where DataFusion does not.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -687,10 +707,13 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
+        // The pipeline breakers of a native probe side (e.g. the build side
+        // of a join below) wait for the build side of the join, see
+        // `build_pipelines`.
         let mut children = Vec::with_capacity(2);
         for (input, keys) in [(join.left(), build_keys), (join.right(), probe_keys)] {
             let input = without_redistribution(input, &keys);
-            let mut lowered = lower_input(input)?;
+            let lowered = lower_input(input)?;
             if lowered.schema() != input.schema() {
                 return internal_err!(
                     "The lowered input {} of a HashJoinExec has schema {:?}, expected {:?}",
@@ -698,17 +721,6 @@ impl PhysicalHashJoin {
                     lowered.schema(),
                     input.schema()
                 );
-            }
-            // DataFusion reads the probe side only once the build side is
-            // collected: not if the build side never completes (e.g. before a
-            // limit above cancels the join), nor if the join cannot produce
-            // output. The pipelines of the pipeline breakers of a native probe
-            // side (e.g. the build side of a join below) do not wait for the
-            // build side, so they would compute (and raise errors) where
-            // DataFusion does not: such a probe side is left to DataFusion,
-            // which executes it only once the native join reads it.
-            if children.len() == 1 && has_pipeline_breakers(&lowered) {
-                lowered = Arc::new(BridgeOperator::new(Arc::clone(input)));
             }
             children.push(lowered);
         }
@@ -1443,13 +1455,6 @@ fn cast_cannot_fail(cast: &CastExpr, schema: &Schema) -> bool {
     }
 }
 
-/// Whether `operator`, or an operator below it, is a pipeline breaker (a
-/// sink, e.g. a join or an aggregation), whose input runs in pipelines of its
-/// own. A bridged plan is a source: DataFusion executes it when it is read.
-fn has_pipeline_breakers(operator: &Arc<dyn PhysicalOperator>) -> bool {
-    operator.is_sink() || operator.children().iter().any(has_pipeline_breakers)
-}
-
 /// Whether a `HashJoinExec` has a prepared build side attached, whose left
 /// input is a placeholder that is not executed. (The prepared build is only
 /// visible in the display of the node.)
@@ -2088,11 +2093,12 @@ impl PhysicalOperator for PhysicalHashJoin {
         let Some(last_pipeline) = meta.pipelines().last().copied() else {
             return internal_err!("A meta pipeline without pipelines");
         };
-        {
+        let build_meta = {
             // The build side sinks into the join, in a child meta pipeline,
             // whose last pipeline builds the pointer tables in parallel.
             let (mut build, mut build_pipeline) =
                 meta.create_child_meta_pipeline(current, Arc::clone(&this))?;
+            let build_meta = build.id();
             let finalize_pipeline =
                 build.create_union_pipeline(&build_pipeline, false)?;
             build.set_source(
@@ -2118,9 +2124,14 @@ impl PhysicalOperator for PhysicalHashJoin {
                     build.add_dependency(&finalize_pipeline, &pipeline)?;
                 }
             }
-        }
-        // The probe side continues the current pipeline.
-        meta.build(current, self.probe_side())?;
+            build_meta
+        };
+        // The probe side continues the current pipeline. DataFusion reads it
+        // only once the build side is collected: the pipelines of its
+        // pipeline breakers (e.g. the build side of a join below) wait for
+        // the build side to be finalized, so that they do not run (nor fail)
+        // if the join cannot produce output, or is canceled before.
+        meta.build_with_dependency(current, self.probe_side(), build_meta)?;
         // The build rows emitted after probing, in a pipeline that runs once
         // all the pipelines of the probe side completed.
         if self.spec.emits_final_build_rows() {
@@ -2294,7 +2305,7 @@ mod tests {
     use datafusion_physical_plan::union::UnionExec;
     use futures::StreamExt;
 
-    use crate::bridge::{BridgeOperator, PipelineRootExec};
+    use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::join::hash_table::hashes_are_forced_to_collide;
@@ -3200,20 +3211,41 @@ mod tests {
     async fn differential_multiple_joins_and_partitionings() {
         for (sql, lowered) in [
             // A join below the probe side of a join (inner, `Right` as
-            // DataFusion plans these `LEFT JOIN`s, or `Full`): the probe side
-            // is left to DataFusion, which reads it only once the build side
-            // is collected (see `PhysicalHashJoin::try_lower`).
+            // DataFusion plans these `LEFT JOIN`s, or `Full`): both are
+            // native, the build side of the join below waits for the build
+            // side of the join above (see `PhysicalHashJoin::try_lower`).
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON t1.a = y.k AND x.w = y.w",
-                1,
+                2,
             ),
             (
                 "SELECT t1.id, x.name FROM t1 LEFT JOIN t2 x ON t1.a = x.k LEFT JOIN t2 y ON x.w = y.w",
-                1,
+                2,
             ),
             (
                 "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k FULL JOIN t2 y ON x.w = y.w",
-                1,
+                2,
+            ),
+            // Chains of three and four joins, of every side.
+            (
+                "SELECT t1.id, x.name, y.w, z.k FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON x.w = y.w JOIN t2 z ON y.k = z.k",
+                3,
+            ),
+            (
+                "SELECT t1.id, x.name, y.w, z.k FROM t1 LEFT JOIN t2 x ON t1.a = x.k RIGHT JOIN t2 y ON x.w = y.w FULL JOIN t2 z ON y.k = z.k AND z.w > 10",
+                3,
+            ),
+            (
+                "SELECT a.id, b.id, c.id, d.id FROM t1 a JOIN t1 b ON a.id = b.id + 1 JOIN t1 c ON b.id = c.id + 1 JOIN t1 d ON c.id = d.id + 1 WHERE a.id % 3 = 0",
+                3,
+            ),
+            (
+                "SELECT t2.k, t2.name FROM t2 WHERE k IN (SELECT a FROM t1 WHERE a IN (SELECT k FROM t2 WHERE w > 3)) AND NOT EXISTS (SELECT 1 FROM t1 WHERE t1.a = t2.k AND t1.b > t2.w)",
+                3,
+            ),
+            (
+                "SELECT t1.id, u.k, v.name, w.w FROM t1 JOIN t2 u ON t1.a = u.k JOIN (SELECT k, name FROM t2 WHERE w % 2 = 0) v ON u.k = v.k JOIN t2 w ON v.name = w.name AND t1.b < w.w + 5000 JOIN t2 x ON w.k = x.k",
+                4,
             ),
             // A join below the build side of a join: both are native.
             (
@@ -3255,12 +3287,232 @@ mod tests {
             assert!(display.contains("mode=Partitioned"), "{display}");
             let root = assert_join_parity_with_config(sql, partitioned_config(), 1).await;
             assert!(
-                crate::bridge::bridged_plans(&root)
+                bridged_plans(&root)
                     .iter()
                     .all(|plan| !plan.is::<RepartitionExec>()),
                 "{}",
                 format_operator_tree(&root)
             );
+        }
+    }
+
+    /// The tables of TPC-H that the joins of [`TPCH_JOIN_CHAINS`] read, small
+    /// and with keys spread so that every chain has matches.
+    const TPCH_TABLES: [(&str, &str); 8] = [
+        (
+            "region",
+            "SELECT column1 AS r_regionkey, column2 AS r_name FROM (VALUES \
+             (0, 'AFRICA'), (1, 'AMERICA'), (2, 'ASIA'), (3, 'EUROPE'), (4, 'MIDDLE EAST'))",
+        ),
+        (
+            "nation",
+            "SELECT column1 AS n_nationkey, column2 AS n_name, column3 AS n_regionkey FROM (VALUES \
+             (0, 'ALGERIA', 0), (1, 'ARGENTINA', 1), (2, 'BRAZIL', 1), (3, 'CANADA', 1), \
+             (4, 'EGYPT', 4), (5, 'ETHIOPIA', 0), (6, 'FRANCE', 3), (7, 'GERMANY', 3), \
+             (8, 'INDIA', 2), (9, 'INDONESIA', 2), (10, 'IRAN', 4), (11, 'IRAQ', 4), \
+             (12, 'JAPAN', 2), (13, 'JORDAN', 4), (14, 'KENYA', 0), (15, 'MOROCCO', 0), \
+             (16, 'MOZAMBIQUE', 0), (17, 'PERU', 1), (18, 'CHINA', 2), (19, 'ROMANIA', 3), \
+             (20, 'SAUDI ARABIA', 4), (21, 'VIETNAM', 2), (22, 'RUSSIA', 3), \
+             (23, 'UNITED KINGDOM', 3), (24, 'UNITED STATES', 1))",
+        ),
+        (
+            "supplier",
+            "SELECT value AS s_suppkey, concat('Supplier#', value) AS s_name, \
+             value % 25 AS s_nationkey, CAST(value * 37 % 1000 AS DECIMAL(15, 2)) AS s_acctbal \
+             FROM generate_series(1, 50)",
+        ),
+        (
+            "customer",
+            "SELECT value AS c_custkey, concat('Customer#', value) AS c_name, \
+             value % 25 AS c_nationkey, CAST(value * 13 % 997 AS DECIMAL(15, 2)) AS c_acctbal, \
+             CASE value % 5 WHEN 0 THEN 'BUILDING' WHEN 1 THEN 'AUTOMOBILE' \
+             WHEN 2 THEN 'MACHINERY' WHEN 3 THEN 'HOUSEHOLD' ELSE 'FURNITURE' END AS c_mktsegment \
+             FROM generate_series(1, 150)",
+        ),
+        (
+            "part",
+            "SELECT value AS p_partkey, \
+             concat(CASE value % 3 WHEN 0 THEN 'forest green ' WHEN 1 THEN 'navy ' ELSE 'red ' END, value) AS p_name, \
+             CASE value % 4 WHEN 0 THEN 'ECONOMY ANODIZED STEEL' WHEN 1 THEN 'STANDARD POLISHED BRASS' \
+             WHEN 2 THEN 'PROMO BRUSHED BRASS' ELSE 'LARGE PLATED TIN' END AS p_type, \
+             value % 20 + 1 AS p_size FROM generate_series(1, 100)",
+        ),
+        (
+            "partsupp",
+            "SELECT value / 4 + 1 AS ps_partkey, (value / 4 + value % 4 * 13) % 50 + 1 AS ps_suppkey, \
+             CAST(value * 17 % 500 + 1 AS DECIMAL(15, 2)) AS ps_supplycost FROM generate_series(0, 399)",
+        ),
+        (
+            "orders",
+            "SELECT value AS o_orderkey, value * 7 % 150 + 1 AS o_custkey, \
+             CASE value % 3 WHEN 0 THEN 'F' WHEN 1 THEN 'O' ELSE 'P' END AS o_orderstatus, \
+             arrow_cast(arrow_cast(8035 + value * 11 % 2400, 'Int32'), 'Date32') AS o_orderdate \
+             FROM generate_series(1, 600)",
+        ),
+        (
+            "lineitem",
+            "SELECT value / 4 + 1 AS l_orderkey, value * 13 % 100 + 1 AS l_partkey, \
+             (value / 4 + value % 4 * 13) * 13 % 50 + 1 AS l_suppkey, value % 4 + 1 AS l_linenumber, \
+             CAST(value % 50 + 1 AS DECIMAL(15, 2)) AS l_quantity, \
+             CAST(value * 31 % 10000 AS DECIMAL(15, 2)) AS l_extendedprice, \
+             CAST(value % 11 AS DECIMAL(15, 2)) AS l_discount, \
+             CASE value % 4 WHEN 0 THEN 'R' WHEN 1 THEN 'A' ELSE 'N' END AS l_returnflag, \
+             arrow_cast(arrow_cast(8035 + value * 3 % 2500, 'Int32'), 'Date32') AS l_shipdate, \
+             arrow_cast(arrow_cast(8045 + value * 3 % 2500, 'Int32'), 'Date32') AS l_commitdate, \
+             arrow_cast(arrow_cast(8035 + value * 3 % 2500 + CASE WHEN value % 5 = 0 THEN 20 ELSE 5 END, \
+             'Int32'), 'Date32') AS l_receiptdate \
+             FROM generate_series(0, 2399)",
+        ),
+    ];
+
+    /// The joins of TPC-H queries 2, 3, 5, 7, 8, 9, 10 and 21, chains of 3 to
+    /// 8 tables whose probe sides are joins (with the predicates of the
+    /// queries, adapted to the data of [`TPCH_TABLES`], and the joined
+    /// columns instead of the aggregations): DataFusion plans them as chains
+    /// of `HashJoinExec`s, the probe side of every join is the next join.
+    const TPCH_JOIN_CHAINS: [(&str, &str); 8] = [
+        (
+            "Q2",
+            "SELECT s_acctbal, s_name, n_name, p_partkey, ps_supplycost \
+             FROM part, supplier, partsupp, nation, region \
+             WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size > 5 \
+             AND p_type LIKE '%BRASS' AND s_nationkey = n_nationkey \
+             AND n_regionkey = r_regionkey AND r_name = 'EUROPE'",
+        ),
+        (
+            "Q3",
+            "SELECT l_orderkey, l_extendedprice, l_discount, o_orderdate \
+             FROM customer, orders, lineitem \
+             WHERE c_mktsegment = 'BUILDING' AND c_custkey = o_custkey \
+             AND l_orderkey = o_orderkey AND o_orderdate < DATE '1995-03-15' \
+             AND l_shipdate > DATE '1995-03-15'",
+        ),
+        (
+            "Q5",
+            "SELECT n_name, l_extendedprice, l_discount \
+             FROM customer, orders, lineitem, supplier, nation, region \
+             WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey \
+             AND l_suppkey = s_suppkey AND c_nationkey = s_nationkey \
+             AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey \
+             AND r_name = 'AMERICA' AND o_orderdate >= DATE '1993-01-01' \
+             AND o_orderdate < DATE '1997-01-01'",
+        ),
+        (
+            "Q7",
+            "SELECT n1.n_name AS supp_nation, n2.n_name AS cust_nation, l_shipdate, l_extendedprice \
+             FROM supplier, lineitem, orders, customer, nation n1, nation n2 \
+             WHERE s_suppkey = l_suppkey AND o_orderkey = l_orderkey AND c_custkey = o_custkey \
+             AND s_nationkey = n1.n_nationkey AND c_nationkey = n2.n_nationkey \
+             AND ((n1.n_regionkey = 3 AND n2.n_name = 'BRAZIL') \
+             OR (n1.n_name = 'BRAZIL' AND n2.n_regionkey = 3)) \
+             AND l_shipdate BETWEEN DATE '1993-01-01' AND DATE '1997-12-31'",
+        ),
+        (
+            "Q8",
+            "SELECT o_orderdate, l_extendedprice, l_discount, n2.n_name AS nation \
+             FROM part, supplier, lineitem, orders, customer, nation n1, nation n2, region \
+             WHERE p_partkey = l_partkey AND s_suppkey = l_suppkey AND l_orderkey = o_orderkey \
+             AND o_custkey = c_custkey AND c_nationkey = n1.n_nationkey \
+             AND n1.n_regionkey = r_regionkey AND r_name = 'AMERICA' \
+             AND s_nationkey = n2.n_nationkey \
+             AND o_orderdate BETWEEN DATE '1993-01-01' AND DATE '1997-12-31' \
+             AND p_type = 'ECONOMY ANODIZED STEEL'",
+        ),
+        (
+            "Q9",
+            "SELECT n_name AS nation, o_orderdate, l_extendedprice, l_discount, ps_supplycost, l_quantity \
+             FROM part, supplier, lineitem, partsupp, orders, nation \
+             WHERE s_suppkey = l_suppkey AND ps_suppkey = l_suppkey AND ps_partkey = l_partkey \
+             AND p_partkey = l_partkey AND o_orderkey = l_orderkey \
+             AND s_nationkey = n_nationkey AND p_name LIKE '%green%'",
+        ),
+        (
+            "Q10",
+            "SELECT c_custkey, c_name, l_extendedprice, l_discount, c_acctbal, n_name \
+             FROM customer, orders, lineitem, nation \
+             WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey \
+             AND o_orderdate >= DATE '1993-10-01' AND o_orderdate < DATE '1995-01-01' \
+             AND l_returnflag = 'R' AND c_nationkey = n_nationkey",
+        ),
+        (
+            "Q21",
+            "SELECT s_name, l1.l_orderkey FROM supplier, lineitem l1, orders, nation \
+             WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey \
+             AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate \
+             AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey \
+             AND l2.l_suppkey <> l1.l_suppkey) \
+             AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey \
+             AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate) \
+             AND s_nationkey = n_nationkey \
+             AND n_name IN ('SAUDI ARABIA', 'GERMANY', 'PERU', 'CHINA', 'FRANCE')",
+        ),
+    ];
+
+    /// Register the tables of [`TPCH_TABLES`] in `ctx`, as `MemTable`s.
+    async fn register_tpch_memtables(ctx: &SessionContext) -> Result<()> {
+        for (table, query) in TPCH_TABLES {
+            ctx.sql(&format!("CREATE TABLE {table} AS {query}"))
+                .await?
+                .collect()
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The number of `HashJoinExec`s of `plan`.
+    fn count_hash_joins(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        usize::from(plan.is::<HashJoinExec>())
+            + plan
+                .children()
+                .into_iter()
+                .map(count_hash_joins)
+                .sum::<usize>()
+    }
+
+    /// Assert that the chain of joins `sql` produces byte-identical results on
+    /// DataFusion and on the pipeline engine (see
+    /// [`assert_join_parity_with_setup`]), and runs natively from top to
+    /// bottom: every `HashJoinExec` of DataFusion's plan is lowered to a
+    /// [`PhysicalHashJoin`], and no `BridgeOperator` is left. Returns the
+    /// number of rows of the result.
+    async fn assert_native_join_chain<F>(
+        name: &str,
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> usize
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await.expect("setup");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("planning")
+            .create_physical_plan()
+            .await
+            .expect("physical planning");
+        let joins = count_hash_joins(&plan);
+        assert!(joins >= 2, "{name}: {joins} joins");
+        let root = assert_join_parity_with_setup(sql, config, setup, joins).await;
+        let bridged = bridged_plans(&root);
+        assert!(
+            bridged.is_empty(),
+            "{name} falls back to BridgeOperator: {}",
+            format_operator_tree(&root)
+        );
+        let expected = run_sql(&ctx, sql).await.expect("DataFusion");
+        count_rows(&expected.batches)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_tpch_join_chains_over_memtables() {
+        let setup = async |ctx: &SessionContext| register_tpch_memtables(ctx).await;
+        for (name, sql) in TPCH_JOIN_CHAINS {
+            let rows =
+                assert_native_join_chain(name, sql, test_session_config(), &setup).await;
+            assert!(rows > 0, "{name} has no rows");
         }
     }
 
@@ -3734,6 +3986,100 @@ mod tests {
             let root = join_of(build as _, Arc::clone(&probe) as _, join_type)?;
             with_timeout(Executor::collect(root, task_ctx(), 4)).await?;
             assert_eq!(probe.produced() > 0, executed, "{join_type}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pipelines_of_joins_on_the_probe_side() -> Result<()> {
+        // `t1 JOIN (t2 JOIN t3)`: the build side of the inner join (meta
+        // pipeline 2) waits for the build side of the outer join (1).
+        let inner = join_of(
+            source(data_schema("l"), vec![]) as _,
+            source(data_schema("r"), vec![]) as _,
+            JoinType::Inner,
+        )?;
+        let outer = join_of(
+            source(data_schema("l"), vec![]) as _,
+            inner,
+            JoinType::Inner,
+        )?;
+        assert_eq!(
+            format_pipelines(&outer)?,
+            "MetaPipeline 0 (sink: ResultSink) children: [1, 2]\n  \
+             Pipeline 0: TestSource -> PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on meta pipelines [1, 2]\n\
+             MetaPipeline 1 (sink: PhysicalHashJoin)\n  \
+             Pipeline 1: TestSource -> PhysicalHashJoin\n  \
+             Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]\n\
+             MetaPipeline 2 (sink: PhysicalHashJoin)\n  \
+             Pipeline 3: TestSource -> PhysicalHashJoin depends on meta pipelines [1]\n  \
+             Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]\n"
+        );
+        // The scan of the unmatched build rows of an inner `Full` join, in the
+        // meta pipeline of the outer join, runs after its probe pipeline.
+        let inner = join_of(
+            source(data_schema("l"), vec![]) as _,
+            source(data_schema("r"), vec![]) as _,
+            JoinType::Full,
+        )?;
+        let outer = join_of(
+            source(data_schema("l"), vec![]) as _,
+            inner,
+            JoinType::Inner,
+        )?;
+        assert_eq!(
+            format_pipelines(&outer)?,
+            "MetaPipeline 0 (sink: ResultSink) children: [1, 2]\n  \
+             Pipeline 0: TestSource -> PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on meta pipelines [1, 2]\n  \
+             Pipeline 5: PhysicalHashJoin -> PhysicalHashJoin -> ResultSink depends on pipelines [0] depends on meta pipelines [1]\n\
+             MetaPipeline 1 (sink: PhysicalHashJoin)\n  \
+             Pipeline 1: TestSource -> PhysicalHashJoin\n  \
+             Pipeline 2: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [1]\n\
+             MetaPipeline 2 (sink: PhysicalHashJoin)\n  \
+             Pipeline 3: TestSource -> PhysicalHashJoin depends on meta pipelines [1]\n  \
+             Pipeline 4: JoinHashTableBuild -> PhysicalHashJoin depends on pipelines [3] depends on meta pipelines [1]\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_breakers_of_the_probe_side_wait_for_the_build_side() -> Result<()> {
+        // A join of an empty build side and of the probe side `inner`, a
+        // join of two non-empty inputs. If the outer join cannot produce
+        // output without build rows, DataFusion does not read its probe side,
+        // and so neither input of `inner`: the build pipelines of `inner`
+        // wait for the build side of the outer join, and are canceled.
+        for (join_type, executed) in [
+            (JoinType::Inner, false),
+            (JoinType::LeftSemi, false),
+            (JoinType::RightSemi, false),
+            (JoinType::LeftMark, false),
+            (JoinType::Right, true),
+            (JoinType::RightAnti, true),
+            (JoinType::Full, true),
+        ] {
+            for build_rows in [0, 50] {
+                let nested_build =
+                    source(data_schema("l"), vec![data_batch("l", 0..100, 0)]);
+                let nested_probe =
+                    source(data_schema("r"), vec![data_batch("r", 0..100, 0)]);
+                let inner = join_of(
+                    Arc::clone(&nested_build) as _,
+                    Arc::clone(&nested_probe) as _,
+                    JoinType::Inner,
+                )?;
+                let batches = if build_rows == 0 {
+                    vec![]
+                } else {
+                    vec![data_batch("l", 0..build_rows, 0)]
+                };
+                let root =
+                    join_of(source(data_schema("l"), batches) as _, inner, join_type)?;
+                with_timeout(Executor::collect(root, task_ctx(), 4)).await?;
+                let executed = executed || build_rows > 0;
+                assert_eq!(nested_build.produced() > 0, executed, "{join_type}");
+                assert_eq!(nested_probe.produced() > 0, executed, "{join_type}");
+            }
         }
         Ok(())
     }
@@ -4720,15 +5066,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn probe_sides_with_pipeline_breakers_are_left_to_datafusion() -> Result<()> {
+    async fn probe_sides_with_pipeline_breakers_wait_for_the_build_side() -> Result<()> {
         // An inner join whose build side ends empty after a while, over a join
-        // whose non-empty build side has the key `1 / 0`. DataFusion reads
-        // the probe side of the outer join only once its build side is
-        // collected: never, as it is empty, so it never collects the build
-        // side of the inner join. The pipelines of that build side would not
-        // wait for the outer build side: the probe side is left to DataFusion.
+        // on `(1 / 0, k) = (k, k)` whose build side is not empty, and whose
+        // keys DataFusion evaluates once its build side is collected.
+        // DataFusion reads the probe side of the outer join only once its
+        // build side is collected: never, as it is empty, so it never collects
+        // the build side of the inner join (nor divides by zero). Both joins
+        // are native: the pipelines of the build side of the inner join wait
+        // for the build side of the outer join, and are canceled with it.
         let make_plan = |join_type: JoinType| -> Result<Arc<dyn ExecutionPlan>> {
-            let nested = join_on_one_over_zero(
+            let nested = join_on_one_over_zero_and_k(
                 int32_k_scan(vec![Some(1)])?,
                 int32_k_scan(vec![Some(1)])?,
                 JoinType::RightSemi,
@@ -4740,30 +5088,33 @@ mod tests {
             })?;
             join_on_k(build, nested, join_type)
         };
-        let root = assert_lowered_plan_byte_eq(
-            || make_plan(JoinType::Inner),
-            lower,
-            task_ctx(),
-            false,
-        )
-        .await;
-        let join = root
-            .downcast_ref::<PhysicalHashJoin>()
-            .expect("a native join");
-        let probe = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
-        assert!(probe.plan().is::<HashJoinExec>());
+        for join_type in [JoinType::Inner, JoinType::LeftSemi, JoinType::RightSemi] {
+            let root = assert_lowered_plan_byte_eq(
+                || make_plan(join_type),
+                lower,
+                task_ctx(),
+                false,
+            )
+            .await;
+            let join = root
+                .downcast_ref::<PhysicalHashJoin>()
+                .expect("a native join");
+            assert!(join.probe_side().is::<PhysicalHashJoin>(), "{join_type}");
+        }
 
         // A `Right` join reads its probe side also if its build side is
         // empty, once it is collected: both engines divide by zero then.
-        let root = assert_lowered_plan_fails_like_datafusion(
-            || make_plan(JoinType::Right),
-            lower,
-            test_session_config(),
-            "Divide by zero",
-        )
-        .await;
-        let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
-        assert!(join.probe_side().is::<BridgeOperator>());
+        for join_type in [JoinType::Right, JoinType::RightAnti, JoinType::Full] {
+            let root = assert_lowered_plan_fails_like_datafusion(
+                || make_plan(join_type),
+                lower,
+                test_session_config(),
+                "Divide by zero",
+            )
+            .await;
+            let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
+            assert!(join.probe_side().is::<PhysicalHashJoin>(), "{join_type}");
+        }
         Ok(())
     }
 
@@ -4934,20 +5285,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn probe_sides_wait_for_the_build_side_of_every_join_type() -> Result<()> {
-        // A `RightAnti` join, whose build side never produces anything, over
-        // a join whose build key `1 / k` divides by zero, under a limit that
-        // is reached after 200 ms. DataFusion never reads the probe side of
-        // the outer join, as its build side never completes, so it never
-        // collects the build side of the inner join: neither engine fails.
-        let make_plan = || {
+        // A join, whose build side never produces anything, over a join whose
+        // build keys `(1 / k, k)` divide by zero, under a limit that is
+        // reached after 200 ms. DataFusion never reads the probe side of the
+        // outer join, as its build side never completes, so it never collects
+        // the build side of the inner join: neither engine fails. With a
+        // single build key `1 / k`, which DataFusion evaluates on every build
+        // batch as it collects them, the inner join is left to DataFusion.
+        let make_plan = |join_type: JoinType, keys: usize| {
+            let k = col("k", &int32_k_schema())?;
             let one_over_k = Arc::new(BinaryExpr::new(
                 lit(1_i32),
                 Operator::Divide,
-                col("k", &int32_k_schema())?,
+                Arc::clone(&k),
             ));
             let build = int32_k_scan(vec![Some(0)])?;
             let probe = int32_k_scan(vec![Some(1)])?;
-            let on = vec![(one_over_k as _, col("k", &probe.schema())?)];
+            let probe_k = col("k", &probe.schema())?;
+            let mut on = vec![(one_over_k as _, Arc::clone(&probe_k))];
+            if keys == 2 {
+                on.push((k, probe_k));
+            }
             let nested: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
                 build,
                 probe,
@@ -4959,17 +5317,35 @@ mod tests {
                 NullEquality::NullEqualsNothing,
                 false,
             )?);
-            let join = join_on_k(
-                pending_plan(int32_k_schema(), 1)?,
+            // Only the first column (`k` of either side), for the union with
+            // the row 42.
+            let build = pending_plan(int32_k_schema(), 1)?;
+            let on = vec![(col("k", &build.schema())?, col("k", &nested.schema())?)];
+            let join = HashJoinExec::try_new(
+                build,
                 nested,
-                JoinType::RightAnti,
+                on,
+                None,
+                &join_type,
+                Some(vec![0]),
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
             )?;
-            limit_over_delayed_42(join)
+            limit_over_delayed_42(Arc::new(join))
         };
-        let root =
-            assert_lowered_plan_byte_eq(make_plan, lower_with_limit, task_ctx(), false)
+        for join_type in ALL_JOIN_TYPES {
+            for keys in [1, 2] {
+                let root = assert_lowered_plan_byte_eq(
+                    || make_plan(join_type, keys),
+                    lower_with_limit,
+                    task_ctx(),
+                    false,
+                )
                 .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+                assert_eq!(count::<PhysicalHashJoin>(&root), keys, "{join_type}");
+            }
+        }
         Ok(())
     }
 
