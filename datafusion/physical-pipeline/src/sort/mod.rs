@@ -158,9 +158,10 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   which rows it returns depend on the order of its batches;
 /// * TopKs whose dynamic filter DataFusion pushed into a node below them (e.g.
 ///   a Parquet scan), if that node or a node between it and the TopK
-///   evaluates an expression that can fail, or is not a scan, projection,
-///   filter, union, merge or repartition of partitions: the filter prunes the
-///   rows of that node as the threshold tightens, which happens at other
+///   evaluates an expression that can fail, is not a scan, projection,
+///   filter, union, merge or repartition of partitions, or has a fetch (it
+///   stops after a number of rows that pass the filter): the filter prunes
+///   the rows of that node as the threshold tightens, which happens at other
 ///   times in DataFusion than natively, so these nodes process other rows;
 /// * merges over projections whose keys, or the keys of whose sort, can fail
 ///   to evaluate: the native sort evaluates only the keys of the top merge;
@@ -695,9 +696,10 @@ fn cannot_fail_to_evaluate(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// Returns `None` if no node of `plan` consumes the filter, `Some(true)` if
 /// the nodes that consume it and the nodes above them only pass rows through
 /// (scans, projections, filters, unions, merges and repartitions of
-/// partitions) and only evaluate expressions that cannot fail, so that
-/// skipping rows makes no difference but in speed, and `Some(false)`
-/// otherwise.
+/// partitions, without a fetch: a node with a fetch stops after a number of
+/// rows that pass the filter) and only evaluate expressions that cannot
+/// fail, so that skipping rows makes no difference but in speed, and
+/// `Some(false)` otherwise.
 fn pruned_work_cannot_fail(
     plan: &Arc<dyn ExecutionPlan>,
     filter_id: u64,
@@ -721,12 +723,13 @@ fn pruned_work_cannot_fail(
     if !consumes && below.is_none() {
         return Ok(None);
     }
-    let passes_rows = plan.is::<DataSourceExec>()
+    let passes_rows = (plan.is::<DataSourceExec>()
         || plan.is::<ProjectionExec>()
         || plan.is::<FilterExec>()
         || plan.is::<UnionExec>()
         || plan.is::<CoalescePartitionsExec>()
-        || plan.is::<RepartitionExec>();
+        || plan.is::<RepartitionExec>())
+        && plan.fetch().is_none();
     Ok(Some(below.unwrap_or(true) && passes_rows && cannot_fail))
 }
 
@@ -1412,6 +1415,7 @@ mod tests {
         lower_with,
     };
     use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::filter::FilterExecBuilder;
     use datafusion_physical_plan::limit::GlobalLimitExec;
 
     use crate::aggregate::PhysicalHashAggregate;
@@ -2765,6 +2769,89 @@ mod tests {
         assert!(
             try_lower(&merge(view, &[("id", false)], None), &options, bridge)?.is_some()
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_dynamic_filter_reaches_a_fetch_are_left_to_datafusion()
+    -> Result<()> {
+        // `SortExec(fetch=1) -> FilterExec(the sort's dynamic filter, fetch=10)`
+        // over the one-row batches `[10, 20, 21, ..., 28, 0]`, with batches of
+        // one row: DataFusion's TopK publishes the threshold 10 after the first
+        // row, so its filter drops 20 to 28 and reads 0 within its fetch of 10
+        // rows. The native TopK publishes its threshold later, and the filter
+        // stopped after 10 to 28, before 0. Which rows a node with a fetch
+        // between the TopK and the nodes that consume its dynamic filter passes
+        // depends on when the threshold tightens: such TopKs are left to
+        // DataFusion. Without the fetch, the TopK stays native.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batches = [10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 0]
+            .map(|v| {
+                let columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![v]))];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .to_vec();
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(1);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        /// A TopK of `v` over the plan that `filtered` makes of its dynamic
+        /// filter and `scan`.
+        fn topk_of(
+            scan: Arc<dyn ExecutionPlan>,
+            filtered: impl Fn(
+                Arc<dyn PhysicalExpr>,
+                Arc<dyn ExecutionPlan>,
+            ) -> Result<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            let placeholder =
+                FilterExecBuilder::new(lit(true), Arc::clone(&scan)).build()?;
+            let sort = sort_exec(Arc::new(placeholder), &[("v", false)], false, Some(1));
+            let filter = sort
+                .dynamic_expressions_produced()
+                .into_iter()
+                .find(|expr| expr.is::<DynamicFilterPhysicalExpr>())
+                .expect("the dynamic filter of the TopK");
+            sort.replace_children(
+                vec![filtered(filter, scan)?],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+        for (fetch, native) in [(Some(10), false), (None, true)] {
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                topk_of(scan, |filter, scan| {
+                    let filter = FilterExecBuilder::new(filter, scan)
+                        .with_fetch(fetch)
+                        .with_batch_size(1)
+                        .build()?;
+                    Ok(Arc::new(filter))
+                })
+            };
+            let root =
+                assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                    .await;
+            assert_eq!(sorts(&root) == 1, native, "fetch {fetch:?}");
+        }
+        // Also a coalesce with a fetch above the filter.
+        let scan = MemorySourceConfig::try_new_exec(
+            &[batches[..5].to_vec(), batches[5..].to_vec()],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let plan = topk_of(scan, |filter, scan| {
+            let filter = FilterExecBuilder::new(filter, scan).build()?;
+            let coalesce =
+                CoalescePartitionsExec::new(Arc::new(filter)).with_fetch(Some(10));
+            Ok(Arc::new(coalesce))
+        })?;
+        assert!(try_lower_bridged(&plan).is_none());
         Ok(())
     }
 
