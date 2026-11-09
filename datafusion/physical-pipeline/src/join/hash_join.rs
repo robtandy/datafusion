@@ -454,6 +454,17 @@ impl PhysicalHashJoin {
     ///   numbers of build and probe partitions; and the joins without probe
     ///   partitions, which have no output partitions, so that DataFusion
     ///   executes neither of their inputs (nor evaluates their keys);
+    /// * a `Partitioned` join of several partitions whose join type produces
+    ///   no output without build rows (`empty_build_side_produces_empty_result`),
+    ///   unless its probe side is partitioned directly below the join: a
+    ///   partition of DataFusion's join whose build partition is empty does not
+    ///   read its probe partition, so the nodes between the join and the
+    ///   repartitioning of its probe side do not run on the rows of that
+    ///   partition (and raise no errors on them);
+    /// * a join whose probe keys fail without any row (e.g. `1 / 0`):
+    ///   DataFusion evaluates them on every batch of its probe side, also on
+    ///   an empty one, which a native join, called with the non-empty chunks
+    ///   of its probe side, cannot reproduce;
     /// * a null-aware join with several keys or a filter (a correlated or
     ///   multi-column `NOT IN`), or with `NullEqualsNull`;
     /// * a join whose keys have different types on the two sides, or whose
@@ -522,9 +533,35 @@ impl PhysicalHashJoin {
                 plan.schema()
             );
         }
-        let mut children = Vec::with_capacity(2);
         let build_keys = join.on().iter().map(|(build, _)| build).collect::<Vec<_>>();
         let probe_keys = join.on().iter().map(|(_, probe)| probe).collect::<Vec<_>>();
+        // A partition of a `Partitioned` join whose build partition cannot
+        // produce output does not read its probe partition, whose nodes then
+        // do not run on its rows. All threads of a native join read the whole
+        // probe side: the same rows only if the probe side is partitioned
+        // directly below the join, by a repartitioning that reads all of its
+        // input (if any partition reads it), which the native join reads.
+        if *join.partition_mode() == PartitionMode::Partitioned
+            && partitions(join.right()) > 1
+            && join.join_type().empty_build_side_produces_empty_result()
+            && Arc::ptr_eq(
+                without_redistribution(join.right(), &probe_keys),
+                join.right(),
+            )
+        {
+            return Ok(None);
+        }
+        // DataFusion evaluates the probe keys on every probe batch, also on an
+        // empty one, so that keys that fail without any row (e.g. `1 / 0`)
+        // fail the join as soon as its probe side produces a batch. The native
+        // join evaluates them on the (non-empty) chunks of its probe side.
+        let empty_probe = RecordBatch::new_empty(join.right().schema());
+        if evaluate_expressions_to_arrays(probe_keys.iter().copied(), &empty_probe)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let mut children = Vec::with_capacity(2);
         for (input, keys) in [(join.left(), build_keys), (join.right(), probe_keys)] {
             let lowered = lower_input(without_redistribution(input, &keys))?;
             if lowered.schema() != input.schema() {
@@ -3575,13 +3612,24 @@ mod tests {
     /// A scan of a single partition of `values` of `k` (without any batch if
     /// there are none).
     fn int32_k_scan(values: Vec<Option<i32>>) -> Result<Arc<dyn ExecutionPlan>> {
-        let schema = int32_k_schema();
-        let batches = if values.is_empty() {
+        int32_k_batches(if values.is_empty() {
             vec![]
         } else {
-            let values = Arc::new(Int32Array::from(values));
-            vec![RecordBatch::try_new(Arc::clone(&schema), vec![values])?]
-        };
+            vec![values]
+        })
+    }
+
+    /// A scan of a single partition with a batch of `k` per element of
+    /// `batches`, also the empty ones.
+    fn int32_k_batches(batches: Vec<Vec<Option<i32>>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = int32_k_schema();
+        let batches = batches
+            .into_iter()
+            .map(|values| {
+                let values = Arc::new(Int32Array::from(values));
+                RecordBatch::try_new(Arc::clone(&schema), vec![values])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
     }
 
@@ -3668,6 +3716,156 @@ mod tests {
             assert_lowered_plan_byte_eq(make_plan, lower_limit, task_ctx(), false).await;
         assert!(root.is::<PhysicalLimit>());
         assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_probe_keys_fail_without_rows_are_left_to_datafusion()
+    -> Result<()> {
+        // DataFusion evaluates the probe key `1 / 0` on every probe batch: an
+        // empty one fails the join, a probe side without batches does not. A
+        // native join only sees the non-empty chunks of its probe side, so
+        // the join is left to DataFusion.
+        let join =
+            |probe_batches: Vec<Vec<Option<i32>>>| -> Result<Arc<dyn ExecutionPlan>> {
+                let build = int32_k_scan(vec![Some(1)])?;
+                let probe = int32_k_batches(probe_batches)?;
+                let one_over_zero =
+                    Arc::new(BinaryExpr::new(lit(1_i32), Operator::Divide, lit(0_i32)));
+                let on = vec![(col("k", &build.schema())?, one_over_zero as _)];
+                Ok(Arc::new(HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?))
+            };
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || join(vec![vec![]]),
+            lower,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        assert!(root.is::<BridgeOperator>());
+        let root =
+            assert_lowered_plan_byte_eq(|| join(vec![]), lower, task_ctx(), false).await;
+        assert!(root.is::<BridgeOperator>());
+        Ok(())
+    }
+
+    /// A `Partitioned` join of 4 partitions of build keys `[1]` and probe rows
+    /// `(k, d)` of `(1, 1), (2, 0)` by `k`, with a projection of `k, 1 / d`
+    /// above the repartitioning of the probe side, or below it.
+    fn partitioned_join_over_one_over_d(
+        join_type: JoinType,
+        projection_below_repartition: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let by_k = |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+            let k = col("k", &input.schema())?;
+            Ok(Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(vec![k], 4),
+            )?))
+        };
+        let one_over_d =
+            |input: Arc<dyn ExecutionPlan>| -> Result<Arc<dyn ExecutionPlan>> {
+                let schema = input.schema();
+                let inverse = Arc::new(BinaryExpr::new(
+                    lit(1_i32),
+                    Operator::Divide,
+                    col("d", &schema)?,
+                ));
+                Ok(Arc::new(ProjectionExec::try_new(
+                    [
+                        (col("k", &schema)?, "k".to_string()),
+                        (inverse as _, "inv".to_string()),
+                    ],
+                    input,
+                )?))
+            };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("d", DataType::Int32, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![1, 0])),
+            ],
+        )?;
+        let probe: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![rows]], schema, None)?;
+        let probe = if projection_below_repartition {
+            by_k(one_over_d(probe)?)?
+        } else {
+            one_over_d(by_k(probe)?)?
+        };
+        let build = by_k(int32_k_scan(vec![Some(1)])?)?;
+        let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+        Ok(Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &join_type,
+            None,
+            PartitionMode::Partitioned,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partitioned_joins_read_no_probe_partitions_of_empty_build_partitions()
+    -> Result<()> {
+        // DataFusion does not read the probe partition of the empty build
+        // partition of the row `(2, 0)` (unless all hashes collide, then all
+        // rows are in one partition), so `1 / d` above the repartitioning
+        // does not divide by its zero: the join is left to DataFusion.
+        let above = || partitioned_join_over_one_over_d(JoinType::Inner, false);
+        let root = if hashes_are_forced_to_collide() {
+            assert_lowered_plan_fails_like_datafusion(
+                above,
+                lower,
+                test_session_config(),
+                "Divide by zero",
+            )
+            .await
+        } else {
+            assert_eq!(count_rows(&collect(above()?, task_ctx()).await?), 1);
+            assert_lowered_plan_byte_eq(above, lower, task_ctx(), false).await
+        };
+        assert!(root.is::<BridgeOperator>());
+
+        // Below the repartitioning, which reads all rows in DataFusion, and
+        // with a join type that reads all probe partitions, both engines
+        // divide by zero: the joins are native.
+        for (join_type, projection_below_repartition) in [
+            (JoinType::Inner, true),
+            (JoinType::Right, false),
+            (JoinType::RightAnti, false),
+        ] {
+            let root = assert_lowered_plan_fails_like_datafusion(
+                || {
+                    partitioned_join_over_one_over_d(
+                        join_type,
+                        projection_below_repartition,
+                    )
+                },
+                lower,
+                test_session_config(),
+                "Divide by zero",
+            )
+            .await;
+            assert!(root.is::<PhysicalHashJoin>(), "{join_type}");
+        }
         Ok(())
     }
 
