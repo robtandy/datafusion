@@ -1636,6 +1636,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concatenations_of_strings_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
+        // `ProjectionExec` evaluates `s || s` on the batch of 8192 rows, 2 GiB
+        // of strings, whose 32-bit offsets overflow, but a pipeline on chunks
+        // of 2048 rows (see the test of the same name for filters).
+        let batch = large_strings();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        physical_expr("(s || s) IS NOT NULL", &schema),
+                        "b",
+                    )],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Offset overflow error: 2147483648")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
         // `ProjectionExec` evaluates `repeat(s, n)` on the batch of 8192 rows,
         // 4 GiB of strings, more than DataFusion allows, but a pipeline on

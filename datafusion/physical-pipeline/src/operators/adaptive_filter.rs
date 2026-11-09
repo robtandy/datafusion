@@ -388,7 +388,11 @@ fn node_fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibilit
             Fallibility::Uniform
         }
         // Or on the number of rows it is evaluated on together.
-        Fallibility::Infallible if expands_values(expr, schema) => Fallibility::PerRow,
+        Fallibility::Infallible
+            if expands_values(expr, schema) || builds_byte_offsets(expr, schema) =>
+        {
+            Fallibility::PerRow
+        }
         fallibility => fallibility,
     }
 }
@@ -770,6 +774,12 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   with `x`;
 /// * `expr` is such a constant (e.g. a string that a projection outputs),
 ///   which whoever evaluates it copies for every row of the batch;
+/// * a part of `expr` other than a column builds strings or binaries with
+///   32-bit offsets from more bytes than one of its operands has, e.g.
+///   `s || s`, which overflows on a batch of more than 1 GiB of strings, but
+///   not on a chunk of a quarter of its rows (but for casts into the type of
+///   their operand, and `CASE` expressions whose values come from a single
+///   column of their type);
 /// * a part of `expr` that the classification does not know (e.g. a
 ///   function) builds values of variable lengths (strings, binaries, lists or
 ///   maps, at any depth, also of 64-bit offsets or views): their sizes depend
@@ -858,8 +868,9 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
                 .is_ok_and(|data_type| contains_narrow_lengths(&data_type)))
         // It copies values that its operands share between rows, or a
         // constant, into arrays whose 32-bit offsets overflow beyond 2 GiB of
-        // bytes.
+        // bytes, or builds such arrays from more bytes than an operand has.
         || expands_values(expr, schema)
+        || builds_byte_offsets(expr, schema)
         // It is opaque, and builds values whose sizes depend on the values
         // (e.g. `repeat(s, n)`), and on which DataFusion may set limits per
         // batch.
@@ -1118,18 +1129,68 @@ pub(crate) fn has_32_bit_offsets(data_type: &DataType) -> bool {
 /// column, and `CASE WHEN x THEN '…' END` copies it for every row with `x`.
 fn is_broadcast_constant(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        let value = literal.value();
-        let no_bytes = match value {
-            ScalarValue::Utf8(value) => value.as_deref().is_none_or(str::is_empty),
-            ScalarValue::Binary(value) => value.as_deref().is_none_or(<[u8]>::is_empty),
-            value => value.is_null(),
-        };
-        return !no_bytes && contains_byte_offsets(&value.data_type());
+        return !has_no_bytes(expr)
+            && contains_byte_offsets(&literal.value().data_type());
     }
     is_constant_tree(expr)
         && expr
             .data_type(schema)
             .is_ok_and(|data_type| contains_byte_offsets(&data_type))
+}
+
+/// Whether `expr` is a literal without bytes: a null, or an empty string or
+/// binary.
+fn has_no_bytes(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<Literal>()
+        .is_some_and(|literal| match literal.value() {
+            ScalarValue::Utf8(value) => value.as_deref().is_none_or(str::is_empty),
+            ScalarValue::Binary(value) => value.as_deref().is_none_or(<[u8]>::is_empty),
+            value => value.is_null(),
+        })
+}
+
+/// Whether `expr`, but a column or a literal (see [`is_broadcast_constant`]),
+/// builds strings or binaries with 32-bit offsets (see
+/// [`contains_byte_offsets`]), which overflow beyond 2 GiB of bytes in an
+/// array, from more bytes than one of its operands has (whose arrays fit in
+/// their offsets): e.g. `s || s` on a batch of more than 1 GiB of strings,
+/// which chunks of fewer rows do not reach, or `CAST(x AS Utf8)` of enough
+/// integers. Not a cast into the type of its operand, which passes it on, nor
+/// a `CASE` whose values are, but for literals without bytes, those of a
+/// single column of its type, which it selects for each row.
+fn builds_byte_offsets(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if expr.is::<Column>() || expr.is::<Literal>() {
+        return false;
+    }
+    let Ok(data_type) = expr.data_type(schema) else {
+        return true;
+    };
+    if !contains_byte_offsets(&data_type) {
+        return false;
+    }
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        return cast
+            .expr()
+            .data_type(schema)
+            .map_or(true, |from| from != data_type);
+    }
+    if let Some(case) = expr.downcast_ref::<CaseExpr>() {
+        let mut values = case
+            .when_then_expr()
+            .iter()
+            .map(|(_, then)| then)
+            .chain(case.else_expr())
+            .filter(|value| !has_no_bytes(value));
+        let selected = values.next();
+        return values.next().is_some()
+            || selected.is_some_and(|value| {
+                !value.is::<Column>()
+                    || value
+                        .data_type(schema)
+                        .map_or(true, |selected| selected != data_type)
+            });
+    }
+    true
 }
 
 /// Whether all the leaves of `expr` are literals: it reads nothing of the
@@ -1826,6 +1887,51 @@ mod tests {
     }
 
     #[test]
+    fn finds_strings_built_from_more_bytes() {
+        // Strings with 32-bit offsets built from more bytes than an operand
+        // has overflow beyond 2 GiB of bytes in a batch, which a batch of more
+        // rows reaches without its columns overflowing.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("t", DataType::Utf8, true),
+            Field::new("l", DataType::LargeUtf8, true),
+            Field::new("a", DataType::Int32, true),
+            Field::new("e", DataType::Boolean, true),
+        ]));
+        let cast = |name: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
+            Arc::new(CastExpr::new(physical_expr(name, &schema), to, None))
+        };
+        let case = |then: &str, otherwise: Option<&str>| -> Arc<dyn PhysicalExpr> {
+            Arc::new(
+                CaseExpr::try_new(
+                    None,
+                    vec![(physical_expr("e", &schema), physical_expr(then, &schema))],
+                    otherwise.map(|otherwise| physical_expr(otherwise, &schema)),
+                )
+                .unwrap(),
+            )
+        };
+        for (expr, depends) in [
+            (physical_expr("s || s", &schema), true),
+            (physical_expr("s || t", &schema), true),
+            (cast("a", DataType::Utf8), true),
+            (cast("l", DataType::Utf8), true),
+            (case("s", Some("t")), true),
+            (case("s", Some("'x'")), true),
+            // A cast into the type of its operand passes it on, and a `CASE`
+            // selects, for each row, a value of its only column with bytes.
+            (cast("s", DataType::Utf8), false),
+            (cast("s", DataType::LargeUtf8), false),
+            (case("s", None), false),
+            (case("s", Some("''")), false),
+            (case("NULL", Some("s")), false),
+            (physical_expr("s = t", &schema), false),
+        ] {
+            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+        }
+    }
+
+    #[test]
     fn finds_expansions_of_values() {
         use Fallibility::*;
         // A union of `Int32` and of `data_type`.
@@ -1891,13 +1997,14 @@ mod tests {
             (cast("du", DataType::LargeUtf8), (PerRow, true)),
             (cast("du", DataType::Utf8View), (PerRow, true)),
             (cast("r", DataType::LargeUtf8), (PerRow, true)),
-            // But not for `IS NULL`, nor for sparse unions, whose rows do not
-            // share values, nor for unions of values without offsets.
+            // But not for `IS NULL`, nor for unions of values without offsets.
+            // (A sparse union does not share values, but casting it into
+            // strings builds them, see `finds_strings_built_from_more_bytes`.)
             (
                 Arc::new(IsNullExpr::new(physical_expr("du", &schema))),
                 (Infallible, false),
             ),
-            (cast("su", DataType::Utf8), (PerRow, false)),
+            (cast("su", DataType::Utf8), (PerRow, true)),
             (cast("di", DataType::Float64), (PerRow, false)),
             // Nor into 64-bit offsets or views, nor into the values of a
             // dictionary, which Arrow casts once.

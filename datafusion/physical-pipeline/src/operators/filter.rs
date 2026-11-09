@@ -2116,6 +2116,34 @@ pub(crate) mod test_support {
         .unwrap()
     }
 
+    /// A guard that each test taking gigabytes of memory holds while it runs,
+    /// so that only one runs at a time: the tests that run in parallel do not
+    /// take the sum.
+    pub(crate) async fn one_large_test_at_a_time() -> tokio::sync::MutexGuard<'static, ()>
+    {
+        static LARGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LARGE.lock().await
+    }
+
+    /// A batch of 8192 rows of `id` (`Int32`) and of `s` (`Utf8`), strings of
+    /// 128 KiB: 1 GiB of strings, and 256 MiB on a chunk of 2048 rows.
+    pub(crate) fn large_strings() -> RecordBatch {
+        let string = "x".repeat(128 << 10);
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from_iter_values(0..8192)) as ArrayRef,
+            ),
+            (
+                "s",
+                Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                    &string, 8192,
+                ))) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
     /// A batch of 8192 rows of `s` (`LargeUtf8`), `"x"`, and of `n` (`Int64`),
     /// `1 << 19`: `repeat(s, n)` builds 4 GiB of strings on the batch, and
     /// 1 GiB on a chunk of 2048 rows.
@@ -3748,6 +3776,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concatenations_of_strings_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
+        // `s || s` builds 2 GiB of strings on the batch of 8192 rows of
+        // `FilterExec`, whose 32-bit offsets overflow, but 512 MiB on the
+        // chunks of the native filter (whose output drops `s`).
+        let batch = large_strings();
+        let plan = || filter_exec_without_strings("(s || s) IS NOT NULL", scan(&batch));
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Offset overflow error: 2147483648")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
         // DataFusion checks the size of the strings that `repeat` builds on a
         // batch (also with 64-bit offsets): 4 GiB on the batch of 8192 rows of
@@ -4069,6 +4119,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_of_strings_in_shared_buffers_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
         // `FilterExec` concatenates the strings of the batches it coalesces
         // into batches of 8192 rows, whose 32-bit offsets overflow beyond
         // 2 GiB of bytes, which batches that share their buffers reach without
@@ -4474,6 +4525,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
         // Rows of a dense union may point to the same value of a child, which
         // Arrow copies for every row when it extracts the child (casting the
         // union) or filters the union: the 32-bit offsets of 1200 copies of a
