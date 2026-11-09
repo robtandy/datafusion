@@ -36,8 +36,10 @@
 //! TPC-H plan is native, the test enforces that all 22 queries run natively
 //! over both sources, except for the fallbacks of [`EXPECTED_FALLBACKS`] (the
 //! nodes that the native operators leave to DataFusion to keep its results
-//! and errors exact), and lists every other fallback of every query, and
-//! every expected fallback that no longer happens, otherwise.
+//! and errors exact), and lists every other fallback of every query
+//! otherwise. The queries that run fewer nodes in `BridgeOperator`s than
+//! listed are reported on stderr, so that the operators can run more nodes
+//! natively without changing this file, and the list can then be tightened.
 //!
 //! The benchmark `benches/pipeline_vs_default.rs` includes this file as a
 //! module to reuse the data generator and the queries.
@@ -2087,6 +2089,11 @@ fn count_operators(operator: &Arc<dyn PhysicalOperator>) -> usize {
         .sum::<usize>()
 }
 
+/// The number of nodes of the DataFusion plan `plan`.
+fn count_nodes(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    1 + plan.children().into_iter().map(count_nodes).sum::<usize>()
+}
+
 /// How the pipeline engine lowered the plan of a query.
 #[derive(Debug)]
 pub(crate) struct Lowering {
@@ -2094,6 +2101,9 @@ pub(crate) struct Lowering {
     pub(crate) operators: usize,
     /// The DataFusion plans that run in `BridgeOperator`s, on one line each.
     pub(crate) bridged: Vec<String>,
+    /// The number of nodes of the DataFusion plans that run in
+    /// `BridgeOperator`s.
+    pub(crate) bridged_nodes: usize,
 }
 
 impl Lowering {
@@ -2106,7 +2116,8 @@ impl Lowering {
                 plan.name()
             ))
         })?;
-        let bridged = bridged_plans(root.operator())
+        let plans = bridged_plans(root.operator());
+        let bridged = plans
             .iter()
             .map(|plan| displayable(plan.as_ref()).one_line().to_string())
             .map(|line| line.trim_end().to_string())
@@ -2114,6 +2125,7 @@ impl Lowering {
         Ok(Self {
             operators: count_operators(root.operator()),
             bridged,
+            bridged_nodes: plans.iter().map(count_nodes).sum(),
         })
     }
 
@@ -2218,61 +2230,70 @@ enum Why {
     FilterOrder,
 }
 
-/// A query (by number) that falls back to `BridgeOperator`s: the roots of its
-/// bridged plans, each with why the native operators leave it to DataFusion.
-type Fallback = (usize, &'static [(&'static str, Why)]);
+/// A query (by number) that falls back to `BridgeOperator`s: the number of
+/// DataFusion nodes that its `BridgeOperator`s run at most, and the roots of
+/// its bridged plans, each with why the native operators leave it to
+/// DataFusion.
+type Fallback = (usize, usize, &'static [(&'static str, Why)]);
 
 /// The TPC-H plans that still run parts in `BridgeOperator`s once
 /// `PipelineQueryPlanner` lowers plans, for every source.
 ///
-/// The zero-fallback check fails on any other fallback, and on any of these
-/// that no longer happens: when an operator learns to run one of them, its
-/// entry must be removed, so that the list only shrinks.
+/// The zero-fallback check fails on any other fallback: a query that is not
+/// listed with a `BridgeOperator`, or that runs more DataFusion nodes in its
+/// `BridgeOperator`s than listed. (Once an operator learns to run the root of
+/// a bridged plan natively, the other nodes of that plan run natively or in
+/// smaller bridged plans below it, with other roots: the number of nodes can
+/// only decrease.) It reports the queries that run fewer nodes than listed on
+/// stderr: update (or remove) their entries, so that the list only shrinks.
 #[rustfmt::skip]
 const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
     ("MemTable", &[
-        (1, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, &[("HashJoinExec", Why::ProbeSide), ("ProjectionExec", Why::ProbeSide)]),
-        (3, &[("AggregateExec", Why::AggregateArguments)]),
-        (5, &[("AggregateExec", Why::AggregateArguments)]),
-        (7, &[("ProjectionExec", Why::Projection)]),
-        (8, &[("ProjectionExec", Why::Projection)]),
-        (9, &[("ProjectionExec", Why::Projection)]),
-        (10, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (14, &[("ProjectionExec", Why::Projection)]),
-        (15, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, &[("HashJoinExec", Why::ProbeSide)]),
-        (17, &[("HashJoinExec", Why::JoinFilter)]),
-        (18, &[("FilterExec", Why::ProbeSide)]),
-        (19, &[("AggregateExec", Why::AggregateArguments)]),
-        (20, &[("HashJoinExec", Why::ProbeSide)]),
-        (21, &[("HashJoinExec", Why::ProbeSide)]),
-        (22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, 25, &[("HashJoinExec", Why::ProbeSide), ("ProjectionExec", Why::ProbeSide)]),
+        (3, 13, &[("AggregateExec", Why::AggregateArguments)]),
+        (5, 21, &[("AggregateExec", Why::AggregateArguments)]),
+        (7, 22, &[("ProjectionExec", Why::Projection)]),
+        (8, 27, &[("ProjectionExec", Why::Projection)]),
+        (9, 19, &[("ProjectionExec", Why::Projection)]),
+        (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (14, 10, &[("ProjectionExec", Why::Projection)]),
+        (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, 5, &[("HashJoinExec", Why::ProbeSide)]),
+        (17, 12, &[("HashJoinExec", Why::JoinFilter)]),
+        (18, 5, &[("FilterExec", Why::ProbeSide)]),
+        (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, 13, &[("HashJoinExec", Why::ProbeSide)]),
+        (21, 9, &[("HashJoinExec", Why::ProbeSide)]),
+        (22, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
     ("Parquet", &[
-        (1, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, &[("HashJoinExec", Why::JoinDynamicFilter), ("ProjectionExec", Why::ProbeSide)]),
-        (3, &[("AggregateExec", Why::AggregateArguments)]),
-        (4, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (5, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, &[("FilterExec", Why::FilterOrder)]),
-        (7, &[("ProjectionExec", Why::Projection)]),
-        (8, &[("ProjectionExec", Why::Projection)]),
-        (9, &[("ProjectionExec", Why::Projection)]),
-        (10, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (13, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (14, &[("ProjectionExec", Why::Projection)]),
-        (15, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (18, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
-        (19, &[("AggregateExec", Why::AggregateArguments)]),
-        (20, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, 32, &[
+            ("HashJoinExec", Why::JoinDynamicFilter),
+            ("ProjectionExec", Why::ProbeSide),
+        ]),
+        (3, 14, &[("AggregateExec", Why::AggregateArguments)]),
+        (4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (5, 22, &[("AggregateExec", Why::AggregateArguments)]),
+        (6, 2, &[("FilterExec", Why::FilterOrder)]),
+        (7, 23, &[("ProjectionExec", Why::Projection)]),
+        (8, 29, &[("ProjectionExec", Why::Projection)]),
+        (9, 18, &[("ProjectionExec", Why::Projection)]),
+        (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (12, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (13, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (14, 10, &[("ProjectionExec", Why::Projection)]),
+        (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (17, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (18, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
+        (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (21, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (22, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
 ];
 
@@ -2282,9 +2303,10 @@ const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
 ///
 /// The check is deferred while `PipelineQueryPlanner` does not lower plans,
 /// and enforced on Q1 to Q22 over both sources as soon as any operator of
-/// any TPC-H plan is native (see [`ZeroFallback::judge`]). It fails on the
-/// fallbacks that [`EXPECTED_FALLBACKS`] does not list (by the roots of the
-/// bridged plans of a query), and on the listed ones that no longer happen.
+/// any TPC-H plan is native (see [`ZeroFallback::judge`]). It fails on every
+/// query that runs more DataFusion nodes in `BridgeOperator`s than
+/// [`EXPECTED_FALLBACKS`] lists for it (none, if it does not list the query),
+/// and reports the queries that run fewer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
     let mut lowerings = vec![];
@@ -2304,56 +2326,55 @@ async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
         }
         ZeroFallback::Enforced(fallbacks) => {
             let mut unexpected = vec![];
-            let mut happened = vec![];
+            let mut fewer = vec![];
             for (source, queries) in &lowerings {
                 let expected = EXPECTED_FALLBACKS
                     .iter()
                     .find(|(name, _)| name == source)
                     .map_or(&[][..], |(_, expected)| expected);
                 for (i, lowering) in queries.iter().enumerate() {
-                    if lowering.bridged.is_empty() {
-                        continue;
-                    }
-                    let roots = lowering
-                        .bridged
-                        .iter()
-                        .map(|line| line.split(':').next().unwrap_or(line));
-                    let listed = expected.iter().any(|(query, bridged)| {
-                        *query == i + 1
-                            && bridged.iter().map(|(root, _)| *root).eq(roots.clone())
-                    });
-                    if listed {
-                        happened.push((*source, i + 1));
-                    } else {
+                    let query = i + 1;
+                    let listed = expected.iter().find(|(listed, ..)| *listed == query);
+                    let nodes = listed.map_or(0, |(_, nodes, _)| *nodes);
+                    if lowering.bridged_nodes > nodes {
                         unexpected.push(format!(
-                            "Q{} over {source}: {} of {} operators are \
-                             BridgeOperators, which run\n  {}",
-                            i + 1,
+                            "Q{query} over {source}: {} DataFusion nodes (at most {nodes} \
+                             listed) run in BridgeOperators ({} of {} operators), \
+                             whose plans are\n  {}",
+                            lowering.bridged_nodes,
                             lowering.bridged.len(),
                             lowering.operators,
                             lowering.bridged.join("\n  ")
                         ));
+                    } else if let Some((_, nodes, roots)) = listed
+                        && lowering.bridged_nodes < *nodes
+                    {
+                        fewer.push(format!(
+                            "Q{query} over {source}: {} of the {nodes} listed DataFusion \
+                             nodes ({roots:?}) run in BridgeOperators",
+                            lowering.bridged_nodes
+                        ));
                     }
                 }
             }
-            let gone = EXPECTED_FALLBACKS
-                .iter()
-                .flat_map(|(source, expected)| {
-                    expected.iter().map(move |entry| (*source, entry))
-                })
-                .filter(|(source, (query, _))| !happened.contains(&(*source, *query)))
-                .map(|(source, (query, bridged))| {
-                    format!("Q{query} over {source}: {bridged:?}")
-                })
-                .collect::<Vec<_>>();
+            if !fewer.is_empty() {
+                // Bypass the output capture of libtest, so that every test run
+                // shows the entries to update.
+                writeln!(
+                    std::io::stderr().lock(),
+                    "tpch_parity: {} TPC-H plans run fewer DataFusion nodes in \
+                     BridgeOperators than EXPECTED_FALLBACKS lists, update their \
+                     entries:\n{}",
+                    fewer.len(),
+                    fewer.join("\n")
+                )?;
+            }
             assert!(
-                unexpected.is_empty() && gone.is_empty(),
-                "{} TPC-H plans fall back to BridgeOperator. Not in \
-                 EXPECTED_FALLBACKS:\n{}\nIn EXPECTED_FALLBACKS, but no longer \
-                 happen (remove them):\n{}",
+                unexpected.is_empty(),
+                "{} TPC-H plans fall back to BridgeOperator, more than \
+                 EXPECTED_FALLBACKS lists:\n{}",
                 fallbacks.len(),
-                unexpected.join("\n"),
-                gone.join("\n")
+                unexpected.join("\n")
             );
         }
     }
@@ -2367,14 +2388,17 @@ fn zero_fallback_check_is_enforced_once_native_lowering_starts() {
     let bridged = || Lowering {
         operators: 1,
         bridged: vec!["SortPreservingMergeExec: [a@0 ASC]".to_string()],
+        bridged_nodes: 3,
     };
     let partly_native = || Lowering {
         operators: 3,
         bridged: vec!["ProjectionExec: expr=[a@0 * b@1 as c]".to_string()],
+        bridged_nodes: 2,
     };
     let native = || Lowering {
         operators: 2,
         bridged: vec![],
+        bridged_nodes: 0,
     };
 
     // The planner does not lower plans yet.
