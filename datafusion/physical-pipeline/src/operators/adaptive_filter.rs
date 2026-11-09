@@ -62,10 +62,11 @@
 //! whose implementations are known (e.g. `date_part`, `substr` or `abs`, see
 //! `BuiltinFunction`) in the sessions that trust them (see
 //! [`TrustedFunctions`]): they fail on the values of a row independently of
-//! the other rows, if at all, and only build strings from the bytes of their
-//! arguments (see `function_fallibility`). They are identified by the types
-//! that implement them, which the sessions register, so that a user-defined
-//! function that shadows one (e.g. Spark's `abs`) stays opaque.
+//! the other rows, if at all, in a single step over the rows of a batch, and
+//! only build strings from the bytes of their arguments (see
+//! `function_fallibility`). They are identified by the types that implement
+//! them, which the sessions register, so that a user-defined function that
+//! shadows one (e.g. Spark's `abs`) stays opaque.
 //!
 //! String constants are copied for every row of a batch by whoever evaluates
 //! them, so they overflow the 32-bit offsets of strings on batches of enough
@@ -1000,12 +1001,35 @@ impl ConfigExtension for TrustedFunctions {
 /// * `regexp_like` with a constant pattern (and flags), which it compiles
 ///   before it matches any value.
 ///
-/// The others may fail on some rows: `substr`, `abs`, `floor`, `ceil`,
-/// `trunc`, `round` and `regexp_like` but for the cases above, `upper` and
-/// `lower` (on a value whose conversion is too large for a string), `sqrt`
-/// (of negative numbers), `power` (of zero to a negative power), `date_trunc`
-/// (of timestamps beyond the range of nanoseconds) and `to_timestamp` (of
-/// strings that are not timestamps).
+/// The known functions must also evaluate the rows of a batch in a single
+/// step, which fails, if at all, on the first row that fails: a function that
+/// processes a whole batch in steps that fail with different errors (e.g. that
+/// casts all of its values before it converts any) fails with the error of
+/// the first step on a batch, but with the error of the second on a chunk on
+/// which the first step does not fail. So these are opaque:
+///
+/// * `floor`, `ceil`, `trunc` and `round` of decimals and integers, and
+///   `round` to numbers of decimal places of each row (e.g.
+///   `calculate_binary_math` casts the decimal places of the whole batch
+///   before it rounds any value);
+/// * `regexp_like` with flags, but for a constant pattern with constant
+///   flags: it checks the flags of the whole batch for the global option `g`
+///   (a planning error) before it compiles any pattern (an execution error),
+///   and it copies flags that are views or have 64-bit offsets into 32-bit
+///   offsets, which overflow on batches of more than 2 GiB of flags;
+/// * `to_timestamp` but of strings: e.g. it casts decimals into
+///   `Decimal128(38, 9)` (a cast error on the whole batch) before it converts
+///   them into timestamps (an execution error), and unsigned integers into
+///   timestamps of seconds before nanoseconds (conservatively, of all other
+///   types).
+///
+/// The others may fail on some rows, in a single step: `substr` and `abs` but
+/// for the cases above, `regexp_like` with patterns of each row and without
+/// flags (it compiles the pattern of a row when it matches its value),
+/// `upper` and `lower` (on a value whose conversion is too large for a
+/// string), `sqrt` (of negative numbers), `power` (of zero to a negative
+/// power), `date_trunc` (of timestamps beyond the range of nanoseconds) and
+/// `to_timestamp` of strings (that are not timestamps).
 fn function_fallibility(
     function: &ScalarFunctionExpr,
     schema: &Schema,
@@ -1044,9 +1068,13 @@ fn function_fallibility(
         Abs if !first.is_signed_integer() => Infallible,
         Floor | Ceil | Trunc if first.is_floating() => Infallible,
         Round if first.is_floating() && constant(1) => Infallible,
+        Floor | Ceil | Trunc | Round => return None,
         RegexpLike if constant(1) && constant(2) => Infallible,
-        Substr | Abs | Floor | Ceil | Trunc | Round | RegexpLike | Upper | Lower
-        | Sqrt | Power | DateTrunc | ToTimestamp => PerRow,
+        RegexpLike if args.len() == 2 => PerRow,
+        RegexpLike => return None,
+        ToTimestamp if is_string(first) => PerRow,
+        ToTimestamp => return None,
+        Substr | Abs | Upper | Lower | Sqrt | Power | DateTrunc => PerRow,
     })
 }
 
@@ -3582,8 +3610,6 @@ mod tests {
             ),
             // Built-in functions that may fail on some rows.
             ("abs(n)".to_owned(), PerRow, false),
-            ("ceil(l_discount)".to_owned(), PerRow, false),
-            ("round(x, ps_availqty)".to_owned(), PerRow, false),
             ("sqrt(x)".to_owned(), PerRow, false),
             ("power(x, 2)".to_owned(), PerRow, false),
             ("substr(s, 1, -1)".to_owned(), PerRow, false),
@@ -3597,6 +3623,26 @@ mod tests {
             ("lower(s)".to_owned(), PerRow, true),
             // A failure on empty batches, which DataFusion evaluates.
             ("date_trunc('invalid', ts)".to_owned(), PerRow, true),
+            // Opaque: built-in functions that process a whole batch in steps
+            // that fail with different errors (e.g. cast decimal places of all
+            // rows before rounding any value, check flags of all rows for `g`
+            // before compiling any pattern, or cast decimals before converting
+            // them into timestamps), which fail first on a batch and on a
+            // chunk differently, and, conservatively, `to_timestamp` of
+            // anything but strings.
+            ("ceil(l_discount)".to_owned(), PerRow, true),
+            (
+                "floor(l_discount) + trunc(l_discount)".to_owned(),
+                PerRow,
+                true,
+            ),
+            ("round(l_discount, 1)".to_owned(), PerRow, true),
+            ("round(x, ps_availqty)".to_owned(), PerRow, true),
+            ("regexp_like(s, c_phone, 'i')".to_owned(), PerRow, true),
+            ("regexp_like(s, 'a', s)".to_owned(), PerRow, true),
+            ("to_timestamp(l_quantity)".to_owned(), PerRow, true),
+            ("to_timestamp(n)".to_owned(), PerRow, true),
+            ("to_timestamp(x)".to_owned(), PerRow, true),
             // Opaque: not a built-in function that the classification knows.
             ("repeat(s, 2)".to_owned(), PerRow, true),
             ("concat(s, c_phone)".to_owned(), PerRow, true),

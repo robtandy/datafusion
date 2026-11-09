@@ -2758,6 +2758,143 @@ mod tests {
         }
     }
 
+    /// A projection of `expr` (on the schema of `batch`) over a scan of `batch`,
+    /// whether it is supported, and the native projection of `expr`.
+    fn project_batch(
+        expr: &str,
+        batch: &RecordBatch,
+    ) -> (Arc<dyn ExecutionPlan>, bool, PhysicalProjection) {
+        let schema = batch.schema();
+        let expr = physical_expr(expr, &schema);
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                [ProjectionExpr::new(Arc::clone(&expr), "v")],
+                scan_batches(&schema, std::slice::from_ref(batch)),
+            )
+            .unwrap(),
+        );
+        let supported = PhysicalProjection::supports_projection_exec(
+            plan.downcast_ref::<ProjectionExec>().unwrap(),
+        );
+        let native = PhysicalProjection::try_new(
+            source(schema, vec![]),
+            vec![(expr, "v".to_owned())],
+        )
+        .unwrap();
+        (plan, supported, native)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn regexp_like_with_flags_of_rows_stays_in_datafusion() {
+        // With flags of each row, `regexp_like` checks the flags of the whole
+        // batch for `g` before it compiles any pattern: DataFusion fails to
+        // plan the global option on the batch of 4096 rows, but a pipeline
+        // would fail to compile `[` on its first chunk, whose flags are `i`.
+        let rows = 4096;
+        let batch = RecordBatch::try_from_iter([
+            (
+                "s",
+                Arc::new(StringArray::from(vec!["a"; rows])) as ArrayRef,
+            ),
+            (
+                "p",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|row| if row < 2048 { "[" } else { "a" }),
+                )),
+            ),
+            (
+                "f",
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|row| if row < 2048 { "i" } else { "g" }),
+                )),
+            ),
+        ])
+        .unwrap();
+        let (plan, supported, native) = project_batch("regexp_like(s, p, f)", &batch);
+        assert!(!supported);
+        let task_ctx = Arc::new(TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Error during planning")
+                    && error.contains("global")),
+            "{outcome:?}"
+        );
+        let error = project(&native, &DataChunk::from(batch.slice(0, 2048))).unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::Execution(_)),
+            "{error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn regexp_like_with_large_flags_of_rows_stays_in_datafusion() {
+        let _large = one_large_test_at_a_time().await;
+        // `regexp_like` copies flags of each row that are views into 32-bit
+        // offsets for the whole batch: 4096 flags of 512 KiB overflow them
+        // (2 GiB) on the batch of DataFusion, which panics, but not on chunks
+        // of 2048 rows (no pattern compiles: all strings are null).
+        let rows = 4096;
+        let flag = "i".repeat(512 * 1024);
+        let mut flags = arrow::array::StringViewBuilder::new();
+        let block = flags.append_block(arrow::buffer::Buffer::from(flag.as_bytes()));
+        for _ in 0..rows {
+            flags.try_append_view(block, 0, flag.len() as u32).unwrap();
+        }
+        let batch = RecordBatch::try_from_iter([
+            (
+                "s",
+                Arc::new(StringArray::from(vec![None::<&str>; rows])) as ArrayRef,
+            ),
+            ("f", Arc::new(flags.finish())),
+        ])
+        .unwrap();
+        let (plan, supported, _) = project_batch("regexp_like(s, 'a', f)", &batch);
+        assert!(!supported);
+        let task_ctx = Arc::new(TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("offset overflow")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn to_timestamp_of_numbers_stays_in_datafusion() {
+        // `to_timestamp` casts decimals into `Decimal128(38, 9)` before it
+        // converts them into timestamps, on the whole batch: DataFusion fails
+        // to cast `10^60` on the batch of 4096 rows, but a pipeline would fail
+        // to convert `10^12` seconds into nanoseconds on its first chunk.
+        let rows = 4096;
+        use arrow::array::ArrowNativeTypeOp;
+        let ten = arrow::datatypes::i256::from_i128(10);
+        let values = arrow::array::Decimal256Array::from_iter_values(
+            (0..rows).map(|row| ten.pow_wrapping(if row < 2048 { 12 } else { 60 })),
+        )
+        .with_precision_and_scale(76, 0)
+        .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("d", Arc::new(values) as ArrayRef)]).unwrap();
+        let (plan, supported, native) = project_batch("to_timestamp(d)", &batch);
+        assert!(!supported);
+        let task_ctx = Arc::new(TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Cast error")),
+            "{outcome:?}"
+        );
+        let error = project(&native, &DataChunk::from(batch.slice(0, 2048))).unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::Execution(_)),
+            "{error}"
+        );
+    }
+
     /// A user-defined function named `abs`, implemented by a type named like
     /// the built-in one, which returns the number of rows of the batch that it
     /// is evaluated on: its results depend on the batches.
