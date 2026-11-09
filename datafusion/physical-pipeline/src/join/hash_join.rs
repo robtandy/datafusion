@@ -115,6 +115,7 @@ use datafusion_physical_plan::{
 };
 use parking_lot::Mutex;
 
+use crate::bridge::BridgeOperator;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::join::hash_table::{
     ChainScan, JoinHashTable, JoinHashTableBuilder, hash_join_keys,
@@ -140,9 +141,10 @@ pub struct PhysicalHashJoin {
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: JoinSpec,
     /// The probe input of the `HashJoinExec` the join was lowered from, whose
-    /// streams `HashJoinExec::execute` creates also when the join cannot
-    /// produce any output and does not read them: the join creates them too
-    /// then (see [`PhysicalOperator::finalize`]), to raise the same errors.
+    /// streams `HashJoinExec::execute` creates right away, before it reads
+    /// its build side (and also if it then does not read its probe side): the
+    /// join creates them too (see [`Self::create_probe_streams`]), to raise
+    /// the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
 }
 
@@ -486,6 +488,15 @@ impl PhysicalHashJoin {
     /// partitioning by join keys), which the join evaluates on all rows too,
     /// raising the same errors. Other `RepartitionExec`s are kept, so that
     /// DataFusion evaluates their expressions.
+    ///
+    /// The probe side of a join whose join type produces no output without
+    /// build rows (`empty_build_side_produces_empty_result`) is left to
+    /// DataFusion (bridged) if its lowered form has pipeline breakers, e.g. a
+    /// join or an aggregation: their pipelines run independently of the build
+    /// side of this join, while DataFusion reads the probe side only once the
+    /// build side is collected, and not at all if it is empty, so that they
+    /// would compute (and raise errors) where DataFusion does not. A bridged
+    /// probe side is executed by DataFusion when the native join reads it.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -570,7 +581,8 @@ impl PhysicalHashJoin {
         }
         let mut children = Vec::with_capacity(2);
         for (input, keys) in [(join.left(), build_keys), (join.right(), probe_keys)] {
-            let lowered = lower_input(without_redistribution(input, &keys))?;
+            let input = without_redistribution(input, &keys);
+            let mut lowered = lower_input(input)?;
             if lowered.schema() != input.schema() {
                 return internal_err!(
                     "The lowered input {} of a HashJoinExec has schema {:?}, expected {:?}",
@@ -578,6 +590,19 @@ impl PhysicalHashJoin {
                     lowered.schema(),
                     input.schema()
                 );
+            }
+            // DataFusion reads the probe side only once the build side is
+            // collected, and not at all if the join cannot produce output.
+            // The pipelines of the pipeline breakers of a native probe side
+            // (e.g. the build side of a join below) do not wait for the build
+            // side, so they would compute (and raise errors) where DataFusion
+            // does not: such a probe side is left to DataFusion, which
+            // executes it only once the native join reads it.
+            if children.len() == 1
+                && spec.join_type.empty_build_side_produces_empty_result()
+                && has_pipeline_breakers(&lowered)
+            {
+                lowered = Arc::new(BridgeOperator::new(Arc::clone(input)));
             }
             children.push(lowered);
         }
@@ -591,8 +616,9 @@ impl PhysicalHashJoin {
     /// Create the streams of all partitions of the probe input of the
     /// `HashJoinExec` the join was lowered from and drop them without polling
     /// them, as `HashJoinExec::execute` creates the probe stream of its
-    /// partition also when it does not read it: the same errors (e.g. of a
-    /// scan of an object store that is not registered), nothing read.
+    /// partition before it reads its build side (and also if it then does not
+    /// read its probe side): the same errors (e.g. of a scan of an object
+    /// store that is not registered), nothing read.
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
@@ -1150,6 +1176,13 @@ fn take_rows(array: &ArrayRef, indices: &UInt32Array) -> Result<ArrayRef> {
     Ok(take(array.as_ref(), indices, None)?)
 }
 
+/// Whether `operator`, or an operator below it, is a pipeline breaker (a
+/// sink, e.g. a join or an aggregation), whose input runs in pipelines of its
+/// own. A bridged plan is a source: DataFusion executes it when it is read.
+fn has_pipeline_breakers(operator: &Arc<dyn PhysicalOperator>) -> bool {
+    operator.is_sink() || operator.children().iter().any(has_pipeline_breakers)
+}
+
 /// Whether a `HashJoinExec` has a prepared build side attached, whose left
 /// input is a placeholder that is not executed. (The prepared build is only
 /// visible in the display of the node.)
@@ -1233,6 +1266,10 @@ struct JoinState {
     /// saw: rows, and a NULL key.
     probe_has_rows: AtomicBool,
     probe_has_null_key: AtomicBool,
+    /// Whether the streams of the DataFusion probe input were created (see
+    /// [`PhysicalHashJoin::create_probe_streams`]), or the error of creating
+    /// them.
+    probe_streams: OnceLock<std::result::Result<(), Arc<DataFusionError>>>,
     /// The memory of the build rows.
     reservation: MemoryReservation,
 }
@@ -1458,15 +1495,28 @@ impl PhysicalOperator for PhysicalHashJoin {
             build_null_key_rows: AtomicUsize::new(0),
             probe_has_rows: AtomicBool::new(false),
             probe_has_null_key: AtomicBool::new(false),
+            probe_streams: OnceLock::new(),
             reservation,
         }))
     }
 
     fn get_local_sink_state(
         &self,
-        _ctx: &ExecutionContext,
-        _gstate: &dyn GlobalSinkState,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
+        let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
+        // `HashJoinExec::execute` creates the streams of its probe side right
+        // away, after the stream of its build side and before reading either:
+        // the first thread of a build pipeline creates them once its source
+        // is created, while the other threads wait, before any of them reads
+        // anything, so that the join raises the same errors, also if its build
+        // side never completes.
+        state
+            .probe_streams
+            .get_or_init(|| self.create_probe_streams(ctx).map_err(Arc::new))
+            .as_ref()
+            .map_err(|e| DataFusionError::Shared(Arc::clone(e)))?;
         Ok(Box::new(BuildLocalState::default()))
     }
 
@@ -1584,12 +1634,10 @@ impl PhysicalOperator for PhysicalHashJoin {
             )?;
         }
         let table = state.finish_build(spec)?;
-        // Like DataFusion, which then does not read its probe side either (but
-        // creates its streams).
+        // Like DataFusion, which then does not read its probe side either.
         if (build_empty && spec.join_type.empty_build_side_produces_empty_result())
             || (table.is_empty() && spec.join_type.empty_map_produces_empty_result())
         {
-            self.create_probe_streams(ctx)?;
             return Ok(SinkFinalize::NoOutputPossible);
         }
         Ok(SinkFinalize::Ready)
@@ -2764,11 +2812,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_multiple_joins_and_partitionings() {
-        for sql in [
-            "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON t1.a = y.k AND x.w = y.w",
-            "SELECT t1.id, x.name FROM t1 LEFT JOIN t2 x ON t1.a = x.k LEFT JOIN t2 y ON x.w = y.w",
+        for (sql, lowered) in [
+            // A join below the probe side of an inner join: the probe side is
+            // left to DataFusion, which reads it only once the build side is
+            // collected (see `PhysicalHashJoin::try_lower`).
+            (
+                "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k JOIN t2 y ON t1.a = y.k AND x.w = y.w",
+                1,
+            ),
+            // Below the probe side of joins that read their probe side
+            // anyway (`Right`, as DataFusion plans these `LEFT JOIN`s, and
+            // `Full`): both joins are native.
+            (
+                "SELECT t1.id, x.name FROM t1 LEFT JOIN t2 x ON t1.a = x.k LEFT JOIN t2 y ON x.w = y.w",
+                2,
+            ),
+            (
+                "SELECT t1.id, x.name, y.w FROM t1 JOIN t2 x ON t1.a = x.k FULL JOIN t2 y ON x.w = y.w",
+                2,
+            ),
         ] {
-            assert_join_parity_with_config(sql, test_session_config(), 2).await;
+            assert_join_parity_with_config(sql, test_session_config(), lowered).await;
         }
         for target_partitions in [1, 3, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
@@ -4150,6 +4214,141 @@ mod tests {
         let root = assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
         assert!(root.is::<PhysicalHashJoin>());
         assert_eq!(created.load(Ordering::Relaxed), 2);
+        assert!(!polled.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// A partition of `k` that ends without producing anything after `delay`.
+    #[derive(Debug)]
+    struct EmptyAfter {
+        schema: SchemaRef,
+        delay: Duration,
+    }
+
+    impl PartitionStream for EmptyAfter {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let delay = self.delay;
+            let stream = futures::stream::once(tokio::time::sleep(delay))
+                .filter_map(|()| futures::future::ready(None::<Result<RecordBatch>>));
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_sides_with_pipeline_breakers_are_left_to_datafusion() -> Result<()> {
+        // An inner join whose build side ends empty after a while, over a join
+        // whose non-empty build side has the key `1 / 0`. DataFusion reads
+        // the probe side of the outer join only once its build side is
+        // collected: never, as it is empty, so it never collects the build
+        // side of the inner join. The pipelines of that build side would not
+        // wait for the outer build side: the probe side is left to DataFusion.
+        let make_plan = |join_type: JoinType| -> Result<Arc<dyn ExecutionPlan>> {
+            let nested = join_on_one_over_zero(
+                int32_k_scan(vec![Some(1)])?,
+                int32_k_scan(vec![Some(1)])?,
+                JoinType::RightSemi,
+                PartitionMode::CollectLeft,
+            )?;
+            let build = partition_plan(EmptyAfter {
+                schema: int32_k_schema(),
+                delay: Duration::from_millis(200),
+            })?;
+            join_on_k(build, nested, join_type)
+        };
+        let root = assert_lowered_plan_byte_eq(
+            || make_plan(JoinType::Inner),
+            lower,
+            task_ctx(),
+            false,
+        )
+        .await;
+        let join = root
+            .downcast_ref::<PhysicalHashJoin>()
+            .expect("a native join");
+        let probe = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
+        assert!(probe.plan().is::<HashJoinExec>());
+
+        // A `Right` join reads its probe side also if its build side is
+        // empty: both joins are native, and both engines divide by zero.
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || make_plan(JoinType::Right),
+            lower,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 2);
+        Ok(())
+    }
+
+    /// Poll `execution` until `created` is `expected` (for at most 10 s), then
+    /// drop it. Panics if it completes.
+    async fn run_until_created(
+        execution: impl Future<Output = Result<Vec<RecordBatch>>>,
+        created: &AtomicUsize,
+        expected: usize,
+    ) {
+        let mut execution = std::pin::pin!(execution);
+        for _ in 0..1000 {
+            if created.load(Ordering::Relaxed) >= expected {
+                break;
+            }
+            if let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(10), &mut execution).await
+            {
+                panic!("The execution completed: {:?}", result.map(|b| b.len()));
+            }
+        }
+        assert_eq!(created.load(Ordering::Relaxed), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_streams_are_created_before_the_build_side_is_read() -> Result<()> {
+        // `HashJoinExec::execute` creates the stream of its probe side right
+        // away: with a build side that never produces anything, creating the
+        // stream of a scan of an object store that is not registered fails
+        // the join at once.
+        let make_plan = || {
+            join_on_k(
+                pending_plan(int32_k_schema(), 1)?,
+                unregistered_csv_scan()?,
+                JoinType::Inner,
+            )
+        };
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make_plan,
+            lower,
+            test_session_config(),
+            UNREGISTERED_STORE,
+        )
+        .await;
+        assert!(root.is::<PhysicalHashJoin>());
+
+        // The stream of a probe side that can be created is created, but not
+        // polled: neither engine completes.
+        let created = Arc::new(AtomicUsize::new(0));
+        let polled = Arc::new(AtomicBool::new(false));
+        let make_plan = || {
+            let probe = partition_plan(TrackedPartition {
+                schema: int32_k_schema(),
+                created: Arc::clone(&created),
+                polled: Arc::clone(&polled),
+            })?;
+            join_on_k(pending_plan(int32_k_schema(), 1)?, probe, JoinType::Inner)
+        };
+        run_until_created(collect(make_plan()?, task_ctx()), &created, 1).await;
+        let plan = make_plan()?;
+        let root = lower(&plan)?;
+        assert!(root.is::<PhysicalHashJoin>());
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        run_until_created(collect(exec, task_ctx()), &created, 2).await;
         assert!(!polled.load(Ordering::Relaxed));
         Ok(())
     }
