@@ -3044,7 +3044,10 @@ mod tests {
             // The chains of TPC-H (Q1, Q7 to Q10, Q14): the integers are cast
             // into decimals with enough digits for them, which cannot fail.
             ("l_extendedprice * (1 - l_discount) * (1 + l_tax)", true),
-            ("l_extendedprice * (1 - l_discount) - c_phone_cost", true),
+            (
+                "l_extendedprice * (1 - l_discount) - l_tax * l_quantity",
+                true,
+            ),
             ("l_extendedprice * (1 - l_discount) + big", true),
             ("ps_availqty * l_extendedprice + l_quantity", true),
             // A cast of strings, or a division, may fail otherwise.
@@ -3058,8 +3061,7 @@ mod tests {
             ),
             ("l_extendedprice * l_tax + 10 / n", false),
         ] {
-            let expr = expr.replace("c_phone_cost", "l_tax * l_quantity");
-            let expr = physical_expr(&expr, &schema);
+            let expr = physical_expr(expr, &schema);
             let failures = failures(&expr, &schema);
             assert!(failures.parts() > 1, "{expr}: {failures:?}");
             assert_eq!(failing_parts(&expr, &schema), failures.parts(), "{expr}");
@@ -3361,7 +3363,6 @@ mod tests {
                 .unwrap_or_else(|_| panic!("no built-in function {name}"));
             assert_eq!(udf.name(), name);
             assert_eq!(implementation_name(&udf), implementation, "{name}");
-            let schema = tpch_schema();
             let call = ScalarFunctionExpr::new(
                 name,
                 Arc::clone(&udf),
@@ -3370,7 +3371,6 @@ mod tests {
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
             );
             assert_eq!(BuiltinFunction::of(&call), Some(builtin), "{name}");
-            let _ = schema;
         }
         // A function that shadows a built-in one under its name is opaque.
         let schema = tpch_schema();
