@@ -83,6 +83,10 @@
 //!   above an input that may fail (expressions, native or not, or sources):
 //!   DataFusion evaluates the keys of a sort once it read all of its input,
 //!   the native sort whenever it sorts a run of rows of its input.
+//! * A hash join with a build key that may fail: DataFusion evaluates the
+//!   build keys once it collected its build side, all keys on a build batch
+//!   before the next, the last batch first, the native join on its chunks as
+//!   they arrive.
 //! * A `FilterExec` or a `CoalesceBatchesExec` whose plan has parts that may
 //!   fail (expressions, or sources that may fail to read or decode their rows,
 //!   e.g. a CSV file with a value that does not parse), below a node of the
@@ -593,11 +597,17 @@ impl Lowering<'_> {
 
     /// Lower a hash join with [`PhysicalHashJoin::try_lower`].
     ///
-    /// The join reads all of its build side before it probes, and raises the
-    /// errors of build keys that may fail only then, as DataFusion does: its
-    /// build side is lowered like the input of a pipeline breaker. Its probe
-    /// side continues the pipeline of the nodes above the join (the keys and
-    /// the filter of a native join cannot fail).
+    /// The join reads all of its build side before it probes, as DataFusion
+    /// does: its build side is lowered like the input of a pipeline breaker.
+    /// Its probe side continues the pipeline of the nodes above the join (the
+    /// probe keys and the filter of a native join cannot fail).
+    ///
+    /// A join with a build key that may fail is left to DataFusion, which
+    /// evaluates the build keys once it collected its build side: all keys on
+    /// a build batch before the next, the last batch first. A native join
+    /// evaluates them on its chunks as they arrive, so that another error
+    /// could come first: of another key, of another row, or of a key whose
+    /// errors depend on the batches (see [`depends_on_batches`]).
     fn try_lower_hash_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -606,6 +616,14 @@ impl Lowering<'_> {
         let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
             return Ok(None);
         };
+        let build_schema = join.left().schema();
+        let mut build_keys = Judgement::default();
+        for (key, _) in join.on() {
+            build_keys.add(key, &build_schema);
+        }
+        if build_keys.batch_dependent || build_keys.failing_parts > 0 {
+            return Ok(None);
+        }
         let build = Context::below_breaker(0);
         let probe = Context {
             limited: false,
@@ -2323,6 +2341,148 @@ mod tests {
         let root = assert_parity(sql).await;
         assert_native(sql, &root);
         assert_eq!(count::<PhysicalSort>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_with_build_keys_that_may_fail_are_left_to_datafusion() -> Result<()> {
+        use datafusion_common::{JoinType, NullEquality};
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{binary, cast, lit};
+
+        // DataFusion evaluates the (two) build keys of a join once it
+        // collected its build side: both keys on a build batch before the
+        // next, the last batch first. A native join evaluates them on its
+        // chunks of up to 2048 rows, as they arrive.
+        let config = test_session_config().with_target_partitions(1);
+        let probe_schema = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]));
+        let probe = RecordBatch::try_new(
+            Arc::clone(&probe_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )?;
+        // The build keys of a join, on the schema of its build side.
+        type Keys = dyn Fn(&Schema) -> Result<Vec<Arc<dyn PhysicalExpr>>>;
+        // A `CollectLeft` join of `build` (one partition) on `keys` with the
+        // row `x = 1, y = 1`.
+        let join = |build: Vec<RecordBatch>, keys: &Keys| {
+            let schema = build[0].schema();
+            let keys = keys(&schema).unwrap();
+            let (probe, probe_schema) = (probe.clone(), Arc::clone(&probe_schema));
+            move || -> Arc<dyn ExecutionPlan> {
+                let on = keys
+                    .iter()
+                    .cloned()
+                    .zip(["x", "y"].map(|name| col(name, &probe_schema).unwrap()))
+                    .collect();
+                Arc::new(
+                    HashJoinExec::try_new(
+                        MemorySourceConfig::try_new_exec(
+                            std::slice::from_ref(&build),
+                            Arc::clone(&schema),
+                            None,
+                        )
+                        .unwrap(),
+                        MemorySourceConfig::try_new_exec(
+                            &[vec![probe.clone()]],
+                            Arc::clone(&probe_schema),
+                            None,
+                        )
+                        .unwrap(),
+                        on,
+                        None,
+                        &JoinType::Inner,
+                        None,
+                        PartitionMode::CollectLeft,
+                        NullEquality::NullEqualsNothing,
+                        false,
+                    )
+                    .unwrap(),
+                )
+            }
+        };
+        let ints = |values: Vec<i32>| -> Result<RecordBatch> {
+            Ok(RecordBatch::try_from_iter([(
+                "a",
+                Arc::new(Int32Array::from(values)) as _,
+            )])?)
+        };
+
+        // 600 rows `a = 1`, then 2400 `a = 0`: DataFusion evaluates the right
+        // side of `a <> 0 AND 10 / a > 1` only on the 600 rows that the left
+        // side selects in the batch (at most 20% of it), a native join on all
+        // rows of its first chunk (more than 20% of which are selected).
+        let mut values = vec![1; 600];
+        values.extend([0; 2400]);
+        let batch_dependent = join(vec![ints(values.clone())?], &|schema| {
+            let a = col("a", schema)?;
+            let left = binary(Arc::clone(&a), Operator::NotEq, lit(0), schema)?;
+            let divide = binary(lit(10), Operator::Divide, Arc::clone(&a), schema)?;
+            let right = binary(divide, Operator::Gt, lit(1), schema)?;
+            let both = binary(left, Operator::And, right, schema)?;
+            Ok(vec![cast(both, schema, DataType::Int32)?, a])
+        });
+        let root = assert_plan_outcome(&batch_dependent, config.clone(), None).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        // The same rows, joined on keys that cannot fail, natively.
+        let infallible = join(vec![ints(values)?], &|schema| {
+            Ok(vec![col("a", schema)?, col("a", schema)?])
+        });
+        let root = assert_plan_outcome(&infallible, config.clone(), None).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        assert!(bridged_plans(&root).is_empty());
+
+        // Two keys that may fail: `CAST(s AS INT)` on row 2100, `10 / a` on
+        // row 100. DataFusion casts all rows of the batch first.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let strings = |a: Vec<i32>, s: Vec<String>| -> Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(a)),
+                    Arc::new(arrow::array::StringViewArray::from(s)),
+                ],
+            )?)
+        };
+        let mut a = vec![1; 3000];
+        a[100] = 0;
+        let mut s = vec!["1".to_string(); 3000];
+        s[2100] = "x".to_string();
+        let two_failing_keys = join(vec![strings(a, s)?], &|schema| {
+            let divide = binary(lit(10), Operator::Divide, col("a", schema)?, schema)?;
+            Ok(vec![
+                cast(col("s", schema)?, schema, DataType::Int32)?,
+                divide,
+            ])
+        });
+        let error = Some("Cannot cast string 'x'");
+        let root = assert_plan_outcome(&two_failing_keys, config.clone(), error).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+
+        // A single key that may fail, on a row of each of two batches:
+        // DataFusion fails on the row of the last batch first.
+        let batch = |bad: &str| {
+            let mut s = vec!["1".to_string(); 3000];
+            s[10] = bad.to_string();
+            strings(vec![1; 3000], s)
+        };
+        let one_failing_key = join(vec![batch("x")?, batch("y")?], &|schema| {
+            Ok(vec![
+                cast(col("s", schema)?, schema, DataType::Int32)?,
+                col("a", schema)?,
+            ])
+        });
+        let error = Some("Cannot cast string 'y'");
+        let root = assert_plan_outcome(&one_failing_key, config, error).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
         Ok(())
     }
 
