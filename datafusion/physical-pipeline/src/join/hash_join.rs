@@ -92,7 +92,7 @@ use arrow_select::take::take;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_datafusion_err,
-    internal_err, plan_err,
+    internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::PhysicalExprRef;
@@ -104,7 +104,9 @@ use datafusion_physical_plan::joins::utils::{
 };
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::repartition::RepartitionExec;
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+use datafusion_physical_plan::{
+    ExecutionPlan, ExecutionPlanProperties, Partitioning, displayable,
+};
 use parking_lot::Mutex;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
@@ -185,6 +187,22 @@ impl JoinSpec {
         {
             return plan_err!(
                 "A null-aware PhysicalHashJoin must be a LeftAnti, LeftMark or RightAnti join, got {join_type}"
+            );
+        }
+        // The `NOT IN` of a single key without filter. With several keys (a
+        // multi-column `NOT IN`, or correlation keys) or a filter (a
+        // correlated `NOT IN`), whether a NULL makes `IN` UNKNOWN depends on
+        // the pairs of rows it is compared with, which the join does not
+        // implement; nor does it implement `NOT IN` with NULLs that are equal.
+        if null_aware
+            && (on.len() != 1
+                || filter.is_some()
+                || null_equality != NullEquality::NullEqualsNothing)
+        {
+            return not_impl_err!(
+                "PhysicalHashJoin implements the null-aware join of a single key, without filter and with NullEqualsNothing, got {} keys, {} filter and {null_equality:?}",
+                on.len(),
+                if filter.is_some() { "a" } else { "no" }
             );
         }
         let (join_schema, all_columns) =
@@ -388,19 +406,24 @@ impl PhysicalHashJoin {
     ///   above the join makes its `fetch` redundant can lower the join
     ///   without it, `HashJoinExec::with_fetch(None)`);
     /// * a join with a prepared build side, whose left input is not
-    ///   executed, or in `PartitionMode::Auto`, which DataFusion does not
-    ///   execute;
+    ///   executed, and the joins DataFusion does not execute: in
+    ///   `PartitionMode::Auto`, in `PartitionMode::CollectLeft` with several
+    ///   build partitions, and in `PartitionMode::Partitioned` with different
+    ///   numbers of build and probe partitions;
     /// * a null-aware join with several keys or a filter (a correlated or
     ///   multi-column `NOT IN`), or with `NullEqualsNull`;
     /// * a join whose keys have different types on the two sides, or whose
     ///   build columns the [`TupleDataLayout`] cannot store.
     ///
-    /// The inputs of the join are lowered without the `RepartitionExec`s
-    /// (that do not preserve the order) and `CoalescePartitionsExec`s
-    /// (without a limit) directly below the join:
-    /// they only distribute the rows of the inputs over partitions, and the
-    /// join has a single build side shared by all threads, which read the
-    /// probe side directly.
+    /// The inputs of the join are lowered without the nodes directly below
+    /// the join that only distribute the rows of the inputs over partitions:
+    /// the join has a single build side shared by all threads, which read the
+    /// probe side directly. These are the `CoalescePartitionsExec`s without a
+    /// limit and the `RepartitionExec`s that do not preserve the order and
+    /// evaluate nothing but join keys of their side (round robin, or hash
+    /// partitioning by join keys), which the join evaluates on all rows too,
+    /// raising the same errors. Other `RepartitionExec`s are kept, so that
+    /// DataFusion evaluates their expressions.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -411,19 +434,18 @@ impl PhysicalHashJoin {
         let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
             return Ok(None);
         };
-        if !matches!(
-            join.partition_mode(),
-            PartitionMode::CollectLeft | PartitionMode::Partitioned
-        ) || join.fetch().is_some()
-            || has_prepared_build(plan)
-        {
-            return Ok(None);
-        }
-        if join.null_aware
-            && (join.on().len() != 1
-                || join.filter().is_some()
-                || join.null_equality() != NullEquality::NullEqualsNothing)
-        {
+        // The partitions DataFusion executes the join with.
+        let partitions = |input: &Arc<dyn ExecutionPlan>| {
+            input.output_partitioning().partition_count()
+        };
+        let executable = match join.partition_mode() {
+            PartitionMode::CollectLeft => partitions(join.left()) == 1,
+            PartitionMode::Partitioned => {
+                partitions(join.left()) == partitions(join.right())
+            }
+            PartitionMode::Auto => false,
+        };
+        if !executable || join.fetch().is_some() || has_prepared_build(plan) {
             return Ok(None);
         }
         let spec = match JoinSpec::try_new(
@@ -437,7 +459,8 @@ impl PhysicalHashJoin {
             join.null_aware,
         ) {
             Ok(spec) => spec,
-            // Unsupported types, or keys of different types.
+            // Unsupported types or null-aware joins, or keys of different
+            // types.
             Err(DataFusionError::NotImplemented(_) | DataFusionError::Plan(_)) => {
                 return Ok(None);
             }
@@ -451,8 +474,10 @@ impl PhysicalHashJoin {
             );
         }
         let mut children = Vec::with_capacity(2);
-        for input in [join.left(), join.right()] {
-            let lowered = lower_input(without_redistribution(input))?;
+        let build_keys = join.on().iter().map(|(build, _)| build).collect::<Vec<_>>();
+        let probe_keys = join.on().iter().map(|(_, probe)| probe).collect::<Vec<_>>();
+        for (input, keys) in [(join.left(), build_keys), (join.right(), probe_keys)] {
+            let lowered = lower_input(without_redistribution(input, &keys))?;
             if lowered.schema() != input.schema() {
                 return internal_err!(
                     "The lowered input {} of a HashJoinExec has schema {:?}, expected {:?}",
@@ -842,10 +867,13 @@ impl PhysicalHashJoin {
         } else {
             None
         };
+        // Like DataFusion, hash the keys of all probe rows, also if no build
+        // row can match them: hashing fails for the types it does not
+        // support.
+        hash_join_keys(&keys, num_rows, hashes)?;
         if table.is_empty() {
             scan.reset_without_matches(num_rows);
         } else {
-            hash_join_keys(&keys, num_rows, hashes)?;
             let keys = DataChunk::try_new(Arc::clone(&spec.key_schema), keys, None)?;
             scan.reset(table, &keys, hashes, valid.as_ref())?;
             if spec.filter.is_none()
@@ -1020,14 +1048,20 @@ fn has_prepared_build(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .contains(", prepared_build=")
 }
 
-/// `plan` without the nodes that only distribute its rows over partitions:
-/// `RepartitionExec`s that do not preserve the order, and
-/// `CoalescePartitionsExec`s without a limit.
-fn without_redistribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
+/// `plan`, an input of a join whose join keys on its side are `keys`,
+/// without the nodes that only distribute its rows over partitions:
+/// `CoalescePartitionsExec`s without a limit, and `RepartitionExec`s that do
+/// not preserve the order and only evaluate join keys (see
+/// [`partitions_by_keys`]).
+fn without_redistribution<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    keys: &[&PhysicalExprRef],
+) -> &'a Arc<dyn ExecutionPlan> {
     let mut plan = plan;
     loop {
         if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
             && !repartition.preserve_order()
+            && partitions_by_keys(repartition.partitioning(), keys)
         {
             plan = repartition.input();
         } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
@@ -1039,6 +1073,22 @@ fn without_redistribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPl
         } else {
             return plan;
         }
+    }
+}
+
+/// Whether distributing the rows of an input of a join with `partitioning`
+/// evaluates nothing but join keys of that input (`keys`): round robin
+/// partitioning, or hash partitioning by join keys. As the join evaluates
+/// (and hashes) its keys on all rows of its inputs too, it then raises the
+/// errors that distributing the rows would raise. Any other expression,
+/// e.g. a division by zero, is left to DataFusion.
+fn partitions_by_keys(partitioning: &Partitioning, keys: &[&PhysicalExprRef]) -> bool {
+    match partitioning {
+        Partitioning::RoundRobinBatch(_) => true,
+        Partitioning::Hash(exprs, _) => exprs
+            .iter()
+            .all(|expr| keys.iter().any(|key| key.as_ref() == expr.as_ref())),
+        _ => false,
     }
 }
 
@@ -1642,17 +1692,18 @@ mod tests {
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, col};
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+    use datafusion_physical_plan::collect;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::joins::HashJoinExecBuilder;
     use datafusion_physical_plan::projection::ProjectionExec;
-    use datafusion_physical_plan::{Partitioning, collect};
 
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
-        TestSource, assert_lowered_plan_byte_eq, count,
+        TestSource, assert_lowered_plan_byte_eq,
+        assert_lowered_plan_fails_like_datafusion, count,
     };
     use crate::test_utils::{
         EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
@@ -1667,9 +1718,11 @@ mod tests {
     ///
     /// * `HashJoinExec`s with [`PhysicalHashJoin::try_lower`], and unions
     ///   with [`PhysicalUnion::try_lower`];
-    /// * `CoalescePartitionsExec`s without a fetch and `RepartitionExec`s
-    ///   that do not preserve the order are removed (the pipeline engine
-    ///   merges the partitions of their input anyway);
+    /// * `CoalescePartitionsExec`s without a fetch and the `RepartitionExec`s
+    ///   that do not preserve the order and do not evaluate any expression
+    ///   that can fail (round robin, or hash partitioning by columns) are
+    ///   removed (the pipeline engine merges the partitions of their input
+    ///   anyway);
     /// * `ProjectionExec`s and `FilterExec`s (without a fetch) with
     ///   [`TestMap`]s, minimal stand-ins for the native operators, so that the
     ///   joins below them are lowered too;
@@ -1690,6 +1743,13 @@ mod tests {
         }
         if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
             && !repartition.preserve_order()
+            && match repartition.partitioning() {
+                Partitioning::RoundRobinBatch(_) => true,
+                Partitioning::Hash(exprs, _) => {
+                    exprs.iter().all(|expr| expr.is::<Column>())
+                }
+                _ => false,
+            }
         {
             return lower(repartition.input());
         }
@@ -3116,6 +3176,198 @@ mod tests {
         Ok(())
     }
 
+    /// A null-aware `LeftAnti` join (`k NOT IN`) of a build side with the key
+    /// 1 and a probe side with a NULL key, with the residual filter `false`.
+    fn not_in_with_a_filter() -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}k"), DataType::Int32, true),
+                Field::new(format!("{side}v"), DataType::Int64, false),
+            ]))
+        };
+        let scan = |side: &str, key: Option<i32>| {
+            let batch = RecordBatch::try_new(
+                schema(side),
+                vec![
+                    Arc::new(Int32Array::from(vec![key])),
+                    Arc::new(Int64Array::from(vec![10])),
+                ],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema(side), None).unwrap()
+        };
+        let (build, probe) = (scan("l", Some(1)), scan("r", None));
+        let filter_schema =
+            Arc::new(Schema::new(vec![Field::new("rv", DataType::Int64, false)]));
+        let filter = JoinFilter::new(
+            Arc::new(BinaryExpr::new(
+                col("rv", &filter_schema)?,
+                Operator::Lt,
+                datafusion_physical_expr::expressions::lit(0_i64),
+            )),
+            vec![ColumnIndex {
+                index: 1,
+                side: JoinSide::Right,
+            }],
+            filter_schema,
+        );
+        let on = vec![(col("lk", &build.schema())?, col("rk", &probe.schema())?)];
+        Ok(Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            Some(filter),
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn null_aware_joins_it_does_not_implement_are_refused() -> Result<()> {
+        // `1 NOT IN (SELECT k FROM probe WHERE false)` is true: DataFusion
+        // keeps the build row.
+        let plan = not_in_with_a_filter()?;
+        let expected = collect(Arc::clone(&plan), task_ctx()).await?;
+        let rows = expected.iter().map(RecordBatch::num_rows).sum::<usize>();
+        assert_eq!(rows, 1);
+        // The join is left to DataFusion...
+        let root =
+            assert_lowered_plan_byte_eq(not_in_with_a_filter, lower, task_ctx(), false)
+                .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        // ... and cannot be created directly either: with a filter, several
+        // keys or NULLs that are equal.
+        let join = plan.downcast_ref::<HashJoinExec>().unwrap();
+        let try_new = |on: Vec<(PhysicalExprRef, PhysicalExprRef)>,
+                       filter: Option<JoinFilter>,
+                       null_equality| {
+            PhysicalHashJoin::try_new(
+                Arc::new(BridgeOperator::new(Arc::clone(join.left()))),
+                Arc::new(BridgeOperator::new(Arc::clone(join.right()))),
+                on,
+                filter,
+                JoinType::LeftAnti,
+                None,
+                null_equality,
+                true,
+            )
+        };
+        let on = join.on().to_vec();
+        let mut two_keys = on.clone();
+        two_keys.extend(on.clone());
+        for (on, filter, null_equality) in [
+            (
+                on.clone(),
+                join.filter().cloned(),
+                NullEquality::NullEqualsNothing,
+            ),
+            (two_keys, None, NullEquality::NullEqualsNothing),
+            (on.clone(), None, NullEquality::NullEqualsNull),
+        ] {
+            let err = try_new(on, filter, null_equality).unwrap_err();
+            assert!(matches!(err, DataFusionError::NotImplemented(_)), "{err}");
+        }
+        // Without filter, the build row is removed by the NULL probe key, by
+        // the native join too.
+        let native = try_new(on, None, NullEquality::NullEqualsNothing)?;
+        let batches =
+            with_timeout(Executor::collect(Arc::new(native), task_ctx(), 4)).await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        Ok(())
+    }
+
+    /// A join on `k` whose probe side is repartitioned by `1 / d`, with `d`
+    /// zero in every row: evaluating the repartitioning fails.
+    fn join_with_a_failing_repartition() -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}k"), DataType::Int32, true),
+                Field::new(format!("{side}d"), DataType::Int32, false),
+            ]))
+        };
+        let scan = |side: &str| {
+            let batch = RecordBatch::try_new(
+                schema(side),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![0, 0, 0])),
+                ],
+            )
+            .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema(side), None).unwrap()
+        };
+        let probe = scan("r");
+        let inverse = Arc::new(BinaryExpr::new(
+            datafusion_physical_expr::expressions::lit(1_i32),
+            Operator::Divide,
+            col("rd", &probe.schema())?,
+        ));
+        let probe = Arc::new(RepartitionExec::try_new(
+            probe,
+            Partitioning::Hash(vec![inverse], 4),
+        )?);
+        let build = scan("l");
+        let on = vec![(col("lk", &build.schema())?, col("rk", &probe.schema())?)];
+        Ok(Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repartitions_that_can_fail_are_kept() -> Result<()> {
+        // The repartitioning is left to DataFusion, which fails like the plan.
+        let root = assert_lowered_plan_fails_like_datafusion(
+            join_with_a_failing_repartition,
+            lower,
+            test_session_config(),
+            "Divide by zero",
+        )
+        .await;
+        let join = root
+            .downcast_ref::<PhysicalHashJoin>()
+            .expect("a native join");
+        let bridged = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
+        assert!(bridged.plan().is::<RepartitionExec>());
+
+        // A repartitioning by the join keys (or round robin) is removed: the
+        // join evaluates its keys on all rows too.
+        let plan = join_with_a_failing_repartition()?;
+        let join = plan.downcast_ref::<HashJoinExec>().unwrap();
+        let probe = join.right().downcast_ref::<RepartitionExec>().unwrap();
+        for partitioning in [
+            Partitioning::Hash(vec![col("rk", &probe.schema())?], 4),
+            Partitioning::RoundRobinBatch(3),
+        ] {
+            let repartition =
+                RepartitionExec::try_new(Arc::clone(probe.input()), partitioning)?;
+            let plan = join
+                .builder()
+                .with_new_children(vec![Arc::clone(join.left()), Arc::new(repartition)])?
+                .build_exec()?;
+            let native = PhysicalHashJoin::try_lower(&plan, |input| {
+                Ok(Arc::new(BridgeOperator::new(Arc::clone(input))))
+            })?
+            .expect("a native join");
+            let bridged = native
+                .probe_side()
+                .downcast_ref::<BridgeOperator>()
+                .unwrap();
+            assert!(bridged.plan().is::<DataSourceExec>());
+        }
+        Ok(())
+    }
+
     #[test]
     fn lowering_of_hash_joins() -> Result<()> {
         let try_lower = |plan: Arc<dyn ExecutionPlan>| {
@@ -3186,6 +3438,29 @@ mod tests {
             ..JoinCase::new(JoinType::LeftAnti, vec!["k"])
         };
         assert!(try_lower(null_equal.plan()?)?.is_none());
+        // Partitions DataFusion does not execute: a `CollectLeft` join of
+        // several build partitions, a `Partitioned` join of different numbers
+        // of partitions.
+        let left = data_scan("l", 10, 0);
+        let right = data_scan("r", 10, 0);
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        for (mode, right) in [
+            (PartitionMode::CollectLeft, Arc::clone(&right)),
+            (
+                PartitionMode::Partitioned,
+                Arc::new(CoalescePartitionsExec::new(right)) as _,
+            ),
+        ] {
+            let invalid = HashJoinExecBuilder::new(
+                Arc::clone(&left),
+                right,
+                on.clone(),
+                JoinType::Inner,
+            )
+            .with_partition_mode(mode)
+            .build_exec()?;
+            assert!(try_lower(invalid)?.is_none(), "{mode}");
+        }
         // Keys of different types.
         let left = data_scan("l", 10, 0);
         let right = data_scan("r", 10, 0);
