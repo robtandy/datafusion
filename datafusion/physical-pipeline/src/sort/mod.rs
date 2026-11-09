@@ -175,7 +175,15 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   input: nodes that advertise a different number of partitions than their
 ///   input has, merges of no partitions, and sorts of several partitions that
 ///   are not merged;
-/// * sort keys that the Arrow row format does not support.
+/// * sort keys that the Arrow row format does not support;
+/// * rows with dictionaries with keys of fewer than 32 bits, or run-end
+///   encodings with run ends of fewer than 32 bits (also in nested types): the
+///   native sort materializes runs (of up to [`SORT_RUN_ROWS`] rows) and
+///   chunks of more rows than DataFusion's batches, whose dictionaries can
+///   need more values, and whose runs more rows, than such keys and run ends
+///   address, where DataFusion's batches fit.
+///
+/// [`SORT_RUN_ROWS`]: sort_sink::SORT_RUN_ROWS
 ///
 /// `lower_input` lowers the input of the sort (with the projections above
 /// it). Returns `Ok(None)` for any other node, without calling
@@ -421,6 +429,18 @@ impl SortPlan {
         if !SortKeys::supports(&ordering, &input.schema())? {
             return Ok(None);
         }
+        // The native sort materializes runs (and chunks) of more rows than the
+        // batches of DataFusion's sort, so their dictionaries can need more
+        // values than narrow keys address, and their run-end encodings longer
+        // runs than narrow run ends address, where DataFusion's batches fit.
+        if input
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| has_narrow_encoding(field.data_type()))
+        {
+            return Ok(None);
+        }
 
         let dynamic_filter = match topk {
             true => dynamic_filter(sort, &ordering, &projections)?,
@@ -637,6 +657,38 @@ fn compares_floats(ordering: &LexOrdering, schema: &Schema) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Whether values of `data_type` (or of its children) are dictionary encoded
+/// with keys of fewer than 32 bits, or run-end encoded with run ends of fewer
+/// than 32 bits: an array of those addresses at most 65536 dictionary values
+/// or 32767 rows.
+fn has_narrow_encoding(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(keys, values) => {
+            matches!(
+                keys.as_ref(),
+                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
+            ) || has_narrow_encoding(values)
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            run_ends.data_type() == &DataType::Int16
+                || has_narrow_encoding(values.data_type())
+        }
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_narrow_encoding(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_narrow_encoding(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_narrow_encoding(field.data_type())),
+        _ => false,
+    }
 }
 
 /// Whether the values of `data_type` are floats (possibly dictionary or
@@ -1891,7 +1943,7 @@ mod tests {
     async fn differential_order_by_dictionary_and_nested_keys() {
         assert_sorted_natively(&[
             "SELECT id, arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 ORDER BY dd, id",
-            "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
+            "SELECT id, arrow_cast(d, 'Dictionary(Int64, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
             "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l, id",
             "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
             "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s NULLS FIRST, id",
@@ -1899,6 +1951,11 @@ mod tests {
             "SELECT id, make_array(c) AS l FROM t1 ORDER BY l, id LIMIT 2400",
         ])
         .await;
+        // Dictionaries with narrow keys are left to DataFusion, see
+        // `sorts_of_narrow_dictionaries_are_left_to_datafusion`.
+        let sql = "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 \
+                   ORDER BY dd DESC NULLS LAST, id LIMIT 30";
+        assert_eq!(sorts(&assert_parity(sql).await), 0);
     }
 
     /// A table `z` with a float column `v` and a unique `id`, in a single
@@ -1990,6 +2047,117 @@ mod tests {
             assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
         }
         Ok(())
+    }
+
+    /// A scan of three partitions of 64 rows `(id, s)`: `id` is unique, and
+    /// the 192 values of `s` are distinct, in a dictionary with keys of type
+    /// `key_type`.
+    fn dictionary_scan(key_type: DataType) -> Arc<dyn ExecutionPlan> {
+        let dictionary =
+            DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", dictionary.clone(), true),
+        ]));
+        let partitions = (0..3_i64)
+            .map(|partition| {
+                // The ids of the partitions interleave, so that the batches of
+                // the sorted output mix the values of all partitions.
+                let id = (0..64).map(|i| i * 3 + partition).collect::<Vec<_>>();
+                let s = id
+                    .iter()
+                    .map(|id| format!("value {id}"))
+                    .collect::<Vec<_>>();
+                let s = arrow::compute::cast(&StringArray::from(s), &dictionary).unwrap();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(id)), s],
+                )
+                .unwrap();
+                vec![batch]
+            })
+            .collect::<Vec<_>>();
+        MemorySourceConfig::try_new_exec(&partitions, schema, None).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_narrow_dictionaries_are_left_to_datafusion() {
+        // The native sort materializes runs and chunks of more rows than
+        // DataFusion's batches, whose dictionaries can then need more values
+        // than narrow keys address: DataFusion merges the sorted partitions
+        // into batches of 64 rows, each of which uses at most 64 of the 192
+        // values, but 192 values do not fit in `Int8` keys. Such sorts are
+        // left to DataFusion.
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        for (key_type, native) in [
+            (DataType::Int8, false),
+            (DataType::UInt8, false),
+            (DataType::Int16, false),
+            (DataType::Int32, true),
+        ] {
+            for fetch in [None, Some(150)] {
+                let key = key_type.clone();
+                let make = move || -> Result<Arc<dyn ExecutionPlan>> {
+                    let sort = sort_exec(
+                        dictionary_scan(key.clone()),
+                        &[("id", false)],
+                        true,
+                        fetch,
+                    );
+                    Ok(merge(sort, &[("id", false)], fetch))
+                };
+                let root =
+                    assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                        .await;
+                assert_eq!(sorts(&root) == 1, native, "{key_type}, fetch {fetch:?}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_with_a_fetch_of_sorts_of_run_end_encoded_floats_keep_negative_zeros()
+    {
+        // A merge with a fetch of a sort of run-end encoded floats keeps the
+        // first rows of DataFusion's sort, in which the `-0.0`s come first. The
+        // threshold of the native TopK must select both zeros, also for run-end
+        // encoded values.
+        let values = Arc::new(Field::new("values", DataType::Float64, true));
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+        let ree = DataType::RunEndEncoded(Arc::clone(&run_ends), Arc::clone(&values));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", ree, true)]));
+        let batch = |value: f64, len: i32| {
+            let array = arrow::array::RunArray::<Int32Type>::try_new(
+                &Int32Array::from(vec![len]),
+                &Float64Array::from(vec![value]),
+            )
+            .unwrap();
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).unwrap()
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        for (first, then, descending) in [(0.0, -0.0, false), (-0.0, 0.0, true)] {
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let partitions = [vec![batch(first, 2048), batch(then, 5)]];
+                let scan = MemorySourceConfig::try_new_exec(
+                    &partitions,
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let sort = sort_exec(scan, &[("v", descending)], true, None);
+                Ok(merge(sort, &[("v", descending)], Some(10)))
+            };
+            let root =
+                assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                    .await;
+            assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
+        }
     }
 
     /// A scan of the rows `(a, b)` of `partitions`, a list of batches per

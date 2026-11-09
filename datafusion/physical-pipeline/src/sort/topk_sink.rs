@@ -391,13 +391,16 @@ pub(crate) fn threshold_predicate(
     }))
 }
 
-/// Whether `value` is a float `0.0` or `-0.0` (possibly dictionary encoded).
+/// Whether `value` is a float `0.0` or `-0.0` (possibly dictionary or run-end
+/// encoded).
 fn is_float_zero(value: &ScalarValue) -> bool {
     match value {
         ScalarValue::Float16(Some(v)) => v.to_f32() == 0.0,
         ScalarValue::Float32(Some(v)) => *v == 0.0,
         ScalarValue::Float64(Some(v)) => *v == 0.0,
-        ScalarValue::Dictionary(_, value) => is_float_zero(value),
+        ScalarValue::Dictionary(_, value) | ScalarValue::RunEndEncoded(_, _, value) => {
+            is_float_zero(value)
+        }
         _ => false,
     }
 }
@@ -937,6 +940,50 @@ mod tests {
         // No key to compare: no predicate.
         assert!(threshold_predicate(&[], &[ScalarValue::Int32(Some(1))])?.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn float_zeros_are_recognized_in_all_encodings() {
+        let float16 = |v: f64| {
+            let array =
+                arrow::compute::cast(&Float64Array::from(vec![v]), &DataType::Float16);
+            ScalarValue::try_from_array(&array.unwrap(), 0).unwrap()
+        };
+        let dictionary = |value: ScalarValue| {
+            ScalarValue::Dictionary(Box::new(DataType::Int32), Box::new(value))
+        };
+        let run_end_encoded = |value: ScalarValue| {
+            ScalarValue::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", value.data_type(), true)),
+                Box::new(value),
+            )
+        };
+        for zero in [
+            ScalarValue::Float64(Some(0.0)),
+            ScalarValue::Float64(Some(-0.0)),
+            ScalarValue::Float32(Some(-0.0)),
+            float16(0.0),
+            float16(-0.0),
+        ] {
+            assert!(is_float_zero(&zero), "{zero:?}");
+            assert!(is_float_zero(&dictionary(zero.clone())), "{zero:?}");
+            assert!(is_float_zero(&run_end_encoded(zero.clone())), "{zero:?}");
+            assert!(
+                is_float_zero(&run_end_encoded(dictionary(zero.clone()))),
+                "{zero:?}"
+            );
+        }
+        for other in [
+            ScalarValue::Float64(Some(1.0)),
+            ScalarValue::Float64(Some(f64::NAN)),
+            ScalarValue::Float64(None),
+            ScalarValue::Int64(Some(0)),
+            ScalarValue::Utf8(Some("0".to_string())),
+        ] {
+            assert!(!is_float_zero(&other), "{other:?}");
+            assert!(!is_float_zero(&run_end_encoded(other.clone())), "{other:?}");
+        }
     }
 
     /// Run the sink of `topk` on `chunks` on a single thread with the states
