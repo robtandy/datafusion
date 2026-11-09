@@ -38,23 +38,46 @@
 //! the rows of a hash chain, one per round), so its keys are prepared once
 //! ([`RowMatcher::prepare`], DuckDB's `TupleDataVectorFormat`) and then
 //! compared with [`RowMatcher::match_prepared`] in every round.
+//!
+//! # Fast paths
+//!
+//! The comparisons are tight loops, specialized (once per key column, not
+//! per row) for the storage and the width of the key, for probe keys with
+//! and without nulls, and for probe keys with and without an indirection
+//! (a selection or dictionary keys, which [`RowMatcher::prepare`] resolves to
+//! the index of the value of every logical row):
+//!
+//! * the candidate rows are resolved to their addresses once per
+//!   [`RowMatcher::match_prepared`] call, for all key columns (one block
+//!   lookup per candidate), and their values are read at the offsets of the
+//!   key columns without bounds checks;
+//! * fixed-width keys (e.g. `Int32`, `Int64`, `UInt32`, `UInt64`, `Date32`,
+//!   `Decimal128`) compare their 1, 2, 4, 8, 16 or 32 bytes at once;
+//! * variable-length keys (e.g. `Utf8`, `Utf8View`) compare the length and
+//!   the 4 byte prefix of their 16 byte slots in one `u64` comparison, like
+//!   DuckDB's `string_t`, then the other 8 inline bytes of values of at most
+//!   12 bytes, and only touch the heap for longer values whose length and
+//!   prefix are equal. The probe keys are prepared as Arrow views (the views
+//!   of `Utf8View` keys are used as they are), which are laid out like the
+//!   slots.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, make_comparator};
-use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer};
+use arrow::array::{Array, ArrayRef, AsArray, GenericByteArray, make_comparator};
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow::compute::SortOptions;
-use arrow::datatypes::DataType;
+use arrow::datatypes::{ArrowNativeType, ByteArrayType, DataType};
 use arrow_row::Rows;
 use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::{NullEquality, Result, internal_datafusion_err, internal_err};
 
 use super::collection::{
-    DictionaryValues, RowLocation, RowRef, TupleDataCollection, fixed_values,
+    DictionaryValues, RowLocation, RowPtr, TupleDataCollection, ValidityBits,
+    check_column, fixed_values, heap_offset, offset_value_view,
 };
-use super::layout::{ColumnLayout, ColumnStorage, TupleDataLayout};
+use super::layout::{ColumnLayout, ColumnStorage, MAX_INLINE_LEN, TupleDataLayout};
 use crate::chunk::{DataChunk, SelectionVector};
 
 /// Compares the key columns of probe rows with the key columns of candidate
@@ -75,13 +98,13 @@ pub struct RowMatcher {
 /// [`RowMatcher::match_prepared`] by [`RowMatcher::prepare`]: nested values
 /// are encoded with the row format (or have their floats normalized; the
 /// values of dictionaries once per value, without expanding them to one
-/// value per row), and the logical nulls are computed, once per probe chunk.
+/// value per row), strings and binaries get their views, and the logical
+/// nulls and the values of the logical rows (through the selection of the
+/// chunk) are resolved, once per probe chunk.
 #[derive(Debug)]
 pub struct PreparedProbe {
     /// The number of (logical) rows of the probe chunk.
     len: usize,
-    /// The selection of the probe chunk.
-    selection: Option<SelectionVector>,
     /// One entry per key column of the matcher.
     columns: Vec<ProbeColumn>,
 }
@@ -98,12 +121,15 @@ impl PreparedProbe {
     }
 }
 
+/// A key column of a probe chunk, by logical row.
 #[derive(Debug)]
 struct ProbeColumn {
-    /// The logical nulls of the key, `None` if all keys are valid.
+    /// The logical nulls of the keys of the logical rows, `None` if all keys
+    /// are valid.
     nulls: Option<NullBuffer>,
-    /// For dictionaries, the index in the values of `data` of the value of
-    /// every row, see [`DictionaryValues`].
+    /// The index in the values of `data` of the value of every logical row
+    /// (through the selection of the chunk and the keys of a dictionary, see
+    /// [`DictionaryValues`]), `None` if the value of row `i` is value `i`.
     indices: Option<Vec<usize>>,
     data: ProbeData,
 }
@@ -116,8 +142,15 @@ enum ProbeData {
     Boolean(BooleanBuffer),
     /// The bytes of fixed-width values (`width` bytes per row).
     Fixed(Buffer),
-    /// A string or binary array.
-    VarLen(ArrayRef),
+    /// A string or binary array, and the views of its values (see
+    /// [`probe_views`]), which are laid out like the slots of the values in
+    /// the rows: the length and the zero padded bytes of a value of at most
+    /// [`MAX_INLINE_LEN`] bytes, the length and the prefix (in the lower 64
+    /// bits) of a longer value.
+    VarLen {
+        views: ScalarBuffer<u128>,
+        values: ArrayRef,
+    },
     /// Nested values encoded with the row format of the column: equal
     /// values have equal encodings.
     Encoded(Rows),
@@ -181,16 +214,20 @@ impl RowMatcher {
         let columns = if probe.is_empty() {
             vec![]
         } else {
+            let selection = probe.selection().map(SelectionVector::indices);
             self.key_columns
                 .iter()
                 .map(|&column| {
-                    ProbeColumn::try_new(self.layout.column(column), probe.column(column))
+                    ProbeColumn::try_new(
+                        self.layout.column(column),
+                        probe.column(column),
+                        selection,
+                    )
                 })
                 .collect::<Result<_>>()?
         };
         Ok(PreparedProbe {
             len: probe.len(),
-            selection: probe.selection().cloned(),
             columns,
         })
     }
@@ -258,9 +295,18 @@ impl RowMatcher {
                 candidates.len()
             );
         }
-        let mut rows = collection
-            .row_refs_of(sel.iter().map(|&row| candidates[row as usize]), sel.len())?;
-        let physical = probe.selection.as_ref().map(SelectionVector::indices);
+        // The slots of the keys are in the rows of the collection, whose
+        // layout has the same slots.
+        for &column in &self.key_columns {
+            check_column(collection.layout(), self.layout.column(column), column)?;
+        }
+        // One block lookup per candidate, for all key columns.
+        let mut rows =
+            collection.resolve_rows(sel.iter().map(|&row| candidates[row as usize]))?;
+        let heaps = CandidateHeaps {
+            candidates,
+            collection,
+        };
         for (&column, probe_column) in self.key_columns.iter().zip(&probe.columns) {
             if sel.is_empty() {
                 break;
@@ -269,24 +315,26 @@ impl RowMatcher {
                 sel: &mut *sel,
                 rows: &mut rows,
                 no_match: no_match.as_deref_mut(),
-                physical,
                 column,
                 null_equals_null: self.null_equality == NullEquality::NullEqualsNull,
             };
-            let layout = self.layout.column(column);
-            match probe_column.indices.as_deref() {
-                None => match_column(layout, probe_column, &mut matches, |i| i)?,
-                Some(indices) => {
-                    match_column(layout, probe_column, &mut matches, |i| indices[i])?
-                }
-            }
+            match_column(
+                self.layout.column(column),
+                probe_column,
+                &mut matches,
+                heaps,
+            )?;
         }
         Ok(sel.len())
     }
 }
 
 impl ProbeColumn {
-    fn try_new(layout: &ColumnLayout, array: &ArrayRef) -> Result<Self> {
+    fn try_new(
+        layout: &ColumnLayout,
+        array: &ArrayRef,
+        selection: Option<&[u32]>,
+    ) -> Result<Self> {
         let (values, mut dictionary) = if layout.is_dictionary() {
             let dictionary = DictionaryValues::try_new(array)?;
             (Arc::clone(&dictionary.values), Some(dictionary))
@@ -302,7 +350,10 @@ impl ProbeColumn {
                 ProbeData::Boolean(values.as_boolean().values().clone())
             }
             ColumnStorage::Fixed(width) => ProbeData::Fixed(fixed_values(&values, width)),
-            ColumnStorage::VarLen => ProbeData::VarLen(values),
+            ColumnStorage::VarLen => ProbeData::VarLen {
+                views: probe_views(&values)?,
+                values,
+            },
             ColumnStorage::Encoded => {
                 let codec = layout.codec().ok_or_else(|| {
                     internal_datafusion_err!("Encoded column without a row codec")
@@ -324,80 +375,142 @@ impl ProbeColumn {
                 }
             }
         };
+        let indices = dictionary.map(|dictionary| dictionary.indices);
+        let Some(selection) = selection else {
+            return Ok(Self {
+                nulls,
+                indices,
+                data,
+            });
+        };
+        // Resolve the selection: the keys by logical row.
+        let nulls = nulls
+            .map(|nulls| {
+                NullBuffer::new(BooleanBuffer::collect_bool(selection.len(), |row| {
+                    nulls.is_valid(selection[row] as usize)
+                }))
+            })
+            .filter(|nulls| nulls.null_count() > 0);
+        let indices = selection
+            .iter()
+            .map(|&i| match &indices {
+                Some(indices) => indices[i as usize],
+                None => i as usize,
+            })
+            .collect();
         Ok(Self {
             nulls,
-            indices: dictionary.map(|dictionary| dictionary.indices),
+            indices: Some(indices),
             data,
         })
     }
 }
 
+/// The views of the values of the string or binary array `values`, see
+/// [`ProbeData::VarLen`]: the views of a view array (whose inline views are
+/// zero padded and whose other views have the prefix of their values, which
+/// Arrow validates), and new views of the values of an array with offsets
+/// (see [`offset_value_view`]).
+fn probe_views(values: &ArrayRef) -> Result<ScalarBuffer<u128>> {
+    fn views_of<T: ByteArrayType>(values: &GenericByteArray<T>) -> ScalarBuffer<u128> {
+        let data = values.value_data();
+        values
+            .value_offsets()
+            .windows(2)
+            .map(|w| offset_value_view(data, w[0].as_usize()..w[1].as_usize()))
+            .collect()
+    }
+    Ok(match values.data_type() {
+        DataType::Utf8View => values.as_string_view().views().clone(),
+        DataType::BinaryView => values.as_binary_view().views().clone(),
+        DataType::Utf8 => views_of(values.as_string::<i32>()),
+        DataType::LargeUtf8 => views_of(values.as_string::<i64>()),
+        DataType::Binary => views_of(values.as_binary::<i32>()),
+        DataType::LargeBinary => views_of(values.as_binary::<i64>()),
+        data_type => {
+            return internal_err!("Unexpected variable-length data type {data_type}");
+        }
+    })
+}
+
+/// The heaps of the candidates of the probe rows.
+#[derive(Clone, Copy)]
+struct CandidateHeaps<'r> {
+    candidates: &'r [RowLocation],
+    collection: &'r TupleDataCollection,
+}
+
+impl<'r> CandidateHeaps<'r> {
+    /// The heap of the candidate of probe row `row`.
+    #[inline]
+    fn of(self, row: u32) -> &'r [u8] {
+        self.collection.heap(self.candidates[row as usize])
+    }
+}
+
 /// Compare a key column (with layout `layout`) of the probe rows with their
-/// candidates, where the value of physical probe row `i` is value `index(i)`
-/// of `probe`.
+/// candidates, whose heaps are `heaps`.
 fn match_column(
     layout: &ColumnLayout,
     probe: &ProbeColumn,
     matches: &mut ColumnMatches<'_, '_>,
-    index: impl Fn(usize) -> usize + Copy,
+    heaps: CandidateHeaps<'_>,
 ) -> Result<()> {
-    let nulls = probe.nulls.as_ref();
     let offset = layout.offset();
+    // SAFETY (of all reads of the candidates): the slot of the column is in
+    // the rows of the candidates (checked by `RowMatcher::match_prepared`).
     match &probe.data {
         // Both sides are always null.
-        ProbeData::Null => matches.retain(nulls, |_, _, _| true),
-        ProbeData::Boolean(values) => matches.retain(nulls, |_, i, row| {
-            values.value(index(i)) == (row.row[offset] != 0)
+        ProbeData::Null => matches.retain(probe, |_, _, _, _| true),
+        ProbeData::Boolean(values) => matches.retain(probe, |_, _, v, candidate| {
+            values.value(v) == (unsafe { candidate.byte(offset) } != 0)
         }),
         ProbeData::Fixed(bytes) => {
             let bytes = bytes.as_slice();
             match layout.value_type() {
-                DataType::Float16 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<2>(&bytes[index(i) * 2..], &row.row[offset..])
-                }),
-                DataType::Float32 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<4>(&bytes[index(i) * 4..], &row.row[offset..])
-                }),
-                DataType::Float64 => matches.retain(nulls, |_, i, row| {
-                    float_bits_eq::<8>(&bytes[index(i) * 8..], &row.row[offset..])
-                }),
+                DataType::Float16 => matches.retain_floats::<2>(probe, bytes, offset),
+                DataType::Float32 => matches.retain_floats::<4>(probe, bytes, offset),
+                DataType::Float64 => matches.retain_floats::<8>(probe, bytes, offset),
                 _ => match layout.width() {
-                    1 => matches.retain_fixed::<1>(nulls, bytes, offset, index),
-                    2 => matches.retain_fixed::<2>(nulls, bytes, offset, index),
-                    4 => matches.retain_fixed::<4>(nulls, bytes, offset, index),
-                    8 => matches.retain_fixed::<8>(nulls, bytes, offset, index),
-                    16 => matches.retain_fixed::<16>(nulls, bytes, offset, index),
-                    32 => matches.retain_fixed::<32>(nulls, bytes, offset, index),
-                    width => matches.retain(nulls, |_, i, row| {
-                        let v = index(i);
+                    1 => matches.retain_fixed::<1>(probe, bytes, offset),
+                    2 => matches.retain_fixed::<2>(probe, bytes, offset),
+                    4 => matches.retain_fixed::<4>(probe, bytes, offset),
+                    8 => matches.retain_fixed::<8>(probe, bytes, offset),
+                    16 => matches.retain_fixed::<16>(probe, bytes, offset),
+                    32 => matches.retain_fixed::<32>(probe, bytes, offset),
+                    width => matches.retain(probe, |_, _, v, candidate| {
                         bytes[v * width..(v + 1) * width]
-                            == row.row[offset..offset + width]
+                            == *unsafe { candidate.slice(offset, width) }
                     }),
                 },
             }
         }
-        ProbeData::VarLen(values) => {
-            macro_rules! retain_bytes {
+        ProbeData::VarLen { views, values } => {
+            macro_rules! retain_var_len {
                 ($values:expr, $as_bytes:expr) => {{
                     let values = $values;
-                    matches.retain(nulls, |_, i, row| {
-                        $as_bytes(values.value(index(i))) == row.var_len(offset)
+                    matches.retain_var_len(probe, views, offset, heaps, |v| {
+                        $as_bytes(values.value(v))
                     })
                 }};
             }
             match values.data_type() {
-                DataType::Utf8 => retain_bytes!(values.as_string::<i32>(), str::as_bytes),
+                DataType::Utf8 => {
+                    retain_var_len!(values.as_string::<i32>(), str::as_bytes)
+                }
                 DataType::LargeUtf8 => {
-                    retain_bytes!(values.as_string::<i64>(), str::as_bytes)
+                    retain_var_len!(values.as_string::<i64>(), str::as_bytes)
                 }
                 DataType::Utf8View => {
-                    retain_bytes!(values.as_string_view(), str::as_bytes)
+                    retain_var_len!(values.as_string_view(), str::as_bytes)
                 }
-                DataType::Binary => retain_bytes!(values.as_binary::<i32>(), identity),
+                DataType::Binary => retain_var_len!(values.as_binary::<i32>(), identity),
                 DataType::LargeBinary => {
-                    retain_bytes!(values.as_binary::<i64>(), identity)
+                    retain_var_len!(values.as_binary::<i64>(), identity)
                 }
-                DataType::BinaryView => retain_bytes!(values.as_binary_view(), identity),
+                DataType::BinaryView => {
+                    retain_var_len!(values.as_binary_view(), identity)
+                }
                 data_type => {
                     return internal_err!(
                         "Unexpected variable-length data type {data_type}"
@@ -406,8 +519,9 @@ fn match_column(
             }
         }
         // Equal values have equal row encodings.
-        ProbeData::Encoded(encoded) => matches.retain(nulls, |_, i, row| {
-            encoded.row(index(i)).data() == row.var_len(offset)
+        ProbeData::Encoded(encoded) => matches.retain(probe, |_, row, v, candidate| {
+            encoded.row(v).data()
+                == unsafe { candidate.var_len(offset, || heaps.of(row)) }
         }),
         // Compare the (normalized) values, like `JoinKeyComparator`.
         ProbeData::Compared(values) => {
@@ -429,8 +543,9 @@ fn match_column(
             let candidates = matches
                 .rows
                 .iter()
-                .map(|row| {
-                    let encoding = row.var_len(offset);
+                .zip(matches.sel.iter())
+                .map(|(candidate, &row)| {
+                    let encoding = unsafe { candidate.var_len(offset, || heaps.of(row)) };
                     *indices_of_encodings.entry(encoding).or_insert_with(|| {
                         distinct.push(encoding);
                         distinct.len() - 1
@@ -442,8 +557,8 @@ fn match_column(
                 normalize_floats(&codec.decode_flat(distinct)?).as_ref(),
                 SortOptions::default(),
             )?;
-            matches.retain(nulls, |entry, i, _| {
-                comparator(index(i), candidates[entry]).is_eq()
+            matches.retain(probe, |entry, _, v, _| {
+                comparator(v, candidates[entry]).is_eq()
             })
         }
     }
@@ -455,16 +570,59 @@ fn identity(bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-/// Whether the native-endian floats of `W` bytes at the start of `a` and
-/// `b` are equal after normalizing `-0.0` to `+0.0` (DataFusion's
-/// `normalize_float`), i.e. `-0.0 == +0.0` and `NaN`s are equal if they
-/// have the same bits.
-#[inline]
-fn float_bits_eq<const W: usize>(a: &[u8], b: &[u8]) -> bool {
-    #[inline]
-    fn normalized<const W: usize>(bytes: &[u8]) -> u64 {
+/// Compare a valid variable-length probe value whose view is `view` (see
+/// [`ProbeData::VarLen`]) with a valid stored value whose slot is `slot`
+/// (see [`RowPtr::var_len_slot`]), like DuckDB's `string_t` equality: the
+/// lengths and the 4 byte prefixes at once, in one `u64` comparison, then the
+/// other 8 inline bytes of values of at most [`MAX_INLINE_LEN`] bytes, which
+/// are zero padded in the views and in the slots.
+///
+/// Returns `None` if the values have the same length and prefix but more
+/// than [`MAX_INLINE_LEN`] bytes: their other bytes, in the heap, must be
+/// compared (see [`long_bytes_eq`]).
+#[inline(always)]
+fn compare_slots(view: u128, slot: u128) -> Option<bool> {
+    if view as u64 != slot as u64 {
+        return Some(false);
+    }
+    if slot as u32 as usize <= MAX_INLINE_LEN {
+        return Some(view >> 64 == slot >> 64);
+    }
+    None
+}
+
+/// Whether `a` and `b` are equal, compared 8 bytes at a time (the last 8
+/// bytes overlap the previous ones if the length is not a multiple of 8)
+/// instead of calling `memcmp`, for the bytes of values of more than
+/// [`MAX_INLINE_LEN`] bytes after their prefix.
+#[inline(always)]
+fn long_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len();
+    if len != b.len() || len < 8 {
+        return a == b;
+    }
+    let word = |bytes: &[u8], i: usize| -> u64 {
+        u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap())
+    };
+    let mut i = 0;
+    while i + 8 < len {
+        if word(a, i) != word(b, i) {
+            return false;
+        }
+        i += 8;
+    }
+    word(a, len - 8) == word(b, len - 8)
+}
+
+/// Whether the native-endian floats `a` and `b` of `W` bytes are equal after
+/// normalizing `-0.0` to `+0.0` (DataFusion's `normalize_float`), i.e.
+/// `-0.0 == +0.0` and `NaN`s are equal if they have the same bits.
+#[inline(always)]
+fn float_bits_eq<const W: usize>(a: [u8; W], b: [u8; W]) -> bool {
+    #[inline(always)]
+    fn normalized<const W: usize>(bytes: [u8; W]) -> u64 {
         let mut value = [0_u8; 8];
-        value[..W].copy_from_slice(&bytes[..W]);
+        value[..W].copy_from_slice(&bytes);
         let bits = u64::from_ne_bytes(value);
         let negative_zero = if cfg!(target_endian = "little") {
             1_u64 << (W * 8 - 1)
@@ -473,51 +631,97 @@ fn float_bits_eq<const W: usize>(a: &[u8], b: &[u8]) -> bool {
         };
         if bits == negative_zero { 0 } else { bits }
     }
-    normalized::<W>(a) == normalized::<W>(b)
+    normalized(a) == normalized(b)
 }
 
 /// The state of the comparison of one key column: the probe rows (`sel`)
 /// and their candidate rows (`rows`) that matched all previous columns.
 struct ColumnMatches<'a, 'r> {
     sel: &'a mut Vec<u32>,
-    rows: &'a mut Vec<RowRef<'r>>,
+    rows: &'a mut Vec<RowPtr<'r>>,
     no_match: Option<&'a mut Vec<u32>>,
-    /// The selection of the probe chunk.
-    physical: Option<&'a [u32]>,
     column: usize,
     null_equals_null: bool,
 }
 
-impl ColumnMatches<'_, '_> {
-    /// Keep the entries whose values are equal, where `nulls` are the
-    /// logical nulls of the probe column and `equal(entry, i, row)` compares
-    /// the valid value of physical probe row `i` with the valid value of
-    /// candidate `row`, the candidate of entry `entry`.
-    #[inline]
+/// Evaluate `$body` with `$value`, the function that maps a logical row of the
+/// probe column `$probe` to the index of its value, and `$valid`, the
+/// function that returns whether the key of a logical row is valid: the
+/// comparison loops are specialized for probe columns with and without
+/// indices (a selection or dictionary keys) and nulls, so that they check
+/// neither per row.
+macro_rules! with_probe_rows {
+    ($probe:expr, |$value:ident, $valid:ident| $body:expr) => {
+        match ($probe.indices.as_deref(), $probe.nulls.as_ref()) {
+            (None, None) => {
+                let ($value, $valid) = (|row: usize| row, |_: usize| true);
+                $body
+            }
+            (Some(indices), None) => {
+                let ($value, $valid) = (|row: usize| indices[row], |_: usize| true);
+                $body
+            }
+            (None, Some(nulls)) => {
+                let nulls = ValidityBits::new(nulls);
+                let ($value, $valid) =
+                    (|row: usize| row, |row: usize| nulls.is_valid(row));
+                $body
+            }
+            (Some(indices), Some(nulls)) => {
+                let nulls = ValidityBits::new(nulls);
+                let ($value, $valid) =
+                    (|row: usize| indices[row], |row: usize| nulls.is_valid(row));
+                $body
+            }
+        }
+    };
+}
+
+impl<'r> ColumnMatches<'_, 'r> {
+    /// Keep the entries whose keys are equal, where `equal(entry, row, v,
+    /// candidate)` compares the valid value `v` of the probe column (the value
+    /// of logical probe row `row`) with the valid value of `candidate`, the
+    /// candidate of entry `entry`.
+    #[inline(always)]
     fn retain(
         &mut self,
-        nulls: Option<&NullBuffer>,
-        mut equal: impl FnMut(usize, usize, &RowRef<'_>) -> bool,
+        probe: &ProbeColumn,
+        equal: impl FnMut(usize, u32, usize, RowPtr<'r>) -> bool,
     ) {
+        with_probe_rows!(probe, |value, valid| self.retain_with(value, valid, equal))
+    }
+
+    /// [`Self::retain`], where `value(row)` is the index of the value of
+    /// logical probe row `row` and `valid(row)` whether it is valid.
+    #[inline(always)]
+    fn retain_with(
+        &mut self,
+        value: impl Fn(usize) -> usize,
+        valid: impl Fn(usize) -> bool,
+        mut equal: impl FnMut(usize, u32, usize, RowPtr<'r>) -> bool,
+    ) {
+        let (column, null_equals_null) = (self.column, self.null_equals_null);
+        // Slices, so that the stores of the loop do not reload the vectors.
+        let (sel, rows) = (self.sel.as_mut_slice(), self.rows.as_mut_slice());
+        let mut no_match = self.no_match.as_deref_mut();
         let mut kept = 0;
-        for entry in 0..self.sel.len() {
-            let row = self.sel[entry];
-            let candidate = self.rows[entry];
-            let i = match self.physical {
-                Some(physical) => physical[row as usize] as usize,
-                None => row as usize,
-            };
-            let probe_valid = nulls.is_none_or(|n| n.is_valid(i));
-            let equal = match (probe_valid, candidate.is_valid(self.column)) {
-                (true, true) => equal(entry, i, &candidate),
-                (false, false) => self.null_equals_null,
-                _ => false,
+        for entry in 0..sel.len().min(rows.len()) {
+            let row = sel[entry];
+            let candidate = rows[entry];
+            let probe_valid = valid(row as usize);
+            // SAFETY: the validity bit of the column is in the rows of the
+            // candidates (checked by `RowMatcher::match_prepared`).
+            let candidate_valid = unsafe { candidate.is_valid(column) };
+            let equal = if probe_valid && candidate_valid {
+                equal(entry, row, value(row as usize), candidate)
+            } else {
+                probe_valid == candidate_valid && null_equals_null
             };
             if equal {
-                self.sel[kept] = row;
-                self.rows[kept] = candidate;
+                sel[kept] = row;
+                rows[kept] = candidate;
                 kept += 1;
-            } else if let Some(no_match) = self.no_match.as_deref_mut() {
+            } else if let Some(no_match) = no_match.as_deref_mut() {
                 no_match.push(row);
             }
         }
@@ -525,23 +729,125 @@ impl ColumnMatches<'_, '_> {
         self.rows.truncate(kept);
     }
 
-    /// [`Self::retain`] for fixed-width values of `W` bytes (`bytes` holds
-    /// the probe values, the value of physical probe row `i` is value
-    /// `index(i)`; the candidate values are at `offset`).
-    #[inline]
+    /// [`Self::retain`] for fixed-width values of `W` bytes, which are equal
+    /// if their bytes are equal (`bytes` holds the probe values, the
+    /// candidate values are at `offset`).
+    #[inline(always)]
     fn retain_fixed<const W: usize>(
         &mut self,
-        nulls: Option<&NullBuffer>,
+        probe: &ProbeColumn,
         bytes: &[u8],
         offset: usize,
-        index: impl Fn(usize) -> usize,
     ) {
-        self.retain(nulls, |_, i, row| {
-            let v = index(i);
-            let probe: &[u8; W] = bytes[v * W..(v + 1) * W].try_into().unwrap();
-            let candidate: &[u8; W] = row.row[offset..offset + W].try_into().unwrap();
-            probe == candidate
+        let (values, _) = bytes.as_chunks::<W>();
+        // SAFETY: the slot of the column is in the rows of the candidates
+        // (checked by `RowMatcher::match_prepared`).
+        self.retain(probe, |_, _, v, candidate| {
+            values[v] == unsafe { candidate.read::<W>(offset) }
         })
+    }
+
+    /// [`Self::retain_fixed`] for floats of `W` bytes, see [`float_bits_eq`].
+    #[inline(always)]
+    fn retain_floats<const W: usize>(
+        &mut self,
+        probe: &ProbeColumn,
+        bytes: &[u8],
+        offset: usize,
+    ) {
+        let (values, _) = bytes.as_chunks::<W>();
+        // SAFETY: the slot of the column is in the rows of the candidates
+        // (checked by `RowMatcher::match_prepared`).
+        self.retain(probe, |_, _, v, candidate| {
+            float_bits_eq::<W>(values[v], unsafe { candidate.read::<W>(offset) })
+        })
+    }
+
+    /// [`Self::retain`] for variable-length values with the views `views`
+    /// (see [`ProbeData::VarLen`]) and the bytes `bytes(v)`, whose slots are
+    /// at `offset` of the candidates, which have the heaps `heaps`.
+    ///
+    /// The values are compared in two passes: the first one compares the
+    /// lengths, the prefixes and the inline bytes of all entries (see
+    /// [`compare_slots`]), and defers the comparison of the other bytes of
+    /// longer values to the second one, which only reads the heap. The reads
+    /// of the heap then do not wait for the reads of the slots of their rows,
+    /// so that more of them are in flight at once.
+    #[inline(always)]
+    fn retain_var_len<'p>(
+        &mut self,
+        probe: &ProbeColumn,
+        views: &[u128],
+        offset: usize,
+        heaps: CandidateHeaps<'_>,
+        bytes: impl Fn(usize) -> &'p [u8],
+    ) {
+        with_probe_rows!(probe, |value, valid| {
+            self.retain_var_len_with(value, valid, views, offset, heaps, bytes)
+        })
+    }
+
+    /// [`Self::retain_var_len`], with `value` and `valid` as for
+    /// [`Self::retain_with`].
+    #[inline(always)]
+    fn retain_var_len_with<'p>(
+        &mut self,
+        value: impl Fn(usize) -> usize,
+        valid: impl Fn(usize) -> bool,
+        views: &[u128],
+        offset: usize,
+        heaps: CandidateHeaps<'_>,
+        bytes: impl Fn(usize) -> &'p [u8],
+    ) {
+        let (column, null_equals_null) = (self.column, self.null_equals_null);
+        let (sel, rows) = (self.sel.as_mut_slice(), self.rows.as_mut_slice());
+        let len = sel.len().min(rows.len());
+        // The entries whose other bytes must be compared, with the heap
+        // offset of the values of their candidates.
+        let mut deferred = vec![];
+        let mut equals = vec![false; len];
+        for (entry, equal) in equals.iter_mut().enumerate() {
+            let row = sel[entry];
+            let candidate = rows[entry];
+            let probe_valid = valid(row as usize);
+            // SAFETY: the slot and the validity bit of the column are in the
+            // rows of the candidates (checked by `RowMatcher::match_prepared`).
+            let candidate_valid = unsafe { candidate.is_valid(column) };
+            *equal = if probe_valid && candidate_valid {
+                let slot = unsafe { candidate.var_len_slot(offset) };
+                compare_slots(views[value(row as usize)], slot).unwrap_or_else(|| {
+                    deferred.push((entry, heap_offset(slot)));
+                    false
+                })
+            } else {
+                probe_valid == candidate_valid && null_equals_null
+            };
+        }
+        for (entry, start) in deferred {
+            let row = sel[entry];
+            let v = value(row as usize);
+            let len = views[v] as u32 as usize;
+            // The bytes after the prefix.
+            let stored = heaps.of(row).get(start + 4..start + len);
+            equals[entry] = match (stored, bytes(v).get(4..)) {
+                (Some(stored), Some(probe)) => long_bytes_eq(stored, probe),
+                _ => false,
+            };
+        }
+        let mut no_match = self.no_match.as_deref_mut();
+        let mut kept = 0;
+        for (entry, equal) in equals.into_iter().enumerate() {
+            let row = sel[entry];
+            if equal {
+                sel[kept] = row;
+                rows[kept] = rows[entry];
+                kept += 1;
+            } else if let Some(no_match) = no_match.as_deref_mut() {
+                no_match.push(row);
+            }
+        }
+        self.sel.truncate(kept);
+        self.rows.truncate(kept);
     }
 }
 
@@ -1192,7 +1498,7 @@ mod tests {
         let dense_type_ids = elements
             .iter()
             .map(|&(t, _)| t)
-            .collect::<arrow::buffer::ScalarBuffer<i8>>();
+            .collect::<ScalarBuffer<i8>>();
         let mut dense_offsets = vec![];
         let (mut ints, mut strings) = (vec![], vec![]);
         for &(t, v) in &elements {
@@ -2216,6 +2522,308 @@ mod tests {
         for (a, e) in actual.iter().zip(&expected) {
             assert_eq!(a.0, e.0);
             assert_eq!(a.1, e.1);
+        }
+    }
+
+    /// Assert that matching every probe row `i` of `probe` (whose keys are
+    /// its first column) with build row `(i + shift) % n` (of the `n` rows of
+    /// `build`) agrees with `JoinKeyComparator` for every shift, in both null
+    /// equality modes, with keys that are prepared once, and that the rows that
+    /// do not match are returned in their order.
+    fn assert_all_shifts_match_join_key_comparator(build: &ArrayRef, probe: &DataChunk) {
+        let (collection, locations) = store(&batch(vec![("k", Arc::clone(build))]));
+        let probe_keys = Arc::clone(probe.compact().unwrap().column(0));
+        let n = build.len();
+        for null_equality in [
+            NullEquality::NullEqualsNothing,
+            NullEquality::NullEqualsNull,
+        ] {
+            let matcher = RowMatcher::try_new(
+                Arc::clone(collection.layout()),
+                vec![0],
+                null_equality,
+            )
+            .unwrap();
+            let prepared = matcher.prepare(probe).unwrap();
+            let comparator = JoinKeyComparator::new(
+                &[Arc::clone(build)],
+                &[Arc::clone(&probe_keys)],
+                &[SortOptions::default()],
+                null_equality,
+            )
+            .unwrap();
+            for shift in 0..n {
+                let build_row = |i: usize| (i + shift) % n;
+                let candidates = (0..probe.len())
+                    .map(|i| locations[build_row(i)])
+                    .collect::<Vec<_>>();
+                let mut sel = (0..probe.len() as u32).collect::<Vec<_>>();
+                let mut no_match = vec![];
+                matcher
+                    .match_prepared(
+                        &prepared,
+                        &mut sel,
+                        &candidates,
+                        &collection,
+                        Some(&mut no_match),
+                    )
+                    .unwrap();
+                let (expected, expected_no_match): (Vec<u32>, Vec<u32>) =
+                    (0..probe.len() as u32).partition(|&i| {
+                        comparator.is_equal(build_row(i as usize), i as usize)
+                    });
+                let name = build.data_type();
+                assert_eq!(sel, expected, "{name}, {null_equality:?}, shift {shift}");
+                assert_eq!(
+                    no_match, expected_no_match,
+                    "{name}, {null_equality:?}, shift {shift}"
+                );
+            }
+        }
+    }
+
+    /// Assert [`assert_all_shifts_match_join_key_comparator`] for probe chunks
+    /// with the keys of `build` in reverse order, without a selection and
+    /// through a selection.
+    fn assert_matches_with_and_without_selection(build: &ArrayRef) {
+        let n = build.len() as u32;
+        let reversed = (0..n).rev().collect::<arrow::array::UInt32Array>();
+        let probe = arrow::compute::take(build.as_ref(), &reversed, None).unwrap();
+        let probe = DataChunk::from_record_batch(batch(vec![("k", probe)]));
+        assert_all_shifts_match_join_key_comparator(build, &probe);
+        let probe = chunk_with_selection(
+            &batch(vec![("k", Arc::clone(build))]),
+            (0..n).rev().collect(),
+        );
+        assert_all_shifts_match_join_key_comparator(build, &probe);
+    }
+
+    /// Strings that the comparison of variable-length keys must tell apart
+    /// at each of its steps: the lengths and the 4 byte prefixes of their
+    /// slots, compared at once, the other inline bytes, and the bytes in the
+    /// heap, compared 8 at a time, with an overlapping last word. Equal
+    /// lengths and prefixes, differences in the last inline byte, around the
+    /// 12 inline bytes, in the first and the last byte after the prefix, in
+    /// the last word, trailing zero bytes (the padding of inline slots is
+    /// zero too) and multi-byte UTF-8.
+    fn tricky_strings() -> Vec<String> {
+        let mut strings = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "ab",
+            "abc",
+            "abd",
+            "abcd",
+            "abce",
+            "abcd\0",
+            "abcde",
+            "abcdf",
+            "abcdefghijk",
+            "abcdefghijl",
+            "abcdefghijkl",
+            "abcdefghijkm",
+            "abcdefghijkl\0",
+            "abcdefghijklm",
+            "abcdefghijkln",
+            "bbcdefghijklm",
+            "ünïcödé",
+            "ünïcödé ✓ ünïcödé",
+        ]
+        .map(String::from)
+        .to_vec();
+        let long = "Customer#000000001-a-long-key";
+        for len in [13, 16, 19, 20, 21, 24, 29] {
+            let value = &long[..len];
+            strings.push(value.to_string());
+            for i in [4, 5, 11, 12, len - 8, len - 1] {
+                let mut bytes = value.as_bytes().to_vec();
+                bytes[i] = b'~';
+                strings.push(String::from_utf8(bytes).unwrap());
+            }
+        }
+        strings
+    }
+
+    #[test]
+    fn var_len_keys_match_join_key_comparator() {
+        let strings = tricky_strings();
+        for nulls in [false, true] {
+            let values = strings
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (!nulls || i % 5 != 2).then_some(s.as_str()))
+                .collect::<StringArray>();
+            for data_type in [
+                DataType::Utf8,
+                DataType::LargeUtf8,
+                DataType::Utf8View,
+                DataType::Binary,
+                DataType::LargeBinary,
+                DataType::BinaryView,
+            ] {
+                let keys = arrow::compute::cast(&values, &data_type).unwrap();
+                assert_matches_with_and_without_selection(&keys);
+            }
+        }
+    }
+
+    /// Keys of the types whose comparisons are specialized, with duplicates
+    /// (so that some pairs of keys are equal), and with nulls if `nulls`.
+    fn specialized_keys(nulls: bool) -> Vec<ArrayRef> {
+        use arrow::array::{
+            Date32Array, Decimal128Array, Int64Array, StringViewArray, UInt32Array,
+            UInt64Array,
+        };
+        let value = |i: usize| (!nulls || i % 7 != 3).then_some((i * 7) % 13);
+        let values = (0..40).map(value).collect::<Vec<_>>();
+        let strings = |format: fn(usize) -> String| {
+            values
+                .iter()
+                .map(|v| v.map(format))
+                .collect::<Vec<Option<String>>>()
+        };
+        let short = strings(|v| format!("k{v}"));
+        let long = strings(|v| format!("a long key with the number {v}"));
+        let dictionary = |values: ArrayRef| -> ArrayRef {
+            Arc::new(
+                DictionaryArray::<Int8Type>::try_new(
+                    (0..40)
+                        .map(|i| (!nulls || i % 6 != 1).then_some((i % 9) as i8))
+                        .collect(),
+                    values,
+                )
+                .unwrap(),
+            )
+        };
+        vec![
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| v as i32 - 6))
+                    .collect::<Int32Array>(),
+            ),
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| (v as i64) << 40))
+                    .collect::<Int64Array>(),
+            ),
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| u32::MAX - v as u32))
+                    .collect::<UInt32Array>(),
+            ),
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| u64::MAX - v as u64))
+                    .collect::<UInt64Array>(),
+            ),
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| 19_000 + v as i32))
+                    .collect::<Date32Array>(),
+            ),
+            Arc::new(
+                values
+                    .iter()
+                    .map(|v| v.map(|v| (v as i128) * 10_i128.pow(30) - 1))
+                    .collect::<Decimal128Array>()
+                    .with_precision_and_scale(38, 10)
+                    .unwrap(),
+            ),
+            Arc::new(StringViewArray::from(short.clone())),
+            Arc::new(StringViewArray::from(long.clone())),
+            Arc::new(StringArray::from(short)),
+            Arc::new(StringArray::from(long.clone())),
+            dictionary(Arc::new(StringViewArray::from(long[..9].to_vec()))),
+            dictionary(Arc::new(
+                (0..9)
+                    .map(|i| (!nulls || i != 4).then_some(i64::from(i) % 4))
+                    .collect::<Int64Array>(),
+            )),
+        ]
+    }
+
+    /// The specialized comparisons of probe keys with and without a
+    /// selection, with and without nulls, and with and without dictionaries
+    /// agree with `JoinKeyComparator`.
+    #[test]
+    fn specialized_keys_match_join_key_comparator() {
+        for nulls in [false, true] {
+            for keys in specialized_keys(nulls) {
+                assert_matches_with_and_without_selection(&keys);
+            }
+        }
+    }
+
+    /// Multi-column keys with fixed-width and variable-length columns, whose
+    /// candidates are compared column by column: the candidates of the rows
+    /// that matched the previous columns stay aligned with their rows.
+    #[test]
+    fn mixed_multi_column_keys_match_join_key_comparator() {
+        for nulls in [false, true] {
+            let keys = specialized_keys(nulls);
+            // `Int64`, long `Utf8View`, `Date32` and `Utf8` keys.
+            let columns = [1, 7, 4, 8].map(|c| Arc::clone(&keys[c]));
+            let build = batch(
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (["a", "b", "c", "d"][i], Arc::clone(c)))
+                    .collect(),
+            );
+            let probe = chunk_with_selection(&build, (0..40).rev().collect());
+            let compacted = probe.compact().unwrap();
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let comparator = JoinKeyComparator::new(
+                    build.columns(),
+                    compacted.columns(),
+                    &[SortOptions::default(); 4],
+                    null_equality,
+                )
+                .unwrap();
+                for shift in [0, 1, 13, 26, 39] {
+                    let pairs = (0..40).map(|i| (i + shift) % 40).collect::<Vec<_>>();
+                    let (matched, unmatched) = match_pairs(
+                        &build,
+                        &probe,
+                        &pairs,
+                        vec![0, 1, 2, 3],
+                        null_equality,
+                    );
+                    let (expected, expected_unmatched): (Vec<u32>, Vec<u32>) = (0..40)
+                        .partition(|&i| {
+                            comparator.is_equal(pairs[i as usize], i as usize)
+                        });
+                    assert_eq!(matched, expected, "{null_equality:?}, shift {shift}");
+                    assert_eq!(unmatched, expected_unmatched);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_bytes_are_compared_8_at_a_time() {
+        let bytes = (0..40_u8).collect::<Vec<_>>();
+        for len in 0..=40 {
+            let a = &bytes[..len];
+            assert!(long_bytes_eq(a, a));
+            for i in 0..len {
+                let mut b = a.to_vec();
+                b[i] ^= 0x80;
+                assert!(!long_bytes_eq(a, &b), "length {len}, byte {i}");
+            }
+            if len > 0 {
+                assert!(!long_bytes_eq(a, &a[..len - 1]));
+            }
         }
     }
 
