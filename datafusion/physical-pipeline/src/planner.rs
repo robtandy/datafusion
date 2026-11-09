@@ -19,18 +19,19 @@
 //! chain of nodes, that a native operator reproduces exactly by that
 //! operator, whose inputs are lowered in turn:
 //!
-//! | DataFusion plan                                                                                     | Native operator                                                   |
-//! | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-//! | `SortPreservingMergeExec -> SortExec`, `SortExec`                                                   | [`PhysicalSort`], or [`PhysicalTopK`] with a fetch                |
-//! | `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)`, `AggregateExec(Single)` | [`PhysicalHashAggregate`]                                         |
-//! | `HashJoinExec` (`CollectLeft` or `Partitioned`)                                                     | [`PhysicalHashJoin`]                                              |
-//! | `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch                          | [`PhysicalLimit`]                                                 |
-//! | `UnionExec`, `InterleaveExec`                                                                       | [`PhysicalUnion`]                                                 |
-//! | `PlaceholderRowExec`                                                                                | [`PhysicalPlaceholderRow`]                                        |
-//! | `FilterExec`                                                                                        | [`PhysicalFilter`], wrapped in a [`CachingOperator`]              |
-//! | `ProjectionExec`                                                                                    | [`PhysicalProjection`]                                            |
-//! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                                                | the native scan sources of [`try_create_scan_source`]             |
-//! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                                  | removed                                                           |
+//! | DataFusion plan                                                             | Native operator                                    |
+//! | --------------------------------------------------------------------------- | -------------------------------------------------- |
+//! | `SortPreservingMergeExec -> SortExec`, `SortExec`                           | [`PhysicalSort`], or [`PhysicalTopK`] with a fetch |
+//! | `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)` | [`PhysicalHashAggregate`]                          |
+//! | `AggregateExec(Single \| SinglePartitioned)`                                | [`PhysicalHashAggregate`]                          |
+//! | `HashJoinExec` (`CollectLeft` or `Partitioned`)                             | [`PhysicalHashJoin`]                               |
+//! | `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch  | [`PhysicalLimit`]                                  |
+//! | `UnionExec`, `InterleaveExec`                                               | [`PhysicalUnion`]                                  |
+//! | `PlaceholderRowExec`                                                        | [`PhysicalPlaceholderRow`]                         |
+//! | `FilterExec`                                                                | [`PhysicalFilter`] in a [`CachingOperator`]        |
+//! | `ProjectionExec`                                                            | [`PhysicalProjection`]                             |
+//! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                        | the sources of [`try_create_scan_source`]          |
+//! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`          | removed                                            |
 //!
 //! The nodes that only distribute rows over partitions or change the size of
 //! batches are removed: all threads of a pipeline read the chunks of its
@@ -551,12 +552,13 @@ impl Lowering<'_> {
         let lowered = PhysicalHashJoin::try_lower(plan, |input| {
             // The join lowers its inputs without the nodes that distribute
             // their rows over partitions.
-            let side =
-                if distributes(join.left(), input) && !distributes(join.right(), input) {
-                    build
-                } else {
-                    probe
-                };
+            let side = if redistributes(join.left(), input)
+                && !redistributes(join.right(), input)
+            {
+                build
+            } else {
+                probe
+            };
             self.lower(input, side)
         })?;
         Ok(lowered.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>))
@@ -724,10 +726,10 @@ fn spreads_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
         })
 }
 
-/// Whether `input` is `side`, or a node below `side` that only nodes that
-/// distribute rows over partitions (`RepartitionExec`s and
-/// `CoalescePartitionsExec`s) separate from it.
-fn distributes(side: &Arc<dyn ExecutionPlan>, input: &Arc<dyn ExecutionPlan>) -> bool {
+/// Whether `side` is `input`, or only redistributes the rows of `input` over
+/// partitions: `input` is below `side`, separated from it only by
+/// `RepartitionExec`s and `CoalescePartitionsExec`s.
+fn redistributes(side: &Arc<dyn ExecutionPlan>, input: &Arc<dyn ExecutionPlan>) -> bool {
     let mut node = side;
     loop {
         if Arc::ptr_eq(node, input) {
