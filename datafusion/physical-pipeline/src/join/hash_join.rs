@@ -100,15 +100,22 @@ use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_datafusion_err,
     internal_err, not_impl_err, plan_err,
 };
+use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::empty::EmptyExec;
+use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
 };
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion_physical_plan::memory::LazyMemoryExec;
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, displayable,
@@ -470,6 +477,14 @@ impl PhysicalHashJoin {
     ///   read its probe partition, so the nodes between the join and the
     ///   repartitioning of its probe side do not run on the rows of that
     ///   partition (and raise no errors on them);
+    /// * a join whose probe input cannot be copied with its own state (see
+    ///   `reset_plan_states`): with a leaf other than a scan of files or of
+    ///   memory, or of no rows (e.g. a `StreamingTableExec`, whose partitions
+    ///   may open a file or take a channel when they are executed), or with a
+    ///   node that is not copied. `HashJoinExec::execute` creates the streams
+    ///   of its probe input right away, which the native join does too, on
+    ///   such a copy, to raise the same errors before it reads its probe
+    ///   side;
     /// * a join whose probe keys fail without any row (e.g. `1 / 0`):
     ///   DataFusion evaluates them on every batch of its probe side, also on
     ///   an empty one, which a native join, called with the non-empty chunks
@@ -523,6 +538,7 @@ impl PhysicalHashJoin {
             || join.fetch().is_some()
             || has_prepared_build(plan)
             || !plan.dynamic_expressions_produced().is_empty()
+            || !probe_streams_can_be_replayed(join.right())
         {
             return Ok(None);
         }
@@ -619,10 +635,18 @@ impl PhysicalHashJoin {
     /// partition before it reads its build side (and also if it then does not
     /// read its probe side): the same errors (e.g. of a scan of an object
     /// store that is not registered), nothing read.
+    ///
+    /// The streams are those of a copy of the probe input with its own state
+    /// (see `reset_plan_states`, and [`probe_streams_can_be_replayed`]):
+    /// creating them can start tasks that already read (e.g. those of a
+    /// `CoalescePartitionsExec`), which must not take, for instance, the
+    /// channels of a `RepartitionExec` of the probe input that the probe side
+    /// still reads.
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
         };
+        let probe = reset_plan_states(Arc::clone(probe))?;
         for partition in 0..probe.output_partitioning().partition_count() {
             drop(probe.execute(partition, Arc::clone(&ctx.task_ctx))?);
         }
@@ -1174,6 +1198,34 @@ fn take_rows(array: &ArrayRef, indices: &UInt32Array) -> Result<ArrayRef> {
         return Ok(array.slice(first, len));
     }
     Ok(take(array.as_ref(), indices, None)?)
+}
+
+/// Whether the streams of a copy of `plan` with its own state (see
+/// `reset_plan_states`) can be created (and dropped) without changing what
+/// `plan` itself reads: all its leaves are scans that read only when polled
+/// (of files or memory, or of no rows), and all its other nodes are copied.
+/// Other leaves, e.g. a `StreamingTableExec`, whose partitions may open a
+/// file or take a channel when they are executed, are not replayed.
+fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    fn replayed(plan: &Arc<dyn ExecutionPlan>, copy: &Arc<dyn ExecutionPlan>) -> bool {
+        let (children, copies) = (plan.children(), copy.children());
+        if children.is_empty() {
+            return plan.is::<EmptyExec>()
+                || plan.is::<PlaceholderRowExec>()
+                || (plan.is::<LazyMemoryExec>() && !Arc::ptr_eq(plan, copy))
+                || plan.downcast_ref::<DataSourceExec>().is_some_and(|exec| {
+                    exec.data_source().is::<MemorySourceConfig>()
+                        || exec.data_source().is::<FileScanConfig>()
+                });
+        }
+        !Arc::ptr_eq(plan, copy)
+            && children.len() == copies.len()
+            && children
+                .iter()
+                .zip(copies)
+                .all(|(child, copy)| replayed(child, copy))
+    }
+    reset_plan_states(Arc::clone(plan)).is_ok_and(|copy| replayed(plan, &copy))
 }
 
 /// Whether `operator`, or an operator below it, is a pipeline breaker (a
@@ -1766,6 +1818,19 @@ impl PhysicalOperator for PhysicalHashJoin {
                 &finalize_pipeline,
                 Arc::new(JoinHashTableBuild::new(Arc::clone(&this))),
             )?;
+            // The probe streams of a join lowered from a `HashJoinExec` are
+            // created as soon as the execution starts, in a pipeline that
+            // depends on nothing.
+            if self.probe_plan.is_some() {
+                let init_pipeline =
+                    build.create_union_pipeline(&build_pipeline, false)?;
+                build.set_source(
+                    &init_pipeline,
+                    Arc::new(ProbeStreamsInit {
+                        schema: Arc::new(Schema::empty()),
+                    }),
+                )?;
+            }
             build.build(&mut build_pipeline, self.build_side())?;
             for pipeline in build.pipelines() {
                 if pipeline != finalize_pipeline {
@@ -1865,6 +1930,46 @@ impl PhysicalOperator for JoinHashTableBuild {
         } else {
             SourceResult::Finished
         })
+    }
+}
+
+/// The source of a pipeline of the build meta pipeline of a
+/// [`PhysicalHashJoin`] lowered from a `HashJoinExec`, which depends on
+/// nothing, so that it runs as soon as the execution starts. It produces no
+/// rows: its sink, the join, creates the streams of its DataFusion probe
+/// input when it creates the local sink state of the pipeline (see
+/// [`PhysicalHashJoin::create_probe_streams`]), as `HashJoinExec::execute`
+/// does right away, also when the build pipelines wait for pipeline breakers
+/// of the build side.
+#[derive(Debug)]
+struct ProbeStreamsInit {
+    schema: SchemaRef,
+}
+
+impl PhysicalOperator for ProbeStreamsInit {
+    fn name(&self) -> &str {
+        "ProbeStreamsInit"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &[]
+    }
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn get_data(
+        &self,
+        _ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSourceState,
+        _lstate: &mut dyn LocalSourceState,
+    ) -> Result<SourceResult> {
+        Ok(SourceResult::Finished)
     }
 }
 
@@ -4200,7 +4305,15 @@ mod tests {
             }
         }
 
-        // The streams are created, by both engines, but not polled.
+        // The streams are created, but not read: reading a file that does not
+        // exist would fail.
+        let make_plan =
+            || join_on_k(int32_k_scan(vec![])?, missing_csv_scan()?, JoinType::Inner);
+        let root = assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
+        assert!(root.is::<PhysicalHashJoin>());
+
+        // A probe input whose streams cannot be created twice safely is left
+        // to DataFusion, which creates them once, and does not poll them.
         let created = Arc::new(AtomicUsize::new(0));
         let polled = Arc::new(AtomicBool::new(false));
         let make_plan = || {
@@ -4212,10 +4325,22 @@ mod tests {
             join_on_k(int32_k_scan(vec![])?, probe, JoinType::Inner)
         };
         let root = assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
-        assert!(root.is::<PhysicalHashJoin>());
+        assert!(root.is::<BridgeOperator>());
         assert_eq!(created.load(Ordering::Relaxed), 2);
         assert!(!polled.load(Ordering::Relaxed));
         Ok(())
+    }
+
+    /// A CSV scan of `k` of a local file that does not exist: its stream is
+    /// created, but reading it fails.
+    fn missing_csv_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(CsvSource::new(int32_k_schema())),
+        )
+        .with_file(PartitionedFile::new("/does/not/exist/data.csv", 10))
+        .build();
+        Ok(DataSourceExec::from_data_source(config))
     }
 
     /// A partition of `k` that ends without producing anything after `delay`.
@@ -4288,25 +4413,14 @@ mod tests {
         Ok(())
     }
 
-    /// Poll `execution` until `created` is `expected` (for at most 10 s), then
-    /// drop it. Panics if it completes.
-    async fn run_until_created(
-        execution: impl Future<Output = Result<Vec<RecordBatch>>>,
-        created: &AtomicUsize,
-        expected: usize,
-    ) {
-        let mut execution = std::pin::pin!(execution);
-        for _ in 0..1000 {
-            if created.load(Ordering::Relaxed) >= expected {
-                break;
-            }
-            if let Ok(result) =
-                tokio::time::timeout(Duration::from_millis(10), &mut execution).await
-            {
-                panic!("The execution completed: {:?}", result.map(|b| b.len()));
-            }
+    /// Assert that `execution` neither completes nor fails for a while (then
+    /// drop it).
+    async fn assert_pending(execution: impl Future<Output = Result<Vec<RecordBatch>>>) {
+        if let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(500), execution).await
+        {
+            panic!("The execution completed: {:?}", result.map(|b| b.len()));
         }
-        assert_eq!(created.load(Ordering::Relaxed), expected);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4331,25 +4445,84 @@ mod tests {
         .await;
         assert!(root.is::<PhysicalHashJoin>());
 
-        // The stream of a probe side that can be created is created, but not
-        // polled: neither engine completes.
-        let created = Arc::new(AtomicUsize::new(0));
-        let polled = Arc::new(AtomicBool::new(false));
+        // A probe side that can be created (but would fail when read) is not
+        // read: neither engine completes, nor fails.
         let make_plan = || {
-            let probe = partition_plan(TrackedPartition {
-                schema: int32_k_schema(),
-                created: Arc::clone(&created),
-                polled: Arc::clone(&polled),
-            })?;
-            join_on_k(pending_plan(int32_k_schema(), 1)?, probe, JoinType::Inner)
+            join_on_k(
+                pending_plan(int32_k_schema(), 1)?,
+                missing_csv_scan()?,
+                JoinType::Inner,
+            )
         };
-        run_until_created(collect(make_plan()?, task_ctx()), &created, 1).await;
+        assert_pending(collect(make_plan()?, task_ctx())).await;
         let plan = make_plan()?;
         let root = lower(&plan)?;
         assert!(root.is::<PhysicalHashJoin>());
         let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
-        run_until_created(collect(exec, task_ctx()), &created, 2).await;
-        assert!(!polled.load(Ordering::Relaxed));
+        assert_pending(collect(exec, task_ctx())).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_streams_are_created_before_pipeline_breakers_of_the_build_side()
+    -> Result<()> {
+        // The build side of the join is a native join whose own build side
+        // never produces anything. DataFusion creates the stream of the probe
+        // side right away, and fails: so does the native join, before its
+        // build pipelines (which wait for the nested build side) start.
+        let make_plan = || {
+            let nested = join_on_k(
+                pending_plan(int32_k_schema(), 1)?,
+                int32_k_scan(vec![Some(1)])?,
+                JoinType::RightSemi,
+            )?;
+            join_on_k(nested, unregistered_csv_scan()?, JoinType::Inner)
+        };
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make_plan,
+            lower,
+            test_session_config(),
+            UNREGISTERED_STORE,
+        )
+        .await;
+        let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
+        assert!(join.build_side().is::<PhysicalHashJoin>());
+        // The pipeline that creates the probe streams depends on nothing.
+        let pipelines = format_pipelines(&root)?;
+        assert!(
+            pipelines.contains("Pipeline 3: ProbeStreamsInit -> PhysicalHashJoin\n"),
+            "{pipelines}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_streams_are_created_on_a_copy_of_the_probe_input() -> Result<()> {
+        // Creating the streams of a `CoalescePartitionsExec` starts tasks that
+        // read its input: here, the channels of a `RepartitionExec` by a
+        // literal, which the native join reads (bridged). The streams created
+        // before the build side is read are those of a copy with its own
+        // state, so that the probe side still reads all of its rows.
+        let make_plan = || {
+            let schema = int32_k_schema();
+            let repartition = RepartitionExec::try_new(
+                int32_k_scan(vec![Some(1), Some(2), Some(3)])?,
+                Partitioning::Hash(vec![lit(7_i32)], 32),
+            )?;
+            let probe = Arc::new(CoalescePartitionsExec::new(Arc::new(repartition)));
+            assert_eq!(probe.schema(), schema);
+            join_on_k(
+                int32_k_scan(vec![Some(1), Some(2), Some(3)])?,
+                probe,
+                JoinType::Inner,
+            )
+        };
+        let batches = collect(make_plan()?, task_ctx()).await?;
+        assert_eq!(count_rows(&batches), 3);
+        let root = assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
+        let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
+        let probe = join.probe_side().downcast_ref::<BridgeOperator>().unwrap();
+        assert!(probe.plan().is::<RepartitionExec>());
         Ok(())
     }
 
