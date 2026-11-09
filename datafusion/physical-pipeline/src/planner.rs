@@ -80,14 +80,25 @@
 //! * A filter, projection, aggregation or sort with a part that may fail
 //!   above native operators of the same pipeline that have parts that may fail
 //!   too: which of them fails first depends on the batches.
-//! * A `FilterExec` whose plan has parts that may fail, below a node of the
-//!   same pipeline that has a part that may fail too: `FilterExec` coalesces
-//!   its output, so it raises the errors of later batches of its input before
-//!   the nodes above it see the rows of the earlier ones.
+//! * A `FilterExec` or a `CoalesceBatchesExec` whose plan has parts that may
+//!   fail (expressions, or sources that may fail to read or decode their rows,
+//!   e.g. a CSV file with a value that does not parse), below a node of the
+//!   same pipeline that has a part that may fail too: they coalesce their
+//!   output, so they raise the errors of later batches of their input before
+//!   the nodes above them see the rows of the earlier ones.
 //! * An aggregation that produces a dynamic filter (for `MIN` / `MAX`, which
 //!   DataFusion pushes into scans) above nodes that have parts that may fail:
 //!   the native aggregation does not update the filter, so these nodes see rows
 //!   that DataFusion prunes.
+//! * A two-stage aggregation with a stage between its final and its partial
+//!   aggregation that does not pass the partial states on unchanged, e.g. a
+//!   `PartialReduce` that merges them into other groups (not by their own
+//!   group columns, or with other aggregates, filters or a limit), or a
+//!   repartitioning of the states by an expression that may fail:
+//!   the native aggregation merges all partial states at once, without these
+//!   stages. And the sort that DataFusion adds below ordered aggregates (and
+//!   that the native aggregation does without) if both the aggregates and the
+//!   input of the sort may fail: the sort reads all of its input first.
 //! * A hash repartitioning by expressions that may fail, which DataFusion
 //!   evaluates on every batch, and a `CoalesceBatchesExec` of types whose
 //!   concatenation may fail.
@@ -143,6 +154,8 @@ use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Explain;
 use datafusion_physical_expr::LexOrdering;
@@ -151,9 +164,11 @@ use datafusion_physical_plan::aggregates::{
 };
 use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
@@ -456,6 +471,15 @@ impl Lowering<'_> {
             return Ok(scan);
         }
         if let Some(input) = redistributed_input(plan) {
+            // Like `FilterExec` (see `lower_filter`), `CoalesceBatchesExec` pulls
+            // later batches of its input, whose errors it raises, before the
+            // nodes above it see the rows of earlier ones.
+            if is_coalesce_batches(plan)
+                && ctx.fallible_above
+                && subtree_failing_parts(input) > 0
+            {
+                return Ok(bridge(plan));
+            }
             let lowered = self.lower(input, ctx)?;
             // DataFusion executes a bridged input anyway: keep a
             // repartitioning that spreads it over more partitions, which the
@@ -535,8 +559,10 @@ impl Lowering<'_> {
         if !plan.is::<AggregateExec>() {
             return Ok(None);
         }
-        let plan = &without_intermediate_aggregation_stages(plan)?
-            .unwrap_or_else(|| Arc::clone(plan));
+        let Some(plan) = aggregation_to_lower(plan)? else {
+            return Ok(None);
+        };
+        let plan = &plan;
         let Some(raw) = raw_aggregate(plan) else {
             return Ok(None);
         };
@@ -552,7 +578,7 @@ impl Lowering<'_> {
         let own = judgement.failing_parts;
         let input = Context::below_breaker(own);
         let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, |plan| {
-            self.lower(without_ordering_sort(raw, plan), input)
+            self.lower(without_ordering_sort(raw, own, plan), input)
         })?
         else {
             return Ok(None);
@@ -828,9 +854,13 @@ fn raw_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
 /// require it (see [`PhysicalHashAggregate`]). The sort is removed if it sorts
 /// every partition of its input, without a fetch, by keys that cannot fail
 /// (DataFusion evaluates them on all rows, the native aggregation evaluates
-/// them on the rows that pass the filters of the aggregates).
+/// them on the rows that pass the filters of the aggregates), unless both the
+/// expressions of `raw` (with `own_failing_parts` parts that may fail) and its
+/// input may fail: the sort reads all of its input before the aggregation
+/// sees any row, so DataFusion raises the errors of the input first.
 fn without_ordering_sort<'a>(
     raw: &AggregateExec,
+    own_failing_parts: usize,
     plan: &'a Arc<dyn ExecutionPlan>,
 ) -> &'a Arc<dyn ExecutionPlan> {
     let Some(sort) = plan.downcast_ref::<SortExec>() else {
@@ -847,11 +877,14 @@ fn without_ordering_sort<'a>(
     let sorts_partitions = sort.input().output_partitioning().partition_count()
         == plan.output_partitioning().partition_count();
     let keys = Judgement::of_ordering(sort.expr(), &sort.input().schema());
+    let errors_in_order =
+        own_failing_parts == 0 || subtree_failing_parts(sort.input()) == 0;
     if orders_aggregates
         && sorts_partitions
         && sort.fetch().is_none()
         && !keys.batch_dependent
         && keys.failing_parts == 0
+        && errors_in_order
     {
         sort.input()
     } else {
@@ -859,78 +892,118 @@ fn without_ordering_sort<'a>(
     }
 }
 
-/// `plan`, an aggregation in `Final` or `FinalPartitioned` mode, without the
-/// stages between it and its `Partial` aggregation that do not distribute
-/// the partial states, which [`PhysicalHashAggregate::try_lower`] does not
-/// look through: `CoalesceBatchesExec`s without a fetch, and `PartialReduce`
-/// aggregations (with their input schema), which merge partial states into
-/// partial states, as the final aggregation does. Returns `None` if there are
-/// none, or if `plan` is not such a chain.
-fn without_intermediate_aggregation_stages(
+/// `plan`, an aggregation, as [`PhysicalHashAggregate::try_lower`] lowers it:
+/// in `Final` or `FinalPartitioned` mode, without the stages between it and
+/// its `Partial` aggregation that `try_lower` does not look through
+/// (`CoalesceBatchesExec`s and `PartialReduce` aggregations), and `plan`
+/// itself otherwise.
+///
+/// The native aggregation merges all states of the partial aggregation at
+/// once, without these stages and the `RepartitionExec`s and
+/// `CoalescePartitionsExec`s that distribute the states: returns `None`, so
+/// that DataFusion executes the aggregation, if a stage does not pass the
+/// partial states on unchanged (see [`passes_states_on`]), e.g. a
+/// `PartialReduce` that merges them into other groups, or a repartitioning by
+/// an expression that may fail.
+fn aggregation_to_lower(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(aggregate) = plan.downcast_ref::<AggregateExec>() else {
-        return Ok(None);
+    let Some(last) = plan.downcast_ref::<AggregateExec>() else {
+        return Ok(Some(Arc::clone(plan)));
     };
     if !matches!(
-        aggregate.mode(),
+        last.mode(),
         AggregateMode::Final | AggregateMode::FinalPartitioned
     ) {
+        return Ok(Some(Arc::clone(plan)));
+    }
+    // The stages from the top, down to the partial aggregation.
+    let mut stages = vec![];
+    let mut node = last.input();
+    let partial = loop {
+        if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
+            match aggregate.mode() {
+                AggregateMode::Partial => break aggregate,
+                AggregateMode::PartialReduce => {}
+                _ => return Ok(None),
+            }
+        } else if !(node.is::<RepartitionExec>()
+            || node.is::<CoalescePartitionsExec>()
+            || is_coalesce_batches(node))
+        {
+            return Ok(None);
+        }
+        stages.push(node);
+        match node.children().as_slice() {
+            [input] => node = *input,
+            _ => return Ok(None),
+        }
+    };
+    if !stages.iter().all(|stage| passes_states_on(stage, partial)) {
         return Ok(None);
     }
-    match states_without_intermediate_stages(aggregate.input())? {
-        Some((input, true)) => Ok(Some(
-            Arc::clone(plan).replace_children(vec![input], recompute())?,
-        )),
-        _ => Ok(None),
+    let distributes = |stage: &Arc<dyn ExecutionPlan>| {
+        stage.is::<RepartitionExec>() || stage.is::<CoalescePartitionsExec>()
+    };
+    if stages.iter().all(|stage| distributes(stage)) {
+        return Ok(Some(Arc::clone(plan)));
     }
+    // Without the stages that only coalesce batches or reduce states.
+    let mut input = Arc::clone(node);
+    for stage in stages.iter().rev().filter(|stage| distributes(stage)) {
+        input = Arc::clone(stage).replace_children(vec![input], recompute())?;
+    }
+    Ok(Some(
+        Arc::clone(plan).replace_children(vec![input], recompute())?,
+    ))
 }
 
-/// The partial states `plan` (the input of a final aggregation, or a node
-/// below it) without the intermediate stages that
-/// [`without_intermediate_aggregation_stages`] removes, and whether there
-/// were any. `None` if `plan` does not lead to a `Partial` aggregation
-/// through nodes that distribute states and intermediate stages.
-fn states_without_intermediate_stages(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Option<(Arc<dyn ExecutionPlan>, bool)>> {
-    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
-        return match aggregate.mode() {
-            AggregateMode::Partial => Ok(Some((Arc::clone(plan), false))),
-            AggregateMode::PartialReduce
-                if aggregate.input().schema() == aggregate.schema() =>
-            {
-                Ok(states_without_intermediate_stages(aggregate.input())?
-                    .map(|(input, _)| (input, true)))
-            }
-            _ => Ok(None),
-        };
+/// Whether `stage`, a node between a final aggregation and the `Partial`
+/// aggregation `partial` whose states it merges, passes these states on
+/// unchanged, as the native aggregation assumes:
+///
+/// * a `RepartitionExec` that does not preserve the order, round robin, or by
+///   hash expressions that cannot fail and whose errors do not depend on the
+///   batches (DataFusion evaluates them on every batch of states);
+/// * a `CoalescePartitionsExec` without a fetch;
+/// * a `CoalesceBatchesExec` without a fetch, of states whose concatenation
+///   cannot fail;
+/// * a `PartialReduce` aggregation that merges the states of `partial` into
+///   the same states: it groups by the group columns of the states and merges
+///   the aggregates of `partial`, without filters or a limit.
+fn passes_states_on(stage: &Arc<dyn ExecutionPlan>, partial: &AggregateExec) -> bool {
+    if let Some(repartition) = stage.downcast_ref::<RepartitionExec>() {
+        let schema = repartition.input().schema();
+        return !repartition.preserve_order()
+            && match repartition.partitioning() {
+                Partitioning::RoundRobinBatch(_) => true,
+                Partitioning::Hash(exprs, _) => exprs.iter().all(|expr| {
+                    !depends_on_batches(expr, &schema)
+                        && failing_parts(expr, &schema) == 0
+                }),
+                _ => false,
+            };
     }
-    let Some(input) = plan.children().into_iter().next() else {
-        return Ok(None);
-    };
-    if is_coalesce_batches(plan) && plan.fetch().is_none() {
-        return Ok(
-            states_without_intermediate_stages(input)?.map(|(input, _)| (input, true))
-        );
+    if let Some(coalesce) = stage.downcast_ref::<CoalescePartitionsExec>() {
+        return coalesce.fetch().is_none();
     }
-    let distributes_states = plan
-        .downcast_ref::<RepartitionExec>()
-        .is_some_and(|repartition| !repartition.preserve_order())
-        || plan
-            .downcast_ref::<CoalescePartitionsExec>()
-            .is_some_and(|coalesce| coalesce.fetch().is_none());
-    if !distributes_states {
-        return Ok(None);
+    if is_coalesce_batches(stage) {
+        return stage.fetch().is_none()
+            && stage
+                .schema()
+                .fields()
+                .iter()
+                .all(|field| !may_fail_to_concatenate(field.data_type()));
     }
-    match states_without_intermediate_stages(input)? {
-        Some((new_input, true)) => Ok(Some((
-            Arc::clone(plan).replace_children(vec![new_input], recompute())?,
-            true,
-        ))),
-        Some((_, false)) => Ok(Some((Arc::clone(plan), false))),
-        None => Ok(None),
-    }
+    stage.downcast_ref::<AggregateExec>().is_some_and(|reduce| {
+        reduce.mode() == &AggregateMode::PartialReduce
+            && reduce.group_expr() == &partial.group_expr().as_final()
+            && reduce.aggr_expr() == partial.aggr_expr()
+            && reduce.filter_expr().iter().all(Option::is_none)
+            && reduce.limit_options().is_none()
+            && reduce.input().schema() == partial.schema()
+            && reduce.schema() == partial.schema()
+    })
 }
 
 /// How the expressions that a node evaluates on the rows of its input can
@@ -1036,13 +1109,29 @@ fn native_sort_keys(sort: &Arc<dyn PhysicalOperator>) -> Judgement {
     Judgement::of_ordering(ordering, &input.schema())
 }
 
-/// The parts that may fail of the expressions of all nodes of `plan` (see
-/// [`Judgement::of_plan`]), sources included.
+/// The parts that may fail of all nodes of `plan`: the parts of their
+/// expressions that may fail (see [`Judgement::of_plan`]), and the sources
+/// that may fail to read or decode their rows (see [`source_may_fail`]).
 fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> usize {
-    plan.children().into_iter().map(subtree_failing_parts).fold(
-        Judgement::of_plan(plan.as_ref()).failing_parts,
-        usize::saturating_add,
-    )
+    let own = Judgement::of_plan(plan.as_ref())
+        .failing_parts
+        .saturating_add(usize::from(source_may_fail(plan)));
+    plan.children()
+        .into_iter()
+        .map(subtree_failing_parts)
+        .fold(own, usize::saturating_add)
+}
+
+/// Whether `plan` is a source that may fail to read or decode its rows: every
+/// leaf but a scan of memory, of an empty relation or of placeholder rows,
+/// e.g. a scan of files, which may fail to read or parse them, or a stream.
+fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.children().is_empty()
+        && !(plan.is::<EmptyExec>()
+            || plan.is::<PlaceholderRowExec>()
+            || plan
+                .downcast_ref::<DataSourceExec>()
+                .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>()))
 }
 
 /// The parts that may fail (see [`failing_parts`]) of the native filters and
@@ -1093,6 +1182,7 @@ mod tests {
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal, col};
+    use datafusion_physical_plan::aggregates::PhysicalGroupBy;
     use datafusion_physical_plan::joins::PartitionMode;
     use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
     use datafusion_physical_plan::{collect, displayable};
@@ -1877,6 +1967,319 @@ mod tests {
         }
     }
 
+    /// Assert that executing the plan that `make_plan` creates gives the same
+    /// outcome in DataFusion and lowered (with [`create_pipeline_plan`]): the
+    /// same rows, or errors that contain `error`. Returns the lowered
+    /// operator tree.
+    async fn assert_plan_outcome(
+        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
+        config: SessionConfig,
+        error: Option<&str>,
+    ) -> Arc<dyn PhysicalOperator> {
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let root = create_pipeline_plan(make_plan()).unwrap();
+        let operator = Arc::clone(root.operator());
+        let tree = format_operator_tree(&operator);
+        let expected = collect(make_plan(), Arc::clone(&task_ctx)).await;
+        let actual = collect(root as Arc<dyn ExecutionPlan>, task_ctx).await;
+        match (error, expected, actual) {
+            (None, Ok(expected), Ok(actual)) => {
+                let output = |batches| crate::test_utils::EngineOutput {
+                    plan: make_plan(),
+                    schema: make_plan().schema(),
+                    batches,
+                    ordered: false,
+                };
+                if let Err(message) = compare_outputs(&output(expected), &output(actual))
+                {
+                    panic!("Results differ: {message}\nlowered: {tree}");
+                }
+            }
+            (Some(error), Err(expected), Err(actual)) => {
+                assert!(
+                    expected.to_string().contains(error),
+                    "DataFusion: {expected}"
+                );
+                assert!(
+                    actual.to_string().contains(error),
+                    "pipeline engine: {actual}\nlowered: {tree}"
+                );
+            }
+            (_, expected, actual) => panic!(
+                "Outcomes differ: DataFusion {:?}, pipeline engine {:?}\nlowered: {tree}",
+                expected.map(|batches| batches.len()),
+                actual.map(|batches| batches.len())
+            ),
+        }
+        operator
+    }
+
+    /// The plan of `sql` in default DataFusion, on a table `t` of four
+    /// partitions with the rows `a = 0, 1, 2, 3` each.
+    async fn plan_of_four_partitions(sql: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+        )
+        .unwrap();
+        let ctx = datafusion_context(test_session_config());
+        let table =
+            datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]; 4])
+                .unwrap();
+        ctx.register_table("t", Arc::new(table)).unwrap();
+        ctx.sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// `plan` with `stage(partial)` above its `Partial` aggregation.
+    fn above_partial_aggregation(
+        plan: Arc<dyn ExecutionPlan>,
+        stage: impl Fn(&AggregateExec, Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let last = plan
+            .downcast_ref::<AggregateExec>()
+            .expect("a final aggregation");
+        let mut node = Arc::clone(last.input());
+        let mut above = vec![];
+        while !node
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|aggregate| aggregate.mode() == &AggregateMode::Partial)
+        {
+            above.push(Arc::clone(&node));
+            node = Arc::clone(node.children()[0]);
+        }
+        let mut input = stage(last, node);
+        for node in above.into_iter().rev() {
+            input = node.replace_children(vec![input], recompute()).unwrap();
+        }
+        plan.replace_children(vec![input], recompute()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partial_reductions_that_change_the_states_are_left_to_datafusion() {
+        let sql = "SELECT a, COUNT(*) AS n FROM t GROUP BY a";
+        let plan = plan_of_four_partitions(sql).await;
+        let projection = plan.downcast_ref::<ProjectionExec>().expect("a projection");
+        let aggregation = Arc::clone(projection.input());
+        // A `PartialReduce` stage that merges all states into the group
+        // `a = 0`: DataFusion returns `(0, 16)`, which removing it would not.
+        let reduce = |groups: PhysicalGroupBy| {
+            let aggregation = Arc::clone(&aggregation);
+            move || {
+                above_partial_aggregation(Arc::clone(&aggregation), |last, partial| {
+                    Arc::new(
+                        AggregateExec::try_new(
+                            AggregateMode::PartialReduce,
+                            groups.clone(),
+                            last.aggr_expr().to_vec(),
+                            last.filter_expr().to_vec(),
+                            partial,
+                            last.input_schema(),
+                        )
+                        .unwrap(),
+                    )
+                })
+            }
+        };
+        let zero = PhysicalGroupBy::new_single(vec![(
+            datafusion_physical_expr::expressions::lit(0_i32),
+            "a".to_string(),
+        )]);
+        let make_plan = reduce(zero);
+        assert_eq!(make_plan().schema(), aggregation.schema());
+        let root = assert_plan_outcome(&make_plan, test_session_config(), None).await;
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 0);
+        let task_ctx = Arc::new(TaskContext::default());
+        let rows = collect(make_plan(), task_ctx).await.unwrap();
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        // A `PartialReduce` stage that merges the states into the same groups
+        // is removed: the native aggregation merges all states at once.
+        let identity = aggregation
+            .downcast_ref::<AggregateExec>()
+            .unwrap()
+            .group_expr()
+            .clone();
+        let make_plan = reduce(identity);
+        let root = assert_plan_outcome(&make_plan, test_session_config(), None).await;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redistributions_of_partial_states_that_may_fail_are_left_to_datafusion() {
+        let plan = plan_of_four_partitions("SELECT SUM(a) AS n FROM t").await;
+        let projection = plan.downcast_ref::<ProjectionExec>().expect("a projection");
+        let aggregation = Arc::clone(projection.input());
+        let last = aggregation
+            .downcast_ref::<AggregateExec>()
+            .expect("an aggregation");
+        assert_eq!(last.mode(), &AggregateMode::Final);
+        let partial = Arc::clone(last.input().children()[0]);
+        let state: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::Column::new(
+                partial.schema().field(0).name(),
+                0,
+            ));
+        // A `RepartitionExec` of the partial states by `key` (instead of the
+        // `CoalescePartitionsExec`).
+        let repartition = |key: Arc<dyn PhysicalExpr>| {
+            let (aggregation, partial) = (Arc::clone(&aggregation), Arc::clone(&partial));
+            move || {
+                let input: Arc<dyn ExecutionPlan> = Arc::new(
+                    RepartitionExec::try_new(
+                        Arc::clone(&partial),
+                        Partitioning::Hash(vec![Arc::clone(&key)], 1),
+                    )
+                    .unwrap(),
+                );
+                Arc::clone(&aggregation)
+                    .replace_children(vec![input], recompute())
+                    .unwrap()
+            }
+        };
+        // By `10 / (sum - sum)`: DataFusion divides by zero, which removing
+        // the repartitioning would not.
+        let key: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Literal::new(datafusion_common::ScalarValue::Int64(Some(
+                10,
+            )))),
+            datafusion_expr::Operator::Divide,
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&state),
+                datafusion_expr::Operator::Minus,
+                Arc::clone(&state),
+            )),
+        ));
+        let make_plan = repartition(key);
+        let root = assert_plan_outcome(
+            &make_plan,
+            test_session_config(),
+            Some("Divide by zero"),
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 0);
+        // By an expression that cannot fail, it is removed.
+        let make_plan = repartition(state);
+        let root = assert_plan_outcome(&make_plan, test_session_config(), None).await;
+        assert_native("SELECT SUM(a) AS n FROM t", &root);
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalescing_below_fallible_nodes_over_fallible_inputs_stays_in_datafusion() {
+        use crate::operators::union::test_support::{
+            AfterBatch, INJECTED_FAILURE, batch_plan,
+        };
+
+        // `10 / a` over 1000 zeros, then a source error. `FilterExec` and
+        // `CoalesceBatchesExec` pull the error before they emit the zeros, so
+        // DataFusion raises the source error; native operators that pass the
+        // zeros on at once would divide by zero first.
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let zeros = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![0; 1000]))],
+        )
+        .unwrap();
+        let divide = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            let a = col("a", &input.schema()).unwrap();
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                    10,
+                )))),
+                datafusion_expr::Operator::Divide,
+                a,
+            ));
+            Arc::new(
+                ProjectionExec::try_new(vec![(expr, "x".to_string())], input).unwrap(),
+            )
+        };
+        let make_plan = || {
+            let source = batch_plan(zeros.clone(), AfterBatch::Fail).unwrap();
+            divide(Arc::new(coalesce_batches(source, None)))
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let root =
+            assert_plan_outcome(make_plan, config.clone(), Some(INJECTED_FAILURE)).await;
+        let projection = root.downcast_ref::<PhysicalProjection>().expect("native");
+        let bridge = projection.children()[0]
+            .downcast_ref::<BridgeOperator>()
+            .expect("a bridge");
+        assert!(is_coalesce_batches(bridge.plan()));
+        // Without a part that may fail above it, the coalescing is removed.
+        let make_plan = || {
+            let source = batch_plan(zeros.clone(), AfterBatch::Fail).unwrap();
+            let coalesced: Arc<dyn ExecutionPlan> =
+                Arc::new(coalesce_batches(source, None));
+            let a = col("a", &coalesced.schema()).unwrap();
+            Arc::new(
+                ProjectionExec::try_new(vec![(a, "x".to_string())], coalesced).unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let root =
+            assert_plan_outcome(make_plan, config.clone(), Some(INJECTED_FAILURE)).await;
+        let projection = root.downcast_ref::<PhysicalProjection>().expect("native");
+        let bridge = projection.children()[0]
+            .downcast_ref::<BridgeOperator>()
+            .expect("a bridge");
+        assert!(!is_coalesce_batches(bridge.plan()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_below_fallible_nodes_over_fallible_sources_stay_in_datafusion()
+    -> Result<()> {
+        // A CSV file of 1000 zeros, 7192 negative ones (DataFusion's first
+        // batch of 8192 rows), then a value that is not an integer. DataFusion's
+        // `FilterExec` coalesces the 1000 zeros that pass `a >= 0` and reads
+        // the next batch, which fails to parse, before the projection above
+        // divides by zero: the source error comes first, as it does when a
+        // sort below an aggregation reads all of its input first.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("f.csv");
+        let mut csv = String::from("a\n");
+        csv.push_str(&"0\n".repeat(1000));
+        csv.push_str(&"-1\n".repeat(7192));
+        csv.push_str("x\n");
+        csv.push_str(&"1\n".repeat(10));
+        std::fs::write(&path, csv)?;
+        let path = path.to_str().unwrap().to_string();
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_csv("f", &path, CsvReadOptions::new().schema(&schema))
+                .await?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        for sql in [
+            "SELECT 10 / a AS x FROM f WHERE a >= 0",
+            "SELECT ARRAY_AGG(10 / a ORDER BY a) AS x FROM f WHERE a > -2",
+        ] {
+            let datafusion = datafusion_context(config.clone());
+            setup(&datafusion).await?;
+            let error = crate::test_utils::run_sql(&datafusion, sql)
+                .await
+                .expect_err("DataFusion fails")
+                .to_string();
+            assert!(!error.contains("Divide by zero"), "{sql}: {error}");
+            assert_fails_like_datafusion(sql, config.clone(), &setup, &error).await;
+        }
+        // Over a source that cannot fail, the filter is native.
+        let root = lowered(
+            "SELECT 10 / a AS x FROM t1 WHERE a >= 0",
+            test_session_config(),
+            setup_test_tables,
+        )
+        .await;
+        assert_native("SELECT 10 / a AS x FROM t1 WHERE a >= 0", &root);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn redistributions_are_removed() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
@@ -1945,61 +2348,80 @@ mod tests {
     async fn intermediate_aggregation_stages_are_removed() -> Result<()> {
         // `Final -> CoalesceBatches -> Repartition -> PartialReduce ->
         // Repartition -> Partial`, from DataFusion's `Final -> Repartition ->
-        // Partial`.
-        let sql =
-            "SELECT d, COUNT(*) AS n, SUM(a) AS sa, MIN(h) AS mh FROM t1 GROUP BY d";
-        let make_plan = || async {
-            let plan = datafusion_plan(sql, test_session_config()).await;
-            plan.transform_down(|node| {
-                let Some(last) = node.downcast_ref::<AggregateExec>() else {
-                    return Ok(datafusion_common::tree_node::Transformed::no(node));
-                };
-                if last.mode() != &AggregateMode::FinalPartitioned {
-                    return Ok(datafusion_common::tree_node::Transformed::no(node));
-                }
-                let repartition = Arc::clone(last.input());
-                let partial = Arc::clone(repartition.children()[0]);
-                let reduce: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
-                    AggregateMode::PartialReduce,
-                    last.group_expr().clone(),
-                    last.aggr_expr().to_vec(),
-                    last.filter_expr().to_vec(),
-                    Arc::clone(&partial),
-                    last.input_schema(),
-                )?);
-                assert_eq!(reduce.schema(), partial.schema());
-                let below = Arc::clone(&repartition)
-                    .replace_children(vec![reduce], recompute())?;
-                let above = repartition.replace_children(vec![below], recompute())?;
-                let coalesce: Arc<dyn ExecutionPlan> =
-                    Arc::new(coalesce_batches(above, None));
-                let plan =
-                    Arc::clone(&node).replace_children(vec![coalesce], recompute())?;
-                Ok(datafusion_common::tree_node::Transformed::yes(plan))
-            })
-            .unwrap()
-            .data
-        };
-        let plan = make_plan().await;
-        assert_eq!(count_nodes(&plan, "AggregateExec"), 3);
-        let root = lower_execution_plan(&plan)?;
-        assert_native(sql, &root);
-        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
-
-        let task_ctx =
-            Arc::new(TaskContext::default().with_session_config(test_session_config()));
-        let expected = collect(make_plan().await, Arc::clone(&task_ctx)).await?;
-        let root: Arc<dyn ExecutionPlan> = create_pipeline_plan(make_plan().await)?;
-        let actual = collect(Arc::clone(&root), task_ctx).await?;
-        let output =
-            |plan: &Arc<dyn ExecutionPlan>, batches| crate::test_utils::EngineOutput {
-                schema: plan.schema(),
-                plan: Arc::clone(plan),
-                batches,
-                ordered: false,
+        // Partial`. The `PartialReduce` merges the states into the same states,
+        // so the native aggregation does without both stages, unless
+        // concatenating the states may fail (strings with 32-bit offsets, here
+        // the group key `d`), as `CoalesceBatchesExec` does.
+        for (sql, native) in [
+            (
+                "SELECT e, COUNT(*) AS n, SUM(a) AS sa, MIN(h) AS mh FROM t1 GROUP BY e",
+                true,
+            ),
+            (
+                "SELECT d, COUNT(*) AS n, SUM(a) AS sa, MIN(h) AS mh FROM t1 GROUP BY d",
+                false,
+            ),
+        ] {
+            let make_plan = || async {
+                let plan = datafusion_plan(sql, test_session_config()).await;
+                plan.transform_down(|node| {
+                    let Some(last) = node.downcast_ref::<AggregateExec>() else {
+                        return Ok(datafusion_common::tree_node::Transformed::no(node));
+                    };
+                    if last.mode() != &AggregateMode::FinalPartitioned {
+                        return Ok(datafusion_common::tree_node::Transformed::no(node));
+                    }
+                    let repartition = Arc::clone(last.input());
+                    let partial = Arc::clone(repartition.children()[0]);
+                    let reduce: Arc<dyn ExecutionPlan> =
+                        Arc::new(AggregateExec::try_new(
+                            AggregateMode::PartialReduce,
+                            last.group_expr().clone(),
+                            last.aggr_expr().to_vec(),
+                            last.filter_expr().to_vec(),
+                            Arc::clone(&partial),
+                            last.input_schema(),
+                        )?);
+                    assert_eq!(reduce.schema(), partial.schema());
+                    let below = Arc::clone(&repartition)
+                        .replace_children(vec![reduce], recompute())?;
+                    let above = repartition.replace_children(vec![below], recompute())?;
+                    let coalesce: Arc<dyn ExecutionPlan> =
+                        Arc::new(coalesce_batches(above, None));
+                    let plan = Arc::clone(&node)
+                        .replace_children(vec![coalesce], recompute())?;
+                    Ok(datafusion_common::tree_node::Transformed::yes(plan))
+                })
+                .unwrap()
+                .data
             };
-        compare_outputs(&output(&plan, expected), &output(&root, actual))
-            .unwrap_or_else(|message| panic!("Results differ: {message}"));
+            let plan = make_plan().await;
+            assert_eq!(count_nodes(&plan, "AggregateExec"), 3);
+            let root = lower_execution_plan(&plan)?;
+            if native {
+                assert_native(sql, &root);
+                assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+            } else {
+                assert_eq!(count::<PhysicalHashAggregate>(&root), 0, "{sql}");
+            }
+
+            let task_ctx = Arc::new(
+                TaskContext::default().with_session_config(test_session_config()),
+            );
+            let expected = collect(make_plan().await, Arc::clone(&task_ctx)).await?;
+            let root: Arc<dyn ExecutionPlan> = create_pipeline_plan(make_plan().await)?;
+            let actual = collect(Arc::clone(&root), task_ctx).await?;
+            let output = |plan: &Arc<dyn ExecutionPlan>, batches| {
+                crate::test_utils::EngineOutput {
+                    schema: plan.schema(),
+                    plan: Arc::clone(plan),
+                    batches,
+                    ordered: false,
+                }
+            };
+            compare_outputs(&output(&plan, expected), &output(&root, actual))
+                .unwrap_or_else(|message| panic!("Results differ: {message}\n{sql}"));
+        }
         Ok(())
     }
 
