@@ -33,6 +33,13 @@
 //!   `k` rows; the dynamic filter is marked complete.
 //! * [`get_data`](PhysicalOperator::get_data): the merger emits the result,
 //!   in order, on a single thread.
+//!
+//! The rows that the threshold discards are never sorted, so their sort keys
+//! are only evaluated by the threshold predicate.
+//! [`try_lower`](super::try_lower) therefore lowers to a TopK only if its sort
+//! keys cannot fail to evaluate (columns and literals): which rows' keys
+//! DataFusion evaluates differs, and a key that fails on a discarded row
+//! would fail in one engine but not in the other.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -148,9 +155,9 @@ impl PhysicalTopK {
     }
 
     /// Lower a sort of a DataFusion plan that keeps only its first rows: see
-    /// [`try_lower`](super::try_lower), which lowers a sort that keeps all
-    /// rows to a [`PhysicalSort`](super::PhysicalSort). Returns `Ok(None)` for
-    /// such sorts and any other node, without calling `lower_input`.
+    /// [`try_lower`](super::try_lower), which lowers the other sorts to a
+    /// [`PhysicalSort`](super::PhysicalSort). Returns `Ok(None)` for those and
+    /// any other node, without calling `lower_input`.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         lower_input: F,
@@ -159,9 +166,7 @@ impl PhysicalTopK {
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
         match SortPlan::try_new(plan)? {
-            Some(sort) if sort.fetch().is_some() => {
-                sort.into_topk(plan, lower_input).map(Some)
-            }
+            Some(sort) if sort.is_topk() => sort.into_topk(plan, lower_input).map(Some),
             _ => Ok(None),
         }
     }
@@ -310,7 +315,9 @@ impl PhysicalTopK {
 /// `0.0`. A float key whose value is a zero is therefore compared with `<=`
 /// (`>=`), which selects both zeros: `x < 0.0` would discard a `-0.0` that
 /// comes before the threshold row. (The predicate selects all rows that come
-/// before the threshold row, and some others.)
+/// before the threshold row, and some others. DataFusion's own TopK uses
+/// `x < 0.0`, so its result depends on the order of its batches; the TopKs of
+/// float keys are left to it, see [`try_lower`](super::try_lower).)
 pub(crate) fn threshold_predicate(
     keys: &[(Arc<dyn PhysicalExpr>, SortOptions)],
     values: &[ScalarValue],
@@ -1062,7 +1069,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topk_keeps_negative_zeros_before_zeros() -> Result<()> {
         // DataFusion compares `-0.0 = 0.0`, but sorts `-0.0` first: once the
-        // threshold is a zero, the zeros of the other sign must still pass.
+        // threshold is a zero, the zeros of the other sign must still pass, so
+        // that the TopK keeps the first rows of the sort (as DataFusion's merge
+        // with a fetch of a sort does; DataFusion's own TopK does not, which
+        // is why the TopKs of float keys are left to it, see `try_lower`).
         let schema =
             Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
         let chunk = |values: Vec<f64>| {

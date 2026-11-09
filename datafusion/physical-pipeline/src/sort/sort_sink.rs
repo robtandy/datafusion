@@ -87,11 +87,12 @@ impl PhysicalSort {
         })
     }
 
-    /// Lower a sort of a DataFusion plan that keeps all rows: see
+    /// Lower a sort of a DataFusion plan that is not a TopK: see
     /// [`try_lower`](super::try_lower), which lowers a sort that keeps only
-    /// its first rows to a [`PhysicalTopK`](super::PhysicalTopK). Returns
-    /// `Ok(None)` for such sorts and any other node, without calling
-    /// `lower_input`.
+    /// its first rows to a [`PhysicalTopK`](super::PhysicalTopK), unless it is
+    /// a merge with a fetch of a sort whose keys can fail to evaluate (a
+    /// `PhysicalSort` with a fetch). Returns `Ok(None)` for TopKs and any
+    /// other node, without calling `lower_input`.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         lower_input: F,
@@ -100,9 +101,7 @@ impl PhysicalSort {
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
         match SortPlan::try_new(plan)? {
-            Some(sort) if sort.fetch().is_none() => {
-                sort.into_sort(plan, lower_input).map(Some)
-            }
+            Some(sort) if !sort.is_topk() => sort.into_sort(plan, lower_input).map(Some),
             _ => Ok(None),
         }
     }
