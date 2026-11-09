@@ -2895,6 +2895,97 @@ mod tests {
         );
     }
 
+    /// The kind of `error`: the variant of its root, and of the error of Arrow
+    /// that it wraps.
+    fn error_kind(error: &DataFusionError) -> String {
+        let debug = match error.find_root() {
+            DataFusionError::ArrowError(error, _) => format!("ArrowError::{error:?}"),
+            error => format!("{error:?}"),
+        };
+        debug.split('(').next().unwrap_or_default().to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parts_that_fail_with_several_kinds_of_errors_stay_in_datafusion() {
+        // DataFusion evaluates the rows of a partition in order, and fails on
+        // row 2047, but a pipeline evaluates the chunks of the partition on
+        // several threads, and raises the error of the chunk that fails first,
+        // which may be the second one, with another kind of error:
+        // `to_timestamp` without formats fails on a date beyond the range of
+        // nanoseconds with an execution error, but to parse a string with a
+        // parse error; and a division of integers fails on the smallest
+        // integer divided by -1 with an overflow, but on a divisor of 0 with a
+        // division by zero.
+        let rows = 4096;
+        let strings = StringArray::from_iter_values((0..rows).map(|row| match row {
+            0..2047 => "2020-01-01",
+            2047 => "3000-01-01",
+            _ => "not timestamp",
+        }));
+        let dividends = Int32Array::from_iter_values(
+            (0..rows).map(|row| if row == 2047 { i32::MIN } else { 1 }),
+        );
+        let divisors = Int32Array::from_iter_values((0..rows).map(|row| match row {
+            0..2047 => 1,
+            2047 => -1,
+            _ => 0,
+        }));
+        for (expr, batch, kinds) in [
+            (
+                "to_timestamp(s)",
+                RecordBatch::try_from_iter([("s", Arc::new(strings) as ArrayRef)])
+                    .unwrap(),
+                ["Execution", "ArrowError::ParseError"],
+            ),
+            (
+                "x / y",
+                RecordBatch::try_from_iter([
+                    ("x", Arc::new(dividends) as ArrayRef),
+                    ("y", Arc::new(divisors) as ArrayRef),
+                ])
+                .unwrap(),
+                ["ArrowError::ArithmeticOverflow", "ArrowError::DivideByZero"],
+            ),
+        ] {
+            let (plan, supported, native) = project_batch(expr, &batch);
+            assert!(!supported, "{expr}");
+            for threads in 2..=4 {
+                for _ in 0..8 {
+                    let config = SessionConfig::new().with_target_partitions(threads);
+                    let (error, operators) = assert_native_plan_parity_with_config(
+                        || Arc::clone(&plan),
+                        false,
+                        config,
+                    )
+                    .await;
+                    assert_eq!(operators.projections, 0, "{expr}");
+                    assert!(error.is_some(), "{expr}");
+                }
+            }
+            // The chunks fail with different kinds of errors.
+            let outcome = |offset| {
+                let chunk = DataChunk::from(batch.slice(offset, 2048));
+                error_kind(&project(&native, &chunk).unwrap_err())
+            };
+            assert_eq!([outcome(0), outcome(2048)], kinds, "{expr}");
+        }
+        // With formats, `to_timestamp` fails with execution errors only, as
+        // the remainders of integers fail with divisions by zero.
+        let batch = RecordBatch::try_from_iter([
+            (
+                "s",
+                Arc::new(StringArray::from(vec!["2020-01-01"])) as ArrayRef,
+            ),
+            ("x", Arc::new(Int32Array::from(vec![1]))),
+            ("y", Arc::new(Int32Array::from(vec![1]))),
+        ])
+        .unwrap();
+        for expr in ["to_timestamp(s, '%Y-%m-%d')", "x % y", "10 / y"] {
+            let (_, supported, _) = project_batch(expr, &batch);
+            assert!(supported, "{expr}");
+        }
+    }
+
     /// A user-defined function named `abs`, implemented by a type named like
     /// the built-in one, which returns the number of rows of the batch that it
     /// is evaluated on: its results depend on the batches.

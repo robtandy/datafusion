@@ -89,7 +89,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
 use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{Result, ScalarValue, config_err};
-use datafusion_expr::{Operator, ScalarUDF};
+use datafusion_expr::{ColumnarValue, Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
     LikeExpr, Literal, NegativeExpr, NotExpr, TryCastExpr,
@@ -808,6 +808,16 @@ impl BuiltinFunction {
             _ => false,
         }
     }
+
+    /// Whether the function fails, if at all, with the same kind of error on
+    /// all rows (see `fails_with_one_kind`): all of them but `to_timestamp`
+    /// without formats, which fails to parse a string with a parse error of
+    /// Arrow (see `string_to_datetime`), but on a date beyond the range of
+    /// nanoseconds with an execution error. (With formats, it fails with
+    /// execution errors only, see `string_to_datetime_formatted`.)
+    fn fails_with_one_kind(self, args: &[Arc<dyn PhysicalExpr>]) -> bool {
+        self != Self::ToTimestamp || args.len() > 1
+    }
 }
 
 /// The type that implements `udf`.
@@ -1088,6 +1098,11 @@ fn is_flat(data_type: &DataType) -> bool {
         )
 }
 
+/// Whether `data_type` is a type of intervals or of durations.
+fn is_interval_or_duration(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Interval(_) | DataType::Duration(_))
+}
+
 /// Whether `data_type` is a type of strings.
 fn is_string(data_type: &DataType) -> bool {
     matches!(
@@ -1307,6 +1322,13 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   zero on the first chunk of a pipeline (but parts that can only fail with
 ///   arithmetic overflows, e.g. `a * (1 - b) * (1 + c)` of decimals, raise the
 ///   same error whatever the batches);
+/// * a part of `expr` may fail with different kinds of errors on different
+///   rows (see `fails_with_one_kind`): a pipeline evaluates the chunks of a
+///   partition on several threads, and raises the error of the chunk that
+///   fails first, which may not be the first chunk that fails, e.g. on rows
+///   of `'3000-01-01'` then `'invalid'`, `to_timestamp(s)` fails in DataFusion
+///   on the date beyond the range of nanoseconds (an execution error), but
+///   may fail to parse `'invalid'` first in a pipeline (a parse error);
 /// * the right side of an `AND` or an `OR`, or a value after the first one
 ///   of an `IN` list, may fail on some rows and not on others
 ///   ([`Fallibility::PerRow`]). DataFusion evaluates the right side of an
@@ -1463,6 +1485,16 @@ fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// overflow, which does not depend on the order in which the parts or the
 /// rows are evaluated: e.g. in the chains of TPC-H,
 /// `l_extendedprice * (1 - l_discount) * (1 + l_tax)`.
+///
+/// And a pipeline evaluates the chunks of a partition of DataFusion on
+/// several threads, so it raises the error of the chunk that fails first,
+/// which may be any chunk that fails, while DataFusion raises the error of the
+/// first row of the partition that fails: even a single part that may fail
+/// with different kinds of errors on different rows (see
+/// `fails_with_one_kind`), e.g. `to_timestamp(s)`, which fails to parse a
+/// string with a parse error, but on a date beyond the range of nanoseconds
+/// with an execution error, raises an error whose kind depends on the
+/// threads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Failures {
     /// The number of parts that may fail.
@@ -1470,6 +1502,9 @@ pub struct Failures {
     /// The number of the parts that may fail with other errors than arithmetic
     /// overflows.
     others: usize,
+    /// The number of the parts that may fail with different kinds of errors
+    /// on different rows.
+    mixed: usize,
 }
 
 impl Failures {
@@ -1477,18 +1512,28 @@ impl Failures {
     pub const NONE: Self = Self {
         parts: 0,
         others: 0,
+        mixed: 0,
     };
 
     /// A part that can only fail with arithmetic overflows.
     const OVERFLOW: Self = Self {
         parts: 1,
         others: 0,
+        mixed: 0,
     };
 
-    /// A part that may fail with any error.
+    /// A part that may fail with another error, the same on all rows.
     const ANY: Self = Self {
         parts: 1,
         others: 1,
+        mixed: 0,
+    };
+
+    /// A part that may fail with different kinds of errors on different rows.
+    const MIXED: Self = Self {
+        parts: 1,
+        others: 1,
+        mixed: 1,
     };
 
     /// The number of parts that may fail.
@@ -1509,9 +1554,12 @@ impl Failures {
 
     /// Whether which error DataFusion raises first may depend on the order in
     /// which it evaluates the parts, and so on its batches: several parts may
-    /// fail, not all of them only with arithmetic overflows.
+    /// fail, not all of them only with arithmetic overflows. Or which kind of
+    /// error a pipeline raises first may depend on the order in which its
+    /// threads evaluate the chunks of a partition: a part may fail with
+    /// different kinds of errors on different rows.
     pub fn order_matters(&self) -> bool {
-        self.parts > 1 && self.others > 0
+        (self.parts > 1 && self.others > 0) || self.mixed > 0
     }
 
     /// The parts of `self` and of `other`.
@@ -1520,6 +1568,7 @@ impl Failures {
         Self {
             parts: self.parts.saturating_add(other.parts),
             others: self.others.saturating_add(other.others),
+            mixed: self.mixed.saturating_add(other.mixed),
         }
     }
 }
@@ -1559,6 +1608,7 @@ fn failures_with(
             Fallibility::PerRow if fails_only_on_overflows(expr, schema) => {
                 Failures::OVERFLOW
             }
+            Fallibility::PerRow if !fails_with_one_kind(expr, schema) => Failures::MIXED,
             _ => Failures::ANY,
         }
     };
@@ -1610,6 +1660,141 @@ fn fails_only_on_overflows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> boo
         _ => false,
     };
     same_numbers && !fails_on_operand_types(expr, schema)
+}
+
+/// Whether `expr` itself, which may fail on some rows (see
+/// [`Fallibility::PerRow`]), fails with the same kind of error on all the
+/// rows that it fails on (see [`Failures`]): a pipeline evaluates the chunks
+/// of a partition on several threads, and raises the error of the chunk that
+/// fails first, whose kind must not depend on which chunk that is. So do:
+///
+/// * the parts that can only fail with arithmetic overflows (see
+///   `fails_only_on_overflows`), negations (which Arrow computes wrapping, but
+///   for scalars, with overflow checks), `TRY_CAST`s (on types that Arrow does
+///   not cast), matches of patterns of each row (that do not compile),
+///   concatenations of strings (whose offsets overflow), and additions and
+///   subtractions of dates, times, timestamps, intervals and durations (each
+///   of which Arrow computes with one kind of check, e.g. `Date arithmetic
+///   overflow` compute errors for a date and an interval, see `date_op`);
+/// * divisions and remainders, see `divides_with_one_kind`;
+/// * the casts that only fail with cast errors, see `casts_with_one_kind`;
+/// * the built-in functions that the classification knows, but for
+///   `to_timestamp` without formats (see `BuiltinFunction::fails_with_one_kind`).
+///
+/// Not the others (e.g. arithmetic on dates or intervals): conservatively,
+/// they may fail with different kinds of errors.
+fn fails_with_one_kind(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    use Operator::*;
+    if fails_only_on_overflows(expr, schema)
+        || expr.is::<NegativeExpr>()
+        || expr.is::<TryCastExpr>()
+        || expr.is::<LikeExpr>()
+    {
+        return true;
+    }
+    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+        let is_temporal = |operand: &Arc<dyn PhysicalExpr>| {
+            operand.data_type(schema).is_ok_and(|data_type| {
+                data_type.is_temporal() || is_interval_or_duration(&data_type)
+            })
+        };
+        return match binary.op() {
+            LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch | RegexMatch
+            | RegexIMatch | RegexNotMatch | RegexNotIMatch | StringConcat => true,
+            Plus | Minus => is_temporal(binary.left()) || is_temporal(binary.right()),
+            Divide | Modulo => divides_with_one_kind(binary, schema),
+            _ => false,
+        };
+    }
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
+        return cast
+            .expr()
+            .data_type(schema)
+            .is_ok_and(|from| casts_with_one_kind(&from, cast.cast_type()));
+    }
+    if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
+        return BuiltinFunction::of(function)
+            .is_some_and(|builtin| builtin.fails_with_one_kind(function.args()));
+    }
+    false
+}
+
+/// Whether the division or the remainder `binary` fails, if at all, with the
+/// same kind of error on all rows (see `fails_with_one_kind`). Arrow divides
+/// integers with checks, which fail with `ArrowError::DivideByZero` on a
+/// divisor of `0`, but with `ArrowError::ArithmeticOverflow` on the smallest
+/// integer divided by `-1`: only on one of them if the divisor is a
+/// constant, or the dividend a constant that is not negative, or unsigned. It
+/// computes
+/// the remainders of integers wrapping, but for divisors of `0`. And it
+/// rescales decimals before it divides them, which overflows, so only a
+/// constant divisor that is not `0` divides them with one kind of error.
+fn divides_with_one_kind(binary: &BinaryExpr, schema: &Schema) -> bool {
+    let (Ok(left), Ok(right)) = (
+        binary.left().data_type(schema),
+        binary.right().data_type(schema),
+    ) else {
+        return false;
+    };
+    // The value of a constant operand (e.g. a literal that DataFusion casts
+    // into the type of the other operand).
+    let constant = |expr: &Arc<dyn PhysicalExpr>| {
+        if !is_constant(expr) {
+            return None;
+        }
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        match expr.evaluate(&batch) {
+            Ok(ColumnarValue::Scalar(value)) => Some(value),
+            _ => None,
+        }
+    };
+    if left.is_integer() && right.is_integer() {
+        return binary.op() == &Operator::Modulo
+            || left.is_unsigned_integer()
+            || constant(binary.right()).is_some()
+            || constant(binary.left()).is_some_and(|dividend| {
+                ScalarValue::new_zero(&left).is_ok_and(|zero| {
+                    dividend
+                        .partial_cmp(&zero)
+                        .is_some_and(|order| order.is_ge())
+                })
+            });
+    }
+    left.is_decimal()
+        && right.is_decimal()
+        && constant(binary.right()).is_some_and(|divisor| {
+            !divisor.is_null()
+                && ScalarValue::new_zero(&right).is_ok_and(|zero| divisor != zero)
+        })
+}
+
+/// Whether Arrow fails to cast values of `from` into `to`, if at all, with
+/// cast errors only (`ArrowError::CastError`): numbers into numbers (see
+/// `cast_numeric_arrays`), strings into numbers, booleans, dates and times
+/// (see `parse_string`), and unions whose children it so casts (it casts the
+/// child of the type of `to`, or of another, see `union_extract_by_type`).
+/// And numbers into strings, which can only fail if their offsets overflow.
+/// Conservatively, not the other casts, e.g. of strings into decimals or
+/// timestamps, nor of decimals.
+fn casts_with_one_kind(from: &DataType, to: &DataType) -> bool {
+    let is_number =
+        |data_type: &DataType| data_type.is_integer() || data_type.is_floating();
+    if let DataType::Union(fields, _) = from {
+        return fields.iter().all(|(_, field)| {
+            field.data_type() == to || casts_with_one_kind(field.data_type(), to)
+        });
+    }
+    (is_number(from) && (is_number(to) || is_string(to)))
+        || (is_string(from)
+            && (is_number(to)
+                || matches!(
+                    to,
+                    DataType::Boolean
+                        | DataType::Date32
+                        | DataType::Date64
+                        | DataType::Time32(_)
+                        | DataType::Time64(_)
+                )))
 }
 
 /// The fallibility of `expr` (see [`fallibility`]), and whether its errors
@@ -3617,7 +3802,10 @@ mod tests {
             ("regexp_like(s, c_phone)".to_owned(), PerRow, false),
             ("upper(c_phone)".to_owned(), PerRow, false),
             ("date_trunc('month', ts)".to_owned(), PerRow, false),
-            ("to_timestamp(s)".to_owned(), PerRow, false),
+            ("to_timestamp(s, '%Y-%m-%d')".to_owned(), PerRow, false),
+            // Without formats, `to_timestamp` fails with parse errors and with
+            // execution errors, of which a pipeline may raise either first.
+            ("to_timestamp(s)".to_owned(), PerRow, true),
             // `upper` and `lower` build strings with 32-bit offsets of more bytes
             // than their arguments have, which overflow on a batch.
             ("lower(s)".to_owned(), PerRow, true),
@@ -3728,7 +3916,7 @@ mod tests {
         fn invoke_with_args(
             &self,
             args: datafusion_expr::ScalarFunctionArgs,
-        ) -> Result<datafusion_expr::ColumnarValue> {
+        ) -> Result<ColumnarValue> {
             Ok(args.args[0].clone())
         }
     }
@@ -3756,7 +3944,7 @@ mod tests {
         fn invoke_with_args(
             &self,
             args: datafusion_expr::ScalarFunctionArgs,
-        ) -> Result<datafusion_expr::ColumnarValue> {
+        ) -> Result<ColumnarValue> {
             Ok(args.args[0].clone())
         }
     }
@@ -3854,6 +4042,53 @@ mod tests {
         );
         assert!(depends(&untrusted, &schema));
         assert_eq!(fallibility(&untrusted, &schema), Fallibility::PerRow);
+    }
+
+    #[test]
+    fn parts_that_fail_with_several_kinds_of_errors_depend_on_batches() {
+        // A pipeline evaluates the chunks of a partition on several threads,
+        // and raises the error of the chunk that fails first: a part that may
+        // fail with different kinds of errors on different rows raises an
+        // error whose kind depends on the threads.
+        let schema = tpch_schema();
+        for (expr, expected) in [
+            // Parse errors, and execution errors beyond the nanoseconds.
+            ("to_timestamp(s)", true),
+            ("to_timestamp(s, '%Y-%m-%d')", false),
+            // Divisions by zero, and of the smallest integer by -1 (overflows).
+            ("n / n", true),
+            ("10 / n", false),
+            ("-10 / n", true),
+            ("n / 0", false),
+            ("n / -1", false),
+            ("n % n", false),
+            // Overflows when decimals are rescaled, and divisions by zero.
+            ("l_extendedprice / l_discount", true),
+            ("l_extendedprice % l_discount", true),
+            ("l_extendedprice / 7", false),
+            ("l_extendedprice / 0", true),
+            // Casts with cast errors only.
+            ("CAST(n AS INT)", false),
+            ("CAST(x AS BIGINT)", false),
+            ("CAST(s AS INT)", false),
+            ("CAST(s AS DATE)", false),
+            ("CAST(s AS BOOLEAN)", false),
+            ("CAST(n AS VARCHAR) = s", false),
+            // Casts of strings into decimals, or of decimals into narrower
+            // ones, also fail on their precision.
+            ("CAST(s AS DECIMAL(5, 2))", true),
+            ("CAST(l_quantity AS DECIMAL(5, 2))", true),
+            ("CAST(s AS TIMESTAMP)", true),
+            // Arithmetic on dates and intervals.
+            ("o_orderdate + INTERVAL '1 day'", false),
+            ("ts - INTERVAL '1 month'", false),
+            // Decimal arithmetic, which can only overflow, and its parts.
+            ("l_extendedprice * (1 - l_discount) * (1 + l_tax)", false),
+        ] {
+            let expr = physical_expr(expr, &schema);
+            assert_eq!(depends(&expr, &schema), expected, "{expr}");
+            assert_eq!(failures(&expr, &schema).order_matters(), expected, "{expr}");
+        }
     }
 
     #[test]
