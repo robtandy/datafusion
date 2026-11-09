@@ -181,7 +181,9 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   native sort materializes runs (of up to [`SORT_RUN_ROWS`] rows) and
 ///   chunks of more rows than DataFusion's batches, whose dictionaries can
 ///   need more values, and whose runs more rows, than such keys and run ends
-///   address, where DataFusion's batches fit;
+///   address, where DataFusion's batches fit. This includes columns of the
+///   `SortExec` that projections above it remove: DataFusion sorts them,
+///   and whether it fails depends on its batches;
 /// * sort keys that evaluate to such encodings (also inside the key, e.g.
 ///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`): the native sort
 ///   evaluates its keys on each chunk, DataFusion on its batches, or on all
@@ -465,12 +467,17 @@ impl SortPlan {
         // batches of DataFusion's sort, so their dictionaries can need more
         // values than narrow keys address, and their run-end encodings longer
         // runs than narrow run ends address, where DataFusion's batches fit.
-        if input
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| has_narrow_encoding(field.data_type()))
-        {
+        // DataFusion's sort materializes the rows of the `SortExec`, also the
+        // columns that projections above it remove (which the native sort
+        // projects before it sorts), and whether it fails depends on its
+        // batches too.
+        let narrow = |schema: SchemaRef| {
+            schema
+                .fields()
+                .iter()
+                .any(|field| has_narrow_encoding(field.data_type()))
+        };
+        if narrow(sort.schema()) || narrow(input.schema()) {
             return Ok(None);
         }
         // For the same reason, keys that evaluate to such encodings: the native
@@ -2274,20 +2281,20 @@ mod tests {
         Ok(())
     }
 
-    /// A scan of three partitions of 64 rows `(id, s)`: `id` is unique, and
-    /// the 192 values of `s` are distinct, in a dictionary with keys of type
-    /// `key_type`.
-    fn dictionary_scan(key_type: DataType) -> Arc<dyn ExecutionPlan> {
+    /// A scan of three batches of 64 rows `(id, s)`, in three partitions or
+    /// in one: `id` is unique, and the 192 values of `s` are distinct, in a
+    /// dictionary with keys of type `key_type`.
+    fn dictionary_scan(key_type: DataType, partitions: usize) -> Arc<dyn ExecutionPlan> {
         let dictionary =
             DataType::Dictionary(Box::new(key_type), Box::new(DataType::Utf8));
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("s", dictionary.clone(), true),
         ]));
-        let partitions = (0..3_i64)
+        let batches = (0..3_i64)
             .map(|partition| {
-                // The ids of the partitions interleave, so that the batches of
-                // the sorted output mix the values of all partitions.
+                // The ids of the batches interleave, so that the batches of the
+                // sorted output mix the values of all batches.
                 let id = (0..64).map(|i| i * 3 + partition).collect::<Vec<_>>();
                 let s = id
                     .iter()
@@ -2302,7 +2309,56 @@ mod tests {
                 vec![batch]
             })
             .collect::<Vec<_>>();
+        let partitions = match partitions {
+            1 => vec![batches.into_iter().flatten().collect()],
+            3 => batches,
+            _ => unreachable!(),
+        };
         MemorySourceConfig::try_new_exec(&partitions, schema, None).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_narrow_dictionaries_that_projections_remove_are_left_to_datafusion()
+    -> Result<()> {
+        // `SPM[id] -> Projection[id] -> SortExec[id]` of a partition of three
+        // 64-row batches with 192 distinct `Int8`-keyed dictionary values:
+        // DataFusion's sort sorts the rows of the `SortExec`, and concatenates
+        // the batches of the small partition, whose dictionaries need more
+        // values than the keys address. The native sort projects the rows
+        // before it sorts them, without the dictionaries, and returned the
+        // rows. Such sorts are left to DataFusion; `Int32` keys stay native.
+        let config = test_session_config().with_target_partitions(1);
+        for (key_type, fails) in [(DataType::Int8, true), (DataType::Int32, false)] {
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = dictionary_scan(key_type.clone(), 1);
+                let sort = sort_exec(scan, &[("id", false)], true, None);
+                let id = col("id", &sort.schema())?;
+                let projection =
+                    ProjectionExec::try_new(vec![(id, "id".to_string())], sort)?;
+                Ok(merge(Arc::new(projection), &[("id", false)], None))
+            };
+            let root = match fails {
+                true => {
+                    let message = "Dictionary key bigger than the key type";
+                    assert_lowered_plan_fails_like_datafusion(
+                        make,
+                        lower,
+                        config.clone(),
+                        message,
+                    )
+                    .await
+                }
+                false => {
+                    let task_ctx = Arc::new(
+                        datafusion_execution::TaskContext::default()
+                            .with_session_config(config.clone()),
+                    );
+                    assert_lowered_plan_byte_eq(make, lower, task_ctx, true).await
+                }
+            };
+            assert_eq!(sorts(&root) == 1, !fails, "{key_type}");
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2331,7 +2387,7 @@ mod tests {
                 let key = key_type.clone();
                 let make = move || -> Result<Arc<dyn ExecutionPlan>> {
                     let sort = sort_exec(
-                        dictionary_scan(key.clone()),
+                        dictionary_scan(key.clone(), 3),
                         &[("id", false)],
                         true,
                         fetch,
