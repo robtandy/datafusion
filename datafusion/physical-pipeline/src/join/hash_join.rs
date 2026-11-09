@@ -638,23 +638,15 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        // DataFusion evaluates the probe keys on every probe batch, also on an
-        // empty one, so that keys that fail without any row (e.g. `1 / 0`)
-        // fail the join as soon as its probe side produces a batch. The native
-        // join evaluates them on the (non-empty) chunks of its probe side.
-        let empty_probe = RecordBatch::new_empty(join.right().schema());
-        if evaluate_expressions_to_arrays(probe_keys.iter().copied(), &empty_probe)
-            .is_err()
-        {
-            return Ok(None);
-        }
         // DataFusion evaluates the residual filter on up to `batch_size`
         // candidate pairs of a probe batch at once, and the probe keys on
-        // whole probe batches, before it emits any of their rows. A native
-        // join evaluates them chunk by chunk and emits as it goes, so that,
-        // e.g. under a limit, it could stop before it evaluates them on rows
-        // on which DataFusion fails: a filter or probe keys that can fail on
-        // some rows are left to DataFusion.
+        // whole probe batches (also empty ones), before it emits any of their
+        // rows. A native join evaluates them chunk by chunk (and never on an
+        // empty chunk) and emits as it goes, so that, e.g. under a limit, it
+        // could stop before it evaluates them on rows on which DataFusion
+        // fails: a filter or probe keys that can fail on some rows (or on no
+        // rows, e.g. `1 / 0`) are left to DataFusion. (Lowering evaluates no
+        // expression: an expression may change its state when evaluated.)
         let probe_schema = join.right().schema();
         if join
             .filter()
@@ -1332,20 +1324,29 @@ fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// arithmetic that wraps on overflow, divisions by constants other than 0 and
 /// -1 and casts that cannot fail cannot fail.
 fn can_fail(expr: &PhysicalExprRef, schema: &Schema) -> bool {
-    let infallible = expr.is::<Column>()
-        || expr.is::<Literal>()
-        || expr.is::<NotExpr>()
-        || expr.is::<IsNullExpr>()
-        || expr.is::<IsNotNullExpr>()
-        || expr.is::<CaseExpr>()
-        || expr.is::<InListExpr>()
-        || expr.is::<TryCastExpr>()
-        || expr
-            .downcast_ref::<BinaryExpr>()
-            .is_some_and(|binary| binary_cannot_fail(binary, schema))
-        || expr
-            .downcast_ref::<CastExpr>()
-            .is_some_and(|cast| cast_cannot_fail(cast, schema));
+    if expr.is::<Column>() || expr.is::<Literal>() {
+        return false;
+    }
+    // A result of a dictionary with narrow keys, or with narrow run ends, is
+    // encoded from all the rows of the batch, and fails if they have more
+    // distinct values (or rows) than the keys (or run ends) hold, however
+    // the values are computed (e.g. by a `TRY_CAST`).
+    let narrow_result = expr
+        .data_type(schema)
+        .map_or(true, |data_type| concatenation_can_overflow(&data_type));
+    let infallible = !narrow_result
+        && (expr.is::<NotExpr>()
+            || expr.is::<IsNullExpr>()
+            || expr.is::<IsNotNullExpr>()
+            || expr.is::<CaseExpr>()
+            || expr.is::<InListExpr>()
+            || expr.is::<TryCastExpr>()
+            || expr
+                .downcast_ref::<BinaryExpr>()
+                .is_some_and(|binary| binary_cannot_fail(binary, schema))
+            || expr
+                .downcast_ref::<CastExpr>()
+                .is_some_and(|cast| cast_cannot_fail(cast, schema)));
     !infallible || expr.children().iter().any(|child| can_fail(child, schema))
 }
 
@@ -1410,6 +1411,8 @@ fn safe_integer_divisor(value: &ScalarValue) -> bool {
 /// input type: a wider integer, a float, a string, or the values of a
 /// dictionary.
 fn cast_cannot_fail(cast: &CastExpr, schema: &Schema) -> bool {
+    // A safe cast casts the values that do not fit to NULL (its results of
+    // narrow encodings are checked by `can_fail`).
     if cast.cast_options().safe {
         return true;
     }
@@ -5259,6 +5262,207 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn casts_to_narrow_dictionaries_are_left_to_datafusion() -> Result<()> {
+        // 5,000 build rows of key 7, whose strings `v` are the same 3,000
+        // times, then all different, a probe row of key 7, and the filter
+        // `(TRY_)CAST(v AS Dictionary(Int8, Utf8)) IS NOT NULL` under a limit
+        // of one row, on one thread. DataFusion evaluates the filter on all
+        // 5,000 candidate pairs at once: more distinct values than keys of 8
+        // bits hold, also for casts that cast what does not fit to NULL. A
+        // native join, which emits as it goes, would stop after its first
+        // chunk (of a single value).
+        let make_plan = |try_cast: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("v", DataType::Utf8, true),
+            ]));
+            let rows = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![7; 5000])),
+                    Arc::new(StringArray::from_iter_values((0..5000).map(|i| {
+                        if i < 3000 {
+                            "same".to_string()
+                        } else {
+                            format!("v{i}")
+                        }
+                    }))),
+                ],
+            )?;
+            let build: Arc<dyn ExecutionPlan> =
+                MemorySourceConfig::try_new_exec(&[vec![rows]], schema, None)?;
+            let probe = int32_k_scan(vec![Some(7)])?;
+            let filter_schema =
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+            let v = col("v", &filter_schema)?;
+            let dictionary =
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+            let cast: PhysicalExprRef = if try_cast {
+                Arc::new(TryCastExpr::new(v, dictionary))
+            } else {
+                let options = arrow::compute::CastOptions {
+                    safe: true,
+                    ..Default::default()
+                };
+                Arc::new(CastExpr::new(v, dictionary, Some(options)))
+            };
+            let filter = JoinFilter::new(
+                Arc::new(IsNotNullExpr::new(cast)),
+                vec![ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                }],
+                filter_schema,
+            );
+            let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+            let join = Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                on,
+                Some(filter),
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            Ok(Arc::new(
+                datafusion_physical_plan::limit::GlobalLimitExec::new(join, 0, Some(1)),
+            ))
+        };
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(8192);
+        for try_cast in [true, false] {
+            let task_ctx =
+                Arc::new(TaskContext::default().with_session_config(config.clone()));
+            let error = collect(make_plan(try_cast)?, task_ctx).await.unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("Dictionary key bigger than the key type"),
+                "{message}"
+            );
+            let root = assert_lowered_plan_fails_like_datafusion(
+                || make_plan(try_cast),
+                lower_with_limit,
+                config.clone(),
+                &message,
+            )
+            .await;
+            assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{try_cast}");
+        }
+        Ok(())
+    }
+
+    /// A probe key that is 1 (for all rows) when it is evaluated the first
+    /// time, 2 the second time, and so on.
+    #[derive(Debug)]
+    struct Sequence {
+        evaluations: Arc<std::sync::atomic::AtomicI32>,
+    }
+
+    impl fmt::Display for Sequence {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "sequence()")
+        }
+    }
+
+    impl PartialEq for Sequence {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.evaluations, &other.evaluations)
+        }
+    }
+
+    impl Eq for Sequence {}
+
+    impl std::hash::Hash for Sequence {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.evaluations).hash(state);
+        }
+    }
+
+    impl PhysicalExpr for Sequence {
+        fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
+            Ok(DataType::Int32)
+        }
+
+        fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn evaluate(
+            &self,
+            batch: &RecordBatch,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            let value = self.evaluations.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(datafusion_expr::ColumnarValue::Array(Arc::new(
+                Int32Array::from(vec![value; batch.num_rows()]),
+            )))
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            Ok(self)
+        }
+
+        fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "sequence()")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lowering_does_not_evaluate_expressions() -> Result<()> {
+        // The probe key of the probe row is the next value of a sequence,
+        // which matches the build key 1 if it is evaluated once, by the
+        // execution. Lowering must not evaluate it (the join, whose key is not
+        // known to never fail, is left to DataFusion).
+        // Every plan has a sequence of its own.
+        let make_plan =
+            || -> Result<(Arc<dyn ExecutionPlan>, Arc<std::sync::atomic::AtomicI32>)> {
+                let evaluations = Arc::new(std::sync::atomic::AtomicI32::new(0));
+                let build = int32_k_scan(vec![Some(1)])?;
+                let probe = int32_k_scan(vec![Some(5)])?;
+                let sequence = Arc::new(Sequence {
+                    evaluations: Arc::clone(&evaluations),
+                });
+                let on = vec![(col("k", &build.schema())?, sequence as _)];
+                let join = HashJoinExec::try_new(
+                    build,
+                    probe,
+                    on,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?;
+                Ok((Arc::new(join), evaluations))
+            };
+        let (plan, evaluations) = make_plan()?;
+        let root = lower(&plan)?;
+        assert_eq!(evaluations.load(Ordering::Relaxed), 0);
+        assert!(root.is::<BridgeOperator>());
+        let (plan, _) = make_plan()?;
+        assert_eq!(count_rows(&collect(plan, task_ctx()).await?), 1);
+        let root = assert_lowered_plan_byte_eq(
+            || make_plan().map(|(plan, _)| plan),
+            lower,
+            task_ctx(),
+            false,
+        )
+        .await;
+        assert!(root.is::<BridgeOperator>());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn build_keys_that_datafusion_evaluates_on_empty_batches() -> Result<()> {
         // The single build key `1 / 0` of type `Int32`, whose bounds
         // DataFusion computes on every build batch: on the empty batch the
@@ -5321,6 +5525,50 @@ mod tests {
             (cast(&i, DataType::Utf8), false),
             (cast(&i, DataType::Int16), true),
             (cast(&s, DataType::Int32), true),
+            (
+                Arc::new(TryCastExpr::new(Arc::clone(&s), DataType::Int32)),
+                false,
+            ),
+            (
+                Arc::new(TryCastExpr::new(
+                    Arc::clone(&s),
+                    DataType::Dictionary(
+                        Box::new(DataType::Int8),
+                        Box::new(DataType::Utf8),
+                    ),
+                )),
+                true,
+            ),
+            (
+                Arc::new(CastExpr::new(
+                    Arc::clone(&s),
+                    DataType::Dictionary(
+                        Box::new(DataType::Int16),
+                        Box::new(DataType::Utf8),
+                    ),
+                    Some(arrow::compute::CastOptions {
+                        safe: true,
+                        ..Default::default()
+                    }),
+                )),
+                true,
+            ),
+            (
+                Arc::new(TryCastExpr::new(
+                    Arc::clone(&s),
+                    DataType::Dictionary(
+                        Box::new(DataType::Int32),
+                        Box::new(DataType::Utf8),
+                    ),
+                )),
+                false,
+            ),
+            (
+                Arc::new(Sequence {
+                    evaluations: Arc::new(std::sync::atomic::AtomicI32::new(0)),
+                }),
+                true,
+            ),
             (
                 binary(
                     &binary(&i, Operator::Gt, &lit(0_i32)),
