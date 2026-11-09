@@ -140,7 +140,9 @@ impl AdaptiveFilter {
                 fallibility: fallibility(expr, input_schema),
             })
             .collect::<Vec<_>>();
-        let volatile = conjuncts.iter().any(|conjunct| is_volatile(&conjunct.expr));
+        let volatile = conjuncts
+            .iter()
+            .any(|conjunct| must_not_be_evaluated(&conjunct.expr));
         let segments = if volatile {
             vec![]
         } else {
@@ -159,8 +161,9 @@ impl AdaptiveFilter {
 
     /// The segments of the filter: the ranges of conjuncts that are
     /// reordered, the maximal runs of at least two consecutive infallible
-    /// conjuncts (none if a conjunct is volatile). Every other conjunct is
-    /// always evaluated at its position in the predicate.
+    /// conjuncts (none if a conjunct is volatile, or dynamic, which may hide
+    /// a volatile expression). Every other conjunct is always evaluated at its
+    /// position in the predicate.
     pub fn segments(&self) -> &[Range<usize>] {
         &self.segments
     }
@@ -483,6 +486,9 @@ fn fails_on_operand_types(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
     let Ok(probe) = Arc::clone(expr).with_new_children(columns) else {
         return true;
     };
+    if must_not_be_evaluated(&probe) {
+        return true;
+    }
     let nulls = data_types
         .iter()
         .map(|data_type| new_null_array(data_type, 1))
@@ -571,7 +577,7 @@ fn constant_pattern_fallibility(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
 ) -> Fallibility {
-    if is_volatile(expr) {
+    if must_not_be_evaluated(expr) {
         // Never evaluated before the execution: it may count its calls.
         return Fallibility::PerRow;
     }
@@ -655,10 +661,11 @@ fn is_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// Whether evaluating `expr` on an empty batch of `schema` fails (or,
 /// conservatively, whether there is no array of a type of `schema`).
 fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if !schema
-        .fields()
-        .iter()
-        .all(|field| can_build_nulls(field.data_type(), 0))
+    if must_not_be_evaluated(expr)
+        || !schema
+            .fields()
+            .iter()
+            .all(|field| can_build_nulls(field.data_type(), 0))
     {
         return true;
     }
@@ -727,7 +734,8 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 /// * a part of `expr` is dynamic (see `PhysicalExpr::snapshot`), e.g. a
 ///   `DynamicFilterPhysicalExpr`, which a `TopK` or a join updates during the
 ///   execution: its children are the columns it reads, not the expression it
-///   evaluates, which is not known before the execution;
+///   evaluates, which is not known before the execution (nor evaluated here:
+///   it may be volatile);
 /// * several parts of `expr` may fail (see [`failing_parts`]): which error
 ///   DataFusion raises first depends on its batches, e.g. on a batch of
 ///   `("1", 0)` then `("invalid", 1)` rows, `CAST(s AS INT) + 10 / x` fails
@@ -807,7 +815,7 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
 ///   on batches with more than 128 distinct values.
 pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    if is_volatile(expr) || is_dynamic(expr) || failing_parts(expr, schema) > 1 {
+    if must_not_be_evaluated(expr) || failing_parts(expr, schema) > 1 {
         return true;
     }
     let (fallibility, depends_on_batches) = analyze(expr, schema);
@@ -815,6 +823,14 @@ pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
         || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
         // Whoever evaluates it copies it for every row of the batch.
         || is_broadcast_constant(expr, schema)
+}
+
+/// Whether `expr` must not be evaluated before the execution (to classify
+/// it): a volatile part may observe how often it is evaluated (e.g. count
+/// its calls), and a dynamic part (see [`is_dynamic`]) evaluates an
+/// expression that its children do not show (e.g. a volatile one).
+fn must_not_be_evaluated(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    is_volatile(expr) || is_dynamic(expr)
 }
 
 /// Whether a part of `expr` is dynamic: it has a snapshot (see

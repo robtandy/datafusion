@@ -119,6 +119,16 @@ impl PhysicalProjection {
     /// first, depend on DataFusion's batches.
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
         let input_schema = exec.input().schema();
+        // First the expressions that must not be evaluated before the
+        // execution (volatile or dynamic ones), which `depends_on_batches`
+        // finds before it probes any.
+        if exec
+            .expr()
+            .iter()
+            .any(|projection| depends_on_batches(&projection.expr, input_schema.as_ref()))
+        {
+            return false;
+        }
         let failing_parts = exec
             .expr()
             .iter()
@@ -129,9 +139,6 @@ impl PhysicalProjection {
                 .fields()
                 .iter()
                 .all(|field| can_gather(field.data_type()))
-            && !exec.expr().iter().any(|projection| {
-                depends_on_batches(&projection.expr, input_schema.as_ref())
-            })
     }
 
     /// Lower a DataFusion [`ProjectionExec`]: evaluate its expressions on the
@@ -1837,6 +1844,51 @@ mod tests {
                 .is_err_and(|error| error.contains("string size overflow on repeat")),
             "{outcome:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_expressions_are_not_evaluated_before_execution() {
+        // `first_call()` is volatile, but hidden in a dynamic expression:
+        // evaluating it while checking whether the projection is supported
+        // (e.g. to find whether the `LIKE` fails without rows, before finding
+        // that it is dynamic) would make it return `false` during the
+        // execution (see the test of the same name for filters).
+        let batch = RecordBatch::try_from_iter([(
+            "x",
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )])
+        .unwrap();
+        let schema = batch.schema();
+        let projection = |expr: Arc<dyn PhysicalExpr>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(expr, "m")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plan = projection(dynamic_first_call(&calls, &schema));
+        let exec = plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // The fallback returns `true` on all rows, as DataFusion does.
+        let (error, operators) = assert_native_plan_parity(
+            || projection(dynamic_first_call(&Arc::default(), &schema)),
+            false,
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.projections, 0);
+        let batches = datafusion_physical_plan::collect(
+            projection(dynamic_first_call(&Arc::default(), &schema)),
+            Arc::new(datafusion_execution::TaskContext::default()),
+        )
+        .await
+        .unwrap();
+        let values = batches[0].column(0).as_boolean();
+        assert_eq!(values.true_count(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

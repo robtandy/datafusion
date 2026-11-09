@@ -1802,6 +1802,89 @@ pub(crate) mod test_support {
         )
     }
 
+    /// A volatile function that returns whether it is called for the first
+    /// time, on all rows.
+    #[derive(Debug)]
+    pub(crate) struct FirstCall {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        signature: Signature,
+    }
+
+    impl PartialEq for FirstCall {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.calls, &other.calls)
+        }
+    }
+
+    impl Eq for FirstCall {}
+
+    impl std::hash::Hash for FirstCall {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.calls).hash(state);
+        }
+    }
+
+    impl ScalarUDFImpl for FirstCall {
+        fn name(&self) -> &str {
+            "first_call"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Ok(ColumnarValue::Array(Arc::new(
+                arrow::array::BooleanArray::from(vec![first; args.number_rows]),
+            )))
+        }
+    }
+
+    /// `CAST(dynamic(first_call()) AS Utf8) LIKE 'true'`, with `first_call()`
+    /// (see [`FirstCall`]) counting in `calls` in a `DynamicFilterPhysicalExpr`
+    /// (without children): `true` if evaluated once, `false` after.
+    pub(crate) fn dynamic_first_call(
+        calls: &Arc<std::sync::atomic::AtomicUsize>,
+        schema: &Schema,
+    ) -> Arc<dyn PhysicalExpr> {
+        let udf = ScalarUDF::new_from_impl(FirstCall {
+            calls: Arc::clone(calls),
+            signature: Signature::nullary(Volatility::Volatile),
+        });
+        let first_call = Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(udf),
+                vec![],
+                schema,
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            )
+            .unwrap(),
+        );
+        let dynamic = Arc::new(
+            datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr::new(
+                vec![],
+                first_call,
+            ),
+        );
+        Arc::new(datafusion_physical_expr::expressions::LikeExpr::new(
+            false,
+            false,
+            Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
+                dynamic,
+                DataType::Utf8,
+                None,
+            )),
+            Arc::new(datafusion_physical_expr::expressions::Literal::new(
+                datafusion_common::ScalarValue::Utf8(Some("true".to_owned())),
+            )),
+        ))
+    }
+
     /// An immutable function of strings `s` that returns the lengths of
     /// `s || s`, an intermediate of strings with 32-bit offsets: it returns
     /// integers, but fails on more than 1 GiB of strings in a batch.
@@ -4393,6 +4476,43 @@ mod tests {
             assert!(error.is_none(), "{expr}");
             assert_eq!(operators.filters, 0, "{expr}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_predicates_are_not_evaluated_before_execution() {
+        // `first_call()` is volatile, but hidden in a dynamic expression (whose
+        // children are not the expression it evaluates): evaluating it before
+        // the execution (e.g. on an empty batch, to find whether the `LIKE`
+        // fails without rows) would make it return `false` during it.
+        let batch = runs(&[(1, 3)]);
+        let schema = batch.schema();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let expr = dynamic_first_call(&calls, &schema);
+        let filter = |predicate: Arc<dyn PhysicalExpr>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(FilterExec::try_new(predicate, scan(&batch)).unwrap())
+        };
+        let plan = filter(Arc::clone(&expr));
+        let exec = plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        assert!(depends_on_batches(&expr, &schema));
+        let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
+        let _ = crate::operators::adaptive_filter::failing_parts(&expr, &schema);
+        lower(&plan).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // DataFusion selects all rows, natively too.
+        let (error, operators) = assert_native_plan_parity(
+            || filter(dynamic_first_call(&Arc::default(), &schema)),
+            false,
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 0);
+        let outcome = outcome(
+            filter(dynamic_first_call(&Arc::default(), &schema)),
+            Arc::new(TaskContext::default()),
+        )
+        .await;
+        assert_eq!(outcome, Ok(3));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
