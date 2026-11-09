@@ -260,13 +260,20 @@ impl PhysicalHashAggregate {
     /// * aggregations that advertise another number of partitions than their
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
-    ///   input only, or fails.
+    ///   input only, or fails;
+    /// * aggregations with a soft limit on their groups (`lim=[n]`, from
+    ///   DataFusion's optimization of `SELECT DISTINCT ... LIMIT n`): each of
+    ///   their stages stops reading its input once it has `n` groups, so
+    ///   DataFusion neither evaluates the rest of its input (which may fail,
+    ///   e.g. with a division by zero) nor returns its groups, and the limit
+    ///   above returns groups of the rows read first. The native operator
+    ///   reads all of its input.
     ///
-    /// The limits that DataFusion pushes into an aggregation (`lim=[n]`,
-    /// for a `DISTINCT ... LIMIT` or a top-k `ORDER BY ... LIMIT`) are hints
-    /// that let it stop early or keep fewer groups; the limit or sort above
-    /// the aggregation applies them, so the native operator computes all
-    /// groups instead.
+    /// The limit of a top-k aggregation (`lim=[n]` of an `ORDER BY ...
+    /// LIMIT n` that DataFusion aggregates with its top-k stream) only lets
+    /// DataFusion keep fewer groups: the top-k stream reads all of its input,
+    /// and the sort above the aggregation selects the same top groups from
+    /// all groups, which the native operator computes instead.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -289,6 +296,7 @@ impl PhysicalHashAggregate {
         };
         if [Some(raw), last].into_iter().flatten().any(|aggregate| {
             aggregate.group_clustering_mode() != &GroupClusteringMode::None
+                || has_soft_limit(aggregate)
         }) {
             return Ok(None);
         }
@@ -478,6 +486,17 @@ fn partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
         return partial_aggregate(coalesce.input());
     }
     None
+}
+
+/// Whether `aggregate` has a soft limit on its groups, DataFusion's
+/// optimization of `SELECT DISTINCT ... LIMIT n` (an aggregation without
+/// aggregates whose limit has no order): its stream stops reading its input
+/// once it has `n` groups. (A limit with an order belongs to a top-k
+/// aggregation, whose stream reads all of its input.)
+fn has_soft_limit(aggregate: &AggregateExec) -> bool {
+    aggregate
+        .limit_options()
+        .is_some_and(|options| options.descending().is_none())
 }
 
 /// Whether `aggregate` advertises the partitions of its input: DataFusion
@@ -784,6 +803,7 @@ mod tests {
     use super::*;
 
     use arrow::array::{Int64Array, StringArray};
+    use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::functions_aggregate::sum::sum_udaf;
@@ -1110,6 +1130,67 @@ mod tests {
             partial_aggregate(other.input()).unwrap()
         ));
         assert!(try_lower(&(other as Plan))?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn soft_limited_aggregations_are_not_lowered() -> Result<()> {
+        // `SELECT DISTINCT k FROM ...`, in mode `mode`.
+        let distinct = |mode, input: Plan| -> Result<AggregateExec> {
+            let schema = input_schema();
+            let group_by = if mode == AggregateMode::FinalPartitioned {
+                group_by(true)?.as_final()
+            } else {
+                group_by(true)?
+            };
+            AggregateExec::try_new(mode, group_by, vec![], vec![], input, schema)
+        };
+        // `... LIMIT 3`: the stream of the aggregation stops reading its
+        // input once it has 3 groups.
+        let soft_limit = |aggregate: AggregateExec| -> AggregateExec {
+            let aggregate = aggregate
+                .try_optimize_distinct_soft_limit(3)
+                .expect("a soft limit")
+                .data;
+            assert_eq!(
+                aggregate.limit_options().map(|o| o.descending()),
+                Some(None)
+            );
+            aggregate
+        };
+        let plan = |aggregate: AggregateExec| Arc::new(aggregate) as Plan;
+
+        let single = distinct(AggregateMode::Single, input(1, false)?)?;
+        assert!(try_lower(&plan(single.clone()))?.is_some());
+        assert!(try_lower(&plan(soft_limit(single.clone())))?.is_none());
+        // A limit of the partial or of the final stage, or of both.
+        for (limit_partial, limit_final) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let partial = distinct(AggregateMode::Partial, input(4, false)?)?;
+            let partial = if limit_partial {
+                soft_limit(partial)
+            } else {
+                partial
+            };
+            let states = hash_repartition(plan(partial))?;
+            let last = distinct(AggregateMode::FinalPartitioned, states)?;
+            let last = if limit_final { soft_limit(last) } else { last };
+            let lowered = try_lower(&plan(last))?.is_some();
+            assert_eq!(lowered, !limit_partial && !limit_final);
+        }
+
+        // A top-k aggregation (`... ORDER BY k DESC LIMIT 3`) reads all of
+        // its input: lowered.
+        let top_k = single
+            .try_optimize_topk(3, "k", SortOptions::new(true, false))
+            .expect("a top-k aggregation")
+            .data;
+        assert_eq!(
+            top_k.limit_options().map(|o| o.descending()),
+            Some(Some(true))
+        );
+        assert!(try_lower(&plan(top_k))?.is_some());
         Ok(())
     }
 

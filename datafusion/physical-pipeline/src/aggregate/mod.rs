@@ -584,8 +584,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, DictionaryArray, Float64Array, Int64Array, ListArray, RecordBatch,
-        StringArray,
+        ArrayRef, DictionaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+        RecordBatch, StringArray,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use datafusion::datasource::MemTable;
@@ -970,6 +970,55 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_limited_distinct_aggregations_are_left_to_datafusion() {
+        // Tables of a single partition. DataFusion's `DISTINCT ... LIMIT n`
+        // stops reading as soon as it has `n` groups: after the first batch
+        // here, so it never divides by zero (`t`), and returns the groups of
+        // the rows it read first (`s`). A native aggregation would read all
+        // batches.
+        let setup = async |ctx: &SessionContext| {
+            register_test_tables(ctx)?;
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            let batch = |values: Vec<i32>| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+                )
+            };
+            let t = vec![vec![batch(vec![1])?, batch(vec![0])?]];
+            ctx.register_table(
+                "t",
+                Arc::new(MemTable::try_new(Arc::clone(&schema), t)?),
+            )?;
+            let s = vec![vec![
+                batch(vec![5, 3])?,
+                batch(vec![4, 4, 1])?,
+                batch(vec![2])?,
+            ]];
+            ctx.register_table("s", Arc::new(MemTable::try_new(schema, s)?))?;
+            Ok(())
+        };
+        for (sql, thread_counts) in [
+            (
+                "SELECT COUNT(*) FROM (SELECT DISTINCT 1000 / a FROM t LIMIT 1)",
+                &[1, 4][..],
+            ),
+            (
+                "SELECT COUNT(*), MIN(x), MAX(x) FROM (SELECT DISTINCT a AS x FROM s LIMIT 2)",
+                &[1],
+            ),
+        ] {
+            for &threads in thread_counts {
+                let config = test_session_config().with_target_partitions(threads);
+                let root = assert_aggregate_parity_with_setup(sql, config, &setup).await;
+                // Only the outer aggregation is native.
+                assert_eq!(count::<PhysicalHashAggregate>(&root), 1, "{sql}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
