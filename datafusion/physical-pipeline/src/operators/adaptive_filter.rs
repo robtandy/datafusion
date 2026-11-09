@@ -1291,6 +1291,15 @@ pub fn failures(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Failures {
         .fold(itself, Failures::and)
 }
 
+/// The number of the parts of `expr` that may fail (on some rows or on all of
+/// them), see [`failures`], whatever their errors: more than one may fail
+/// with different errors, which DataFusion raises in an order that depends
+/// on its batches, unless they can all only fail with arithmetic overflows
+/// (see [`Failures::order_matters`]), which this does not tell.
+pub fn failing_parts(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
+    failures(expr, schema).parts()
+}
+
 /// Whether `expr`, which may fail on some rows (and not whenever it is
 /// evaluated, see [`Fallibility::Uniform`]), can only fail with arithmetic
 /// overflows (`ArrowError::ArithmeticOverflow`): `+`, `-` and `*` of
@@ -3053,6 +3062,7 @@ mod tests {
             let expr = physical_expr(&expr, &schema);
             let failures = failures(&expr, &schema);
             assert!(failures.parts() > 1, "{expr}: {failures:?}");
+            assert_eq!(failing_parts(&expr, &schema), failures.parts(), "{expr}");
             assert_eq!(failures.only_overflows(), only_overflows, "{expr}");
             assert_eq!(failures.order_matters(), !only_overflows, "{expr}");
             assert_eq!(
