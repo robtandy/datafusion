@@ -65,11 +65,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
-use arrow::compute::{SortColumn, concat, lexsort_to_indices, take, take_arrays};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::compute::{SortColumn, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{RowConverter, SortField};
-use arrow_select::interleave::interleave;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, exec_datafusion_err, internal_err};
 use datafusion_datasource::source::DataSourceExec;
@@ -103,6 +102,7 @@ pub mod sort_sink;
 pub mod topk_sink;
 
 pub use merge::{RunMerger, SortedRun};
+use merge::{gather_rows_in_batches, is_capacity_error};
 pub use sort_sink::PhysicalSort;
 pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 
@@ -760,15 +760,17 @@ impl SortKeys {
             .collect()
     }
 
-    /// Sort the rows of `batches` into a run with schema `schema`, keeping
-    /// only the first `limit` rows (all rows if `None`). Returns `None` if
-    /// there are no rows to keep.
+    /// Sort the rows of `batches` into runs with schema `schema`, keeping
+    /// only the first `limit` rows (all rows if `None`). The runs hold
+    /// consecutive rows of the sort, in order: a single run, unless the rows
+    /// do not fit into one batch (see [`gather_rows_in_batches`]). Returns no
+    /// run if there are no rows to keep.
     pub(crate) fn sort(
         &self,
         schema: &SchemaRef,
         batches: &[RecordBatch],
         limit: Option<usize>,
-    ) -> Result<Option<SortedRun>> {
+    ) -> Result<Vec<SortedRun>> {
         let batches = batches
             .iter()
             .filter(|batch| batch.num_rows() > 0)
@@ -776,7 +778,7 @@ impl SortKeys {
         let num_rows = batches.iter().map(|batch| batch.num_rows()).sum::<usize>();
         let len = limit.map_or(num_rows, |limit| limit.min(num_rows));
         if len == 0 {
-            return Ok(None);
+            return Ok(vec![]);
         }
         let num_rows_u32 = u32::try_from(num_rows)
             .map_err(|_| exec_datafusion_err!("Cannot sort {num_rows} rows at once"))?;
@@ -788,77 +790,135 @@ impl SortKeys {
 
         // The positions of the sorted rows in the concatenation of `batches`,
         // and the encoded keys of the sorted rows.
-        let (indices, sorted_keys) = if self.sort_with_kernel {
-            let key = match keys.as_slice() {
-                [keys] => Arc::clone(&keys[0]),
-                _ => {
-                    concat(&keys.iter().map(|keys| keys[0].as_ref()).collect::<Vec<_>>())?
+        let sorted = match self.sort_with_kernel {
+            true => self.sort_with_kernel(&keys, limit)?,
+            false => None,
+        };
+        let (order, sorted_keys) = match sorted {
+            Some(sorted) => sorted,
+            None => {
+                let mut rows = self.converter.empty_rows(num_rows, 0);
+                for keys in &keys {
+                    self.converter.append(&mut rows, keys)?;
                 }
-            };
-            let column = SortColumn {
-                values: Arc::clone(&key),
-                options: Some(self.ordering[0].options),
-            };
-            let indices = lexsort_to_indices(&[column], limit)?;
-            let sorted = take(key.as_ref(), &indices, None)?;
-            let sorted_keys = self.converter.convert_columns(&[sorted])?;
-            (indices, sorted_keys)
-        } else {
-            let mut rows = self.converter.empty_rows(num_rows, 0);
-            for keys in &keys {
-                self.converter.append(&mut rows, keys)?;
+                let mut order = (0..num_rows_u32).collect::<Vec<_>>();
+                let compare =
+                    |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
+                if len < num_rows {
+                    order.select_nth_unstable_by(len - 1, compare);
+                    order.truncate(len);
+                }
+                order.sort_unstable_by(compare);
+                let data_len = order.iter().map(|&i| rows.row_len(i as usize)).sum();
+                let mut sorted_keys = self.converter.empty_rows(len, data_len);
+                for &i in &order {
+                    sorted_keys.push(rows.row(i as usize));
+                }
+                (order, sorted_keys)
             }
-            let mut order = (0..num_rows_u32).collect::<Vec<_>>();
-            let compare =
-                |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
-            if len < num_rows {
-                order.select_nth_unstable_by(len - 1, compare);
-                order.truncate(len);
-            }
-            order.sort_unstable_by(compare);
-            let data_len = order.iter().map(|&i| rows.row_len(i as usize)).sum();
-            let mut sorted_keys = self.converter.empty_rows(len, data_len);
-            for &i in &order {
-                sorted_keys.push(rows.row(i as usize));
-            }
-            (UInt32Array::from(order), sorted_keys)
         };
 
-        let columns = match batches.as_slice() {
-            [batch] => take_arrays(batch.columns(), &indices, None)?,
+        // The batch and row of every sorted row.
+        let mut starts = Vec::with_capacity(batches.len());
+        let mut start = 0;
+        for batch in &batches {
+            starts.push(start);
+            start += batch.num_rows();
+        }
+        let positions = order
+            .iter()
+            .map(|&index| {
+                let index = index as usize;
+                let batch = starts.partition_point(|&start| start <= index) - 1;
+                (batch, index - starts[batch])
+            })
+            .collect::<Vec<_>>();
+        let gathered = gather_rows_in_batches(schema, &batches, &positions)?;
+        if let [_] = gathered.as_slice() {
+            let batch = gathered.into_iter().next().expect("one batch");
+            return Ok(vec![SortedRun::try_new(batch, sorted_keys)?]);
+        }
+        // Split the keys like the rows.
+        let mut runs = Vec::with_capacity(gathered.len());
+        let mut start = 0;
+        for batch in gathered {
+            let rows = start..start + batch.num_rows();
+            let data_len = rows.clone().map(|row| sorted_keys.row_len(row)).sum();
+            let mut keys = self.converter.empty_rows(rows.len(), data_len);
+            for row in rows {
+                keys.push(sorted_keys.row(row));
+            }
+            start += batch.num_rows();
+            runs.push(SortedRun::try_new(batch, keys)?);
+        }
+        Ok(runs)
+    }
+
+    /// Sort the single sort key `keys` (of every batch) with
+    /// `lexsort_to_indices`: the positions of the first `limit` rows in the
+    /// concatenation of the batches, and their encoded keys. `None` if the
+    /// keys of all batches do not fit into one array (then they are sorted by
+    /// their encoded rows, which have no such limit).
+    fn sort_with_kernel(
+        &self,
+        keys: &[Vec<ArrayRef>],
+        limit: Option<usize>,
+    ) -> Result<Option<(Vec<u32>, arrow_row::Rows)>> {
+        let key = match keys {
+            [keys] => Arc::clone(&keys[0]),
             _ => {
-                // The batch and row of every sorted row.
-                let mut starts = Vec::with_capacity(batches.len());
-                let mut start = 0;
-                for batch in &batches {
-                    starts.push(start);
-                    start += batch.num_rows();
-                }
-                let positions = indices
-                    .values()
+                let keys = keys.iter().map(|keys| keys[0].as_ref()).collect::<Vec<_>>();
+                // `concat` would only fail after copying the values.
+                let bytes = keys
                     .iter()
-                    .map(|&index| {
-                        let index = index as usize;
-                        let batch = starts.partition_point(|&start| start <= index) - 1;
-                        (batch, index - starts[batch])
-                    })
-                    .collect::<Vec<_>>();
-                (0..schema.fields().len())
-                    .map(|column| {
-                        let values = batches
-                            .iter()
-                            .map(|batch| batch.column(column).as_ref())
-                            .collect::<Vec<&dyn Array>>();
-                        Ok(interleave(&values, &positions)?)
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                    .map(|key| offset_value_bytes(*key))
+                    .sum::<usize>();
+                if bytes > i32::MAX as usize {
+                    return Ok(None);
+                }
+                match concat(&keys) {
+                    Ok(key) => key,
+                    Err(error) if is_capacity_error(&error) => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                }
             }
         };
-        let options = RecordBatchOptions::new().with_row_count(Some(len));
-        let batch =
-            RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)?;
-        Ok(Some(SortedRun::try_new(batch, sorted_keys)?))
+        let column = SortColumn {
+            values: Arc::clone(&key),
+            options: Some(self.ordering[0].options),
+        };
+        let indices = lexsort_to_indices(&[column], limit)?;
+        let sorted = take(key.as_ref(), &indices, None)?;
+        let sorted_keys = self.converter.convert_columns(&[sorted])?;
+        Ok(Some((indices.values().to_vec(), sorted_keys)))
     }
+}
+
+/// The bytes of the values of `array` if it is a `Utf8` or `Binary` array,
+/// whose 32-bit offsets address at most `i32::MAX` bytes of values (0 for
+/// other arrays).
+fn offset_value_bytes(array: &dyn Array) -> usize {
+    let offsets = match array.data_type() {
+        DataType::Utf8 => array.as_string::<i32>().offsets(),
+        DataType::Binary => array.as_binary::<i32>().offsets(),
+        _ => return 0,
+    };
+    (offsets.last() - offsets.first()) as usize
+}
+
+/// The size of the memory that the rows of `batch` occupy: the bytes they
+/// would take in new arrays (more for zero-copy slices of view arrays).
+pub(crate) fn memory_size(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| {
+            column
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| column.get_array_memory_size())
+        })
+        .sum()
 }
 
 /// The data types of the sort keys `ordering` of rows with schema `schema`.
@@ -1163,8 +1223,9 @@ mod tests {
     use datafusion_expr::Operator;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
-    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::repartition::RepartitionExec;
+    use datafusion_physical_plan::{Partitioning, execute_stream};
+    use futures::StreamExt;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -1301,7 +1362,9 @@ mod tests {
             }
             let sort_keys = sort_keys(&schema, &keys);
             for limit in [None, Some(1), Some(77), Some(499), Some(500), Some(800)] {
-                let run = sort_keys.sort(&schema, &batches, limit)?.expect("rows");
+                let mut runs = sort_keys.sort(&schema, &batches, limit)?;
+                assert_eq!(runs.len(), 1, "the rows fit into one run");
+                let run = runs.pop().expect("a run");
                 assert_eq!(run.num_rows(), limit.unwrap_or(500).min(500));
                 // The keys are the encoded keys of the rows of the run, in
                 // order.
@@ -1331,14 +1394,17 @@ mod tests {
                     let mut by_rows =
                         SortKeys::try_new(sort_keys.ordering.clone(), &schema)?;
                     by_rows.sort_with_kernel = false;
-                    let other = by_rows.sort(&schema, &batches, limit)?.expect("rows");
+                    let other = by_rows
+                        .sort(&schema, &batches, limit)?
+                        .pop()
+                        .expect("a run");
                     for row in 0..run.num_rows() {
                         assert_eq!(run.key(row), other.key(row), "case {case}: {keys:?}");
                     }
                 }
             }
-            assert!(sort_keys.sort(&schema, &batches, Some(0))?.is_none());
-            assert!(sort_keys.sort(&schema, &[], None)?.is_none());
+            assert!(sort_keys.sort(&schema, &batches, Some(0))?.is_empty());
+            assert!(sort_keys.sort(&schema, &[], None)?.is_empty());
         }
         Ok(())
     }
@@ -2158,6 +2224,143 @@ mod tests {
                     .await;
             assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_of_large_strings_sort_rows_that_fit_into_arrays() {
+        // 1024 one-row batches of a 2 MiB `Utf8` value (all sharing one
+        // buffer), then `"a"`: DataFusion's TopK of 1 row returns `"a"`. The
+        // native TopK buffered the 1024 rows (2 GiB) and concatenated their
+        // keys, whose offsets overflowed: it now also reduces its buffer once
+        // it holds about `TOPK_BUFFER_BYTES` bytes, and sorts keys that do not
+        // fit into one array by their encoded rows.
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let large = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["b".repeat(2 << 20)]))],
+        )
+        .unwrap();
+        let small = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        let mut partition = vec![large; 1024];
+        partition.push(small);
+        let config = test_session_config().with_target_partitions(1);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&partition),
+                Arc::clone(&schema),
+                None,
+            )?;
+            Ok(sort_exec(scan, &[("s", false)], false, Some(1)))
+        };
+        let root = assert_lowered_plan_byte_eq(make, lower, task_ctx, true).await;
+        assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
+
+        // Keys that do not fit into one array are not sorted by the kernel,
+        // but by their encoded rows.
+        let sort_keys = sort_keys(&schema, &[("s", SortOptions::default())]);
+        assert!(sort_keys.sort_with_kernel);
+        let keys = partition
+            .iter()
+            .map(|batch| sort_keys.evaluate(batch))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            sort_keys
+                .sort_with_kernel(&keys, Some(2))
+                .unwrap()
+                .is_none()
+        );
+        let some = &keys[1000..];
+        assert!(sort_keys.sort_with_kernel(some, Some(2)).unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_large_values_emit_batches_that_fit_into_arrays() -> Result<()> {
+        // Two partitions of 512 rows with interleaving keys and a constant,
+        // distinct, run-end encoded 2 MiB string each. DataFusion merges them
+        // into batches of 64 rows (128 MiB of values each); a sorted run or
+        // chunk of all 1024 rows needs 2 GiB of values, more than the 32-bit
+        // offsets of `Utf8` address. The native sort splits such runs and
+        // chunks into smaller ones.
+        let values = Arc::new(Field::new("values", DataType::Utf8, true));
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+        let ree = DataType::RunEndEncoded(run_ends, values);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("p", ree, true),
+        ]));
+        let partition = |first: i64, letter: &str| {
+            let keys = Int64Array::from_iter_values((0..512).map(|i| i * 2 + first));
+            let payload = arrow::array::RunArray::<Int32Type>::try_new(
+                &Int32Array::from(vec![512]),
+                &StringArray::from(vec![letter.repeat(2 << 20)]),
+            )
+            .unwrap();
+            vec![
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(keys), Arc::new(payload)],
+                )
+                .unwrap(),
+            ]
+        };
+        let partitions = [partition(0, "x"), partition(1, "y")];
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan =
+                MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+            Ok(merge(
+                sort_exec(scan, &[("k", false)], true, None),
+                &[("k", false)],
+                None,
+            ))
+        };
+        /// The key, the first letter and the length of the payload of every
+        /// row of `plan` (whose batches hold 2 GiB: they are streamed, and
+        /// their bytes are not compared).
+        async fn rows(
+            plan: Arc<dyn ExecutionPlan>,
+            config: SessionConfig,
+        ) -> Result<Vec<(i64, u8, usize)>> {
+            let schema = plan.schema();
+            let task_ctx = Arc::new(
+                datafusion_execution::TaskContext::default().with_session_config(config),
+            );
+            let mut stream = execute_stream(plan, task_ctx)?;
+            let mut rows = vec![];
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                assert_eq!(batch.schema(), schema);
+                let keys = batch.column(0).as_primitive::<Int64Type>();
+                let payload = batch.column(1).as_run::<Int32Type>();
+                let values = payload.values().as_string::<i32>();
+                for row in 0..batch.num_rows() {
+                    let value = values.value(payload.get_physical_index(row));
+                    rows.push((keys.value(row), value.as_bytes()[0], value.len()));
+                }
+            }
+            Ok(rows)
+        }
+        let config = test_session_config().with_batch_size(64);
+        let expected = rows(make()?, config.clone()).await?;
+        assert_eq!(expected.len(), 1024);
+        for threads in [1, 4] {
+            let plan = make()?;
+            let root = lower(&plan)?;
+            assert!(root.is::<PhysicalSort>());
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let output = rows(exec, config.clone().with_target_partitions(threads))
+                .await
+                .map_err(|e| e.context(format!("{threads} threads")))?;
+            assert_eq!(output, expected, "{threads} threads");
+        }
+        Ok(())
     }
 
     /// A scan of the rows `(a, b)` of `partitions`, a list of batches per

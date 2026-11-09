@@ -21,14 +21,94 @@
 //! which comparing two rows is a `memcmp` of their bytes. Rows that compare
 //! equal are emitted in the order of their runs, and within a run in the
 //! order of the run.
+//!
+//! Materializing rows can need more bytes than a single Arrow array
+//! addresses (e.g. 2 GiB of `Utf8` values, whose offsets are 32-bit), also
+//! when the rows come from arrays that fit: the rows are then split into
+//! several runs, and the merger emits smaller chunks.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::compute::take_arrays;
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow_row::{Row, Rows};
 use arrow_select::interleave::interleave;
 use datafusion_common::{Result, internal_err};
+
+/// Whether `error` says that rows do not fit into one array: its offsets
+/// (32-bit for `Utf8`, `Binary`, `List`, ..., also in nested and run-end
+/// encoded arrays) would overflow. The rows then fit into smaller arrays.
+pub(crate) fn is_capacity_error(error: &ArrowError) -> bool {
+    match error {
+        ArrowError::OffsetOverflowError(_) => true,
+        // `MutableArrayData`, which some kernels fall back to.
+        ArrowError::InvalidArgumentError(message) => message.contains("offset overflow"),
+        _ => false,
+    }
+}
+
+/// The rows `positions` (`(batch, row)`) of `batches` as one batch with
+/// schema `schema`: taken from the only batch, or interleaved.
+pub(crate) fn gather_rows(
+    schema: &SchemaRef,
+    batches: &[&RecordBatch],
+    positions: &[(usize, usize)],
+) -> std::result::Result<RecordBatch, ArrowError> {
+    let columns = match batches {
+        [batch] => {
+            let rows = positions
+                .iter()
+                .map(|&(_, row)| u32::try_from(row))
+                .collect::<std::result::Result<UInt32Array, _>>()
+                .map_err(|e| ArrowError::ComputeError(e.to_string()))?;
+            take_arrays(batch.columns(), &rows, None)?
+        }
+        _ => (0..schema.fields().len())
+            .map(|column| {
+                let values = batches
+                    .iter()
+                    .map(|batch| batch.column(column).as_ref())
+                    .collect::<Vec<&dyn Array>>();
+                interleave(&values, positions)
+            })
+            .collect::<std::result::Result<Vec<ArrayRef>, _>>()?,
+    };
+    let options = RecordBatchOptions::new().with_row_count(Some(positions.len()));
+    RecordBatch::try_new_with_options(Arc::clone(schema), columns, &options)
+}
+
+/// The rows `positions` of `batches` (see [`gather_rows`]), in order, in as
+/// few batches as their columns fit into: all of them in one batch, unless
+/// that needs more bytes than an array addresses, in which case the rows
+/// are split (see [`is_capacity_error`]).
+pub(crate) fn gather_rows_in_batches(
+    schema: &SchemaRef,
+    batches: &[&RecordBatch],
+    positions: &[(usize, usize)],
+) -> Result<Vec<RecordBatch>> {
+    let mut gathered = vec![];
+    let mut start = 0;
+    while start < positions.len() {
+        let mut len = positions.len() - start;
+        loop {
+            match gather_rows(schema, batches, &positions[start..start + len]) {
+                Ok(batch) => {
+                    gathered.push(batch);
+                    start += len;
+                    break;
+                }
+                Err(error) if len > 1 && is_capacity_error(&error) => {
+                    len = len.div_ceil(2);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(gathered)
+}
 
 /// Rows in sort order: a batch, and the sort keys of its rows in the Arrow
 /// row format (the same [`RowConverter`](arrow_row::RowConverter) for all
@@ -89,6 +169,10 @@ pub struct RunMerger {
     runs: Vec<Option<SortedRun>>,
     /// The next row of every run.
     positions: Vec<usize>,
+    /// Rows `(run, row)` that the tree chose, but that were not emitted yet,
+    /// in order: a chunk whose rows do not fit into one batch is emitted in
+    /// parts.
+    pending: Vec<(usize, usize)>,
     /// `tree[0]` is the winner, the run whose current row comes first;
     /// `tree[1..]` are the losers of the matches at the inner nodes. Leaf `i`
     /// (run `i`) is the child of node `(k + i) / 2`, and node `j` is the child of
@@ -117,6 +201,7 @@ impl RunMerger {
         let mut merger = Self {
             schema,
             positions: vec![0; runs.len()],
+            pending: vec![],
             tree: vec![],
             runs,
             remaining: fetch.map_or(total, |fetch| fetch.min(total)),
@@ -132,27 +217,53 @@ impl RunMerger {
 
     /// The number of rows the merger still emits.
     pub fn remaining_rows(&self) -> usize {
-        self.remaining
+        self.remaining + self.pending.len()
     }
 
     /// Emit the next (at most) `max_rows` rows in sort order, or `None` once
     /// all rows (or `fetch` rows) were emitted.
+    ///
+    /// The batch has fewer rows if the rows do not fit into one batch (the
+    /// offsets of a column would overflow); the other rows come with the next
+    /// batches.
     pub fn next_batch(&mut self, max_rows: usize) -> Result<Option<RecordBatch>> {
-        let len = self.remaining.min(max_rows);
-        if len == 0 {
-            return Ok(None);
+        if self.pending.is_empty() {
+            let len = self.remaining.min(max_rows);
+            if len == 0 {
+                return Ok(None);
+            }
+            for _ in 0..len {
+                let winner = self.tree[0];
+                let position = self.positions[winner];
+                self.pending.push((winner, position));
+                self.positions[winner] = position + 1;
+                self.replay(winner);
+            }
+            self.remaining -= len;
         }
-        let mut indices = Vec::with_capacity(len);
-        for _ in 0..len {
-            let winner = self.tree[0];
-            let position = self.positions[winner];
-            indices.push((winner, position));
-            self.positions[winner] = position + 1;
-            self.replay(winner);
+        let mut len = self.pending.len().min(max_rows);
+        let batch = loop {
+            match self.gather(&self.pending[..len])? {
+                Ok(batch) => break batch,
+                Err(error) if len > 1 && is_capacity_error(&error) => {
+                    len = len.div_ceil(2);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
+        // Drop the runs that have no rows left to emit, neither in the tree
+        // nor pending.
+        let (emitted, pending) = self.pending.split_at(len);
+        for &(run, _) in emitted {
+            if self.runs[run]
+                .as_ref()
+                .is_some_and(|sorted| self.positions[run] >= sorted.num_rows())
+                && !pending.iter().any(|&(other, _)| other == run)
+            {
+                self.runs[run] = None;
+            }
         }
-        self.remaining -= len;
-        let batch = self.gather(&indices)?;
-        self.release_exhausted_runs(&indices);
+        self.pending.drain(..len);
         Ok(Some(batch))
     }
 
@@ -221,24 +332,29 @@ impl RunMerger {
             .map(|run| run.key(position))
     }
 
-    /// The rows `(run, row)` of `indices`, as a batch.
-    fn gather(&self, indices: &[(usize, usize)]) -> Result<RecordBatch> {
+    /// The rows `(run, row)` of `indices`, as a batch. The inner error says
+    /// why the rows cannot be materialized, e.g. that they do not fit into one
+    /// batch.
+    fn gather(
+        &self,
+        indices: &[(usize, usize)],
+    ) -> Result<std::result::Result<RecordBatch, ArrowError>> {
         let (first_run, first_row) = indices[0];
         let consecutive = indices
             .iter()
             .enumerate()
             .all(|(i, &(run, row))| run == first_run && row == first_row + i);
-        let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
         if consecutive {
             // All rows come from one run, in order (e.g. a single run): no
             // copy.
             let batch = self.run(first_run)?.batch.slice(first_row, indices.len());
             let (_, columns, _) = batch.into_parts();
+            let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
             return Ok(RecordBatch::try_new_with_options(
                 SchemaRef::clone(&self.schema),
                 columns,
                 &options,
-            )?);
+            ));
         }
         // Interleave the rows of the runs that occur in `indices`.
         let mut slots = vec![usize::MAX; self.runs.len()];
@@ -257,38 +373,13 @@ impl RunMerger {
             .iter()
             .map(|&run| Ok(&self.run(run)?.batch))
             .collect::<Result<Vec<_>>>()?;
-        let columns = (0..self.schema.fields().len())
-            .map(|column| {
-                let values = batches
-                    .iter()
-                    .map(|batch| batch.column(column).as_ref())
-                    .collect::<Vec<&dyn Array>>();
-                Ok(interleave(&values, &indices)?)
-            })
-            .collect::<Result<Vec<ArrayRef>>>()?;
-        Ok(RecordBatch::try_new_with_options(
-            SchemaRef::clone(&self.schema),
-            columns,
-            &options,
-        )?)
+        Ok(gather_rows(&self.schema, &batches, &indices))
     }
 
     fn run(&self, run: usize) -> Result<&SortedRun> {
         match &self.runs[run] {
             Some(run) => Ok(run),
             None => internal_err!("RunMerger: run {run} was already released"),
-        }
-    }
-
-    /// Drop the runs of `indices` that have no rows left.
-    fn release_exhausted_runs(&mut self, indices: &[(usize, usize)]) {
-        for &(run, _) in indices {
-            if self.runs[run]
-                .as_ref()
-                .is_some_and(|sorted| self.positions[run] >= sorted.num_rows())
-            {
-                self.runs[run] = None;
-            }
         }
     }
 }
@@ -378,6 +469,20 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    #[test]
+    fn capacity_errors_are_recognized() {
+        assert!(is_capacity_error(&ArrowError::OffsetOverflowError(1 << 31)));
+        // The error of `MutableArrayData`.
+        let message = "offset overflow: data exceeds the capacity of the offset type";
+        assert!(is_capacity_error(&ArrowError::InvalidArgumentError(
+            message.to_string()
+        )));
+        assert!(!is_capacity_error(&ArrowError::DivideByZero));
+        assert!(!is_capacity_error(&ArrowError::InvalidArgumentError(
+            "invalid".to_string()
+        )));
     }
 
     #[test]

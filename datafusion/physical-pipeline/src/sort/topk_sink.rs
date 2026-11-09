@@ -16,9 +16,10 @@
 //!   threshold predicate (`key < threshold`, as DataFusion's TopK builds it),
 //!   so rows behind the threshold are discarded right away. The rows that
 //!   pass are buffered; once the buffer holds at least `k` rows (and
-//!   [`MIN_TOPK_BUFFER_ROWS`]), the thread sorts its run and the buffer and
-//!   keeps the first `k` rows, which gives a tighter threshold. The cost per
-//!   buffered row is `O(log k)`, also for large `k`.
+//!   [`MIN_TOPK_BUFFER_ROWS`]), or at least [`TOPK_BUFFER_BYTES`] and as many
+//!   bytes as the run, the thread sorts its run and the buffer and keeps the
+//!   first `k` rows, which gives a tighter threshold. The cost per buffered
+//!   row is `O(log k)`, also for large `k`.
 //! * The tightest threshold of any thread is shared with the other threads
 //!   through the global sink state, so that every thread filters with the
 //!   tightest threshold known. If the `SortExec` that the operator replaces
@@ -62,7 +63,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, next_sorted_chunk};
+use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -73,6 +74,12 @@ use crate::operator::{
 /// A thread reduces its buffered rows to its top `k` rows once it buffered
 /// `k` rows, but not before it buffered this many rows.
 pub const MIN_TOPK_BUFFER_ROWS: usize = 1024;
+
+/// A thread also reduces its buffered rows once they occupy about this many
+/// bytes (and as many as its top `k` rows), so that large rows do not pile
+/// up: e.g. 1024 rows of 2 MiB hold more `Utf8` values than an Arrow array
+/// addresses.
+pub const TOPK_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 /// The [`DynamicFilterPhysicalExpr`] of a `SortExec` with a fetch, which a
 /// [`PhysicalTopK`] updates, and the expressions of the filter's input (the
@@ -218,26 +225,28 @@ impl PhysicalTopK {
         }
     }
 
-    /// Sort the run and the buffered rows of `state` and keep the first `k`
+    /// Sort the runs and the buffered rows of `state` and keep the first `k`
     /// rows. If that gives a tighter threshold, publish it.
     fn reduce(&self, global: &TopKSinkState, state: &mut TopKLocalState) -> Result<()> {
         if state.buffer.is_empty() {
             return Ok(());
         }
-        let mut batches = Vec::with_capacity(state.buffer.len() + 1);
-        batches.extend(state.top.take().map(SortedRun::into_batch));
+        let mut batches = Vec::with_capacity(state.buffer.len() + state.top.len());
+        batches.extend(state.top.drain(..).map(SortedRun::into_batch));
         batches.append(&mut state.buffer);
         state.buffered_rows = 0;
+        state.buffered_bytes = 0;
         state.top = self.keys.sort(&self.schema, &batches, Some(self.k))?;
+        state.top_bytes = state.top.iter().map(|run| memory_size(run.batch())).sum();
         drop(batches);
 
-        let Some(top) = &state.top else {
+        // The `k`-th row is the last row of the last run.
+        let rows = state.top.iter().map(SortedRun::num_rows).sum::<usize>();
+        let Some(last) = state.top.last().filter(|_| rows == self.k) else {
             return Ok(());
         };
-        if top.num_rows() < self.k {
-            return Ok(());
-        }
-        let key = top.key(self.k - 1);
+        let row = last.num_rows() - 1;
+        let key = last.key(row);
         if state
             .threshold
             .as_ref()
@@ -245,15 +254,14 @@ impl PhysicalTopK {
         {
             return Ok(());
         }
-        let threshold = Arc::new(self.threshold(top)?);
+        let threshold = Arc::new(self.threshold(last, row)?);
         state.threshold = Some(Arc::clone(&threshold));
         self.publish(global, &threshold)
     }
 
-    /// The threshold of `top`, a run of `k` rows: its last row.
-    fn threshold(&self, top: &SortedRun) -> Result<Threshold> {
-        let row = self.k - 1;
-        let batch = top.batch().slice(row, 1);
+    /// The threshold of a top-k whose `k`-th row is row `row` of `run`.
+    fn threshold(&self, run: &SortedRun, row: usize) -> Result<Threshold> {
+        let batch = run.batch().slice(row, 1);
         let values = self
             .ordering()
             .iter()
@@ -269,7 +277,7 @@ impl PhysicalTopK {
             .collect::<Vec<_>>();
         let predicate = threshold_predicate(&keys, &values)?;
         Ok(Threshold {
-            key: top.key(row).owned(),
+            key: run.key(row).owned(),
             values,
             predicate,
         })
@@ -436,13 +444,18 @@ impl GlobalSinkState for TopKSinkState {}
 /// The local sink state of a [`PhysicalTopK`]: the top-k of the thread.
 #[derive(Debug, Default)]
 struct TopKLocalState {
-    /// The first (at most) `k` rows of the thread, in order.
-    top: Option<SortedRun>,
+    /// The first (at most) `k` rows of the thread, in order: consecutive runs
+    /// (usually a single one, see [`SortKeys::sort`]).
+    top: Vec<SortedRun>,
+    /// The estimated memory size of `top`.
+    top_bytes: usize,
     /// Compacted rows that came before the threshold and were not reduced
     /// into `top` yet.
     buffer: Vec<RecordBatch>,
     /// The number of rows of `buffer`.
     buffered_rows: usize,
+    /// The estimated memory size of `buffer`.
+    buffered_bytes: usize,
     /// The tightest threshold the thread knows.
     threshold: Option<Arc<Threshold>>,
     /// The generation of the global threshold the thread knows.
@@ -528,8 +541,11 @@ impl PhysicalOperator for PhysicalTopK {
             }
         }
         state.buffered_rows += batch.num_rows();
+        state.buffered_bytes += memory_size(&batch);
         state.buffer.push(batch);
-        if state.buffered_rows >= self.reduce_rows() {
+        if state.buffered_rows >= self.reduce_rows()
+            || state.buffered_bytes >= TOPK_BUFFER_BYTES.max(state.top_bytes)
+        {
             self.reduce(global, state)?;
         }
         Ok(SinkResult::NeedMoreInput)
@@ -545,9 +561,7 @@ impl PhysicalOperator for PhysicalTopK {
         let state =
             downcast_state_mut::<TopKLocalState>(lstate.as_any_mut(), self.name())?;
         self.reduce(global, state)?;
-        if let Some(top) = state.top.take() {
-            global.runs.lock().push(top);
-        }
+        global.runs.lock().append(&mut state.top);
         Ok(())
     }
 
@@ -1012,6 +1026,36 @@ mod tests {
     }
 
     #[test]
+    fn buffers_of_large_rows_are_reduced_before_they_hold_k_rows() -> Result<()> {
+        // Rows of 2 MiB (sharing one buffer): the thread reduces its buffer
+        // once it holds `TOPK_BUFFER_BYTES` bytes (32 rows), long before it
+        // holds `MIN_TOPK_BUFFER_ROWS` rows (2 GiB, more than the 32-bit
+        // offsets of a `Utf8` array of all of them address).
+        let large = 2 << 20;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["b".repeat(large)]))],
+        )?;
+        let chunks = vec![DataChunk::from_record_batch(batch); 100];
+        let input: Arc<dyn PhysicalOperator> = Arc::new(TestSource::new(chunks.clone()));
+        let topk = topk(input, false, 1);
+        let ctx = ExecutionContext::new(Arc::new(TaskContext::default()), 0, 1);
+        let global = topk.get_global_sink_state(&ctx)?;
+        let mut local = topk.get_local_sink_state(&ctx, global.as_ref())?;
+        let limit = TOPK_BUFFER_BYTES.div_ceil(large);
+        for chunk in chunks.chunks(10) {
+            sink_all(&topk, global.as_ref(), local.as_mut(), chunk)?;
+            assert!(buffered_rows(local.as_ref()) < limit);
+        }
+        let state = local.downcast_ref::<TopKLocalState>().unwrap();
+        assert_eq!(state.top.len(), 1);
+        assert_eq!(state.top[0].num_rows(), 1);
+        assert!(state.threshold.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn rows_behind_the_threshold_are_discarded_while_sinking() -> Result<()> {
         let input: Arc<dyn PhysicalOperator> = Arc::new(TestSource::new(vec![]));
         let topk = topk(input, false, 10);
@@ -1027,7 +1071,8 @@ mod tests {
         )?;
         assert_eq!(buffered_rows(local.as_ref()), 0);
         let state = local.downcast_ref::<TopKLocalState>().unwrap();
-        assert_eq!(state.top.as_ref().unwrap().num_rows(), 10);
+        assert_eq!(state.top.len(), 1);
+        assert_eq!(state.top[0].num_rows(), 10);
         let threshold = state.threshold.as_ref().unwrap();
         assert_eq!(threshold.values, vec![ScalarValue::Int64(Some(9))]);
         assert_eq!(

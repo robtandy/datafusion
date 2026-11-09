@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, RecordBatch};
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr::LexOrdering;
@@ -38,7 +38,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, next_sorted_chunk};
+use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -134,9 +134,9 @@ impl PhysicalSort {
         let batches = std::mem::take(&mut state.batches);
         state.rows = 0;
         state.bytes = 0;
-        if let Some(run) = self.keys.sort(&self.schema, &batches, self.fetch)? {
-            state.runs.push(run);
-        }
+        state
+            .runs
+            .extend(self.keys.sort(&self.schema, &batches, self.fetch)?);
         Ok(())
     }
 }
@@ -165,21 +165,6 @@ struct SortLocalState {
 }
 
 impl LocalSinkState for SortLocalState {}
-
-/// The size of the memory that the rows of `batch` occupy: the bytes they
-/// would take in new arrays (more for zero-copy slices of view arrays).
-fn memory_size(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|column| {
-            column
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| column.get_array_memory_size())
-        })
-        .sum()
-}
 
 impl PhysicalOperator for PhysicalSort {
     fn name(&self) -> &str {
@@ -323,6 +308,8 @@ impl PhysicalOperator for PhysicalSort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use arrow::array::Array;
 
     use arrow::array::{AsArray, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
