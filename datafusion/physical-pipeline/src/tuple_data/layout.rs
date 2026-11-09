@@ -36,7 +36,13 @@
 //!   len >  12: | len: u32 | prefix (4 bytes) | offset: u64  |
 //!   ```
 //!
-//!   Null values have length `0`.
+//!   Null values have length `0`. All integers are little endian, so the
+//!   slot of a value of at most 12 bytes is exactly its view in a `Utf8View`
+//!   or `BinaryView` array, and the first 8 bytes of any slot (the length and
+//!   the prefix) are those of its view. The gathers rely on this to build
+//!   views from slots, and the [`RowMatcher`](super::RowMatcher) to compare
+//!   the lengths and the prefixes of two values in one `u64` comparison, and
+//!   the other inline bytes in another one.
 //! * **nested columns** ([`ColumnStorage::Encoded`]: structs, lists, maps,
 //!   unions, run-end encoded arrays) are encoded with the Arrow row format
 //!   ([`arrow_row`]) and the encoding is stored like a variable-length value
