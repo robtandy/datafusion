@@ -165,17 +165,20 @@ impl PhysicalFilter {
     ///   (see `can_gather`);
     /// * the output of `exec` has dictionaries with keys of less than 32 bits
     ///   or of values that take less than a byte each (e.g. nulls), run ends of
-    ///   less than 32 bits, or lists with 32-bit offsets, at any depth:
-    ///   `FilterExec` coalesces its output batches, merging the dictionaries
-    ///   of distinct batches, which fails if they have more values than the
-    ///   keys can index (e.g. two batches of 100 distinct values, with `Int8`
-    ///   keys, or dictionaries of `1 << 30` and `(1 << 30) + 1` nulls, which
-    ///   take no memory and which Arrow does not merge, with `Int32` keys), and
-    ///   adding up the offsets of lists, which fails beyond `i32::MAX` values
-    ///   (e.g. two lists of `1 << 30` nulls). Whether it fails depends on the
-    ///   batches of the input plan, and the native filter does not coalesce
-    ///   its output. Nor run-end encoded arrays whose child fields are not
-    ///   Arrow's, which Arrow's `filter` renames;
+    ///   less than 32 bits, or lists, strings or binaries with 32-bit offsets
+    ///   (`Utf8`, `Binary`, but not their large or view types), at any depth,
+    ///   also as the values of dictionaries: `FilterExec` coalesces its output
+    ///   batches, merging the dictionaries of distinct batches, which fails if
+    ///   they have more values than the keys can index (e.g. two batches of
+    ///   100 distinct values, with `Int8` keys, or dictionaries of `1 << 30`
+    ///   and `(1 << 30) + 1` nulls, which take no memory and which Arrow does
+    ///   not merge, with `Int32` keys), and adding up offsets, which fails
+    ///   beyond `i32::MAX` values or bytes (e.g. two lists of `1 << 30` nulls,
+    ///   or 32 copies of a batch with a string of 64 MiB, which share its
+    ///   buffer). Whether it fails depends on the batches of the input plan,
+    ///   and the native filter does not coalesce its output. Nor run-end
+    ///   encoded arrays whose child fields are not Arrow's, which Arrow's
+    ///   `filter` renames;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
     ///   belong to partitions;
@@ -364,7 +367,7 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
         .find(|field| may_fail_to_coalesce(field.data_type()))
     {
         return Some(format!(
-            "it may fail to coalesce the dictionaries, run ends or lists of its output column '{}'",
+            "it may fail to coalesce the dictionaries, run ends, lists or strings of its output column '{}'",
             field.name()
         ));
     }
@@ -395,12 +398,13 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
 /// depth: it concatenates the arrays of the batches it coalesces, which
 /// merges the dictionaries of distinct batches, and fails when their keys
 /// cannot index all of their values (keys of less than 32 bits, or values that
-/// take less than a byte each, e.g. nulls, which Arrow does not merge, and
-/// of which any number takes no memory), adds up run
-/// ends (run ends of less than 32 bits), and the offsets of lists (32-bit
-/// offsets, which lists of nulls overflow without memory). The 32-bit offsets
-/// of strings and binaries overflow too, but on more than 2 GiB of data. And
-/// Arrow's `filter` rebuilds run-end encoded arrays with its own child
+/// take less than a byte each, e.g. nulls, which Arrow does not merge, and of
+/// which any number takes no memory), adds up run ends (run ends of less than
+/// 32 bits), and the offsets of lists (32-bit offsets, which lists of nulls
+/// overflow without memory), and of strings and binaries (32-bit offsets,
+/// which overflow beyond 2 GiB of bytes, which batches that share their
+/// buffers reach without memory, e.g. copies of a batch with a large string).
+/// And Arrow's `filter` rebuilds run-end encoded arrays with its own child
 /// fields, so their fields must be Arrow's.
 fn may_fail_to_coalesce(data_type: &DataType) -> bool {
     let narrow = |index: &DataType| {
@@ -425,6 +429,9 @@ fn may_fail_to_coalesce(data_type: &DataType) -> bool {
         // Their 32-bit offsets overflow on more than `i32::MAX` values, which
         // need no memory if they are nulls.
         DataType::List(_) | DataType::ListView(_) | DataType::Map(..) => true,
+        // Their 32-bit offsets overflow beyond 2 GiB of bytes, in batches
+        // that may share their buffers.
+        DataType::Utf8 | DataType::Binary => true,
         DataType::LargeList(field)
         | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _) => may_fail_to_coalesce(field.data_type()),
@@ -3304,19 +3311,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_selective_filters() {
         assert_all_native_byte_eq(&[
-            "SELECT * FROM t1 WHERE a > 10",
-            "SELECT * FROM t1 WHERE id % 1000 = 7",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE a > 10",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE id % 1000 = 7",
             "SELECT id, a, h FROM t1 WHERE a > 10 AND d <> 'beta'",
-            "SELECT * FROM t1 WHERE id < 0",
-            "SELECT * FROM t_empty WHERE a > 0",
-            "SELECT * FROM t1 WHERE a IS NULL",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE id < 0",
+            "SELECT * EXCLUDE (d) FROM t_empty WHERE a > 0",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE a IS NULL",
             "SELECT id, c FROM t1 WHERE c > -0.0",
             "SELECT id, f, ts FROM t1 WHERE f > DATE '1970-01-02' AND ts < TIMESTAMP '2024-01-10 00:00:00'",
             "SELECT id, g FROM t1 WHERE g > 0 AND g < 100.5",
             "SELECT id FROM t1 WHERE a IN (1, 2, 3, -5) AND d IS NOT NULL",
             "SELECT id, e FROM t1 WHERE e",
             "SELECT id, e FROM t1 WHERE NOT e",
-            "SELECT * FROM t2 WHERE k > 0",
+            "SELECT * EXCLUDE (name) FROM t2 WHERE k > 0",
         ])
         .await;
         // `isnan` is a function, which may fail (as far as the filter knows)
@@ -3326,13 +3333,22 @@ mod tests {
             "SELECT id, c FROM t1 WHERE c IS NULL OR c = 0.0 OR isnan(c)",
         ])
         .await;
+        // `FilterExec` concatenates the strings of the batches it coalesces,
+        // whose 32-bit offsets may overflow (`d` and `name` are `Utf8`, `h`
+        // `Utf8View`): filters that output them stay in DataFusion.
+        assert_all_byte_eq_in_datafusion(&[
+            "SELECT * FROM t1 WHERE a > 10",
+            "SELECT id, d FROM t1 WHERE a > 40 OR d = 'gamma'",
+            "SELECT * FROM t2 WHERE k > 0",
+        ])
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_multi_conjunct_and_or_filters() {
         assert_all_native_byte_eq(&[
             "SELECT id, a, b FROM t1 WHERE a > 0 AND b < 5000 AND c > 0.0 AND e",
-            "SELECT id, d FROM t1 WHERE a > 40 OR d = 'gamma'",
+            "SELECT id, h FROM t1 WHERE a > 40 OR d = 'gamma'",
             "SELECT id FROM t1 WHERE (a > 0 OR b IS NULL) AND (d LIKE 'a%' OR h LIKE '%01%') AND NOT e",
             "SELECT id, h FROM t1 WHERE h > 'a fairly long view string 0150' AND id % 2 = 0 AND a < 30",
             "SELECT id FROM t1 WHERE b % 7 = 1 AND a + b > 100 AND c * 2.0 > 1.0",
@@ -3356,7 +3372,7 @@ mod tests {
         // batches: these filters are native. (DataFusion's optimizer moves
         // function calls and `LIKE` after the cheap conjuncts.)
         assert_all_native_byte_eq(&[
-            "SELECT id, s FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
+            "SELECT id, x FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X'",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X' AND s LIKE '%1%'",
             "SELECT id, x FROM fallible WHERE 10 / (x + 100) < 1 AND x <> 0",
@@ -3461,20 +3477,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_string_view_and_dictionary_filters() {
         assert_all_native_byte_eq(&[
-            "SELECT d32, i FROM vd WHERE d32 = 'k3'",
-            "SELECT i, d32, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
+            "SELECT i FROM vd WHERE d32 = 'k3'",
+            "SELECT i, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
             // Patterns that compile cannot fail, after other conjuncts too.
             "SELECT i, sv FROM vd WHERE i % 3 = 0 AND sv LIKE '%7%'",
             "SELECT i, sv FROM vd WHERE i % 2 = 0 AND (sv ILIKE 'A%' OR sv ~ '7$')",
-            "SELECT i, d32 FROM vd WHERE d32 IN ('k1', 'k2', 'k39') OR d8 IS NULL",
+            "SELECT i FROM vd WHERE d32 IN ('k1', 'k2', 'k39') OR d8 IS NULL",
             "SELECT i, sv FROM vd WHERE sv > 'short4' AND i % 3 = 0",
-            "SELECT i, d32 FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",
+            "SELECT i, sv FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",
         ])
         .await;
         // `FilterExec` coalesces its output, merging the dictionaries of `d8`
-        // (`Int8` keys), which may fail.
+        // (`Int8` keys), which may fail, or concatenating strings (also the
+        // values of dictionaries), whose 32-bit offsets may overflow.
         assert_all_byte_eq_in_datafusion(&[
             "SELECT * FROM vd WHERE d32 = 'k3'",
+            "SELECT d32, i FROM vd WHERE d32 = 'k3'",
             "SELECT i, d8, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
             "SELECT * FROM vd WHERE sv IS NULL",
         ])
@@ -3485,15 +3503,15 @@ mod tests {
     async fn differential_filters_below_other_operators() {
         assert_all_native_byte_eq(&[
             "SELECT COUNT(*) FROM t1 WHERE a > 0",
-            "SELECT d, COUNT(*), SUM(a) FROM t1 WHERE a > 0 AND e GROUP BY d",
+            "SELECT h, COUNT(*), SUM(a) FROM t1 WHERE a > 0 AND e GROUP BY h",
             "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k WHERE t1.b > 10 AND t2.w < 100",
             "SELECT t1.id, t2.k FROM t1 LEFT JOIN t2 ON t1.a = t2.k WHERE t1.id % 10 = 3",
             "SELECT id, a FROM t1 WHERE a > 0 ORDER BY id",
             "SELECT id, h FROM t1 WHERE h LIKE '%1%' ORDER BY h DESC, id LIMIT 20",
-            "SELECT * FROM (SELECT * FROM t1 ORDER BY id LIMIT 100) WHERE a > 0",
+            "SELECT * FROM (SELECT id, a, h FROM t1 ORDER BY id LIMIT 100) WHERE a > 0",
             "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2 WHERE k < 0",
-            "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1 WHERE a > 0",
-            "SELECT d, MAX(h) FROM t1 WHERE id % 3 = 0 GROUP BY d HAVING COUNT(*) > 100",
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY h ORDER BY id) AS rn FROM t1 WHERE a > 0",
+            "SELECT e, MAX(h) FROM t1 WHERE id % 3 = 0 GROUP BY e HAVING COUNT(*) > 100",
         ])
         .await;
         // The limit is pushed into the filter (`fetch = 7`), which is lowered:
@@ -3519,7 +3537,7 @@ mod tests {
                 "SELECT id FROM t1 WHERE id % 1000 = 7",
                 "SELECT id, a FROM t1 WHERE a > 0 ORDER BY id",
                 "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0",
-                "SELECT id, s FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
+                "SELECT id, x FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
             ] {
                 let run =
                     assert_native_byte_eq_with_config(sql, config.clone(), all_tables)
@@ -3648,6 +3666,33 @@ mod tests {
         )
     }
 
+    /// [`filter_exec`] without a fetch, whose output drops the columns of its
+    /// input that `FilterExec` may fail to coalesce (e.g. strings): it is
+    /// lowered if its predicate can be.
+    fn filter_exec_without_strings(
+        predicate: &str,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = input.schema();
+        let projection = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| !may_fail_to_coalesce(field.data_type()))
+            .map(|(index, _)| index)
+            .collect();
+        Arc::new(
+            datafusion_physical_plan::filter::FilterExecBuilder::new(
+                physical_expr(predicate, &schema),
+                input,
+            )
+            .apply_projection(Some(projection))
+            .unwrap()
+            .build()
+            .unwrap(),
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn batch_dependent_predicates_stay_in_datafusion() {
         // One batch of 4096 rows, 1848 zeros then 2248 ones. Split into two
@@ -3719,9 +3764,18 @@ mod tests {
             let predicate: Arc<dyn PhysicalExpr> = Arc::new(
                 datafusion_physical_expr::expressions::BinaryExpr::new(left, op, right),
             );
+            // (Without the strings of `s` in the output, see
+            // `may_fail_to_coalesce`.)
             let plan = || -> Arc<dyn ExecutionPlan> {
                 Arc::new(
-                    FilterExec::try_new(Arc::clone(&predicate), scan(&batch)).unwrap(),
+                    datafusion_physical_plan::filter::FilterExecBuilder::new(
+                        Arc::clone(&predicate),
+                        scan(&batch),
+                    )
+                    .apply_projection(Some(vec![0, 1]))
+                    .unwrap()
+                    .build()
+                    .unwrap(),
                 )
             };
             let (error, operators) = assert_native_plan_parity(plan, false).await;
@@ -3754,10 +3808,10 @@ mod tests {
         assert!(filter.errors_depend_on_batches());
         let chunks = [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
         assert!(drive(&filter, chunks).is_ok());
-        // Patterns that compile are lowered.
+        // Patterns that compile are lowered (without strings in the output).
         for predicate in ["x > 0 AND s ILIKE 'A%'", "x > 0 AND s NOT ILIKE '%É'"] {
             let (error, operators) = assert_native_plan_parity(
-                || filter_exec(predicate, scan(&batch), None),
+                || filter_exec_without_strings(predicate, scan(&batch)),
                 false,
             )
             .await;
@@ -3892,6 +3946,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_strings_in_shared_buffers_stay_in_datafusion() {
+        // `FilterExec` concatenates the strings of the batches it coalesces
+        // into batches of 8192 rows, whose 32-bit offsets overflow beyond
+        // 2 GiB of bytes, which batches that share their buffers reach without
+        // memory: here 32 copies of a batch of 256 rows with a string of 64 MiB
+        // (and 255 empty strings). The native filter does not coalesce its
+        // output, and the cache only up to 2048 rows.
+        let mut strings = vec![String::new(); 256];
+        strings[0] = "x".repeat((1 << 26) + 1);
+        let batch = RecordBatch::try_from_iter([
+            ("x", Arc::new(Int32Array::from(vec![1; 256])) as ArrayRef),
+            ("s", Arc::new(StringArray::from(strings)) as ArrayRef),
+        ])
+        .unwrap();
+        let batches = vec![batch; 32];
+        let schema = batches[0].schema();
+        let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("Offset overflow error: 2147483680")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_of_dictionaries_of_values_without_memory_stay_in_datafusion() {
         // `FilterExec` concatenates the dictionaries of the batches it
         // coalesces: Arrow cannot merge dictionaries of nulls, which take no
@@ -3967,7 +4053,8 @@ mod tests {
         assert_eq!(operators.filters, 0);
 
         // Without the dictionaries in its output, or with keys of 32 bits,
-        // which can index the values of any batch, the filter is lowered.
+        // which can index the values of any batch (of strings with 64-bit
+        // offsets: Arrow may concatenate the values), the filter is lowered.
         let projected = || -> Arc<dyn ExecutionPlan> {
             Arc::new(
                 datafusion_physical_plan::filter::FilterExecBuilder::new(
@@ -3983,7 +4070,18 @@ mod tests {
         let (error, operators) = assert_native_plan_parity(projected, false).await;
         assert!(error.is_none());
         assert_eq!(operators.filters, 1);
-        let wide = distinct_dictionary_batches(&DataType::Int32);
+        let large = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::LargeUtf8),
+        );
+        let wide = distinct_dictionary_batches(&DataType::Int32)
+            .into_iter()
+            .map(|batch| {
+                let d = arrow::compute::cast(batch.column(0), &large).unwrap();
+                RecordBatch::try_from_iter([("d", d), ("i", Arc::clone(batch.column(1)))])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         let (error, operators) = assert_native_plan_parity(
             || filter_exec(predicate, scan_batches(&wide[0].schema(), &wide), None),
             false,
@@ -3995,15 +4093,17 @@ mod tests {
 
     #[test]
     fn finds_outputs_that_may_fail_to_coalesce() {
-        let utf8 = |keys: DataType| {
-            DataType::Dictionary(Box::new(keys), Box::new(DataType::Utf8))
+        // (Of strings with 64-bit offsets, which concatenate without
+        // overflowing.)
+        let large = |keys: DataType| {
+            DataType::Dictionary(Box::new(keys), Box::new(DataType::LargeUtf8))
         };
         let field = |data_type: DataType| Arc::new(Field::new("f", data_type, true));
         for (data_type, fails) in [
-            (utf8(DataType::Int8), true),
-            (utf8(DataType::UInt16), true),
-            (utf8(DataType::Int32), false),
-            (utf8(DataType::UInt64), false),
+            (large(DataType::Int8), true),
+            (large(DataType::UInt16), true),
+            (large(DataType::Int32), false),
+            (large(DataType::UInt64), false),
             // Dictionaries of values that take less than a byte each may have
             // more values than any keys index, which Arrow concatenates.
             (
@@ -4031,34 +4131,58 @@ mod tests {
                 ),
                 false,
             ),
-            (DataType::List(field(utf8(DataType::Int8))), true),
+            (DataType::List(field(large(DataType::Int8))), true),
             // Lists of more than `i32::MAX` values overflow their offsets (lists
             // of nulls take no memory).
             (DataType::List(field(DataType::Null)), true),
             (DataType::List(field(DataType::Int32)), true),
             (DataType::ListView(field(DataType::Int32)), true),
             (DataType::LargeList(field(DataType::Null)), false),
-            (DataType::LargeList(field(utf8(DataType::Int32))), false),
-            (DataType::LargeList(field(utf8(DataType::Int8))), true),
+            (DataType::LargeList(field(large(DataType::Int32))), false),
+            (DataType::LargeList(field(large(DataType::Int8))), true),
             (
-                DataType::Struct(vec![field(utf8(DataType::UInt8))].into()),
+                DataType::Struct(vec![field(large(DataType::UInt8))].into()),
                 true,
             ),
             (
                 DataType::RunEndEncoded(
                     Arc::new(Field::new("run_ends", DataType::Int16, false)),
-                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
                 ),
                 true,
             ),
             (
                 DataType::RunEndEncoded(
                     Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
                 ),
                 false,
             ),
-            (DataType::Utf8, false),
+            // The 32-bit offsets of strings and binaries overflow beyond 2 GiB
+            // of bytes, which batches that share their buffers reach without
+            // memory; also as the values of dictionaries, which Arrow may
+            // concatenate, and of runs.
+            (DataType::Utf8, true),
+            (DataType::Binary, true),
+            (
+                DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8)),
+                true,
+            ),
+            (DataType::Struct(vec![field(DataType::Utf8)].into()), true),
+            (DataType::FixedSizeList(field(DataType::Binary), 2), true),
+            (
+                DataType::RunEndEncoded(
+                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
+                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                ),
+                true,
+            ),
+            // Not those with 64-bit offsets, nor views.
+            (DataType::LargeUtf8, false),
+            (DataType::LargeBinary, false),
+            (DataType::Utf8View, false),
+            (DataType::BinaryView, false),
+            (DataType::LargeList(field(DataType::LargeUtf8)), false),
             // Arrow's `filter` renames the fields of run-end encoded arrays.
             (
                 DataType::RunEndEncoded(
@@ -4077,7 +4201,7 @@ mod tests {
             (
                 DataType::RunEndEncoded(
                     Arc::new(Field::new("run_ends", DataType::Int64, false)),
-                    Arc::new(Field::new("values", DataType::Utf8, true)),
+                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
                 ),
                 false,
             ),
@@ -4114,7 +4238,7 @@ mod tests {
         }
         // The first value is evaluated on all rows.
         let (error, operators) = assert_native_plan_parity(
-            || filter_exec("x IN (10 / y, 1)", scan(&batch), None),
+            || filter_exec_without_strings("x IN (10 / y, 1)", scan(&batch)),
             false,
         )
         .await;
@@ -4151,7 +4275,7 @@ mod tests {
         // A pattern that compiles cannot fail.
         let predicate = "x = 0 OR (y = 0 OR s ~ 'a+')";
         let (error, operators) = assert_native_plan_parity(
-            || filter_exec(predicate, scan(&batch), None),
+            || filter_exec_without_strings(predicate, scan(&batch)),
             false,
         )
         .await;
@@ -4211,7 +4335,12 @@ mod tests {
             ),
         ] {
             let (error, operators) = assert_native_plan_parity(
-                || filter_exec(predicate, scan_batches(&schema, &batches), None),
+                || {
+                    filter_exec_without_strings(
+                        predicate,
+                        scan_batches(&schema, &batches),
+                    )
+                },
                 false,
             )
             .await;
@@ -4770,7 +4899,8 @@ mod tests {
         assert_eq!((operators.filters, operators.projections), (0, 0));
         // Without a part that may fail in the projection, both are lowered.
         let (error, operators) =
-            assert_native_plan_parity_with_config(|| plan("s"), false, config()).await;
+            assert_native_plan_parity_with_config(|| plan("x + 1"), false, config())
+                .await;
         assert!(error.unwrap().contains("Divide by zero"));
         assert_eq!((operators.filters, operators.projections), (1, 1));
     }
@@ -4969,9 +5099,10 @@ mod tests {
         }
         // A predicate that fails whenever it is evaluated is not lowered
         // either, but a pattern that compiles cannot fail.
+        // (Views, which `FilterExec` coalesces without 32-bit offsets.)
         let strings = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)])),
-            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
+            vec![Arc::new(StringViewArray::from(vec!["a", "b"]))],
         )
         .unwrap();
         for (predicate, lowered) in [("s ~ 'a{1000000}'", false), ("s LIKE 'a%'", true)] {
