@@ -800,6 +800,7 @@ pub(crate) mod test_support {
     use datafusion_physical_plan::repartition::RepartitionExec;
     use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, collect};
 
+    use crate::aggregate::PhysicalHashAggregate;
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::chunk::DataChunk;
     use crate::explain::format_operator_tree;
@@ -820,11 +821,11 @@ pub(crate) mod test_support {
     /// until it lowers sorts (#10):
     ///
     /// * sorts with [`try_lower`](super::try_lower);
-    /// * limits, unions and placeholder rows with their `try_lower`;
-    /// * `CoalescePartitionsExec`s without a fetch (over at least one
-    ///   partition) and `RepartitionExec`s that do not preserve the order are
-    ///   removed: the pipeline engine merges the partitions of their input
-    ///   anyway;
+    /// * aggregations, limits, unions and placeholder rows with their
+    ///   `try_lower`;
+    /// * `CoalescePartitionsExec`s without a fetch and `RepartitionExec`s that
+    ///   do not preserve the order (over at least one partition) are removed:
+    ///   the pipeline engine merges the partitions of their input anyway;
     /// * `ProjectionExec`s with a [`TestProjection`], so that the operators
     ///   below them are lowered too;
     /// * scans with the native sources;
@@ -834,6 +835,9 @@ pub(crate) mod test_support {
     ) -> Result<Arc<dyn PhysicalOperator>> {
         if let Some(sort) = super::try_lower(plan, lower)? {
             return Ok(sort);
+        }
+        if let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, lower)? {
+            return Ok(Arc::new(aggregate));
         }
         if let Some(limit) = PhysicalLimit::try_lower(plan, lower)? {
             return Ok(Arc::new(limit));
@@ -852,6 +856,7 @@ pub(crate) mod test_support {
         }
         if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
             && !repartition.preserve_order()
+            && repartition.input().output_partitioning().partition_count() > 0
         {
             return lower(repartition.input());
         }
@@ -1015,6 +1020,7 @@ mod tests {
     use super::test_support::{
         assert_native_byte_eq, assert_parity, assert_parity_with_config, lower,
     };
+    use crate::aggregate::PhysicalHashAggregate;
     use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::explain::format_operator_tree;
     use crate::operators::limit::PhysicalLimit;
@@ -2102,13 +2108,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_order_by_of_aggregates_joins_and_subqueries() {
-        assert_sorted_natively(&[
-            // Projections between the merge and the sort.
+        // Projections between the merge and the sort, over native
+        // aggregations.
+        for sql in [
             "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
-            "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d DESC LIMIT 3",
             "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY n DESC, d LIMIT 4",
             "SELECT d AS x, SUM(b) AS s FROM t1 GROUP BY d ORDER BY x DESC",
             "SELECT e, f, COUNT(DISTINCT a) AS da FROM t1 GROUP BY e, f ORDER BY f, e",
+            "SELECT a, SUM(b) AS s FROM t1 GROUP BY a ORDER BY s DESC, a LIMIT 20",
+        ] {
+            let root = assert_parity(sql).await;
+            let tree = format_operator_tree(&root);
+            assert!(sorts(&root) > 0, "{sql}\n{tree}");
+            assert!(count::<PhysicalHashAggregate>(&root) > 0, "{sql}\n{tree}");
+        }
+        assert_sorted_natively(&[
+            // DataFusion keeps the top groups only in the aggregation of a
+            // top-k aggregation, which the native aggregation leaves to it.
+            "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d DESC LIMIT 3",
+            "SELECT a, MAX(id) AS m FROM t1 GROUP BY a ORDER BY m DESC LIMIT 20",
             "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.id, t2.name, t2.w LIMIT 50",
             "SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t2.w DESC, t1.id",
             "SELECT * FROM (SELECT id, a FROM t1 ORDER BY a NULLS FIRST, id LIMIT 10) ORDER BY id",
