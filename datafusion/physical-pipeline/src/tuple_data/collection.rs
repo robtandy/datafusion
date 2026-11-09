@@ -736,8 +736,10 @@ impl TupleDataCollection {
         );
         let blocks = self.blocks.as_slice();
         let mut invalid = None;
+        let first_invalid = &mut invalid;
+        // By value, so that the loop keeps them in registers.
         let rows = locations
-            .map(|location| {
+            .map(move |location| {
                 let row = location.row();
                 match blocks.get(location.block()) {
                     // The rows of a block are `count * row_width` bytes, so
@@ -747,7 +749,7 @@ impl TupleDataCollection {
                         row: PhantomData,
                     },
                     _ => {
-                        invalid.get_or_insert(location);
+                        first_invalid.get_or_insert(location);
                         RowPtr {
                             ptr: std::ptr::null(),
                             row: PhantomData,
@@ -2018,17 +2020,17 @@ unsafe fn gather_fixed(
         bit: usize,
     ) -> (Buffer, bool) {
         let (byte, mask) = (bit >> 3, 1_u8 << (bit & 7));
+        // An explicit loop with local state, so that `valid` stays in a
+        // register (not in the environment of a closure).
         let mut valid = mask;
-        let values = rows
-            .iter()
-            .map(|row| {
-                // SAFETY: guaranteed by the caller.
-                unsafe {
-                    valid &= row.byte(byte);
-                    row.read_native::<T>(offset)
-                }
-            })
-            .collect::<Vec<T>>();
+        let mut values = vec![T::default(); rows.len()];
+        for (value, row) in values.iter_mut().zip(rows) {
+            // SAFETY: guaranteed by the caller.
+            unsafe {
+                valid &= row.byte(byte);
+                *value = row.read_native::<T>(offset);
+            }
+        }
         (Buffer::from_vec(values), valid != 0)
     }
     // SAFETY: guaranteed by the caller.

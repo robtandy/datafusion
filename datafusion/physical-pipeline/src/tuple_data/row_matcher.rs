@@ -805,25 +805,24 @@ impl<'r> ColumnMatches<'_, 'r> {
         // The entries whose other bytes must be compared, with the heap
         // offset of the values of their candidates.
         let mut deferred = vec![];
-        let mut equals = (0..len)
-            .map(|entry| {
-                let row = sel[entry];
-                let candidate = rows[entry];
-                let probe_valid = valid(row as usize);
-                // SAFETY: the slot and the validity bit of the column are in
-                // the rows of the candidates (checked by
-                // `RowMatcher::match_prepared`).
-                let candidate_valid = unsafe { candidate.is_valid(column) };
-                if !(probe_valid && candidate_valid) {
-                    return probe_valid == candidate_valid && null_equals_null;
-                }
+        let mut equals = vec![false; len];
+        for (entry, equal) in equals.iter_mut().enumerate() {
+            let row = sel[entry];
+            let candidate = rows[entry];
+            let probe_valid = valid(row as usize);
+            // SAFETY: the slot and the validity bit of the column are in the
+            // rows of the candidates (checked by `RowMatcher::match_prepared`).
+            let candidate_valid = unsafe { candidate.is_valid(column) };
+            *equal = if probe_valid && candidate_valid {
                 let slot = unsafe { candidate.var_len_slot(offset) };
                 compare_slots(views[value(row as usize)], slot).unwrap_or_else(|| {
                     deferred.push((entry, heap_offset(slot)));
                     false
                 })
-            })
-            .collect::<Vec<_>>();
+            } else {
+                probe_valid == candidate_valid && null_equals_null
+            };
+        }
         for (entry, start) in deferred {
             let row = sel[entry];
             let v = value(row as usize);
