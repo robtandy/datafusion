@@ -931,7 +931,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_projections_over_filtered_chunks() {
         assert_all_native_byte_eq(&[
-            "SELECT id, a + b AS s, c * 2 AS c2, upper(d) AS u, NOT e AS ne FROM t1 WHERE a > 10",
+            "SELECT id, a + b AS s, c * 2 AS c2, length(d) AS u, NOT e AS ne FROM t1 WHERE a > 10",
             "SELECT a AS x, id, h, a AS y FROM t1 WHERE a > 10 AND d <> 'beta'",
             "SELECT id, CASE WHEN a IS NULL THEN 0 WHEN a < 0 THEN -1 ELSE 1 END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, '' AS s FROM t1 WHERE a > 0",
@@ -949,9 +949,11 @@ mod tests {
         // Several functions (whose failures are not known) or other parts that
         // may fail: which error comes first depends on the batches. Or string
         // constants, copied for every row of a batch, whose 32-bit offsets
-        // overflow on batches with enough rows.
+        // overflow on batches with enough rows. Or functions that build
+        // strings, whose sizes DataFusion may limit per batch.
         assert_all_projections_in_datafusion(&[
             "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
+            "SELECT id, a + b AS s, upper(d) AS u FROM t1 WHERE a > 10",
             "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day FROM t1",
             "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
@@ -1634,6 +1636,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
+        // `ProjectionExec` evaluates `repeat(s, n)` on the batch of 8192 rows,
+        // 4 GiB of strings, more than DataFusion allows, but a pipeline on
+        // chunks of 2048 rows (see the test of the same name for filters).
+        let batch = repeated_strings();
+        let schema = batch.schema();
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        physical_expr("repeat(s, n) IS NOT NULL", &schema),
+                        "b",
+                    )],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        let task_ctx = Arc::new(datafusion_execution::TaskContext::default());
+        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("string size overflow on repeat")),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dynamic_expressions_stay_in_datafusion() {
         // `ProjectionExec` evaluates `x <> 0 AND 10 / x > 1` on the batch of
         // 1848 zeros then 2248 ones, more than 20% of which pass `x <> 0`, so
@@ -1933,17 +1967,20 @@ mod tests {
     async fn differential_projections_of_views_and_dictionaries() {
         assert_all_native_byte_eq(&[
             "SELECT d8, sv, d32 AS d FROM vd WHERE d32 = 'k1'",
-            "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
+            "SELECT i, character_length(sv) AS c FROM vd WHERE i % 5 = 0",
             "SELECT CAST(d32 AS VARCHAR) || '!' AS x FROM vd WHERE sv IS NOT NULL",
-            "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
+            "SELECT i, sv, strpos(sv, 'g') AS g FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT d8 AS d, i + 1 AS j FROM vd WHERE d8 IS NOT NULL",
         ])
         .await;
         // `upper` takes the dictionary itself, and may evaluate all of its
         // values, which depend on DataFusion's batches; `||` and `length` may
-        // both fail.
+        // both fail; `concat` and `substr` build strings, whose sizes
+        // DataFusion may limit per batch.
         assert_all_projections_in_datafusion(&[
             "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
+            "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
+            "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
             "SELECT CAST(d32 AS VARCHAR) || '!' AS x, length(sv) AS l FROM vd WHERE sv IS NOT NULL",
         ])
         .await;

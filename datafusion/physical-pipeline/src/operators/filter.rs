@@ -2116,6 +2116,24 @@ pub(crate) mod test_support {
         .unwrap()
     }
 
+    /// A batch of 8192 rows of `s` (`LargeUtf8`), `"x"`, and of `n` (`Int64`),
+    /// `1 << 19`: `repeat(s, n)` builds 4 GiB of strings on the batch, and
+    /// 1 GiB on a chunk of 2048 rows.
+    pub(crate) fn repeated_strings() -> RecordBatch {
+        RecordBatch::try_from_iter([
+            (
+                "s",
+                Arc::new(arrow::array::LargeStringArray::from(vec!["x"; 8192]))
+                    as ArrayRef,
+            ),
+            (
+                "n",
+                Arc::new(Int64Array::from(vec![1 << 19; 8192])) as ArrayRef,
+            ),
+        ])
+        .unwrap()
+    }
+
     /// `predicate` (on `schema`) in a `DynamicFilterPhysicalExpr`, whose
     /// children are the columns that `predicate` reads (as DataFusion builds
     /// them), not `predicate`.
@@ -3401,9 +3419,17 @@ mod tests {
         // function calls and `LIKE` after the cheap conjuncts.)
         assert_all_native_byte_eq(&[
             "SELECT id, x FROM fallible WHERE CAST(id AS INT) % 10 = 0 AND s IS NOT NULL",
+            "SELECT id, x FROM fallible WHERE length(s) <> 3",
+            "SELECT id, x FROM fallible WHERE length(s) <> 3 AND s LIKE '%1%'",
+            "SELECT id, x FROM fallible WHERE 10 / (x + 100) < 1 AND x <> 0",
+        ])
+        .await;
+        // Functions that build strings may fail depending on how many rows
+        // they are evaluated on together (DataFusion may limit their sizes
+        // per batch).
+        assert_all_byte_eq_in_datafusion(&[
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X'",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X' AND s LIKE '%1%'",
-            "SELECT id, x FROM fallible WHERE 10 / (x + 100) < 1 AND x <> 0",
         ])
         .await;
         // DataFusion divides only the rows with `x <> 0` because, in each
@@ -3719,6 +3745,38 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
+        // DataFusion checks the size of the strings that `repeat` builds on a
+        // batch (also with 64-bit offsets): 4 GiB on the batch of 8192 rows of
+        // `FilterExec`, more than it allows, but 1 GiB on the chunks of the
+        // native filter. Functions are opaque: whether one that builds values
+        // of variable lengths fails depends on the rows it is evaluated on
+        // together.
+        let batch = repeated_strings();
+        let plan = || filter_exec("repeat(s, n) IS NOT NULL", scan(&batch), None);
+        let filter_plan = plan();
+        let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
+        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        let outcome =
+            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
+                .await;
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("string size overflow on repeat")),
+            "{outcome:?}"
+        );
+        // A function that builds values of fixed widths is lowered.
+        let (error, operators) = assert_native_plan_parity(
+            || filter_exec_without_strings("abs(n) > 0", scan(&batch)),
+            false,
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

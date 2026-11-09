@@ -770,6 +770,12 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   with `x`;
 /// * `expr` is such a constant (e.g. a string that a projection outputs),
 ///   which whoever evaluates it copies for every row of the batch;
+/// * a part of `expr` that the classification does not know (e.g. a
+///   function) builds values of variable lengths (strings, binaries, lists or
+///   maps, at any depth, also of 64-bit offsets or views): their sizes depend
+///   on the values, and DataFusion may limit them per batch, e.g. `repeat`
+///   fails on more than 4 GiB of strings in a batch (8192 rows of
+///   `repeat(s, 1 << 19)`), which a chunk of 2048 rows does not reach;
 /// * a part of `expr` that may fail is evaluated on, or produces,
 ///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
 ///   dictionary of `d`, even those that no row references (when DataFusion
@@ -854,6 +860,13 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
         // constant, into arrays whose 32-bit offsets overflow beyond 2 GiB of
         // bytes.
         || expands_values(expr, schema)
+        // It is opaque, and builds values whose sizes depend on the values
+        // (e.g. `repeat(s, n)`), and on which DataFusion may set limits per
+        // batch.
+        || (is_opaque(expr)
+            && expr
+                .data_type(schema)
+                .is_ok_and(|data_type| has_variable_lengths(&data_type)))
         // It may fail and evaluates or produces dictionaries.
         || (node != Fallibility::Infallible
             && children.iter().copied().chain([expr]).any(|expr| {
@@ -861,6 +874,52 @@ fn analyze(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> (Fallibility, bool)
                     .is_ok_and(|data_type| contains_dictionaries(&data_type))
             }));
     (fallibility, depends_on_batches)
+}
+
+/// Whether `expr` is opaque to the classification: not one of the
+/// expressions whose evaluation it knows (columns, literals, `BinaryExpr`,
+/// `LIKE`, casts, `NOT`, `IS [NOT] NULL`, `IN` lists, `CASE`), e.g. a
+/// function.
+fn is_opaque(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    !(expr.is::<Column>()
+        || expr.is::<Literal>()
+        || expr.is::<BinaryExpr>()
+        || expr.is::<LikeExpr>()
+        || expr.is::<CastExpr>()
+        || expr.is::<NotExpr>()
+        || expr.is::<IsNullExpr>()
+        || expr.is::<IsNotNullExpr>()
+        || expr.is::<InListExpr>()
+        || expr.is::<CaseExpr>())
+}
+
+/// Whether arrays of `data_type` contain, at any depth, values of variable
+/// lengths, whose sizes do not follow from the number of rows: strings and
+/// binaries (also large ones, and views), lists and maps.
+fn has_variable_lengths(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(..) => true,
+        DataType::FixedSizeList(field, _) => has_variable_lengths(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_variable_lengths(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_variable_lengths(field.data_type())),
+        DataType::Dictionary(_, values) => has_variable_lengths(values),
+        DataType::RunEndEncoded(_, values) => has_variable_lengths(values.data_type()),
+        _ => false,
+    }
 }
 
 /// The operands of `expr` that DataFusion evaluates on rows that depend on
@@ -1544,8 +1603,13 @@ mod tests {
             // rows.
             ("10 / a > 1 AND b = 1", false),
             ("10 / a > 1 OR b = 1", false),
-            ("upper(s) = 'X' AND a > 0", false),
+            ("length(s) = 1 AND a > 0", false),
             ("regexp_count(s, 'a+') > 0 AND a > 0", false),
+            // But a function that builds strings (or other values of variable
+            // lengths) may fail depending on how many rows it is evaluated on
+            // together (e.g. `repeat` limits the size of its strings).
+            ("upper(s) = 'X' AND a > 0", true),
+            ("repeat(s, b) IS NULL", true),
             // `regexp_count` only compiles its pattern if there are rows: it
             // fails on the first row, whatever the batches.
             ("regexp_count(s, 'a{1000000}') > 0 AND a > 0", false),
@@ -1575,7 +1639,7 @@ mod tests {
             ("CAST(10 / a AS SMALLINT) > 0", true),
             ("upper(s) = lower(s)", true),
             ("10 / a > 1", false),
-            ("upper(s) = 'X' AND a > 0", false),
+            ("length(s) = 1 AND a > 0", false),
             // `CASE` itself does not fail.
             ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
         ] {
