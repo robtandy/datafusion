@@ -1288,8 +1288,23 @@ mod tests {
         let mut hashes = vec![];
         hash_join_keys(&keys, 4, &mut hashes).unwrap();
         assert_eq!(hashes[0], hashes[1]);
-        assert_ne!(hashes[0], hashes[2]);
-        assert_ne!(hashes[0], hashes[3]);
+        // Different keys have different hashes, unless every value hashes to
+        // the same value (as with `datafusion-common/force_hash_collisions`,
+        // which `hash_collisions_only_cost_key_comparisons` simulates).
+        if !hashes_are_forced_to_collide() {
+            assert_ne!(hashes[0], hashes[2]);
+            assert_ne!(hashes[0], hashes[3]);
+        }
+    }
+
+    /// Whether all values have the same hash, as with the
+    /// `datafusion-common/force_hash_collisions` feature that the tests run
+    /// with too.
+    fn hashes_are_forced_to_collide() -> bool {
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![0, 1]))];
+        let mut hashes = vec![];
+        hash_join_keys(&keys, 2, &mut hashes).unwrap();
+        hashes[0] == hashes[1]
     }
 
     #[test]
