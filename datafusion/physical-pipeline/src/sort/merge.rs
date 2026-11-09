@@ -472,6 +472,38 @@ mod tests {
     }
 
     #[test]
+    fn chunks_whose_rows_do_not_fit_into_one_batch_are_split() {
+        // 1100 runs of one row, whose strings share a 2 MiB buffer: a chunk of
+        // all 1100 rows needs 2.2 GiB of string values, more than the 32-bit
+        // offsets of `Utf8` address. The merger emits two chunks instead.
+        let converter = converter(SortOptions::default());
+        let s = StringArray::from(vec!["x".repeat(2 << 20)]);
+        let runs = (0..1100)
+            .map(|i| {
+                let k = Arc::new(Int32Array::from(vec![i])) as ArrayRef;
+                let id = Arc::new(Int64Array::from(vec![i64::from(i)]));
+                let keys = converter.convert_columns(&[Arc::clone(&k)]).unwrap();
+                let batch =
+                    RecordBatch::try_new(schema(), vec![k, Arc::new(s.clone()), id])
+                        .unwrap();
+                SortedRun::try_new(batch, keys).unwrap()
+            })
+            .collect();
+        let mut merger = RunMerger::new(schema(), runs, None);
+        let mut sizes = vec![];
+        let mut ids = vec![];
+        while let Some(batch) = merger.next_batch(2048).unwrap() {
+            sizes.push(batch.num_rows());
+            let s = batch.column(1).as_string::<i32>();
+            assert!((0..batch.num_rows()).all(|row| s.value(row).len() == 2 << 20));
+            ids.extend_from_slice(batch.column(2).as_primitive::<Int64Type>().values());
+        }
+        assert_eq!(sizes, [550, 550]);
+        assert_eq!(ids, (0..1100).collect::<Vec<_>>());
+        assert_eq!(merger.remaining_rows(), 0);
+    }
+
+    #[test]
     fn capacity_errors_are_recognized() {
         assert!(is_capacity_error(&ArrowError::OffsetOverflowError(1 << 31)));
         // The error of `MutableArrayData`.

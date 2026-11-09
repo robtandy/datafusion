@@ -186,7 +186,17 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`): the native sort
 ///   evaluates its keys on each chunk, DataFusion on its batches, or on all
 ///   rows of a small partition at once, so one of them can fail where the
-///   other does not.
+///   other does not;
+/// * TopKs of more than one row whose rows have values with 32-bit offsets
+///   (`Utf8`, `Binary`, lists, maps, also inside dictionaries, run-end
+///   encodings and structs), and sorts of run-end encoded values with 32-bit
+///   offsets. DataFusion's TopK gathers all its rows into one batch (when it
+///   emits and when it compacts them), and its sort takes chunks of
+///   `batch_size` sorted rows, in which run-end encoded values can need a
+///   value per row. Neither splits rows that need more than the 2 GiB that
+///   32-bit offsets address, so whether DataFusion fails depends on its
+///   batches; the native operators split such rows into smaller runs and
+///   chunks, as DataFusion's merges do.
 ///
 /// [`SORT_RUN_ROWS`]: sort_sink::SORT_RUN_ROWS
 ///
@@ -316,6 +326,23 @@ impl SortPlan {
                 .0
                 .is_empty()
         {
+            return Ok(None);
+        }
+
+        // DataFusion materializes some rows of the sort in single arrays,
+        // without splitting rows that do not fit (32-bit offsets address 2 GiB
+        // of values): its TopK gathers all its rows into one batch, also while
+        // it compacts them, and its sort takes chunks of `batch_size` sorted
+        // rows of each run, in which run-end encoded values can need a value
+        // per row. Whether it fails depends on its batches; the native
+        // operators split such rows, so these sorts are left to DataFusion.
+        let rows = sort.schema();
+        let mut types = rows.fields().iter().map(|field| field.data_type());
+        let unsplit = match sort.fetch() {
+            Some(fetch) => fetch > 1 && types.any(has_32_bit_offsets),
+            None => types.any(has_run_end_encoded_offsets),
+        };
+        if unsplit {
             return Ok(None);
         }
 
@@ -700,6 +727,54 @@ fn has_narrow_encoding(data_type: &DataType) -> bool {
         DataType::Union(fields, _) => fields
             .iter()
             .any(|(_, field)| has_narrow_encoding(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether values of `data_type` (or of its children, dictionary values or
+/// run-end encoded values) have 32-bit offsets, which address at most 2 GiB
+/// of values (or 2^31 child values) in one array.
+fn has_32_bit_offsets(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Utf8
+        | DataType::Binary
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::Map(_, _) => true,
+        DataType::Dictionary(_, values) => has_32_bit_offsets(values),
+        DataType::RunEndEncoded(_, values) => has_32_bit_offsets(values.data_type()),
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => has_32_bit_offsets(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_32_bit_offsets(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_32_bit_offsets(field.data_type())),
+        _ => false,
+    }
+}
+
+/// Whether values of `data_type` (or of its children) are run-end encoded
+/// with values that have 32-bit offsets (see [`has_32_bit_offsets`]): rows of
+/// such an array taken in another order can need a value per row.
+fn has_run_end_encoded_offsets(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::RunEndEncoded(_, values) => has_32_bit_offsets(values.data_type()),
+        DataType::Dictionary(_, values) => has_run_end_encoded_offsets(values),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_run_end_encoded_offsets(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_run_end_encoded_offsets(field.data_type())),
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_run_end_encoded_offsets(field.data_type())),
         _ => false,
     }
 }
@@ -1244,10 +1319,9 @@ mod tests {
 
     use arrow::array::{
         AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
-        Float64Array, Int32Array, Int64Array, ListArray, RunArray, StringArray,
-        StringViewArray, StructArray, TimestampNanosecondArray,
+        Float64Array, Int32Array, Int64Array, RunArray, StringArray, StringViewArray,
+        TimestampNanosecondArray,
     };
-    use arrow::buffer::OffsetBuffer;
     use arrow::compute::{SortOptions, concat_batches};
     use arrow::datatypes::{Field, Int32Type, Int64Type};
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
@@ -1256,9 +1330,8 @@ mod tests {
     use datafusion_expr::Operator;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, col, lit};
+    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::repartition::RepartitionExec;
-    use datafusion_physical_plan::{Partitioning, execute_stream};
-    use futures::StreamExt;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -1466,9 +1539,53 @@ mod tests {
 
     /// `t1` with its 4 skewed partitions (`partitions == 4`), in a single
     /// partition (`1`) or without partitions (`0`).
-    fn t1_scan(partitions: usize) -> Arc<dyn ExecutionPlan> {
+    /// The partitions of `t1`, with `d` as `Utf8View`: TopKs of rows with
+    /// 32-bit offsets are left to DataFusion (see
+    /// `topks_of_rows_with_32_bit_offsets_are_left_to_datafusion`), and the
+    /// tests of the lowering would not lower them.
+    fn t1_partitions() -> (SchemaRef, Vec<Vec<RecordBatch>>) {
         let t1 = test_table_t1().unwrap();
         let schema = t1[0][0].schema();
+        let view = |data_type: &DataType| match data_type {
+            DataType::Utf8 => DataType::Utf8View,
+            data_type => data_type.clone(),
+        };
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(view(field.data_type()))
+            })
+            .collect::<Vec<_>>();
+        let schema =
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+        let t1 = t1
+            .into_iter()
+            .map(|partition| {
+                partition
+                    .into_iter()
+                    .map(|batch| {
+                        let columns = batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                arrow::compute::cast(column, &view(column.data_type()))
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .unwrap();
+                        RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+                    })
+                    .collect()
+            })
+            .collect();
+        (schema, t1)
+    }
+
+    fn t1_scan(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let (schema, t1) = t1_partitions();
         let t1 = match partitions {
             0 => vec![],
             1 => vec![t1.into_iter().flatten().collect()],
@@ -1480,8 +1597,7 @@ mod tests {
 
     /// `t1` in a single partition sorted by `id`, which the scan declares.
     fn sorted_t1_scan() -> Arc<dyn ExecutionPlan> {
-        let t1 = test_table_t1().unwrap();
-        let schema = t1[0][0].schema();
+        let (schema, t1) = t1_partitions();
         let batch = concat_batches(&schema, t1.iter().flatten()).unwrap();
         let ordering = ordering(&schema, &[("id", false)]);
         let source = MemorySourceConfig::try_new(&[vec![batch]], schema, None)
@@ -2042,14 +2158,24 @@ mod tests {
     async fn differential_order_by_dictionary_and_nested_keys() {
         assert_sorted_natively(&[
             "SELECT id, arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 ORDER BY dd, id",
-            "SELECT id, arrow_cast(d, 'Dictionary(Int64, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
+            "SELECT id, arrow_cast(d, 'Dictionary(Int64, LargeUtf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
             "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l, id",
-            "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
+            "SELECT id, arrow_cast(make_array(a, b), 'LargeList(Int64)') AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
             "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s NULLS FIRST, id",
-            "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
-            "SELECT id, make_array(c) AS l FROM t1 ORDER BY l, id LIMIT 2400",
+            "SELECT id, named_struct('x', a, 'y', h) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
+            "SELECT id, arrow_cast(make_array(c), 'LargeList(Float64)') AS l FROM t1 ORDER BY l, id LIMIT 2400",
         ])
         .await;
+        // TopKs of rows with values that have 32-bit offsets, also in
+        // dictionaries, lists and structs, are left to DataFusion, see
+        // `topks_of_rows_with_32_bit_offsets_are_left_to_datafusion`.
+        for sql in [
+            "SELECT id, arrow_cast(d, 'Dictionary(Int64, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
+            "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
+            "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
+        ] {
+            assert_eq!(sorts(&assert_parity(sql).await), 0, "{sql}");
+        }
         // Dictionaries with narrow keys are left to DataFusion, see
         // `sorts_of_narrow_dictionaries_are_left_to_datafusion`.
         let sql = "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 \
@@ -2200,6 +2326,8 @@ mod tests {
             (DataType::Int32, true),
         ] {
             for fetch in [None, Some(150)] {
+                // A TopK of rows with `Utf8` values is left to DataFusion too.
+                let native = native && fetch.is_none();
                 let key = key_type.clone();
                 let make = move || -> Result<Arc<dyn ExecutionPlan>> {
                     let sort = sort_exec(
@@ -2438,120 +2566,254 @@ mod tests {
         assert!(sort_keys.sort_with_kernel(some, Some(2)).unwrap().is_some());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_of_large_values_emit_batches_that_fit_into_arrays() -> Result<()> {
-        // Two partitions of 512 rows with interleaving keys and a constant,
-        // distinct, run-end encoded 2 MiB string each, also in a list (of one
-        // element per row) in a struct. DataFusion merges them into batches of
-        // 64 rows (128 MiB of values each); a sorted run or chunk of all 1024
-        // rows needs 2 GiB of values, more than the 32-bit offsets of `Utf8`
-        // address. The native sort splits such runs and chunks into smaller
-        // ones (on one worker both). The nested payloads run on one worker
-        // only: on four, the run of each thread takes one string per row, 1
-        // GiB, as DataFusion's sort of each partition does.
-        let run_end_encoded = |letter: &str| -> ArrayRef {
-            Arc::new(
-                RunArray::<Int32Type>::try_new(
-                    &Int32Array::from(vec![512]),
-                    &StringArray::from(vec![letter.repeat(2 << 20)]),
-                )
-                .unwrap(),
-            )
-        };
-        let nested = |payload: ArrayRef| -> ArrayRef {
-            let item = Arc::new(Field::new("item", payload.data_type().clone(), true));
-            let offsets =
-                OffsetBuffer::from_lengths(std::iter::repeat_n(1, payload.len()));
-            let list: ArrayRef = Arc::new(ListArray::new(item, offsets, payload, None));
-            let field = Arc::new(Field::new("l", list.data_type().clone(), true));
-            Arc::new(StructArray::new(vec![field].into(), vec![list], None))
-        };
-        for (nest, workers) in [(false, &[1, 4][..]), (true, &[1][..])] {
-            let payloads = ["x", "y"].map(|letter| match nest {
-                false => run_end_encoded(letter),
-                true => nested(run_end_encoded(letter)),
-            });
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int64, false),
-                Field::new("p", payloads[0].data_type().clone(), true),
-            ]));
-            let partitions = payloads
-                .iter()
-                .zip([0, 1])
-                .map(|(payload, first)| {
-                    let keys =
-                        Int64Array::from_iter_values((0..512).map(|i| i * 2 + first));
-                    let columns = vec![Arc::new(keys) as ArrayRef, Arc::clone(payload)];
-                    vec![RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()]
-                })
-                .collect::<Vec<_>>();
-            let make = || -> Result<Arc<dyn ExecutionPlan>> {
-                let scan = MemorySourceConfig::try_new_exec(
-                    &partitions,
-                    Arc::clone(&schema),
-                    None,
-                )?;
-                Ok(merge(
-                    sort_exec(scan, &[("k", false)], true, None),
-                    &[("k", false)],
-                    None,
-                ))
-            };
-            let config = test_session_config().with_batch_size(64);
-            let expected = large_value_rows(make()?, config.clone()).await?;
-            assert_eq!(expected.len(), 1024);
-            for &threads in workers {
-                let plan = make()?;
-                let root = lower(&plan)?;
-                assert!(root.is::<PhysicalSort>());
-                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
-                let output = large_value_rows(
-                    exec,
-                    config.clone().with_target_partitions(threads),
-                )
-                .await
-                .map_err(|e| e.context(format!("{threads} threads, {nest}")))?;
-                assert_eq!(output, expected, "{threads} threads, nested: {nest}");
-            }
+    #[test]
+    fn sorted_rows_that_do_not_fit_into_one_batch_are_split_into_runs() {
+        // 1025 one-row batches in descending order of `k`, whose strings share
+        // a 2 MiB buffer: sorted, they need 2 GiB of string values in one
+        // array, more than its 32-bit offsets address. They become
+        // consecutive runs, which merge into the sorted rows.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(2 << 20)]));
+        let batches = (0..1025)
+            .rev()
+            .map(|k| {
+                let columns: Vec<ArrayRef> =
+                    vec![Arc::new(Int64Array::from(vec![k])), Arc::clone(&s)];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let sort_keys = sort_keys(&schema, &[("k", SortOptions::default())]);
+        let runs = sort_keys.sort(&schema, &batches, None).unwrap();
+        assert_eq!(
+            runs.iter().map(SortedRun::num_rows).collect::<Vec<_>>(),
+            [513, 512]
+        );
+        let mut merger = RunMerger::new(Arc::clone(&schema), runs, None);
+        let mut keys = vec![];
+        while let Some(batch) = merger.next_batch(2048).unwrap() {
+            keys.extend_from_slice(batch.column(0).as_primitive::<Int64Type>().values());
         }
-        Ok(())
+        assert_eq!(keys, (0..1025).collect::<Vec<_>>());
     }
 
-    /// The key, the first letter and the length of the run-end encoded string
-    /// (also in lists and structs) of every row of `plan`, whose batches hold
-    /// 2 GiB: they are streamed, and their bytes are not compared.
-    async fn large_value_rows(
-        plan: Arc<dyn ExecutionPlan>,
-        config: SessionConfig,
-    ) -> Result<Vec<(i64, u8, usize)>> {
-        let schema = plan.schema();
-        let task_ctx = Arc::new(
-            datafusion_execution::TaskContext::default().with_session_config(config),
-        );
-        let mut stream = execute_stream(plan, task_ctx)?;
-        let mut rows = vec![];
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            assert_eq!(batch.schema(), schema);
-            let keys = batch.column(0).as_primitive::<Int64Type>();
-            for row in 0..batch.num_rows() {
-                let mut value = batch.column(1).slice(row, 1);
-                loop {
-                    value = match value.data_type() {
-                        DataType::Struct(_) => Arc::clone(value.as_struct().column(0)),
-                        DataType::List(_) => value.as_list::<i32>().value(0),
-                        _ => break,
-                    };
-                }
-                let run = value.as_run::<Int32Type>();
-                let string = run
-                    .values()
-                    .as_string::<i32>()
-                    .value(run.get_physical_index(0));
-                rows.push((keys.value(row), string.as_bytes()[0], string.len()));
-            }
+    /// One partition of two batches of 512 rows `(k, p)`, with interleaving
+    /// keys `k` and the run-end encoded payloads `p` of `payload`.
+    fn interleaving_payloads_scan(
+        payload: fn(&str) -> ArrayRef,
+    ) -> Arc<dyn ExecutionPlan> {
+        let batches = [(0, "x"), (1, "y")].map(|(first, letter)| {
+            let keys = Int64Array::from_iter_values((0..512).map(|i| i * 2 + first));
+            (Arc::new(keys) as ArrayRef, payload(letter))
+        });
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("p", batches[0].1.data_type().clone(), true),
+        ]));
+        let batches = batches
+            .into_iter()
+            .map(|(keys, payload)| {
+                RecordBatch::try_new(Arc::clone(&schema), vec![keys, payload]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        MemorySourceConfig::try_new_exec(&[batches], schema, None).unwrap()
+    }
+
+    /// 512 rows of a run-end encoded 2 MiB string of `letter`.
+    fn run_end_encoded_strings(letter: &str) -> ArrayRef {
+        Arc::new(
+            RunArray::<Int32Type>::try_new(
+                &Int32Array::from(vec![512]),
+                &StringArray::from(vec![letter.repeat(2 << 20)]),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Whether a sort of rows `(k, p)` with `p` of `data_type`, by `k` and
+    /// with `fetch`, is lowered.
+    fn lowers_sort_of_payload(data_type: &DataType, fetch: Option<usize>) -> bool {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("p", data_type.clone(), true),
+        ]));
+        let scan = MemorySourceConfig::try_new_exec(&[vec![]], schema, None).unwrap();
+        try_lower_bridged(&sort_exec(scan, &[("k", false)], false, fetch)).is_some()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_of_rows_with_32_bit_offsets_are_left_to_datafusion() {
+        // DataFusion's TopK gathers its rows into one batch (when it emits and
+        // when it compacts them), without splitting rows that do not fit, so
+        // it fails where the native TopK, which splits them, returns rows.
+        let config = test_session_config();
+        // Two batches with interleaving keys and a constant, distinct, run-end
+        // encoded 2 MiB string each: the top 1024 rows alternate between the
+        // batches and need 2 GiB of values.
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = interleaving_payloads_scan(run_end_encoded_strings);
+            Ok(sort_exec(scan, &[("k", false)], false, Some(1024)))
+        };
+        let message = "Offset overflow error: 2147483648";
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make,
+            lower,
+            config.clone(),
+            message,
+        )
+        .await;
+        assert_eq!(sorts(&root), 0);
+        // 1100 one-row batches whose strings share a 2 MiB buffer.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(2 << 20)]));
+        let batches = (0..1100)
+            .map(|k| {
+                let columns: Vec<ArrayRef> =
+                    vec![Arc::new(Int64Array::from(vec![k])), Arc::clone(&s)];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )?;
+            Ok(sort_exec(scan, &[("k", false)], false, Some(2000)))
+        };
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make,
+            lower,
+            config,
+            "Offset overflow error",
+        )
+        .await;
+        assert_eq!(sorts(&root), 0);
+
+        // Rows whose values have 32-bit offsets, also inside them, are left to
+        // DataFusion; a TopK of one row cannot need more than an array holds.
+        let field = |data_type: DataType| Arc::new(Field::new("x", data_type, true));
+        let dictionary = |values: DataType| {
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(values))
+        };
+        let run_end_encoded = |values: DataType| {
+            let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+            DataType::RunEndEncoded(run_ends, field(values))
+        };
+        // Their full sorts stay native, except for run-end encoded strings,
+        // see `sorts_of_run_end_encoded_strings_are_left_to_datafusion`.
+        for (data_type, sorted_natively) in [
+            (DataType::Utf8, true),
+            (DataType::Binary, true),
+            (DataType::List(field(DataType::Int32)), true),
+            (DataType::LargeList(field(DataType::Utf8)), true),
+            (dictionary(DataType::Utf8), true),
+            (DataType::Struct(vec![field(DataType::Utf8)].into()), true),
+            (run_end_encoded(DataType::Utf8), false),
+        ] {
+            assert!(!lowers_sort_of_payload(&data_type, Some(2)), "{data_type}");
+            assert!(lowers_sort_of_payload(&data_type, Some(1)), "{data_type}");
+            let lowered = lowers_sort_of_payload(&data_type, None);
+            assert_eq!(lowered, sorted_natively, "{data_type}");
         }
-        Ok(rows)
+        for data_type in [
+            DataType::Int64,
+            DataType::Utf8View,
+            DataType::LargeUtf8,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(4),
+            DataType::LargeList(field(DataType::Int64)),
+            dictionary(DataType::LargeUtf8),
+            DataType::Struct(vec![field(DataType::Utf8View)].into()),
+            run_end_encoded(DataType::Int64),
+        ] {
+            assert!(lowers_sort_of_payload(&data_type, Some(2)), "{data_type}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_run_end_encoded_strings_are_left_to_datafusion() {
+        // DataFusion's sort takes chunks of `batch_size` sorted rows of a run
+        // without splitting rows that do not fit: one batch of two runs of a
+        // 2 MiB string, by keys that interleave the runs, needs a string per
+        // sorted row, 2 GiB in a chunk of 1024 rows, and DataFusion fails with
+        // the default `batch_size`. With 64 rows per chunk it would succeed.
+        // Sorts of run-end encoded values with 32-bit offsets are left to it.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("p", run_end_encoded_strings("x").data_type().clone(), true),
+        ]));
+        let keys = (0..512).map(|i| i * 2).chain((0..512).map(|i| i * 2 + 1));
+        let payload = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![512, 1024]),
+            &StringArray::from(vec!["x".repeat(2 << 20), "y".repeat(2 << 20)]),
+        )
+        .unwrap();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(keys)),
+            Arc::new(payload),
+        ];
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            Ok(sort_exec(scan, &[("k", false)], false, None))
+        };
+        let message = "Offset overflow error: 2147483648";
+        let root = assert_lowered_plan_fails_like_datafusion(
+            make,
+            lower,
+            test_session_config(),
+            message,
+        )
+        .await;
+        assert_eq!(sorts(&root), 0);
+        // Also merged sorts of partitions, merges with a fetch of a sort, and
+        // nested run-end encoded strings. Run-end encoded values without
+        // 32-bit offsets stay native.
+        let merged = |payload: fn(&str) -> ArrayRef, fetch: Option<usize>| {
+            let sort = sort_exec(
+                interleaving_payloads_scan(payload),
+                &[("k", false)],
+                true,
+                None,
+            );
+            try_lower_bridged(&merge(sort, &[("k", false)], fetch)).is_some()
+        };
+        assert!(!merged(run_end_encoded_strings, None));
+        assert!(!merged(run_end_encoded_strings, Some(10)));
+        let field = |data_type: DataType| Arc::new(Field::new("x", data_type, true));
+        let run_end_encoded = |values: DataType| {
+            let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
+            DataType::RunEndEncoded(run_ends, field(values))
+        };
+        let nested = DataType::Struct(
+            vec![field(DataType::List(field(run_end_encoded(
+                DataType::Utf8,
+            ))))]
+            .into(),
+        );
+        assert!(!lowers_sort_of_payload(&nested, None));
+        assert!(!lowers_sort_of_payload(
+            &run_end_encoded(DataType::Binary),
+            None
+        ));
+        assert!(lowers_sort_of_payload(
+            &run_end_encoded(DataType::Float64),
+            None
+        ));
+        assert!(lowers_sort_of_payload(
+            &run_end_encoded(DataType::LargeUtf8),
+            None
+        ));
     }
 
     /// A scan of the rows `(a, b)` of `partitions`, a list of batches per
@@ -2789,28 +3051,32 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_order_by_limit() {
+        // (`* EXCLUDE (d)`: TopKs of rows with `Utf8` values are left to
+        // DataFusion, see below; `h` is a `Utf8View` column.)
         for sql in [
-            "SELECT * FROM t1 ORDER BY id LIMIT 10",
+            "SELECT * EXCLUDE (d) FROM t1 ORDER BY id LIMIT 10",
             "SELECT * FROM t1 ORDER BY id DESC LIMIT 1",
             "SELECT id, a FROM t1 ORDER BY a NULLS FIRST, id LIMIT 7",
             "SELECT id, a FROM t1 ORDER BY a DESC NULLS LAST, id LIMIT 25",
-            "SELECT id, d FROM t1 ORDER BY d DESC, id LIMIT 777",
+            "SELECT id, h FROM t1 ORDER BY h DESC, id LIMIT 777",
             "SELECT id, g FROM t1 ORDER BY g, id LIMIT 50",
             "SELECT id, g FROM t1 ORDER BY g DESC NULLS LAST, id LIMIT 2500",
             "SELECT id, h FROM t1 ORDER BY h, id DESC LIMIT 1024",
             "SELECT id, ts FROM t1 ORDER BY ts DESC, id LIMIT 2049",
-            "SELECT * FROM t1 ORDER BY e NULLS FIRST, f, id LIMIT 4999",
-            "SELECT * FROM t1 ORDER BY b, id LIMIT 5000",
-            "SELECT * FROM t1 ORDER BY b, id LIMIT 6000",
+            "SELECT * EXCLUDE (d) FROM t1 ORDER BY e NULLS FIRST, f, id LIMIT 4999",
+            "SELECT * EXCLUDE (d) FROM t1 ORDER BY b, id LIMIT 5000",
+            "SELECT * EXCLUDE (d) FROM t1 ORDER BY b, id LIMIT 6000",
             "SELECT id, a + b AS s FROM t1 ORDER BY s DESC, id LIMIT 33",
             // Keys that cannot fail although they are not columns.
             "SELECT id, a FROM t1 ORDER BY a > 0 DESC, a IS NULL, id LIMIT 30",
             // Ties of rows that are identical in the output.
             "SELECT a, e FROM t1 ORDER BY a, e LIMIT 1000",
-            "SELECT d FROM t1 ORDER BY d DESC LIMIT 2600",
+            "SELECT h FROM t1 ORDER BY h DESC LIMIT 2600",
             // With an offset.
-            "SELECT id, d FROM t1 ORDER BY id LIMIT 10 OFFSET 5",
+            "SELECT id, h FROM t1 ORDER BY id LIMIT 10 OFFSET 5",
             "SELECT id, f FROM t1 ORDER BY f DESC, id LIMIT 3000 OFFSET 2047",
+            // A TopK of a single row cannot need more than one array holds.
+            "SELECT id, d FROM t1 ORDER BY d DESC, id LIMIT 1",
         ] {
             let root = assert_parity(sql).await;
             assert_eq!(
@@ -2828,6 +3094,11 @@ mod tests {
             "SELECT c FROM t1 ORDER BY c LIMIT 2300",
             "SELECT id, c FROM t1 ORDER BY c DESC, id LIMIT 3000 OFFSET 2047",
             "SELECT id, b FROM t1 ORDER BY a * 2 + 1 DESC, id LIMIT 33",
+            // TopKs of rows with values that have 32-bit offsets (see
+            // `topks_of_rows_with_32_bit_offsets_are_left_to_datafusion`).
+            "SELECT * FROM t1 ORDER BY id LIMIT 10",
+            "SELECT id, d FROM t1 ORDER BY d DESC, id LIMIT 777",
+            "SELECT d FROM t1 ORDER BY d DESC LIMIT 2600",
         ] {
             let root = assert_parity(sql).await;
             assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
@@ -2885,7 +3156,7 @@ mod tests {
         // aggregations.
         for sql in [
             "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
-            "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY n DESC, d LIMIT 4",
+            "SELECT h, COUNT(*) AS n FROM t1 GROUP BY h ORDER BY n DESC, h LIMIT 4",
             "SELECT d AS x, SUM(b) AS s FROM t1 GROUP BY d ORDER BY x DESC",
             "SELECT e, f, COUNT(DISTINCT a) AS da FROM t1 GROUP BY e, f ORDER BY f, e",
             "SELECT a, SUM(b) AS s FROM t1 GROUP BY a ORDER BY s DESC, a LIMIT 20",
@@ -2900,9 +3171,9 @@ mod tests {
         assert_sorted_natively(&[
             // DataFusion keeps the top groups only in the aggregation of a
             // top-k aggregation, which the native aggregation leaves to it.
-            "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d DESC LIMIT 3",
+            "SELECT h, COUNT(*) AS n FROM t1 GROUP BY h ORDER BY h DESC LIMIT 3",
             "SELECT a, MAX(id) AS m FROM t1 GROUP BY a ORDER BY m DESC LIMIT 20",
-            "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.id, t2.name, t2.w LIMIT 50",
+            "SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.id, t2.w LIMIT 50",
             "SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t2.w DESC, t1.id",
             "SELECT * FROM (SELECT id, a FROM t1 ORDER BY a NULLS FIRST, id LIMIT 10) ORDER BY id",
         ])
@@ -2923,11 +3194,11 @@ mod tests {
     async fn differential_sorts_of_empty_single_row_and_skewed_inputs() {
         assert_sorted_natively(&[
             "SELECT * FROM t_empty ORDER BY id",
-            "SELECT * FROM t_empty ORDER BY g DESC, id LIMIT 5",
+            "SELECT * EXCLUDE (d) FROM t_empty ORDER BY g DESC, id LIMIT 5",
             "SELECT * FROM t1 WHERE id < 0 ORDER BY a",
-            "SELECT * FROM t1 WHERE id < 0 ORDER BY a LIMIT 3",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE id < 0 ORDER BY a LIMIT 3",
             "SELECT * FROM t1 WHERE id = 42 ORDER BY a",
-            "SELECT * FROM t1 WHERE id = 4999 ORDER BY a DESC LIMIT 3",
+            "SELECT * EXCLUDE (d) FROM t1 WHERE id = 4999 ORDER BY a DESC LIMIT 3",
             // `t1` has skewed partitions: most rows in one, none in another.
             "SELECT * FROM t1 WHERE id >= 4990 OR id < 5 ORDER BY id DESC",
             "SELECT * FROM t2 ORDER BY w, k, name",
@@ -2941,8 +3212,8 @@ mod tests {
             let config = test_session_config().with_target_partitions(target_partitions);
             for sql in [
                 "SELECT * FROM t1 ORDER BY c, id",
-                "SELECT id, d FROM t1 ORDER BY d DESC, id LIMIT 100",
-                "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY n, d LIMIT 3",
+                "SELECT id, h FROM t1 ORDER BY h DESC, id LIMIT 100",
+                "SELECT h, COUNT(*) AS n FROM t1 GROUP BY h ORDER BY n, h LIMIT 3",
             ] {
                 let root = assert_parity_with_config(sql, config.clone()).await;
                 assert_eq!(sorts(&root), 1, "{sql}");
