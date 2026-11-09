@@ -30,7 +30,14 @@
 //! a batch unless at most 20% of them have `x <> 0`, or
 //! `x = 0 OR s ~ 'a{1000000}'`, whose right side does not compile and is
 //! evaluated on empty batches, must be evaluated by DataFusion, on the
-//! batches of its input plan.
+//! batches of its input plan. The analytical expressions of TPC-H are
+//! lowered: chains of decimal arithmetic, which can only fail with arithmetic
+//! overflows (e.g. `l_extendedprice * (1 - l_discount) * (1 + l_tax)`), the
+//! built-in functions whose implementations are known (e.g.
+//! `extract(year from o_orderdate)` or `substring(c_phone from 1 for 2)`), and
+//! constant strings of bounded sizes (e.g.
+//! `CASE WHEN ... THEN '1-URGENT' ELSE '2-HIGH' END`), see
+//! [`depends_on_batches`].
 //!
 //! The evaluation of expressions on some of the rows of a chunk (`BoundExprs`)
 //! is shared with [`PhysicalFilter`](super::filter::PhysicalFilter).
@@ -51,7 +58,9 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
-use super::adaptive_filter::{depends_on_batches, failing_parts, has_32_bit_offsets};
+use super::adaptive_filter::{
+    Failures, depends_on_batches, failures, has_32_bit_offsets,
+};
 use crate::chunk::{DataChunk, Gather, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -98,21 +107,29 @@ impl PhysicalProjection {
     /// exactly its semantics, including its errors: whether none of its
     /// expressions has errors that depend on how DataFusion splits the rows
     /// into batches, empty ones included (see [`depends_on_batches`]), at most
-    /// one part of all of its expressions may fail (which error
-    /// `ProjectionExec`, which evaluates each expression on a whole batch
-    /// before the next one, raises first depends on its batches, see
-    /// [`failing_parts`]), and its input has no lists of values that take
-    /// less than a byte each (e.g. fixed-size lists of `1 << 30` nulls,
-    /// booleans, or empty lists or binaries), which the native operators cannot
-    /// gather with `take`, and no run-end encoded arrays whose child fields are
-    /// not Arrow's (see `can_gather`).
+    /// one part of all of its expressions may fail, unless all of them can
+    /// only fail with arithmetic overflows (which error `ProjectionExec`,
+    /// which evaluates each expression on a whole batch before the next one,
+    /// raises first depends on its batches otherwise, see [`Failures`]), and
+    /// its input has no lists of values that take less than a byte each (e.g.
+    /// fixed-size lists of `1 << 30` nulls, booleans, or empty lists or
+    /// binaries), which the native operators cannot gather with `take`, and no
+    /// run-end encoded arrays whose child fields are not Arrow's (see
+    /// `can_gather`).
+    ///
+    /// So the projections of analytical queries are lowered, e.g. the decimal
+    /// arithmetic `l_extendedprice * (1 - l_discount) * (1 + l_tax)`, the
+    /// built-in functions `extract(year from o_orderdate)` and
+    /// `substring(c_phone from 1 for 2)`, or the bounded constants of
+    /// `CASE WHEN ... THEN '1-URGENT' ELSE '2-HIGH' END`.
     ///
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion,
     /// and so it must a projection with a part that may fail above native
-    /// operators of the same pipeline with parts that may fail, and the
-    /// filters below a projection with a part that may fail whose plans have
-    /// parts that may fail (see
+    /// operators of the same pipeline with parts that may fail (unless all of
+    /// these parts can only fail with arithmetic overflows), and the filters
+    /// below a projection with a part that may fail whose plans have parts
+    /// that may fail (likewise, see
     /// [`supports_filter_exec`](super::filter::PhysicalFilter::supports_filter_exec)):
     /// the rows evaluated before the limit is reached, and which error comes
     /// first, depend on DataFusion's batches.
@@ -128,12 +145,12 @@ impl PhysicalProjection {
         {
             return false;
         }
-        let failing_parts = exec
+        let failures = exec
             .expr()
             .iter()
-            .map(|projection| failing_parts(&projection.expr, input_schema.as_ref()))
-            .fold(0, usize::saturating_add);
-        failing_parts <= 1
+            .map(|projection| failures(&projection.expr, input_schema.as_ref()))
+            .fold(Failures::NONE, Failures::and);
+        !failures.order_matters()
             && input_schema
                 .fields()
                 .iter()
@@ -963,20 +980,32 @@ mod tests {
             "SELECT d, COUNT(*) AS n FROM t1 WHERE a > 0 GROUP BY d",
             "SELECT t1.id, t2.name, t1.a * t2.w AS aw FROM t1 JOIN t2 ON t1.a = t2.k WHERE t1.b > 10",
             "SELECT id FROM t1 WHERE a > 40 UNION ALL SELECT k FROM t2 WHERE k < 0",
-        ])
-        .await;
-        // Several functions (whose failures are not known) or other parts that
-        // may fail: which error comes first depends on the batches. Or string
-        // constants, copied for every row of a batch, whose 32-bit offsets
-        // overflow on batches with enough rows. Or functions that build
-        // strings, whose sizes DataFusion may limit per batch.
-        assert_all_projections_in_datafusion(&[
-            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
-            "SELECT id, a + b AS s, upper(d) AS u FROM t1 WHERE a > 10",
+            // Built-in functions whose implementations are known, a widening
+            // cast of decimals into floats with another part that may fail,
+            // and string constants of bounded sizes, which a batch holds for
+            // each of its rows.
             "SELECT id, a + b AS s, length(d) AS u FROM t1 WHERE a > 10",
             "SELECT id, CAST(g AS DOUBLE) AS gd, f + INTERVAL '1 day' AS next_day FROM t1",
             "SELECT id, CASE WHEN a IS NULL THEN 'none' WHEN a < 0 THEN 'neg' ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
+        ])
+        .await;
+        // Several functions (whose failures are not known) or other parts that
+        // may fail: which error comes first depends on the batches. Or string
+        // constants of more than `MAX_CONSTANT_BYTES`, copied for every row of
+        // a batch, whose 32-bit offsets overflow on batches with enough rows.
+        // Or functions that build strings, whose sizes DataFusion may limit
+        // per batch, or that may overflow their 32-bit offsets.
+        let large = format!(
+            "SELECT 1 AS one, '{}' AS s FROM t1 WHERE a > 0",
+            "x".repeat(crate::operators::adaptive_filter::MAX_CONSTANT_BYTES + 1)
+        );
+        assert_all_projections_in_datafusion(&[
+            "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
+            "SELECT id, a + b AS s, upper(d) AS u FROM t1 WHERE a > 10",
+            "SELECT id, CAST(a AS SMALLINT) AS n, f + INTERVAL '1 day' AS next_day FROM t1",
+            "SELECT id, CASE WHEN a < 0 THEN d ELSE 'pos' END AS sign FROM t1 WHERE b > 100",
+            &large,
         ])
         .await;
     }
@@ -2032,7 +2061,9 @@ mod tests {
         // and panics, but a pipeline on chunks of 2048 rows, on which `CASE`
         // returns the constant itself, or nulls (see the test of the same
         // name for filters). A constant that a projection outputs is copied
-        // for every row of the batch too.
+        // for every row of the batch too, unless it has at most
+        // `MAX_CONSTANT_BYTES` bytes, which batches hold for each of their
+        // rows.
         let batch = half_true();
         let schema = batch.schema();
         let plan = || -> Arc<dyn ExecutionPlan> {
@@ -2068,7 +2099,11 @@ mod tests {
             .unwrap();
             PhysicalProjection::supports_projection_exec(&projection)
         };
-        assert!(!constant("x"));
+        let max = crate::operators::adaptive_filter::MAX_CONSTANT_BYTES;
+        assert!(!constant(&"x".repeat(max + 1)));
+        assert!(!constant(&"x".repeat(2 << 20)));
+        assert!(constant(&"x".repeat(max)));
+        assert!(constant("x"));
         assert!(constant(""));
     }
 
@@ -2215,17 +2250,24 @@ mod tests {
             "SELECT d8 AS d, i + 1 AS j FROM vd WHERE d8 IS NOT NULL",
         ])
         .await;
-        // Functions are opaque: whatever they return, they may fail depending
-        // on the rows they are evaluated on together (e.g. `upper` takes the
-        // dictionary itself, and may evaluate all of its values, which depend
-        // on DataFusion's batches).
-        assert_all_projections_in_datafusion(&[
+        // Built-in functions whose implementations are known, of views.
+        assert_all_native_byte_eq(&[
             "SELECT i, character_length(sv) AS c FROM vd WHERE i % 5 = 0",
             "SELECT i, sv, strpos(sv, 'g') AS g FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
-            "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
-            "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
             "SELECT i, sv, substr(sv, 3) AS tail FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0",
+            "SELECT i, upper(sv) AS u, btrim(sv, 'as') AS t FROM vd WHERE i % 3 = 0",
             "SELECT CAST(d32 AS VARCHAR) || '!' AS x, length(sv) AS l FROM vd WHERE sv IS NOT NULL",
+        ])
+        .await;
+        // Functions are opaque: whatever they return, they may fail depending
+        // on the rows they are evaluated on together. And so are the
+        // built-in ones of dictionaries (e.g. `upper` takes the dictionary
+        // itself, and may evaluate all of its values, which depend on
+        // DataFusion's batches).
+        assert_all_projections_in_datafusion(&[
+            "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
+            "SELECT i, length(d8) AS u FROM vd WHERE i % 5 = 0",
+            "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
         ])
         .await;
     }
