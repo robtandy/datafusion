@@ -111,7 +111,9 @@ impl PhysicalProjection {
     /// Below a limit that stops the execution early (e.g. a
     /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion,
     /// and so it must a projection with a part that may fail above native
-    /// operators of the same pipeline with parts that may fail (see
+    /// operators of the same pipeline with parts that may fail, and the
+    /// filters below a projection with a part that may fail whose plans have
+    /// parts that may fail (see
     /// [`supports_filter_exec`](super::filter::PhysicalFilter::supports_filter_exec)):
     /// the rows evaluated before the limit is reached, and which error comes
     /// first, depend on DataFusion's batches.
@@ -1656,6 +1658,37 @@ mod tests {
         let (error, operators) = assert_native_plan_parity(plan, false).await;
         assert!(error.is_some());
         assert_eq!(operators.projections, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn projections_above_filters_between_failures_keep_their_errors() {
+        // `FilterExec(x >= 0)` pulls both batches of its input, and the cast of
+        // the second one fails, before the projection above it divides by zero
+        // the rows of the first one; a native filter would pass them on at
+        // once (see `filters_between_failures_stay_in_datafusion`).
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            let input = filtered_casts();
+            let schema = input.schema();
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(
+                        physical_expr("10 / x + c + l", &schema),
+                        "v",
+                    )],
+                    input,
+                )
+                .unwrap(),
+            )
+        };
+        let config =
+            || datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) =
+            assert_native_plan_parity_with_config(plan, false, config()).await;
+        let error = error.unwrap();
+        assert!(error.contains("Cannot cast string 'invalid'"), "{error}");
+        // The filter stays in DataFusion, with its input; the projection
+        // above it is lowered.
+        assert_eq!((operators.filters, operators.projections), (0, 1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -197,7 +197,8 @@ impl PhysicalFilter {
     /// included, unless a sort that reads all of its input is in between: a
     /// sort whose order its input does not satisfy, without a fetch or with
     /// a fetch that shares no prefix with the order of its input (a sort that
-    /// its input satisfies streams it, and such a TopK may stop early). DataFusion pulls its input lazily, batch by batch, but for
+    /// its input satisfies streams it, and such a TopK may stop early).
+    /// DataFusion pulls its input lazily, batch by batch, but for
     /// `FilterExec`, which pulls ahead to coalesce its output, so the rows that
     /// are evaluated before the limit is reached, and so the errors, depend on
     /// these pulls, which a pipeline (on several threads, with a cache of
@@ -210,6 +211,18 @@ impl PhysicalFilter {
     /// have parts that may fail too: DataFusion evaluates each operator on a
     /// whole batch before the next one, a pipeline each chunk with all of its
     /// operators, so which error comes first depends on the batches.
+    ///
+    /// And a planner must keep `exec` in DataFusion, with its input plan, if a
+    /// node above it (in DataFusion or not, e.g. a projection or the key of a
+    /// sort) has a part that may fail, and its predicate or a node of its
+    /// input plan (in DataFusion or not, sources included) has one too:
+    /// `FilterExec` coalesces its output, so it pulls later batches of its
+    /// input, and raises their errors, before the nodes above it see the rows
+    /// of the earlier ones, which the native filter passes on at once (e.g.
+    /// `10 / x` above `FilterExec(x >= 0)` above `CAST(s AS BIGINT)`, which
+    /// fails on the second batch: DataFusion raises the cast error, but
+    /// native operators above a native filter would divide the rows of the
+    /// first batch by zero first).
     pub fn supports_filter_exec(exec: &FilterExec) -> bool {
         unsupported_filter_exec(exec).is_none()
     }
@@ -1001,6 +1014,11 @@ pub(crate) mod test_support {
     /// * Below a limit that stops the execution early (unless a sort that
     ///   reads all of its input, see [`reads_all_input`], is in between), the
     ///   whole plan is executed by DataFusion.
+    /// * Below a node with a part that may fail, a `FilterExec` whose plan has
+    ///   parts that may fail (its predicate included) is executed by
+    ///   DataFusion with its input: it coalesces its output, so it raises the
+    ///   errors of later batches of its input before the nodes above it see
+    ///   the rows of earlier ones.
     /// * A `FilterExec` or a `ProjectionExec` that is not lowered, and a node
     ///   whose expressions may fail depending on DataFusion's batches, are
     ///   executed by DataFusion with their whole input plan, so that they see
@@ -1015,14 +1033,16 @@ pub(crate) mod test_support {
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        lower_below(plan, false)
+        lower_below(plan, false, false)
     }
 
     /// [`lower`] `plan`, which is below a limit that stops the execution
-    /// early if `limited`.
+    /// early if `limited`, and below a node with a part that may fail if
+    /// `fallible_above`.
     fn lower_below(
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
+        fallible_above: bool,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         if limited && !reads_all_input(plan) {
             // DataFusion pulls the input of a limit lazily, batch by batch,
@@ -1037,9 +1057,19 @@ pub(crate) mod test_support {
         // operators of a pipeline have several parts that may fail, which
         // error comes first depends on the batches.
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+            // `FilterExec` coalesces its output: it pulls later batches of its
+            // input, whose errors it raises, before the nodes above it see the
+            // rows of earlier ones, which the native filter passes on at once.
+            if fallible_above && subtree_failing_parts(plan)? > 0 {
+                return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
+            }
             if PhysicalFilter::supports_filter_exec(filter) {
-                let input = lower_below(filter.input(), filter.fetch().is_some())?;
                 let own = failing_parts(filter.predicate(), &filter.input().schema());
+                let input = lower_below(
+                    filter.input(),
+                    filter.fetch().is_some(),
+                    fallible_above || own > 0,
+                )?;
                 if own == 0 || native_failing_parts(&input) == 0 {
                     let filter: Arc<dyn PhysicalOperator> =
                         Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
@@ -1050,13 +1080,14 @@ pub(crate) mod test_support {
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             if PhysicalProjection::supports_projection_exec(projection) {
-                let input = lower_below(projection.input(), false)?;
                 let input_schema = projection.input().schema();
                 let own = projection
                     .expr()
                     .iter()
                     .map(|expr| failing_parts(&expr.expr, &input_schema))
                     .sum::<usize>();
+                let input =
+                    lower_below(projection.input(), false, fallible_above || own > 0)?;
                 if own == 0 || native_failing_parts(&input) == 0 {
                     return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
                         projection, input,
@@ -1068,16 +1099,22 @@ pub(crate) mod test_support {
         if let Some(scan) = crate::sources::try_create_scan_source(plan)? {
             return Ok(scan);
         }
-        if has_batch_dependent_expressions(plan)? {
+        let (batch_dependent, own) = judge_expressions(plan)?;
+        if batch_dependent {
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
+        let fallible_above = fallible_above || own > 0;
         if only_repartitions(plan) {
-            let input = lower_below(plan.children()[0], limited)?;
+            let input = lower_below(plan.children()[0], limited, fallible_above)?;
             if !input.is::<BridgeOperator>() {
                 return Ok(input);
             }
         }
-        Ok(Arc::new(BridgeOperator::new(bridged_plan(plan, limited)?)))
+        Ok(Arc::new(BridgeOperator::new(bridged_plan(
+            plan,
+            limited,
+            fallible_above,
+        )?)))
     }
 
     /// The parts that may fail (see [`failing_parts`]) of the native filters
@@ -1132,21 +1169,21 @@ pub(crate) mod test_support {
 
     /// Whether some expression of `plan` may fail depending on the batches
     /// it is evaluated on, or several parts of its expressions may fail (see
-    /// [`failing_parts`](crate::operators::adaptive_filter::failing_parts)):
-    /// judged on the schema of the input of `plan` if it has a single child,
-    /// and without schema otherwise, which is conservative (expressions that
-    /// may fail then fail on empty batches).
+    /// [`failing_parts`](crate::operators::adaptive_filter::failing_parts)),
+    /// and the number of these parts: judged on the schema of the input of
+    /// `plan` if it has a single child, and without schema otherwise, which is
+    /// conservative (expressions that may fail then fail on empty batches).
     /// The aggregations that merge partial states evaluate no expression on
     /// their input (the arguments of their aggregate functions are those of
     /// the partial aggregations).
-    fn has_batch_dependent_expressions(plan: &Arc<dyn ExecutionPlan>) -> Result<bool> {
+    fn judge_expressions(plan: &Arc<dyn ExecutionPlan>) -> Result<(bool, usize)> {
         if plan
             .downcast_ref::<AggregateExec>()
             .is_some_and(|aggregate| {
                 aggregate.mode().input_mode() == AggregateInputMode::Partial
             })
         {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let schema = match plan.children().as_slice() {
             [child] => child.schema(),
@@ -1168,7 +1205,18 @@ pub(crate) mod test_support {
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
-        Ok(batch_dependent || parts > 1)
+        Ok((batch_dependent || parts > 1, parts))
+    }
+
+    /// The parts that may fail of the expressions of the nodes of `plan` (see
+    /// [`judge_expressions`]), sources included.
+    fn subtree_failing_parts(plan: &Arc<dyn ExecutionPlan>) -> Result<usize> {
+        plan.children()
+            .into_iter()
+            .map(subtree_failing_parts)
+            .try_fold(judge_expressions(plan)?.1, |parts, child| {
+                Ok(parts.saturating_add(child?))
+            })
     }
 
     /// `plan`, to be executed by DataFusion, with its children lowered: a
@@ -1186,6 +1234,7 @@ pub(crate) mod test_support {
     fn bridged_plan(
         plan: &Arc<dyn ExecutionPlan>,
         limited: bool,
+        fallible_above: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let soft_limit = plan
             .downcast_ref::<AggregateExec>()
@@ -1196,7 +1245,7 @@ pub(crate) mod test_support {
         let new_children = children
             .iter()
             .enumerate()
-            .map(|(index, child)| child_plan(plan, index, child, limited))
+            .map(|(index, child)| child_plan(plan, index, child, limited, fallible_above))
             .collect::<Result<Vec<_>>>()?;
         let unchanged = children
             .iter()
@@ -1229,8 +1278,9 @@ pub(crate) mod test_support {
         index: usize,
         child: &Arc<dyn ExecutionPlan>,
         limited: bool,
+        fallible_above: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let lowered = lower_below(child, limited)?;
+        let lowered = lower_below(child, limited, fallible_above)?;
         if let Some(bridge) = lowered.downcast_ref::<BridgeOperator>() {
             return Ok(Arc::clone(bridge.plan()));
         }
@@ -1249,7 +1299,7 @@ pub(crate) mod test_support {
         ) && child.output_ordering().is_none()
             && !limits_partitions;
         if !single_partition && !unconstrained {
-            return bridged_plan(child, limited);
+            return bridged_plan(child, limited, fallible_above);
         }
         Ok(Arc::new(PipelineRootExec::try_new(
             lowered,
@@ -2176,6 +2226,31 @@ pub(crate) mod test_support {
     {
         static LARGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         LARGE.lock().await
+    }
+
+    /// One partition of two batches of 2048 rows, `(x, s) = (0, "1")` then
+    /// `(0, "invalid")`, projected by `x, CAST(s AS BIGINT) AS c, length(s) AS
+    /// l` (which stays in DataFusion: `length` is a function), and filtered by
+    /// `x >= 0` (whose `FilterExec` coalesces batches of 8192 rows).
+    pub(crate) fn filtered_casts() -> Arc<dyn ExecutionPlan> {
+        let batches = [xss(&[((0, "1"), 2048)]), xss(&[((0, "invalid"), 2048)])];
+        let schema = batches[0].schema();
+        let projection = Arc::new(
+            ProjectionExec::try_new(
+                [("x", "x"), ("CAST(s AS BIGINT)", "c"), ("length(s)", "l")].map(
+                    |(expr, name)| {
+                        datafusion_physical_expr::projection::ProjectionExpr::new(
+                            physical_expr(expr, &schema),
+                            name,
+                        )
+                    },
+                ),
+                scan_batches(&schema, &batches),
+            )
+            .unwrap(),
+        );
+        let predicate = physical_expr("x >= 0", &projection.schema());
+        Arc::new(FilterExec::try_new(predicate, projection).unwrap())
     }
 
     /// A batch of 4096 rows of `x` (`Boolean`), `true` on the first 2048 rows
@@ -3896,6 +3971,25 @@ mod tests {
             .build()
             .unwrap(),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_between_failures_stay_in_datafusion() {
+        // `FilterExec(x >= 0)` coalesces its output: it pulls both batches of
+        // its input, and the cast of the second one fails, before the filter
+        // above it divides by zero the rows of the first one. The native
+        // filter passes the rows of the first chunk on at once, and the native
+        // filter above it divides them by zero first.
+        let plan = || filter_exec("10 / x + c + l > 0", filtered_casts(), None);
+        let config =
+            || datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) =
+            assert_native_plan_parity_with_config(plan, false, config()).await;
+        let error = error.unwrap();
+        assert!(error.contains("Cannot cast string 'invalid'"), "{error}");
+        // The filter below stays in DataFusion, with its input; the one above
+        // is lowered.
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
