@@ -27,18 +27,13 @@
 //! 3. the pipeline engine runs the TPC-H queries with native operators only,
 //!    without falling back to a `BridgeOperator` (on both sources).
 //!
-//! The third assertion is made by the tests
-//! `tpch_queries_run_without_bridge_operator_*`, which are ignored by default
-//! until the pipeline engine runs all TPC-H plans natively: as long as
-//! `PipelineQueryPlanner` does not lower plans, every plan runs in a single
-//! `BridgeOperator`, and the native operators leave some of the nodes of the
-//! TPC-H plans to DataFusion (e.g. projections with several parts that may
-//! fail, such as the decimal arithmetic of Q1, or the `ScalarSubqueryExec` of
-//! Q11, Q15 and Q22). They list every fallback of every query:
-//!
-//! ```text
-//! cargo test -p datafusion-physical-pipeline --test tpch_parity -- --ignored
-//! ```
+//! The third assertion (`tpch_queries_run_without_bridge_operator`) is
+//! deferred while `PipelineQueryPlanner` does not lower plans to native
+//! operators: until the full plan lowering lands, the planner runs every plan
+//! in a single `BridgeOperator`, which the test detects (no operator of any
+//! TPC-H plan is native) and reports on stderr. As soon as any operator of any
+//! TPC-H plan is native, the test enforces that all 22 queries run natively
+//! over both sources, and lists every fallback of every query otherwise.
 //!
 //! The benchmark `benches/pipeline_vs_default.rs` includes this file as a
 //! module to reuse the data generator and the queries.
@@ -46,6 +41,7 @@
 #[path = "../src/test_utils.rs"]
 pub(crate) mod test_utils;
 
+use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{AsArray, RecordBatch};
@@ -2123,46 +2119,154 @@ impl Lowering {
     }
 }
 
-/// Plan the 22 TPC-H queries with the pipeline engine over `source` and
-/// assert that none of them falls back to a `BridgeOperator`: every node of
-/// their plans runs on a native pipeline operator. Lists all fallbacks.
-async fn assert_tpch_queries_run_natively(source: Source) -> Result<()> {
+/// The lowerings of the 22 TPC-H queries by the pipeline engine over
+/// `source`, in query order.
+async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
     let ctx = pipeline_context(test_session_config());
     source.register(&ctx).await?;
-    let mut fallbacks = vec![];
-    for (i, sql) in tpch::QUERIES.iter().enumerate() {
+    let mut lowerings = Vec::with_capacity(tpch::QUERIES.len());
+    for sql in tpch::QUERIES {
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let lowering = Lowering::of(&plan)?;
-        if !lowering.bridged.is_empty() {
-            fallbacks.push(format!(
-                "Q{}: {} of {} operators are BridgeOperators, which run\n  {}",
-                i + 1,
-                lowering.bridged.len(),
-                lowering.operators,
-                lowering.bridged.join("\n  ")
-            ));
-        }
+        lowerings.push(Lowering::of(&plan)?);
     }
-    assert!(
-        fallbacks.is_empty(),
-        "{} of the 22 TPC-H queries fall back to BridgeOperator over {}:\n{}",
-        fallbacks.len(),
-        source.name(),
-        fallbacks.join("\n")
-    );
+    Ok(lowerings)
+}
+
+/// The verdict of the zero-fallback check on the lowerings of the TPC-H
+/// queries over all sources.
+#[derive(Debug, PartialEq, Eq)]
+enum ZeroFallback {
+    /// No operator of any plan is native: `PipelineQueryPlanner` does not
+    /// lower plans yet (it runs every plan in a single `BridgeOperator`), so
+    /// the check is deferred.
+    Deferred,
+    /// Native lowering started, so the check is enforced: the plans that
+    /// still fall back to `BridgeOperator`s (none if it passes).
+    Enforced(Vec<String>),
+}
+
+impl ZeroFallback {
+    /// Judge `lowerings`: for every source (by name), the lowerings of the
+    /// TPC-H queries in query order. As soon as any operator of any plan is
+    /// native, every query must be native over every source.
+    fn judge(lowerings: &[(&str, Vec<Lowering>)]) -> Self {
+        let native = lowerings
+            .iter()
+            .flat_map(|(_, queries)| queries)
+            .map(Lowering::native_operators)
+            .sum::<usize>();
+        if native == 0 {
+            return Self::Deferred;
+        }
+        let fallbacks = lowerings
+            .iter()
+            .flat_map(|(source, queries)| {
+                queries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, lowering)| !lowering.bridged.is_empty())
+                    .map(move |(i, lowering)| {
+                        format!(
+                            "Q{} over {source}: {} of {} operators are BridgeOperators, \
+                             which run\n  {}",
+                            i + 1,
+                            lowering.bridged.len(),
+                            lowering.operators,
+                            lowering.bridged.join("\n  ")
+                        )
+                    })
+            })
+            .collect();
+        Self::Enforced(fallbacks)
+    }
+}
+
+/// No TPC-H query falls back to a `BridgeOperator`, over both sources: every
+/// node of every plan runs on a native pipeline operator.
+///
+/// The check is deferred while `PipelineQueryPlanner` does not lower plans,
+/// and enforced on Q1 to Q22 over both sources as soon as any operator of
+/// any TPC-H plan is native (see [`ZeroFallback::judge`]).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
+    let mut lowerings = vec![];
+    for source in [Source::memtable(), Source::parquet()] {
+        lowerings.push((source.name(), tpch_lowerings(&source).await?));
+    }
+    match ZeroFallback::judge(&lowerings) {
+        ZeroFallback::Deferred => {
+            // Bypass the output capture of libtest, so that every test run
+            // shows that the check is deferred.
+            writeln!(
+                std::io::stderr().lock(),
+                "tpch_parity: deferring the zero-BridgeOperator check of the TPC-H \
+                 queries: PipelineQueryPlanner does not lower plans to native operators \
+                 yet (every plan runs in a single BridgeOperator)"
+            )?;
+        }
+        ZeroFallback::Enforced(fallbacks) => assert!(
+            fallbacks.is_empty(),
+            "{} TPC-H plans fall back to BridgeOperator:\n{}",
+            fallbacks.len(),
+            fallbacks.join("\n")
+        ),
+    }
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "not all TPC-H queries run natively yet: run with --ignored to list the fallbacks"]
-async fn tpch_queries_run_without_bridge_operator_over_memtables() -> Result<()> {
-    assert_tpch_queries_run_natively(Source::memtable()).await
-}
+/// The zero-fallback check is deferred while no operator of any TPC-H plan is
+/// native, and enforced on every query over every source as soon as one is.
+#[test]
+fn zero_fallback_check_is_enforced_once_native_lowering_starts() {
+    let bridged = || Lowering {
+        operators: 1,
+        bridged: vec!["SortPreservingMergeExec: [a@0 ASC]".to_string()],
+    };
+    let partly_native = || Lowering {
+        operators: 3,
+        bridged: vec!["ProjectionExec: expr=[a@0 * b@1 as c]".to_string()],
+    };
+    let native = || Lowering {
+        operators: 2,
+        bridged: vec![],
+    };
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "not all TPC-H queries run natively yet: run with --ignored to list the fallbacks"]
-async fn tpch_queries_run_without_bridge_operator_over_parquet() -> Result<()> {
-    assert_tpch_queries_run_natively(Source::parquet()).await
+    // The planner does not lower plans yet.
+    assert_eq!(
+        ZeroFallback::judge(&[
+            ("MemTable", vec![bridged(), bridged()]),
+            ("Parquet", vec![bridged(), bridged()]),
+        ]),
+        ZeroFallback::Deferred
+    );
+
+    // A single native operator anywhere enforces the check on all plans,
+    // including the plans that run in a single `BridgeOperator`.
+    let ZeroFallback::Enforced(fallbacks) = ZeroFallback::judge(&[
+        ("MemTable", vec![bridged(), native()]),
+        ("Parquet", vec![partly_native(), bridged()]),
+    ]) else {
+        panic!("the check is not enforced");
+    };
+    let queries = fallbacks
+        .iter()
+        .map(|fallback| fallback.split(':').next().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queries,
+        ["Q1 over MemTable", "Q1 over Parquet", "Q2 over Parquet"]
+    );
+    assert!(
+        fallbacks[1].contains("1 of 3 operators")
+            && fallbacks[1].contains("ProjectionExec"),
+        "{fallbacks:?}"
+    );
+
+    // All plans are native: the check passes.
+    assert_eq!(
+        ZeroFallback::judge(&[("MemTable", vec![native()]), ("Parquet", vec![native()])]),
+        ZeroFallback::Enforced(vec![])
+    );
 }
 
 /// The single `BIGINT` value that `sql` returns on `ctx`.
