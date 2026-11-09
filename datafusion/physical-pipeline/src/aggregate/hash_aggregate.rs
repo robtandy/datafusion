@@ -261,19 +261,20 @@ impl PhysicalHashAggregate {
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
     ///   input only, or fails;
-    /// * aggregations with a soft limit on their groups (`lim=[n]`, from
-    ///   DataFusion's optimization of `SELECT DISTINCT ... LIMIT n`): each of
-    ///   their stages stops reading its input once it has `n` groups, so
-    ///   DataFusion neither evaluates the rest of its input (which may fail,
-    ///   e.g. with a division by zero) nor returns its groups, and the limit
-    ///   above returns groups of the rows read first. The native operator
-    ///   reads all of its input.
-    ///
-    /// The limit of a top-k aggregation (`lim=[n]` of an `ORDER BY ...
-    /// LIMIT n` that DataFusion aggregates with its top-k stream) only lets
-    /// DataFusion keep fewer groups: the top-k stream reads all of its input,
-    /// and the sort above the aggregation selects the same top groups from
-    /// all groups, which the native operator computes instead.
+    /// * aggregations with a limit on their groups (`lim=[n]`), which
+    ///   DataFusion computes only some groups of; the native operator reads
+    ///   all of its input and computes all groups. The limit is
+    ///   * a soft limit, from DataFusion's optimization of `SELECT DISTINCT
+    ///     ... LIMIT n` (without an order): each stage stops reading its
+    ///     input once it has `n` groups, so DataFusion neither evaluates the
+    ///     rest of its input (which may fail, e.g. with a division by zero)
+    ///     nor returns its groups, and the limit above returns groups of the
+    ///     rows read first;
+    ///   * the limit of a top-k aggregation, of an `ORDER BY ... LIMIT n` by
+    ///     its group key or a `MIN` / `MAX` aggregate (with an order): each
+    ///     stage keeps only its top `n` groups, so the operators between the
+    ///     aggregation and the sort above it (e.g. a projection, which may
+    ///     fail on the other groups) only see these.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -296,7 +297,7 @@ impl PhysicalHashAggregate {
         };
         if [Some(raw), last].into_iter().flatten().any(|aggregate| {
             aggregate.group_clustering_mode() != &GroupClusteringMode::None
-                || has_soft_limit(aggregate)
+                || aggregate.limit_options().is_some()
         }) {
             return Ok(None);
         }
@@ -486,17 +487,6 @@ fn partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
         return partial_aggregate(coalesce.input());
     }
     None
-}
-
-/// Whether `aggregate` has a soft limit on its groups, DataFusion's
-/// optimization of `SELECT DISTINCT ... LIMIT n` (an aggregation without
-/// aggregates whose limit has no order): its stream stops reading its input
-/// once it has `n` groups. (A limit with an order belongs to a top-k
-/// aggregation, whose stream reads all of its input.)
-fn has_soft_limit(aggregate: &AggregateExec) -> bool {
-    aggregate
-        .limit_options()
-        .is_some_and(|options| options.descending().is_none())
 }
 
 /// Whether `aggregate` advertises the partitions of its input: DataFusion
@@ -806,6 +796,7 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::count::count_udaf;
+    use datafusion::functions_aggregate::min_max::max_udaf;
     use datafusion::functions_aggregate::sum::sum_udaf;
     use datafusion_common::ScalarValue;
     use datafusion_datasource::memory::MemorySourceConfig;
@@ -1133,64 +1124,101 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn soft_limited_aggregations_are_not_lowered() -> Result<()> {
-        // `SELECT DISTINCT k FROM ...`, in mode `mode`.
-        let distinct = |mode, input: Plan| -> Result<AggregateExec> {
-            let schema = input_schema();
-            let group_by = if mode == AggregateMode::FinalPartitioned {
-                group_by(true)?.as_final()
-            } else {
-                group_by(true)?
-            };
-            AggregateExec::try_new(mode, group_by, vec![], vec![], input, schema)
-        };
-        // `... LIMIT 3`: the stream of the aggregation stops reading its
-        // input once it has 3 groups.
-        let soft_limit = |aggregate: AggregateExec| -> AggregateExec {
-            let aggregate = aggregate
-                .try_optimize_distinct_soft_limit(3)
-                .expect("a soft limit")
-                .data;
-            assert_eq!(
-                aggregate.limit_options().map(|o| o.descending()),
-                Some(None)
-            );
-            aggregate
-        };
-        let plan = |aggregate: AggregateExec| Arc::new(aggregate) as Plan;
+    /// A limit of an aggregation with the group key `k`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Limit {
+        None,
+        /// DataFusion's soft limit of a `SELECT DISTINCT k ... LIMIT 3`: the
+        /// stream stops reading its input once it has 3 groups.
+        Soft,
+        /// The top-k limit of a `SELECT DISTINCT k ... ORDER BY k DESC
+        /// LIMIT 3`: the stream keeps the top 3 groups.
+        TopKDistinct,
+        /// The top-k limit of a `SELECT k, MAX(v) ... ORDER BY MAX(v) DESC
+        /// LIMIT 3`.
+        TopKMax,
+    }
 
-        let single = distinct(AggregateMode::Single, input(1, false)?)?;
-        assert!(try_lower(&plan(single.clone()))?.is_some());
-        assert!(try_lower(&plan(soft_limit(single.clone())))?.is_none());
-        // A limit of the partial or of the final stage, or of both.
-        for (limit_partial, limit_final) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let partial = distinct(AggregateMode::Partial, input(4, false)?)?;
-            let partial = if limit_partial {
-                soft_limit(partial)
-            } else {
-                partial
-            };
-            let states = hash_repartition(plan(partial))?;
-            let last = distinct(AggregateMode::FinalPartitioned, states)?;
-            let last = if limit_final { soft_limit(last) } else { last };
-            let lowered = try_lower(&plan(last))?.is_some();
-            assert_eq!(lowered, !limit_partial && !limit_final);
+    /// An aggregation with the group key `k` (and `MAX(v)` for
+    /// [`Limit::TopKMax`]) in mode `mode` over `input`, with limit `limit` if
+    /// `apply`.
+    fn limited(
+        mode: AggregateMode,
+        limit: Limit,
+        apply: bool,
+        input: Plan,
+    ) -> Result<AggregateExec> {
+        let schema = input_schema();
+        let group_by = if mode == AggregateMode::FinalPartitioned {
+            group_by(true)?.as_final()
+        } else {
+            group_by(true)?
+        };
+        let aggregates = if limit == Limit::TopKMax {
+            vec![Arc::new(
+                AggregateExprBuilder::new(max_udaf(), vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("max(v)")
+                    .build()?,
+            )]
+        } else {
+            vec![]
+        };
+        let filters = vec![None; aggregates.len()];
+        let aggregate =
+            AggregateExec::try_new(mode, group_by, aggregates, filters, input, schema)?;
+        if !apply {
+            return Ok(aggregate);
         }
+        let descending = SortOptions::new(true, false);
+        let limited = match limit {
+            Limit::None => return Ok(aggregate),
+            Limit::Soft => aggregate.try_optimize_distinct_soft_limit(3),
+            Limit::TopKDistinct => aggregate.try_optimize_topk(3, "k", descending),
+            Limit::TopKMax => aggregate.try_optimize_topk(3, "max(v)", descending),
+        };
+        let Some(limited) = limited else {
+            panic!("no {limit:?} limit for mode {mode:?}");
+        };
+        let limited = limited.data;
+        let order = limited.limit_options().expect("a limit").descending();
+        assert_eq!(order.is_some(), limit != Limit::Soft, "{limit:?}");
+        Ok(limited)
+    }
 
-        // A top-k aggregation (`... ORDER BY k DESC LIMIT 3`) reads all of
-        // its input: lowered.
-        let top_k = single
-            .try_optimize_topk(3, "k", SortOptions::new(true, false))
-            .expect("a top-k aggregation")
-            .data;
-        assert_eq!(
-            top_k.limit_options().map(|o| o.descending()),
-            Some(Some(true))
-        );
-        assert!(try_lower(&plan(top_k))?.is_some());
+    #[test]
+    fn limited_aggregations_are_not_lowered() -> Result<()> {
+        let plan = |aggregate: AggregateExec| Arc::new(aggregate) as Plan;
+        for limit in [
+            Limit::None,
+            Limit::Soft,
+            Limit::TopKDistinct,
+            Limit::TopKMax,
+        ] {
+            for apply in [false, true] {
+                let single =
+                    limited(AggregateMode::Single, limit, apply, input(1, false)?)?;
+                let lowered = try_lower(&plan(single))?.is_some();
+                assert_eq!(lowered, !apply || limit == Limit::None, "{limit:?}");
+            }
+            // A limit of the partial or of the final stage, or of both.
+            for (limit_partial, limit_final) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let partial = limited(
+                    AggregateMode::Partial,
+                    limit,
+                    limit_partial,
+                    input(4, false)?,
+                )?;
+                let states = hash_repartition(plan(partial))?;
+                let last =
+                    limited(AggregateMode::FinalPartitioned, limit, limit_final, states)?;
+                let lowered = try_lower(&plan(last))?.is_some();
+                let is_limited = limit != Limit::None && (limit_partial || limit_final);
+                assert_eq!(lowered, !is_limited, "{limit:?}");
+            }
+        }
         Ok(())
     }
 

@@ -551,6 +551,27 @@ pub(crate) mod test_support {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
+        let root = assert_lowered_parity_with_setup(sql, config, setup).await;
+        assert!(
+            count::<PhysicalHashAggregate>(&root) > 0,
+            "No aggregation was lowered\nquery: {sql}\nlowered: {}",
+            format_operator_tree(&root)
+        );
+        root
+    }
+
+    /// Like [`assert_aggregate_parity_with_setup`], but without requiring
+    /// that an aggregation is lowered, e.g. for the aggregations that
+    /// [`PhysicalHashAggregate::try_lower`] leaves to DataFusion. Returns the
+    /// lowered operator tree.
+    pub(crate) async fn assert_lowered_parity_with_setup<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
         assert_byte_eq_with_datafusion_with_config(sql, config.clone(), &setup).await;
 
         let ctx = datafusion_context(config);
@@ -570,11 +591,6 @@ pub(crate) mod test_support {
                 .await
                 .expect("physical planning");
             let root = lower(&plan).expect("lowering");
-            assert!(
-                count::<PhysicalHashAggregate>(&root) > 0,
-                "No aggregation was lowered\nquery: {sql}\nlowered: {}",
-                format_operator_tree(&root)
-            );
             let exec: Arc<dyn ExecutionPlan> = Arc::new(
                 PipelineRootExec::try_new(Arc::clone(&root), plan).expect("root"),
             );
@@ -620,13 +636,17 @@ mod tests {
     use datafusion_common::Result;
 
     use datafusion::prelude::ParquetReadOptions;
+    use datafusion_physical_plan::ExecutionPlan;
+    use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 
     use super::PhysicalHashAggregate;
     use super::test_support::*;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::count;
     use crate::sources::test_harness::write_parquet;
-    use crate::test_utils::{register_test_tables, test_session_config, test_table_t1};
+    use crate::test_utils::{
+        datafusion_context, register_test_tables, test_session_config, test_table_t1,
+    };
 
     async fn assert_all_parity(queries: &[&str]) {
         for sql in queries {
@@ -860,7 +880,6 @@ mod tests {
             "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d ORDER BY d",
             "SELECT a, COUNT(*) AS n FROM t1 GROUP BY a ORDER BY n DESC, a LIMIT 5",
             "SELECT d, MAX(a) FROM t1 GROUP BY d ORDER BY MAX(a) DESC, d LIMIT 3",
-            "SELECT DISTINCT d FROM t1 ORDER BY d LIMIT 3",
             "SELECT COUNT(*) FROM (SELECT DISTINCT d FROM t1 LIMIT 3)",
         ])
         .await;
@@ -1046,6 +1065,80 @@ mod tests {
                 assert_eq!(count::<PhysicalHashAggregate>(&root), 1, "{sql}");
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_k_aggregations_are_left_to_datafusion() {
+        // DataFusion's top-k aggregation of an `ORDER BY ... LIMIT n` by the
+        // group key (`a`) or a `MIN` / `MAX` aggregate keeps only the top
+        // `n` groups in every stage, so the projection between it and the
+        // sort only evaluates `1000 / ...` for those, never for `0`. A native
+        // aggregation would produce all groups.
+        let setup = async |ctx: &SessionContext| register_test_tables(ctx);
+        let distinct = "SELECT 1000 / a AS v, a FROM (VALUES (0), (1), (2), (3)) AS t(a) \
+             GROUP BY a ORDER BY a DESC LIMIT 1";
+        let max = "SELECT 1000 / MAX(b) AS v, a \
+             FROM (VALUES (0, 0), (1, 5), (2, 7), (3, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY MAX(b) DESC LIMIT 1";
+        let single = &[AggregateMode::Single][..];
+        let coalesced = &[AggregateMode::Final, AggregateMode::Partial][..];
+        let partitioned = &[AggregateMode::FinalPartitioned, AggregateMode::Partial][..];
+        for (sql, stages, native_aggregations) in [
+            // A single stage on 1 thread, and two stages that would be fused
+            // on 4.
+            (distinct, [single, partitioned], 0),
+            (max, [single, partitioned], 0),
+            // `t1` has 4 partitions.
+            (
+                "SELECT DISTINCT d FROM t1 ORDER BY d LIMIT 3",
+                [coalesced, partitioned],
+                0,
+            ),
+            // A native aggregation of the result of a top-k aggregation.
+            (
+                "SELECT COUNT(*), SUM(v) FROM (SELECT 1000 / a AS v, a \
+                 FROM (VALUES (0), (1), (2), (3)) AS t(a) GROUP BY a ORDER BY a DESC LIMIT 2)",
+                [single, partitioned],
+                1,
+            ),
+        ] {
+            for (threads, stages) in [1, 4].into_iter().zip(stages) {
+                let config = test_session_config().with_target_partitions(threads);
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await.expect("setup");
+                let plan = ctx
+                    .sql(sql)
+                    .await
+                    .expect("planning")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical planning");
+                assert_eq!(top_k_aggregations(&plan), stages, "{sql}");
+                let root = assert_lowered_parity_with_setup(sql, config, &setup).await;
+                assert_eq!(
+                    count::<PhysicalHashAggregate>(&root),
+                    native_aggregations,
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    /// The modes of the `AggregateExec`s with a top-k limit in `plan`, from
+    /// the top.
+    fn top_k_aggregations(plan: &Arc<dyn ExecutionPlan>) -> Vec<AggregateMode> {
+        let mut modes = vec![];
+        if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+            && aggregate
+                .limit_options()
+                .is_some_and(|limit| limit.descending().is_some())
+        {
+            modes.push(*aggregate.mode());
+        }
+        for child in plan.children() {
+            modes.extend(top_k_aggregations(child));
+        }
+        modes
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
