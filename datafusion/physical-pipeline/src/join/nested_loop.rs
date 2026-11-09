@@ -741,8 +741,37 @@ impl<K: LoopJoinKind> LoopJoin<K> {
             }
             None => None,
         };
+        let Some(mask) = mask else {
+            // Without filter, all pairs match.
+            if spec.emits_pairs() {
+                chunk.pending_build.try_reserve(num_pairs).map_err(|e| {
+                    resources_datafusion_err!(
+                        "Failed to allocate the pairs of a join: {e}"
+                    )
+                })?;
+                chunk.pending_probe.try_reserve(num_pairs).map_err(|e| {
+                    resources_datafusion_err!(
+                        "Failed to allocate the pairs of a join: {e}"
+                    )
+                })?;
+                for row in first..first + len {
+                    chunk
+                        .pending_build
+                        .extend(std::iter::repeat_n(row, probe_rows));
+                    chunk.pending_probe.extend(0..probe_rows as u32);
+                }
+            }
+            if spec.emits_probe_rows() {
+                chunk.matched.fill(true);
+                chunk.unmatched = 0;
+            }
+            if let Some(matched) = &build.matched {
+                (first..first + len).for_each(|row| matched.set(row));
+            }
+            return Ok(num_pairs);
+        };
         let mut block_matched = vec![false; len];
-        let mut record = |pair: usize| {
+        for pair in mask.set_indices() {
             let (build_row, probe_row) = (pair / probe_rows, pair % probe_rows);
             block_matched[build_row] = true;
             if spec.emits_probe_rows() && !chunk.matched[probe_row] {
@@ -753,10 +782,6 @@ impl<K: LoopJoinKind> LoopJoin<K> {
                 chunk.pending_build.push(first + build_row);
                 chunk.pending_probe.push(probe_row as u32);
             }
-        };
-        match &mask {
-            Some(mask) => mask.set_indices().for_each(&mut record),
-            None => (0..num_pairs).for_each(&mut record),
         }
         if let Some(matched) = &build.matched {
             for (row, _) in block_matched.iter().enumerate().filter(|(_, m)| **m) {
@@ -1022,13 +1047,17 @@ impl<'a> BuildGather<'a> {
         match rows {
             BuildRowsRef::Segment(segment, rows) => Ok(Self::TakeRef(segment, rows)),
             BuildRowsRef::Global(build, rows) => {
-                let Some(&first) = rows.first() else {
+                let (Some(&first), Some(&last)) = (rows.first(), rows.last()) else {
                     return internal_err!("No build rows to gather");
                 };
                 let first_segment = build.segment_of(first);
                 let segment_rows =
                     build.offsets[first_segment]..build.offsets[first_segment + 1];
-                if rows.iter().all(|row| segment_rows.contains(row)) {
+                // The pairs of a probe chunk come in the order of their build
+                // rows: all rows are in the segment of the first one if the
+                // last one is.
+                debug_assert!(rows.is_sorted());
+                if segment_rows.contains(&last) {
                     let offset = segment_rows.start;
                     let indices = rows
                         .iter()

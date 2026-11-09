@@ -649,7 +649,7 @@ impl PhysicalWindow {
 
     /// Sort the rows of `input`, the rows of a bucket, and find its groups.
     fn sort_bucket(&self, input: BucketInput) -> Result<SortedBucket> {
-        let mut runs = input.runs;
+        let BucketInput { mut runs, batches } = input;
         runs.retain(|run| run.num_rows() > 0);
         let batches = match &self.spec.keys {
             // The rows of a single run are sorted already.
@@ -658,14 +658,13 @@ impl PhysicalWindow {
             }
             Some(_) => {
                 let mut merger = RunMerger::new(self.input().schema(), runs, None);
-                let mut batches = vec![];
+                let mut sorted = vec![];
                 while let Some(batch) = merger.next_batch(usize::MAX)? {
-                    batches.push(batch);
+                    sorted.push(batch);
                 }
-                batches
+                sorted
             }
-            None => input
-                .batches
+            None => batches
                 .into_iter()
                 .filter(|batch| batch.num_rows() > 0)
                 .collect(),
@@ -1273,21 +1272,29 @@ impl BucketEmitter {
         if self.pending_rows == 0 {
             return Ok(None);
         }
-        let len = self.pending_rows.min(DEFAULT_VECTOR_SIZE);
+        // Large groups are emitted as they are (in slices of at most
+        // `DEFAULT_VECTOR_SIZE` rows), small ones are concatenated.
         let mut parts = vec![];
-        let mut remaining = len;
-        while remaining > 0 {
-            let Some(front) = self.pending.pop_front() else {
-                return internal_err!("PhysicalWindow lost evaluated rows");
-            };
-            if front.num_rows() <= remaining {
-                remaining -= front.num_rows();
-                parts.push(front);
+        let mut len = 0;
+        while let Some(front) = self.pending.pop_front() {
+            let rows = front.num_rows();
+            let large = rows >= DEFAULT_VECTOR_SIZE / 2;
+            if large && !parts.is_empty() {
+                self.pending.push_front(front);
+                break;
+            }
+            let take = rows.min(DEFAULT_VECTOR_SIZE - len);
+            if take < rows {
+                self.pending.push_front(front.slice(take, rows - take));
+            }
+            parts.push(if take < rows {
+                front.slice(0, take)
             } else {
-                parts.push(front.slice(0, remaining));
-                self.pending
-                    .push_front(front.slice(remaining, front.num_rows() - remaining));
-                remaining = 0;
+                front
+            });
+            len += take;
+            if large || len == DEFAULT_VECTOR_SIZE {
+                break;
             }
         }
         self.pending_rows -= len;
@@ -1392,26 +1399,42 @@ impl PhysicalOperator for PhysicalWindow {
             self.buffer(&mut local.buckets[0], batch)?;
             return Ok(SinkResult::NeedMoreInput);
         }
-        // Distribute the rows over the buckets by the hash of their keys:
-        // the upper bits of the hash pick the bucket.
+        // Distribute the rows over the buckets by the hash of their keys (the
+        // upper bits of the hash pick the bucket): gather them in the order of
+        // their buckets, and hand every bucket its slice of the rows.
         let num_rows = batch.num_rows();
         let keys = partition_keys(&self.spec.group_keys, &batch)?;
         hash_join_keys(&keys, num_rows, &mut local.hashes)?;
         let shift = u64::BITS - state.bits;
-        let mut rows = vec![vec![]; local.buckets.len()];
-        for (row, &hash) in local.hashes.iter().enumerate() {
-            rows[(hash >> shift) as usize].push(row as u32);
+        let num_buckets = local.buckets.len();
+        let mut starts = vec![0; num_buckets + 1];
+        for &hash in &local.hashes {
+            starts[(hash >> shift) as usize + 1] += 1;
         }
-        for (bucket, rows) in rows.into_iter().enumerate() {
-            if rows.is_empty() {
-                continue;
-            }
-            let rows = if rows.len() == num_rows {
-                batch.clone()
-            } else {
-                take_record_batch(&batch, &UInt32Array::from(rows))?
+        for bucket in 0..num_buckets {
+            starts[bucket + 1] += starts[bucket];
+        }
+        let mut next = starts.clone();
+        let mut order = vec![0; num_rows];
+        for (row, &hash) in local.hashes.iter().enumerate() {
+            let bucket = (hash >> shift) as usize;
+            order[next[bucket]] = row as u32;
+            next[bucket] += 1;
+        }
+        let sorted =
+            match (0..num_buckets).find(|&b| starts[b + 1] - starts[b] == num_rows) {
+                // All rows are in one bucket.
+                Some(_) => batch,
+                None => take_record_batch(&batch, &UInt32Array::from(order))?,
             };
-            self.buffer(&mut local.buckets[bucket], rows)?;
+        for bucket in 0..num_buckets {
+            let (start, end) = (starts[bucket], starts[bucket + 1]);
+            if end > start {
+                self.buffer(
+                    &mut local.buckets[bucket],
+                    sorted.slice(start, end - start),
+                )?;
+            }
         }
         Ok(SinkResult::NeedMoreInput)
     }
