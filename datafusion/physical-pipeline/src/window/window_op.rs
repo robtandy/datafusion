@@ -539,8 +539,10 @@ impl PhysicalWindow {
     ///   A `WindowAggExec` reads all rows of its partition first. Several
     ///   window partitions read all rows of the input only if a
     ///   repartitioning (a `RepartitionExec`) distributes them below the
-    ///   window (otherwise one emits rows while another one waits for its
-    ///   input, e.g. above a partitioned join);
+    ///   window, through nodes that read all of their partition (not a filter
+    ///   with a fetch, which ends its partition once it emitted that many
+    ///   rows): otherwise one emits rows while another one waits for its
+    ///   input, e.g. above a partitioned join;
     /// * windows DataFusion does not evaluate on all rows of each window
     ///   partition: with a `WindowStateObserver`; of no partitions (DataFusion
     ///   executes nothing); of several partitions without partition keys, or
@@ -899,20 +901,30 @@ fn sorted_by_sorts(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// Whether every partition of `plan` ends only once all rows below it were
 /// read: it has a single partition, or its partitions are those of a
 /// repartitioning (a `RepartitionExec`, each partition of which ends only once
-/// all of its input was read), passed through nodes that read the partition of
-/// their input that they emit (projections, filters, sorts). Otherwise a
-/// partition of a window above `plan` can emit its rows while another one
-/// waits for its input (forever, for an input that never ends), or before the
-/// input of another one fails.
+/// all of its input was read), passed through nodes that read all of the
+/// partition of their input that they emit (projections, filters and sorts
+/// without a fetch, and sorts that sort, which read all of their input also
+/// with a fetch). A node with a fetch that emits rows as it reads them (a
+/// filter, or a sort that passes its sorted input through) ends every
+/// partition once it emitted that many rows of it, whether the other
+/// partitions ended or not. Otherwise a partition of a window above `plan`
+/// can emit its rows while another one waits for its input (forever, for an
+/// input that never ends), or before the input of another one fails.
 fn ends_once_all_rows_were_read(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if partitions(plan) <= 1 || plan.is::<RepartitionExec>() {
         return true;
     }
     let input = if let Some(sort) = plan.downcast_ref::<SortExec>() {
+        if sort.fetch().is_some() && !sorts(sort) {
+            return false;
+        }
         sort.input()
     } else if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
         projection.input()
     } else if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        if filter.fetch().is_some() {
+            return false;
+        }
         filter.input()
     } else {
         return false;
@@ -2995,11 +3007,22 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// A partition of a `StreamingTableExec` that produces a batch, and then
-    /// fails (if `fail`) or never produces anything again.
+    /// what `tail` says.
     #[derive(Debug)]
     struct OneBatch {
         batch: RecordBatch,
-        fail: bool,
+        tail: Tail,
+    }
+
+    /// What a [`OneBatch`] does after its batch.
+    #[derive(Debug, Clone, Copy)]
+    enum Tail {
+        /// It never produces anything again.
+        Pending,
+        /// It fails at once.
+        Fail,
+        /// It fails after a while (an unbounded stream that breaks).
+        FailLater,
     }
 
     /// The error of a [`OneBatch`] that fails.
@@ -3016,11 +3039,17 @@ mod tests {
         ) -> datafusion_execution::SendableRecordBatchStream {
             use futures::StreamExt;
             let batch = futures::stream::iter([Ok(self.batch.clone())]);
-            let tail = if self.fail {
-                futures::stream::iter([datafusion_common::exec_err!("{STREAM_FAILURE}")])
-                    .boxed()
-            } else {
-                futures::stream::pending().boxed()
+            let tail = match self.tail {
+                Tail::Pending => futures::stream::pending().boxed(),
+                Tail::Fail => futures::stream::iter([datafusion_common::exec_err!(
+                    "{STREAM_FAILURE}"
+                )])
+                .boxed(),
+                Tail::FailLater => futures::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    datafusion_common::exec_err!("{STREAM_FAILURE}")
+                })
+                .boxed(),
             };
             Box::pin(
                 datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
@@ -3039,10 +3068,23 @@ mod tests {
         fail: bool,
         sorted: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let tail = if fail { Tail::Fail } else { Tail::Pending };
+        stream_of(0..100, partitions, tail, sorted)
+    }
+
+    /// A stream of `partitions` partitions of the `values` of
+    /// [`values_schema`] (declared sorted by `v` if `sorted`), each of which
+    /// then does what `tail` says.
+    fn stream_of(
+        values: Range<i64>,
+        partitions: usize,
+        tail: Tail,
+        sorted: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = values_schema();
-        let batch = values_chunk(0..100).into_record_batch()?;
+        let batch = values_chunk(values).into_record_batch()?;
         let partition: Arc<dyn datafusion_physical_plan::streaming::PartitionStream> =
-            Arc::new(OneBatch { batch, fail });
+            Arc::new(OneBatch { batch, tail });
         let ordering = if sorted {
             LexOrdering::new([PhysicalSortExpr::new_default(col("v", &schema)?)])
         } else {
@@ -3054,7 +3096,10 @@ mod tests {
                 vec![partition; partitions],
                 None,
                 ordering,
-                !fail,
+                // (A stream that fails at once is bounded; `RepartitionExec`
+                // emits the rows of unbounded inputs without waiting for a
+                // full batch.)
+                !matches!(tail, Tail::Fail),
                 None,
             )?,
         ))
@@ -3298,6 +3343,116 @@ mod tests {
         // over a merge of partitions, it is native.
         assert_windows("SELECT id, COUNT(*) OVER () AS n, SUM(a) OVER () AS s FROM t1")
             .await;
+        Ok(())
+    }
+
+    /// `ROW_NUMBER() OVER (PARTITION BY v ORDER BY v)` over the rows of
+    /// `input` (of [`values_schema`], partitioned by `v`), in a
+    /// `BoundedWindowAggExec` (if `bounded`) or a `WindowAggExec`.
+    fn row_numbers_by_v(
+        input: Arc<dyn ExecutionPlan>,
+        bounded: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let v = col("v", &schema)?;
+        let window_expr = datafusion_physical_plan::windows::create_window_expr(
+            &datafusion_expr::WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            "rn".to_string(),
+            &[],
+            std::slice::from_ref(&v),
+            &[PhysicalSortExpr::new_default(Arc::clone(&v))],
+            Arc::new(datafusion_expr::WindowFrame::new(Some(true))),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        Ok(if bounded {
+            Arc::new(BoundedWindowAggExec::try_new(
+                vec![window_expr],
+                input,
+                datafusion_physical_plan::InputOrderMode::Sorted,
+                true,
+            )?)
+        } else {
+            Arc::new(WindowAggExec::try_new(vec![window_expr], input, true)?)
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_over_partitions_that_end_early_are_left_to_datafusion() -> Result<()>
+    {
+        use crate::bridge::PipelineRootExec;
+        use datafusion_physical_plan::limit::GlobalLimitExec;
+        let task_ctx = || {
+            Arc::new(TaskContext::default().with_session_config(test_session_config()))
+        };
+        // A window over the sorted partitions of a filter with a fetch, of a
+        // repartitioning by `v`: the filter ends a partition once it emitted
+        // its row, whether the other partition ended or not. The only batch
+        // of the input has rows with `v = 1` only, in one partition, so that
+        // the window emits that row while the other partition waits for the
+        // input, which never ends or fails later.
+        let window = |input: Arc<dyn ExecutionPlan>, fetch, bounded| {
+            let schema = input.schema();
+            let v = col("v", &schema)?;
+            let repartitioned = Arc::new(RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(vec![v], 2),
+            )?);
+            let filtered = FilterExec::try_new(
+                datafusion_physical_expr::expressions::lit(true),
+                repartitioned,
+            )?
+            .with_fetch(fetch)
+            .expect("a filter with a fetch");
+            row_numbers_by_v(sort_exec(filtered, &["v"], true)?, bounded)
+        };
+        let limited = |plan: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            let merged = Arc::new(CoalescePartitionsExec::new(plan));
+            Arc::new(GlobalLimitExec::new(merged, 0, Some(1)))
+        };
+        // The rows of `plan`, within a few seconds.
+        let rows = async |plan: Arc<dyn ExecutionPlan>| {
+            let collect = datafusion_physical_plan::collect(plan, task_ctx());
+            let timeout = std::time::Duration::from_secs(10);
+            let batches = tokio::time::timeout(timeout, collect).await;
+            let batches = batches.expect("no hang").expect("no error");
+            concat_batches(&batches[0].schema(), &batches).unwrap()
+        };
+        for bounded in [true, false] {
+            for tail in [Tail::Pending, Tail::FailLater] {
+                let make = || {
+                    let input = stream_of(1..2, 1, tail, false)?;
+                    Ok::<_, DataFusionError>(limited(window(input, Some(1), bounded)?))
+                };
+                // DataFusion returns the row of `v = 1`.
+                let expected = rows(make()?).await;
+                assert_eq!(expected.num_rows(), 1, "{tail:?}");
+                let plan = make()?;
+                let root = lower(&plan)?;
+                assert_eq!(count::<PhysicalWindow>(&root), 0, "{tail:?}");
+                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                assert_eq!(rows(exec).await, expected, "{tail:?}");
+            }
+            // Without a fetch, every partition of the filter reads all of its
+            // partition of the repartitioning: the window is native, and
+            // returns DataFusion's rows.
+            let finite = || {
+                let batch = values_chunk((0..300).map(|v| v % 50)).into_record_batch()?;
+                let scan = MemorySourceConfig::try_new_exec(
+                    &[vec![batch]],
+                    values_schema(),
+                    None,
+                )?;
+                window(scan, None, bounded)
+            };
+            let root =
+                assert_lowered_plan_byte_eq(finite, lower, task_ctx(), false).await;
+            assert_eq!(count::<PhysicalWindow>(&root), 1);
+        }
         Ok(())
     }
 
