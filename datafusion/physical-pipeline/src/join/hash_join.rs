@@ -432,6 +432,19 @@ impl PhysicalHashJoin {
     ///   partitions cannot reproduce (a planner that knows that a limit
     ///   above the join makes its `fetch` redundant can lower the join
     ///   without it, `HashJoinExec::with_fetch(None)`);
+    /// * a join that produces a dynamic filter (see
+    ///   `ExecutionPlan::dynamic_expressions_produced`), which DataFusion
+    ///   attaches to a join when a node of its probe side, such as a Parquet
+    ///   scan, reads the filter. Once the build side is collected, DataFusion
+    ///   sets the filter to a predicate of the build keys (bounds, an `IN`
+    ///   list or a hash table lookup, depending on the size of the build
+    ///   side), with which that node skips probe rows (or whole row groups)
+    ///   that cannot match, so the nodes between it and the join never
+    ///   evaluate their expressions on those rows. A [`PhysicalHashJoin`]
+    ///   leaves the filter `true`, so they would see all rows (and could
+    ///   raise errors on them, like a division by zero). Joins without one
+    ///   are lowered, e.g. with
+    ///   `datafusion.optimizer.enable_join_dynamic_filter_pushdown` off;
     /// * a join with a prepared build side, whose left input is not
     ///   executed, and the joins DataFusion does not execute: in
     ///   `PartitionMode::Auto`, in `PartitionMode::CollectLeft` with several
@@ -472,7 +485,11 @@ impl PhysicalHashJoin {
             }
             PartitionMode::Auto => false,
         };
-        if !executable || join.fetch().is_some() || has_prepared_build(plan) {
+        if !executable
+            || join.fetch().is_some()
+            || has_prepared_build(plan)
+            || !plan.dynamic_expressions_produced().is_empty()
+        {
             return Ok(None);
         }
         let spec = match JoinSpec::try_new(
@@ -1729,7 +1746,7 @@ mod tests {
     };
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{DataType, Int64Type, TimeUnit};
-    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_execution::TaskContext;
@@ -1749,6 +1766,7 @@ mod tests {
         TestSource, assert_lowered_plan_byte_eq,
         assert_lowered_plan_fails_like_datafusion, count,
     };
+    use crate::sources::test_harness::write_parquet;
     use crate::test_utils::{
         EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
         datafusion_context, register_test_tables, run_sql, test_session_config,
@@ -3410,6 +3428,78 @@ mod tests {
             assert!(bridged.plan().is::<DataSourceExec>());
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_that_produce_dynamic_filters_are_left_to_datafusion() -> Result<()> {
+        // The probe side `(k, d)` of `(1, 1), (2, 0)` is a Parquet file, whose
+        // scan reads the dynamic filter of the join by `k`. Once DataFusion has
+        // collected the build key 1, the scan skips the row of key 2 (with
+        // `pushdown_filters`) before `1 / d` divides by its zero.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p.parquet");
+        let probe = RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef),
+            ("d", Arc::new(Int64Array::from(vec![1, 0])) as ArrayRef),
+        ])?;
+        write_parquet(&path, probe.schema(), &[probe], None)?;
+        let path = path.to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            let build = RecordBatch::try_from_iter([(
+                "k",
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )])?;
+            ctx.register_batch("b", build)?;
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        let sql = "SELECT b.k, x.inv FROM b JOIN (SELECT k, 1 / d AS inv FROM p) x ON b.k = x.k";
+        let mut config = test_session_config();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        // `b` is the build side, although it is not smaller than `p`.
+        config.options_mut().optimizer.join_reordering = false;
+
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let join = find_hash_join(&plan).expect("a hash join");
+        assert_eq!(join.dynamic_expressions_produced().len(), 1);
+        let expected = run_sql(&ctx, sql).await?;
+        assert_eq!(count_rows(&expected.batches), 1);
+        // The join is left to DataFusion, with the same result.
+        assert_join_parity_with_setup(sql, config.clone(), &setup, 0).await;
+
+        // Without the dynamic filter, the join is native and both engines
+        // divide by zero.
+        config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = false;
+        let ctx = datafusion_context(config);
+        setup(&ctx).await?;
+        let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
+        assert!(error.to_string().contains("Divide by zero"), "{error}");
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let root = lower(&plan)?;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let error = with_timeout(collect(exec, ctx.task_ctx()))
+            .await
+            .expect_err("the pipeline engine fails");
+        assert!(error.to_string().contains("Divide by zero"), "{error}");
+        Ok(())
+    }
+
+    /// The first `HashJoinExec` of `plan`, depth first.
+    fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.is::<HashJoinExec>() {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().into_iter().find_map(find_hash_join)
+    }
+
+    fn count_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
     }
 
     /// A memory pool without limit that records the peak memory reserved by
