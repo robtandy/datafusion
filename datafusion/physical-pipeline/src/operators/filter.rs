@@ -2870,6 +2870,213 @@ pub(crate) mod test_support {
         )
     }
 
+    /// Register the default test tables and three tables of TPC-H's schema
+    /// (`DECIMAL(15, 2)` prices, `DATE` dates, `Utf8View` strings, as in
+    /// DataFusion's SQL tables and Parquet scans), with nulls, in skewed
+    /// partitions (one of them empty) of batches of very different sizes:
+    ///
+    /// * `lineitem`: 6000 rows of `l_orderkey`, `l_quantity`,
+    ///   `l_extendedprice`, `l_discount`, `l_tax`, `l_returnflag`,
+    ///   `l_linestatus`, `l_shipdate` and `l_shipmode`;
+    /// * `orders`: 3000 rows of `o_orderkey`, `o_custkey`, `o_orderdate`,
+    ///   `o_orderpriority`, `o_totalprice` and `o_comment` (`Utf8`);
+    /// * `customer`: 1500 rows of `c_custkey`, `c_phone` (`NN-NNN-NNN-NNNN`,
+    ///   whose country codes are 10 to 34), `c_acctbal` (also negative) and
+    ///   `c_mktsegment`.
+    pub(crate) async fn tpch_tables(ctx: &SessionContext) -> Result<()> {
+        register_all_tables(ctx)?;
+        use arrow::array::{Date32Array, Decimal128Array};
+        let decimal = DataType::Decimal128(15, 2);
+        let decimals = |values: Vec<Option<i64>>| -> Result<ArrayRef> {
+            Ok(Arc::new(
+                Decimal128Array::from_iter(values.into_iter().map(|v| v.map(i128::from)))
+                    .with_precision_and_scale(15, 2)?,
+            ))
+        };
+        let views = |values: Vec<Option<String>>| -> ArrayRef {
+            Arc::new(StringViewArray::from_iter(values))
+        };
+        // 1992-01-01 plus up to 7 years.
+        let date = |i: i64| 8035 + ((i * 7919) % 2557) as i32;
+        let skewed = |batch: &dyn Fn(std::ops::Range<i64>) -> Result<RecordBatch>,
+                      n: i64| {
+            Ok::<_, DataFusionError>(vec![
+                vec![batch(0..n / 2)?, batch(n / 2..n / 2 + 7)?],
+                vec![],
+                vec![batch(n / 2 + 7..n / 2 + 8)?, batch(n / 2 + 8..n)?],
+            ])
+        };
+
+        let lineitem = Arc::new(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+            Field::new("l_quantity", decimal.clone(), false),
+            Field::new("l_extendedprice", decimal.clone(), false),
+            Field::new("l_discount", decimal.clone(), true),
+            Field::new("l_tax", decimal.clone(), true),
+            Field::new("l_returnflag", DataType::Utf8View, false),
+            Field::new("l_linestatus", DataType::Utf8View, false),
+            Field::new("l_shipdate", DataType::Date32, true),
+            Field::new("l_shipmode", DataType::Utf8View, true),
+        ]));
+        let lineitem_batch = |ids: std::ops::Range<i64>| -> Result<RecordBatch> {
+            let modes = ["AIR", "MAIL", "SHIP", "TRUCK", "REG AIR", "RAIL", "FOB"];
+            let flags = ["A", "N", "R"];
+            let columns = vec![
+                Arc::new(Int64Array::from_iter_values(ids.clone().map(|i| i / 4)))
+                    as ArrayRef,
+                decimals(ids.clone().map(|i| Some(100 + (i * 37) % 5000)).collect())?,
+                decimals(
+                    ids.clone()
+                        .map(|i| Some(90_000 + (i * 7_919) % 10_000_000))
+                        .collect(),
+                )?,
+                decimals(
+                    ids.clone()
+                        .map(|i| (i % 23 != 5).then_some(i % 11))
+                        .collect(),
+                )?,
+                decimals(
+                    ids.clone()
+                        .map(|i| (i % 29 != 8).then_some(i % 9))
+                        .collect(),
+                )?,
+                views(
+                    ids.clone()
+                        .map(|i| Some(flags[(i % 3) as usize].to_owned()))
+                        .collect(),
+                ),
+                views(
+                    ids.clone()
+                        .map(|i| Some(if i % 5 < 2 { "O" } else { "F" }.to_owned()))
+                        .collect(),
+                ),
+                Arc::new(Date32Array::from_iter(
+                    ids.clone().map(|i| (i % 31 != 3).then(|| date(i))),
+                )),
+                views(
+                    ids.map(|i| {
+                        (i % 41 != 6).then(|| modes[(i % 7) as usize].to_owned())
+                    })
+                    .collect(),
+                ),
+            ];
+            Ok(RecordBatch::try_new(Arc::clone(&lineitem), columns)?)
+        };
+        register_partitions(ctx, "lineitem", skewed(&lineitem_batch, 6000)?)?;
+
+        let orders = Arc::new(Schema::new(vec![
+            Field::new("o_orderkey", DataType::Int64, false),
+            Field::new("o_custkey", DataType::Int64, true),
+            Field::new("o_orderdate", DataType::Date32, false),
+            Field::new("o_orderpriority", DataType::Utf8View, false),
+            Field::new("o_totalprice", decimal.clone(), true),
+            Field::new("o_comment", DataType::Utf8, true),
+        ]));
+        let orders_batch = |ids: std::ops::Range<i64>| -> Result<RecordBatch> {
+            let priorities =
+                ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"];
+            let columns = vec![
+                Arc::new(Int64Array::from_iter_values(ids.clone())) as ArrayRef,
+                Arc::new(Int64Array::from_iter(
+                    ids.clone()
+                        .map(|i| (i % 37 != 2).then_some((i * 13) % 1500)),
+                )),
+                Arc::new(Date32Array::from_iter_values(ids.clone().map(date))),
+                views(
+                    ids.clone()
+                        .map(|i| Some(priorities[((i * 3) % 5) as usize].to_owned()))
+                        .collect(),
+                ),
+                decimals(
+                    ids.clone()
+                        .map(|i| (i % 43 != 1).then_some((i * 104_729) % 50_000_000))
+                        .collect(),
+                )?,
+                Arc::new(StringArray::from_iter(ids.map(|i| {
+                    (i % 19 != 4).then(|| format!("comment {} special requests", i % 97))
+                }))),
+            ];
+            Ok(RecordBatch::try_new(Arc::clone(&orders), columns)?)
+        };
+        register_partitions(ctx, "orders", skewed(&orders_batch, 3000)?)?;
+
+        let customer = Arc::new(Schema::new(vec![
+            Field::new("c_custkey", DataType::Int64, false),
+            Field::new("c_phone", DataType::Utf8View, true),
+            Field::new("c_acctbal", decimal, true),
+            Field::new("c_mktsegment", DataType::Utf8View, false),
+        ]));
+        let customer_batch = |ids: std::ops::Range<i64>| -> Result<RecordBatch> {
+            let segments = [
+                "AUTOMOBILE",
+                "BUILDING",
+                "FURNITURE",
+                "MACHINERY",
+                "HOUSEHOLD",
+            ];
+            let columns = vec![
+                Arc::new(Int64Array::from_iter_values(ids.clone())) as ArrayRef,
+                views(
+                    ids.clone()
+                        .map(|i| {
+                            (i % 17 != 9).then(|| {
+                                format!(
+                                    "{}-{:03}-{:03}-{:04}",
+                                    10 + i % 25,
+                                    (i * 7) % 1000,
+                                    (i * 11) % 1000,
+                                    (i * 13) % 10_000
+                                )
+                            })
+                        })
+                        .collect(),
+                ),
+                decimals(
+                    ids.clone()
+                        .map(|i| {
+                            (i % 13 != 7).then_some((i * 7_907) % 1_100_000 - 100_000)
+                        })
+                        .collect(),
+                )?,
+                views(
+                    ids.map(|i| Some(segments[(i % 5) as usize].to_owned()))
+                        .collect(),
+                ),
+            ];
+            Ok(RecordBatch::try_new(Arc::clone(&customer), columns)?)
+        };
+        register_partitions(ctx, "customer", skewed(&customer_batch, 1500)?)
+    }
+
+    /// Assert that every `ProjectionExec` and `FilterExec` of `plan` (at any
+    /// depth) can be lowered (see [`PhysicalProjection::supports_projection_exec`]
+    /// and [`PhysicalFilter::supports_filter_exec`]), and return their numbers.
+    pub(crate) fn assert_all_lowerable(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+        let (mut projections, mut filters) = (0, 0);
+        if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+            assert!(
+                PhysicalProjection::supports_projection_exec(projection),
+                "not supported: {}",
+                datafusion_physical_plan::displayable(projection).one_line()
+            );
+            projections += 1;
+        }
+        if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+            assert!(
+                PhysicalFilter::supports_filter_exec(filter),
+                "not supported: {}",
+                datafusion_physical_plan::displayable(filter).one_line()
+            );
+            filters += 1;
+        }
+        for child in plan.children() {
+            let (child_projections, child_filters) = assert_all_lowerable(child);
+            projections += child_projections;
+            filters += child_filters;
+        }
+        (projections, filters)
+    }
+
     /// The tables of the error parity tests: [`register_all_tables`] and the
     /// guard tables `dense`, `sparse`, `nulls` and `nulls_ok`.
     pub(crate) async fn guard_tables(ctx: &SessionContext) -> Result<()> {
@@ -3973,6 +4180,64 @@ mod tests {
             (1, 0),
             "{sql}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_tpch_filters_are_native() {
+        for sql in [
+            // Decimal arithmetic chains, whose parts may only fail with
+            // arithmetic overflows.
+            "SELECT l_orderkey, l_quantity FROM lineitem \
+             WHERE l_extendedprice * (1 - l_discount) > 50000.00",
+            "SELECT l_orderkey FROM lineitem \
+             WHERE l_extendedprice * (1 - l_discount) * (1 + l_tax) > l_extendedprice",
+            // `extract(year from ...)` and `substring(... from 1 for 2)`, also
+            // after other conjuncts.
+            "SELECT o_orderkey, o_orderdate FROM orders WHERE extract(year from o_orderdate) = 1995",
+            "SELECT c_custkey, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > 0.00",
+            "SELECT c_custkey FROM customer WHERE c_acctbal > 0.00 \
+             AND substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17')",
+            "SELECT o_orderkey FROM orders WHERE o_custkey > 100 \
+             AND date_part('month', o_orderdate) = 3 AND strpos(o_orderpriority, 'HIGH') > 0",
+            // Constant strings of bounded sizes.
+            "SELECT o_orderkey FROM orders WHERE CASE WHEN o_orderpriority = '1-URGENT' \
+             OR o_orderpriority = '2-HIGH' THEN '1-URGENT' ELSE '2-HIGH' END = '1-URGENT'",
+            // Widening casts of decimals.
+            "SELECT c_custkey FROM customer WHERE CAST(c_acctbal AS DECIMAL(19, 6)) > 1000.50",
+        ] {
+            let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+            let (_, filters) = assert_all_lowerable(&run.expected.plan);
+            assert!(filters > 0, "no filter: {sql}");
+            assert!(run.operators.filters > 0, "no native filter: {sql}");
+            assert!(run.operators.scans > 0, "no native scan: {sql}");
+        }
+        // But not with a cast that may fail with another error than an
+        // overflow: `CAST(l_quantity * 1000 AS DECIMAL(38, 6))` of a
+        // `DECIMAL(36, 2)` may overflow its precision.
+        let sql = "SELECT l_orderkey FROM lineitem \
+                   WHERE l_extendedprice * (1 - l_discount) * (1 + l_tax) < l_quantity * 1000";
+        let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+        assert_eq!(run.operators.filters, 0, "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operators_that_only_overflow_share_pipelines() {
+        // Parts of a projection and of a filter below it that may only fail
+        // with arithmetic overflows raise the same error, whichever comes
+        // first: both are native.
+        let sql = "SELECT l_extendedprice * (1 - l_discount) AS v FROM lineitem \
+                   WHERE l_extendedprice * l_tax > 10.00";
+        let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+        assert_eq!((run.operators.projections, run.operators.filters), (1, 1));
+        // But a part that may fail otherwise (a division) above them: the
+        // filter stays in DataFusion, with its input (see
+        // `projections_above_filters_between_failures_keep_their_errors`).
+        let sql = "SELECT 10 / (l_orderkey + 1) AS q FROM lineitem \
+                   WHERE l_extendedprice * l_tax > 10.00";
+        let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+        assert_eq!((run.operators.projections, run.operators.filters), (1, 0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2313,4 +2313,287 @@ mod tests {
             );
         }
     }
+
+    /// Assert that `queries` (on [`tpch_tables`]) return byte-identical
+    /// results natively, that every projection and filter of their plans can
+    /// be lowered, and that their projections are native (but those that
+    /// DataFusion executes because a node above needs their partitions, e.g.
+    /// a `SortPreservingMergeExec`).
+    async fn assert_all_lowered_natively(queries: &[&str]) {
+        for sql in queries {
+            let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+            let (projections, _) = assert_all_lowerable(&run.expected.plan);
+            assert!(projections > 0, "no projection: {sql}");
+            assert!(run.operators.projections > 0, "no native projection: {sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_tpch_projections_are_native() {
+        assert_all_lowered_natively(&[
+            // Decimal arithmetic chains (Q1, Q3, Q5, Q7 to Q10, Q14, Q19): their
+            // parts may only fail with arithmetic overflows.
+            "SELECT l_orderkey, l_extendedprice * (1 - l_discount) * (1 + l_tax) AS charge \
+             FROM lineitem WHERE l_shipdate <= DATE '1998-09-02'",
+            "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, \
+             sum(l_extendedprice) AS sum_base_price, \
+             sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, \
+             sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge, \
+             avg(l_quantity) AS avg_qty, avg(l_discount) AS avg_disc, count(*) AS count_order \
+             FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' \
+             GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
+            "SELECT l_orderkey, l_extendedprice * (1 - l_discount) - l_tax * l_quantity AS amount \
+             FROM lineitem",
+            // `extract(year from ...)` (Q7 to Q9), with decimal arithmetic.
+            "SELECT extract(year from l_shipdate) AS l_year, \
+             l_extendedprice * (1 - l_discount) AS volume FROM lineitem \
+             WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'",
+            "SELECT o_year, sum(volume) AS revenue FROM (\
+             SELECT extract(year from o_orderdate) AS o_year, \
+             o_totalprice * (1 + o_custkey % 3) AS volume FROM orders) \
+             GROUP BY o_year ORDER BY o_year",
+            // `substring(c_phone from 1 for 2)` (Q22).
+            "SELECT substring(c_phone from 1 for 2) AS cntrycode, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > 0.00",
+            "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (\
+             SELECT substring(c_phone from 1 for 2) AS cntrycode, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > 0.00) GROUP BY cntrycode ORDER BY cntrycode",
+            // Constant strings of bounded sizes (Q12-style priorities).
+            "SELECT o_orderkey, CASE WHEN o_orderpriority = '1-URGENT' \
+             OR o_orderpriority = '2-HIGH' THEN '1-URGENT' ELSE '2-HIGH' END AS priority \
+             FROM orders WHERE o_orderdate >= DATE '1994-01-01'",
+            "SELECT o_orderkey, CASE WHEN o_totalprice > 250000.00 THEN 'HIGH' \
+             WHEN o_totalprice > 100000.00 THEN 'MEDIUM' ELSE 'LOW' END AS level, \
+             'TPC-H' AS benchmark FROM orders",
+            // `coalesce` (a `CASE` of views), widening decimal casts and
+            // casts into floats (Q14, Q22), other built-in functions.
+            "SELECT c_custkey, coalesce(c_phone, 'unknown') AS phone, \
+             CAST(c_acctbal AS DECIMAL(19, 6)) AS balance FROM customer",
+            "SELECT 100.00 * CAST(promo AS DOUBLE) / CAST(total AS DOUBLE) AS promo_revenue FROM (\
+             SELECT sum(CASE WHEN l_shipmode LIKE 'AIR%' THEN l_extendedprice * (1 - l_discount) \
+             ELSE 0 END) AS promo, sum(l_extendedprice * (1 - l_discount)) AS total \
+             FROM lineitem WHERE l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1996-09-01')",
+            "SELECT o_orderkey, upper(o_orderpriority) AS p, \
+             character_length(o_orderpriority) AS n, date_part('month', o_orderdate) AS m, \
+             abs(o_totalprice) AS a FROM orders \
+             WHERE starts_with(o_orderpriority, '1') OR o_orderkey % 10 = 0",
+            // Of strings with 32-bit offsets, the functions that return parts
+            // of them.
+            "SELECT o_orderkey, character_length(o_comment) AS n, octet_length(o_comment) AS b, \
+             substr(o_comment, 9, 3) AS c, trim(o_comment) AS t, \
+             nullif(o_comment, 'comment 7 special requests') AS u FROM orders",
+        ])
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_decimal_overflows_match_datafusion() {
+        // `a * b * c` overflows `Decimal128` on some rows of every partition:
+        // the first product on the rows of `x = 1`, the second one on the rows
+        // of `x = 2`. Whatever the batches and the order of the rows, both
+        // engines fail with an arithmetic overflow.
+        let setup = async |ctx: &SessionContext| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("x", DataType::Int32, false),
+                Field::new("a", DataType::Decimal128(38, 0), false),
+                Field::new("b", DataType::Decimal128(38, 0), false),
+                Field::new("c", DataType::Decimal128(38, 0), false),
+                Field::new("s", DataType::Utf8, false),
+            ]));
+            let batch = |rows: std::ops::Range<i32>| {
+                let x = Int32Array::from_iter_values(rows.clone().map(|i| i % 3));
+                let decimal = |values: Vec<i128>| -> ArrayRef {
+                    Arc::new(
+                        arrow::array::Decimal128Array::from(values)
+                            .with_precision_and_scale(38, 0)
+                            .unwrap(),
+                    )
+                };
+                let a = decimal(
+                    rows.clone()
+                        .map(|i| if i % 3 == 1 { 10_i128.pow(20) } else { 7 })
+                        .collect(),
+                );
+                let b = decimal(
+                    rows.clone()
+                        .map(|i| {
+                            if i % 3 == 1 {
+                                10_i128.pow(19)
+                            } else {
+                                10_i128.pow(18)
+                            }
+                        })
+                        .collect(),
+                );
+                let c = decimal(
+                    rows.clone()
+                        .map(|i| if i % 3 == 2 { 10_i128.pow(20) } else { 3 })
+                        .collect(),
+                );
+                let s = StringArray::from_iter_values(
+                    rows.map(|i| if i % 3 == 0 { "1" } else { "x" }),
+                );
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(x), a, b, c, Arc::new(s)],
+                )
+                .unwrap()
+            };
+            register_partitions(
+                ctx,
+                "overflows",
+                vec![
+                    vec![batch(0..3000), batch(3000..3100)],
+                    vec![batch(3100..5000)],
+                ],
+            )
+        };
+        for (sql, native, fails) in [
+            // Several products that may only overflow: native.
+            ("SELECT a * b * c AS v FROM overflows", true, true),
+            ("SELECT a * b AS ab, b * c AS bc FROM overflows", true, true),
+            (
+                "SELECT x, a * b * c AS v FROM overflows WHERE x = 0",
+                true,
+                false,
+            ),
+            (
+                "SELECT a * b * c AS v FROM overflows WHERE x = 2",
+                true,
+                true,
+            ),
+            ("SELECT x FROM overflows WHERE a * b * c > 0", true, true),
+            // But after a guard: DataFusion decides per batch on which rows it
+            // evaluates them (here on all of them: a third of the rows have
+            // `x = 0`).
+            (
+                "SELECT x FROM overflows WHERE x = 0 AND a * b > c * a",
+                false,
+                true,
+            ),
+            (
+                "SELECT a * b AS v FROM overflows WHERE b * c > 0",
+                true,
+                true,
+            ),
+            // With a part that fails otherwise (a cast of strings), which error
+            // comes first depends on the batches: in DataFusion.
+            (
+                "SELECT a * b + CAST(s AS DECIMAL(38, 0)) AS v FROM overflows",
+                false,
+                true,
+            ),
+            (
+                "SELECT a * b + CAST(s AS DECIMAL(38, 0)) AS v FROM overflows WHERE x = 0",
+                false,
+                false,
+            ),
+        ] {
+            let (error, operators) = assert_native_parity_with_setup(sql, &setup).await;
+            assert_eq!(
+                operators.projections + operators.filters > 0,
+                native,
+                "{sql}"
+            );
+            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
+            if let Some(error) = error {
+                assert!(
+                    error.contains("Overflow") || error.contains("Cannot cast"),
+                    "{sql}: {error}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decimal_overflows_raise_the_same_error_on_chunks() {
+        // One batch of 4096 rows: on the first 2048 rows, the second product of
+        // `a * b * c` overflows, on the others the first one. `ProjectionExec`
+        // computes `a * b` on all rows first, and fails on row 2048; a pipeline
+        // computes both products on the first chunk first, and fails on row 0.
+        // The rows differ, but both fail with an arithmetic overflow.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Decimal128(38, 0), false),
+            Field::new("b", DataType::Decimal128(38, 0), false),
+            Field::new("c", DataType::Decimal128(38, 0), false),
+        ]));
+        let decimal = |values: Vec<i128>| -> ArrayRef {
+            Arc::new(
+                arrow::array::Decimal128Array::from(values)
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+            )
+        };
+        let first = |i: usize| i < 2048;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                decimal(
+                    (0..4096)
+                        .map(|i| if first(i) { 10 } else { 10_i128.pow(20) })
+                        .collect(),
+                ),
+                decimal((0..4096).map(|_| 10_i128.pow(19)).collect()),
+                decimal(
+                    (0..4096)
+                        .map(|i| if first(i) { 10_i128.pow(19) } else { 1 })
+                        .collect(),
+                ),
+            ],
+        )
+        .unwrap();
+        let expr = physical_expr("a * b * c", &schema);
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                ProjectionExec::try_new(
+                    [ProjectionExpr::new(Arc::clone(&expr), "v")],
+                    scan_batches(&schema, std::slice::from_ref(&batch)),
+                )
+                .unwrap(),
+            )
+        };
+        let projection_plan = plan();
+        let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        let (error, operators) =
+            assert_native_plan_parity_with_config(plan, false, config).await;
+        let error = error.unwrap();
+        assert!(error.contains("Arithmetic overflow"), "{error}");
+        assert_eq!(operators.projections, 1);
+        // The errors are raised on other rows.
+        let datafusion_error = datafusion_physical_plan::collect(
+            plan(),
+            Arc::new(datafusion_execution::TaskContext::default()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            datafusion_error.contains(&format!(
+                "{} * {}",
+                10_i128.pow(20),
+                10_i128.pow(19)
+            )),
+            "{datafusion_error}"
+        );
+        let native = PhysicalProjection::try_new(
+            source(Arc::clone(&schema), vec![]),
+            vec![(Arc::clone(&expr), "v".to_owned())],
+        )
+        .unwrap();
+        let native_error = project(&native, &DataChunk::from(batch.slice(0, 2048)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            native_error.contains(&format!("{} * {}", 10_i128.pow(20), 10_i128.pow(19))),
+            "{native_error}"
+        );
+        assert!(
+            native_error.contains("Arithmetic overflow"),
+            "{native_error}"
+        );
+    }
 }
