@@ -92,6 +92,14 @@
 //! output (sorts, aggregations and the build side of hash joins) separate
 //! these concerns: nothing above them runs before their input is exhausted.
 //!
+//! # `EXPLAIN` and `EXPLAIN ANALYZE`
+//!
+//! `EXPLAIN` shows the plan that the pipeline engine executes: the
+//! `physical_plan` is the [`PipelineRootExec`], with the lowered operator tree
+//! and its pipelines (see [`crate::explain`]). `EXPLAIN VERBOSE` also shows the
+//! physical plans of DataFusion that it was lowered from. `EXPLAIN ANALYZE`
+//! executes the lowered plan and shows the metrics of every operator.
+//!
 //! # Example
 //!
 //! ```
@@ -125,12 +133,16 @@ use arrow::datatypes::{DataType, Schema};
 use async_trait::async_trait;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::format::ExplainFormat;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::LogicalPlan;
+use datafusion_expr::logical_plan::Explain;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateInputMode, AggregateMode,
 };
+use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::HashJoinExec;
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -174,6 +186,66 @@ impl PipelineQueryPlanner {
     pub fn physical_planner(&self) -> &Arc<dyn PhysicalPlanner> {
         &self.physical_planner
     }
+
+    /// The plan of `EXPLAIN`: DataFusion's `ExplainExec`, whose final
+    /// physical plan is the plan that the pipeline engine executes.
+    async fn create_explain_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        explain: &Explain,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = self
+            .physical_planner
+            .create_physical_plan(logical_plan, session)
+            .await?;
+        let options = session.config_options();
+        let shows_physical_plan = explain.logical_optimization_succeeded
+            && !options.explain.logical_plan_only
+            && matches!(
+                explain.explain_format,
+                ExplainFormat::Indent | ExplainFormat::Tree
+            );
+        let Some(exec) = plan
+            .downcast_ref::<ExplainExec>()
+            .filter(|_| shows_physical_plan)
+        else {
+            return Ok(plan);
+        };
+        // DataFusion's `ExplainExec` reports the errors of physical planning.
+        let Ok(input) = self
+            .physical_planner
+            .create_physical_plan(&explain.plan, session)
+            .await
+        else {
+            return Ok(plan);
+        };
+        let root = create_pipeline_plan_with_options(input, options)?;
+        Ok(Arc::new(crate::explain::explain_pipeline_plan(
+            exec, &root, explain, session,
+        )))
+    }
+
+    /// The plan of `EXPLAIN ANALYZE`: DataFusion's `AnalyzeExec`, executing
+    /// (and showing the metrics of) the plan of the pipeline engine.
+    async fn create_analyze_plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let plan = self
+            .physical_planner
+            .create_physical_plan(logical_plan, session)
+            .await?;
+        let Some(analyze) = plan.downcast_ref::<AnalyzeExec>() else {
+            return Ok(plan);
+        };
+        let root: Arc<dyn ExecutionPlan> = create_pipeline_plan_with_options(
+            Arc::clone(analyze.input()),
+            session.config_options(),
+        )?;
+        Arc::clone(&plan).replace_children(vec![root], recompute())
+    }
 }
 
 impl fmt::Debug for PipelineQueryPlanner {
@@ -190,10 +262,20 @@ impl QueryPlanner for PipelineQueryPlanner {
         logical_plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let plan = self
-            .physical_planner
-            .create_physical_plan(logical_plan, session)
-            .await?;
+        let plan = match logical_plan {
+            LogicalPlan::Explain(explain) => {
+                self.create_explain_plan(logical_plan, explain, session)
+                    .await?
+            }
+            LogicalPlan::Analyze(_) => {
+                self.create_analyze_plan(logical_plan, session).await?
+            }
+            _ => {
+                self.physical_planner
+                    .create_physical_plan(logical_plan, session)
+                    .await?
+            }
+        };
         let plan: Arc<dyn ExecutionPlan> =
             create_pipeline_plan_with_options(plan, session.config_options())?;
         Ok(plan)
@@ -875,7 +957,7 @@ fn native_failing_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
 mod tests {
     use super::*;
 
-    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::array::{AsArray, Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::{
         CsvReadOptions, ParquetReadOptions, SessionConfig, SessionContext,
@@ -1548,5 +1630,159 @@ mod tests {
         assert_native(sql, &root);
         assert_eq!(count::<PhysicalHashJoin>(&root), 1);
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // EXPLAIN
+    // ---------------------------------------------------------------------
+
+    /// The output of `sql`, an `EXPLAIN`, with the pipeline engine: the plan of
+    /// every plan type.
+    async fn explain(sql: &str) -> Vec<(String, String)> {
+        let ctx = pipeline_context(test_session_config());
+        register_test_tables(&ctx).unwrap();
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let types = batch.column(0).as_string::<i32>();
+                let plans = batch.column(1).as_string::<i32>();
+                types
+                    .iter()
+                    .zip(plans.iter())
+                    .map(|(plan_type, plan)| {
+                        (plan_type.unwrap().to_owned(), plan.unwrap().to_owned())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The plan of type `plan_type` of an `EXPLAIN` output.
+    fn plan_of<'a>(explained: &'a [(String, String)], plan_type: &str) -> &'a str {
+        explained
+            .iter()
+            .find(|(t, _)| t == plan_type)
+            .map(|(_, plan)| plan.as_str())
+            .unwrap_or_else(|| panic!("no {plan_type} in {explained:#?}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn explain_shows_the_pipelines() {
+        let sql = "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d";
+        let explained = explain(&format!("EXPLAIN {sql}")).await;
+        assert_eq!(explained.len(), 2, "{explained:#?}");
+        assert!(plan_of(&explained, "logical_plan").contains("Aggregate:"));
+        let plan = plan_of(&explained, "physical_plan");
+        assert_eq!(
+            plan,
+            "PipelineRootExec: pipelines=2\n  \
+             PhysicalProjection: expr=[d@0 as d, count(Int64(1))@1 as n], pipelines=[0]\n    \
+             PhysicalHashAggregate: gby=[d@0 as d], aggr=[count(Int64(1))], pipelines=[0, 1]\n      \
+             MemoryScanSource: partitions=4, rows=5000, chunks=6, pipelines=[1]\n  \
+             Pipeline 1: MemoryScanSource -> PhysicalHashAggregate\n  \
+             Pipeline 0: PhysicalHashAggregate -> PhysicalProjection -> CollectorSink, \
+             after pipelines [1]\n"
+        );
+
+        // A bridged plan is shown below its bridge.
+        let explained = explain(
+            "EXPLAIN SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1",
+        )
+        .await;
+        let plan = plan_of(&explained, "physical_plan");
+        assert!(plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"));
+        assert!(
+            plan.contains(
+                "\n    BridgeOperator, pipelines=[0]\n      BoundedWindowAggExec: "
+            ),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("\n          RepartitionExec: partitioning=Hash"),
+            "{plan}"
+        );
+
+        // `EXPLAIN VERBOSE` also shows the plans of DataFusion that the plan
+        // of the pipeline engine was lowered from.
+        let explained = explain(&format!("EXPLAIN VERBOSE {sql}")).await;
+        assert!(
+            explained.iter().any(|(plan_type, plan)| plan_type
+                .starts_with("physical_plan after")
+                && plan.contains("RepartitionExec")),
+            "{explained:#?}"
+        );
+        for plan_type in [
+            "physical_plan",
+            "physical_plan_with_stats",
+            "physical_plan_with_schema",
+        ] {
+            let plan = plan_of(&explained, plan_type);
+            assert!(
+                plan.starts_with("PipelineRootExec: pipelines=2"),
+                "{plan_type}: {plan}"
+            );
+            assert!(!plan.contains("RepartitionExec"), "{plan_type}: {plan}");
+        }
+        assert!(
+            plan_of(&explained, "physical_plan_with_schema").contains("schema=[d:Utf8;N")
+        );
+
+        // `EXPLAIN FORMAT TREE`.
+        let explained = explain(&format!("EXPLAIN FORMAT TREE {sql}")).await;
+        let plan = plan_of(&explained, "physical_plan");
+        assert!(plan.contains("PipelineRootExec"), "{plan}");
+        assert!(plan.contains("pipelines: 2"), "{plan}");
+        assert!(!plan.contains("RepartitionExec"), "{plan}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn explain_analyze_shows_the_metrics_of_every_operator() {
+        let explained = explain(
+            "EXPLAIN ANALYZE SELECT e, COUNT(*) AS n FROM t1 WHERE a > 0 GROUP BY e",
+        )
+        .await;
+        let plan = plan_of(&explained, "Plan with Metrics");
+        let lines = plan.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 8, "{plan}");
+        assert_eq!(lines[0], "PipelineRootExec: pipelines=2", "{plan}");
+        let operators = [
+            "  PhysicalProjection: expr=[e@0 as e, count(Int64(1))@1 as n], pipelines=[0], \
+             metrics=[output_rows=3, output_chunks=",
+            "    PhysicalHashAggregate: gby=[e@0 as e], aggr=[count(Int64(1))], \
+             pipelines=[0, 1], metrics=[output_rows=3, output_chunks=",
+            "      CachingOperator: threshold=256, pipelines=[1], metrics=[output_rows=",
+            "        PhysicalFilter: a@0 > 0, projection=[e@1], pipelines=[1], \
+             metrics=[output_rows=",
+            "          MemoryScanSource: partitions=4, rows=5000, chunks=6, pipelines=[1], \
+             metrics=[output_rows=5.00 K, output_chunks=6, elapsed_compute=",
+        ];
+        for (line, operator) in lines[1..].iter().zip(operators) {
+            assert!(line.starts_with(operator), "{line}\n{plan}");
+        }
+        // The aggregation consumed the rows the filter produced, as a sink.
+        let filtered = lines[3]
+            .split("output_rows=")
+            .nth(1)
+            .and_then(|metrics| metrics.split(',').next())
+            .unwrap();
+        assert!(
+            lines[2].contains(&format!("sink_rows={filtered}, ")),
+            "{plan}"
+        );
+        assert_eq!(
+            lines[6],
+            "  Pipeline 1: MemoryScanSource -> PhysicalFilter -> CachingOperator -> \
+             PhysicalHashAggregate",
+            "{plan}"
+        );
+        // DataFusion appends the metrics of the `PipelineRootExec` itself.
+        assert!(
+            lines[7].starts_with(
+                "  Pipeline 0: PhysicalHashAggregate -> PhysicalProjection -> CollectorSink, \
+                 after pipelines [1], metrics=[output_rows=3, elapsed_compute="
+            ),
+            "{plan}"
+        );
     }
 }
