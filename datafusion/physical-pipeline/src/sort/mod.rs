@@ -2107,6 +2107,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn differential_random_order_by() {
+        // Random sort keys (columns of every type and expressions), directions
+        // and null orders, filters, limits and offsets, on 1 to 16 target
+        // partitions. `id` breaks the ties.
+        let mut rng = StdRng::seed_from_u64(99);
+        let keys = [
+            "id", "a", "b", "c", "d", "e", "f", "g", "h", "ts", "a + b", "upper(d)",
+            "a % 7", "c * 2",
+        ];
+        let filters = ["", " WHERE a > 0", " WHERE id % 3 = 1", " WHERE b < 5000"];
+        for _ in 0..64 {
+            let ordering = (0..rng.random_range(1..4))
+                .map(|_| {
+                    let key = keys[rng.random_range(0..keys.len())];
+                    let direction = ["", " ASC", " DESC"][rng.random_range(0..3)];
+                    let nulls =
+                        ["", " NULLS FIRST", " NULLS LAST"][rng.random_range(0..3)];
+                    format!("{key}{direction}{nulls}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let filter = filters[rng.random_range(0..filters.len())];
+            let limit = match rng.random_range(0..4) {
+                0 => String::new(),
+                1 => format!(" LIMIT {}", rng.random_range(1..20)),
+                2 => format!(" LIMIT {}", rng.random_range(1..6000)),
+                _ => format!(
+                    " LIMIT {} OFFSET {}",
+                    rng.random_range(1..3000),
+                    rng.random_range(0..3000)
+                ),
+            };
+            let sql = format!(
+                "SELECT id, a, c, d FROM t1{filter} ORDER BY {ordering}, id{limit}"
+            );
+            let target_partitions = [1, 3, 4, 16][rng.random_range(0..4)];
+            let config = test_session_config().with_target_partitions(target_partitions);
+            assert_parity_with_config(&sql, config).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_order_by_of_aggregates_joins_and_subqueries() {
         // Projections between the merge and the sort, over native
         // aggregations.
