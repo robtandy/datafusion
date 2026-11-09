@@ -79,7 +79,10 @@
 //!   refuse such expressions themselves.)
 //! * A filter, projection, aggregation or sort with a part that may fail
 //!   above native operators of the same pipeline that have parts that may fail
-//!   too: which of them fails first depends on the batches.
+//!   too: which of them fails first depends on the batches. For a sort, also
+//!   above an input that may fail (expressions, native or not, or sources):
+//!   DataFusion evaluates the keys of a sort once it read all of its input,
+//!   the native sort whenever it sorts a run of rows of its input.
 //! * A `FilterExec` or a `CoalesceBatchesExec` whose plan has parts that may
 //!   fail (expressions, or sources that may fail to read or decode their rows,
 //!   e.g. a CSV file with a value that does not parse), below a node of the
@@ -501,8 +504,10 @@ impl Lowering<'_> {
     /// of `a <> 0 AND 10 / a > 1`, which DataFusion evaluates on all rows of a
     /// batch unless at most 20% of them are left, or more than one part that
     /// may fail (which error comes first depends on the batches) is left to
-    /// DataFusion, as is a sort with a key that may fail above native operators
-    /// of the same pipeline that may fail too.
+    /// DataFusion. So is a sort with a key that may fail over an input that
+    /// may fail (its expressions, native or not, or its sources): DataFusion
+    /// evaluates the keys once it read all of its input, the native sort
+    /// whenever it sorts a run of its input, before it read all of it.
     fn try_lower_sort(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -514,6 +519,10 @@ impl Lowering<'_> {
         if !keys.evaluates_like_datafusion() {
             return Ok(None);
         }
+        let input_may_fail = || subtree_failing_parts(sort.input()) > 0;
+        if keys.failing_parts > 0 && input_may_fail() {
+            return Ok(None);
+        }
         let input = Context::below_breaker(keys.failing_parts);
         let Some(lowered) =
             crate::sort::try_lower(plan, self.options, |plan| self.lower(plan, input))?
@@ -523,15 +532,8 @@ impl Lowering<'_> {
         // The keys that the native sort evaluates (those of the top merge, over
         // the projections below it, if any).
         let native_keys = native_sort_keys(&lowered);
-        if !native_keys.evaluates_like_datafusion() {
-            return Ok(None);
-        }
-        let own = keys.failing_parts.max(native_keys.failing_parts);
-        if own > 0
-            && lowered
-                .children()
-                .iter()
-                .any(|input| native_failing_parts(input) > 0)
+        if !native_keys.evaluates_like_datafusion()
+            || (native_keys.failing_parts > 0 && input_may_fail())
         {
             return Ok(None);
         }
@@ -2277,6 +2279,50 @@ mod tests {
         )
         .await;
         assert_native("SELECT 10 / a AS x FROM t1 WHERE a >= 0", &root);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_by_fallible_keys_of_fallible_inputs_stay_in_datafusion() -> Result<()>
+    {
+        // A CSV file of 300000 rows, the first of which is 0, with a value that
+        // is not an integer near its end. DataFusion's sort reads all of its
+        // input before it evaluates its keys, so it fails to parse the file;
+        // the native sort sorts (and evaluates the keys of) runs of
+        // `SORT_RUN_ROWS` rows as it reads its input, and would divide by zero
+        // first.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("f.csv");
+        let mut csv = String::from("a\n0\n");
+        csv.push_str(&"1\n".repeat(289_999));
+        csv.push_str("x\n");
+        csv.push_str(&"1\n".repeat(10_000));
+        std::fs::write(&path, csv)?;
+        let path = path.to_str().unwrap().to_string();
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_csv("f", &path, CsvReadOptions::new().schema(&schema))
+                .await?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT a FROM f ORDER BY 10 / a, a";
+        let datafusion = datafusion_context(config.clone());
+        setup(&datafusion).await?;
+        let error = crate::test_utils::run_sql(&datafusion, sql)
+            .await
+            .expect_err("DataFusion fails")
+            .to_string();
+        assert!(!error.contains("Divide by zero"), "{error}");
+        assert_fails_like_datafusion(sql, config.clone(), &setup, &error).await;
+        let root = lowered(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalSort>(&root), 0);
+        // Over an input that cannot fail, the sort is native (and `a + 100` is
+        // never 0).
+        let sql = "SELECT a FROM t1 ORDER BY 10 / (a + 100), id";
+        let root = assert_parity(sql).await;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalSort>(&root), 1);
         Ok(())
     }
 
