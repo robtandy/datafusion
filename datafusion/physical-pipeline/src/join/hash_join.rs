@@ -36,7 +36,9 @@
 //! * **Parallel finalize** (pipeline 2): the threads of a
 //!   `JoinHashTableBuild` pipeline build the pointer tables of the radix
 //!   partitions in parallel, one partition at a time; `finalize` assembles
-//!   the shared, read-only [`JoinHashTable`]. If the join cannot produce any
+//!   the shared, read-only [`JoinHashTable`]. Like DataFusion, it evaluates
+//!   the build keys on an empty build side, unless the join was canceled
+//!   (its output is not needed). If the join cannot produce any
 //!   output (e.g. an inner join with an empty build side), `finalize` returns
 //!   [`SinkFinalize::NoOutputPossible`], so that the probe side is not
 //!   executed at all, as DataFusion does not read it either. (DataFusion
@@ -449,7 +451,9 @@ impl PhysicalHashJoin {
     ///   executed, and the joins DataFusion does not execute: in
     ///   `PartitionMode::Auto`, in `PartitionMode::CollectLeft` with several
     ///   build partitions, and in `PartitionMode::Partitioned` with different
-    ///   numbers of build and probe partitions;
+    ///   numbers of build and probe partitions; and the joins without probe
+    ///   partitions, which have no output partitions, so that DataFusion
+    ///   executes neither of their inputs (nor evaluates their keys);
     /// * a null-aware join with several keys or a filter (a correlated or
     ///   multi-column `NOT IN`), or with `NullEqualsNull`;
     /// * a join whose keys have different types on the two sides, or whose
@@ -478,13 +482,14 @@ impl PhysicalHashJoin {
         let partitions = |input: &Arc<dyn ExecutionPlan>| {
             input.output_partitioning().partition_count()
         };
-        let executable = match join.partition_mode() {
-            PartitionMode::CollectLeft => partitions(join.left()) == 1,
-            PartitionMode::Partitioned => {
-                partitions(join.left()) == partitions(join.right())
-            }
-            PartitionMode::Auto => false,
-        };
+        let executable = partitions(join.right()) > 0
+            && match join.partition_mode() {
+                PartitionMode::CollectLeft => partitions(join.left()) == 1,
+                PartitionMode::Partitioned => {
+                    partitions(join.left()) == partitions(join.right())
+                }
+                PartitionMode::Auto => false,
+            };
         if !executable
             || join.fetch().is_some()
             || has_prepared_build(plan)
@@ -1491,13 +1496,26 @@ impl PhysicalOperator for PhysicalHashJoin {
 
     fn finalize(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         gstate: &dyn GlobalSinkState,
     ) -> Result<SinkFinalize> {
         let spec = &self.spec;
         let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
-        let table = state.finish_build(spec)?;
         let build_empty = state.build_rows.load(Ordering::Relaxed) == 0;
+        // DataFusion evaluates the build keys on its whole build side, also
+        // when it is empty, which raises the errors of keys that fail without
+        // any row (e.g. `1 / 0`). Not for a join whose output is not needed
+        // any more (canceled, so that its build pipelines stopped or did not
+        // run): DataFusion does not collect the build side of a join that is
+        // not read, nor reports its errors.
+        if build_empty && !ctx.registry().is_sink_finished(self) {
+            let batch = RecordBatch::new_empty(self.build_side().schema());
+            evaluate_expressions_to_arrays(
+                spec.on.iter().map(|(build, _)| build),
+                &batch,
+            )?;
+        }
+        let table = state.finish_build(spec)?;
         // Like DataFusion, which then does not read its probe side either.
         if (build_empty && spec.join_type.empty_build_side_produces_empty_result())
             || (table.is_empty() && spec.join_type.empty_map_produces_empty_result())
@@ -1756,9 +1774,11 @@ mod tests {
     use datafusion_physical_optimizer::PhysicalOptimizerRule;
     use datafusion_physical_optimizer::filter_pushdown::FilterPushdown;
     use datafusion_physical_plan::collect;
+    use datafusion_physical_plan::empty::EmptyExec;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::joins::HashJoinExecBuilder;
     use datafusion_physical_plan::projection::ProjectionExec;
+    use datafusion_physical_plan::union::UnionExec;
 
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::executor::Executor;
@@ -1767,7 +1787,7 @@ mod tests {
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
         TestSource, assert_lowered_plan_byte_eq,
-        assert_lowered_plan_fails_like_datafusion, count,
+        assert_lowered_plan_fails_like_datafusion, count, pending_plan,
     };
     use crate::sources::test_harness::write_parquet;
     use crate::test_utils::{
@@ -3545,6 +3565,132 @@ mod tests {
             .await
             .expect_err("the pipeline engine fails");
         assert!(error.to_string().contains("Divide by zero"), "{error}");
+        Ok(())
+    }
+
+    fn int32_k_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]))
+    }
+
+    /// A scan of a single partition of `values` of `k` (without any batch if
+    /// there are none).
+    fn int32_k_scan(values: Vec<Option<i32>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = int32_k_schema();
+        let batches = if values.is_empty() {
+            vec![]
+        } else {
+            let values = Arc::new(Int32Array::from(values));
+            vec![RecordBatch::try_new(Arc::clone(&schema), vec![values])?]
+        };
+        Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
+    }
+
+    /// A join of `build` and `probe` (of [`int32_k_schema`]) on `1 / 0 = k`:
+    /// its build key fails without any row.
+    fn join_on_one_over_zero(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<dyn ExecutionPlan>,
+        join_type: JoinType,
+        mode: PartitionMode,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let one_over_zero =
+            Arc::new(BinaryExpr::new(lit(1_i32), Operator::Divide, lit(0_i32)));
+        let on = vec![(one_over_zero as _, col("k", &probe.schema())?)];
+        Ok(Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            None,
+            &join_type,
+            None,
+            mode,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn empty_build_sides_evaluate_their_keys() -> Result<()> {
+        // DataFusion evaluates the build keys on its (concatenated) build
+        // side, also when it is empty: a key that fails without any row fails
+        // the join, whether it can produce output or not.
+        for join_type in ALL_JOIN_TYPES {
+            for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+                for probe in [vec![], vec![Some(1), None]] {
+                    let make_plan = || {
+                        join_on_one_over_zero(
+                            int32_k_scan(vec![])?,
+                            int32_k_scan(probe.clone())?,
+                            join_type,
+                            mode,
+                        )
+                    };
+                    let root = assert_lowered_plan_fails_like_datafusion(
+                        make_plan,
+                        lower,
+                        test_session_config(),
+                        "Divide by zero",
+                    )
+                    .await;
+                    assert!(root.is::<PhysicalHashJoin>(), "{join_type} {mode:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn canceled_joins_do_not_evaluate_their_build_keys() -> Result<()> {
+        use crate::operators::limit::PhysicalLimit;
+        // A limit of one row over a union of a scan of that row and a join
+        // whose build side never produces anything. Once the limit has its
+        // row, the join is not needed: DataFusion never collects its build
+        // side, so neither engine evaluates its build key `1 / 0`.
+        let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let join = join_on_one_over_zero(
+                pending_plan(int32_k_schema(), 1)?,
+                int32_k_scan(vec![Some(1)])?,
+                JoinType::RightSemi,
+                PartitionMode::CollectLeft,
+            )?;
+            let union = UnionExec::try_new(vec![join, int32_k_scan(vec![Some(42)])?])?;
+            Ok(Arc::new(
+                CoalescePartitionsExec::new(union).with_fetch(Some(1)),
+            ))
+        };
+        let lower_limit = |plan: &Arc<dyn ExecutionPlan>| match PhysicalLimit::try_lower(
+            plan, lower,
+        )? {
+            Some(limit) => Ok(Arc::new(limit) as Arc<dyn PhysicalOperator>),
+            None => lower(plan),
+        };
+        let root =
+            assert_lowered_plan_byte_eq(make_plan, lower_limit, task_ctx(), false).await;
+        assert!(root.is::<PhysicalLimit>());
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_without_probe_partitions_are_left_to_datafusion() -> Result<()> {
+        // A join without probe partitions has no output partitions:
+        // DataFusion executes neither of its inputs, nor evaluates its build
+        // key `1 / 0` on the build rows.
+        let no_partitions = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(EmptyExec::new(int32_k_schema()).with_partitions(0))
+        };
+        for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+            let make_plan = || {
+                let build = match mode {
+                    PartitionMode::CollectLeft => int32_k_scan(vec![Some(1), Some(2)])?,
+                    _ => no_partitions(),
+                };
+                join_on_one_over_zero(build, no_partitions(), JoinType::Inner, mode)
+            };
+            let root =
+                assert_lowered_plan_byte_eq(make_plan, lower, task_ctx(), false).await;
+            assert!(root.is::<BridgeOperator>(), "{mode:?}");
+        }
         Ok(())
     }
 
