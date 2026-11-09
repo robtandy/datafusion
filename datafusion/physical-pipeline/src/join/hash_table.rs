@@ -139,6 +139,17 @@ pub fn hash_join_keys(
     Ok(())
 }
 
+/// Whether [`hash_join_keys`] gives all values the same hash, as with the
+/// `datafusion-common/force_hash_collisions` feature, with which the tests run
+/// too (in the merge queue).
+#[cfg(test)]
+pub(crate) fn hashes_are_forced_to_collide() -> bool {
+    let keys: Vec<ArrayRef> = vec![Arc::new(arrow::array::Int64Array::from(vec![0, 1]))];
+    let mut hashes = vec![];
+    hash_join_keys(&keys, 2, &mut hashes).unwrap();
+    hashes[0] == hashes[1]
+}
+
 /// The finalizer of MurmurHash3 (`fmix64`).
 #[inline]
 fn mix(mut hash: u64) -> u64 {
@@ -1297,16 +1308,6 @@ mod tests {
         }
     }
 
-    /// Whether all values have the same hash, as with the
-    /// `datafusion-common/force_hash_collisions` feature that the tests run
-    /// with too.
-    fn hashes_are_forced_to_collide() -> bool {
-        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![0, 1]))];
-        let mut hashes = vec![];
-        hash_join_keys(&keys, 2, &mut hashes).unwrap();
-        hashes[0] == hashes[1]
-    }
-
     #[test]
     fn probe_finds_all_matches_in_probe_order() {
         // Duplicates, NULLs and keys on one side only, in several batches
@@ -1589,12 +1590,21 @@ mod tests {
                 batch_with_values(keys, i64::from(b) * 2000)
             })
             .collect::<Vec<_>>();
+        // Hashes that spread the keys over partitions, salts and slots without
+        // `create_hashes`, whose hashes all collide with
+        // `force_hash_collisions`, which would make the builds quadratic.
+        let spread = |batch: &RecordBatch| {
+            let keys = batch.column(0).as_primitive::<Int32Type>();
+            (0..batch.num_rows())
+                .map(|i| (keys.value(i) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                .collect::<Vec<_>>()
+        };
         let data = || {
             let layout = layout(schema(), 512);
             let mut data = PartitionedTupleData::try_new(layout, 3).unwrap();
             for batch in &batches {
                 let chunk = DataChunk::from_record_batch(batch.clone());
-                data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+                data.append_chunk(&chunk, &spread(batch)).unwrap();
             }
             data
         };

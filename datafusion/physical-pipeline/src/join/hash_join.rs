@@ -1763,6 +1763,7 @@ mod tests {
     use crate::bridge::{BridgeOperator, PipelineRootExec};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
+    use crate::join::hash_table::hashes_are_forced_to_collide;
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::{
         TestSource, assert_lowered_plan_byte_eq,
@@ -1926,7 +1927,16 @@ mod tests {
     // ---------------------------------------------------------------------
 
     async fn with_timeout<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(60), future)
+        // With `force_hash_collisions`, all keys collide, which makes the
+        // joins of both engines quadratic in the number of distinct keys
+        // (and the native build single-threaded: all rows are in one
+        // partition).
+        let secs = if hashes_are_forced_to_collide() {
+            600
+        } else {
+            60
+        };
+        tokio::time::timeout(Duration::from_secs(secs), future)
             .await
             .expect("the execution did not complete")
     }
