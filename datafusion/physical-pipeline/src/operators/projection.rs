@@ -9,9 +9,9 @@
 //! output is exactly DataFusion's:
 //!
 //! * If every expression is a column of the input (e.g. `SELECT b, a AS x`),
-//!   the output columns are the input [`ArrayRef`]s and the
-//!   [`SelectionVector`] of the input is kept: no data is copied, not even for
-//!   the output of a filter.
+//!   the output columns are the input [`ArrayRef`](arrow::array::ArrayRef)s
+//!   and the [`SelectionVector`] of the input is kept: no data is copied, not
+//!   even for the output of a filter.
 //! * Otherwise the expressions are evaluated on a [`RecordBatch`] of the
 //!   input columns they reference. If the input carries a selection, only
 //!   these columns are compacted (each once, however many expressions use
@@ -37,9 +37,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
+use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
-use arrow_select::take::take;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
 use datafusion_physical_expr::expressions::{
@@ -53,7 +52,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
 use super::adaptive_filter::{depends_on_batches, failing_parts, has_32_bit_offsets};
-use crate::chunk::{DataChunk, SelectionVector};
+use crate::chunk::{DataChunk, Gather, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
     PhysicalOperator,
@@ -413,14 +412,19 @@ impl BoundExprs {
     /// physical rows if `None`), as a batch on which [`Self::exprs`] can be
     /// evaluated.
     ///
-    /// Without `rows` no data is copied. Otherwise the columns are gathered
-    /// with Arrow's `take` kernel, or sliced if `rows` is a contiguous range.
+    /// Without `rows` no data is copied. Otherwise the columns are sliced if
+    /// `rows` is a contiguous range, and copied with Arrow's `filter` or
+    /// `take` kernels otherwise (see [`Gather`]).
     pub(crate) fn batch(
         &self,
         chunk: &DataChunk,
         rows: Option<&SelectionVector>,
     ) -> Result<RecordBatch> {
         let num_rows = rows.map_or_else(|| chunk.physical_len(), SelectionVector::len);
+        let gather = rows.filter(|_| !self.columns.is_empty()).map(|rows| {
+            let data_types = self.schema.fields().iter().map(|field| field.data_type());
+            Gather::new(rows, chunk.physical_len(), data_types)
+        });
         let columns = self
             .columns
             .iter()
@@ -431,8 +435,8 @@ impl BoundExprs {
                         chunk.columns().len()
                     )
                 })?;
-                match rows {
-                    Some(rows) => gather(column, rows),
+                match &gather {
+                    Some(gather) => gather.column(column),
                     None => Ok(Arc::clone(column)),
                 }
             })
@@ -515,7 +519,7 @@ pub(crate) fn takes_little_memory(data_type: &DataType) -> bool {
 }
 
 /// Whether the native operators can gather rows of arrays of `data_type`
-/// (with [`gather`], or `DataChunk::compact`): not if they contain, at any
+/// (with [`Gather`], e.g. in `DataChunk::compact`): not if they contain, at any
 /// depth, lists whose values may take less than a byte each (nulls, booleans,
 /// run-end encoded values, of which one run stands for any number of values,
 /// empty fixed-size lists of any type or binaries, or structs or fixed-size
@@ -564,28 +568,15 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
     }
 }
 
-/// The rows `rows` of `column`: a slice if `rows` is a contiguous range,
-/// otherwise a copy made with Arrow's `take` kernel.
-pub(crate) fn gather(column: &ArrayRef, rows: &SelectionVector) -> Result<ArrayRef> {
-    if let Some((offset, len)) = rows.as_contiguous_range() {
-        if offset == 0 && len == column.len() {
-            return Ok(Arc::clone(column));
-        }
-        return Ok(column.slice(offset, len));
-    }
-    if rows.is_empty() {
-        return Ok(column.slice(0, 0));
-    }
-    Ok(take(column.as_ref(), &rows.to_uint32_array(), None)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::collections::HashMap;
 
-    use arrow::array::{AsArray, Int32Array, Int64Array, StringArray, StringViewArray};
+    use arrow::array::{
+        ArrayRef, AsArray, Int32Array, Int64Array, StringArray, StringViewArray,
+    };
     use arrow::datatypes::{DataType, Field, Int32Type, Int64Type};
     use datafusion::prelude::SessionContext;
     use datafusion_common::DataFusionError;
