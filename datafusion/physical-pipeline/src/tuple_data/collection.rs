@@ -3463,3 +3463,342 @@ mod tests {
         assert_send_sync::<TupleDataScanState>();
     }
 }
+
+/// Micro-benchmarks of the scatter ([`TupleDataCollection::append_chunk`]),
+/// the gather ([`TupleDataCollection::gather_columns`]) and the key
+/// comparison ([`RowMatcher::match_rows`](super::RowMatcher::match_rows)) of
+/// the column types that are common join keys and payloads, reported in
+/// nanoseconds per row. Run them in an optimized build:
+///
+/// ```text
+/// cargo test --profile release-nonlto -p datafusion-physical-pipeline --lib \
+///     tuple_data::collection::bench -- --ignored --nocapture
+/// ```
+///
+/// `TUPLE_DATA_BENCH_ROWS` sets the number of stored rows (default 65,536).
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    use std::fmt::Write as _;
+    use std::time::Duration;
+
+    use arrow::array::{
+        Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+        StringViewArray, UInt32Array, UInt64Array,
+    };
+    use arrow::compute::take;
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_common::NullEquality;
+    use datafusion_common::instant::Instant;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+
+    use crate::tuple_data::RowMatcher;
+
+    /// A well distributed value of row `i`.
+    fn mix(i: usize) -> u64 {
+        (i as u64 ^ 0x5DEE_CE66).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// `Some(value(i))`, or `None` for about `null_percent` percent of the
+    /// rows.
+    fn nullable<T>(i: usize, null_percent: u64, value: impl Fn(usize) -> T) -> Option<T> {
+        (mix(i + 7) % 100 >= null_percent).then(|| value(i))
+    }
+
+    /// The benchmarked columns: `(name, array)`.
+    fn columns(rows: usize) -> Vec<(&'static str, ArrayRef)> {
+        let ints = |nulls| (0..rows).map(move |i| nullable(i, nulls, mix));
+        let short = |i: usize| format!("{:016x}", mix(i))[6..].to_string();
+        let long = |i: usize| format!("Customer#{:016x}", mix(i));
+        let strings = |value: fn(usize) -> String, nulls| {
+            (0..rows)
+                .map(move |i| nullable(i, nulls, value))
+                .collect::<Vec<_>>()
+        };
+        vec![
+            (
+                "Int32",
+                Arc::new(ints(0).map(|v| v.map(|v| v as i32)).collect::<Int32Array>())
+                    as ArrayRef,
+            ),
+            (
+                "Int64",
+                Arc::new(ints(0).map(|v| v.map(|v| v as i64)).collect::<Int64Array>()),
+            ),
+            (
+                "Int64 (10% nulls)",
+                Arc::new(
+                    ints(10)
+                        .map(|v| v.map(|v| v as i64))
+                        .collect::<Int64Array>(),
+                ),
+            ),
+            (
+                "UInt32",
+                Arc::new(
+                    ints(0)
+                        .map(|v| v.map(|v| v as u32))
+                        .collect::<UInt32Array>(),
+                ),
+            ),
+            ("UInt64", Arc::new(ints(0).collect::<UInt64Array>())),
+            (
+                "Date32",
+                Arc::new(
+                    ints(0)
+                        .map(|v| v.map(|v| (v % 20_000) as i32))
+                        .collect::<Date32Array>(),
+                ),
+            ),
+            (
+                "Decimal128(38, 10)",
+                Arc::new(
+                    ints(0)
+                        .map(|v| v.map(|v| i128::from(v) << 20))
+                        .collect::<Decimal128Array>()
+                        .with_precision_and_scale(38, 10)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "Float64",
+                Arc::new(
+                    ints(0)
+                        .map(|v| v.map(|v| v as f64 / 7.0))
+                        .collect::<Float64Array>(),
+                ),
+            ),
+            (
+                "Utf8View (10 bytes)",
+                Arc::new(StringViewArray::from(strings(short, 0))),
+            ),
+            (
+                "Utf8View (25 bytes)",
+                Arc::new(StringViewArray::from(strings(long, 0))),
+            ),
+            (
+                "Utf8View (25 bytes, 10% nulls)",
+                Arc::new(StringViewArray::from(strings(long, 10))),
+            ),
+            (
+                "Utf8 (10 bytes)",
+                Arc::new(StringArray::from(strings(short, 0))),
+            ),
+            (
+                "Utf8 (25 bytes)",
+                Arc::new(StringArray::from(strings(long, 0))),
+            ),
+        ]
+    }
+
+    /// The best time per row of `run` (which processes `rows` rows), in
+    /// nanoseconds.
+    fn ns_per_row(rows: usize, mut run: impl FnMut()) -> f64 {
+        run();
+        let mut best = f64::INFINITY;
+        for _ in 0..7 {
+            let start = Instant::now();
+            let mut iterations = 0;
+            while iterations == 0 || start.elapsed() < Duration::from_millis(60) {
+                run();
+                iterations += 1;
+            }
+            let elapsed = start.elapsed().as_nanos() as f64;
+            best = best.min(elapsed / (iterations * rows) as f64);
+        }
+        best
+    }
+
+    struct Measurement {
+        append: f64,
+        gather_sequential: f64,
+        gather_random: f64,
+        match_rows: f64,
+        match_prepared: f64,
+    }
+
+    /// Measure the batches `batches` (all with the same schema) whose first
+    /// column is the key compared by `RowMatcher`.
+    fn measure(batches: &[RecordBatch], rng: &mut StdRng) -> Measurement {
+        let schema = batches[0].schema();
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let layout =
+            Arc::new(TupleDataLayout::try_new(Arc::clone(&schema), false).unwrap());
+        let chunks = batches
+            .iter()
+            .map(|batch| DataChunk::from_record_batch(batch.clone()))
+            .collect::<Vec<_>>();
+        let append = ns_per_row(rows, || {
+            let mut collection = TupleDataCollection::new(Arc::clone(&layout));
+            for chunk in &chunks {
+                std::hint::black_box(collection.append_chunk(chunk, None).unwrap());
+            }
+            std::hint::black_box(collection);
+        });
+
+        let mut collection = TupleDataCollection::new(Arc::clone(&layout));
+        let mut locations = vec![];
+        for chunk in &chunks {
+            locations.extend(collection.append_chunk(chunk, None).unwrap());
+        }
+        let column_ids = (0..schema.fields().len()).collect::<Vec<_>>();
+        let gather = |locations: &[RowLocation]| {
+            for chunk in locations.chunks(DEFAULT_VECTOR_SIZE) {
+                std::hint::black_box(
+                    collection.gather_columns(chunk, &column_ids).unwrap(),
+                );
+            }
+        };
+        let gather_sequential = ns_per_row(rows, || gather(&locations));
+        let mut shuffled = (0..rows).collect::<Vec<_>>();
+        shuffled.shuffle(rng);
+        let random_locations = shuffled.iter().map(|&i| locations[i]).collect::<Vec<_>>();
+        let gather_random = ns_per_row(rows, || gather(&random_locations));
+
+        // Probe chunks whose keys are equal to the keys of random candidates.
+        let keys = arrow::compute::concat(
+            &batches
+                .iter()
+                .map(|b| b.column(0).as_ref())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let matcher = RowMatcher::try_new(
+            Arc::clone(&layout),
+            vec![0],
+            NullEquality::NullEqualsNull,
+        )
+        .unwrap();
+        let probes = shuffled
+            .chunks(DEFAULT_VECTOR_SIZE)
+            .map(|rows| {
+                let indices = rows.iter().map(|&i| i as u32).collect::<UInt32Array>();
+                let probe_keys = take(keys.as_ref(), &indices, None).unwrap();
+                let mut columns = vec![probe_keys];
+                // The other columns are not compared.
+                columns.extend(
+                    schema.fields()[1..]
+                        .iter()
+                        .map(|f| new_null_array(f.data_type(), rows.len())),
+                );
+                let chunk =
+                    DataChunk::try_new(Arc::clone(&schema), columns, None).unwrap();
+                let candidates = rows.iter().map(|&i| locations[i]).collect::<Vec<_>>();
+                (chunk, candidates)
+            })
+            .collect::<Vec<_>>();
+        let mut sel = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
+        let match_rows = ns_per_row(rows, || {
+            for (chunk, candidates) in &probes {
+                sel.clear();
+                sel.extend(0..chunk.len() as u32);
+                let matched = matcher
+                    .match_rows(chunk, &mut sel, candidates, &collection, None)
+                    .unwrap();
+                assert_eq!(matched, chunk.len());
+            }
+        });
+        let prepared = probes
+            .iter()
+            .map(|(chunk, _)| matcher.prepare(chunk).unwrap())
+            .collect::<Vec<_>>();
+        let match_prepared = ns_per_row(rows, || {
+            for ((chunk, candidates), prepared) in probes.iter().zip(&prepared) {
+                sel.clear();
+                sel.extend(0..chunk.len() as u32);
+                let matched = matcher
+                    .match_prepared(prepared, &mut sel, candidates, &collection, None)
+                    .unwrap();
+                assert_eq!(matched, chunk.len());
+            }
+        });
+        Measurement {
+            append,
+            gather_sequential,
+            gather_random,
+            match_rows,
+            match_prepared,
+        }
+    }
+
+    fn batches(schema: &SchemaRef, columns: &[ArrayRef]) -> Vec<RecordBatch> {
+        let rows = columns[0].len();
+        (0..rows)
+            .step_by(DEFAULT_VECTOR_SIZE)
+            .map(|offset| {
+                let len = DEFAULT_VECTOR_SIZE.min(rows - offset);
+                RecordBatch::try_new(
+                    Arc::clone(schema),
+                    columns.iter().map(|c| c.slice(offset, len)).collect(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "benchmark: run with --ignored in an optimized build"]
+    fn tuple_data_fast_paths() {
+        let rows = std::env::var("TUPLE_DATA_BENCH_ROWS")
+            .ok()
+            .and_then(|rows| rows.parse().ok())
+            .unwrap_or(1 << 16);
+        let mut rng = StdRng::seed_from_u64(42);
+        let columns = columns(rows);
+        let mut report = format!(
+            "\n{rows} rows, ns/row (best of 7)\n\n\
+             | column | append_chunk | gather_columns (sequential) | gather_columns (random) | match_rows | match_prepared |\n\
+             | --- | ---: | ---: | ---: | ---: | ---: |\n"
+        );
+        let mut line = |name: &str, m: Measurement| {
+            writeln!(
+                report,
+                "| {name} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} |",
+                m.append,
+                m.gather_sequential,
+                m.gather_random,
+                m.match_rows,
+                m.match_prepared
+            )
+            .unwrap();
+        };
+        for (name, array) in &columns {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "k",
+                array.data_type().clone(),
+                true,
+            )]));
+            let measurement = measure(&batches(&schema, &[Arc::clone(array)]), &mut rng);
+            line(name, measurement);
+        }
+        // A join build side: an `Int64` key and payload columns of all types
+        // (the key comparison only compares the key).
+        let payload = [
+            "Int64",
+            "Int32",
+            "Float64",
+            "Decimal128(38, 10)",
+            "Date32",
+            "Utf8View (25 bytes)",
+            "Utf8 (10 bytes)",
+        ];
+        let (fields, arrays): (Vec<_>, Vec<_>) = payload
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let array = &columns.iter().find(|(n, _)| n == name).unwrap().1;
+                (
+                    Field::new(format!("c{i}"), array.data_type().clone(), true),
+                    Arc::clone(array),
+                )
+            })
+            .unzip();
+        let schema = Arc::new(Schema::new(fields));
+        let measurement = measure(&batches(&schema, &arrays), &mut rng);
+        line("7 columns (Int64 key, all of the above)", measurement);
+        println!("{report}");
+    }
+}
