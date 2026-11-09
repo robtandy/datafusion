@@ -87,12 +87,15 @@
 //!   build keys once it collected its build side, all keys on a build batch
 //!   before the next, the last batch first, the native join on its chunks as
 //!   they arrive.
-//! * A `FilterExec` or a `CoalesceBatchesExec` whose plan has parts that may
-//!   fail (expressions, or sources that may fail to read or decode their rows,
-//!   e.g. a CSV file with a value that does not parse), below a node of the
-//!   same pipeline that has a part that may fail too: they coalesce their
-//!   output, so they raise the errors of later batches of their input before
-//!   the nodes above them see the rows of the earlier ones.
+//! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
+//!   or a `RepartitionExec` over a bounded input, which coalesces the batches
+//!   of its output partitions, also below a hash join, which removes the
+//!   redistribution of its inputs), whose plan has parts that may fail
+//!   (expressions, or sources that may fail to read or decode their rows, e.g.
+//!   a CSV file with a value that does not parse), below a node of the same
+//!   pipeline that has a part that may fail too: they coalesce their output,
+//!   so they raise the errors of later batches of their input before the
+//!   nodes above them see the rows of the earlier ones.
 //! * An aggregation that produces a dynamic filter (for `MIN` / `MAX`, which
 //!   DataFusion pushes into scans) above nodes that have parts that may fail:
 //!   the native aggregation does not update the filter, so these nodes see rows
@@ -104,11 +107,13 @@
 //!   repartitioning of the states by an expression that may fail:
 //!   the native aggregation merges all partial states at once, without these
 //!   stages. And the sort that DataFusion adds below ordered aggregates (and
-//!   that the native aggregation does without) if both the aggregates and the
-//!   input of the sort may fail: the sort reads all of its input first.
+//!   that the native aggregation does without) if the aggregates may fail:
+//!   DataFusion evaluates them on the sorted rows.
 //! * A hash repartitioning by expressions that may fail, which DataFusion
-//!   evaluates on every batch, and a `CoalesceBatchesExec` of types whose
-//!   concatenation may fail.
+//!   evaluates on every batch, and a node that coalesces batches of types
+//!   whose concatenation may fail (e.g. dictionaries, whose merged values may
+//!   overflow their keys), also between the stages of an aggregation, or
+//!   below a hash join.
 //!
 //! Which other nodes a native operator reproduces exactly, including their
 //! errors, is up to the operator (see its `try_lower` or `supports_*`
@@ -478,10 +483,10 @@ impl Lowering<'_> {
             return Ok(scan);
         }
         if let Some(input) = redistributed_input(plan) {
-            // Like `FilterExec` (see `lower_filter`), `CoalesceBatchesExec` pulls
-            // later batches of its input, whose errors it raises, before the
-            // nodes above it see the rows of earlier ones.
-            if is_coalesce_batches(plan)
+            // Like `FilterExec` (see `lower_filter`), the nodes that coalesce
+            // batches pull later batches of their input, whose errors they
+            // raise, before the nodes above them see the rows of earlier ones.
+            if coalesces_batches(plan)
                 && ctx.fallible_above
                 && subtree_failing_parts(input) > 0
             {
@@ -624,6 +629,23 @@ impl Lowering<'_> {
         if build_keys.batch_dependent || build_keys.failing_parts > 0 {
             return Ok(None);
         }
+        // The join removes the redistributions of its inputs: a repartitioning
+        // that coalesces batches (see `coalesces_batches`) is left to
+        // DataFusion, with the join, if the concatenation may fail, or, on the
+        // probe side, which continues the pipeline of the nodes above the
+        // join, if its input may fail below a node above that may fail.
+        for (side, probe) in [(join.left(), false), (join.right(), true)] {
+            for repartition in top_repartitions(side) {
+                if coalesces_batches(repartition)
+                    && (concatenation_may_fail(&repartition.schema())
+                        || (probe
+                            && ctx.fallible_above
+                            && subtree_failing_parts(repartition.children()[0]) > 0))
+                {
+                    return Ok(None);
+                }
+            }
+        }
         let build = Context::below_breaker(0);
         let probe = Context {
             limited: false,
@@ -729,7 +751,9 @@ fn bridge(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn PhysicalOperator> {
 ///   without input partitions, DataFusion fails to execute it);
 /// * a `RepartitionExec` (round robin or by hash) that does not preserve the
 ///   order, of at least one partition, whose hash expressions cannot fail
-///   (any other is left to DataFusion, which evaluates it on every batch);
+///   (any other is left to DataFusion, which evaluates it on every batch),
+///   and that, if it coalesces its output (see [`coalesces_batches`]), does
+///   so with types whose concatenation cannot fail;
 /// * a `CoalesceBatchesExec` without a fetch, of types whose concatenation
 ///   cannot fail.
 fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
@@ -749,17 +773,59 @@ fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
             }),
             _ => false,
         };
-        return (infallible && !repartition.preserve_order()).then_some(input);
+        let coalesces = coalesces_batches(plan) && concatenation_may_fail(&schema);
+        return (infallible && !repartition.preserve_order() && !coalesces)
+            .then_some(input);
     }
     if is_coalesce_batches(plan) {
-        let concatenates = plan
-            .schema()
-            .fields()
-            .iter()
-            .all(|field| !may_fail_to_concatenate(field.data_type()));
-        return (plan.fetch().is_none() && concatenates).then_some(input);
+        return (plan.fetch().is_none() && !concatenation_may_fail(&plan.schema()))
+            .then_some(input);
     }
     None
+}
+
+/// Whether `plan` concatenates the batches of its input, up to `batch_size`
+/// rows: a `CoalesceBatchesExec`, or a `RepartitionExec` over a bounded input
+/// that does not preserve the order, which coalesces the batches of each of
+/// its output partitions. Such a node may fail to concatenate them (see
+/// [`may_fail_to_concatenate`]), and pulls later batches of its input, whose
+/// errors it raises, before the nodes above it see the rows of earlier ones.
+fn coalesces_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    is_coalesce_batches(plan)
+        || plan
+            .downcast_ref::<RepartitionExec>()
+            .is_some_and(|repartition| {
+                !repartition.preserve_order()
+                    && !repartition.input().boundedness().is_unbounded()
+            })
+}
+
+/// Whether concatenating batches of `schema` may fail (see
+/// [`may_fail_to_concatenate`]).
+fn concatenation_may_fail(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|field| may_fail_to_concatenate(field.data_type()))
+}
+
+/// The `RepartitionExec`s of the chain of `RepartitionExec`s and
+/// `CoalescePartitionsExec`s at the top of `plan`, which a node may remove
+/// below it (e.g. a hash join, from its inputs).
+fn top_repartitions(plan: &Arc<dyn ExecutionPlan>) -> Vec<&Arc<dyn ExecutionPlan>> {
+    let mut repartitions = vec![];
+    let mut node = plan;
+    loop {
+        if node.is::<RepartitionExec>() {
+            repartitions.push(node);
+        } else if !node.is::<CoalescePartitionsExec>() {
+            return repartitions;
+        }
+        match node.children().as_slice() {
+            [child] => node = *child,
+            _ => return repartitions,
+        }
+    }
 }
 
 /// Whether `plan` is a `CoalesceBatchesExec` (which DataFusion does not plan
@@ -769,11 +835,12 @@ fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
 }
 
-/// Whether concatenating arrays of `data_type`, as `CoalesceBatchesExec`
-/// does, may fail: it merges the values of dictionaries, which may overflow
-/// their keys, adds up run ends, and the offsets of lists, strings and
-/// binaries with 32-bit offsets (which lists of nulls, and batches that
-/// share large strings, overflow without memory), at any depth.
+/// Whether concatenating arrays of `data_type`, as the nodes that coalesce
+/// batches do (see [`coalesces_batches`]), may fail: it merges the values of
+/// dictionaries, which may overflow their keys, adds up run ends, and the
+/// offsets of lists, strings and binaries with 32-bit offsets (which lists of
+/// nulls, and batches that share large strings, overflow without memory), at
+/// any depth.
 fn may_fail_to_concatenate(data_type: &DataType) -> bool {
     match data_type {
         DataType::Dictionary(..)
@@ -874,10 +941,12 @@ fn raw_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
 /// require it (see [`PhysicalHashAggregate`]). The sort is removed if it sorts
 /// every partition of its input, without a fetch, by keys that cannot fail
 /// (DataFusion evaluates them on all rows, the native aggregation evaluates
-/// them on the rows that pass the filters of the aggregates), unless both the
-/// expressions of `raw` (with `own_failing_parts` parts that may fail) and its
-/// input may fail: the sort reads all of its input before the aggregation
-/// sees any row, so DataFusion raises the errors of the input first.
+/// them on the rows that pass the filters of the aggregates), unless the
+/// expressions of `raw` (with `own_failing_parts` parts that may fail) may
+/// fail: DataFusion evaluates them on the sorted rows, so that which row fails
+/// first depends on the sort (and the sort reads all of its input before the
+/// aggregation sees any row, so DataFusion raises the errors of the input
+/// first).
 fn without_ordering_sort<'a>(
     raw: &AggregateExec,
     own_failing_parts: usize,
@@ -897,14 +966,12 @@ fn without_ordering_sort<'a>(
     let sorts_partitions = sort.input().output_partitioning().partition_count()
         == plan.output_partitioning().partition_count();
     let keys = Judgement::of_ordering(sort.expr(), &sort.input().schema());
-    let errors_in_order =
-        own_failing_parts == 0 || subtree_failing_parts(sort.input()) == 0;
     if orders_aggregates
         && sorts_partitions
         && sort.fetch().is_none()
         && !keys.batch_dependent
         && keys.failing_parts == 0
-        && errors_in_order
+        && own_failing_parts == 0
     {
         sort.input()
     } else {
@@ -984,7 +1051,9 @@ fn aggregation_to_lower(
 ///
 /// * a `RepartitionExec` that does not preserve the order, round robin, or by
 ///   hash expressions that cannot fail and whose errors do not depend on the
-///   batches (DataFusion evaluates them on every batch of states);
+///   batches (DataFusion evaluates them on every batch of states), and that,
+///   if it coalesces its output (see [`coalesces_batches`]), does so with
+///   states whose concatenation cannot fail;
 /// * a `CoalescePartitionsExec` without a fetch;
 /// * a `CoalesceBatchesExec` without a fetch, of states whose concatenation
 ///   cannot fail;
@@ -994,26 +1063,24 @@ fn aggregation_to_lower(
 fn passes_states_on(stage: &Arc<dyn ExecutionPlan>, partial: &AggregateExec) -> bool {
     if let Some(repartition) = stage.downcast_ref::<RepartitionExec>() {
         let schema = repartition.input().schema();
-        return !repartition.preserve_order()
-            && match repartition.partitioning() {
-                Partitioning::RoundRobinBatch(_) => true,
-                Partitioning::Hash(exprs, _) => exprs.iter().all(|expr| {
-                    !depends_on_batches(expr, &schema)
-                        && failing_parts(expr, &schema) == 0
-                }),
-                _ => false,
-            };
+        if repartition.preserve_order()
+            || (coalesces_batches(stage) && concatenation_may_fail(&schema))
+        {
+            return false;
+        }
+        return match repartition.partitioning() {
+            Partitioning::RoundRobinBatch(_) => true,
+            Partitioning::Hash(exprs, _) => exprs.iter().all(|expr| {
+                !depends_on_batches(expr, &schema) && failing_parts(expr, &schema) == 0
+            }),
+            _ => false,
+        };
     }
     if let Some(coalesce) = stage.downcast_ref::<CoalescePartitionsExec>() {
         return coalesce.fetch().is_none();
     }
     if is_coalesce_batches(stage) {
-        return stage.fetch().is_none()
-            && stage
-                .schema()
-                .fields()
-                .iter()
-                .all(|field| !may_fail_to_concatenate(field.data_type()));
+        return stage.fetch().is_none() && !concatenation_may_fail(&stage.schema());
     }
     stage.downcast_ref::<AggregateExec>().is_some_and(|reduce| {
         reduce.mode() == &AggregateMode::PartialReduce
@@ -1242,6 +1309,64 @@ mod tests {
         register_test_tables(ctx)
     }
 
+    /// The tables of [`register_test_tables`], with their `Utf8` columns as
+    /// `Utf8View`, the string type of the tables of DataFusion's SQL and of
+    /// its Parquet scans: the nodes that coalesce batches (e.g. a
+    /// `RepartitionExec`) may fail to concatenate `Utf8` columns, so the
+    /// planner leaves them, and the nodes that remove them, to DataFusion.
+    fn register_view_tables(ctx: &SessionContext) -> Result<()> {
+        let view = |partitions: Vec<Vec<RecordBatch>>| -> Result<_> {
+            let schema = partitions[0][0].schema();
+            let fields = schema
+                .fields()
+                .iter()
+                .map(|field| match field.data_type() {
+                    DataType::Utf8 => {
+                        field.as_ref().clone().with_data_type(DataType::Utf8View)
+                    }
+                    _ => field.as_ref().clone(),
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(fields));
+            let partitions = partitions
+                .into_iter()
+                .map(|batches| {
+                    batches
+                        .into_iter()
+                        .map(|batch| {
+                            let columns = batch
+                                .columns()
+                                .iter()
+                                .zip(schema.fields())
+                                .map(|(column, field)| {
+                                    arrow::compute::cast(column, field.data_type())
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((schema, partitions))
+        };
+        let table =
+            |schema, partitions| -> Result<Arc<datafusion::datasource::MemTable>> {
+                Ok(Arc::new(datafusion::datasource::MemTable::try_new(
+                    schema, partitions,
+                )?))
+            };
+        let (schema, t1) = view(test_table_t1()?)?;
+        ctx.register_table("t1", table(Arc::clone(&schema), t1)?)?;
+        let (t2_schema, t2) = view(crate::test_utils::test_table_t2()?)?;
+        ctx.register_table("t2", table(t2_schema, t2)?)?;
+        ctx.register_table("t_empty", table(schema, vec![vec![]])?)?;
+        Ok(())
+    }
+
+    async fn setup_view_tables(ctx: &SessionContext) -> Result<()> {
+        register_view_tables(ctx)
+    }
+
     /// The plan of `sql` in default DataFusion, in a session configured with
     /// `config` with the tables of [`register_test_tables`].
     async fn datafusion_plan(sql: &str, config: SessionConfig) -> Arc<dyn ExecutionPlan> {
@@ -1459,15 +1584,6 @@ mod tests {
                 4,
                 2,
             ),
-            // Ordered aggregates: the native aggregation orders the values
-            // itself, without the sort DataFusion plans below it.
-            (
-                "SELECT d, ARRAY_AGG(id ORDER BY id) AS ids, \
-                 FIRST_VALUE(a ORDER BY id DESC) AS last_a, \
-                 NTH_VALUE(h, 2 ORDER BY id) AS second_h FROM t1 GROUP BY d",
-                2,
-                1,
-            ),
             // A single partition is aggregated in a single stage.
             ("SELECT COUNT(*), SUM(a) FROM t_empty", 1, 1),
         ] {
@@ -1478,7 +1594,8 @@ mod tests {
                 "{sql}\n{}",
                 displayable(plan.as_ref()).indent(false)
             );
-            let root = assert_parity(sql).await;
+            let root =
+                assert_parity_with(sql, test_session_config(), setup_view_tables).await;
             assert_native(sql, &root);
             assert_eq!(
                 count::<PhysicalHashAggregate>(&root),
@@ -1487,6 +1604,25 @@ mod tests {
                 format_operator_tree(&root)
             );
         }
+
+        // Ordered aggregates: the native aggregation orders the values itself,
+        // without the sort DataFusion plans below it. Their states are lists:
+        // over several partitions, they pass through a repartitioning that may
+        // fail to concatenate them (see `may_fail_to_concatenate`), so the
+        // aggregation is native over a single partition only.
+        let sql = "SELECT d, ARRAY_AGG(id ORDER BY id) AS ids, \
+                   FIRST_VALUE(a ORDER BY id DESC) AS last_a, \
+                   NTH_VALUE(h, 2 ORDER BY id) AS second_h FROM t1 GROUP BY d";
+        let config = test_session_config().with_target_partitions(1);
+        let plan = datafusion_plan(sql, config.clone()).await;
+        assert_eq!(count_nodes(&plan, "SortExec"), 1);
+        let root = assert_parity_with(sql, config, setup_view_tables).await;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+        assert_eq!(count::<PhysicalSort>(&root), 0);
+        let root =
+            assert_parity_with(sql, test_session_config(), setup_view_tables).await;
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1518,7 +1654,7 @@ mod tests {
                     assert_eq!(count_nodes(&plan, "RepartitionExec"), 2, "{sql}");
                 }
                 let root =
-                    assert_parity_with(sql, config.clone(), setup_test_tables).await;
+                    assert_parity_with(sql, config.clone(), setup_view_tables).await;
                 assert_native(sql, &root);
                 assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{sql}");
             }
@@ -1549,7 +1685,8 @@ mod tests {
             // partitions.
             let plan = datafusion_plan(sql, test_session_config()).await;
             assert_eq!(count_nodes(&plan, "SortPreservingMergeExec"), 1, "{sql}");
-            let root = assert_parity(sql).await;
+            let root =
+                assert_parity_with(sql, test_session_config(), setup_view_tables).await;
             assert_native(sql, &root);
             let tree = format_operator_tree(&root);
             assert_eq!(count::<PhysicalSort>(&root), sorts, "{sql}\n{tree}");
@@ -1596,18 +1733,33 @@ mod tests {
             // Aggregations of aggregations, and of unions.
             "SELECT n, COUNT(*) AS groups, SUM(n) AS total FROM \
              (SELECT a, COUNT(*) AS n FROM t1 GROUP BY a) GROUP BY n ORDER BY n",
-            "SELECT k, COUNT(*) AS n, COUNT(DISTINCT w) AS dw FROM \
-             (SELECT a AS k, b AS w FROM t1 UNION ALL SELECT k, w FROM t2) \
-             GROUP BY k ORDER BY k",
             // A semi join, a TopK and a limit.
             "SELECT id, a, h FROM t1 WHERE a IN (SELECT k FROM t2 WHERE w > 1000) \
              ORDER BY h DESC NULLS LAST, id LIMIT 20 OFFSET 3",
+        ] {
+            let root =
+                assert_parity_with(sql, test_session_config(), setup_view_tables).await;
+            assert_native(sql, &root);
+        }
+        // Aggregations whose states are lists: natively over a single
+        // partition. Over several, their states pass through a repartitioning
+        // that may fail to concatenate them (see `may_fail_to_concatenate`),
+        // so the aggregations are left to DataFusion.
+        for sql in [
+            // Of a union.
+            "SELECT k, COUNT(*) AS n, COUNT(DISTINCT w) AS dw FROM \
+             (SELECT a AS k, b AS w FROM t1 UNION ALL SELECT k, w FROM t2) \
+             GROUP BY k ORDER BY k",
             // Ordered aggregates of a join, without the sort of their input.
             "SELECT t1.e, ARRAY_AGG(t2.w ORDER BY t2.w DESC NULLS LAST, t1.id) AS ws \
              FROM t1 JOIN t2 ON t1.a = t2.k GROUP BY t1.e",
         ] {
-            let root = assert_parity(sql).await;
+            let config = test_session_config().with_target_partitions(1);
+            let root = assert_parity_with(sql, config, setup_view_tables).await;
             assert_native(sql, &root);
+            let root =
+                assert_parity_with(sql, test_session_config(), setup_view_tables).await;
+            assert_eq!(count::<PhysicalHashAggregate>(&root), 0, "{sql}");
         }
     }
 
@@ -1622,7 +1774,7 @@ mod tests {
                 "SELECT id, a FROM t1 ORDER BY id DESC LIMIT 25",
             ] {
                 let root =
-                    assert_parity_with(sql, config.clone(), setup_test_tables).await;
+                    assert_parity_with(sql, config.clone(), setup_view_tables).await;
                 assert_native(sql, &root);
             }
         }
@@ -2487,6 +2639,198 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repartitions_that_may_fail_to_coalesce_are_kept() -> Result<()> {
+        use datafusion_common::{JoinType, NullEquality};
+
+        // Two batches of 100 rows whose `Dictionary(Int8, Utf8)` values are
+        // disjoint. A `RepartitionExec` over a bounded input coalesces the
+        // batches of every output partition (up to `batch_size` rows), which
+        // merges their dictionaries into one of 200 values: more than keys of
+        // 8 bits hold.
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("d", dictionary, false),
+        ]));
+        let batch = |prefix: &str| {
+            let strings = (0..100).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>();
+            let values: arrow::array::DictionaryArray<arrow::datatypes::Int8Type> =
+                strings.iter().map(String::as_str).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(0..100)),
+                    Arc::new(values),
+                ],
+            )
+        };
+        let batches = vec![batch("a")?, batch("b")?];
+        let repartitioned = |partitioning: &Partitioning| -> Arc<dyn ExecutionPlan> {
+            let source = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )
+            .unwrap();
+            Arc::new(RepartitionExec::try_new(source, partitioning.clone()).unwrap())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let error = Some("Dictionary key bigger than the key type");
+        let k = col("k", &schema)?;
+        let d = col("d", &schema)?;
+        for partitioning in [
+            Partitioning::RoundRobinBatch(1),
+            Partitioning::Hash(vec![Arc::clone(&d)], 1),
+        ] {
+            let make_plan = || repartitioned(&partitioning);
+            let root = assert_plan_outcome(make_plan, config.clone(), error).await;
+            assert!(root.is::<BridgeOperator>(), "{partitioning}");
+
+            // The probe side of a join, whose redistribution the join removes.
+            let build_schema =
+                Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
+            let build = RecordBatch::try_new(
+                Arc::clone(&build_schema),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )?;
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                let probe = match &partitioning {
+                    Partitioning::Hash(..) => Partitioning::Hash(vec![Arc::clone(&k)], 1),
+                    other => other.clone(),
+                };
+                Arc::new(
+                    HashJoinExec::try_new(
+                        MemorySourceConfig::try_new_exec(
+                            &[vec![build.clone()]],
+                            Arc::clone(&build_schema),
+                            None,
+                        )
+                        .unwrap(),
+                        repartitioned(&probe),
+                        vec![(col("b", &build_schema).unwrap(), Arc::clone(&k))],
+                        None,
+                        &JoinType::Inner,
+                        None,
+                        PartitionMode::CollectLeft,
+                        NullEquality::NullEqualsNothing,
+                        false,
+                    )
+                    .unwrap(),
+                )
+            };
+            let root = assert_plan_outcome(make_plan, config.clone(), error).await;
+            assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{partitioning}");
+        }
+
+        // Even if the keys hold the values of all batches: a dictionary may fail
+        // to coalesce, the repartitioning is kept.
+        let make_plan = || {
+            let source = MemorySourceConfig::try_new_exec(
+                &[vec![batches[0].clone()]],
+                Arc::clone(&schema),
+                None,
+            )
+            .unwrap();
+            Arc::new(
+                RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(1))
+                    .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let root = assert_plan_outcome(make_plan, config, None).await;
+        assert!(
+            root.is::<BridgeOperator>(),
+            "a dictionary may fail to coalesce"
+        );
+
+        // `Utf8` columns, whose 32-bit offsets may overflow: the aggregation of
+        // states that a repartitioning coalesces, and the partitioned join
+        // whose inputs it coalesces, are left to DataFusion.
+        let sql = "SELECT d, COUNT(*) AS n FROM t1 GROUP BY d";
+        let root = assert_parity(sql).await;
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 0);
+        let sql = "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k";
+        let root = assert_parity_with(sql, partitioned_config(), setup_test_tables).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repartitions_below_fallible_nodes_over_fallible_inputs_stay_in_datafusion() {
+        use crate::operators::union::test_support::{
+            AfterBatch, INJECTED_FAILURE, batch_plan,
+        };
+
+        // `10 / a` over 1000 zeros, then a source error. A `RepartitionExec`
+        // over a bounded input coalesces its output, so it pulls the error
+        // before it emits the zeros, and DataFusion raises the source error.
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let zeros = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![0; 1000]))],
+        )
+        .unwrap();
+        let config = test_session_config().with_target_partitions(1);
+        let a = col("a", &schema).unwrap();
+        for partitioning in [
+            Partitioning::RoundRobinBatch(1),
+            Partitioning::Hash(vec![Arc::clone(&a)], 1),
+        ] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                let source = batch_plan(zeros.clone(), AfterBatch::Fail).unwrap();
+                let repartition: Arc<dyn ExecutionPlan> = Arc::new(
+                    RepartitionExec::try_new(source, partitioning.clone()).unwrap(),
+                );
+                let divide: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
+                        10,
+                    )))),
+                    datafusion_expr::Operator::Divide,
+                    Arc::clone(&a),
+                ));
+                Arc::new(
+                    ProjectionExec::try_new(vec![(divide, "x".to_string())], repartition)
+                        .unwrap(),
+                )
+            };
+            let root =
+                assert_plan_outcome(make_plan, config.clone(), Some(INJECTED_FAILURE))
+                    .await;
+            let projection = root.downcast_ref::<PhysicalProjection>().expect("native");
+            let bridge = projection.children()[0]
+                .downcast_ref::<BridgeOperator>()
+                .expect("a bridge");
+            assert!(bridge.plan().is::<RepartitionExec>(), "{partitioning}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordering_sorts_of_ordered_aggregates_that_may_fail_are_kept() {
+        // DataFusion sorts the rows of an ordered aggregate (here `1, 'y'`
+        // first) before the aggregation evaluates its arguments, so it fails
+        // to cast `'y'`; without the sort, the native aggregation would fail
+        // to cast `'x'`, the first row of its input.
+        let sql = "SELECT ARRAY_AGG(CAST(column2 AS INT) ORDER BY column1 DESC) \
+                   FROM (VALUES (0, 'x'), (1, 'y'))";
+        let config = test_session_config().with_target_partitions(1);
+        let setup = async |_: &SessionContext| Ok(());
+        assert_fails_like_datafusion(
+            sql,
+            config.clone(),
+            &setup,
+            "Cannot cast string 'y'",
+        )
+        .await;
+        // The arguments of the aggregate cannot fail: the sort is removed.
+        let sql = "SELECT ARRAY_AGG(column2 ORDER BY column1 DESC) AS x \
+                   FROM (VALUES (0, 'x'), (1, 'y'))";
+        let root = lowered(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalSort>(&root), 0);
+        assert_eq!(count::<PhysicalHashAggregate>(&root), 1);
+        assert!(bridged_plans(&root).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn redistributions_are_removed() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
         let batch = |values: std::ops::Range<i32>| {
@@ -2648,7 +2992,7 @@ mod tests {
         }
         let (parquet, csv) = (parquet.to_str().unwrap(), csv.to_str().unwrap());
         let setup = async |ctx: &SessionContext| {
-            register_test_tables(ctx)?;
+            register_view_tables(ctx)?;
             ctx.register_parquet("p", parquet, ParquetReadOptions::default())
                 .await?;
             ctx.register_csv("c", csv, CsvReadOptions::new()).await?;
@@ -2699,7 +3043,7 @@ mod tests {
     /// every plan type.
     async fn explain(sql: &str) -> Vec<(String, String)> {
         let ctx = pipeline_context(test_session_config());
-        register_test_tables(&ctx).unwrap();
+        register_view_tables(&ctx).unwrap();
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         batches
             .iter()
@@ -2784,7 +3128,8 @@ mod tests {
             assert!(!plan.contains("RepartitionExec"), "{plan_type}: {plan}");
         }
         assert!(
-            plan_of(&explained, "physical_plan_with_schema").contains("schema=[d:Utf8;N")
+            plan_of(&explained, "physical_plan_with_schema")
+                .contains("schema=[d:Utf8View;N")
         );
 
         // `EXPLAIN FORMAT TREE`.
