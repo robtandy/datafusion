@@ -53,6 +53,7 @@ use arrow::compute::{SortOptions, filter_record_batch};
 use arrow::datatypes::SchemaRef;
 use arrow_row::OwnedRow;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr::expressions::{
@@ -170,12 +171,13 @@ impl PhysicalTopK {
     /// any other node, without calling `lower_input`.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
+        options: &ConfigOptions,
         lower_input: F,
     ) -> Result<Option<Self>>
     where
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
-        match SortPlan::try_new(plan)? {
+        match SortPlan::try_new(plan, options)? {
             Some(sort) if sort.is_topk() => sort.into_topk(plan, lower_input).map(Some),
             _ => Ok(None),
         }

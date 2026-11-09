@@ -69,6 +69,7 @@ use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute::{SortColumn, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{RowConverter, SortField};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, exec_datafusion_err, internal_err};
 use datafusion_datasource::source::DataSourceExec;
@@ -170,7 +171,9 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   sorted rows that the merges read, which read the first batches of every
 ///   partition and stop with their fetch, or when a node above them stops
 ///   reading (e.g. a limit). The native sort projects all rows before it
-///   sorts them, and a computation can fail;
+///   sorts them, in chunks of its input, and a computation can fail. So can
+///   a literal with 32-bit offsets (e.g. a string, repeated for every row of
+///   a chunk), so such projections are left to DataFusion too;
 /// * plans that DataFusion does not execute as a sort of all rows of the
 ///   input: nodes that advertise a different number of partitions than their
 ///   input has, merges of no partitions, and sorts of several partitions that
@@ -200,10 +203,17 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 ///   value per row. Neither splits rows that need more than the 2 GiB that
 ///   32-bit offsets address, so whether DataFusion fails depends on its
 ///   batches; the native operators split such rows into smaller runs and
-///   chunks, as DataFusion's merges do.
+///   chunks, as DataFusion's merges do;
+/// * sorts without a fetch of values with 32-bit offsets, in sessions whose
+///   `sort_in_place_threshold_bytes` exceeds 2 GiB: DataFusion's sort
+///   concatenates the batches of a partition while they occupy fewer bytes,
+///   and such a concatenation can need more than 32-bit offsets address. Up
+///   to 2 GiB (1 MiB by default), its concatenations fit.
 ///
 /// [`SORT_RUN_ROWS`]: sort_sink::SORT_RUN_ROWS
 ///
+/// `options` are the options of the session that executes `plan`: e.g.
+/// whether DataFusion's sort concatenates large batches depends on them.
 /// `lower_input` lowers the input of the sort (with the projections above
 /// it). Returns `Ok(None)` for any other node, without calling
 /// `lower_input`.
@@ -211,12 +221,13 @@ pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 /// [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
 pub fn try_lower<F>(
     plan: &Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
     lower_input: F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
     F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
 {
-    let Some(sort) = SortPlan::try_new(plan)? else {
+    let Some(sort) = SortPlan::try_new(plan, options)? else {
         return Ok(None);
     };
     let operator: Arc<dyn PhysicalOperator> = match sort.topk {
@@ -248,8 +259,11 @@ pub(crate) struct SortPlan {
 }
 
 impl SortPlan {
-    /// Analyze `plan`, see [`try_lower`].
-    pub(crate) fn try_new(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Self>> {
+    /// Analyze `plan`, executed with `options`, see [`try_lower`].
+    pub(crate) fn try_new(
+        plan: &Arc<dyn ExecutionPlan>,
+        options: &ConfigOptions,
+    ) -> Result<Option<Self>> {
         let partitions =
             |plan: &Arc<dyn ExecutionPlan>| plan.output_partitioning().partition_count();
         // The merges and the projections between them, from the top, down to
@@ -341,12 +355,24 @@ impl SortPlan {
         // per row. Whether it fails depends on its batches; the native
         // operators split such rows, so these sorts are left to DataFusion.
         let rows = sort.schema();
-        let mut types = rows.fields().iter().map(|field| field.data_type());
+        let types = || rows.fields().iter().map(|field| field.data_type());
         let unsplit = match sort.fetch() {
-            Some(fetch) => fetch > 1 && types.any(has_32_bit_offsets),
-            None => types.any(has_run_end_encoded_offsets),
+            Some(fetch) => fetch > 1 && types().any(has_32_bit_offsets),
+            None => types().any(has_run_end_encoded_offsets),
         };
         if unsplit {
+            return Ok(None);
+        }
+        // DataFusion's sort also concatenates the batches of a partition (or
+        // groups of them) while they occupy fewer than
+        // `sort_in_place_threshold_bytes` (their memory and the bytes of their
+        // rows). Above 2 GiB, a concatenation of values with 32-bit offsets
+        // can need more than those address, and fails.
+        let threshold = options.execution.sort_in_place_threshold_bytes;
+        if sort.fetch().is_none()
+            && threshold > i32::MAX as usize
+            && types().any(has_32_bit_offsets)
+        {
             return Ok(None);
         }
 
@@ -428,19 +454,23 @@ impl SortPlan {
         // lazily, on the sorted rows that are read: the merges read the first
         // batches of every partition, and stop with their fetch or when a node
         // above them (e.g. a limit) stops reading. The native sort projects all
-        // rows before it sorts them, which only makes no difference for
-        // projections that cannot fail (of columns and literals).
+        // rows (in chunks of its input) before it sorts them, which only makes
+        // no difference for projections that cannot fail (of columns and
+        // literals), and that compute no values of which an array holds only
+        // so many (e.g. a string literal, repeated for every row).
         let projections = chain
             .iter()
             .filter_map(|node| node.downcast_ref::<ProjectionExec>())
             .collect::<Vec<_>>();
-        if projections.iter().any(|projection| {
-            projection
-                .expr()
-                .iter()
-                .any(|expr| !cannot_fail_to_evaluate(&expr.expr))
-        }) {
-            return Ok(None);
+        for projection in &projections {
+            let schema = projection.input().schema();
+            for expr in projection.expr() {
+                if !cannot_fail_to_evaluate(&expr.expr)
+                    || computes_limited_values(&expr.expr, &schema)?
+                {
+                    return Ok(None);
+                }
+            }
         }
 
         // The rows to sort: the input of the sort, without a merge of its
@@ -1142,6 +1172,7 @@ pub(crate) mod test_support {
     use arrow::datatypes::SchemaRef;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::Result;
+    use datafusion_common::config::ConfigOptions;
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::projection::ProjectionExec;
@@ -1178,10 +1209,21 @@ pub(crate) mod test_support {
     ///   below them are lowered too;
     /// * scans with the native sources;
     /// * every other node is bridged, with its subtree.
+    ///
+    /// For sessions with the default options, see [`lower_with`].
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        if let Some(sort) = super::try_lower(plan, lower)? {
+        lower_with(plan, &ConfigOptions::default())
+    }
+
+    /// Lower `plan` like [`lower`], for sessions with `options`.
+    pub(crate) fn lower_with(
+        plan: &Arc<dyn ExecutionPlan>,
+        options: &ConfigOptions,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let lower = |plan: &Arc<dyn ExecutionPlan>| lower_with(plan, options);
+        if let Some(sort) = super::try_lower(plan, options, lower)? {
             return Ok(sort);
         }
         if let Some(aggregate) = PhysicalHashAggregate::try_lower(plan, lower)? {
@@ -1367,7 +1409,9 @@ mod tests {
 
     use super::test_support::{
         assert_native_byte_eq, assert_parity, assert_parity_with_config, lower,
+        lower_with,
     };
+    use datafusion_common::ScalarValue;
     use datafusion_physical_plan::limit::GlobalLimitExec;
 
     use crate::aggregate::PhysicalHashAggregate;
@@ -1678,7 +1722,7 @@ mod tests {
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Option<(Arc<dyn PhysicalOperator>, Arc<dyn ExecutionPlan>)> {
         let mut input = None;
-        let lowered = try_lower(plan, |plan| {
+        let lowered = try_lower(plan, &ConfigOptions::default(), |plan| {
             assert!(input.is_none(), "the input is lowered once");
             input = Some(Arc::clone(plan));
             Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
@@ -2082,6 +2126,7 @@ mod tests {
 
     #[test]
     fn lowering_checks_the_node_and_the_lowered_input() -> Result<()> {
+        let options = ConfigOptions::default();
         // Other nodes are not lowered, without lowering their input.
         let not_called =
             |_: &Arc<dyn ExecutionPlan>| -> Result<Arc<dyn PhysicalOperator>> {
@@ -2095,23 +2140,28 @@ mod tests {
                 Partitioning::RoundRobinBatch(4),
             )?) as _,
         ] {
-            assert!(try_lower(&plan, not_called)?.is_none());
+            assert!(try_lower(&plan, &options, not_called)?.is_none());
         }
         // `PhysicalSort::try_lower` lowers the sorts without fetch,
         // `PhysicalTopK::try_lower` the others.
         let id = [("id", false)];
         let sort = merge(sort_exec(t1_scan(4), &id, true, None), &id, None);
         let topk = merge(sort_exec(t1_scan(4), &id, true, Some(3)), &id, Some(3));
-        assert!(PhysicalTopK::try_lower(&sort, not_called)?.is_none());
-        assert!(PhysicalSort::try_lower(&topk, not_called)?.is_none());
+        assert!(PhysicalTopK::try_lower(&sort, &options, not_called)?.is_none());
+        assert!(PhysicalSort::try_lower(&topk, &options, not_called)?.is_none());
         let bridge =
             |plan: &Arc<dyn ExecutionPlan>| -> Result<Arc<dyn PhysicalOperator>> {
                 Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
             };
-        assert!(PhysicalSort::try_lower(&sort, bridge)?.is_some());
-        assert_eq!(PhysicalTopK::try_lower(&topk, bridge)?.unwrap().k(), 3);
+        assert!(PhysicalSort::try_lower(&sort, &options, bridge)?.is_some());
+        assert_eq!(
+            PhysicalTopK::try_lower(&topk, &options, bridge)?
+                .unwrap()
+                .k(),
+            3
+        );
         // The lowered input must have the schema of the sort.
-        let err = try_lower(&sort, |_| {
+        let err = try_lower(&sort, &options, |_| {
             Ok(Arc::new(BridgeOperator::new(batch_plan(
                 values_chunk(0..1).into_record_batch()?,
                 AfterBatch::End,
@@ -2615,6 +2665,106 @@ mod tests {
             let tree = format_operator_tree(&root);
             assert_eq!(sorts(&root) == 1, native, "{sql}\n{tree}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_below_projections_of_large_literals_are_left_to_datafusion()
+    -> Result<()> {
+        // `SPM(fetch=1) -> Projection[id, 2 MiB string] -> SortExec[id]` of one
+        // batch of 1024 rows, with batches of 64 rows: DataFusion evaluates the
+        // literal on the sorted batches that it reads, of 64 rows, while the
+        // native sort projects the chunks of its input, here all 1024 rows,
+        // which need 2 GiB of strings. Projections of literals with 32-bit
+        // offsets are left to DataFusion; other literals stay native.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ids = Int64Array::from_iter_values((0..1024).rev());
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids)])?;
+        let config = test_session_config().with_batch_size(64);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        for (literal, native) in [
+            (ScalarValue::Utf8(Some("x".repeat(2 << 20))), false),
+            (ScalarValue::Int64(Some(7)), true),
+        ] {
+            let make = || -> Result<Arc<dyn ExecutionPlan>> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    &[vec![batch.clone()]],
+                    Arc::clone(&schema),
+                    None,
+                )?;
+                let sort = sort_exec(scan, &[("id", false)], true, None);
+                let exprs = vec![
+                    (col("id", &sort.schema())?, "id".to_string()),
+                    (lit(literal.clone()), "l".to_string()),
+                ];
+                let projection = Arc::new(ProjectionExec::try_new(exprs, sort)?);
+                Ok(merge(projection, &[("id", false)], Some(1)))
+            };
+            let root =
+                assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                    .await;
+            assert_eq!(sorts(&root) == 1, native, "{literal:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_that_datafusion_concatenates_beyond_offsets_are_left_to_it()
+    -> Result<()> {
+        // DataFusion's sort concatenates the batches of a partition while they
+        // occupy fewer than `sort_in_place_threshold_bytes`. With a threshold
+        // of `usize::MAX`, it concatenates 1025 one-row batches whose strings
+        // share a 2 MiB buffer, which need 2 GiB of strings in one array, and
+        // fails; the native sort returned the first row. Up to 2 GiB, which
+        // its reservations count for every batch, its concatenations fit.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(2 << 20)]));
+        let batches = (0..1025)
+            .map(|id| {
+                let columns: Vec<ArrayRef> =
+                    vec![Arc::new(Int64Array::from(vec![id])), Arc::clone(&s)];
+                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let make = || -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )?;
+            let sort = sort_exec(scan, &[("id", false)], true, None);
+            Ok(merge(sort, &[("id", false)], Some(1)))
+        };
+        let mut config = test_session_config();
+        config.options_mut().execution.sort_in_place_threshold_bytes = usize::MAX;
+        let options = Arc::clone(config.options());
+        let lower = |plan: &Arc<dyn ExecutionPlan>| lower_with(plan, &options);
+        let message = "Offset overflow error";
+        let root =
+            assert_lowered_plan_fails_like_datafusion(make, lower, config, message).await;
+        assert_eq!(sorts(&root), 0);
+        // With thresholds up to 2 GiB, and for sorts of values without 32-bit
+        // offsets, the sort stays native.
+        let bridge =
+            |plan: &Arc<dyn ExecutionPlan>| -> Result<Arc<dyn PhysicalOperator>> {
+                Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
+            };
+        let mut options = ConfigOptions::default();
+        assert!(try_lower(&make()?, &options, bridge)?.is_some());
+        options.execution.sort_in_place_threshold_bytes = i32::MAX as usize;
+        assert!(try_lower(&make()?, &options, bridge)?.is_some());
+        options.execution.sort_in_place_threshold_bytes = usize::MAX;
+        assert!(try_lower(&make()?, &options, bridge)?.is_none());
+        let view = sort_exec(t1_scan(4), &[("id", false)], true, None);
+        assert!(
+            try_lower(&merge(view, &[("id", false)], None), &options, bridge)?.is_some()
+        );
         Ok(())
     }
 

@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::ExecutionPlan;
@@ -95,12 +96,13 @@ impl PhysicalSort {
     /// other node, without calling `lower_input`.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
+        options: &ConfigOptions,
         lower_input: F,
     ) -> Result<Option<Self>>
     where
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
-        match SortPlan::try_new(plan)? {
+        match SortPlan::try_new(plan, options)? {
             Some(sort) if !sort.is_topk() => sort.into_sort(plan, lower_input).map(Some),
             _ => Ok(None),
         }
