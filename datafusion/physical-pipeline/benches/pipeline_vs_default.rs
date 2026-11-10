@@ -13,6 +13,13 @@
 //! query, it checks that both engines return the same rows (the benchmark
 //! fails at the end if they do not).
 //!
+//! The sessions of both engines trust DataFusion's built-in functions (see
+//! `TrustedFunctions`), so that the native operators can evaluate the calls of
+//! the functions that they know, as a session of the pipeline engine would,
+//! and the strings of all tables are `Utf8View`, the string type of
+//! DataFusion's SQL tables and Parquet scans (DataFusion's ClickBench reads
+//! `hits.parquet` so).
+//!
 //! The TPC-H data and queries are those of the parity suite
 //! (`tests/tpch_parity.rs`), which this file includes as a module. As the
 //! crate has no `harness = false` benchmark targets, the benchmark is the
@@ -30,7 +37,9 @@
 //! ```
 //!
 //! The report is written to stdout, also when libtest captures the output
-//! of tests. The benchmark is configured with environment variables:
+//! of tests: a table of all measurements, followed by the same table in
+//! Markdown (as in `docs/architecture.md`). The benchmark is configured with
+//! environment variables:
 //!
 //! | Variable                    | Meaning                                                          | Default (optimized / debug build) |
 //! | --------------------------- | ---------------------------------------------------------------- | --------------------------------- |
@@ -38,7 +47,7 @@
 //! | `PIPELINE_BENCH_HITS`       | rows of the `hits` table                                         | `1000000` / `20000`               |
 //! | `PIPELINE_BENCH_ITERATIONS` | timed executions of every query on every engine                  | `5` / `1`                         |
 //! | `PIPELINE_BENCH_THREADS`    | threads (and target partitions)                                  | available parallelism             |
-//! | `PIPELINE_BENCH_SOURCE`     | `memory` (`MemTable`s), `parquet` (files in a `TempDir`), `both` | `memory`                          |
+//! | `PIPELINE_BENCH_SOURCE`     | `memory` (`MemTable`s), `parquet` (files in a `TempDir`), `both` | `both`                            |
 //! | `PIPELINE_BENCH_QUERIES`    | comma-separated names of the queries to run, e.g. `q1,q18,hits4` | all                               |
 
 #[path = "../tests/tpch_parity.rs"]
@@ -54,6 +63,7 @@ use arrow::array::RecordBatch;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::instant::Instant;
 use datafusion_common::{DataFusionError, Result};
+use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
 use datafusion_physical_plan::collect;
 use tempfile::TempDir;
 
@@ -66,8 +76,9 @@ use crate::tpch_parity::tpch::{self, TableLayout, TpchData};
 
 /// A synthetic ClickBench `hits` table and ClickBench-style queries.
 ///
-/// The table has the columns of ClickBench's `hits` that the queries use,
-/// with skewed distributions: a few users, counters, regions, search phrases
+/// The table has the columns of ClickBench's `hits` that the queries use (its
+/// strings as `Utf8View`, as DataFusion reads them from `hits.parquet`), with
+/// skewed distributions: a few users, counters, regions, search phrases
 /// and URLs account for most of the rows, most rows have no search phrase,
 /// no advertising engine and no mobile phone model. The queries are those of
 /// ClickBench, with tie-breakers added to their `ORDER BY`s (so that their
@@ -77,7 +88,7 @@ mod hits {
 
     use arrow::array::{
         ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        StringViewArray,
     };
     use arrow::datatypes::{Field, Schema};
     use datafusion_common::Result;
@@ -227,10 +238,13 @@ mod hits {
             ),
             (
                 "SearchPhrase",
-                Arc::new(StringArray::from_iter_values(search_phrases)),
+                Arc::new(StringViewArray::from_iter_values(search_phrases)),
             ),
-            ("URL", Arc::new(StringArray::from_iter_values(url_column))),
-            ("Title", Arc::new(StringArray::from_iter_values(titles))),
+            (
+                "URL",
+                Arc::new(StringViewArray::from_iter_values(url_column)),
+            ),
+            ("Title", Arc::new(StringViewArray::from_iter_values(titles))),
             ("IsRefresh", Arc::new(Int16Array::from(is_refresh))),
             ("DontCountHits", Arc::new(Int16Array::from(dont_count_hits))),
             (
@@ -240,7 +254,7 @@ mod hits {
             ("MobilePhone", Arc::new(Int16Array::from(mobile_phones))),
             (
                 "MobilePhoneModel",
-                Arc::new(StringArray::from_iter_values(mobile_phone_models)),
+                Arc::new(StringViewArray::from_iter_values(mobile_phone_models)),
             ),
         ];
         let schema = Schema::new(
@@ -442,7 +456,7 @@ impl BenchConfig {
         // that the benchmark runs.
         let optimized = !cfg!(debug_assertions);
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let source = env_or("PIPELINE_BENCH_SOURCE", "memory".to_string());
+        let source = env_or("PIPELINE_BENCH_SOURCE", "both".to_string());
         let sources = match source.to_lowercase().as_str() {
             "memory" => vec![SourceKind::Memory],
             "parquet" => vec![SourceKind::Parquet],
@@ -493,8 +507,15 @@ impl BenchConfig {
             .collect()
     }
 
+    /// The configuration of the sessions of both engines: `threads` target
+    /// partitions, trusting DataFusion's built-in functions (see the module
+    /// documentation).
     fn session_config(&self) -> SessionConfig {
-        SessionConfig::new().with_target_partitions(self.threads)
+        let trusted =
+            TrustedFunctions::new(&datafusion::functions::all_default_functions());
+        SessionConfig::new()
+            .with_target_partitions(self.threads)
+            .with_option_extension(trusted)
     }
 }
 
@@ -723,33 +744,17 @@ fn report(config: &BenchConfig, measurements: &[Measurement]) -> String {
             .iter()
             .filter(|measurement| measurement.source == *source)
             .collect::<Vec<_>>();
-        let total = |timings: fn(&Measurement) -> &Timings| {
-            measurements
-                .iter()
-                .map(|measurement| millis(timings(measurement).median()))
-                .sum::<f64>()
-        };
-        let datafusion = total(|measurement| &measurement.datafusion);
-        let pipeline = total(|measurement| &measurement.pipeline);
-        let log_speedups = measurements
-            .iter()
-            .map(|measurement| {
-                let datafusion = millis(measurement.datafusion.median());
-                let pipeline = millis(measurement.pipeline.median());
-                (datafusion.max(f64::MIN_POSITIVE) / pipeline.max(f64::MIN_POSITIVE)).ln()
-            })
-            .sum::<f64>();
+        let summary = Summary::of(&measurements);
         let _ = writeln!(
             out,
-            "{:<8} total: DataFusion {datafusion:.2} ms, pipeline {pipeline:.2} ms, \
-             speedup {:.2}x (geometric mean {:.2}x), fully native {}/{} queries",
+            "{:<8} total: DataFusion {:.2} ms, pipeline {:.2} ms, speedup {:.2}x \
+             (geometric mean {:.2}x), fully native {}/{} queries",
             source.name(),
-            datafusion / pipeline.max(f64::MIN_POSITIVE),
-            (log_speedups / measurements.len().max(1) as f64).exp(),
-            measurements
-                .iter()
-                .filter(|measurement| measurement.lowering.bridged.is_empty())
-                .count(),
+            summary.datafusion,
+            summary.pipeline,
+            summary.datafusion / summary.pipeline.max(f64::MIN_POSITIVE),
+            summary.geometric_mean_speedup,
+            summary.fully_native,
             measurements.len()
         );
     }
@@ -776,6 +781,133 @@ fn report(config: &BenchConfig, measurements: &[Measurement]) -> String {
     out
 }
 
+/// The measurements of `report`, as Markdown tables: the median times on
+/// both engines, the speedup and the native and all operators of the lowered
+/// plan of every query, on every source, and the totals of every source.
+fn markdown_report(config: &BenchConfig, measurements: &[Measurement]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nTPC-H SF {} and {} ClickBench-style hits, {} threads, median of {} \
+         executions in ms (native: native / all operators of the lowered plan):\n",
+        config.scale, config.hits, config.threads, config.iterations
+    );
+    let mut header = "| Query | Rows |".to_string();
+    let mut separator = "| ----- | ---: |".to_string();
+    for source in &config.sources {
+        let name = source.name();
+        let _ = write!(
+            header,
+            " {name} DataFusion | {name} pipeline | {name} speedup | {name} native |"
+        );
+        separator.push_str(" ---: | ---: | ---: | ---: |");
+    }
+    let _ = writeln!(out, "{header}\n{separator}");
+    // The queries, in the order of their first measurement.
+    let mut queries: Vec<&str> = vec![];
+    for measurement in measurements {
+        if !queries.contains(&measurement.query.as_str()) {
+            queries.push(&measurement.query);
+        }
+    }
+    for query in queries {
+        let of_query = measurements
+            .iter()
+            .filter(|measurement| measurement.query == query)
+            .collect::<Vec<_>>();
+        let rows = of_query.first().map_or(0, |measurement| measurement.rows);
+        let mut row = format!("| {query} | {rows} |");
+        for source in &config.sources {
+            match of_query
+                .iter()
+                .find(|measurement| measurement.source == *source)
+            {
+                Some(measurement) => {
+                    let datafusion = millis(measurement.datafusion.median());
+                    let pipeline = millis(measurement.pipeline.median());
+                    let _ = write!(
+                        row,
+                        " {datafusion:.2} | {pipeline:.2} | {:.2}x | {}/{} |",
+                        datafusion / pipeline.max(f64::MIN_POSITIVE),
+                        measurement.lowering.native_operators(),
+                        measurement.lowering.operators,
+                    );
+                }
+                None => row.push_str(" | | | |"),
+            }
+        }
+        let _ = writeln!(out, "{row}");
+    }
+    let _ = writeln!(
+        out,
+        "\n| Source | DataFusion (ms) | Pipeline (ms) | Speedup | Geometric mean speedup | Fully native queries |"
+    );
+    let _ = writeln!(
+        out,
+        "| ------ | --------------: | ------------: | ------: | ---------------------: | -------------------: |"
+    );
+    for source in &config.sources {
+        let measurements = measurements
+            .iter()
+            .filter(|measurement| measurement.source == *source)
+            .collect::<Vec<_>>();
+        let summary = Summary::of(&measurements);
+        let _ = writeln!(
+            out,
+            "| {} | {:.2} | {:.2} | {:.2}x | {:.2}x | {}/{} |",
+            source.name(),
+            summary.datafusion,
+            summary.pipeline,
+            summary.datafusion / summary.pipeline.max(f64::MIN_POSITIVE),
+            summary.geometric_mean_speedup,
+            summary.fully_native,
+            measurements.len()
+        );
+    }
+    out
+}
+
+/// The totals of the measurements of a source.
+struct Summary {
+    /// The sum of the medians on DataFusion, in ms.
+    datafusion: f64,
+    /// The sum of the medians on the pipeline engine, in ms.
+    pipeline: f64,
+    /// The geometric mean of the speedups of the medians.
+    geometric_mean_speedup: f64,
+    /// The number of queries without `BridgeOperator`s.
+    fully_native: usize,
+}
+
+impl Summary {
+    fn of(measurements: &[&Measurement]) -> Self {
+        let total = |timings: fn(&Measurement) -> &Timings| {
+            measurements
+                .iter()
+                .map(|measurement| millis(timings(measurement).median()))
+                .sum::<f64>()
+        };
+        let log_speedups = measurements
+            .iter()
+            .map(|measurement| {
+                let datafusion = millis(measurement.datafusion.median());
+                let pipeline = millis(measurement.pipeline.median());
+                (datafusion.max(f64::MIN_POSITIVE) / pipeline.max(f64::MIN_POSITIVE)).ln()
+            })
+            .sum::<f64>();
+        Self {
+            datafusion: total(|measurement| &measurement.datafusion),
+            pipeline: total(|measurement| &measurement.pipeline),
+            geometric_mean_speedup: (log_speedups / measurements.len().max(1) as f64)
+                .exp(),
+            fully_native: measurements
+                .iter()
+                .filter(|measurement| measurement.lowering.bridged.is_empty())
+                .count(),
+        }
+    }
+}
+
 /// The benchmark, see the module documentation.
 #[test]
 fn pipeline_vs_default() -> Result<()> {
@@ -789,6 +921,7 @@ fn pipeline_vs_default() -> Result<()> {
     // the benchmark.
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(report(&config, &measurements).as_bytes())?;
+    stdout.write_all(markdown_report(&config, &measurements).as_bytes())?;
     stdout.flush()?;
     let mismatches = measurements
         .iter()
