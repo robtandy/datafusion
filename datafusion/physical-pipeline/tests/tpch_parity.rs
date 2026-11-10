@@ -2170,13 +2170,14 @@ async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
 /// DataFusion's results and errors exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
-    /// An operator with a part that may fail with other errors than arithmetic
-    /// overflows (the casts of decimals of Q11, whose errors name the values
-    /// that fail), which the native operators would evaluate on the chunks of
-    /// a partition in parallel, on several threads, so that another row than
-    /// in DataFusion could fail first (see `PipelineQueryPlanner`; the parts
-    /// that can only fail with arithmetic overflows, e.g. the decimal
-    /// arithmetic of Q1, are evaluated on any number of threads).
+    /// An operator with a part that may fail with other errors than overflows
+    /// (e.g. a cast of strings into numbers, whose errors name the values that
+    /// fail), which the native operators would evaluate on the chunks of a
+    /// partition in parallel, on several threads, so that another row than in
+    /// DataFusion could fail first (see `PipelineQueryPlanner`; the parts that
+    /// can only fail with overflows, e.g. the decimal arithmetic of Q1 and the
+    /// casts of the sums of Q11 into decimals, are evaluated on any number of
+    /// threads).
     ParallelErrors,
     /// `PhysicalProjection::supports_projection_exec` refuses the projection:
     /// the classification of errors does not know its functions (`date_part`
@@ -2232,10 +2233,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
         (9, 3, 4, 19, &[("ProjectionExec", Why::Projection)]),
         (10, 14, 14, 0, &[]),
-        (11, 4, 6, 24, &[
-            ("FilterExec", Why::ParallelErrors),
-            ("ProjectionExec", Why::ParallelErrors),
-        ]),
+        (11, 23, 23, 0, &[]),
         (12, 8, 8, 0, &[]),
         (13, 10, 10, 0, &[]),
         (14, 8, 8, 0, &[]),
@@ -2262,10 +2260,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
         (9, 3, 4, 18, &[("ProjectionExec", Why::Projection)]),
         (10, 14, 14, 0, &[]),
-        (11, 4, 6, 26, &[
-            ("FilterExec", Why::ParallelErrors),
-            ("ProjectionExec", Why::ParallelErrors),
-        ]),
+        (11, 23, 23, 0, &[]),
         (12, 8, 8, 0, &[]),
         (13, 10, 10, 0, &[]),
         (14, 8, 8, 0, &[]),
