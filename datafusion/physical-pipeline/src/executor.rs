@@ -18,7 +18,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -153,11 +152,6 @@ pub struct PipelineExecutor {
     /// The `finish_epoch` of the registry when this thread last checked
     /// whether an operator or the sink of the pipeline finished.
     finish_epoch: usize,
-    /// Yield as soon as the source produced a second chunk (see
-    /// [`Self::yield_on_more_input`]); cleared once it did.
-    yield_on_more_input: bool,
-    /// The number of non-empty chunks the source produced on this thread.
-    source_chunks: usize,
     done: bool,
 }
 
@@ -192,8 +186,6 @@ impl PipelineExecutor {
                 budget: 0,
                 thread: ctx.registry().next_thread_id(),
                 finish_epoch: 0,
-                yield_on_more_input: false,
-                source_chunks: 0,
                 done: false,
                 shared,
                 ctx,
@@ -224,20 +216,10 @@ impl PipelineExecutor {
             budget: 0,
             thread: ctx.registry().next_thread_id(),
             finish_epoch: 0,
-            yield_on_more_input: false,
-            source_chunks: 0,
             done: false,
             shared,
             ctx,
         })
-    }
-
-    /// Yield (end the current poll with [`Progress::Yield`]) as soon as the
-    /// source produces a second chunk, before pushing it: the source has more
-    /// work than this thread did so far, so that the executor can start the
-    /// threads of the pipeline. Once.
-    fn yield_on_more_input(&mut self) {
-        self.yield_on_more_input = true;
     }
 
     /// Run the pipeline until it is complete or blocked.
@@ -415,14 +397,6 @@ impl PipelineExecutor {
                 self.shared.source_metrics.record_output(chunk.len());
                 self.chunks[0] = chunk;
                 self.push_stage = 0;
-                self.source_chunks += 1;
-                if self.yield_on_more_input && self.source_chunks > 1 {
-                    // End the poll before the first operator call: the push
-                    // resumes from the `in_process_operators` stack (or the
-                    // pending sink chunk).
-                    self.yield_on_more_input = false;
-                    self.budget = 0;
-                }
                 let outcome = self.push(0)?;
                 self.handle_push_outcome(outcome)
             }
@@ -683,11 +657,9 @@ impl ExecutionMetrics {
 /// all pipelines of a meta pipeline completed (and every thread combined its
 /// local sink state), the sink of the meta pipeline is finalized.
 ///
-/// The tasks are sized to the work: a pipeline on a single thread that runs
-/// while no other pipeline does runs on the task of the execution (the task
-/// that polls the [`PipelineStream`]) and spawns no task, and a source that
-/// does not bound its threads only gets them once it produced a second chunk,
-/// see [`Executor::execute`].
+/// A pipeline on a single thread that runs while no other pipeline does runs
+/// on the task of the execution (the task that polls the [`PipelineStream`])
+/// and spawns no task, see [`Executor::execute`].
 #[derive(Debug)]
 pub struct Executor {
     graph: Arc<PipelineGraph>,
@@ -764,11 +736,9 @@ impl Executor {
     /// Run all pipelines to completion.
     ///
     /// A pipeline on a single thread that runs while no other pipeline does
-    /// runs on the task that awaits this future, and so does a pipeline whose
-    /// source does not bound its threads, until the source produced a second
-    /// chunk, the thread used up the call budget of a poll or is blocked.
-    /// Otherwise all threads of a pipeline run on worker tasks, and pipelines
-    /// that do not depend on each other run concurrently.
+    /// runs on the task that awaits this future. Otherwise all threads of a
+    /// pipeline run on worker tasks, and pipelines that do not depend on each
+    /// other run concurrently.
     pub async fn execute(&self) -> Result<()> {
         let registry = Arc::new(ExecutionRegistry::new(
             self.metrics.by_key(),
@@ -864,13 +834,10 @@ impl Executor {
     /// If no other pipeline runs at the same time (`alone`), a pipeline on a
     /// single thread (e.g. the pipeline that reads a sort, or the result of an
     /// ungrouped aggregation, or a table of a single chunk) runs on the task
-    /// of the execution itself, which spares it all task overhead. So does a
-    /// pipeline on several threads whose source does not bound its threads
-    /// (`GlobalSourceState::max_threads` is `usize::MAX`), until its source
-    /// produces a second chunk (or its first thread is blocked or used up the
-    /// call budget of a poll): if it has little work, it completes without
-    /// spawning tasks that would immediately exit. Otherwise (and if the
-    /// pipeline does not run alone) all of its threads run on worker tasks.
+    /// of the execution itself, which spares it all task overhead. Otherwise
+    /// all of its threads run on worker tasks, which start at about the same
+    /// time: a thread that started earlier would claim more of the input
+    /// (e.g. buffer more rows to sort, which it then sorts alone).
     async fn run_pipeline(
         &self,
         pipeline: &Pipeline,
@@ -924,46 +891,24 @@ impl Executor {
             skip,
         });
 
+        // A pipeline on a single thread that runs while no other pipeline does
+        // runs on this task, without a worker task. A pipeline on several
+        // threads runs all of them, each on a worker task: a source that is
+        // finished for one thread may still have work for the others.
+        if alone && num_threads == 1 {
+            let ctx = self.context(0, num_threads, registry);
+            return PipelineExecutor::try_new(shared, ctx)?.execute().await;
+        }
         let mut workers = JoinSet::new();
-        let spawn = |workers: &mut JoinSet<Result<()>>, threads: Range<usize>| {
-            for thread_id in threads {
-                let shared = Arc::clone(&shared);
-                let ctx = self.context(thread_id, num_threads, registry);
-                workers.spawn(async move {
-                    PipelineExecutor::try_new(shared, ctx)?.execute().await
-                });
-            }
-        };
-        if !alone {
-            spawn(&mut workers, 0..num_threads);
-            return join_workers(workers).await;
+        for thread_id in 0..num_threads {
+            let shared = Arc::clone(&shared);
+            let ctx = self.context(thread_id, num_threads, registry);
+            workers.spawn(async move {
+                PipelineExecutor::try_new(shared, ctx)?.execute().await
+            });
         }
-
-        let mut first = PipelineExecutor::try_new(
-            Arc::clone(&shared),
-            self.context(0, num_threads, registry),
-        )?;
-        if num_threads == 1 {
-            return first.execute().await;
-        }
-        if shared.source_state.max_threads() == usize::MAX {
-            // The source does not know how much work it has: run the first
-            // thread on this task until the source produced a second chunk,
-            // the thread is blocked, or it used up the call budget of a poll.
-            // A pipeline with less work is complete by then, without tasks.
-            first.yield_on_more_input();
-            match futures::future::poll_fn(|cx| Poll::Ready(first.poll_run(cx))).await {
-                Poll::Ready(Ok(Progress::Done)) => return Ok(()),
-                Poll::Ready(Err(e)) => return Err(e),
-                Poll::Ready(Ok(Progress::Yield)) | Poll::Pending => {}
-            }
-        }
-        // All threads run on worker tasks, also the first one, so that they
-        // start at about the same time: a thread that started earlier would
-        // claim more of the input (e.g. buffer more rows to sort, which it then
-        // sorts alone).
-        workers.spawn(first.execute());
-        spawn(&mut workers, 1..num_threads);
+        // Dropping `workers` (on error, or when the execution is dropped)
+        // aborts the threads.
         join_workers(workers).await
     }
 
@@ -1420,6 +1365,7 @@ impl Drop for PipelineStream {
 mod tests {
     use super::*;
 
+    use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arrow::array::{AsArray, BooleanArray, Int64Array};
@@ -2894,61 +2840,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pipelines_get_the_threads_their_work_needs() -> Result<()> {
-        // A source that does not bound its threads, with a single chunk, on 4
-        // threads: the first thread runs on the task that polls the stream
-        // (here the test, which is not a task) and finds no more work, so no
-        // other thread starts, and no task is spawned.
-        let source = Arc::new(VecSource::new(batches(0, 1, 10)));
-        let output = run(Arc::clone(&source) as _, 4).await?;
-        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
-        assert_eq!(source.local_states.load(Ordering::Relaxed), 1);
-        // The chunk, then the end of the source.
-        assert_eq!(source.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(source.tasks(), (1, true));
-        // Also when a task polls the stream, and for every pipeline that runs
-        // alone: here the pipelines into and out of a pipeline breaker.
-        let source = Arc::new(VecSource::new(batches(0, 1, 10)));
-        let materialize = Arc::new(Materialize::new(Arc::clone(&source) as _));
-        let task = {
-            let (source, materialize) = (Arc::clone(&source), Arc::clone(&materialize));
-            SpawnedTask::spawn(async move {
-                let output = run(materialize, 4).await?;
-                Ok::<_, DataFusionError>((output, source.tasks()))
-            })
-        };
-        let (output, tasks) = task.join().await.unwrap()?;
-        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
-        assert_eq!(tasks, (1, true));
-        assert_eq!(materialize.combines.load(Ordering::Relaxed), 1);
-        assert_eq!(materialize.get_data_calls.load(Ordering::Relaxed), 2);
-
-        // With more chunks, all threads run on worker tasks once the first
-        // thread got a second chunk (which it got on the task of the test).
-        let source = Arc::new(VecSource::new(batches(0, 40, 10)));
-        let output = run(Arc::clone(&source) as _, 4).await?;
-        assert_eq!(sorted_values(&output), (0..400).collect::<Vec<_>>());
-        assert_eq!(source.local_states.load(Ordering::Relaxed), 4);
-        assert_eq!(source.tasks(), (5, true));
-        // A source that bounds its threads to one runs on the task of the test,
-        // to several on worker tasks right away.
+    async fn pipelines_on_a_single_thread_run_on_the_task_of_the_stream() -> Result<()> {
+        // A pipeline on a single thread (here of a source bounded to one
+        // thread, on 4 threads) runs on the task that polls the stream (here
+        // the test, which is not a task): no task is spawned.
         let source = Arc::new(VecSource::new(batches(0, 40, 10)).with_max_threads(1));
         let output = run(Arc::clone(&source) as _, 4).await?;
         assert_eq!(values(&output), (0..400).collect::<Vec<_>>());
         assert_eq!(source.local_states.load(Ordering::Relaxed), 1);
         assert_eq!(source.tasks(), (1, true));
-        let source = Arc::new(VecSource::new(batches(0, 1, 10)).with_max_threads(2));
-        let output = run(Arc::clone(&source) as _, 4).await?;
-        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
-        assert_eq!(source.local_states.load(Ordering::Relaxed), 2);
-        assert_eq!(source.tasks(), (2, false));
+        // Also when a task polls the stream, and every pipeline on a single
+        // thread that runs alone: here the pipelines into and out of a
+        // pipeline breaker with a source that is not parallel.
+        let source = Arc::new(VecSource::new(batches(0, 3, 10)).with_max_threads(1));
+        let count: Arc<dyn PhysicalOperator> = Arc::new(Count {
+            children: vec![Arc::clone(&source) as _],
+        });
+        let task = {
+            let source = Arc::clone(&source);
+            SpawnedTask::spawn(async move {
+                let output = run(count, 4).await?;
+                Ok::<_, DataFusionError>((output, source.tasks()))
+            })
+        };
+        let (output, tasks) = task.join().await.unwrap()?;
+        assert_eq!(values(&output), [30]);
+        assert_eq!(tasks, (1, true));
 
-        // Pipelines that run at the same time (the inputs of a union) run all
-        // their threads on worker tasks; one after the other (an ordered
-        // union), each of them runs alone.
+        // A pipeline on several threads runs all of them, on worker tasks: a
+        // source that is finished for one thread may have rows for another one
+        // (see `sources_that_assign_rows_to_threads_run_on_all_threads`).
+        for (max_threads, threads) in [(usize::MAX, 4), (2, 2)] {
+            let source =
+                Arc::new(VecSource::new(batches(0, 1, 10)).with_max_threads(max_threads));
+            let output = run(Arc::clone(&source) as _, 4).await?;
+            assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
+            assert_eq!(source.local_states.load(Ordering::Relaxed), threads);
+            assert_eq!(source.tasks(), (threads, false));
+        }
+
+        // Pipelines on a single thread that run at the same time (the inputs of
+        // a union) run on worker tasks; one after the other (an ordered union),
+        // each of them runs alone, on the task of the test.
         for order_matters in [false, true] {
-            let inputs =
-                [0, 100].map(|start| Arc::new(VecSource::new(batches(start, 1, 10))));
+            let inputs = [0, 100].map(|start| {
+                Arc::new(VecSource::new(batches(start, 1, 10)).with_max_threads(1))
+            });
             let root: Arc<dyn PhysicalOperator> = Arc::new(Union {
                 children: inputs.iter().map(|input| Arc::clone(input) as _).collect(),
                 order_matters,
@@ -2956,13 +2893,96 @@ mod tests {
             let output = run(root, 4).await?;
             assert_eq!(values(&output).len(), 20);
             for input in &inputs {
-                let (threads, tasks) = match order_matters {
-                    false => (4, (4, false)),
-                    true => (1, (1, true)),
-                };
-                assert_eq!(input.local_states.load(Ordering::Relaxed), threads);
+                assert_eq!(input.local_states.load(Ordering::Relaxed), 1);
+                let tasks = (1, order_matters);
                 assert_eq!(input.tasks(), tasks, "order matters: {order_matters}");
             }
+        }
+        Ok(())
+    }
+
+    /// A parallel source that does not bound its threads (it has the default
+    /// global source state) and assigns its rows to the threads: thread `t`
+    /// of `n` emits the rows of `0..rows` with `row % n == t`, in one chunk,
+    /// and is then finished. So the other threads still have rows when one
+    /// thread is finished.
+    #[derive(Debug)]
+    struct ThreadShardedSource {
+        rows: i64,
+    }
+
+    #[derive(Default)]
+    struct ThreadShardedLocal {
+        done: bool,
+    }
+
+    impl LocalSourceState for ThreadShardedLocal {}
+
+    impl PhysicalOperator for ThreadShardedSource {
+        fn name(&self) -> &str {
+            "ThreadShardedSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_local_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            Ok(Box::new(ThreadShardedLocal::default()))
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let lstate = lstate.downcast_mut::<ThreadShardedLocal>().unwrap();
+            if std::mem::replace(&mut lstate.done, true) {
+                return Ok(SourceResult::Finished);
+            }
+            let (thread, threads) = (ctx.thread_id as i64, ctx.num_threads as i64);
+            let rows = (0..self.rows).filter(|row| row % threads == thread);
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from_iter_values(rows))],
+            )?;
+            Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sources_that_assign_rows_to_threads_run_on_all_threads() -> Result<()> {
+        // `SourceResult::Finished` only ends the source for its thread: a
+        // source that does not bound its threads may still have rows for the
+        // other threads when one of them is finished, so all of them run.
+        for threads in [1, 2, 4, 7] {
+            let source: Arc<dyn PhysicalOperator> =
+                Arc::new(ThreadShardedSource { rows: 4 });
+            let output = run(Arc::clone(&source), threads).await?;
+            assert_eq!(sorted_values(&output), [0, 1, 2, 3], "{threads} threads");
+            // Also as the input of a pipeline breaker.
+            let root: Arc<dyn PhysicalOperator> = Arc::new(Count {
+                children: vec![source],
+            });
+            let output = run(root, threads).await?;
+            assert_eq!(values(&output), [4], "{threads} threads");
         }
         Ok(())
     }
@@ -3014,12 +3034,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn panics_are_propagated() {
-        // A panic of the first thread (on the task that polls the stream), of
-        // the other threads (on worker tasks, once the first thread got a
-        // second chunk), and of pipelines that do not run alone.
-        for (threads, order_matters) in [(0..1, None), (1..4, None), (0..4, Some(false))]
-        {
-            let input = || source(batches(0, 40, 10));
+        // A panic of a pipeline on a single thread (on the task that polls the
+        // stream), of threads of a pipeline on several threads (on worker
+        // tasks), and of pipelines that do not run alone.
+        let cases = [
+            (0..1, 1, None),
+            (0..1, usize::MAX, None),
+            (1..4, usize::MAX, None),
+        ];
+        let unions = [(0..4, usize::MAX, Some(false)), (0..1, 1, Some(false))];
+        for (threads, max_threads, order_matters) in cases.into_iter().chain(unions) {
+            let input = || -> Arc<dyn PhysicalOperator> {
+                let source = VecSource::new(batches(0, 40, 10));
+                Arc::new(source.with_max_threads(max_threads))
+            };
             let input = match order_matters {
                 Some(order_matters) => Arc::new(Union {
                     children: vec![input(), input()],
