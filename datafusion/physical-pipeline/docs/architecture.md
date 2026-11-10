@@ -42,8 +42,8 @@ SQL / DataFrame
      v
 LogicalPlan
      |  PipelineQueryPlanner::create_physical_plan
-     |    1. DefaultPhysicalPlanner -> optimized ExecutionPlan
-     |    2. lower_execution_plan   -> PhysicalOperator tree
+     |    1. DefaultPhysicalPlanner             -> optimized ExecutionPlan
+     |    2. lower_execution_plan_with_runtime  -> PhysicalOperator tree
      v
 PipelineRootExec (an ExecutionPlan with one output partition)
      |  execute(0): Executor::execute_stream
@@ -63,10 +63,10 @@ SendableRecordBatchStream (fed by CollectorSink)
 | `pipeline.rs`                                                                      | `Pipeline`, `MetaPipeline`, `PipelineGraph`, `PipelineBuilder`, `MetaPipelineBuilder`     |
 | `executor.rs`                                                                      | `PipelineExecutor` (push loop), `Executor` (scheduler), `CollectorSink`, `PipelineStream` |
 | `bridge.rs`                                                                        | `BridgeOperator` (any `ExecutionPlan` as a source), `PipelineRootExec`                    |
-| `planner.rs`                                                                       | `PipelineQueryPlanner`, `lower_execution_plan`                                            |
+| `planner.rs`                                                                       | `PipelineQueryPlanner`, `lower_execution_plan*` (the lowering of `ExecutionPlan`s)        |
 | `explain.rs`                                                                       | `DisplayAs` for `PipelineRootExec`, pipeline / metrics rendering                          |
 | `test_utils.rs`                                                                    | differential byte-equivalence test harness (test only)                                    |
-| `tuple_data/`, `sources/`, `operators/`, `join/`, `aggregate/`, `sort/`, `window/` | native operators (Waves 2-4)                                                              |
+| `tuple_data/`, `sources/`, `operators/`, `join/`, `aggregate/`, `sort/`, `window/` | native operators (Waves 2-5), see [Native operators](#native-operators)                   |
 
 All dependencies needed by the native operators are declared in `Cargo.toml`
 up front, and all modules are declared in `lib.rs`, so that work on different
@@ -473,15 +473,284 @@ let ctx = SessionContext::new_with_state(state);
 
 The planner wraps a DataFusion `PhysicalPlanner` (this crate does not depend
 on the `datafusion` core crate), creates the optimized `ExecutionPlan` with
-it, lowers it with `lower_execution_plan` and returns a `PipelineRootExec`.
+it, lowers it with `lower_execution_plan_with_runtime` (with the options and
+the runtime of its session) and returns a `PipelineRootExec`. `EXPLAIN` shows
+the lowered operator tree and its pipelines, `EXPLAIN ANALYZE` the metrics of
+every operator (see `explain.rs`).
 
-`lower_execution_plan` is the extension point for native operators: it
-recognizes `ExecutionPlan` nodes (and node patterns, e.g. two-stage
-aggregations or `SortPreservingMergeExec -> SortExec`) and replaces them with
-native operators whose children are lowered recursively. Any node it does not
-recognize is wrapped, with its whole subtree, in a `BridgeOperator`, so every
-query can be executed. Currently no node is lowered natively: every plan runs
-through a single `BridgeOperator`.
+The lowering is the extension point for native operators: it recognizes
+`ExecutionPlan` nodes (and node patterns, e.g. two-stage aggregations or
+`SortPreservingMergeExec -> SortExec`) and replaces them with native
+operators whose children are lowered recursively:
+
+| DataFusion plan                                                                                      | Native operator                                                             |
+| ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `SortPreservingMergeExec -> SortExec`, `SortExec`                                                    | `PhysicalSort`, or `PhysicalTopK` with a fetch                              |
+| `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)`, `AggregateExec(Single)` | `PhysicalHashAggregate`                                                     |
+| `HashJoinExec` (`CollectLeft` or `Partitioned`)                                                      | `PhysicalHashJoin`                                                          |
+| `WindowAggExec`, `BoundedWindowAggExec`, with the sorts and repartitionings below them               | `PhysicalWindow`                                                            |
+| `SortPreservingMergeExec` of the sorted partitions of a window                                       | `PhysicalSort` of the `PhysicalWindow`                                      |
+| `NestedLoopJoinExec`, `CrossJoinExec`                                                                | `PhysicalNestedLoopJoin`, `PhysicalCrossJoin`                               |
+| `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch                           | `PhysicalLimit`                                                             |
+| `UnionExec`, `InterleaveExec`                                                                        | `PhysicalUnion`                                                             |
+| `PlaceholderRowExec`                                                                                 | `PhysicalPlaceholderRow`                                                    |
+| `FilterExec`                                                                                         | `PhysicalFilter` in a `CachingOperator`                                     |
+| `ProjectionExec`                                                                                     | `PhysicalProjection`                                                        |
+| `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                                                 | `MemoryScanSource`, `ParquetScanSource`, `CsvScanSource`, `EmptyScanSource` |
+| `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                                   | removed                                                                     |
+
+The nodes that only distribute rows over partitions are removed: the threads
+of a pipeline read the chunks of its source directly, and the pipeline
+breakers (the build sides of joins, aggregations, sorts and windows) are
+shared by all threads, which sink their rows into them (and the aggregations
+and windows partition them by their keys themselves), so no rows are shuffled
+through channels.
+
+Any node it does not recognize (e.g. a sort-merge join, a scalar subquery, a
+recursive query or a custom node) is wrapped, with its whole subtree, in a
+`BridgeOperator`, so every query can be executed. So are the nodes whose
+results or errors a native operator would not reproduce exactly. Every
+native operator documents which nodes it reproduces in its `try_lower` (or
+`supports_*`) function, and the module documentation of `planner.rs` lists
+the rules of the planner itself. In short, DataFusion executes:
+
+- the plans below a limit that stops the execution early (but for sorts and
+  windows, which read all of their input in both engines);
+- operators with an expression whose errors depend on the batches it is
+  evaluated on, or with more than one part that may fail (which error comes
+  first depends on the batches), and, on several threads, operators with a
+  part that may fail (the threads evaluate the chunks of a partition in
+  parallel, DataFusion its rows in order): e.g. the decimal arithmetic of
+  TPC-H, which may overflow;
+- nodes that coalesce or concatenate batches of types whose concatenation may
+  fail (dictionaries, run-end encodings, strings and lists with 32-bit
+  offsets), and, below a node of the same pipeline that may fail, nodes that
+  pull ahead of their consumers (`FilterExec`, coalescing repartitions, hash
+  and nested loop joins, which coalesce their output);
+- joins and TopKs whose dynamic filters prune the reads of inputs that may
+  fail (e.g. Parquet scans), and windows above TopKs that may end some of
+  their partitions early.
+
+Windows, nested loop joins and cross joins keep all of their rows in memory
+without reserving it in the memory pool, while the DataFusion nodes that they
+replace reserve their memory (and fail, or spill, once the pool is
+exhausted): they are only lowered for sessions whose memory pool has no
+limit. `lower_execution_plan` (for any session) and
+`PipelineRootExec::reset_state` lower as if the pool had a limit, and as if
+the session had the options for which the fewest nodes can be lowered.
+
+## Native operators
+
+| Module                               | Operators                                                                                                                                         |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sources/`                           | `MemoryScanSource`, `ParquetScanSource` and `CsvScanSource` (morsel-driven), `EmptyScanSource`                                                    |
+| `operators/`                         | `PhysicalFilter` (with the `AdaptiveFilter`), `PhysicalProjection`, `CachingOperator`, `PhysicalLimit`, `PhysicalUnion`, `PhysicalPlaceholderRow` |
+| `tuple_data/`                        | `TupleDataCollection` (row-major storage), its radix partitioning and the `RowMatcher`, used by joins and aggregations                            |
+| `join/hash_join.rs`, `hash_table.rs` | `PhysicalHashJoin` over a shared `JoinHashTable`                                                                                                  |
+| `join/nested_loop.rs`                | `PhysicalNestedLoopJoin`, `PhysicalCrossJoin`                                                                                                     |
+| `aggregate/`                         | `PhysicalHashAggregate` (thread-local tables, radix-partitioned by `RadixHashAggregate`)                                                          |
+| `sort/`                              | `PhysicalSort`, `PhysicalTopK`                                                                                                                    |
+| `window/`                            | `PhysicalWindow`                                                                                                                                  |
+
+The joins, aggregations, sorts and windows are pipeline breakers: their
+inputs sink into them on all threads, they finalize (in parallel where it
+pays), and they are the sources of the pipelines that read their output.
+Joins are also operators of their probe pipelines.
+
+## Native coverage of TPC-H
+
+`tests/tpch_parity.rs` runs the 22 TPC-H queries and a stress corpus of 75
+analytical queries (correlated subqueries, `EXISTS`, `IN`, multi-stage
+aggregations, grouping sets, windows, skewed hash joins, nested loop and cross
+joins, TopKs, set operations) over `MemTable`s and Parquet files on both
+engines, and asserts their byte parity. `tpch_queries_are_lowered_as_listed`
+asserts the exact lowering of every TPC-H query (`TPCH_COVERAGE`): the
+numbers of native and of all operators, and the DataFusion plans that run in
+`BridgeOperator`s, each with why the native operators leave it to DataFusion.
+On 4 threads:
+
+- Over `MemTable`s, Q2, Q4, Q12, Q13, Q16, Q18, Q20 and Q21 run fully
+  natively.
+- Q1, Q3, Q5, Q10 and Q19 aggregate decimal arithmetic with more than one part
+  that may overflow, Q6 (an aggregation) and Q14 (a projection) decimal
+  arithmetic with one part, on several threads: these operators stay in
+  DataFusion, with their inputs.
+- The native projection refuses the projections of Q7 and Q9 (`date_part`,
+  which the classification of errors only knows in sessions that trust
+  DataFusion's built-in functions; their decimal arithmetic would keep them in
+  DataFusion on several threads anyway) and of Q8 (a decimal division, which
+  may fail with several kinds of errors).
+- Q11, Q15 and Q22 have scalar subqueries (`ScalarSubqueryExec`), and the
+  semi join of Q17 a residual filter with decimal arithmetic.
+- Over Parquet, the hash joins of Q2, Q4, Q12, Q13, Q16, Q17, Q20 and Q21 and
+  the TopK of Q18 have dynamic filters that prune the reads of the Parquet
+  scans below them (which may fail to read or decode the rows that DataFusion
+  skips): they stay in DataFusion too, so no query runs fully natively.
+
+All window queries of the stress corpus run on native windows but the two
+whose windows are stacked on windows of other partitions or orders, which
+DataFusion sorts or merges in between (`PhysicalWindow::try_lower` does not
+look through them), and all of its nested loop and cross joins run natively
+(`windows_and_loop_joins_of_the_stress_corpus_are_native`).
+
+## Benchmarks
+
+`benches/pipeline_vs_default.rs` measures the wall-clock time of the 22
+TPC-H queries (over the synthetic data of the parity suite) and of 25
+ClickBench-style queries (over a synthetic `hits` table) on default DataFusion
+and on the pipeline engine, both with `target_partitions` set to the number of
+threads, over `MemTable`s and over Parquet files, and checks that both engines
+return the same rows (every row of the tables below did):
+
+```text
+cargo test --profile release-nonlto -p datafusion-physical-pipeline --bench pipeline_vs_default -- pipeline_vs_default --nocapture
+PIPELINE_BENCH_SCALE=1 PIPELINE_BENCH_HITS=10000000 cargo test --profile release-nonlto -p datafusion-physical-pipeline --bench pipeline_vs_default -- pipeline_vs_default --nocapture
+```
+
+Both sessions trust DataFusion's built-in functions, and the strings are
+`Utf8View` (as DataFusion reads them from Parquet). The measurements below were
+taken on a 16-core Neoverse-N1 machine with 16 threads: the median of 5
+executions, in ms (without planning), and the native operators / all
+operators of the lowered plan (a plan of one operator runs entirely in
+DataFusion, in a `BridgeOperator`; the queries whose plans are partly native
+leave the operators of [Native coverage of TPC-H](#native-coverage-of-tpc-h)
+to DataFusion).
+
+### TPC-H SF 0.1, 1,000,000 `hits` rows
+
+| Query  | Rows | MemTable: DataFusion | Pipeline | Speedup | Native | Parquet: DataFusion | Pipeline | Speedup | Native |
+| ------ | ---: | -------------------: | -------: | ------: | -----: | ------------------: | -------: | ------: | -----: |
+| q1     |    4 |                 6.16 |     5.19 |   1.19x |    2/3 |               10.27 |    10.24 |   1.00x |    2/3 |
+| q2     |   48 |                 5.24 |     8.73 |   0.60x |  26/26 |                8.13 |    10.29 |   0.79x |    4/6 |
+| q3     |   10 |                 3.20 |     3.74 |   0.85x |    2/3 |                8.05 |     7.73 |   1.04x |    2/3 |
+| q4     |    5 |                 4.70 |     5.45 |   0.86x |  10/10 |                4.79 |     4.43 |   1.08x |    3/4 |
+| q5     |    5 |                 4.02 |     4.65 |   0.86x |    2/3 |                8.49 |     9.12 |   0.93x |    2/3 |
+| q6     |    1 |                 0.66 |     0.72 |   0.92x |    1/2 |                2.90 |     3.15 |   0.92x |    1/2 |
+| q7     |    4 |                22.17 |    15.96 |   1.39x |    3/4 |                9.02 |     9.02 |   1.00x |    3/4 |
+| q8     |    2 |                 3.54 |     4.03 |   0.88x |    1/2 |               10.10 |    11.00 |   0.92x |    1/2 |
+| q9     |  175 |                 7.46 |     7.37 |   1.01x |    3/4 |               12.12 |    12.06 |   1.01x |    3/4 |
+| q10    |   20 |                 5.23 |     5.99 |   0.87x |    2/3 |                9.66 |    10.13 |   0.95x |    2/3 |
+| q11    | 2443 |                 3.11 |     3.07 |   1.01x |    0/1 |                6.03 |     6.18 |   0.98x |    0/1 |
+| q12    |    2 |                 4.07 |     4.19 |   0.97x |    8/8 |                5.92 |     5.74 |   1.03x |    3/4 |
+| q13    |   39 |                 5.64 |     5.58 |   1.01x |  10/10 |                7.35 |     6.83 |   1.08x |    5/6 |
+| q14    |    1 |                 1.65 |     1.76 |   0.93x |    2/3 |                4.04 |     4.83 |   0.84x |    2/3 |
+| q15    |    1 |                 3.87 |     3.76 |   1.03x |    0/1 |                8.17 |     7.94 |   1.03x |    0/1 |
+| q16    | 2925 |                 6.22 |     5.79 |   1.07x |  13/13 |                7.23 |     8.14 |   0.89x |    8/9 |
+| q17    |    1 |                 5.10 |     5.25 |   0.97x |    2/3 |               17.21 |    16.94 |   1.02x |    2/3 |
+| q18    |  100 |                33.15 |    20.99 |   1.58x |  12/12 |               15.59 |    15.06 |   1.04x |    0/1 |
+| q19    |    1 |                 2.26 |     2.32 |   0.97x |    1/2 |                8.14 |     8.26 |   0.98x |    1/2 |
+| q20    |   17 |                 3.71 |     6.45 |   0.58x |  18/18 |                9.53 |     9.61 |   0.99x |    1/2 |
+| q21    |   45 |                 9.80 |    17.49 |   0.56x |  22/22 |               13.99 |    21.52 |   0.65x |    7/8 |
+| q22    |    7 |                 2.23 |     2.31 |   0.97x |    0/1 |                5.56 |     5.52 |   1.01x |    0/1 |
+| hits0  |    1 |                 0.07 |     0.15 |   0.51x |    2/2 |                0.07 |     0.17 |   0.43x |    2/2 |
+| hits1  |    1 |                 0.36 |     0.51 |   0.70x |    5/5 |                1.63 |     1.67 |   0.98x |    5/5 |
+| hits2  |    1 |                 0.46 |     0.64 |   0.72x |    3/3 |                1.70 |     1.66 |   1.02x |    3/3 |
+| hits4  |    1 |                 5.26 |     4.58 |   1.15x |    4/4 |                7.97 |     7.76 |   1.03x |    4/4 |
+| hits5  |    1 |                 5.06 |     4.49 |   1.13x |    4/4 |                7.13 |     7.64 |   0.93x |    4/4 |
+| hits6  |    1 |                 0.31 |     0.47 |   0.65x |    2/2 |                0.08 |     0.16 |   0.48x |    2/2 |
+| hits7  |   30 |                 1.71 |     0.82 |   2.07x |    6/6 |                2.72 |     2.02 |   1.35x |    6/6 |
+| hits8  |   10 |                11.43 |     9.01 |   1.27x |    5/5 |               12.95 |    12.41 |   1.04x |    5/5 |
+| hits10 |    8 |                 4.51 |     2.75 |   1.64x |    7/7 |                6.13 |     5.80 |   1.06x |    7/7 |
+| hits12 |   10 |                 5.74 |     4.68 |   1.23x |    6/6 |                8.35 |     8.27 |   1.01x |    6/6 |
+| hits14 |   10 |                 7.50 |     6.22 |   1.20x |    6/6 |                9.21 |    11.01 |   0.84x |    6/6 |
+| hits15 |   10 |                 7.07 |     5.49 |   1.29x |    4/4 |                9.40 |     8.53 |   1.10x |    4/4 |
+| hits16 |   10 |                13.96 |    12.92 |   1.08x |    4/4 |               16.34 |    17.36 |   0.94x |    4/4 |
+| hits20 |    1 |                 1.68 |     1.79 |   0.94x |    5/5 |                6.01 |     6.00 |   1.00x |    5/5 |
+| hits21 |   10 |                 4.27 |     3.59 |   1.19x |    6/6 |                8.75 |     9.23 |   0.95x |    6/6 |
+| hits23 |   10 |                 3.74 |     3.26 |   1.15x |    4/4 |               15.33 |    16.66 |   0.92x |    0/1 |
+| hits25 |   10 |                 1.52 |     1.16 |   1.31x |    4/4 |                3.31 |     3.47 |   0.95x |    0/1 |
+| hits27 |   25 |                 5.26 |     4.22 |   1.25x |    0/1 |                8.93 |     9.15 |   0.98x |    0/1 |
+| hits29 |    1 |                 0.42 |     0.61 |   0.69x |    4/4 |                1.28 |     1.28 |   1.00x |    3/3 |
+| hits30 |   10 |                 6.36 |     5.89 |   1.08x |    6/6 |                9.67 |    11.62 |   0.83x |    6/6 |
+| hits32 |   10 |                14.01 |    13.33 |   1.05x |    4/4 |               16.58 |    18.02 |   0.92x |    4/4 |
+| hits33 |   10 |                14.85 |    14.97 |   0.99x |    4/4 |               18.53 |    19.52 |   0.95x |    4/4 |
+| hits35 |   10 |                 9.75 |     8.02 |   1.22x |    5/5 |               11.89 |    11.29 |   1.05x |    5/5 |
+| hits36 |   10 |                 4.64 |     4.13 |   1.12x |    6/6 |                9.36 |    10.19 |   0.92x |    6/6 |
+| hits42 |   10 |                 2.03 |     1.90 |   1.07x |    3/4 |                4.93 |     4.93 |   1.00x |    3/4 |
+
+| Source   | DataFusion (ms) | Pipeline (ms) | Speedup | Geometric mean speedup | Fully native queries |
+| -------- | --------------: | ------------: | ------: | ---------------------: | -------------------: |
+| MemTable |          275.13 |        256.40 |   1.07x |                  1.00x |                31/47 |
+| Parquet  |          390.53 |        409.57 |   0.95x |                  0.94x |                21/47 |
+
+### TPC-H SF 1, 10,000,000 `hits` rows
+
+| Query  |  Rows | MemTable: DataFusion | Pipeline | Speedup | Native | Parquet: DataFusion | Pipeline | Speedup | Native |
+| ------ | ----: | -------------------: | -------: | ------: | -----: | ------------------: | -------: | ------: | -----: |
+| q1     |     4 |                32.65 |    31.18 |   1.05x |    2/3 |               56.02 |    55.85 |   1.00x |    2/3 |
+| q2     |   100 |                12.00 |    18.57 |   0.65x |  26/26 |               14.24 |    17.96 |   0.79x |    4/6 |
+| q3     |    10 |                19.26 |    18.73 |   1.03x |    2/3 |               31.01 |    31.32 |   0.99x |    2/3 |
+| q4     |     5 |                21.42 |    32.76 |   0.65x |  10/10 |               17.61 |    18.01 |   0.98x |    3/4 |
+| q5     |     5 |                34.69 |    35.18 |   0.99x |    2/3 |               44.29 |    43.68 |   1.01x |    2/3 |
+| q6     |     1 |                 2.96 |     3.07 |   0.97x |    1/2 |               14.07 |    14.72 |   0.96x |    1/2 |
+| q7     |     4 |               146.19 |   149.45 |   0.98x |    3/4 |               50.74 |    48.41 |   1.05x |    3/4 |
+| q8     |     2 |                13.11 |    13.85 |   0.95x |    1/2 |               34.45 |    36.50 |   0.94x |    1/2 |
+| q9     |   175 |                81.96 |    85.25 |   0.96x |    3/4 |               53.41 |    53.20 |   1.00x |    3/4 |
+| q10    |    20 |                26.21 |    27.46 |   0.95x |    2/3 |               39.66 |    39.37 |   1.01x |    2/3 |
+| q11    |   746 |                 5.83 |     5.86 |   0.99x |    0/1 |               11.26 |    10.83 |   1.04x |    0/1 |
+| q12    |     2 |                12.85 |    19.19 |   0.67x |    8/8 |               21.54 |    20.59 |   1.05x |    3/4 |
+| q13    |    41 |                24.06 |    38.70 |   0.62x |  10/10 |               33.90 |    31.32 |   1.08x |    5/6 |
+| q14    |     1 |                 4.86 |     4.87 |   1.00x |    2/3 |               17.17 |    17.40 |   0.99x |    2/3 |
+| q15    |     1 |                10.05 |     9.97 |   1.01x |    0/1 |               29.73 |    30.99 |   0.96x |    0/1 |
+| q16    | 18399 |                16.36 |    17.82 |   0.92x |  13/13 |               16.83 |    19.07 |   0.88x |    8/9 |
+| q17    |     1 |                64.87 |    64.51 |   1.01x |    2/3 |              107.97 |   108.49 |   1.00x |    2/3 |
+| q18    |   100 |               121.15 |   126.20 |   0.96x |    2/3 |              106.33 |   107.27 |   0.99x |    0/1 |
+| q19    |     1 |                10.31 |    10.33 |   1.00x |    1/2 |               34.87 |    35.04 |   1.00x |    1/2 |
+| q20    |   178 |                16.45 |    18.97 |   0.87x |    7/8 |               29.98 |    32.13 |   0.93x |    1/2 |
+| q21    |   100 |               140.54 |   126.21 |   1.11x |  22/22 |               88.97 |   144.87 |   0.61x |    7/8 |
+| q22    |     7 |                 7.12 |     7.01 |   1.02x |    0/1 |               11.65 |    11.67 |   1.00x |    0/1 |
+| hits0  |     1 |                 0.09 |     0.16 |   0.53x |    2/2 |                0.07 |     0.17 |   0.45x |    2/2 |
+| hits1  |     1 |                 0.90 |     2.19 |   0.41x |    5/5 |                5.09 |     7.53 |   0.68x |    5/5 |
+| hits2  |     1 |                 1.51 |     2.51 |   0.60x |    3/3 |                7.60 |     8.35 |   0.91x |    3/3 |
+| hits4  |     1 |                53.33 |    35.40 |   1.51x |    4/4 |               64.22 |    53.89 |   1.19x |    4/4 |
+| hits5  |     1 |                61.05 |    49.42 |   1.24x |    4/4 |               72.71 |    73.62 |   0.99x |    4/4 |
+| hits6  |     1 |                 0.97 |     1.43 |   0.68x |    2/2 |                0.07 |     0.17 |   0.45x |    2/2 |
+| hits7  |    30 |                 3.61 |     3.40 |   1.06x |    6/6 |                7.23 |     8.73 |   0.83x |    6/6 |
+| hits8  |    10 |                83.27 |    83.95 |   0.99x |    5/5 |               98.13 |   111.72 |   0.88x |    5/5 |
+| hits10 |     8 |                21.15 |    19.73 |   1.07x |    7/7 |               33.04 |    39.72 |   0.83x |    7/7 |
+| hits12 |    10 |                58.70 |    50.62 |   1.16x |    6/6 |               70.48 |    74.74 |   0.94x |    6/6 |
+| hits14 |    10 |                57.77 |    61.42 |   0.94x |    6/6 |               73.17 |    87.60 |   0.84x |    6/6 |
+| hits15 |    10 |                71.97 |    49.58 |   1.45x |    4/4 |               79.74 |    66.44 |   1.20x |    4/4 |
+| hits16 |    10 |               120.02 |   154.22 |   0.78x |    4/4 |              139.82 |   170.32 |   0.82x |    4/4 |
+| hits20 |     1 |                12.90 |    14.28 |   0.90x |    5/5 |               36.07 |    36.88 |   0.98x |    5/5 |
+| hits21 |    10 |                21.89 |    22.84 |   0.96x |    6/6 |               53.10 |    55.64 |   0.95x |    6/6 |
+| hits23 |    10 |                21.31 |    26.59 |   0.80x |    4/4 |              113.08 |   111.91 |   1.01x |    0/1 |
+| hits25 |    10 |                 5.86 |     6.68 |   0.88x |    4/4 |               16.34 |    17.06 |   0.96x |    0/1 |
+| hits27 |    25 |                25.27 |    25.01 |   1.01x |    0/1 |               47.44 |    47.70 |   0.99x |    0/1 |
+| hits29 |     1 |                 1.09 |     2.50 |   0.44x |    4/4 |                4.09 |     4.50 |   0.91x |    3/3 |
+| hits30 |    10 |                40.04 |    47.76 |   0.84x |    6/6 |               62.97 |    77.65 |   0.81x |    6/6 |
+| hits32 |    10 |               134.48 |   117.80 |   1.14x |    4/4 |              153.41 |   148.33 |   1.03x |    4/4 |
+| hits33 |    10 |               199.89 |   182.34 |   1.10x |    4/4 |              223.02 |   221.15 |   1.01x |    4/4 |
+| hits35 |    10 |                66.28 |    63.52 |   1.04x |    5/5 |               70.72 |    77.08 |   0.92x |    5/5 |
+| hits36 |    10 |                29.74 |    33.78 |   0.88x |    6/6 |               58.43 |    70.21 |   0.83x |    6/6 |
+| hits42 |    10 |                 6.86 |     5.44 |   1.26x |    3/4 |               21.12 |    21.18 |   1.00x |    3/4 |
+
+| Source   | DataFusion (ms) | Pipeline (ms) | Speedup | Geometric mean speedup | Fully native queries |
+| -------- | --------------: | ------------: | ------: | ---------------------: | -------------------: |
+| MemTable |         1924.86 |       1927.72 |   1.00x |                  0.91x |                29/47 |
+| Parquet  |         2376.86 |       2520.93 |   0.94x |                  0.91x |                21/47 |
+
+Of note:
+
+- The TPC-H plans that run fully natively over `MemTable`s at SF 0.1 are the
+  join-heavy ones (Q2, Q4, Q12, Q13, Q16, Q18, Q20, Q21): Q18 is 1.6x faster
+  than DataFusion, Q2, Q20 and Q21 are about 1.7x slower. At SF 1, Q21 is 1.1x
+  faster, Q4, Q12 and Q13 are about 1.5x slower, and the semi joins of Q18 and
+  Q20 are `Partitioned` hash joins that the native hash join leaves to
+  DataFusion (see `PhysicalHashJoin::try_lower`).
+- The plans of a single operator (0/1) and the operators that stay in
+  DataFusion run at DataFusion's speed: most of TPC-H over Parquet, where the
+  hash joins with dynamic filters, and the decimal arithmetic, stay in
+  DataFusion.
+- The ClickBench-style queries run fully natively but for `hits27` (a TopK by
+  a floating-point average, which the native TopK leaves to DataFusion) and the
+  aggregation of `hits42` (by `to_timestamp_seconds`, which the classification
+  of errors does not know), and over Parquet `hits23` and `hits25` (TopKs whose
+  dynamic filters prune the Parquet scan). Over `MemTable`s, the aggregations are up to
+  2.1x faster at SF 0.1 (`COUNT(DISTINCT)`, `GROUP BY` with TopKs), and between
+  1.3x slower and 1.5x faster with 10,000,000 rows; the queries of less than a
+  millisecond (`hits0`, `hits1`, `hits2`, `hits6`, `hits29`) pay the fixed cost
+  of setting up the pipelines.
 
 ## Differential testing
 
