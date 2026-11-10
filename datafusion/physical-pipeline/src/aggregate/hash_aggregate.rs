@@ -91,7 +91,8 @@ pub(crate) struct AggregateSpec {
     /// Whether the input rows of a thread whose groups hardly repeat may
     /// bypass its thread-local table, and be aggregated by the final
     /// aggregation of their radix partitions directly (see
-    /// [`rows_can_bypass_tables`]).
+    /// [`rows_can_bypass_tables`]): those of the partial stage of an
+    /// aggregation of two stages, whose aggregation DataFusion skips too.
     pub(crate) bypass: bool,
 }
 
@@ -703,7 +704,8 @@ impl PhysicalHashAggregate {
             GroupLimit::TopK(top_k) => Some(top_k),
             GroupLimit::None | GroupLimit::Unsupported => None,
         };
-        let bypass = top_k.is_none()
+        let bypass = !single_stage
+            && top_k.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
         Ok(Self {
@@ -947,10 +949,21 @@ fn orders_like_datafusion(data_type: &DataType) -> bool {
     )
 }
 
-/// Whether the input rows of an aggregation without an input order or a
-/// limit may bypass the thread-local tables of a thread whose groups hardly
-/// repeat (see `RadixLocalState::aggregate`), and be aggregated by the final
-/// aggregation of their radix partitions directly:
+/// Whether the input rows of the partial stage of an aggregation of two
+/// stages without an input order or a limit may bypass the thread-local
+/// tables of a thread whose groups hardly repeat (see
+/// `RadixLocalState::aggregate`), and be aggregated by the final aggregation
+/// of their radix partitions directly.
+///
+/// Like DataFusion, which skips the aggregation of the partial stages (of a
+/// single grouping set, without an order) whose groups hardly repeat, and
+/// passes their rows on to the final stage as partial states: the bypassed
+/// rows are converted to partial states (and dropped) when they are consumed,
+/// so that the accumulators fail on them then (see `validate_rows`), and the
+/// final aggregation of their partition aggregates them. DataFusion does not
+/// skip the aggregation of a single stage, whose accumulators aggregate every
+/// row when it is consumed (and may fail on the groups it aggregated so far),
+/// so its rows do not bypass the tables either.
 ///
 /// * the aggregation has group keys, and no grouping sets;
 /// * the aggregates of the final aggregation (`merge`), which aggregate the
@@ -1185,14 +1198,17 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
     fn get_local_sink_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
-            UngroupedAggregate::local_sink_state(&self.spec)
-        } else {
-            RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity)
+            return UngroupedAggregate::local_sink_state(&self.spec);
         }
+        // DataFusion never skips the aggregation of a partial stage with a
+        // ratio threshold of at least 1.
+        let options = &ctx.task_ctx.session_config().options().execution;
+        let skips = options.skip_partial_aggregation_probe_ratio_threshold < 1.0;
+        RadixHashAggregate::local_sink_state_with(&self.spec, self.table_capacity, skips)
     }
 
     fn sink(

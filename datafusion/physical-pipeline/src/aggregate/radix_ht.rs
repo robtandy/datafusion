@@ -87,9 +87,12 @@ use arrow::compute::{filter_record_batch, interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
+use datafusion_expr::GroupsAccumulator;
 use parking_lot::Mutex;
 
-use super::grouped_ht::{GroupedHashTable, GroupedStates, evaluate_rows};
+use super::grouped_ht::{
+    GroupedHashTable, GroupedStates, evaluate_rows, row_validators, validate_rows,
+};
 use super::hash_aggregate::{AggregateSpec, InputBuffer, TopK};
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -260,9 +263,25 @@ struct RadixLocalState {
     /// worse are not aggregated, like those that DataFusion's top-k
     /// aggregation rules out by the worst of its top groups.
     cutoff: Option<ArrayRef>,
+    /// Whether the rows of the thread may bypass its table: unless the
+    /// session does not let DataFusion skip the aggregation of partial
+    /// stages either (see [`AggregateSpec::bypass`]).
+    may_bypass: bool,
+    /// The accumulators that convert the rows that bypass the table to
+    /// partial states (see [`validate_rows`]), once the thread bypassed it.
+    validators: Option<RowValidators>,
 }
 
 impl LocalSinkState for RadixLocalState {}
+
+/// The accumulators of [`row_validators`].
+struct RowValidators(Vec<Box<dyn GroupsAccumulator>>);
+
+impl std::fmt::Debug for RowValidators {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RowValidators({})", self.0.len())
+    }
+}
 
 impl RadixLocalState {
     /// Aggregate the input rows of `batch` into the thread-local table, and
@@ -309,14 +328,29 @@ impl RadixLocalState {
         batch: &RecordBatch,
     ) -> Result<()> {
         if let Some(bypass) = &mut self.bypass {
-            bypass.push(spec, global, batch, &mut self.distinct_flushed)?;
+            let validators = self.validators.as_ref().map_or(&[][..], |v| &v.0);
+            let scattered = bypass.push(
+                spec,
+                global,
+                batch,
+                &mut self.distinct_flushed,
+                validators,
+            )?;
             self.flushed += batch.num_rows();
-            if bypass.is_full(self.bypass_rows) {
+            let full = bypass.is_full(self.bypass_rows);
+            if full {
                 bypass.scatter(global)?;
-                if let Some(capacity) = self.grown_capacity() {
-                    self.capacity = capacity;
-                    self.bypass = None;
+            }
+            // Once rows were scattered (because there were enough of them, or
+            // of their bytes), the thread aggregates its rows again if its
+            // groups came back: the rows that it buffered are scattered first.
+            if (full || scattered)
+                && let Some(capacity) = self.grown_capacity()
+            {
+                if let Some(mut bypass) = self.bypass.take() {
+                    bypass.scatter(global)?;
                 }
+                self.capacity = capacity;
             }
             return Ok(());
         }
@@ -357,10 +391,14 @@ impl RadixLocalState {
             self.capacity = capacity;
             return Ok(());
         }
-        let bypass =
-            spec.bypass && num_groups as f64 > BYPASS_RATIO * self.table_rows as f64;
+        let bypass = self.may_bypass
+            && spec.bypass
+            && num_groups as f64 > BYPASS_RATIO * self.table_rows as f64;
         self.flush(spec, global)?;
         if bypass {
+            if self.validators.is_none() {
+                self.validators = Some(RowValidators(row_validators(spec)?));
+            }
             self.bypass = Some(BypassBuffer::new(self.bypass_bytes));
         }
         Ok(())
@@ -462,23 +500,29 @@ impl BypassBuffer {
     }
 
     /// Buffer the input rows of `batch`: evaluate their group keys and the
-    /// arguments of the aggregates, hash their keys, and add their hashes to
-    /// `distinct`. If the buffered rows would have more than `max_bytes`
-    /// bytes of values with 32-bit offsets with them, the buffered rows are
-    /// scattered to the partitions of `global` first.
+    /// arguments of the aggregates, convert them to partial states with
+    /// `validators` (see [`validate_rows`]), hash their keys, and add their
+    /// hashes to `distinct`. If the buffered rows would have more than
+    /// `max_bytes` bytes of values with 32-bit offsets with them, the buffered
+    /// rows are scattered to the partitions of `global` first. Returns whether
+    /// they were.
     fn push(
         &mut self,
         spec: &AggregateSpec,
         global: &RadixSinkState,
         batch: &RecordBatch,
         distinct: &mut DistinctEstimate,
-    ) -> Result<()> {
+        validators: &[Box<dyn GroupsAccumulator>],
+    ) -> Result<bool> {
         let columns = evaluate_rows(spec, batch)?;
+        validate_rows(spec, validators, &columns)?;
         let bytes = columns
             .iter()
             .map(|column| offset_bytes(column.as_ref()))
             .sum::<usize>();
-        if !self.chunks.is_empty() && self.offset_bytes + bytes > self.max_bytes {
+        let scattered =
+            !self.chunks.is_empty() && self.offset_bytes + bytes > self.max_bytes;
+        if scattered {
             self.scatter(global)?;
         }
         let keys = &columns[..spec.group_by.expr().len()];
@@ -490,7 +534,7 @@ impl BypassBuffer {
         distinct.add(&self.hashes);
         self.offset_bytes += bytes;
         self.chunks.push(columns);
-        Ok(())
+        Ok(scattered)
     }
 
     /// Whether the buffered rows are to be scattered: once there are `rows`
@@ -623,9 +667,22 @@ impl RadixHashAggregate {
         Ok(Arc::new(RadixSinkState::new()))
     }
 
+    /// The local sink state of a thread, whose rows may bypass its table (if
+    /// [`AggregateSpec::bypass`]).
+    #[cfg(test)]
     pub(crate) fn local_sink_state(
         spec: &AggregateSpec,
         capacity: TableCapacity,
+    ) -> Result<Box<dyn LocalSinkState>> {
+        Self::local_sink_state_with(spec, capacity, true)
+    }
+
+    /// The local sink state of a thread, whose rows may bypass its table if
+    /// `may_bypass` (and [`AggregateSpec::bypass`]).
+    pub(crate) fn local_sink_state_with(
+        spec: &AggregateSpec,
+        capacity: TableCapacity,
+        may_bypass: bool,
     ) -> Result<Box<dyn LocalSinkState>> {
         let initial = capacity.initial.max(1);
         Ok(Box::new(RadixLocalState {
@@ -644,6 +701,8 @@ impl RadixHashAggregate {
             hashes: vec![],
             partitions: vec![],
             cutoff: None,
+            may_bypass,
+            validators: None,
         }))
     }
 
@@ -1564,8 +1623,43 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
     }
 
-    /// The sink of `COUNT(*) GROUP BY k`, with tables of capacity `capacity`,
-    /// whose rows may bypass the tables if `bypass`.
+    /// The `Partial` and `Final` stages of `aggregate`, a `Single` aggregation:
+    /// the aggregations whose input rows may bypass the tables (see
+    /// `AggregateSpec::bypass`).
+    fn two_stages(
+        aggregate: &AggregateExec,
+    ) -> Result<(Arc<AggregateExec>, AggregateExec)> {
+        let partial = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            aggregate.group_expr().clone(),
+            aggregate.aggr_expr().to_vec(),
+            aggregate.filter_expr().to_vec(),
+            Arc::clone(aggregate.input()),
+            aggregate.input_schema(),
+        )?);
+        let last = AggregateExec::try_new(
+            AggregateMode::Final,
+            aggregate.group_expr().as_final(),
+            aggregate.aggr_expr().to_vec(),
+            vec![None; aggregate.aggr_expr().len()],
+            Arc::clone(&partial) as Arc<dyn ExecutionPlan>,
+            aggregate.input_schema(),
+        )?;
+        Ok((partial, last))
+    }
+
+    /// The spec of the two stages of `aggregate`, a `Single` aggregation (see
+    /// [`two_stages`]).
+    fn two_stage_spec(aggregate: &AggregateExec) -> Result<Arc<AggregateSpec>> {
+        let (partial, last) = two_stages(aggregate)?;
+        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
+            aggregate.input(),
+        )));
+        Ok(PhysicalHashAggregate::try_new_two_stage(&partial, &last, input)?.spec())
+    }
+
+    /// The sink of `COUNT(*) GROUP BY k` (of two stages), with tables of
+    /// capacity `capacity`, whose rows may bypass the tables if `bypass`.
     fn count_by_key_with(capacity: TableCapacity, bypass: bool) -> Result<Sink> {
         let schema = key_schema();
         let count = AggregateExprBuilder::new(count_udaf(), vec![lit(1i64)])
@@ -1580,11 +1674,7 @@ mod tests {
             MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
             schema,
         )?;
-        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
-            aggregate.input(),
-        )));
-        let mut spec =
-            PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+        let mut spec = two_stage_spec(&aggregate)?;
         assert!(spec.bypass);
         Arc::get_mut(&mut spec).expect("a single owner").bypass = bypass;
         let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
@@ -1762,8 +1852,8 @@ mod tests {
         ]))
     }
 
-    /// The sink of `COUNT(*), MAX(b) GROUP BY k`, with tables of capacity
-    /// `capacity`: its bypassed rows hold the binaries.
+    /// The sink of `COUNT(*), MAX(b) GROUP BY k` (of two stages), with tables
+    /// of capacity `capacity`: its bypassed rows hold the binaries.
     fn max_binaries_by_key(capacity: TableCapacity) -> Result<Sink> {
         use datafusion::functions_aggregate::min_max::max_udaf;
         let schema = binary_schema();
@@ -1783,10 +1873,7 @@ mod tests {
             MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
             schema,
         )?;
-        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
-            aggregate.input(),
-        )));
-        let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+        let spec = two_stage_spec(&aggregate)?;
         assert!(spec.bypass);
         let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
@@ -1854,6 +1941,35 @@ mod tests {
             .map(|key| (key, 1))
             .collect();
         assert_eq!(finish(sink)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_whose_groups_come_back_aggregate_again_after_scatters_of_bytes()
+    -> Result<()> {
+        // Tables of 16 groups, up to 64: 40 keys cycling in batches of ten rows
+        // of 1,700-byte binaries. Two batches have more than 32 KiB together,
+        // so every batch scatters the rows before it, and the buffered rows
+        // never get to 64: the thread aggregates its rows again once its groups
+        // came back (after the scatters of their bytes), in a table of 64
+        // groups, which holds them all.
+        let mut sink = max_binaries_by_key(SMALL_TABLES)?;
+        let sink_batch = |sink: &mut Sink, batch: RecordBatch| -> Result<()> {
+            let (spec, local, global) = sink;
+            RadixHashAggregate::sink(spec, batch, global.as_ref(), local.as_mut())
+        };
+        let batch = |b: i64| binary_batch((b * 10) % 40..(b * 10) % 40 + 10, 1_700);
+        sink_batch(&mut sink, batch(0)?)?;
+        sink_batch(&mut sink, batch(1)?)?;
+        assert!(local_state(&sink).bypass.is_some());
+        for b in 2..20 {
+            sink_batch(&mut sink, batch(b)?)?;
+        }
+        let state = local_state(&sink);
+        assert!(state.bypass.is_none());
+        assert_eq!(state.capacity, 64);
+        assert_eq!(state.table.num_groups(), 40);
+        assert_eq!(finish(sink)?, (0..40).map(|key| (key, 5)).collect());
         Ok(())
     }
 
@@ -2089,14 +2205,16 @@ mod tests {
             .schema(Arc::clone(&schema))
             .alias("count(literal)")
             .build()?;
-        Ok(Arc::new(AggregateExec::try_new(
+        let single = AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
             vec![Arc::new(count)],
             vec![Some(col("p", &schema)?)],
             input,
             schema,
-        )?))
+        )?;
+        // Of two stages, whose rows may bypass the tables.
+        Ok(Arc::new(two_stages(&single)?.1))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2260,7 +2378,8 @@ mod tests {
 
     /// Assert that the aggregation of `sql` (see [`aggregation`]) produces
     /// DataFusion's results with thread-local tables of capacity `capacity`
-    /// on `threads` threads, and that its rows may bypass the tables.
+    /// on `threads` threads, and that its rows may bypass the tables if it has
+    /// two stages (see `AggregateSpec::bypass`).
     async fn assert_bypassed_parity(
         ctx: &SessionContext,
         sql: &str,
@@ -2278,7 +2397,11 @@ mod tests {
         let aggregate = PhysicalHashAggregate::try_lower(&plan().await?, lower)?
             .expect("a lowered aggregation")
             .with_table_capacity(capacity);
-        assert!(aggregate.spec().bypass, "{sql}");
+        assert_eq!(
+            aggregate.spec().bypass,
+            !aggregate.spec().single_stage,
+            "{sql}"
+        );
         let actual =
             Executor::collect(Arc::new(aggregate), ctx.task_ctx(), threads).await?;
         let schema = expected_plan.schema();
@@ -2438,7 +2561,8 @@ mod tests {
             Ok(())
         };
         let sql = "SELECT k, count(b) AS c FROM trues GROUP BY k";
-        let config = test_session_config().with_target_partitions(1);
+        // Of two stages, whose rows may bypass the tables.
+        let config = test_session_config().with_target_partitions(4);
         let ctx = datafusion_context(config.clone());
         setup(&ctx).await?;
         // DataFusion counts 1 per group.
@@ -2459,6 +2583,148 @@ mod tests {
             assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads).await?;
         }
         assert_aggregate_parity_with_setup(sql, config, setup).await;
+        Ok(())
+    }
+
+    /// A function `non_negative_sum`, whose accumulator rejects negative
+    /// values.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct NonNegativeSum {
+        signature: datafusion_expr::Signature,
+    }
+
+    impl datafusion_expr::AggregateUDFImpl for NonNegativeSum {
+        fn name(&self) -> &str {
+            "non_negative_sum"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn accumulator(
+            &self,
+            _: datafusion_expr::function::AccumulatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::Accumulator>> {
+            Ok(Box::new(NonNegativeSumAccumulator(0)))
+        }
+    }
+
+    /// The accumulator of [`NonNegativeSum`].
+    #[derive(Debug)]
+    struct NonNegativeSumAccumulator(i64);
+
+    impl datafusion_expr::Accumulator for NonNegativeSumAccumulator {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            for value in values[0].as_primitive::<Int64Type>().iter().flatten() {
+                if value < 0 {
+                    return Err(datafusion_common::DataFusionError::Execution(format!(
+                        "non_negative_sum rejects the negative value {value}"
+                    )));
+                }
+                self.0 += value;
+            }
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+            let sums = states[0].as_primitive::<Int64Type>();
+            self.0 += sums.iter().flatten().sum::<i64>();
+            Ok(())
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
+            Ok(vec![datafusion_common::ScalarValue::Int64(Some(self.0))])
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
+            Ok(datafusion_common::ScalarValue::Int64(Some(self.0)))
+        }
+
+        fn size(&self) -> usize {
+            size_of::<Self>()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accumulators_fail_on_the_rows_that_bypass_the_tables_when_they_are_consumed()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which fill the table of a thread, then a
+        // negative value, which `non_negative_sum` rejects, then a string that
+        // is not an integer, whose cast fails: DataFusion fails on the negative
+        // value. So does the native aggregation, on a single thread: of a
+        // single stage (of a partition), its rows do not bypass the tables; of
+        // two stages (of two partitions, one of them empty), its bypassed rows
+        // are converted to partial states when they are consumed, like
+        // DataFusion's partial stage converts the rows whose aggregation it
+        // skips.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = |keys: Vec<i64>, value: i64, string: &str| {
+            let rows = keys.len();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(vec![value; rows])),
+                    Arc::new(StringArray::from(vec![string; rows])),
+                ],
+            )
+        };
+        let batches = vec![
+            batch((0..32_768).collect(), 1, "1")?,
+            batch(vec![50_000], -5, "2")?,
+            batch(vec![50_001], 3, "not an integer")?,
+        ];
+        let sql =
+            "SELECT k, non_negative_sum(v), SUM(CAST(s AS BIGINT)) FROM t GROUP BY k";
+        for (partitions, bypass) in [
+            (vec![batches.clone()], false),
+            (vec![batches.clone(), vec![]], true),
+        ] {
+            let setup = async |ctx: &SessionContext| -> Result<()> {
+                let table = datafusion::datasource::MemTable::try_new(
+                    Arc::clone(&schema),
+                    partitions.clone(),
+                )?;
+                ctx.register_table("t", Arc::new(table))?;
+                let signature = datafusion_expr::Signature::exact(
+                    vec![DataType::Int64],
+                    datafusion_expr::Volatility::Immutable,
+                );
+                let udaf = NonNegativeSum { signature };
+                ctx.register_udaf(datafusion_expr::AggregateUDF::from(udaf));
+                Ok(())
+            };
+            let config = test_session_config().with_target_partitions(1);
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let aggregate = PhysicalHashAggregate::try_lower(
+                &aggregation(&plan).expect("an aggregation"),
+                lower,
+            )?
+            .expect("a lowered aggregation");
+            assert_eq!(
+                aggregate.spec().bypass,
+                bypass,
+                "{} partitions",
+                partitions.len()
+            );
+            let message = "non_negative_sum rejects the negative value -5";
+            assert_aggregate_fails_like_datafusion_with_setup(
+                sql, config, setup, message,
+            )
+            .await;
+        }
         Ok(())
     }
 
