@@ -2042,12 +2042,9 @@ fn join_expression_schema(
     expr: &Arc<dyn PhysicalExpr>,
 ) -> Option<SchemaRef> {
     let is = |candidate: &Arc<dyn PhysicalExpr>| Arc::ptr_eq(candidate, expr);
-    let (keys, filter) = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
-        (join.on(), join.filter())
-    } else if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
-        (&[][..], join.filter())
-    } else {
-        return None;
+    let (keys, filter) = match plan.downcast_ref::<HashJoinExec>() {
+        Some(join) => (join.on(), join.filter()),
+        None => (&[][..], plan.downcast_ref::<NestedLoopJoinExec>()?.filter()),
     };
     let children = plan.children();
     if let Some(filter) = filter.filter(|filter| is(filter.expression())) {
