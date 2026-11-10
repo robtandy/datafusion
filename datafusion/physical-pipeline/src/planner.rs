@@ -6031,8 +6031,8 @@ mod tests {
         // Through the probe side of a join, which is no node that only passes
         // rows on (as `crate::sort::try_lower` judges it), the TopK is left to
         // DataFusion.
-        let sql = "SELECT p.k, t2.name FROM p JOIN t2 ON p.k = t2.k \
-                   ORDER BY p.k DESC, t2.name LIMIT 3";
+        let sql = "SELECT p.k, p.s FROM p JOIN t2 ON p.k = t2.k \
+                   ORDER BY p.k DESC, p.s LIMIT 3";
         let plan = datafusion_plan_with(sql, config.clone(), &setup).await;
         let mut read = 0;
         plan.apply(|node| {
@@ -6041,10 +6041,9 @@ mod tests {
             }
             Ok(TreeNodeRecursion::Continue)
         })?;
+        assert_eq!(read, 1, "{}", displayable(plan.as_ref()).indent(false));
         let root = assert_parity_with(sql, config, &setup).await;
-        if read > 0 {
-            assert_eq!(count::<PhysicalTopK>(&root), 0, "{sql}");
-        }
+        assert_eq!(count::<PhysicalTopK>(&root), 0, "{sql}");
         Ok(())
     }
 
