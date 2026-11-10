@@ -1356,7 +1356,7 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{Field, Int64Type, Schema, SchemaRef};
     use datafusion::functions_aggregate::count::count_udaf;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
@@ -1368,6 +1368,7 @@ mod tests {
 
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{assert_aggregate_parity_with_setup, lower};
+    use super::super::hash_aggregate::TrustedAggregateFunctions;
     use crate::executor::Executor;
     use crate::test_utils::{canonical_batch, datafusion_context, test_session_config};
 
@@ -1698,9 +1699,9 @@ mod tests {
     }
 
     /// The sink of `COUNT(*) GROUP BY k` (of two stages), with tables of
-    /// capacity `capacity`, whose rows may bypass the tables if `bypass`: the
-    /// sink of the bypass, which an aggregation with aggregates does not use
-    /// (see `AggregateSpec::bypass`), with counts to check.
+    /// capacity `capacity`, whose rows may bypass the tables if `bypass` (as
+    /// in the sessions that trust `count`, see
+    /// `AggregateSpec::rows_bypass_tables`), with counts to check.
     fn count_by_key_with(capacity: TableCapacity, bypass: bool) -> Result<Sink> {
         let schema = key_schema();
         let count = AggregateExprBuilder::new(count_udaf(), vec![lit(1i64)])
@@ -1715,10 +1716,9 @@ mod tests {
             MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
             schema,
         )?;
-        let mut spec = two_stage_spec(&aggregate)?;
-        assert!(!spec.bypass);
-        Arc::get_mut(&mut spec).expect("a single owner").bypass = bypass;
-        let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
+        let spec = two_stage_spec(&aggregate)?;
+        assert!(spec.bypass);
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity, bypass)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
     }
 
@@ -2412,15 +2412,26 @@ mod tests {
         plan.children().into_iter().find_map(aggregation)
     }
 
+    /// `config`, trusting the built-in aggregate functions of DataFusion (see
+    /// [`TrustedAggregateFunctions`]).
+    fn trusting(config: SessionConfig) -> SessionConfig {
+        let functions = datafusion::functions_aggregate::all_default_aggregate_functions();
+        config.with_option_extension(PhysicalHashAggregate::trusted_aggregate_functions(
+            &functions,
+        ))
+    }
+
     /// Assert that the aggregation of `sql` (see [`aggregation`]) produces
     /// DataFusion's results with thread-local tables of capacity `capacity`
-    /// on `threads` threads, and that its rows may bypass the tables if it has
-    /// no aggregates (see `AggregateSpec::bypass`).
+    /// on `threads` threads, and that its rows bypass the tables of threads
+    /// whose groups hardly repeat in the session of `ctx` if `bypass` (see
+    /// `AggregateSpec::rows_bypass_tables`).
     async fn assert_bypassed_parity(
         ctx: &SessionContext,
         sql: &str,
         capacity: TableCapacity,
         threads: usize,
+        bypass: bool,
     ) -> Result<()> {
         let plan = async || -> Result<Arc<dyn ExecutionPlan>> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
@@ -2433,9 +2444,10 @@ mod tests {
         let aggregate = PhysicalHashAggregate::try_lower(&plan().await?, lower)?
             .expect("a lowered aggregation")
             .with_table_capacity(capacity);
+        let options = Arc::clone(ctx.state().config().options());
         assert_eq!(
-            aggregate.spec().bypass,
-            aggregate.spec().update.is_empty(),
+            aggregate.spec().rows_bypass_tables(&options),
+            bypass,
             "{sql}"
         );
         let actual =
@@ -2451,31 +2463,71 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bypassed_rows_are_aggregated_like_datafusion() -> Result<()> {
+        // The queries, and whether their rows bypass the tables in the
+        // sessions that trust DataFusion's built-in aggregate functions: those
+        // whose aggregates are neither `DISTINCT` nor ordered (see
+        // `TrustedAggregateFunctions::trusts`). In the other sessions, only the
+        // rows of aggregations without aggregates bypass the tables.
         let queries = [
-            "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(sv), AVG(d), BOOL_OR(b) FROM u \
-             GROUP BY k",
-            "SELECT s, sv, COUNT(v), MAX(k), MIN(d) FROM u GROUP BY s, sv",
-            "SELECT k, d, b, COUNT(*) FROM u WHERE v > -300 GROUP BY k, d, b",
+            (
+                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(sv), AVG(d), BOOL_OR(b) FROM u \
+                 GROUP BY k",
+                true,
+            ),
+            (
+                "SELECT s, sv, COUNT(v), MAX(k), MIN(d) FROM u GROUP BY s, sv",
+                true,
+            ),
+            (
+                "SELECT k, d, b, COUNT(*) FROM u WHERE v > -300 GROUP BY k, d, b",
+                true,
+            ),
             // Filters, which may select all rows of a chunk or none, and whose
             // rows are the only ones that the arguments are evaluated on.
-            "SELECT k, COUNT(*) FILTER (WHERE v > 0), SUM(v) FILTER (WHERE s IS NULL), \
-             MIN(d) FILTER (WHERE false), MAX(s) FILTER (WHERE true), \
-             SUM(1000 / v) FILTER (WHERE v <> 0) FROM u GROUP BY k",
+            (
+                "SELECT k, COUNT(*) FILTER (WHERE v > 0), SUM(v) FILTER (WHERE s IS NULL), \
+                 MIN(d) FILTER (WHERE false), MAX(s) FILTER (WHERE true), \
+                 SUM(1000 / v) FILTER (WHERE v <> 0) FROM u GROUP BY k",
+                true,
+            ),
             // Groups whose rows bypass the tables of several threads.
-            "SELECT k % 97 AS m, COUNT(DISTINCT v), MEDIAN(v), APPROX_DISTINCT(s), \
-             SUM(DISTINCT d) FROM u GROUP BY k % 97",
-            "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
-             FROM u GROUP BY k % 50",
-            "SELECT sv, COUNT(*), MAX(s), BIT_XOR(v) FROM u GROUP BY sv",
-            // Without aggregates, whose rows may bypass the tables.
-            "SELECT k, s, sv FROM u GROUP BY k, s, sv",
-            "SELECT DISTINCT d, b, v FROM u",
-            "SELECT k % 97 AS m FROM u GROUP BY k % 97",
+            (
+                "SELECT k % 97 AS m, COUNT(DISTINCT v), MEDIAN(v), APPROX_DISTINCT(s), \
+                 SUM(DISTINCT d) FROM u GROUP BY k % 97",
+                false,
+            ),
+            (
+                "SELECT k % 97 AS m, MEDIAN(v), APPROX_DISTINCT(s), BOOL_AND(b), \
+                 BIT_AND(v), BIT_OR(v), SUM(d), AVG(v) FROM u GROUP BY k % 97",
+                true,
+            ),
+            (
+                "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
+                 FROM u GROUP BY k % 50",
+                false,
+            ),
+            (
+                "SELECT sv, COUNT(*), MAX(s), BIT_XOR(v) FROM u GROUP BY sv",
+                true,
+            ),
+            // Without aggregates, whose rows bypass the tables in any session.
+            ("SELECT k, s, sv FROM u GROUP BY k, s, sv", true),
+            ("SELECT DISTINCT d, b, v FROM u", true),
+            ("SELECT k % 97 AS m FROM u GROUP BY k % 97", true),
             // Counts of the arguments that the bypassed rows hold: filtered, of
             // several arguments, and distinct ones.
-            "SELECT k, COUNT(s), COUNT(sv) FILTER (WHERE v > 0), COUNT(d, s), \
-             COUNT(b) FILTER (WHERE false), COUNT(v) FILTER (WHERE true), \
-             COUNT(DISTINCT s), COUNT(NULL) FROM u GROUP BY k",
+            (
+                "SELECT k, COUNT(s), COUNT(sv) FILTER (WHERE v > 0), COUNT(d, s), \
+                 COUNT(b) FILTER (WHERE false), COUNT(v) FILTER (WHERE true), \
+                 COUNT(DISTINCT s), COUNT(NULL) FROM u GROUP BY k",
+                false,
+            ),
+            (
+                "SELECT k, COUNT(s), COUNT(sv) FILTER (WHERE v > 0), COUNT(d, s), \
+                 COUNT(b) FILTER (WHERE false), COUNT(v) FILTER (WHERE true), \
+                 COUNT(NULL) FROM u GROUP BY k",
+                true,
+            ),
         ];
         let tables = [
             SMALL_TABLES,
@@ -2484,14 +2536,22 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for target_partitions in [1, 4] {
-            let config = test_session_config().with_target_partitions(target_partitions);
+        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)] {
+            let mut config =
+                test_session_config().with_target_partitions(target_partitions);
+            if trusted {
+                config = trusting(config);
+            }
             let ctx = datafusion_context(config.clone());
             register_u(&ctx)?;
-            for sql in queries {
+            for (sql, trusted_bypass) in queries {
+                // The queries with aggregates are those that call functions.
+                let aggregates = sql.contains('(');
+                let bypass = if trusted { trusted_bypass } else { !aggregates };
                 for capacity in tables {
                     for threads in [1, 4] {
-                        assert_bypassed_parity(&ctx, sql, capacity, threads).await?;
+                        assert_bypassed_parity(&ctx, sql, capacity, threads, bypass)
+                            .await?;
                     }
                 }
                 // And through the planner, with the default and with tiny
@@ -2620,7 +2680,19 @@ mod tests {
         assert_eq!(counts.len(), 40_000);
         assert!(counts.iter().all(|&count| count == 1));
         for threads in [1, 4] {
-            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads).await?;
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads, false)
+                .await?;
+        }
+        assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
+        // Also in a session that trusts DataFusion's `count`, which [`Count`]
+        // replaces: its type is not DataFusion's (see
+        // `TrustedAggregateFunctions`).
+        let config = trusting(config);
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        for threads in [1, 4] {
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads, false)
+                .await?;
         }
         assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
@@ -2896,7 +2968,7 @@ mod tests {
             // the thread-local tables of several threads aggregate the rows of
             // a group apart, each with the running total of its own rows (as
             // on the base).
-            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1).await?;
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1, false).await?;
             assert_aggregate_parity_with_setup(sql, config, setup).await;
         }
         Ok(())
@@ -2947,14 +3019,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bypassed_rows_of_long_values_are_aggregated_like_datafusion() -> Result<()> {
+        // The queries, and whether they have aggregates, whose rows bypass the
+        // tables in the sessions that trust them only.
         let queries = [
-            "SELECT k, COUNT(b), MAX(s), SUM(v) FROM long GROUP BY k",
-            "SELECT k, MIN(b), MAX(b), COUNT(*) FROM long GROUP BY k",
-            "SELECT s, COUNT(*), MIN(k), COUNT(b) FROM long GROUP BY s",
+            ("SELECT k, COUNT(b), MAX(s), SUM(v) FROM long GROUP BY k", true),
+            ("SELECT k, MIN(b), MAX(b), COUNT(*) FROM long GROUP BY k", true),
+            ("SELECT s, COUNT(*), MIN(k), COUNT(b) FROM long GROUP BY s", true),
             // Without aggregates, whose rows (binaries and strings of up to 40
-            // KB included) may bypass the tables.
-            "SELECT k, b FROM long GROUP BY k, b",
-            "SELECT DISTINCT s, v FROM long",
+            // KB included) bypass the tables in any session.
+            ("SELECT k, b FROM long GROUP BY k, b", false),
+            ("SELECT DISTINCT s, v FROM long", false),
         ];
         let tables = [
             SMALL_TABLES,
@@ -2963,14 +3037,20 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for target_partitions in [1, 4] {
-            let config = test_session_config().with_target_partitions(target_partitions);
+        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)] {
+            let mut config =
+                test_session_config().with_target_partitions(target_partitions);
+            if trusted {
+                config = trusting(config);
+            }
             let ctx = datafusion_context(config.clone());
             register_long(&ctx)?;
-            for sql in queries {
+            for (sql, aggregates) in queries {
+                let bypass = trusted || !aggregates;
                 for capacity in tables {
                     for threads in [1, 4] {
-                        assert_bypassed_parity(&ctx, sql, capacity, threads).await?;
+                        assert_bypassed_parity(&ctx, sql, capacity, threads, bypass)
+                            .await?;
                     }
                 }
                 let setup = async |ctx: &SessionContext| register_long(ctx);

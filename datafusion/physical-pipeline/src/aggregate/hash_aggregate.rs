@@ -2834,33 +2834,76 @@ mod tests {
     async fn rows_of_simple_aggregations_may_bypass_the_tables() -> Result<()> {
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
-        for (sql, bypass) in [
+        let untrusting = ConfigOptions::default();
+        let mut trusting = ConfigOptions::default();
+        trusting
+            .extensions
+            .insert(PhysicalHashAggregate::trusted_aggregate_functions(
+                &datafusion::functions_aggregate::all_default_aggregate_functions(),
+            ));
+        // The queries, and whether their rows bypass the tables in a session
+        // that does not trust DataFusion's built-in aggregate functions, and
+        // in a session that does.
+        for (sql, untrusted, trusted) in [
             // Without aggregates.
-            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
-            ("SELECT a, d FROM t1 GROUP BY a, d", true),
-            // The accumulators of aggregates aggregate every row in the tables
-            // (see `rows_can_bypass_tables`).
+            ("SELECT DISTINCT id, c, f, ts FROM t1", true, true),
+            ("SELECT a, d FROM t1 GROUP BY a, d", true, true),
+            // The accumulators of aggregates aggregate every row in the tables,
+            // but in the sessions that trust their functions (see
+            // `rows_can_bypass_tables`).
             (
                 "SELECT a, COUNT(*), SUM(b), MIN(d), AVG(g) FROM t1 GROUP BY a",
                 false,
+                true,
             ),
+            (
+                "SELECT h, MAX(c), BOOL_AND(e), BOOL_OR(e), BIT_AND(b), BIT_OR(a), \
+                 BIT_XOR(b), APPROX_DISTINCT(d), MEDIAN(b) FILTER (WHERE e), \
+                 ARRAY_AGG(a), FIRST_VALUE(d), LAST_VALUE(f), COUNT(a, b) \
+                 FROM t1 GROUP BY h",
+                false,
+                true,
+            ),
+            // `DISTINCT` and ordered aggregates, whose accumulators are not
+            // trusted.
             (
                 "SELECT d, h, COUNT(DISTINCT a), MEDIAN(b) FILTER (WHERE e) FROM t1 \
                  GROUP BY d, h",
+                false,
                 false,
             ),
             (
                 "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
                 false,
+                false,
+            ),
+            (
+                "SELECT d, FIRST_VALUE(a ORDER BY id) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
+            // Functions that are not trusted.
+            ("SELECT d, STDDEV(b) FROM t1 GROUP BY d", false, false),
+            (
+                "SELECT d, COUNT(*), STRING_AGG(h, ',') FROM t1 GROUP BY d",
+                false,
+                false,
             ),
             // Grouping sets.
-            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false),
-            // Keys of nested types and dictionaries.
-            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false),
+            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false, false),
+            (
+                "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
+                false,
+                false,
+            ),
+            // Keys and arguments of nested types and dictionaries.
+            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false, false),
             (
                 "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 GROUP BY dd",
                 false,
+                false,
             ),
+            ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false, false),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let mut aggregate = None;
@@ -2874,7 +2917,9 @@ mod tests {
                 node = child;
             }
             let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
-            assert_eq!(aggregate.spec.bypass, bypass, "{sql}");
+            let spec = &aggregate.spec;
+            assert_eq!(spec.rows_bypass_tables(&untrusting), untrusted, "{sql}");
+            assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
