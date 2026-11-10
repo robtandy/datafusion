@@ -579,13 +579,15 @@ built-in functions by default, see `TrustedFunctions`):
   semi join of Q17. The native projection refuses the projection of Q8: a
   decimal division by a sum that may be 0, which may fail with several kinds
   of errors.
-- Over Parquet, 18 queries run fully natively: all but Q8 and the queries
+- Over Parquet, 19 queries run fully natively: all but Q8 and the queries
   whose hash joins have dynamic filters that prune the reads of the Parquet
   scans of their probe sides, below work that may fail on the rows that
   DataFusion skips (the native join sets its filter to other values, the
-  bounds of its build keys): the decimal arithmetic of the revenues of Q15,
-  the cast into a decimal of the average quantities of Q17, and the residual
-  filter of the semi join of Q20.
+  bounds of its build keys): the decimal arithmetic of the revenues of Q15
+  and the cast into a decimal of the average quantities of Q17. (The residual
+  filter of the semi join below the join of Q20, which casts integers into
+  floats, cannot fail: the planner judges the keys and the filters of joins
+  on the rows that they evaluate them on.)
 - The TopK of Q18 has a dynamic filter that the scan of `orders` reads, below
   hash joins and an aggregation, which reads all of its input before the
   TopK sees its first group: in both engines, the filter prunes nothing, and
