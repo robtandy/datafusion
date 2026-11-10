@@ -1763,8 +1763,7 @@ mod tests {
     }
 
     /// The sink of `COUNT(*), MAX(b) GROUP BY k`, with tables of capacity
-    /// `capacity`: its bypassed rows hold the binaries (those of `COUNT(b)`
-    /// would hold their validity only).
+    /// `capacity`: its bypassed rows hold the binaries.
     fn max_binaries_by_key(capacity: TableCapacity) -> Result<Sink> {
         use datafusion::functions_aggregate::min_max::max_udaf;
         let schema = binary_schema();
@@ -2309,8 +2308,8 @@ mod tests {
             "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
              FROM u GROUP BY k % 50",
             "SELECT sv, COUNT(*), MAX(s), BIT_XOR(v) FROM u GROUP BY sv",
-            // Counts, whose bypassed rows hold the validity of their arguments
-            // only: filtered, of several arguments, and distinct ones.
+            // Counts of the arguments that the bypassed rows hold: filtered, of
+            // several arguments, and distinct ones.
             "SELECT k, COUNT(s), COUNT(sv) FILTER (WHERE v > 0), COUNT(d, s), \
              COUNT(b) FILTER (WHERE false), COUNT(v) FILTER (WHERE true), \
              COUNT(DISTINCT s), COUNT(NULL) FROM u GROUP BY k",
@@ -2338,6 +2337,128 @@ mod tests {
                 assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
             }
         }
+        Ok(())
+    }
+
+    /// A function `count` of a type named `Count` too, which replaces
+    /// DataFusion's `COUNT` and counts the `true` values of its argument.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct Count {
+        signature: datafusion_expr::Signature,
+    }
+
+    impl datafusion_expr::AggregateUDFImpl for Count {
+        fn name(&self) -> &str {
+            "count"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn accumulator(
+            &self,
+            _: datafusion_expr::function::AccumulatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::Accumulator>> {
+            Ok(Box::new(TrueCount(0)))
+        }
+    }
+
+    /// The accumulator of [`Count`].
+    #[derive(Debug)]
+    struct TrueCount(i64);
+
+    impl datafusion_expr::Accumulator for TrueCount {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            self.0 += values[0].as_boolean().true_count() as i64;
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+            let counts = states[0].as_primitive::<Int64Type>();
+            self.0 += counts.iter().flatten().sum::<i64>();
+            Ok(())
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
+            Ok(vec![datafusion_common::ScalarValue::Int64(Some(self.0))])
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
+            Ok(datafusion_common::ScalarValue::Int64(Some(self.0)))
+        }
+
+        fn size(&self) -> usize {
+            size_of::<Self>()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bypassed_rows_hold_the_arguments_of_user_defined_counts() -> Result<()> {
+        // `count` of [`Count`] over 40,000 distinct keys of a single
+        // partition, in batches of 2,048 rows, whose arguments are all `true`:
+        // the rows after the first 32,768 bypass the full table of the thread,
+        // and hold the values of its arguments, which it reads.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+        let batches = (0..40_000)
+            .step_by(2_048)
+            .map(|start| {
+                let keys = start..(start + 2_048).min(40_000);
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(keys.clone())),
+                        Arc::new(BooleanArray::from(vec![
+                            true;
+                            (keys.end - keys.start)
+                                as usize
+                        ])),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![batches.clone()],
+            )?;
+            ctx.register_table("trues", Arc::new(table))?;
+            let signature = datafusion_expr::Signature::exact(
+                vec![DataType::Boolean],
+                datafusion_expr::Volatility::Immutable,
+            );
+            ctx.register_udaf(datafusion_expr::AggregateUDF::from(Count { signature }));
+            Ok(())
+        };
+        let sql = "SELECT k, count(b) AS c FROM trues GROUP BY k";
+        let config = test_session_config().with_target_partitions(1);
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        // DataFusion counts 1 per group.
+        let batches = ctx.sql(sql).await?.collect().await?;
+        let counts = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(counts.len(), 40_000);
+        assert!(counts.iter().all(|&count| count == 1));
+        for threads in [1, 4] {
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads).await?;
+        }
+        assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
     }
 
@@ -2469,10 +2590,7 @@ mod tests {
             Ok(())
         };
         let config = test_session_config().with_target_partitions(1);
-        // `APPROX_DISTINCT(b)` holds the binaries of the bypassed rows (those
-        // of `COUNT(b)` hold their validity only), whose sketches DataFusion
-        // builds without holding them.
-        let sql = "SELECT k, COUNT(b), APPROX_DISTINCT(b) FROM wide GROUP BY k";
+        let sql = "SELECT k, COUNT(b) FROM wide GROUP BY k";
         assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
     }

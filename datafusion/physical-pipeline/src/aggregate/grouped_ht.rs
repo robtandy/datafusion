@@ -87,9 +87,8 @@ impl GroupedStates {
 /// (of the input of `spec`, an aggregation without grouping sets), aligned
 /// with its rows, for [`GroupedHashTable::update_rows`]: the group columns,
 /// followed by the arguments of every aggregate that are not rebuilt (see
-/// [`rebuilt_literal`]), their validity for a `COUNT`, and, for an aggregate
-/// with a filter, the filter result (see
-/// [`AggregateUpdate::evaluate_row_aligned`]).
+/// [`rebuilt_literal`]) and, for an aggregate with a filter, the filter result
+/// (see [`AggregateUpdate::evaluate_row_aligned`]).
 ///
 /// [`AggregateUpdate::evaluate_row_aligned`]: super::hash_aggregate::AggregateUpdate::evaluate_row_aligned
 pub(crate) fn evaluate_rows(
@@ -716,8 +715,8 @@ mod tests {
     fn literal_arguments_of_bypassed_rows_are_rebuilt_or_evaluated() -> Result<()> {
         // `COUNT(1) GROUP BY a` and `COUNT('a literal') GROUP BY a`: the
         // literal of a fixed width is rebuilt for the rows that the aggregate
-        // aggregates, the string is evaluated like the other arguments (and
-        // its validity stored, as the argument of a `COUNT`).
+        // aggregates, the string is evaluated (and stored) like the other
+        // arguments.
         let schema = input_schema();
         for (literal, stored) in [(lit(1i64), 0), (lit("a literal"), 1)] {
             let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
@@ -746,12 +745,12 @@ mod tests {
                 ],
             )?;
             let columns = evaluate_rows(&spec, &batch)?;
-            // The key, and the validity of the string.
+            // The key, and the string.
             assert_eq!(columns.len(), 1 + stored);
             assert!(
                 columns[1..]
                     .iter()
-                    .all(|c| c.data_type() == &DataType::Boolean)
+                    .all(|c| c.data_type() == &DataType::Utf8)
             );
             let mut table = GroupedHashTable::try_new_merge(&spec)?;
             table.update_rows(&spec, &columns)?;
@@ -770,12 +769,12 @@ mod tests {
     }
 
     #[test]
-    fn bypassed_rows_hold_the_validity_of_the_arguments_of_counts() -> Result<()> {
+    fn bypassed_rows_hold_the_arguments_of_their_aggregates() -> Result<()> {
         // `COUNT(b)`, `COUNT(a, b)`, `COUNT(DISTINCT b)` and `MIN(b)` of
-        // strings of 1,000 bytes, a third of them `NULL`, grouped by `a`: the
-        // bypassed rows hold the validity of the arguments of the counts
-        // (which only read their nulls, like DataFusion's counts hold no
-        // string), the strings for the others.
+        // strings, a third of them `NULL`, grouped by `a`: the bypassed rows
+        // hold the arguments of every aggregate (the accumulators of functions
+        // named `count` may read their values, see
+        // `radix_ht::tests::bypassed_rows_hold_the_arguments_of_user_defined_counts`).
         use datafusion::functions_aggregate::min_max::min_udaf;
         let schema = input_schema();
         let aggregate = |udaf, arguments, distinct, alias: &str| {
@@ -814,8 +813,6 @@ mod tests {
         let input = Arc::new(BridgeOperator::new(Arc::clone(aggregation.input())));
         let spec =
             PhysicalHashAggregate::try_new_single_stage(&aggregation, input)?.spec();
-        let counts = spec.update.iter().map(|update| update.counts_non_nulls);
-        assert_eq!(counts.collect::<Vec<_>>(), [true, true, false, false]);
         let rows = 2_048;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -830,26 +827,19 @@ mod tests {
             ],
         )?;
         let columns = evaluate_rows(&spec, &batch)?;
-        // The key; the validity of `b`; that of `a` and `b`; `b`; `b`.
+        // The key; `b`; `a` and `b`; `b`; `b`.
         let types = columns.iter().map(|column| column.data_type().clone());
         assert_eq!(
             types.collect::<Vec<_>>(),
             [
                 DataType::Int32,
-                DataType::Boolean,
-                DataType::Boolean,
-                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Int32,
+                DataType::Utf8,
                 DataType::Utf8,
                 DataType::Utf8,
             ]
         );
-        for validity in &columns[1..4] {
-            // Bits, not bytes of strings.
-            assert!(validity.get_array_memory_size() < 2_048);
-        }
-        assert_eq!(columns[1].logical_nulls(), batch.column(1).logical_nulls());
-        assert_eq!(columns[2].logical_nulls(), batch.column(0).logical_nulls());
-        assert_eq!(columns[3].logical_nulls(), batch.column(1).logical_nulls());
         // Counted like DataFusion counts the rows themselves.
         let mut table = GroupedHashTable::try_new_merge(&spec)?;
         table.update_rows(&spec, &columns)?;

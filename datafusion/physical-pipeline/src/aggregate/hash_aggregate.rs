@@ -12,7 +12,6 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, Scalar, UInt32Array,
     make_comparator, new_empty_array, new_null_array,
 };
-use arrow::buffer::BooleanBuffer;
 use arrow::compute::kernels::cmp::{gt_eq, lt_eq};
 use arrow::compute::{
     SortColumn, SortOptions, concat, filter_record_batch, interleave, lexsort_to_indices,
@@ -301,38 +300,6 @@ pub(crate) struct AggregateUpdate {
     pub(crate) arguments: Vec<Arc<dyn PhysicalExpr>>,
     /// `FILTER (WHERE ...)`.
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
-    /// Whether the accumulator only reads which of its arguments are `NULL`
-    /// (see [`counts_non_nulls`]): the rows that bypass the thread-local
-    /// tables hold the validity of its arguments instead of their values (see
-    /// [`Self::evaluate_row_aligned`]), so that they hold no more bytes than
-    /// the counts of DataFusion for, e.g., the `COUNT` of long strings.
-    pub(crate) counts_non_nulls: bool,
-}
-
-/// Whether `expr` is DataFusion's `COUNT` (not `DISTINCT`), whose
-/// accumulators only read which of their arguments are `NULL` (their logical
-/// nulls): by its name and the name of the type that implements it, which the
-/// `Debug` representation of its implementation starts with. A function
-/// registered under the name `count` (which replaces DataFusion's) is another
-/// type. (Like the native window, the aggregation cannot compare the functions
-/// themselves: it does not depend on DataFusion's function crates.)
-fn counts_non_nulls(expr: &AggregateFunctionExpr) -> bool {
-    let fun = expr.fun();
-    let implementation = format!("{:?}", fun.inner());
-    let type_name = implementation
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next();
-    !expr.is_distinct() && fun.name() == "count" && type_name == Some("Count")
-}
-
-/// The validity of `array` (its logical nulls), all that `COUNT` reads of its
-/// arguments: a boolean array of the same length and nulls, whose values are
-/// all `false`.
-fn validity(array: &ArrayRef) -> ArrayRef {
-    Arc::new(BooleanArray::new(
-        BooleanBuffer::new_unset(array.len()),
-        array.logical_nulls(),
-    ))
 }
 
 /// The arguments of an aggregate for the rows of a batch that pass its
@@ -352,12 +319,10 @@ impl AggregateUpdate {
     ) -> Self {
         let mut arguments = expr.expressions();
         arguments.extend(expr.order_bys().iter().map(|sort| Arc::clone(&sort.expr)));
-        let counts_non_nulls = counts_non_nulls(&expr);
         Self {
             expr,
             arguments,
             filter,
-            counts_non_nulls,
         }
     }
 
@@ -409,10 +374,8 @@ impl AggregateUpdate {
     /// [`rebuilt_literal`]) for the rows of `batch` that pass its filter, like
     /// [`Self::evaluate_filtered`], aligned with the rows of `batch`: the
     /// arguments of the rows that do not pass the filter are `NULL` (they are
-    /// not evaluated, so they cannot cause errors). The arguments of an
-    /// aggregate that only reads which of them are `NULL` are their validity
-    /// (see [`Self::counts_non_nulls`]). Returns the arguments and the filter
-    /// result, `None` without a filter.
+    /// not evaluated, so they cannot cause errors). Returns the arguments and
+    /// the filter result, `None` without a filter.
     pub(crate) fn evaluate_row_aligned(
         &self,
         batch: &RecordBatch,
@@ -422,15 +385,9 @@ impl AggregateUpdate {
             .arguments
             .iter()
             .filter(|argument| rebuilt_literal(argument).is_none());
-        let evaluate =
-            |argument: &Arc<dyn PhysicalExpr>, batch: &RecordBatch| -> Result<ArrayRef> {
-                let values = argument.evaluate(batch)?.into_array(batch.num_rows())?;
-                Ok(if self.counts_non_nulls {
-                    validity(&values)
-                } else {
-                    values
-                })
-            };
+        let evaluate = |argument: &Arc<dyn PhysicalExpr>, batch: &RecordBatch| {
+            argument.evaluate(batch)?.into_array(batch.num_rows())
+        };
         let Some(filter) = &self.filter else {
             let values = arguments
                 .map(|argument| evaluate(argument, batch))
@@ -442,11 +399,10 @@ impl AggregateUpdate {
         let values = match mask.true_count() {
             0 => arguments
                 .map(|argument| {
-                    let data_type = match self.counts_non_nulls {
-                        true => DataType::Boolean,
-                        false => argument.data_type(batch.schema_ref())?,
-                    };
-                    Ok(new_null_array(&data_type, num_rows))
+                    Ok(new_null_array(
+                        &argument.data_type(batch.schema_ref())?,
+                        num_rows,
+                    ))
                 })
                 .collect::<Result<_>>()?,
             selected if selected == num_rows => arguments
