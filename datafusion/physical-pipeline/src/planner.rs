@@ -806,7 +806,7 @@ impl Lowering<'_> {
         // at other times, so that it does not skip the same reads. So a TopK
         // whose dynamic filter a node of its input consumes is left to
         // DataFusion if its input may fail on the rows that DataFusion skips
-        // (see [`pruned_rows_failures`]: expressions that may fail, or sources
+        // (see [`subtree_failures`]: expressions that may fail, or sources
         // that may fail to read their rows, but for scans of Parquet and CSV
         // files with expressions that cannot fail). (The native sort itself
         // leaves to DataFusion the TopKs whose pruned rows the expressions of
@@ -817,7 +817,7 @@ impl Lowering<'_> {
                 .iter()
                 .find_map(|expr| expr.expression_id())
             && consumes_dynamic_filter(sort.input(), filter)
-            && !pruned_rows_failures(sort.input()).is_none()
+            && !subtree_failures(sort.input()).is_none()
         {
             return Ok(None);
         }
@@ -853,7 +853,7 @@ impl Lowering<'_> {
     /// that may fail with another error (see [`conflict`]), and an aggregation
     /// that produces a dynamic filter (which the native aggregation does not
     /// update) above nodes that may fail on the rows that DataFusion would
-    /// prune with it (see [`pruned_rows_failures`]). Parts that can only fail
+    /// prune with it (see [`subtree_failures`]). Parts that can only fail
     /// with arithmetic overflows (e.g. the decimal arithmetic of the
     /// aggregates of TPC-H) are evaluated on any number of threads (see
     /// `Lowering::fails_like_datafusion_on_threads`).
@@ -876,7 +876,7 @@ impl Lowering<'_> {
             return Ok(None);
         }
         if !raw.dynamic_expressions_produced().is_empty()
-            && !pruned_rows_failures(raw.input()).is_none()
+            && !subtree_failures(raw.input()).is_none()
         {
             return Ok(None);
         }
@@ -980,12 +980,12 @@ impl Lowering<'_> {
         // filter rejects once the build side is collected; a native join does
         // not skip the same reads. So a join with a dynamic filter whose probe
         // side may fail on the rows that DataFusion skips is left to
-        // DataFusion (see [`pruned_rows_failures`]: e.g. a probe side with an
+        // DataFusion (see [`subtree_failures`]: e.g. a probe side with an
         // expression that may fail, or a source that may fail to read its
         // rows, but for scans of Parquet and CSV files whose expressions
         // cannot fail, as in TPC-H).
         if !plan.dynamic_expressions_produced().is_empty()
-            && !pruned_rows_failures(join.right()).is_none()
+            && !subtree_failures(join.right()).is_none()
         {
             return Ok(None);
         }
@@ -2013,12 +2013,15 @@ fn subtree_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
 }
 
 /// The parts of `plan` itself that may fail: the parts of its expressions
-/// that may fail (see [`Judgement::of_plan`]), the sources that may fail to
-/// read or decode their rows (see [`source_may_fail`]), and the nodes that
-/// may fail to combine their batches (see [`may_fail_to_combine`]), which may
-/// fail with several kinds of errors.
+/// that may fail (see [`Judgement::of_plan`], and [`file_scan_failures`] for
+/// the scans of Parquet and CSV files, whose expressions are judged on the
+/// schema of their table), the sources that may fail to read or decode their
+/// rows (see [`source_may_fail`]), and the nodes that may fail to combine
+/// their batches (see [`may_fail_to_combine`]), which may fail with several
+/// kinds of errors.
 fn node_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
-    let mut failures = Judgement::of_plan(plan.as_ref()).failures;
+    let mut failures = file_scan_failures(plan)
+        .unwrap_or_else(|| Judgement::of_plan(plan.as_ref()).failures);
     if source_may_fail(plan) {
         failures = failures.and(Failures::MIXED);
     }
@@ -2044,33 +2047,6 @@ fn scalar_subquery_input(
 ) -> Option<&Arc<dyn ExecutionPlan>> {
     plan.downcast_ref::<ScalarSubqueryExec>()
         .map(ScalarSubqueryExec::input)
-}
-
-/// The parts of the nodes of `plan` that may fail on the rows that the
-/// dynamic filters of DataFusion skip, and that the native operators may read
-/// (see [`subtree_failures`]): a native hash join sets its dynamic filter to
-/// the bounds of its build keys only, a native TopK tightens its threshold at
-/// other times than DataFusion's, and a native aggregation does not update
-/// its filter, so that the scans of their inputs skip other files, row
-/// groups and rows than in DataFusion.
-///
-/// The scans of Parquet and CSV files whose expressions cannot fail (see
-/// [`file_scan_failures`]) are judged to read the rows of their files without
-/// failing, as the scans of memory do (unlike [`subtree_failures`], which
-/// judges that the scans of files may fail to read or decode their rows): a
-/// scan of well-formed files reads every row that the scan of the other
-/// engine reads, plus or minus the rows of the files and row groups that only
-/// one of them prunes, which the nodes above evaluate expressions that cannot
-/// fail on (or none), and which the join, TopK or aggregation then rejects.
-fn pruned_rows_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
-    let own = match file_scan_failures(plan) {
-        Some(failures) if failures.is_none() => Failures::NONE,
-        _ => node_failures(plan),
-    };
-    pipeline_children(plan)
-        .into_iter()
-        .map(pruned_rows_failures)
-        .fold(own, Failures::and)
 }
 
 /// If `plan` is a scan of Parquet or CSV files, the parts of its
@@ -2205,15 +2181,21 @@ fn may_fail_to_combine(plan: &Arc<dyn ExecutionPlan>) -> bool {
 }
 
 /// Whether `plan` is a source that may fail to read or decode its rows: every
-/// leaf but a scan of memory, of an empty relation or of placeholder rows,
-/// e.g. a scan of files, which may fail to read or parse them, or a stream.
+/// leaf but a scan of memory, of an empty relation or of placeholder rows, and
+/// a scan of Parquet or CSV files whose expressions (its predicate and its
+/// projection) cannot fail (see [`file_scan_failures`]), e.g. those of TPC-H
+/// and ClickBench: well-formed files are read without failing, whichever of
+/// their files, row groups and rows the dynamic filters of the operators above
+/// skip. Other scans of files, which may fail to read or parse them, and
+/// streams may fail.
 fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.children().is_empty()
         && !(plan.is::<EmptyExec>()
             || plan.is::<PlaceholderRowExec>()
             || plan
                 .downcast_ref::<DataSourceExec>()
-                .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>()))
+                .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>())
+            || file_scan_failures(plan).is_some_and(|failures| failures.is_none()))
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
