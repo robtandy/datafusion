@@ -984,10 +984,11 @@ impl Lowering<'_> {
     /// lowers only where its window reads all of its input before it emits any
     /// row (see [`PhysicalWindow::try_lower`]): by the time the merge emits a
     /// row, DataFusion read all rows below the window, as the native sort does,
-    /// and both evaluate only infallible window functions and keys after that
-    /// (the keys of the merge must not fail nor depend on the batches). So the
-    /// merge is lowered also below a limit, which stops DataFusion's merge
-    /// early.
+    /// and both evaluate only infallible window functions after that (the keys
+    /// of the merge must be columns, which evaluate nothing). So the merge is
+    /// lowered also below a limit, which stops DataFusion's merge early, but
+    /// for a merge of no rows (`fetch == Some(0)`), which DataFusion ends
+    /// without reading its input at all.
     fn try_lower_merge_of_window(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -995,7 +996,11 @@ impl Lowering<'_> {
         let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
             return Ok(None);
         };
+        // A merge of no rows (`fetch == Some(0)`) emits nothing without reading
+        // its input, which the native sort reads all of (and the native window
+        // below it, with the errors of its input).
         if self.runtime.is_none()
+            || merge.fetch() == Some(0)
             || merge.input().output_partitioning().partition_count() == 0
         {
             return Ok(None);
@@ -1015,11 +1020,18 @@ impl Lowering<'_> {
             }
         }
         // The merge produces all rows in its order only if every partition of
-        // its input is ordered by it.
+        // its input is ordered by it. Its keys are columns (which evaluate
+        // nothing), but not of unions, which the native sort orders by the row
+        // format, unlike DataFusion's merge.
         let schema = merge.input().schema();
-        let keys = Judgement::of_ordering(merge.expr(), &schema);
-        if keys.batch_dependent
-            || keys.failing_parts > 0
+        let keys_are_columns = merge.expr().iter().all(|key| {
+            key.expr.is::<Column>()
+                && key
+                    .expr
+                    .data_type(&schema)
+                    .is_ok_and(|data_type| !contains_union(&data_type))
+        });
+        if !keys_are_columns
             || may_fail_to_combine(plan)
             || !merge
                 .input()
@@ -1351,6 +1363,25 @@ fn redistributes(side: &Arc<dyn ExecutionPlan>, input: &Arc<dyn ExecutionPlan>) 
     }
 }
 
+/// Whether values of `data_type` are unions, or have unions inside them.
+fn contains_union(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(..) => true,
+        DataType::Dictionary(_, values) => contains_union(values),
+        DataType::RunEndEncoded(_, values) => contains_union(values.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_union(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| contains_union(field.data_type()))
+        }
+        _ => false,
+    }
+}
+
 /// Whether `plan` is a window node: a `WindowAggExec` or a
 /// `BoundedWindowAggExec`.
 fn is_window(plan: &Arc<dyn ExecutionPlan>) -> bool {
@@ -1424,6 +1455,15 @@ fn window_nodes(window: &Arc<dyn ExecutionPlan>) -> Vec<&Arc<dyn ExecutionPlan>>
 /// that the keys do not order (ties), which come in any order, as from any
 /// sort. A projection of columns evaluates nothing, so it does not matter on
 /// which rows it is evaluated together.
+///
+/// But DataFusion's sort sorts the rows of its input with all of their
+/// columns, also those that the projection then drops, while the sort of the
+/// rewritten plan (which the native window replaces) only sorts the projected
+/// ones. So the rewrite is refused if the sort below `window` may fail to
+/// combine its batches (see [`may_fail_to_combine`], e.g. because of a column
+/// that the projection drops), or if its keys may fail or have errors that
+/// depend on the batches: the guards of the native window only judge the
+/// nodes of the rewritten plan.
 fn with_projection_below_sort(
     window: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
@@ -1440,13 +1480,17 @@ fn with_projection_below_sort(
     let Some(projection) = above_sort.downcast_ref::<ProjectionExec>() else {
         return Ok(None);
     };
-    let Some(sort) = projection
-        .input()
+    let sort_plan = projection.input();
+    let Some(sort) = sort_plan
         .downcast_ref::<SortExec>()
         .filter(|sort| sort.fetch().is_none())
     else {
         return Ok(None);
     };
+    let keys = Judgement::of_plan(sort);
+    if keys.batch_dependent || keys.failing_parts > 0 || may_fail_to_combine(sort_plan) {
+        return Ok(None);
+    }
     let columns = projection
         .expr()
         .iter()
@@ -3125,6 +3169,149 @@ mod tests {
         let root =
             assert_parity_with(sql, test_session_config(), setup_view_tables).await;
         assert_eq!(count::<PhysicalWindow>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_over_projections_of_sorts_that_may_fail_to_combine_stay_in_datafusion()
+    -> Result<()> {
+        // DataFusion plans a projection of columns between a window and the sort
+        // below it, which the planner moves below the sort to lower the window.
+        // But DataFusion's sort sorts all columns of its input, also those that
+        // the projection drops: two rows of lists of `1 << 30` nulls, which the
+        // sort concatenates, fail. A native window, which would sort the
+        // projected rows only, returns them.
+        let config = test_session_config();
+        let make_plan = |many_nulls: bool, bounded: bool| {
+            let rows = vec![
+                row_of_many_nulls(many_nulls).unwrap(),
+                row_of_many_nulls(many_nulls).unwrap(),
+            ];
+            let schema = rows[0].schema();
+            move || -> Arc<dyn ExecutionPlan> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&rows),
+                    Arc::clone(&schema),
+                    None,
+                )
+                .unwrap();
+                let k = col("k", &schema).unwrap();
+                let ordering =
+                    LexOrdering::new([PhysicalSortExpr::new_default(Arc::clone(&k))])
+                        .unwrap();
+                let sorted = Arc::new(SortExec::new(ordering, scan));
+                let projected = Arc::new(
+                    ProjectionExec::try_new(vec![(k, "k".to_string())], sorted).unwrap(),
+                );
+                row_numbers(projected, "k", "k", bounded).unwrap()
+            }
+        };
+        for bounded in [true, false] {
+            let task_ctx =
+                Arc::new(TaskContext::default().with_session_config(config.clone()));
+            let error = collect(make_plan(true, bounded)(), task_ctx)
+                .await
+                .expect_err("DataFusion fails")
+                .to_string();
+            let root = assert_plan_outcome(
+                make_plan(true, bounded),
+                config.clone(),
+                Some(&error),
+            )
+            .await;
+            assert_eq!(count::<PhysicalWindow>(&root), 0);
+            // With other values in the column that the projection drops, the
+            // window is native, with the projection below its sort.
+            let root =
+                assert_plan_outcome(make_plan(false, bounded), config.clone(), None)
+                    .await;
+            assert_eq!(count::<PhysicalWindow>(&root), 1);
+            assert_eq!(count::<PhysicalProjection>(&root), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_no_rows_of_windows_stay_in_datafusion() -> Result<()> {
+        // A merge of the sorted partitions of a window with `fetch == Some(0)`
+        // emits nothing, without reading its input: DataFusion does not cast
+        // the strings below the window, one of which fails to cast. A native
+        // sort of the native window would read all rows below the window, and
+        // fail.
+        use datafusion_physical_expr::expressions::cast;
+        let config = test_session_config();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from_iter_values(0..100)),
+                Arc::new(arrow::array::StringViewArray::from_iter_values(
+                    (0..100).map(|i| if i == 50 { "x" } else { "1" }),
+                )),
+            ],
+        )?;
+        let make_plan = |fetch: Option<usize>, bounded: bool| {
+            let (batch, schema) = (batch.clone(), Arc::clone(&schema));
+            move || -> Arc<dyn ExecutionPlan> {
+                let scan = MemorySourceConfig::try_new_exec(
+                    &[vec![batch.clone()]],
+                    Arc::clone(&schema),
+                    None,
+                )
+                .unwrap();
+                let k = col("k", &schema).unwrap();
+                let v =
+                    cast(col("s", &schema).unwrap(), &schema, DataType::Int32).unwrap();
+                let projected: Arc<dyn ExecutionPlan> = Arc::new(
+                    ProjectionExec::try_new(
+                        vec![(k, "k".to_string()), (v, "v".to_string())],
+                        scan,
+                    )
+                    .unwrap(),
+                );
+                let projected_schema = projected.schema();
+                let k = col("k", &projected_schema).unwrap();
+                let v = col("v", &projected_schema).unwrap();
+                let repartitioned = Arc::new(
+                    RepartitionExec::try_new(
+                        projected,
+                        Partitioning::Hash(vec![Arc::clone(&k)], 2),
+                    )
+                    .unwrap(),
+                );
+                let ordering = LexOrdering::new([
+                    PhysicalSortExpr::new_default(k),
+                    PhysicalSortExpr::new_default(v),
+                ])
+                .unwrap();
+                let sorted = Arc::new(
+                    SortExec::new(ordering.clone(), repartitioned)
+                        .with_preserve_partitioning(true),
+                );
+                let window = row_numbers(sorted, "k", "v", bounded).unwrap();
+                Arc::new(SortPreservingMergeExec::new(ordering, window).with_fetch(fetch))
+            }
+        };
+        for bounded in [true, false] {
+            // DataFusion returns no rows, without casting the strings.
+            let root =
+                assert_plan_outcome(make_plan(Some(0), bounded), config.clone(), None)
+                    .await;
+            assert_eq!(count::<PhysicalSort>(&root), 0);
+            // With a fetch of rows, both engines read all rows below the window,
+            // and fail to cast: the merge is a native sort of the native window.
+            let root = assert_plan_outcome(
+                make_plan(Some(5), bounded),
+                config.clone(),
+                Some("Cannot cast string 'x'"),
+            )
+            .await;
+            assert_eq!(count::<PhysicalSort>(&root), 1);
+            assert_eq!(count::<PhysicalWindow>(&root), 1);
+        }
         Ok(())
     }
 
