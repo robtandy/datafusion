@@ -703,7 +703,7 @@ impl Lowering<'_> {
             // batches pull later batches of their input, whose errors they
             // raise, before the nodes above them see the rows of earlier ones.
             if coalesces_batches(plan)
-                && conflict(ctx.fallible_above, subtree_failures(input))
+                && conflict(ctx.fallible_above, subtree_failures(input, self.runtime))
             {
                 return Ok(bridge(plan));
             }
@@ -824,7 +824,7 @@ impl Lowering<'_> {
         }
         let fails_like_datafusion = |keys: &Judgement| {
             self.fails_like_datafusion_on_threads(keys.failures)
-                && !conflict(keys.failures, subtree_failures(sort.input()))
+                && !conflict(keys.failures, subtree_failures(sort.input(), self.runtime))
         };
         if !fails_like_datafusion(&keys) {
             return Ok(None);
@@ -852,7 +852,9 @@ impl Lowering<'_> {
             Some((_, id)) => {
                 let exact = match topk_filter_pruning(sort.input(), *id) {
                     TopKFilterPruning::Unread | TopKFilterPruning::Settled => true,
-                    TopKFilterPruning::Rows => works_alike_on_any_rows(sort.input()),
+                    TopKFilterPruning::Rows => {
+                        works_alike_on_any_rows(sort.input(), self.runtime)
+                    }
                     TopKFilterPruning::Other => false,
                 };
                 if !exact {
@@ -930,7 +932,7 @@ impl Lowering<'_> {
             return Ok(None);
         }
         if !raw.dynamic_expressions_produced().is_empty()
-            && !subtree_failures(raw.input()).is_none()
+            && !subtree_failures(raw.input(), self.runtime).is_none()
         {
             return Ok(None);
         }
@@ -1016,7 +1018,7 @@ impl Lowering<'_> {
         if concatenation_may_fail(&join.schema())
             || conflict(
                 ctx.fallible_above,
-                subtree_failures(join.right()).and(probe.failures),
+                subtree_failures(join.right(), self.runtime).and(probe.failures),
             )
         {
             return Ok(None);
@@ -1039,7 +1041,7 @@ impl Lowering<'_> {
         // rows, but for scans of well-formed Parquet files whose expressions
         // cannot fail, as in TPC-H, see [`source_may_fail`]).
         if !plan.dynamic_expressions_produced().is_empty()
-            && !subtree_failures(join.right()).is_none()
+            && !subtree_failures(join.right(), self.runtime).is_none()
         {
             return Ok(None);
         }
@@ -1309,7 +1311,7 @@ impl Lowering<'_> {
         // `FilterExec` coalesces its output: it pulls later batches of its
         // input, whose errors it raises, before the nodes above it see the
         // rows of earlier ones, which the native filter passes on at once.
-        if conflict(ctx.fallible_above, subtree_failures(plan)) {
+        if conflict(ctx.fallible_above, subtree_failures(plan, self.runtime)) {
             return Ok(bridge(plan));
         }
         if PhysicalFilter::supports_filter_exec(filter) {
@@ -2092,11 +2094,14 @@ fn conflict(above: Failures, below: Failures) -> bool {
 /// The parts that may fail of all nodes of `plan` (see [`node_failures`]),
 /// in the pipelines of `plan`: the subqueries of a `ScalarSubqueryExec` run
 /// before its input, in both engines (see [`scalar_subquery_input`]).
-fn subtree_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
+fn subtree_failures(
+    plan: &Arc<dyn ExecutionPlan>,
+    runtime: Option<&RuntimeEnv>,
+) -> Failures {
     pipeline_children(plan)
         .into_iter()
-        .map(subtree_failures)
-        .fold(node_failures(plan), Failures::and)
+        .map(|child| subtree_failures(child, runtime))
+        .fold(node_failures(plan, runtime), Failures::and)
 }
 
 /// The parts of `plan` itself that may fail: the parts of its expressions
@@ -2106,10 +2111,13 @@ fn subtree_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
 /// rows (see [`source_may_fail`]), and the nodes that may fail to combine
 /// their batches (see [`may_fail_to_combine`]), which may fail with several
 /// kinds of errors.
-fn node_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
+fn node_failures(
+    plan: &Arc<dyn ExecutionPlan>,
+    runtime: Option<&RuntimeEnv>,
+) -> Failures {
     let mut failures = file_scan_failures(plan)
         .unwrap_or_else(|| Judgement::of_plan(plan.as_ref()).failures);
-    if source_may_fail(plan) {
+    if source_may_fail(plan, runtime) {
         failures = failures.and(Failures::MIXED);
     }
     if may_fail_to_combine(plan) {
@@ -2549,14 +2557,17 @@ fn passes_rows_on(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// failures, see [`file_scan_failures`]): whichever of their rows a dynamic
 /// filter prunes, the work of these nodes on the others is the same, and
 /// cannot fail.
-fn works_alike_on_any_rows(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn works_alike_on_any_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    runtime: Option<&RuntimeEnv>,
+) -> bool {
     let batch_dependent = file_scan_failures(plan).is_none()
         && Judgement::of_plan(plan.as_ref()).batch_dependent;
     !batch_dependent
-        && node_failures(plan).is_none()
+        && node_failures(plan, runtime).is_none()
         && pipeline_children(plan)
             .into_iter()
-            .all(works_alike_on_any_rows)
+            .all(|child| works_alike_on_any_rows(child, runtime))
 }
 
 /// `plan`, a sort whose `SortExec` (see [`sort_of_chain`]) is a TopK, with
@@ -2643,20 +2654,24 @@ fn may_fail_to_combine(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// leaf but a scan of memory, of an empty relation or of placeholder rows, and
 /// a scan of Parquet files whose expressions (its predicate and its
 /// projection) cannot fail (see [`file_scan_failures`]), e.g. those of TPC-H
-/// and ClickBench: well-formed files, whose columns have the types of the
-/// table (as DataFusion infers the schema of a table from its files), are
-/// read without failing, whichever of their files, row groups and rows the
-/// dynamic filters of the operators above skip. Scans of CSV files may fail to
-/// parse any value of their rows (also of files whose schema DataFusion
-/// inferred, from their first rows), and other scans of files, which may fail
-/// to read or parse them, and streams may fail too.
-fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// and ClickBench, and whose files have the types of its table (see
+/// [`reads_files_of_the_types_of_their_table`]): such files are read without
+/// failing, whichever of their files, row groups and rows the dynamic filters
+/// of the operators above skip. A Parquet file whose columns the scan casts into
+/// the types of its table (e.g. a file of strings for a table of integers,
+/// whose schema was given when it was registered) may fail to be read. Scans of
+/// CSV files may fail to parse any value of their rows (also of files whose
+/// schema DataFusion inferred, from their first rows), and other scans of
+/// files, which may fail to read or parse them, and streams may fail too.
+fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) -> bool {
     let well_formed_parquet = file_scan_failures(plan).is_some_and(|failures| {
         failures.is_none()
             && plan
                 .downcast_ref::<DataSourceExec>()
                 .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                .is_some_and(|config| config.file_source().is::<ParquetSource>())
+                .is_some_and(|config| {
+                    reads_files_of_the_types_of_their_table(config, runtime)
+                })
     });
     plan.children().is_empty()
         && !(plan.is::<EmptyExec>()
@@ -2665,6 +2680,72 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
                 .downcast_ref::<DataSourceExec>()
                 .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>())
             || well_formed_parquet)
+}
+
+/// Whether the files of `config`, a scan of Parquet files in a session with
+/// the runtime `runtime`, have the columns of the table of the scan, of its
+/// types, so that the scan reads them without casting any value: as their
+/// metadata (their footers, which DataFusion caches in the file metadata cache
+/// of the runtime when it collects their statistics, see
+/// `datafusion.execution.collect_statistics`) shows, with the coercions of
+/// DataFusion's Parquet reader (e.g. of strings into `Utf8View`, see
+/// `apply_file_schema_type_coercions`). The schema of a table that DataFusion
+/// inferred from its files has their types, but a schema given when the table
+/// was registered may have others, into which the scan casts the values of the
+/// files (and fails on those that it cannot cast). `false` if the metadata of a
+/// file is not cached (or not for its current version), or if the runtime is
+/// not known.
+fn reads_files_of_the_types_of_their_table(
+    config: &FileScanConfig,
+    runtime: Option<&RuntimeEnv>,
+) -> bool {
+    use datafusion_datasource_parquet::metadata::CachedParquetMetaData;
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    if !config.file_source().is::<ParquetSource>() {
+        return false;
+    }
+    let cache = runtime.cache_manager.get_file_metadata_cache();
+    let table = config.file_schema();
+    config
+        .file_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .all(|file| {
+            let Some(entry) = cache.get(&file.object_meta.location) else {
+                return false;
+            };
+            if !entry.is_valid_for(&file.object_meta) {
+                return false;
+            }
+            let Some(metadata) = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedParquetMetaData>()
+                .map(CachedParquetMetaData::parquet_metadata)
+            else {
+                return false;
+            };
+            let file_metadata = metadata.file_metadata();
+            let Ok(file_schema) = parquet::arrow::parquet_to_arrow_schema(
+                file_metadata.schema_descr(),
+                file_metadata.key_value_metadata(),
+            ) else {
+                return false;
+            };
+            let file_schema =
+                datafusion_datasource_parquet::apply_file_schema_type_coercions(
+                    table,
+                    &file_schema,
+                )
+                .unwrap_or(file_schema);
+            table.fields().iter().all(|field| {
+                file_schema
+                    .field_with_name(field.name())
+                    .is_ok_and(|file_field| file_field.data_type() == field.data_type())
+            })
+        })
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
