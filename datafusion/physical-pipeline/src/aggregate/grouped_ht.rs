@@ -22,19 +22,23 @@
 //!   table ([`GroupedHashTable::update`], DataFusion's partial aggregation);
 //! * every radix partition is finalized by merging the partial states of
 //!   its groups from all threads into a new table
-//!   ([`GroupedHashTable::merge`]) and evaluating it
-//!   ([`GroupedHashTable::evaluate`], DataFusion's final aggregation).
+//!   ([`GroupedHashTable::merge`]), aggregating the input rows that
+//!   bypassed the thread-local tables into it
+//!   ([`GroupedHashTable::update_rows`], of rows evaluated by
+//!   [`evaluate_rows`]), and evaluating it ([`GroupedHashTable::evaluate`],
+//!   DataFusion's final aggregation).
 //!
 //! [`Accumulator`]: datafusion_expr::Accumulator
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
-use arrow::compute::prep_null_mask_filter;
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_null_array};
+use arrow::compute::{filter, prep_null_mask_filter, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, ScalarValue, not_impl_err};
+use datafusion_common::cast::as_boolean_array;
+use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
@@ -42,7 +46,7 @@ use datafusion_physical_plan::aggregates::evaluate_group_by;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
-use super::hash_aggregate::AggregateSpec;
+use super::hash_aggregate::{AggregateSpec, rebuilt_literal};
 
 /// The group keys and the aggregate states of a set of groups, emitted by a
 /// [`GroupedHashTable`]: row `i` of every array belongs to the same group.
@@ -59,6 +63,55 @@ impl GroupedStates {
     pub(crate) fn num_groups(&self) -> usize {
         self.keys.first().map_or(0, |keys| keys.len())
     }
+
+    /// The groups at `indices`.
+    pub(crate) fn take(&self, indices: &UInt32Array) -> Result<Self> {
+        let take_all = |arrays: &[ArrayRef]| {
+            arrays
+                .iter()
+                .map(|array| Ok(take(array.as_ref(), indices, None)?))
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok(Self {
+            keys: take_all(&self.keys)?,
+            states: self
+                .states
+                .iter()
+                .map(|state| take_all(state))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// The group keys and the aggregate arguments of the input rows of `batch`
+/// (of the input of `spec`, an aggregation without grouping sets), aligned
+/// with its rows, for [`GroupedHashTable::update_rows`]: the group columns,
+/// followed by the arguments of every aggregate that are not rebuilt (see
+/// [`rebuilt_literal`]) and, for an aggregate with a filter, the filter result
+/// (see [`AggregateUpdate::evaluate_row_aligned`]).
+///
+/// [`AggregateUpdate::evaluate_row_aligned`]: super::hash_aggregate::AggregateUpdate::evaluate_row_aligned
+pub(crate) fn evaluate_rows(
+    spec: &AggregateSpec,
+    batch: &RecordBatch,
+) -> Result<Vec<ArrayRef>> {
+    let mut grouping_sets = evaluate_group_by(&spec.group_by, batch)?;
+    if grouping_sets.len() != 1 {
+        return internal_err!(
+            "Only the input rows of an aggregation without grouping sets can be \
+             evaluated on their own, got {} grouping sets",
+            grouping_sets.len()
+        );
+    }
+    let mut columns = grouping_sets.swap_remove(0);
+    for update in &spec.update {
+        let (values, selection) = update.evaluate_row_aligned(batch)?;
+        columns.extend(values);
+        if let Some(selection) = selection {
+            columns.push(Arc::new(selection));
+        }
+    }
+    Ok(columns)
 }
 
 /// Maps group keys to group indices, and keeps the aggregate states of the
@@ -156,6 +209,98 @@ impl GroupedHashTable {
                     num_groups,
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// Aggregate input rows evaluated by [`evaluate_rows`] (`columns`, of the
+    /// input of `spec`) into the table, like [`Self::update`]: the group keys
+    /// of every row are interned, and the accumulator of every aggregate is
+    /// updated with its arguments for the rows that pass its filter.
+    ///
+    /// The final table of a partition aggregates the rows that bypassed the
+    /// thread-local tables so, with the accumulators of the final
+    /// aggregation: only for aggregations whose final aggregates are those
+    /// that consume the input rows (see `AggregateSpec::bypass`).
+    pub(crate) fn update_rows(
+        &mut self,
+        spec: &AggregateSpec,
+        columns: &[ArrayRef],
+    ) -> Result<()> {
+        let num_keys = spec.group_by.expr().len();
+        let expected = num_keys
+            + spec
+                .update
+                .iter()
+                .map(|update| {
+                    let stored = update
+                        .arguments
+                        .iter()
+                        .filter(|argument| rebuilt_literal(argument).is_none())
+                        .count();
+                    stored + usize::from(update.filter.is_some())
+                })
+                .sum::<usize>();
+        if columns.len() != expected || self.accumulators.len() != spec.update.len() {
+            return internal_err!(
+                "PhysicalHashAggregate expected {expected} columns of input rows for \
+                 {} accumulators, got {} columns for {}",
+                spec.update.len(),
+                columns.len(),
+                self.accumulators.len()
+            );
+        }
+        let (keys, mut rest) = columns.split_at(num_keys);
+        let num_rows = keys.first().map_or(0, |keys| keys.len());
+        self.group_values.intern(keys, &mut self.group_indices)?;
+        let num_groups = self.group_values.len();
+        for (accumulator, update) in self.accumulators.iter_mut().zip(&spec.update) {
+            let stored = update
+                .arguments
+                .iter()
+                .filter(|argument| rebuilt_literal(argument).is_none())
+                .count();
+            let (values, tail) = rest.split_at(stored);
+            rest = tail;
+            let selection = match update.filter {
+                Some(_) => {
+                    let (selection, tail) = rest.split_at(1);
+                    rest = tail;
+                    Some(as_boolean_array(&selection[0])?)
+                }
+                None => None,
+            };
+            // The rows that pass the filter, and their group indices.
+            let selected = selection.and_then(|selection| {
+                compact_group_indices(&self.group_indices, selection)
+                    .map(|indices| (selection, indices))
+            });
+            let (indices, rows) = match &selected {
+                Some((_, indices)) => (indices.as_slice(), indices.len()),
+                None => (self.group_indices.as_slice(), num_rows),
+            };
+            // The arguments of these rows: the literals rebuilt for them.
+            let mut values = values.iter();
+            let mut arguments = Vec::with_capacity(update.arguments.len());
+            for argument in &update.arguments {
+                let array = match rebuilt_literal(argument) {
+                    Some(value) => value.to_array_of_size(rows)?,
+                    None => {
+                        let Some(value) = values.next() else {
+                            return internal_err!(
+                                "PhysicalHashAggregate is missing an argument of {}",
+                                update.expr.name()
+                            );
+                        };
+                        match &selected {
+                            Some((selection, _)) => filter(value.as_ref(), selection)?,
+                            None => Arc::clone(value),
+                        }
+                    }
+                };
+                arguments.push(array);
+            }
+            accumulator.update_batch(&arguments, indices, None, num_groups)?;
         }
         Ok(())
     }
@@ -563,6 +708,176 @@ mod tests {
             };
             assert_eq!(counts(&second), 2 * counts(&first));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn literal_arguments_of_bypassed_rows_are_rebuilt_or_evaluated() -> Result<()> {
+        // `COUNT(1) GROUP BY a` and `COUNT('a literal') GROUP BY a`: the
+        // literal of a fixed width is rebuilt for the rows that the aggregate
+        // aggregates, the string is evaluated (and stored) like the other
+        // arguments.
+        let schema = input_schema();
+        for (literal, stored) in [(lit(1i64), 0), (lit("a literal"), 1)] {
+            let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
+                .schema(Arc::clone(&schema))
+                .alias("count(literal)")
+                .build()?;
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".into())]),
+                vec![Arc::new(count)],
+                vec![None],
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+                Arc::clone(&schema),
+            )?;
+            let input = Arc::new(BridgeOperator::new(Arc::clone(aggregate.input())));
+            let spec =
+                PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+            let rows = 5_000;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values((0..rows).map(|i| i % 3))),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows).map(|i| format!("{i}")),
+                    )),
+                ],
+            )?;
+            let columns = evaluate_rows(&spec, &batch)?;
+            // The key, and the string.
+            assert_eq!(columns.len(), 1 + stored);
+            assert!(
+                columns[1..]
+                    .iter()
+                    .all(|c| c.data_type() == &DataType::Utf8)
+            );
+            let mut table = GroupedHashTable::try_new_merge(&spec)?;
+            table.update_rows(&spec, &columns)?;
+            let output = table.evaluate()?.expect("groups");
+            let mut counts = output[0]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .iter()
+                .zip(output[1].as_primitive::<Int64Type>().values())
+                .map(|(&key, &count)| (key, count))
+                .collect::<Vec<_>>();
+            counts.sort_unstable();
+            assert_eq!(counts, [(0, 1_667), (1, 1_667), (2, 1_666)]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bypassed_rows_hold_the_arguments_of_their_aggregates() -> Result<()> {
+        // `COUNT(b)`, `COUNT(a, b)`, `COUNT(DISTINCT b)` and `MIN(b)` of
+        // strings, a third of them `NULL`, grouped by `a`: the bypassed rows
+        // hold the arguments of every aggregate (the accumulators of functions
+        // named `count` may read their values, see
+        // `radix_ht::tests::bypassed_rows_hold_the_arguments_of_user_defined_counts`).
+        use datafusion::functions_aggregate::min_max::min_udaf;
+        let schema = input_schema();
+        let aggregate = |udaf, arguments, distinct, alias: &str| {
+            AggregateExprBuilder::new(udaf, arguments)
+                .schema(Arc::clone(&schema))
+                .alias(alias)
+                .with_distinct(distinct)
+                .build()
+                .map(Arc::new)
+        };
+        let (a, b) = (col("a", &schema)?, col("b", &schema)?);
+        let aggregates = vec![
+            aggregate(count_udaf(), vec![Arc::clone(&b)], false, "count(b)")?,
+            aggregate(
+                count_udaf(),
+                vec![Arc::clone(&a), Arc::clone(&b)],
+                false,
+                "count(a, b)",
+            )?,
+            aggregate(
+                count_udaf(),
+                vec![Arc::clone(&b)],
+                true,
+                "count(distinct b)",
+            )?,
+            aggregate(min_udaf(), vec![Arc::clone(&b)], false, "min(b)")?,
+        ];
+        let aggregation = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(Arc::clone(&a), "a".into())]),
+            aggregates,
+            vec![None; 4],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::clone(&schema),
+        )?;
+        let input = Arc::new(BridgeOperator::new(Arc::clone(aggregation.input())));
+        let spec =
+            PhysicalHashAggregate::try_new_single_stage(&aggregation, input)?.spec();
+        let rows = 2_048;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter((0..rows).map(|i| {
+                    // Some `NULL` keys too, which `COUNT(a, b)` does not count.
+                    (i % 10 != 9).then_some(i % 4)
+                }))),
+                Arc::new(StringArray::from_iter((0..rows).map(|i| {
+                    (i % 3 != 0).then(|| format!("{i:04}{}", "x".repeat(996)))
+                }))),
+            ],
+        )?;
+        let columns = evaluate_rows(&spec, &batch)?;
+        // The key; `b`; `a` and `b`; `b`; `b`.
+        let types = columns.iter().map(|column| column.data_type().clone());
+        assert_eq!(
+            types.collect::<Vec<_>>(),
+            [
+                DataType::Int32,
+                DataType::Utf8,
+                DataType::Int32,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Utf8,
+            ]
+        );
+        // Counted like DataFusion counts the rows themselves.
+        let mut table = GroupedHashTable::try_new_merge(&spec)?;
+        table.update_rows(&spec, &columns)?;
+        let output = table.evaluate()?.expect("groups");
+        let keys = output[0].as_primitive::<arrow::datatypes::Int32Type>();
+        let mut actual = (0..keys.len())
+            .map(|row| {
+                let count =
+                    |column: &ArrayRef| column.as_primitive::<Int64Type>().value(row);
+                (
+                    keys.is_valid(row).then(|| keys.value(row)),
+                    count(&output[1]),
+                    count(&output[2]),
+                    count(&output[3]),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = std::collections::BTreeMap::<
+            _,
+            (i64, i64, std::collections::BTreeSet<_>),
+        >::new();
+        for i in 0..rows {
+            let key = (i % 10 != 9).then_some(i % 4);
+            let (count, both, distinct) = expected.entry(key).or_default();
+            if i % 3 != 0 {
+                *count += 1;
+                *both += i64::from(key.is_some());
+                distinct.insert(i);
+            }
+        }
+        let expected = expected
+            .into_iter()
+            .map(|(key, (count, both, distinct))| {
+                (key, count, both, distinct.len() as i64)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
         Ok(())
     }
 
