@@ -2504,6 +2504,12 @@ mod tests {
             "SELECT few, MIN(asc) FROM tkn GROUP BY few ORDER BY MIN(asc) LIMIT 3",
             "SELECT few, MAX(asc) FROM tkn GROUP BY few ORDER BY MAX(asc) DESC LIMIT 3",
             "SELECT DISTINCT few FROM tkn ORDER BY few DESC LIMIT 5",
+            // A limit of more groups than a default table holds: its table
+            // holds twice as many (40,000), whose flush sets a cutoff.
+            "SELECT DISTINCT k FROM tkn ORDER BY k LIMIT 20000",
+            "SELECT DISTINCT asc FROM tkn ORDER BY asc DESC LIMIT 20000",
+            "SELECT DISTINCT k FROM tkn ORDER BY k DESC LIMIT 32768",
+            "SELECT DISTINCT k FROM tkn ORDER BY k LIMIT 32769",
         ];
         for target_partitions in [1, 4] {
             let config = test_session_config().with_target_partitions(target_partitions);
@@ -2766,6 +2772,23 @@ mod tests {
             (
                 "shuffled",
                 "SELECT DISTINCT k FROM {t} ORDER BY k LIMIT 1000",
+            ),
+            // Limits near and above the capacity of a table (32,768 groups).
+            (
+                "shuffled",
+                "SELECT DISTINCT k FROM {t} ORDER BY k LIMIT 32768",
+            ),
+            (
+                "shuffled",
+                "SELECT DISTINCT k FROM {t} ORDER BY k LIMIT 32769",
+            ),
+            (
+                "shuffled",
+                "SELECT DISTINCT k FROM {t} ORDER BY k LIMIT 40000",
+            ),
+            (
+                "shuffled",
+                "SELECT DISTINCT k FROM {t} ORDER BY k DESC LIMIT 65536",
             ),
             (
                 "shuffled",

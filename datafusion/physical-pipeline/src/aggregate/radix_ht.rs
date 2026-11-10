@@ -673,11 +673,22 @@ impl RadixHashAggregate {
         Ok(Arc::new(RadixSinkState::new()))
     }
 
+    /// The local sink state of a thread, with a table of capacity `capacity`.
+    ///
+    /// The table of a top-k aggregation holds twice its limit at least (up
+    /// to the maximum capacity), so that every flush keeps the best half of
+    /// its groups and sets a cutoff (see [`TopK::cutoff`]), which rules out
+    /// most of the rows after it: a table that holds fewer groups than the
+    /// limit would keep all of them, and never set one.
     pub(crate) fn local_sink_state(
         spec: &AggregateSpec,
         capacity: TableCapacity,
     ) -> Result<Box<dyn LocalSinkState>> {
-        let initial = capacity.initial.max(1);
+        let mut initial = capacity.initial.max(1);
+        if let Some(top_k) = &spec.top_k {
+            let room = top_k.limit.saturating_mul(2).min(capacity.maximum);
+            initial = initial.max(room);
+        }
         Ok(Box::new(RadixLocalState {
             table: GroupedHashTable::try_new_update(spec)?,
             capacity: initial,
@@ -3117,12 +3128,21 @@ mod tests {
     /// The sink of the top-k aggregation `aggregate` (of a single stage),
     /// with tables of [`SMALL_TABLES`].
     fn top_k_sink(aggregate: AggregateExec) -> Result<Sink> {
+        top_k_sink_with(aggregate, SMALL_TABLES)
+    }
+
+    /// The sink of the top-k aggregation `aggregate` (of a single stage),
+    /// with tables of capacity `capacity`.
+    fn top_k_sink_with(
+        aggregate: AggregateExec,
+        capacity: TableCapacity,
+    ) -> Result<Sink> {
         let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
             aggregate.input(),
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
-        let local = RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES)?;
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
     }
 
@@ -3253,6 +3273,61 @@ mod tests {
             .collect::<Vec<_>>();
         keys.sort_unstable();
         assert_eq!(keys, [None, Some(-3), Some(0)]);
+        Ok(())
+    }
+
+    #[test]
+    fn tables_of_top_k_aggregations_hold_twice_their_limit() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let aggregate = |limit: usize| -> Result<AggregateExec> {
+            Ok(AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+                vec![],
+                vec![],
+                MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+                Arc::clone(&schema),
+            )?
+            .try_optimize_topk(limit, "k", SortOptions::new(false, false))
+            .expect("a top-k aggregation")
+            .data)
+        };
+        let capacity = |limit: usize, tables: TableCapacity| -> Result<usize> {
+            let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
+                aggregate(limit)?.input(),
+            )));
+            let spec =
+                PhysicalHashAggregate::try_new_single_stage(&aggregate(limit)?, input)?
+                    .spec();
+            let local = RadixHashAggregate::local_sink_state(&spec, tables)?;
+            Ok(local.downcast_ref::<RadixLocalState>().unwrap().capacity)
+        };
+        // A table of more groups than the limit would set no cutoff (40,000
+        // groups out of every 32,768).
+        let tables = TableCapacity::default();
+        assert_eq!(capacity(10, tables)?, 1 << 15);
+        assert_eq!(capacity(32_768, tables)?, 65_536);
+        assert_eq!(capacity(32_769, tables)?, 65_538);
+        assert_eq!(capacity(40_000, tables)?, 80_000);
+        // Up to the maximum capacity.
+        assert_eq!(capacity(1_000, SMALL_TABLES)?, 64);
+        assert_eq!(capacity(3, SMALL_TABLES)?, 16);
+        // Its first flush keeps the best half of its groups, and sets a
+        // cutoff.
+        let tables = TableCapacity {
+            initial: 16,
+            maximum: 1_024,
+        };
+        let mut sink = top_k_sink_with(aggregate(40)?, tables)?;
+        assert_eq!(local_state(&sink).capacity, 80);
+        let (spec, local, global) = &mut sink;
+        let keys = (0..80).map(|i| Some((i * 37) % 80)).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(keys))],
+        )?;
+        RadixHashAggregate::sink(spec, batch, global.as_ref(), local.as_mut())?;
+        assert_eq!(cutoff(&sink), Some(39));
         Ok(())
     }
 }
