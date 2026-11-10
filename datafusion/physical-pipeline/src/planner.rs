@@ -2234,10 +2234,12 @@ enum TopKFilterPruning {
     Unread,
     /// Every node that reads the filter is below a node that reads all of
     /// its rows before it emits any row (see
-    /// [`reads_first_child_before_emitting`]), between it and the TopK: in
-    /// both engines, the TopK sees its first row, and the filter gets its
-    /// first threshold, once these nodes have read all of their input, so
-    /// that the filter prunes none of their rows.
+    /// [`reads_first_child_before_emitting`]), between it and the TopK, which
+    /// all rows of the TopK pass (not below one of several inputs of a union,
+    /// whose other inputs may pass rows on before): in both engines, the TopK
+    /// sees its first row, and the filter gets its first threshold, once these
+    /// nodes have read all of their input, so that the filter prunes none of
+    /// their rows.
     Settled,
     /// The nodes that read the filter (and are not below such a node), and
     /// the nodes between them and the TopK, only pass rows on (see
@@ -6016,6 +6018,106 @@ mod tests {
                     assert_ne!(filter.current()?.to_string(), "true", "{sql}");
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A stream of a single batch, `batch`, which it emits at once, and ends
+    /// only after `delay`.
+    #[derive(Debug)]
+    struct EndsLate {
+        batch: RecordBatch,
+        delay: std::time::Duration,
+    }
+
+    impl datafusion_physical_plan::streaming::PartitionStream for EndsLate {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<TaskContext>,
+        ) -> datafusion_execution::SendableRecordBatchStream {
+            use futures::StreamExt;
+            let batch = self.batch.clone();
+            let delay = self.delay;
+            let end = futures::stream::once(async move {
+                tokio::time::sleep(delay).await;
+            })
+            .filter_map(|()| async { None });
+            let stream = futures::stream::once(async move { Ok(batch) }).chain(end);
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.batch.schema(),
+                    stream,
+                ),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_filter_is_read_below_one_of_several_inputs_stay_in_datafusion()
+    -> Result<()> {
+        // `ORDER BY k LIMIT 1` of the union of a stream of the row `(-1, 7)`,
+        // which ends late, and of the groups of an aggregation of 40 Parquet
+        // files of `k >= 0`, with `v = 0` on a row of the last file. DataFusion
+        // pushes the dynamic filter of the TopK into both inputs of the union,
+        // and through the aggregation into the scan. The aggregation reads all
+        // of its input before it emits any group, but the other input of the
+        // union does not wait for it: DataFusion's TopK tightens the filter to
+        // `k < -1` with the row of the stream, while the scan still reads its
+        // files, so that it skips the last one, and never divides by zero. A
+        // native TopK tightens it only once the stream ends, or once it holds
+        // more rows, after the scan read all of its files: the filter of such a
+        // TopK prunes the rows below the aggregation, which may fail, so it
+        // stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = parquet_files_in_order(dir.path(), 40, &[19_999])?;
+        let row = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(arrow::array::Int64Array::from(vec![-1]))
+                    as arrow::array::ArrayRef,
+            ),
+            ("n", Arc::new(arrow::array::Int64Array::from(vec![7])) as _),
+        ])?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await?;
+            let stream = EndsLate {
+                batch: row.clone(),
+                delay: std::time::Duration::from_millis(500),
+            };
+            let table = datafusion::catalog::streaming::StreamingTable::try_new(
+                row.schema(),
+                vec![Arc::new(stream)],
+            )?;
+            ctx.register_table("s", Arc::new(table))?;
+            Ok(())
+        };
+        let sql = "SELECT k, n FROM (SELECT k, n FROM s \
+                   UNION ALL SELECT k, SUM(10 / v) AS n FROM p GROUP BY k) \
+                   ORDER BY k LIMIT 1";
+        // On a single thread, on which DataFusion reads the files in order.
+        {
+            let config = test_session_config().with_target_partitions(1);
+            let plan = datafusion_plan_with(sql, config.clone(), &setup).await;
+            let mut read = 0;
+            plan.apply(|node| {
+                if let Some(sort) = node.downcast_ref::<SortExec>() {
+                    read += usize::from(read_topk_filter(sort).is_some());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            assert!(read > 0, "{}", displayable(plan.as_ref()).indent(false));
+            let root = assert_parity_with(sql, config, &setup).await;
+            assert_eq!(
+                count::<PhysicalTopK>(&root),
+                0,
+                "{}",
+                format_operator_tree(&root)
+            );
         }
         Ok(())
     }
