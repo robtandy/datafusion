@@ -601,13 +601,14 @@ A scan of Parquet files is judged to read its rows without failing only if
 its expressions cannot fail and its files have the types of its table: the
 planner checks the schemas of the files in their metadata, which DataFusion
 caches when it collects their statistics (`collect_statistics`, on by
-default), with the coercions of DataFusion's Parquet reader (e.g. of strings
-into `Utf8View`). DataFusion infers the schema of a table from its files, but
-a schema given when the table is registered may have other types, into which
-the scan casts the values of the files, and fails on those that it cannot
-cast, on rows that a dynamic filter prunes in only one of the engines: such
-scans, and scans of files whose metadata is not cached, may fail. The scans of
-CSV files may fail to parse any of their values.
+default), with the coercions of DataFusion's Parquet reader (of strings into
+`Utf8View`, and of INT96 timestamps into the unit of `coerce_int96`), and no
+nulls in the columns of the table that have none. DataFusion infers the schema
+of a table from its files, but a schema given when the table is registered may
+have other types, into which the scan casts the values of the files, and fails
+on those that it cannot cast, on rows that a dynamic filter prunes in only one
+of the engines: such scans, and scans of files whose metadata is not cached,
+may fail. The scans of CSV files may fail to parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
