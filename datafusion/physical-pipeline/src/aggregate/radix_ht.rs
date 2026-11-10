@@ -61,6 +61,12 @@
 //!   at most [`DEFAULT_VECTOR_SIZE`] rows. Partitions have disjoint groups, so
 //!   the threads finalize them in parallel, without sharing anything.
 //!
+//! A top-k aggregation (see [`TopK`]) only needs the groups that the sort
+//! above it may keep: every flush of a thread-local table only scatters
+//! these groups of the table, and the final top groups of every partition
+//! are merged into the top groups of the aggregation, which the thread that
+//! finalizes the last partition emits.
+//!
 //! The partition hash uses another seed than the hash tables
 //! ([`GroupValues`](datafusion_physical_plan::aggregates::group_values::GroupValues)),
 //! so that the groups of a partition, which share the upper bits of their
@@ -77,14 +83,14 @@ use arrow::array::{
     downcast_primitive,
 };
 use arrow::buffer::NullBuffer;
-use arrow::compute::{interleave, take};
+use arrow::compute::{concat_batches, interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
 use parking_lot::Mutex;
 
 use super::grouped_ht::{GroupedHashTable, GroupedStates, evaluate_rows};
-use super::hash_aggregate::{AggregateSpec, InputBuffer};
+use super::hash_aggregate::{AggregateSpec, InputBuffer, TopK, TopKOrder};
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, SinkFinalize,
@@ -305,7 +311,7 @@ impl RadixLocalState {
         }
         let bypass =
             spec.bypass && num_groups as f64 > BYPASS_RATIO * self.table_rows as f64;
-        self.flush(global)?;
+        self.flush(spec, global)?;
         if bypass {
             self.bypass = Some(BypassBuffer::default());
         }
@@ -326,16 +332,36 @@ impl RadixLocalState {
             .then(|| needed.next_power_of_two().min(self.maximum_capacity))
     }
 
-    /// Flush the groups of the table into the partitions of `global`.
-    fn flush(&mut self, global: &RadixSinkState) -> Result<()> {
+    /// Flush the groups of the table into the partitions of `global`: for a
+    /// top-k aggregation, only the groups that may be among its top groups.
+    fn flush(&mut self, spec: &AggregateSpec, global: &RadixSinkState) -> Result<()> {
         self.table_rows = 0;
-        let Some(states) = self.table.emit_states()? else {
+        let Some(mut states) = self.table.emit_states()? else {
             return Ok(());
         };
+        if let Some(top_k) = &spec.top_k
+            && let Some(indices) = top_k.select(top_k_values(top_k, &states)?)?
+        {
+            states = states.take(&indices)?;
+        }
         hash_keys(&states.keys, &mut self.hashes, &mut self.partitions)?;
         self.flushed += states.num_groups();
         self.distinct_flushed.add(&self.hashes);
         global.add_states(states, &self.partitions)
+    }
+}
+
+/// The values that order the groups of `states`, partial states of a top-k
+/// aggregation: their keys, or the partial states of their aggregate (its
+/// value).
+fn top_k_values<'a>(top_k: &TopK, states: &'a GroupedStates) -> Result<&'a dyn Array> {
+    let values = match top_k.order {
+        TopKOrder::GroupKey => states.keys.first(),
+        TopKOrder::Aggregate => states.states.first().and_then(|state| state.first()),
+    };
+    match values {
+        Some(values) => Ok(values.as_ref()),
+        None => internal_err!("{OPERATOR} found no value to order the groups by"),
     }
 }
 
@@ -445,11 +471,49 @@ struct RadixSourceState {
     partitions: Vec<usize>,
     /// The next entry of `partitions` to claim.
     next: AtomicUsize,
+    /// The top groups of a top-k aggregation.
+    top_k: Option<TopKGroups>,
 }
 
 impl GlobalSourceState for RadixSourceState {
     fn max_threads(&self) -> usize {
         self.partitions.len().max(1)
+    }
+}
+
+/// The top groups (see [`TopK`]) of the partitions of a top-k aggregation
+/// that were finalized so far. The thread that finalizes the last partition
+/// emits them, so that the aggregation produces the top groups of all of its
+/// groups, as DataFusion's top-k aggregation of a single partition does
+/// (rather than the top groups of every partition).
+#[derive(Debug)]
+struct TopKGroups {
+    top_k: TopK,
+    groups: Mutex<Option<RecordBatch>>,
+    /// The number of partitions that were not finalized yet.
+    remaining: AtomicUsize,
+}
+
+impl TopKGroups {
+    /// Add `outputs`, the groups of a finalized partition. Returns the top
+    /// groups of all partitions once all of them were added.
+    fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
+        for output in outputs {
+            let output = self.top_k.select_groups(output)?;
+            let mut groups = self.groups.lock();
+            let merged = match groups.take() {
+                Some(groups) => self.top_k.select_groups(concat_batches(
+                    &output.schema(),
+                    [&groups, &output],
+                )?)?,
+                None => output,
+            };
+            *groups = Some(merged);
+        }
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            return Ok(self.groups.lock().take());
+        }
+        Ok(None)
     }
 }
 
@@ -526,7 +590,7 @@ impl RadixHashAggregate {
         if local.flushed == 0 {
             local.table.add_empty_grouping_sets(spec)?;
         }
-        local.flush(global)
+        local.flush(spec, global)
     }
 
     pub(crate) fn finalize(gstate: &dyn GlobalSinkState) -> Result<SinkFinalize> {
@@ -548,6 +612,7 @@ impl RadixHashAggregate {
     }
 
     pub(crate) fn global_source_state(
+        spec: &AggregateSpec,
         sink_state: Arc<dyn GlobalSinkState>,
     ) -> Result<Arc<dyn GlobalSourceState>> {
         let Some(sink) = sink_state.downcast_arc::<RadixSinkState>() else {
@@ -558,10 +623,16 @@ impl RadixHashAggregate {
         let Some(partitions) = sink.non_empty.lock().clone() else {
             return internal_err!("{OPERATOR} is a source before it was finalized");
         };
+        let top_k = spec.top_k.map(|top_k| TopKGroups {
+            top_k,
+            groups: Mutex::new(None),
+            remaining: AtomicUsize::new(partitions.len()),
+        });
         Ok(Arc::new(RadixSourceState {
             sink,
             partitions,
             next: AtomicUsize::new(0),
+            top_k,
         }))
     }
 
@@ -595,9 +666,11 @@ impl RadixHashAggregate {
                 return Ok(SourceResult::Finished);
             };
             let data = std::mem::take(&mut *state.sink.partitions[partition].lock());
-            let mut outputs = finalize_partition(spec, data)?;
-            outputs.reverse();
-            local.outputs = outputs;
+            let outputs = finalize_partition(spec, data)?;
+            local.outputs = match &state.top_k {
+                Some(top_k) => top_k.add(outputs)?.into_iter().collect(),
+                None => outputs.into_iter().rev().collect(),
+            };
         }
     }
 }
@@ -1088,6 +1161,7 @@ mod tests {
     use arrow::array::{
         BooleanArray, Decimal128Array, Int64Array, StringArray, StringViewArray,
     };
+    use arrow::compute::SortOptions;
     use arrow::datatypes::{Field, Int64Type, Schema, SchemaRef};
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::prelude::SessionContext;
@@ -1447,7 +1521,7 @@ mod tests {
         {
             return Ok(counts);
         }
-        let source = RadixHashAggregate::global_source_state(global)?;
+        let source = RadixHashAggregate::global_source_state(&spec, global)?;
         let mut local = RadixHashAggregate::local_source_state()?;
         while let SourceResult::Chunk(chunk) =
             RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
@@ -1923,6 +1997,99 @@ mod tests {
                 assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flushes_of_top_k_aggregations_keep_their_top_groups() -> Result<()> {
+        // `SELECT k FROM t GROUP BY k ORDER BY k DESC LIMIT 3` over distinct
+        // keys: every flush of a table scatters 3 groups only.
+        let schema = key_schema();
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![],
+            vec![],
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+            Arc::clone(&schema),
+        )?
+        .try_optimize_topk(3, "k", SortOptions::new(true, false))
+        .expect("a top-k aggregation")
+        .data;
+        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
+            aggregate.input(),
+        )));
+        let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+        assert!(spec.top_k.is_some() && !spec.bypass);
+        let global = RadixHashAggregate::global_sink_state()?;
+        // Two threads.
+        let mut locals = (0..2)
+            .map(|_| RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES))
+            .collect::<Result<Vec<_>>>()?;
+        for batch in 0..30 {
+            let keys = (0..10).map(|i| (batch * 10 + i) * 7 % 300);
+            let local = &mut locals[(batch % 2) as usize];
+            RadixHashAggregate::sink(
+                &spec,
+                key_batch(keys)?,
+                global.as_ref(),
+                local.as_mut(),
+            )?;
+        }
+        for local in &mut locals {
+            RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut())?;
+        }
+        let sink = global.downcast_ref::<RadixSinkState>().unwrap();
+        let (flushes, groups) =
+            sink.partitions
+                .iter()
+                .fold((0, 0), |(flushes, groups), data| {
+                    let data = data.lock();
+                    let groups = groups
+                        + data
+                            .states
+                            .iter()
+                            .map(GroupedStates::num_groups)
+                            .sum::<usize>();
+                    (flushes + data.states.len(), groups)
+                });
+        assert!(flushes > 0);
+        // At most 3 groups per flush of a table, out of 300.
+        assert!(groups <= 3 * 300 / 16 + 6, "{groups}");
+        assert!(matches!(
+            RadixHashAggregate::finalize(global.as_ref())?,
+            SinkFinalize::Ready
+        ));
+        // The threads that finalize the partitions emit the top 3 groups once.
+        let source = RadixHashAggregate::global_source_state(&spec, Arc::clone(&global))?;
+        let mut keys: Vec<i64> = vec![];
+        let mut sources = (0..2)
+            .map(|_| RadixHashAggregate::local_source_state())
+            .collect::<Result<Vec<_>>>()?;
+        let mut finished = [false; 2];
+        while !finished.iter().all(|&finished| finished) {
+            for (thread, local) in sources.iter_mut().enumerate() {
+                if finished[thread] {
+                    continue;
+                }
+                match RadixHashAggregate::get_data(
+                    &spec,
+                    source.as_ref(),
+                    local.as_mut(),
+                )? {
+                    SourceResult::Chunk(chunk) => keys.extend(
+                        chunk
+                            .compact()?
+                            .column(0)
+                            .as_primitive::<Int64Type>()
+                            .values(),
+                    ),
+                    _ => finished[thread] = true,
+                }
+            }
+        }
+        keys.sort_unstable();
+        assert_eq!(keys, [297, 298, 299]);
         Ok(())
     }
 }

@@ -33,8 +33,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
-use arrow::compute::{filter, prep_null_mask_filter};
+use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_null_array};
+use arrow::compute::{filter, prep_null_mask_filter, take};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
@@ -62,6 +62,24 @@ impl GroupedStates {
     /// The number of groups.
     pub(crate) fn num_groups(&self) -> usize {
         self.keys.first().map_or(0, |keys| keys.len())
+    }
+
+    /// The groups at `indices`.
+    pub(crate) fn take(&self, indices: &UInt32Array) -> Result<Self> {
+        let take_all = |arrays: &[ArrayRef]| {
+            arrays
+                .iter()
+                .map(|array| Ok(take(array.as_ref(), indices, None)?))
+                .collect::<Result<Vec<_>>>()
+        };
+        Ok(Self {
+            keys: take_all(&self.keys)?,
+            states: self
+                .states
+                .iter()
+                .map(|state| take_all(state))
+                .collect::<Result<_>>()?,
+        })
     }
 }
 

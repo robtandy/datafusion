@@ -1068,12 +1068,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_are_left_to_datafusion() {
+    async fn top_k_aggregations_keep_only_their_top_groups() {
         // DataFusion's top-k aggregation of an `ORDER BY ... LIMIT n` by the
         // group key (`a`) or a `MIN` / `MAX` aggregate keeps only the top
         // `n` groups in every stage, so the projection between it and the
-        // sort only evaluates `1000 / ...` for those, never for `0`. A native
-        // aggregation would produce all groups.
+        // sort only evaluates `1000 / ...` for those, never for `0`. So does
+        // the native aggregation, which produces the same groups, if the final
+        // stage has a single partition (on 1 thread here): DataFusion keeps
+        // the top groups of every partition otherwise, which depend on the
+        // partitioning, and are left to it.
         let setup = async |ctx: &SessionContext| register_test_tables(ctx);
         let distinct = "SELECT 1000 / a AS v, a FROM (VALUES (0), (1), (2), (3)) AS t(a) \
              GROUP BY a ORDER BY a DESC LIMIT 1";
@@ -1084,25 +1087,26 @@ mod tests {
         let coalesced = &[AggregateMode::Final, AggregateMode::Partial][..];
         let partitioned = &[AggregateMode::FinalPartitioned, AggregateMode::Partial][..];
         for (sql, stages, native_aggregations) in [
-            // A single stage on 1 thread, and two stages that would be fused
-            // on 4.
-            (distinct, [single, partitioned], 0),
-            (max, [single, partitioned], 0),
+            // A single stage on 1 thread, and two stages that are fused on 4.
+            (distinct, [single, partitioned], [1, 0]),
+            (max, [single, partitioned], [1, 0]),
             // `t1` has 4 partitions.
             (
                 "SELECT DISTINCT d FROM t1 ORDER BY d LIMIT 3",
                 [coalesced, partitioned],
-                0,
+                [1, 0],
             ),
-            // A native aggregation of the result of a top-k aggregation.
+            // An aggregation of the result of a top-k aggregation.
             (
                 "SELECT COUNT(*), SUM(v) FROM (SELECT 1000 / a AS v, a \
                  FROM (VALUES (0), (1), (2), (3)) AS t(a) GROUP BY a ORDER BY a DESC LIMIT 2)",
                 [single, partitioned],
-                1,
+                [2, 1],
             ),
         ] {
-            for (threads, stages) in [1, 4].into_iter().zip(stages) {
+            for ((threads, stages), native_aggregations) in
+                [1, 4].into_iter().zip(stages).zip(native_aggregations)
+            {
                 let config = test_session_config().with_target_partitions(threads);
                 let ctx = datafusion_context(config.clone());
                 setup(&ctx).await.expect("setup");
