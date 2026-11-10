@@ -34,6 +34,7 @@
 //! | `PlaceholderRowExec`                                                               | [`PhysicalPlaceholderRow`]                         |
 //! | `FilterExec`                                                                       | [`PhysicalFilter`] in a [`CachingOperator`]        |
 //! | `ProjectionExec`                                                                   | [`PhysicalProjection`]                             |
+//! | `ScalarSubqueryExec` (of uncorrelated scalar subqueries)                           | [`PhysicalScalarSubquery`]                         |
 //! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                               | the sources of [`try_create_scan_source`]          |
 //! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                 | removed                                            |
 //!
@@ -61,11 +62,10 @@
 //!
 //! Every native operator documents (in its `try_lower` or `supports_*`
 //! function) which nodes it reproduces exactly, including their errors; any
-//! other node, such as a sort-merge join, a scalar subquery, a recursive
-//! query or a custom node, is executed by DataFusion: it is wrapped, with its
-//! whole subtree, in a [`BridgeOperator`], so that every plan can be
-//! executed. Native operators above a bridged plan read its output as the
-//! source of their pipeline.
+//! other node, such as a sort-merge join, a recursive query or a custom node,
+//! is executed by DataFusion: it is wrapped, with its whole subtree, in a
+//! [`BridgeOperator`], so that every plan can be executed. Native operators
+//! above a bridged plan read its output as the source of their pipeline.
 //!
 //! # Plans that DataFusion must execute
 //!
@@ -85,18 +85,23 @@
 //!   a filter of an aggregate, a sort key) whose errors depend on the batches
 //!   it is evaluated on (see [`depends_on_batches`]), e.g. the right side of
 //!   `a <> 0 AND 10 / a > 1`, which DataFusion evaluates on all rows of a
-//!   batch unless at most 20% of them are left, or with more than one part
-//!   that may fail (see [`failing_parts`]): DataFusion evaluates every
-//!   expression of an operator on a whole batch before the next one, the
-//!   native operators on their chunks. (The native filters and projections
-//!   refuse such expressions themselves.)
+//!   batch unless at most 20% of them are left, or with several parts that
+//!   may fail with different errors (see [`Failures::order_matters`]):
+//!   DataFusion evaluates every expression of an operator on a whole batch
+//!   before the next one, the native operators on their chunks. (The native
+//!   filters and projections refuse such expressions themselves.)
 //! * On several threads (a `target_partitions` above 1, or lowering without
 //!   a session), a filter, projection, aggregation or sort with a part that
 //!   may fail: the threads of a pipeline evaluate the chunks of a partition of
 //!   DataFusion, also of a single batch, in parallel, so which of the rows on
 //!   which it fails fails first depends on them, while DataFusion fails on
 //!   the first of them in its partition (and casts and overflows name the
-//!   value that fails).
+//!   value that fails). But for the parts that can only fail with overflows,
+//!   of decimal arithmetic or of casts of numbers into decimals (see
+//!   [`Failures`]), e.g. the arithmetic of TPC-H and the casts with which Q11
+//!   compares the sums of its groups with the result of its scalar subquery:
+//!   whichever row overflows first, the error is an overflow, as in
+//!   DataFusion (see `Lowering::fails_like_datafusion_on_threads`).
 //! * A filter, projection, aggregation or sort with a part that may fail
 //!   above native operators of the same pipeline that have parts that may fail
 //!   too: which of them fails first depends on the batches. For a sort, also
@@ -593,11 +598,18 @@ impl Lowering<'_> {
     /// fail `failures` (see [`failures`]) fails like DataFusion on the
     /// threads that run its pipelines: if they run on a single thread, which
     /// evaluates the rows in order (see [`Self::evaluates_in_order`]), or if
-    /// these parts can only fail with arithmetic overflows (e.g. the decimal
-    /// arithmetic of TPC-H, `l_extendedprice * (1 - l_discount)`): whichever
-    /// row overflows first on whichever thread, the error is an
-    /// `ArrowError::ArithmeticOverflow`, as in DataFusion (although the values
-    /// it names may be those of another row).
+    /// these parts can only fail with overflows (see
+    /// [`Failures::only_overflows`]): whichever row overflows first on
+    /// whichever thread, the error is an overflow, as in DataFusion (although
+    /// the values it names may be those of another row). These are the
+    /// arithmetic overflows of decimals (e.g. of the decimal arithmetic of
+    /// TPC-H, `l_extendedprice * (1 - l_discount)`), which raise an
+    /// `ArrowError::ArithmeticOverflow`, and the overflows of the values of
+    /// the casts of numbers into decimals (e.g. of the casts with which TPC-H
+    /// Q11 compares the sums of its groups with the result of its scalar
+    /// subquery, `CAST(sum(...) AS Decimal128(38, 15))`), which Arrow reports
+    /// as the cast errors or invalid arguments of the values that overflow the
+    /// decimal (see [`Failures`]).
     fn fails_like_datafusion_on_threads(&self, failures: Failures) -> bool {
         failures.only_overflows() || self.evaluates_in_order()
     }
@@ -5794,6 +5806,166 @@ mod tests {
         let root = assert_parity_with(sql, config, &setup).await;
         assert_native(sql, &root);
         assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Scalar subqueries
+    // ---------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scalar_subqueries_are_native() -> Result<()> {
+        // A `ScalarSubqueryExec` is lowered to a `PhysicalScalarSubquery`,
+        // which runs its subqueries (natively too) before the pipelines of its
+        // input, whose expressions read their results: constants, also in the
+        // arithmetic of a projection, which only overflows, on 4 threads.
+        let q11 = "SELECT a, SUM(g * b) AS s FROM t1 GROUP BY a \
+                   HAVING SUM(g * b) > (SELECT SUM(g * b) * 0.0001 FROM t1)";
+        for (sql, subqueries) in [
+            ("SELECT id, a FROM t1 WHERE a > (SELECT AVG(a) FROM t1)", 1),
+            (
+                "SELECT id, g - (SELECT AVG(g) FROM t1) AS diff FROM t1 WHERE id < 100",
+                1,
+            ),
+            // Several subqueries, and a subquery of a subquery.
+            (
+                "SELECT id FROM t1 WHERE a = (SELECT MAX(k) FROM t2) \
+                 AND b > (SELECT MIN(w) FROM t2)",
+                1,
+            ),
+            (
+                "SELECT id FROM t1 \
+                 WHERE a > (SELECT AVG(k) FROM t2 WHERE k > (SELECT MIN(a) FROM t1))",
+                2,
+            ),
+            // A subquery whose aggregate is null, and one without rows, whose
+            // result is a null.
+            (
+                "SELECT id, (SELECT MAX(k) FROM t2 WHERE w < -1000000) AS m \
+                 FROM t1 WHERE id < 10",
+                1,
+            ),
+            (
+                "SELECT id, (SELECT MAX(k) FROM t2 HAVING MAX(k) > 1000) AS m \
+                 FROM t1 WHERE id < 10",
+                1,
+            ),
+            // The shape of TPC-H Q11, see below.
+            (q11, 1),
+        ] {
+            let root = assert_parity(sql).await;
+            assert_native(sql, &root);
+            assert_eq!(count::<PhysicalScalarSubquery>(&root), subqueries, "{sql}");
+        }
+        // Like TPC-H Q11, the filter casts the sums of its groups into the type
+        // in which it compares them with the result, which the projection of
+        // the subquery casts into that type: casts of numbers into decimals,
+        // which only fail on the values that overflow the decimal (see
+        // `Failures::CAST_OVERFLOW`), and which the native filter and
+        // projection evaluate on 4 threads.
+        let mut casts = vec![];
+        datafusion_plan(q11, test_session_config())
+            .await
+            .apply(|node| {
+                let (exprs, input) = if let Some(filter) =
+                    node.downcast_ref::<FilterExec>()
+                {
+                    (vec![Arc::clone(filter.predicate())], filter.input())
+                } else if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+                    let exprs =
+                        projection.expr().iter().map(|expr| Arc::clone(&expr.expr));
+                    (exprs.collect(), projection.input())
+                } else {
+                    return Ok(TreeNodeRecursion::Continue);
+                };
+                let schema = input.schema();
+                casts.extend(
+                    exprs
+                        .iter()
+                        .map(|expr| failures(expr, &schema))
+                        .filter(|failures| !failures.is_none()),
+                );
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        assert_eq!(casts, [Failures::CAST_OVERFLOW; 2], "{q11}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn errors_of_scalar_subqueries_are_those_of_datafusion() -> Result<()> {
+        // DataFusion runs the subqueries before the input, so that their errors
+        // come first, and fails on a subquery of more than one row, as do the
+        // native scalar subqueries (which leave the subqueries that may produce
+        // more than one row to DataFusion, as below a limit).
+        for (sql, error) in [
+            (
+                "SELECT id FROM t1 WHERE a = (SELECT k FROM t2)",
+                "Scalar subquery returned more than one row",
+            ),
+            (
+                "SELECT 10 / (a - a) AS x FROM t1 \
+                 WHERE b > (SELECT MAX(CAST(name AS INT)) FROM t2)",
+                "Cannot cast string 'name-",
+            ),
+        ] {
+            assert_outcome(sql, Some(error)).await;
+        }
+
+        // A filter that casts a column of 4 partitions into the type of the
+        // result of a subquery, which only fails on the row whose value
+        // overflows the decimal: by more than its integer holds (a cast
+        // error), or by more than its precision (an invalid argument). The
+        // native filter fails on it like DataFusion, on 4 threads.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Decimal128(36, 2),
+            true,
+        )]));
+        let sql = "SELECT COUNT(*) AS n FROM f \
+                   WHERE CAST(x AS DECIMAL(38, 15)) > \
+                   (SELECT CAST(MIN(x) AS DECIMAL(38, 15)) FROM f)";
+        for (overflowing, error) in [
+            (
+                10_i128.pow(30),
+                "Cannot cast to Decimal128(38, 15). Overflowing on 1000000000000000000000000000000",
+            ),
+            (
+                10_i128.pow(25),
+                "is too large to store in a Decimal128 of precision 38",
+            ),
+        ] {
+            let batch = |values: Vec<Option<i128>>| -> Result<RecordBatch> {
+                let values = arrow::array::Decimal128Array::from(values)
+                    .with_precision_and_scale(36, 2)?;
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(values)],
+                )?)
+            };
+            let mut partitions = (0..4)
+                .map(|_| Ok(vec![batch(vec![Some(100); 3000])?]))
+                .collect::<Result<Vec<_>>>()?;
+            partitions[2].push(batch(vec![Some(-100), None, Some(overflowing)])?);
+            let setup = async |ctx: &SessionContext| {
+                let table = datafusion::datasource::MemTable::try_new(
+                    Arc::clone(&schema),
+                    partitions.clone(),
+                )?;
+                ctx.register_table("f", Arc::new(table))?;
+                Ok(())
+            };
+            let datafusion = datafusion_context(test_session_config());
+            setup(&datafusion).await?;
+            let message = crate::test_utils::run_sql(&datafusion, sql)
+                .await
+                .expect_err("DataFusion fails")
+                .to_string();
+            assert!(message.contains(error), "{message}");
+            assert_fails_like_datafusion(sql, test_session_config(), &setup, &message)
+                .await;
+            let root = lowered(sql, test_session_config(), &setup).await;
+            assert_native(sql, &root);
+        }
         Ok(())
     }
 
