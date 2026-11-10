@@ -2790,3 +2790,41 @@ fn lowering_counts_native_and_bridged_operators() -> Result<()> {
     assert!(Lowering::of(&plan).is_err());
     Ok(())
 }
+
+/// The TopK of TPC-H Q18 over Parquet is native also when DataFusion plans
+/// `Partitioned` hash joins, as for the larger tables of the benchmark: its
+/// aggregation then reads the partitions of the semi join below it directly,
+/// with the scan of `orders`, which reads the dynamic filter of the TopK, below
+/// the build sides of joins, which they read all of before they probe them, and
+/// a repartitioning, every partition of which ends with the last of its input:
+/// the filter prunes nothing before the scan read all of its files, in both
+/// engines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topk_of_tpch_q18_over_partitioned_joins_is_native() -> Result<()> {
+    let mut config = test_session_config();
+    let optimizer = &mut config.options_mut().optimizer;
+    optimizer.hash_join_single_partition_threshold = 0;
+    optimizer.hash_join_single_partition_threshold_rows = 0;
+    let source = Source::parquet();
+    let setup = async |ctx: &SessionContext| source.register(ctx).await;
+    let sql = tpch::query(18);
+    let (expected, actual) = run_engines(sql, config, &setup).await?;
+    compare_outputs(&expected, &actual)
+        .unwrap_or_else(|message| panic!("Q18 over Parquet: {message}"));
+    let exec = actual
+        .plan
+        .downcast_ref::<PipelineRootExec>()
+        .expect("a pipeline plan");
+    let plan = displayable(exec.input().as_ref()).indent(false).to_string();
+    assert!(
+        plan.contains("AggregateExec: mode=SinglePartitioned")
+            && plan.contains("HashJoinExec: mode=Partitioned"),
+        "{plan}"
+    );
+    let names = operator_names(exec.operator());
+    assert!(
+        names.iter().any(|name| name == "PhysicalTopK"),
+        "{names:?}\n{plan}"
+    );
+    Ok(())
+}

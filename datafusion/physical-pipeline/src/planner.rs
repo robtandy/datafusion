@@ -2305,7 +2305,7 @@ enum TopKFilterPruning {
 /// child it streams emits any is no barrier either (see
 /// [`emits_rows_after_its_inputs`]).
 fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilterPruning {
-    let read_first = reads_first_child_before_emitting(plan);
+    let read_first = reads_first_child_before_emitting(plan, filter);
     // A join emits its rows as its probe side (the second child) passes rows
     // on (or once a partition of it ends), once it read the matching part of
     // its build side: the timing of its rows is that of its probe side. But
@@ -2434,11 +2434,11 @@ fn reads_dynamic_filter(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
 ///   build side (the first child) before they probe it;
 ///
 /// a partition of which reads the corresponding partition of its first child
-/// first, if the partitions of the child end together (see
-/// [`ends_with_all_partitions`]). The native aggregations, sorts and joins
+/// first, if no partition of the child ends before the nodes below it that
+/// read the filter read all of their input (see [`ends_after_its_readers`]). The native aggregations, sorts and joins
 /// read all of these inputs before they emit any row too: they are pipeline
 /// breakers.
-fn reads_first_child_before_emitting(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn reads_first_child_before_emitting(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
     let reads_first = if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
         matches!(
             aggregate.mode(),
@@ -2462,29 +2462,65 @@ fn reads_first_child_before_emitting(plan: &Arc<dyn ExecutionPlan>) -> bool {
         && plan
             .children()
             .first()
-            .is_some_and(|child| ends_with_all_partitions(child))
+            .is_some_and(|child| ends_after_its_readers(child, filter))
 }
 
-/// Whether no partition of `plan` ends before the nodes below it read all of
-/// their input (or stopped reading it): `plan` has a single partition, or it
-/// is a repartitioning, every output partition of which ends with the last of
-/// its input partitions, possibly below projections, filters and coalesced
-/// batches without a fetch, which pass the rows of each partition on. A node
-/// that reads all rows of a partition of `plan` before it emits any row then
-/// emits no row before the nodes below `plan` read all of their input.
-fn ends_with_all_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.output_partitioning().partition_count() <= 1 || plan.is::<RepartitionExec>() {
+/// Whether no partition of `plan` ends before the nodes below it that read
+/// the dynamic filter with id `filter` read all of their input: there is no
+/// such node, or `plan` has a single partition, or it is a repartitioning or a
+/// merge of partitions, every output partition of which ends with the last of
+/// its input partitions, or a node that reads every partition of its input to
+/// its end before it ends the corresponding partition of its own (projections,
+/// filters and coalesced batches without a fetch, aggregations that merge or
+/// aggregate all rows of their groups, sorts) above such an input, or a join
+/// whose nodes that read the filter are all below its build side (the first
+/// child), which it reads all of before it probes it (or skips its probe side),
+/// above such a build side. A node that reads all rows of a partition of
+/// `plan` before it emits any row then emits no row before the nodes that read
+/// the filter below `plan` read all of their input.
+fn ends_after_its_readers(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
+    if !consumes_dynamic_filter(plan, filter) {
         return true;
     }
-    let passes_partitions_on = (plan.is::<ProjectionExec>()
+    if plan.output_partitioning().partition_count() <= 1
+        || plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+    {
+        return true;
+    }
+    if reads_dynamic_filter(plan, filter) {
+        return false;
+    }
+    let children = plan.children();
+    let reads_partitions_to_their_end = ((plan.is::<ProjectionExec>()
         || plan.is::<FilterExec>()
         || is_coalesce_batches(plan))
-        && plan.fetch().is_none();
-    passes_partitions_on
-        && plan
-            .children()
-            .first()
-            .is_some_and(|child| ends_with_all_partitions(child))
+        && plan.fetch().is_none())
+        || plan.is::<SortExec>()
+        || plan
+            .downcast_ref::<AggregateExec>()
+            .is_some_and(|aggregate| {
+                !matches!(
+                    aggregate.mode(),
+                    AggregateMode::Partial | AggregateMode::PartialReduce
+                ) && aggregate.group_clustering_mode() == &GroupClusteringMode::None
+            });
+    if reads_partitions_to_their_end {
+        return children.len() == 1 && ends_after_its_readers(children[0], filter);
+    }
+    if plan.is::<HashJoinExec>()
+        || plan.is::<CrossJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
+    {
+        return match children.as_slice() {
+            [build, probe] => {
+                !consumes_dynamic_filter(probe, filter)
+                    && ends_after_its_readers(build, filter)
+            }
+            _ => false,
+        };
+    }
+    false
 }
 
 /// Whether `plan` passes on the rows of its inputs as they reach it, without
@@ -6399,6 +6435,65 @@ mod tests {
         compare_outputs(&output(expected), &output(actual))
             .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
         assert_eq!(topks, 0, "{tree}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_filter_is_read_below_the_probe_side_of_a_join_that_settles_it_are_native()
+    -> Result<()> {
+        // `ORDER BY k DESC LIMIT 3` of the groups of an aggregation of 20
+        // Parquet files whose keys are among the groups of another aggregation,
+        // with `Partitioned` hash joins (as TPC-H Q18 at SF 1): DataFusion plans
+        // a semi join whose probe side is the first aggregation (and the second
+        // one its build side), and pushes the
+        // dynamic filter of the TopK through the join and the aggregation into
+        // the scan. The aggregation reads all of its input before it emits any
+        // group, and the join emits its rows as its probe side passes them on:
+        // its build side, which the join reads first and which does not read the
+        // filter, does not pass rows on to the TopK by itself (unlike the inputs
+        // of a union). The filter prunes nothing before the scan read all of its
+        // files, in both engines, and the TopK is native.
+        let dir = tempfile::tempdir()?;
+        let path = parquet_files_in_order(dir.path(), 20, &[])?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await?;
+            ctx.sql(
+                "CREATE TABLE small AS SELECT CAST(value AS BIGINT) AS x \
+                 FROM generate_series(0, 9999, 7)",
+            )
+            .await?
+            .collect()
+            .await?;
+            Ok(())
+        };
+        let config = partitioned_config();
+        let sql = "SELECT g.k, g.n FROM (SELECT k, SUM(v) AS n FROM p GROUP BY k) g \
+                   WHERE g.k IN (SELECT x FROM small GROUP BY x HAVING COUNT(*) > 0) \
+                   ORDER BY g.k DESC LIMIT 3";
+        let plan = datafusion_plan_with(sql, config.clone(), &setup).await;
+        let shape = displayable(plan.as_ref()).indent(false).to_string();
+        assert!(
+            shape.contains("HashJoinExec: mode=Partitioned, join_type=RightSemi"),
+            "{shape}"
+        );
+        let mut read = 0;
+        plan.apply(|node| {
+            if let Some(sort) = node.downcast_ref::<SortExec>() {
+                read += usize::from(read_topk_filter(sort).is_some());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(read, 1, "{}", displayable(plan.as_ref()).indent(false));
+        let root = assert_parity_with(sql, config.clone(), &setup).await;
+        assert_eq!(
+            count::<PhysicalTopK>(&root),
+            1,
+            "{}",
+            format_operator_tree(&root)
+        );
+        let (plan, _) = pipeline_plan(sql, config, &setup).await;
+        filter_of_native_topk(&plan);
         Ok(())
     }
 
