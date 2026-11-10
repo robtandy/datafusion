@@ -2688,8 +2688,11 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) 
 /// metadata (their footers, which DataFusion caches in the file metadata cache
 /// of the runtime when it collects their statistics, see
 /// `datafusion.execution.collect_statistics`) shows, with the coercions of
-/// DataFusion's Parquet reader (e.g. of strings into `Utf8View`, see
-/// `apply_file_schema_type_coercions`). The schema of a table that DataFusion
+/// DataFusion's Parquet reader: of strings into `Utf8View` (see
+/// `apply_file_schema_type_coercions`), and of INT96 timestamps into the unit
+/// of `coerce_int96` (see `Int96Coercer`), from which the scan casts them into
+/// the unit of the table, which may overflow. (Not its coercion of strings into
+/// dictionaries: such files may fail.) The schema of a table that DataFusion
 /// inferred from its files has their types, but a schema given when the table
 /// was registered may have others, into which the scan casts the values of the
 /// files (and fails on those that it cannot cast). `false` if the metadata of a
@@ -2700,52 +2703,64 @@ fn reads_files_of_the_types_of_their_table(
     runtime: Option<&RuntimeEnv>,
 ) -> bool {
     use datafusion_datasource_parquet::metadata::CachedParquetMetaData;
+    use datafusion_datasource_parquet::{Int96Coercer, apply_file_schema_type_coercions};
     let Some(runtime) = runtime else {
         return false;
     };
-    if !config.file_source().is::<ParquetSource>() {
+    let Some(source) = config.file_source().downcast_ref::<ParquetSource>() else {
         return false;
-    }
+    };
+    let options = &source.table_parquet_options().global;
+    let int96 = options.coerce_int96.map(arrow::datatypes::TimeUnit::from);
+    let int96_timezone = options
+        .coerce_int96_tz
+        .as_ref()
+        .map(|timezone| Arc::<str>::from(timezone.as_str()));
     let cache = runtime.cache_manager.get_file_metadata_cache();
     let table = config.file_schema();
+    let has_the_types_of_the_table = |file: &datafusion_datasource::PartitionedFile| {
+        let Some(entry) = cache.get(&file.object_meta.location) else {
+            return false;
+        };
+        if !entry.is_valid_for(&file.object_meta) {
+            return false;
+        }
+        let Some(metadata) = entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<CachedParquetMetaData>()
+            .map(CachedParquetMetaData::parquet_metadata)
+        else {
+            return false;
+        };
+        let file_metadata = metadata.file_metadata();
+        let Ok(file_schema) = parquet::arrow::parquet_to_arrow_schema(
+            file_metadata.schema_descr(),
+            file_metadata.key_value_metadata(),
+        ) else {
+            return false;
+        };
+        let mut file_schema =
+            apply_file_schema_type_coercions(table, &file_schema).unwrap_or(file_schema);
+        if let Some(unit) = &int96
+            && let Some(coerced) =
+                Int96Coercer::new(file_metadata.schema_descr(), &file_schema, unit)
+                    .with_timezone(int96_timezone.clone())
+                    .coerce()
+        {
+            file_schema = coerced;
+        }
+        table.fields().iter().all(|field| {
+            file_schema
+                .field_with_name(field.name())
+                .is_ok_and(|file_field| file_field.data_type() == field.data_type())
+        })
+    };
     config
         .file_groups
         .iter()
         .flat_map(|group| group.iter())
-        .all(|file| {
-            let Some(entry) = cache.get(&file.object_meta.location) else {
-                return false;
-            };
-            if !entry.is_valid_for(&file.object_meta) {
-                return false;
-            }
-            let Some(metadata) = entry
-                .file_metadata
-                .as_any()
-                .downcast_ref::<CachedParquetMetaData>()
-                .map(CachedParquetMetaData::parquet_metadata)
-            else {
-                return false;
-            };
-            let file_metadata = metadata.file_metadata();
-            let Ok(file_schema) = parquet::arrow::parquet_to_arrow_schema(
-                file_metadata.schema_descr(),
-                file_metadata.key_value_metadata(),
-            ) else {
-                return false;
-            };
-            let file_schema =
-                datafusion_datasource_parquet::apply_file_schema_type_coercions(
-                    table,
-                    &file_schema,
-                )
-                .unwrap_or(file_schema);
-            table.fields().iter().all(|field| {
-                file_schema
-                    .field_with_name(field.name())
-                    .is_ok_and(|file_field| file_field.data_type() == field.data_type())
-            })
-        })
+        .all(has_the_types_of_the_table)
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
