@@ -244,7 +244,7 @@ use datafusion_physical_expr::expressions::{
 };
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, conjunction};
 use datafusion_physical_plan::aggregates::{
-    AggregateExec, AggregateInputMode, AggregateMode,
+    AggregateExec, AggregateInputMode, AggregateMode, GroupClusteringMode,
 };
 use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -286,7 +286,7 @@ use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
-use crate::sort::PhysicalSort;
+use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
 use crate::sources::try_create_scan_source;
 use crate::window::PhysicalWindow;
 
@@ -813,31 +813,56 @@ impl Lowering<'_> {
             return Ok(None);
         }
         // DataFusion pushes the dynamic filter of a TopK (its threshold) into
-        // the scans of its input, which skip the files, row groups and rows
-        // that it rejects as it tightens; a native TopK publishes its threshold
-        // at other times, so that it does not skip the same reads. So a TopK
-        // whose dynamic filter a node of its input consumes is left to
-        // DataFusion if its input may fail on the rows that DataFusion skips
-        // (see [`subtree_failures`]: expressions that may fail, or sources
-        // that may fail to read their rows, but for scans of Parquet and CSV
-        // files with expressions that cannot fail). (The native sort itself
-        // leaves to DataFusion the TopKs whose pruned rows the expressions of
-        // their input may fail on.)
-        if sort.fetch().is_some()
-            && let Some(filter) = sort
-                .dynamic_expressions_produced()
-                .iter()
-                .find_map(|expr| expr.expression_id())
-            && consumes_dynamic_filter(sort.input(), filter)
-            && !subtree_failures(sort.input()).is_none()
-        {
-            return Ok(None);
-        }
+        // the scans of its input (e.g. of Parquet files), which skip the files,
+        // row groups and rows that it rejects as it tightens; a native TopK
+        // publishes its threshold at other times, so that the scans skip other
+        // reads. That makes no difference to the rows of the TopK, which only
+        // skips rows that cannot make it into its result in both engines, but
+        // it does to the work of the nodes that read the pruned rows, which
+        // may fail on rows that the other engine skips. So a TopK whose
+        // dynamic filter a node of its input reads is lowered natively only
+        // (see [`topk_filter_pruning`]) if the filter prunes nothing in either
+        // engine (every node that reads it is below a node that reads all of
+        // its input before the TopK sees a row, e.g. the aggregation of TPC-H
+        // Q18 below its TopK), or if the nodes between the scans that read it
+        // and the TopK only pass rows on, and the work of its input cannot
+        // fail on any rows (see [`works_alike_on_any_rows`]: e.g. the `LIKE`
+        // of ClickBench's `hits23` above its scan). The native TopK then
+        // updates the filter, so that the scans prune with its threshold.
+        let read_filter = read_topk_filter(sort);
+        let to_lower = match &read_filter {
+            None => Arc::clone(plan),
+            Some((_, id)) => {
+                let exact = match topk_filter_pruning(sort.input(), *id) {
+                    TopKFilterPruning::Unread | TopKFilterPruning::Settled => true,
+                    TopKFilterPruning::Rows => works_alike_on_any_rows(sort.input()),
+                    TopKFilterPruning::Other => false,
+                };
+                if !exact {
+                    return Ok(None);
+                }
+                // `crate::sort::try_lower` judges the work on the rows that the
+                // filter prunes by the expressions that it knows cannot fail,
+                // and leaves the TopKs above other nodes than those that pass
+                // rows on to DataFusion: it lowers the TopK of a plan whose
+                // `SortExec` has a filter that no node reads, and the native
+                // TopK updates the filter of the plan instead.
+                with_unread_topk_filter(plan)?
+            }
+        };
         let input = Context::below_breaker(keys.failures);
-        let Some(lowered) =
-            crate::sort::try_lower(plan, self.options, |plan| self.lower(plan, input))?
+        let Some(lowered) = crate::sort::try_lower(&to_lower, self.options, |plan| {
+            self.lower(plan, input)
+        })?
         else {
             return Ok(None);
+        };
+        let lowered = match read_filter {
+            None => lowered,
+            Some((filter, _)) => match updating_filter(&lowered, filter)? {
+                Some(lowered) => lowered,
+                None => return Ok(None),
+            },
         };
         // The keys that the native sort evaluates (those of the top merge, over
         // the projections below it, if any).
@@ -2161,6 +2186,253 @@ fn consumes_dynamic_filter(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
         })
     });
     consumes
+}
+
+/// The dynamic filter of `sort`, a `SortExec`, and its id, if `sort` is a TopK
+/// whose dynamic filter a node of its input reads (see
+/// [`consumes_dynamic_filter`]).
+fn read_topk_filter(sort: &SortExec) -> Option<(Arc<DynamicFilterPhysicalExpr>, u64)> {
+    sort.fetch()?;
+    let filter = sort
+        .dynamic_expressions_produced()
+        .into_iter()
+        .find(|expr| expr.is::<DynamicFilterPhysicalExpr>())?;
+    let id = filter.expression_id()?;
+    let filter = (filter as Arc<dyn std::any::Any + Send + Sync>)
+        .downcast::<DynamicFilterPhysicalExpr>()
+        .ok()?;
+    consumes_dynamic_filter(sort.input(), id).then_some((filter, id))
+}
+
+/// How the dynamic filter of a TopK prunes the rows of its input (see
+/// [`topk_filter_pruning`]). The TopK tightens the filter (its threshold) as
+/// it reads its input, at other times in DataFusion than natively, so that
+/// the nodes that read the filter (scans of Parquet files) skip other files,
+/// row groups and rows in the two engines. Either way, they only skip rows
+/// that cannot make it into the result of the TopK, but the nodes that read
+/// the pruned rows (the scans, and the nodes above them) work on other rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TopKFilterPruning {
+    /// No node reads the filter.
+    Unread,
+    /// Every node that reads the filter is below a node that reads all of
+    /// its rows before it emits any row (see
+    /// [`reads_first_child_before_emitting`]), between it and the TopK: in
+    /// both engines, the TopK sees its first row, and the filter gets its
+    /// first threshold, once these nodes have read all of their input, so
+    /// that the filter prunes none of their rows.
+    Settled,
+    /// The nodes that read the filter (and are not below such a node), and
+    /// the nodes between them and the TopK, only pass rows on (see
+    /// [`passes_rows_on`]): the filter prunes rows that cannot make it into
+    /// the result, and the work of these nodes on them.
+    Rows,
+    /// Other nodes are between a node that reads the filter and the TopK,
+    /// e.g. the probe side of a join, an aggregation that emits groups as it
+    /// reads its input, or a node with a fetch, which stops after a number of
+    /// rows that pass the filter (which depend on the rows it prunes).
+    Other,
+}
+
+/// How the dynamic filter with id `filter` of a TopK prunes the rows of
+/// `plan`, the input of the TopK or a node below it whose rows reach the TopK
+/// as `plan` produces them (see [`TopKFilterPruning`]).
+fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilterPruning {
+    let read_first = reads_first_child_before_emitting(plan);
+    let below = plan
+        .children()
+        .into_iter()
+        .enumerate()
+        .map(|(index, child)| match index == 0 && read_first {
+            true if consumes_dynamic_filter(child, filter) => TopKFilterPruning::Settled,
+            true => TopKFilterPruning::Unread,
+            false => topk_filter_pruning(child, filter),
+        })
+        .max()
+        .unwrap_or(TopKFilterPruning::Unread);
+    if below <= TopKFilterPruning::Settled && !reads_dynamic_filter(plan, filter) {
+        return below;
+    }
+    match passes_rows_on(plan) {
+        true => below.max(TopKFilterPruning::Rows),
+        false => TopKFilterPruning::Other,
+    }
+}
+
+/// Whether an expression of `plan` itself (not of its children) reads the
+/// dynamic filter with id `filter`, e.g. the predicate of a scan. A node whose
+/// expressions cannot be listed may read it.
+fn reads_dynamic_filter(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
+    let mut reads = false;
+    let listed = plan.apply_expressions(&mut |expr| {
+        expr.apply(|expr| {
+            reads |= expr.expression_id() == Some(filter);
+            Ok(match reads {
+                true => TreeNodeRecursion::Stop,
+                false => TreeNodeRecursion::Continue,
+            })
+        })
+    });
+    reads || listed.is_err()
+}
+
+/// Whether `plan` reads all rows of its first child before it emits any row,
+/// in DataFusion and natively, so that nothing above `plan` sees a row of
+/// the nodes below that child before they read all of their input (or
+/// stopped reading it):
+///
+/// * an aggregation that merges or aggregates all rows of its groups (in
+///   `Final`, `FinalPartitioned`, `Single` or `SinglePartitioned` mode)
+///   without knowing when a group is complete (no clustering of its input by
+///   its groups, see `GroupClusteringMode`), which emits its groups once its
+///   input ends (or stops reading it once it has as many groups as its
+///   limit);
+/// * a sort whose input is not sorted by its keys (DataFusion passes a sorted
+///   input through), which emits its rows once its input ends (a TopK whose
+///   input is sorted by a prefix of its keys may stop reading it before);
+/// * a hash join, a cross join and a nested loop join, which collect their
+///   build side (the first child) before they probe it;
+///
+/// a partition of which reads the corresponding partition of its first child
+/// first, if the partitions of the child end together (see
+/// [`ends_with_all_partitions`]). The native aggregations, sorts and joins
+/// read all of these inputs before they emit any row too: they are pipeline
+/// breakers.
+fn reads_first_child_before_emitting(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let reads_first = if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        matches!(
+            aggregate.mode(),
+            AggregateMode::Final
+                | AggregateMode::FinalPartitioned
+                | AggregateMode::Single
+                | AggregateMode::SinglePartitioned
+        ) && aggregate.group_clustering_mode() == &GroupClusteringMode::None
+    } else if let Some(sort) = plan.downcast_ref::<SortExec>() {
+        !sort
+            .input()
+            .equivalence_properties()
+            .ordering_satisfy(sort.expr().clone())
+            .unwrap_or(true)
+    } else {
+        plan.is::<HashJoinExec>()
+            || plan.is::<CrossJoinExec>()
+            || plan.is::<NestedLoopJoinExec>()
+    };
+    reads_first
+        && plan
+            .children()
+            .first()
+            .is_some_and(|child| ends_with_all_partitions(child))
+}
+
+/// Whether no partition of `plan` ends before the nodes below it read all of
+/// their input (or stopped reading it): `plan` has a single partition, or it
+/// is a repartitioning, every output partition of which ends with the last of
+/// its input partitions, possibly below projections, filters and coalesced
+/// batches without a fetch, which pass the rows of each partition on. A node
+/// that reads all rows of a partition of `plan` before it emits any row then
+/// emits no row before the nodes below `plan` read all of their input.
+fn ends_with_all_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.output_partitioning().partition_count() <= 1 || plan.is::<RepartitionExec>()
+    {
+        return true;
+    }
+    let passes_partitions_on = (plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || is_coalesce_batches(plan))
+        && plan.fetch().is_none();
+    passes_partitions_on
+        && plan
+            .children()
+            .first()
+            .is_some_and(|child| ends_with_all_partitions(child))
+}
+
+/// Whether `plan` passes on the rows of its inputs as they reach it, without
+/// combining them with other rows and without a fetch (a node with a fetch
+/// stops after a number of rows that pass a filter below it, which depend on
+/// the rows that the filter prunes): a scan, a projection, a filter, a union,
+/// or a merge or repartitioning of partitions, as `crate::sort::try_lower`
+/// judges the nodes between a TopK and the nodes that read its dynamic
+/// filter.
+fn passes_rows_on(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    (plan.is::<DataSourceExec>()
+        || plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<RepartitionExec>())
+        && plan.fetch().is_none()
+}
+
+/// Whether the nodes of `plan` (in its pipelines, see [`pipeline_children`])
+/// have no part that may fail (see [`node_failures`]: also no source that may
+/// fail to read its rows, but for scans of well-formed Parquet files, see
+/// [`source_may_fail`]) and no expression whose errors or results depend on
+/// the rows that it is evaluated on together (see [`depends_on_batches`],
+/// e.g. a volatile function; the scans of files fold that into their
+/// failures, see [`file_scan_failures`]): whichever of their rows a dynamic
+/// filter prunes, the work of these nodes on the others is the same, and
+/// cannot fail.
+fn works_alike_on_any_rows(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let batch_dependent = file_scan_failures(plan).is_none()
+        && Judgement::of_plan(plan.as_ref()).batch_dependent;
+    !batch_dependent
+        && node_failures(plan).is_none()
+        && pipeline_children(plan)
+            .into_iter()
+            .all(works_alike_on_any_rows)
+}
+
+/// `plan`, a sort whose `SortExec` (see [`sort_of_chain`]) is a TopK, with
+/// that `SortExec` replaced by the same TopK with a new dynamic filter, which
+/// no node of its input reads (see `Lowering::try_lower_sort`).
+fn with_unread_topk_filter(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(sort) = plan.downcast_ref::<SortExec>() {
+        let topk = SortExec::new(sort.expr().clone(), Arc::clone(sort.input()))
+            .with_preserve_partitioning(sort.preserve_partitioning())
+            .with_fetch(sort.fetch());
+        return Ok(Arc::new(topk));
+    }
+    let Some(child) = plan.children().into_iter().next() else {
+        return internal_err!("{} is not a sort", plan.name());
+    };
+    let child = with_unread_topk_filter(child)?;
+    Arc::clone(plan).replace_children(vec![child], recompute())
+}
+
+/// `lowered`, the native TopK of a plan whose `SortExec` has a dynamic filter
+/// that no node reads (see [`with_unread_topk_filter`]), updating `filter`,
+/// the dynamic filter of the `SortExec` of the plan that the nodes of its
+/// input read, with the same keys instead: so that they skip the rows that
+/// the threshold of the native TopK rules out. `None` for a TopK by float keys
+/// that runs DataFusion's TopK if its result may differ (see
+/// [`FloatKeyFallback`](crate::sort::FloatKeyFallback)), which would run the
+/// plan whose filter no node reads, and for any other operator.
+fn updating_filter(
+    lowered: &Arc<dyn PhysicalOperator>,
+    filter: Arc<DynamicFilterPhysicalExpr>,
+) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+    let Some(topk) = lowered.downcast_ref::<PhysicalTopK>() else {
+        return Ok(None);
+    };
+    if topk.float_key_fallback().is_some() {
+        return Ok(None);
+    }
+    let mut updating = PhysicalTopK::try_new(
+        Arc::clone(topk.input()),
+        topk.ordering().clone(),
+        topk.k(),
+    )?;
+    if let Some(dynamic_filter) = topk.dynamic_filter() {
+        updating = updating.with_dynamic_filter(TopKDynamicFilter::new(
+            filter,
+            dynamic_filter.keys().to_vec(),
+        ))?;
+    }
+    Ok(Some(Arc::new(updating)))
 }
 
 /// Whether DataFusion may fail to combine the batches of `plan`, a node that
