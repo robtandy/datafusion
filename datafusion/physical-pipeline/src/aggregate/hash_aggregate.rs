@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
-    new_empty_array, new_null_array,
+    make_comparator, new_empty_array, new_null_array,
 };
 use arrow::compute::{
-    SortColumn, SortOptions, concat, filter_record_batch, lexsort_to_indices,
+    SortColumn, SortOptions, concat, filter_record_batch, interleave, lexsort_to_indices,
     sort_to_indices, take_record_batch,
 };
 use arrow::datatypes::{DataType, SchemaRef};
@@ -162,10 +162,7 @@ impl TopK {
     pub(crate) fn select(&self, values: &dyn Array) -> Result<Option<UInt32Array>> {
         let nulls = values.null_count();
         let valid = values.len() - nulls;
-        let null_limit = match self.order {
-            TopKOrder::GroupKey => usize::MAX,
-            TopKOrder::Aggregate => self.limit,
-        };
+        let null_limit = self.null_limit();
         if valid <= self.limit && nulls <= null_limit {
             return Ok(None);
         }
@@ -194,14 +191,99 @@ impl TopK {
     /// distinct groups, that may be among the groups the sort keeps (see
     /// [`Self::select`]).
     pub(crate) fn select_groups(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // The output has the group key followed by the aggregate.
-        let column = match self.order {
-            TopKOrder::GroupKey => 0,
-            TopKOrder::Aggregate => 1,
-        };
-        match self.select(batch.column(column).as_ref())? {
+        match self.select(batch.column(self.column()).as_ref())? {
             Some(indices) => Ok(take_record_batch(&batch, &indices)?),
             None => Ok(batch),
+        }
+    }
+
+    /// The groups of `left` and `right`, outputs of the aggregation for two
+    /// sets of distinct groups (selected by [`Self::select_groups`]), that may
+    /// be among the groups the sort keeps: [`Self::select_groups`] of all of
+    /// them, without concatenating them. Only the selected groups are
+    /// gathered, which DataFusion's top-k aggregation outputs as well, so
+    /// that their strings fit into an array (of 32-bit offsets) whenever its
+    /// do.
+    pub(crate) fn merge_groups(
+        &self,
+        left: &RecordBatch,
+        right: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let (left_values, right_values) =
+            (left.column(self.column()), right.column(self.column()));
+        let options = SortOptions::new(self.descending, false);
+        // The non-null values of either side, the best first.
+        let sorted = |values: &ArrayRef| -> Result<Vec<u32>> {
+            let valid = values.len() - values.null_count();
+            if valid == 0 {
+                return Ok(vec![]);
+            }
+            Ok(sort_to_indices(values, Some(options), Some(valid))?
+                .values()
+                .to_vec())
+        };
+        let (left_sorted, right_sorted) = (sorted(left_values)?, sorted(right_values)?);
+        let compare =
+            make_comparator(left_values.as_ref(), right_values.as_ref(), options)?;
+        // A merge of the sorted sides, up to `limit` rows.
+        let mut rows = vec![];
+        let (mut l, mut r) = (0, 0);
+        while rows.len() < self.limit && (l < left_sorted.len() || r < right_sorted.len())
+        {
+            let from_left = r == right_sorted.len()
+                || (l < left_sorted.len()
+                    && compare(left_sorted[l] as usize, right_sorted[r] as usize)
+                        .is_le());
+            if from_left {
+                rows.push((0, left_sorted[l] as usize));
+                l += 1;
+            } else {
+                rows.push((1, right_sorted[r] as usize));
+                r += 1;
+            }
+        }
+        let nulls = |side: usize, values: &ArrayRef| {
+            (0..values.len())
+                .filter(|&row| values.is_null(row))
+                .map(move |row| (side, row))
+                .collect::<Vec<_>>()
+        };
+        rows.extend(
+            nulls(0, left_values)
+                .into_iter()
+                .chain(nulls(1, right_values))
+                .take(self.null_limit()),
+        );
+        let columns = left
+            .columns()
+            .iter()
+            .zip(right.columns())
+            .map(|(left, right)| Ok(interleave(&[left.as_ref(), right.as_ref()], &rows)?))
+            .collect::<Result<Vec<_>>>()?;
+        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        Ok(RecordBatch::try_new_with_options(
+            left.schema(),
+            columns,
+            &options,
+        )?)
+    }
+
+    /// The column of the output of the aggregation that orders the groups:
+    /// the group key, followed by the aggregate.
+    fn column(&self) -> usize {
+        match self.order {
+            TopKOrder::GroupKey => 0,
+            TopKOrder::Aggregate => 1,
+        }
+    }
+
+    /// The most groups whose value is `NULL` that may be among the groups
+    /// the sort keeps, see [`Self::select`].
+    fn null_limit(&self) -> usize {
+        match self.order {
+            // At most one group has a `NULL` key.
+            TopKOrder::GroupKey => usize::MAX,
+            TopKOrder::Aggregate => self.limit,
         }
     }
 }
@@ -1811,6 +1893,83 @@ mod tests {
         };
         let indices = top_k.select(&strings)?.expect("a selection");
         assert_eq!(indices.values().as_ref(), &[3, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn top_k_merges_the_best_groups_of_two_sets_without_concatenating_them() -> Result<()>
+    {
+        use arrow::array::{AsArray, StringViewArray};
+        use arrow::compute::concat_batches;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8View, true),
+            Field::new("m", DataType::Int64, true),
+        ]));
+        let batch = |keys: &[Option<&str>], values: &[Option<i64>]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringViewArray::from(keys.to_vec())),
+                    Arc::new(Int64Array::from(values.to_vec())),
+                ],
+            )
+        };
+        let left = batch(
+            &[
+                Some("a long key 3"),
+                None,
+                Some("a long key 9"),
+                Some("a long key 5"),
+            ],
+            &[Some(30), Some(1), None, Some(50)],
+        )?;
+        let right = batch(
+            &[
+                Some("a long key 4"),
+                Some("a long key 1"),
+                Some("a long key 8"),
+            ],
+            &[Some(40), None, Some(80)],
+        )?;
+        // The rows of a batch, sorted.
+        let rows = |batch: &RecordBatch| {
+            let mut rows = (0..batch.num_rows())
+                .map(|row| {
+                    let key = batch.column(0).as_string_view();
+                    let value = batch
+                        .column(1)
+                        .as_primitive::<arrow::datatypes::Int64Type>();
+                    (
+                        key.is_valid(row).then(|| key.value(row).to_string()),
+                        value.is_valid(row).then(|| value.value(row)),
+                    )
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        let empty = RecordBatch::new_empty(Arc::clone(&schema));
+        for (order, descending) in [
+            (TopKOrder::GroupKey, false),
+            (TopKOrder::GroupKey, true),
+            (TopKOrder::Aggregate, false),
+            (TopKOrder::Aggregate, true),
+        ] {
+            for limit in [1, 2, 3, 10] {
+                let top_k = TopK {
+                    limit,
+                    descending,
+                    order,
+                };
+                for (left, right) in [(&left, &right), (&right, &left), (&left, &empty)] {
+                    let merged = top_k.merge_groups(left, right)?;
+                    let expected =
+                        top_k.select_groups(concat_batches(&schema, [left, right])?)?;
+                    assert_eq!(rows(&merged), rows(&expected), "{top_k:?}");
+                    assert_eq!(merged.schema(), schema);
+                }
+            }
+        }
         Ok(())
     }
 

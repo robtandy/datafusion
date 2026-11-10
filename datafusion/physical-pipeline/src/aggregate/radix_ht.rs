@@ -83,7 +83,7 @@ use arrow::array::{
     downcast_primitive,
 };
 use arrow::buffer::NullBuffer;
-use arrow::compute::{concat_batches, interleave, take};
+use arrow::compute::{interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
@@ -131,10 +131,17 @@ const PARTITION_HASH: RandomState = RandomState::with_seed(0x8f1b_c3a5_d2e4_7a61
 /// [`RadixLocalState::aggregate`]).
 const BYPASS_RATIO: f64 = 0.75;
 
-/// The bytes of the strings and binaries with 32-bit offsets of the buffered
-/// rows that bypassed a thread-local table at which they are scattered: the
-/// scatter gathers the rows of all buffered chunks into a single array first.
+/// The most bytes of strings and binaries with 32-bit offsets of the rows
+/// that bypassed a thread-local table that are scattered together (see
+/// [`BypassBuffer`]): the scatter gathers the rows of all buffered chunks into
+/// a single array, whose offsets must not overflow.
 const BYPASS_BYTES: usize = 64 << 20;
+
+/// The bytes of strings and binaries with 32-bit offsets of the rows that
+/// bypassed a thread-local table that are scattered together per row of the
+/// initial capacity of the table, up to [`BYPASS_BYTES`] (which the default
+/// capacity reaches).
+const BYPASS_BYTES_PER_ROW: usize = 2 << 10;
 
 /// The sink and source roles of a grouped aggregation, see the
 /// [module documentation](self).
@@ -241,6 +248,9 @@ struct RadixLocalState {
     /// The number of buffered rows that bypassed the table at which they are
     /// scattered.
     bypass_rows: usize,
+    /// The most bytes of strings and binaries with 32-bit offsets of the
+    /// rows that bypassed the table that are scattered together.
+    bypass_bytes: usize,
     /// The partition hashes of the groups being flushed, and their
     /// partitions.
     hashes: Vec<u64>,
@@ -288,7 +298,7 @@ impl RadixLocalState {
         batch: &RecordBatch,
     ) -> Result<()> {
         if let Some(bypass) = &mut self.bypass {
-            bypass.push(spec, batch, &mut self.distinct_flushed)?;
+            bypass.push(spec, global, batch, &mut self.distinct_flushed)?;
             self.flushed += batch.num_rows();
             if bypass.is_full(self.bypass_rows) {
                 bypass.scatter(global)?;
@@ -313,7 +323,7 @@ impl RadixLocalState {
             spec.bypass && num_groups as f64 > BYPASS_RATIO * self.table_rows as f64;
         self.flush(spec, global)?;
         if bypass {
-            self.bypass = Some(BypassBuffer::default());
+            self.bypass = Some(BypassBuffer::new(self.bypass_bytes));
         }
         Ok(())
     }
@@ -371,28 +381,54 @@ fn top_k_values<'a>(top_k: &TopK, states: &'a GroupedStates) -> Result<&'a dyn A
 /// [`evaluate_rows`]), and the sub-partition of every row (see
 /// [`sub_partition_of`]). The rows of many chunks are scattered at once, so
 /// that the final aggregation of a partition aggregates large slices of its
-/// rows.
-#[derive(Debug, Default)]
+/// rows; but the rows of several chunks have at most `max_bytes` bytes of
+/// strings and binaries with 32-bit offsets, which the scatter gathers into
+/// a single array, so that its offsets cannot overflow (a single chunk, whose
+/// arrays hold its bytes already, may have more).
+#[derive(Debug)]
 struct BypassBuffer {
     chunks: Vec<Vec<ArrayRef>>,
     /// The sub-partition of every row, in the order of the chunks.
     partitions: Vec<u8>,
     /// The bytes of the values of the buffered columns with 32-bit offsets.
     offset_bytes: usize,
+    /// The most bytes of the values of the buffered columns with 32-bit
+    /// offsets of several chunks.
+    max_bytes: usize,
     hashes: Vec<u64>,
 }
 
 impl BypassBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            chunks: vec![],
+            partitions: vec![],
+            offset_bytes: 0,
+            max_bytes,
+            hashes: vec![],
+        }
+    }
+
     /// Buffer the input rows of `batch`: evaluate their group keys and the
     /// arguments of the aggregates, hash their keys, and add their hashes to
-    /// `distinct`.
+    /// `distinct`. If the buffered rows would have more than `max_bytes`
+    /// bytes of values with 32-bit offsets with them, the buffered rows are
+    /// scattered to the partitions of `global` first.
     fn push(
         &mut self,
         spec: &AggregateSpec,
+        global: &RadixSinkState,
         batch: &RecordBatch,
         distinct: &mut DistinctEstimate,
     ) -> Result<()> {
         let columns = evaluate_rows(spec, batch)?;
+        let bytes = columns
+            .iter()
+            .map(|column| offset_bytes(column.as_ref()))
+            .sum::<usize>();
+        if !self.chunks.is_empty() && self.offset_bytes + bytes > self.max_bytes {
+            self.scatter(global)?;
+        }
         let keys = &columns[..spec.group_by.expr().len()];
         self.hashes.clear();
         self.hashes.resize(batch.num_rows(), 0);
@@ -400,19 +436,15 @@ impl BypassBuffer {
         self.partitions
             .extend(self.hashes.iter().map(|&hash| sub_partition_of(hash)));
         distinct.add(&self.hashes);
-        self.offset_bytes += columns
-            .iter()
-            .map(|column| offset_bytes(column.as_ref()))
-            .sum::<usize>();
+        self.offset_bytes += bytes;
         self.chunks.push(columns);
         Ok(())
     }
 
     /// Whether the buffered rows are to be scattered: once there are `rows`
-    /// of them, or they have [`BYPASS_BYTES`] bytes of values with 32-bit
-    /// offsets.
+    /// of them, or they have `max_bytes` bytes of values with 32-bit offsets.
     fn is_full(&self, rows: usize) -> bool {
-        self.partitions.len() >= rows || self.offset_bytes >= BYPASS_BYTES
+        self.partitions.len() >= rows || self.offset_bytes >= self.max_bytes
     }
 
     /// Scatter the buffered rows to the partitions of `global`.
@@ -420,6 +452,12 @@ impl BypassBuffer {
         if self.chunks.is_empty() {
             return Ok(());
         }
+        debug_assert!(
+            self.chunks.len() == 1 || self.offset_bytes <= self.max_bytes,
+            "{} chunks with {} bytes of values with 32-bit offsets",
+            self.chunks.len(),
+            self.offset_bytes
+        );
         global.add_rows(std::mem::take(&mut self.chunks), &self.partitions)?;
         self.partitions.clear();
         self.offset_bytes = 0;
@@ -446,7 +484,9 @@ fn offset_bytes(array: &dyn Array) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableCapacity {
     /// The initial capacity. The rows that bypass the table are scattered in
-    /// batches of four times as many rows.
+    /// batches of four times as many rows, and of at most
+    /// [`BYPASS_BYTES_PER_ROW`] bytes of strings and binaries with 32-bit
+    /// offsets per row of it (up to [`BYPASS_BYTES`]).
     pub(crate) initial: usize,
     /// The capacity a table can grow to.
     pub(crate) maximum: usize,
@@ -502,10 +542,7 @@ impl TopKGroups {
             let output = self.top_k.select_groups(output)?;
             let mut groups = self.groups.lock();
             let merged = match groups.take() {
-                Some(groups) => self.top_k.select_groups(concat_batches(
-                    &output.schema(),
-                    [&groups, &output],
-                )?)?,
+                Some(groups) => self.top_k.merge_groups(&groups, &output)?,
                 None => output,
             };
             *groups = Some(merged);
@@ -549,6 +586,9 @@ impl RadixHashAggregate {
             buffer: InputBuffer::default(),
             bypass: None,
             bypass_rows: initial.saturating_mul(4),
+            bypass_bytes: initial
+                .saturating_mul(BYPASS_BYTES_PER_ROW)
+                .min(BYPASS_BYTES),
             hashes: vec![],
             partitions: vec![],
         }))
@@ -1661,6 +1701,103 @@ mod tests {
         Ok(())
     }
 
+    /// The schema of keys `k` and binaries `b`.
+    fn binary_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("b", DataType::Binary, false),
+        ]))
+    }
+
+    /// The sink of `COUNT(b) GROUP BY k`, with tables of capacity `capacity`.
+    fn count_binaries_by_key(capacity: TableCapacity) -> Result<Sink> {
+        let schema = binary_schema();
+        let count = AggregateExprBuilder::new(count_udaf(), vec![col("b", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("count(b)")
+            .build()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![Arc::new(count)],
+            vec![None],
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+            schema,
+        )?;
+        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
+            aggregate.input(),
+        )));
+        let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+        assert!(spec.bypass);
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
+        Ok((spec, local, RadixHashAggregate::global_sink_state()?))
+    }
+
+    /// A batch of keys `keys`, with binaries of `len` bytes.
+    fn binary_batch(keys: std::ops::Range<i64>, len: usize) -> Result<RecordBatch> {
+        let values = keys.clone().map(|key| vec![key as u8; len]);
+        Ok(RecordBatch::try_new(
+            binary_schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(keys)),
+                Arc::new(arrow::array::BinaryArray::from_iter_values(values)),
+            ],
+        )?)
+    }
+
+    #[test]
+    fn bypassed_rows_are_scattered_before_chunks_whose_bytes_they_cannot_take()
+    -> Result<()> {
+        // Tables of 16 groups: the binaries of several chunks of rows that
+        // bypass them are scattered together while they have at most 32 KiB.
+        let mut sink = count_binaries_by_key(SMALL_TABLES)?;
+        let max_bytes = 16 * BYPASS_BYTES_PER_ROW;
+        let sink_batch = |sink: &mut Sink, batch: RecordBatch| -> Result<()> {
+            let (spec, local, global) = sink;
+            RadixHashAggregate::sink(spec, batch, global.as_ref(), local.as_mut())
+        };
+        let buffered = |sink: &Sink| {
+            let bypass = local_state(sink).bypass.as_ref().expect("bypassed rows");
+            assert_eq!(bypass.max_bytes, max_bytes);
+            (bypass.chunks.len(), bypass.offset_bytes)
+        };
+        // Distinct keys fill the table: the next rows bypass it.
+        sink_batch(&mut sink, binary_batch(0..20, 1)?)?;
+        assert_eq!(buffered(&sink), (0, 0));
+        sink_batch(&mut sink, binary_batch(100..110, 1_000)?)?;
+        assert_eq!(buffered(&sink), (1, 10_000));
+        // Together with the buffered rows, more than 32 KiB: the buffered rows
+        // are scattered first.
+        sink_batch(&mut sink, binary_batch(200..202, 12_000)?)?;
+        assert_eq!(buffered(&sink), (1, 24_000));
+        // More than 32 KiB on their own: scattered on their own.
+        sink_batch(&mut sink, binary_batch(300..301, 40_000)?)?;
+        assert_eq!(buffered(&sink), (0, 0));
+        sink_batch(&mut sink, binary_batch(400..410, 100)?)?;
+        assert_eq!(buffered(&sink), (1, 1_000));
+        // Every scattered set of rows has the rows of a single chunk here.
+        let global = sink.2.downcast_ref::<RadixSinkState>().unwrap();
+        let mut scattered = 0;
+        for partition in &global.partitions {
+            for columns in partition.lock().rows.iter().flatten() {
+                let keys = columns[0].as_primitive::<Int64Type>().values();
+                let chunk = |key: i64| key / 100;
+                assert!(keys.iter().all(|&key| chunk(key) == chunk(keys[0])));
+                scattered += keys.len();
+            }
+        }
+        assert_eq!(scattered, 13);
+        let expected = (0..20)
+            .chain(100..110)
+            .chain(200..202)
+            .chain(300..301)
+            .chain(400..410)
+            .map(|key| (key, 1))
+            .collect();
+        assert_eq!(finish(sink)?, expected);
+        Ok(())
+    }
+
     #[test]
     fn rows_of_threads_whose_groups_repeat_do_not_bypass_their_tables() -> Result<()> {
         // Every key twice per batch: a full table has half as many groups as
@@ -1997,6 +2134,139 @@ mod tests {
                 assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
             }
         }
+        Ok(())
+    }
+
+    /// Register table `long`, of a single partition: keys `k`, binaries `b`
+    /// and strings `s` of 1 to 40,000 bytes, and values `v`, in batches of
+    /// distinct keys that fill a thread-local table of 16 groups first, and of
+    /// binaries and strings of more than 32 KiB together (or on their own).
+    fn register_long(ctx: &SessionContext) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("b", DataType::Binary, true),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let batch = |keys: std::ops::Range<i64>, len: usize| -> Result<RecordBatch> {
+            let valid = |key: i64| key % 7 != 3;
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(
+                    keys.clone().map(|key| (key % 11 != 5).then_some(key)),
+                )),
+                Arc::new(arrow::array::BinaryArray::from_iter(
+                    keys.clone()
+                        .map(|key| valid(key).then(|| vec![(key % 251) as u8; len])),
+                )),
+                Arc::new(StringArray::from_iter(keys.clone().map(|key| {
+                    valid(key + 1).then(|| format!("{key:05}{}", "s".repeat(len)))
+                }))),
+                Arc::new(Int64Array::from_iter_values(keys.map(|key| key * 3 - 100))),
+            ];
+            Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+        };
+        let batches = vec![
+            batch(0..40, 1)?,
+            batch(100..110, 1_000)?,
+            batch(200..202, 12_000)?,
+            batch(300..301, 40_000)?,
+            batch(400..450, 10)?,
+            batch(0..12, 3_000)?,
+            batch(500..520, 2_000)?,
+            batch(600..603, 20_000)?,
+        ];
+        let table = datafusion::datasource::MemTable::try_new(schema, vec![batches])?;
+        ctx.register_table("long", Arc::new(table))?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bypassed_rows_of_long_values_are_aggregated_like_datafusion() -> Result<()> {
+        let queries = [
+            "SELECT k, COUNT(b), MAX(s), SUM(v) FROM long GROUP BY k",
+            "SELECT k, MIN(b), MAX(b), COUNT(*) FROM long GROUP BY k",
+            "SELECT s, COUNT(*), MIN(k), COUNT(b) FROM long GROUP BY s",
+        ];
+        let tables = [
+            SMALL_TABLES,
+            TableCapacity {
+                initial: 64,
+                maximum: 256,
+            },
+        ];
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            let ctx = datafusion_context(config.clone());
+            register_long(&ctx)?;
+            for sql in queries {
+                for capacity in tables {
+                    for threads in [1, 4] {
+                        assert_bypassed_parity(&ctx, sql, capacity, threads).await?;
+                    }
+                }
+                let setup = async |ctx: &SessionContext| register_long(ctx);
+                assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Register table `wide`, of a single partition: 32,768 distinct keys
+    /// `k` with short binaries `b`, which fill the thread-local table of a
+    /// thread (whose rows then bypass it), followed by a chunk of a binary of
+    /// 50,000,000 bytes and one of 2,147,000,000 bytes: more than a `Binary`
+    /// array can hold together.
+    fn huge_binaries() -> Result<(SchemaRef, Vec<Vec<RecordBatch>>)> {
+        use arrow::array::BinaryArray;
+        use arrow::buffer::{Buffer, OffsetBuffer};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("b", DataType::Binary, false),
+        ]));
+        let binary = |len: usize, byte: u8| {
+            let offsets = OffsetBuffer::new(vec![0, len as i32].into());
+            BinaryArray::new(offsets, Buffer::from_vec(vec![byte; len]), None)
+        };
+        let batch = |key: i64, len: usize| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![key])),
+                    Arc::new(binary(len, key as u8)),
+                ],
+            )
+        };
+        let short = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..32_768)),
+                Arc::new(BinaryArray::from_iter_values((0..32_768).map(|_| b"x"))),
+            ],
+        )?;
+        let partitions = vec![vec![
+            short,
+            batch(40_000, 50_000_000)?,
+            batch(40_001, 2_147_000_000)?,
+        ]];
+        Ok((schema, partitions))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "allocates more than 4 GiB"]
+    async fn bypassed_rows_of_huge_binaries_are_aggregated_like_datafusion() -> Result<()>
+    {
+        let (schema, partitions) = huge_binaries()?;
+        let setup = async |ctx: &SessionContext| {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                partitions.clone(),
+            )?;
+            ctx.register_table("wide", Arc::new(table))?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT k, COUNT(b) FROM wide GROUP BY k";
+        assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
     }
 
