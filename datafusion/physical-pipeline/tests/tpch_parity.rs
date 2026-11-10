@@ -2170,13 +2170,14 @@ async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
 /// DataFusion's results and errors exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
-    /// An operator with a part that may fail with other errors than arithmetic
-    /// overflows (the casts of decimals of Q11, whose errors name the values
-    /// that fail), which the native operators would evaluate on the chunks of
-    /// a partition in parallel, on several threads, so that another row than
-    /// in DataFusion could fail first (see `PipelineQueryPlanner`; the parts
-    /// that can only fail with arithmetic overflows, e.g. the decimal
-    /// arithmetic of Q1, are evaluated on any number of threads).
+    /// An operator with a part that may fail with other errors than overflows
+    /// (e.g. a cast of strings into numbers, whose errors name the values that
+    /// fail), which the native operators would evaluate on the chunks of a
+    /// partition in parallel, on several threads, so that another row than in
+    /// DataFusion could fail first (see `PipelineQueryPlanner`; the parts that
+    /// can only fail with overflows, e.g. the decimal arithmetic of Q1 and the
+    /// casts of the sums of Q11 into decimals, are evaluated on any number of
+    /// threads).
     ParallelErrors,
     /// `PhysicalProjection::supports_projection_exec` refuses the projection:
     /// the classification of errors judges that its parts may fail with
@@ -2229,10 +2230,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
         (9, 17, 17, 0, &[]),
         (10, 14, 14, 0, &[]),
-        (11, 4, 6, 24, &[
-            ("FilterExec", Why::ParallelErrors),
-            ("ProjectionExec", Why::ParallelErrors),
-        ]),
+        (11, 23, 23, 0, &[]),
         (12, 8, 8, 0, &[]),
         (13, 10, 10, 0, &[]),
         (14, 8, 8, 0, &[]),
@@ -2256,10 +2254,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
         (9, 17, 17, 0, &[]),
         (10, 14, 14, 0, &[]),
-        (11, 4, 6, 26, &[
-            ("FilterExec", Why::ParallelErrors),
-            ("ProjectionExec", Why::ParallelErrors),
-        ]),
+        (11, 23, 23, 0, &[]),
         (12, 8, 8, 0, &[]),
         (13, 10, 10, 0, &[]),
         (14, 8, 8, 0, &[]),
@@ -2349,6 +2344,67 @@ async fn tpch_queries_are_lowered_as_listed() -> Result<()> {
         differences.len(),
         differences.join("\n")
     );
+    Ok(())
+}
+
+/// The scalar subqueries of TPC-H Q11, Q15 and Q22 (their
+/// `ScalarSubqueryExec`s) run natively, with the filters and projections that
+/// compute and read their results (the casts with which Q11 compares the sums
+/// of its groups with its result, which only fail on the sums that overflow
+/// the decimal): on 4 threads, over both sources, these queries run without
+/// `BridgeOperator`s in sessions that trust DataFusion's built-in functions
+/// (the `substr` of Q22, see `TrustedFunctions`), with the results of
+/// DataFusion. But for the hash join of Q15 over Parquet, whose dynamic filter
+/// prunes the reads of the Parquet scan of `lineitem` below it, whose decimal
+/// arithmetic may overflow on the rows that DataFusion skips (which
+/// `PhysicalHashJoin::try_lower` leaves to DataFusion): without the dynamic
+/// filter, it is native too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scalar_subqueries_of_tpch_are_native() -> Result<()> {
+    use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
+    let trusted = TrustedFunctions::new(&datafusion::functions::all_default_functions());
+    let config = test_session_config().with_option_extension(trusted);
+    let mut without_join_filters = config.clone();
+    without_join_filters
+        .options_mut()
+        .optimizer
+        .enable_join_dynamic_filter_pushdown = false;
+    for source in [Source::memtable(), Source::parquet()] {
+        let setup = async |ctx: &SessionContext| source.register(ctx).await;
+        for query in [11, 15, 22] {
+            let sql = tpch::query(query);
+            let parquet_join = query == 15 && matches!(source, Source::Parquet(_));
+            let configs = if parquet_join {
+                vec![
+                    (config.clone(), false),
+                    (without_join_filters.clone(), true),
+                ]
+            } else {
+                vec![(config.clone(), true)]
+            };
+            for (config, native) in configs {
+                let (expected, actual) = run_engines(sql, config, &setup).await?;
+                let context = format!("Q{query} over {}", source.name());
+                compare_outputs(&expected, &actual)
+                    .unwrap_or_else(|message| panic!("{context}: {message}"));
+                let rows = actual
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>();
+                assert!(rows > 0, "{context} returns no rows");
+                let root = actual
+                    .plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .expect("a pipeline plan")
+                    .operator();
+                assert_eq!(root.name(), "PhysicalScalarSubquery", "{context}");
+                let lowering = Lowering::of(&actual.plan)?;
+                let roots: &[&str] = if native { &[] } else { &["HashJoinExec"] };
+                assert_eq!(lowering.roots, roots, "{context}: {:?}", lowering.bridged);
+            }
+        }
+    }
     Ok(())
 }
 

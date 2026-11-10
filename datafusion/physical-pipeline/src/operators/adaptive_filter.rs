@@ -56,7 +56,10 @@
 //! decimals (which Arrow computes with overflow checks) only fail with an
 //! arithmetic overflow, so chains of them, e.g.
 //! `l_extendedprice * (1 - l_discount) * (1 + l_tax)`, do not depend on the
-//! batches (see [`Failures`]).
+//! batches (see [`Failures`]). Nor do the casts of numbers into decimals, which
+//! only fail on the values that overflow the decimal, e.g. the casts with which
+//! TPC-H Q11 compares the sums of its groups with the result of its scalar
+//! subquery.
 //!
 //! Functions are opaque, but for the built-in scalar functions of DataFusion
 //! whose implementations are known (e.g. `date_part`, `substr` or `abs`, see
@@ -88,7 +91,8 @@ use std::time::Duration;
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
 use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
-use datafusion_common::tree_node::TreeNode;
+use datafusion_common::metadata::FieldMetadata;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, ScalarValue, config_err};
 use datafusion_expr::{ColumnarValue, Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{
@@ -521,8 +525,10 @@ fn value_fallibility(
 /// evaluated on rows. Unlike a literal, its value is not known before the
 /// execution: it may have any number of bytes (see `is_broadcast_constant`),
 /// and the classification cannot evaluate it (before the subquery ran, it
-/// fails), so an expression with a result that may fail is judged to fail
-/// without rows (see `fails_without_rows`).
+/// fails), so it judges whether an expression with a result fails without
+/// rows with a null of the type of the result, where the value of the result
+/// makes no difference, and otherwise judges that it does (see
+/// `with_populated_subquery_results`).
 fn is_subquery_result(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.is::<ScalarSubqueryExpr>()
 }
@@ -1325,7 +1331,9 @@ fn is_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
 }
 
 /// Whether evaluating `expr` on an empty batch of `schema` fails (or,
-/// conservatively, whether there is no array of a type of `schema`).
+/// conservatively, whether there is no array of a type of `schema`), once the
+/// results of the scalar subqueries that it reads are populated (see
+/// [`with_populated_subquery_results`]).
 fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     if must_not_be_evaluated(expr)
         || !schema
@@ -1335,10 +1343,100 @@ fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     {
         return true;
     }
+    let Some(expr) = with_populated_subquery_results(expr, schema) else {
+        return true;
+    };
     let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
     expr.evaluate(&batch)
         .and_then(|value| value.into_array(0))
         .is_err()
+}
+
+/// `expr`, to be evaluated on an empty batch of `schema` as DataFusion
+/// evaluates it once the results of its scalar subqueries are populated (see
+/// `is_subquery_result`), before any row: with every result (which fails
+/// before its subquery ran) replaced by a null of its type, or `None` if a
+/// part of `expr` may fail on the value of a result without rows, which a null
+/// does not tell.
+///
+/// A result is a scalar. On a batch without rows, a part of `expr` computes
+/// on the value of a result only if an operand of the part with the result
+/// evaluates to a scalar (a constant, see `is_constant_tree`, or an operand
+/// that may evaluate to a scalar, see `may_change_shape`): e.g. `result * 2`,
+/// or `s ~ result`, whose pattern Arrow compiles before it matches any row.
+/// Whether such a part fails without rows depends on the value of the result
+/// if it may fail on the values of its operands (see `value_fallibility`),
+/// but for arithmetic on numbers with an operand that is an array on every
+/// batch, which Arrow applies to every row of the array (see
+/// `applies_to_rows`): without rows, to none, e.g.
+/// `CAST(x AS DECIMAL(19, 6)) - result`. The parts that cannot fail on the
+/// values of their operands, e.g. the comparisons of TPC-H Q11, Q15 and Q22
+/// with the results of their subqueries, can only fail on their types, which
+/// a null of the type of the result tells.
+fn with_populated_subquery_results(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let reads_results = |expr: &Arc<dyn PhysicalExpr>| {
+        expr.exists(|expr| Ok(is_subquery_result(expr)))
+            .unwrap_or(true)
+    };
+    if !reads_results(expr) {
+        return Some(Arc::clone(expr));
+    }
+    let computes_on_results = expr.exists(|part| {
+        let on_scalar_results = part.children().into_iter().any(|operand| {
+            reads_results(operand)
+                && (is_constant_tree(operand) || may_change_shape(operand))
+        });
+        Ok(on_scalar_results
+            && value_fallibility(part, schema, 0) != Fallibility::Infallible
+            && !applies_to_rows(part, schema))
+    });
+    if computes_on_results.unwrap_or(true) {
+        return None;
+    }
+    let populated = Arc::clone(expr).transform_up(|expr| {
+        if !is_subquery_result(&expr) {
+            return Ok(Transformed::no(expr));
+        }
+        let field = expr.return_field(schema)?;
+        let metadata = FieldMetadata::new_from_field(&field);
+        let null = Literal::new_with_metadata(
+            ScalarValue::try_from(field.data_type())?,
+            (!metadata.is_empty()).then_some(metadata),
+        );
+        Ok(Transformed::yes(Arc::new(null) as Arc<dyn PhysicalExpr>))
+    });
+    populated.ok().map(|populated| populated.data)
+}
+
+/// Whether `part` is arithmetic on numbers (`+`, `-`, `*`, `/` or `%` of
+/// integers, floating point numbers or decimals) with an operand that is an
+/// array on every batch (neither a constant, see `is_constant_tree`, nor an
+/// expression that may evaluate to a scalar, see `may_change_shape`): Arrow
+/// applies it to every row of the array, with the value of the other operand
+/// if that is a scalar (see `arithmetic_op`), so it computes nothing on a
+/// batch without rows, whatever that value.
+fn applies_to_rows(part: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let Some(binary) = part.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    let operands = [binary.left(), binary.right()];
+    matches!(
+        binary.op(),
+        Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+    ) && operands.iter().all(|operand| {
+        operand.data_type(schema).is_ok_and(|data_type| {
+            data_type.is_integer() || data_type.is_floating() || data_type.is_decimal()
+        })
+    }) && operands
+        .iter()
+        .any(|operand| !is_constant_tree(operand) && !may_change_shape(operand))
 }
 
 /// Whether `binary` wraps on overflow instead of failing (DataFusion's
@@ -1579,6 +1677,22 @@ fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
 /// divisor is not `0` (see `divides_by_non_zero`), e.g.
 /// `CASE WHEN b <> 0 THEN a / b END`.
 ///
+/// The casts of numbers into decimals (see `casts_only_on_overflows`) fail
+/// likewise only on the rows whose values overflow, whatever the batches: on
+/// the values that the decimal cannot hold, e.g. the sums of the groups of
+/// TPC-H Q11, which it casts into the type in which it compares them with the
+/// result of its scalar subquery, `CAST(sum(...) AS Decimal128(38, 15))`.
+/// Arrow reports the overflow of a value whose rescaled integer overflows the
+/// integer of the decimal as a cast error (`Cannot cast to Decimal128(38, 15).
+/// Overflowing on ...`), and of a value that only exceeds the precision of the
+/// decimal as an invalid argument (`... is too large to store in a Decimal128
+/// of precision 38 ...`): as the arithmetic overflow that a pipeline raises
+/// first may be of another row than in DataFusion, and name other values, the
+/// overflow of a cast may be of another row, and so be reported as the other
+/// one, but it is the overflow of a value of the cast. It is not an arithmetic
+/// overflow, though: if such casts and other parts may fail, which error comes
+/// first depends on the batches.
+///
 /// And a pipeline evaluates the chunks of a partition of DataFusion on
 /// several threads, so it raises the error of the chunk that fails first,
 /// which may be any chunk that fails, while DataFusion raises the error of the
@@ -1593,11 +1707,14 @@ pub struct Failures {
     /// The number of parts that may fail.
     parts: usize,
     /// The number of the parts that may fail with other errors than arithmetic
-    /// overflows.
+    /// overflows and overflows of casts into decimals.
     others: usize,
     /// The number of the parts that may fail with different kinds of errors
     /// on different rows.
     mixed: usize,
+    /// The number of the parts that can only fail on the values that overflow
+    /// the decimals that they cast them into (see `casts_only_on_overflows`).
+    casts: usize,
 }
 
 impl Failures {
@@ -1606,6 +1723,7 @@ impl Failures {
         parts: 0,
         others: 0,
         mixed: 0,
+        casts: 0,
     };
 
     /// A part that can only fail with arithmetic overflows.
@@ -1613,6 +1731,16 @@ impl Failures {
         parts: 1,
         others: 0,
         mixed: 0,
+        casts: 0,
+    };
+
+    /// A cast into a decimal that can only fail on the values that overflow
+    /// the decimal (see `casts_only_on_overflows`).
+    pub const CAST_OVERFLOW: Self = Self {
+        parts: 1,
+        others: 0,
+        mixed: 0,
+        casts: 1,
     };
 
     /// A part that may fail with another error, the same on all rows.
@@ -1620,6 +1748,7 @@ impl Failures {
         parts: 1,
         others: 1,
         mixed: 0,
+        casts: 0,
     };
 
     /// A part that may fail with different kinds of errors on different rows,
@@ -1628,6 +1757,7 @@ impl Failures {
         parts: 1,
         others: 1,
         mixed: 1,
+        casts: 0,
     };
 
     /// The number of parts that may fail.
@@ -1640,20 +1770,24 @@ impl Failures {
         self.parts == 0
     }
 
-    /// Whether all parts that may fail can only fail with arithmetic
-    /// overflows (also if no part may fail).
+    /// Whether all parts that may fail can only fail with overflows:
+    /// arithmetic overflows, or overflows of the values that they cast into
+    /// decimals (also if no part may fail).
     pub fn only_overflows(&self) -> bool {
         self.others == 0
     }
 
     /// Whether which error DataFusion raises first may depend on the order in
     /// which it evaluates the parts, and so on its batches: several parts may
-    /// fail, not all of them only with arithmetic overflows. Or which kind of
-    /// error a pipeline raises first may depend on the order in which its
-    /// threads evaluate the chunks of a partition: a part may fail with
-    /// different kinds of errors on different rows.
+    /// fail, not all of them only with arithmetic overflows, or not all of
+    /// them only with overflows of casts into decimals. Or which kind of error
+    /// a pipeline raises first may depend on the order in which its threads
+    /// evaluate the chunks of a partition: a part may fail with different
+    /// kinds of errors on different rows.
     pub fn order_matters(&self) -> bool {
-        (self.parts > 1 && self.others > 0) || self.mixed > 0
+        (self.parts > 1 && self.others > 0)
+            || self.mixed > 0
+            || (self.casts > 0 && self.parts > self.casts)
     }
 
     /// The parts of `self` and of `other`.
@@ -1663,6 +1797,7 @@ impl Failures {
             parts: self.parts.saturating_add(other.parts),
             others: self.others.saturating_add(other.others),
             mixed: self.mixed.saturating_add(other.mixed),
+            casts: self.casts.saturating_add(other.casts),
         }
     }
 }
@@ -1719,6 +1854,9 @@ fn failures_where(
             Fallibility::Infallible => Failures::NONE,
             Fallibility::PerRow if fails_only_on_overflows(expr, schema, non_zero) => {
                 Failures::OVERFLOW
+            }
+            Fallibility::PerRow if casts_only_on_overflows(expr, schema) => {
+                Failures::CAST_OVERFLOW
             }
             Fallibility::PerRow if !fails_with_one_kind(expr, schema) => Failures::MIXED,
             _ => Failures::ANY,
@@ -1942,6 +2080,31 @@ fn fails_only_on_overflows(
         _ => false,
     };
     overflows && same_numbers && !fails_on_operand_types(expr, schema)
+}
+
+/// Whether `expr`, which may fail on some rows (and not whenever it is
+/// evaluated, see [`Fallibility::Uniform`]), is a cast of numbers (integers,
+/// floating point numbers or decimals, not dictionaries of them) into a
+/// decimal, which can only fail on the values that overflow the decimal (see
+/// [`Failures`]): Arrow casts every value that is not null on its own (see
+/// `cast_integer_to_decimal`, `cast_floating_point_to_decimal` and
+/// `cast_decimal_to_decimal`), and fails on the values whose rescaled integers
+/// overflow the integer of the decimal (`Overflowing on`, also the floating
+/// point numbers that are not finite), or exceed its precision (`too large to
+/// store` or `too small to store`), whatever the other rows. If Arrow
+/// supports the types (see [`fails_on_operand_types`]: e.g. it fails to
+/// rescale decimals by more digits than their integers hold whenever it casts
+/// them).
+fn casts_only_on_overflows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let Some(cast) = expr.downcast_ref::<CastExpr>() else {
+        return false;
+    };
+    let Ok(from) = cast.expr().data_type(schema) else {
+        return false;
+    };
+    (from.is_integer() || from.is_floating() || from.is_decimal())
+        && cast.cast_type().is_decimal()
+        && !fails_on_operand_types(expr, schema)
 }
 
 /// Whether `expr` itself, which may fail on some rows (see
@@ -4075,12 +4238,109 @@ mod tests {
     }
 
     #[test]
+    fn casts_of_numbers_into_decimals_only_overflow() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sum", DataType::Decimal128(36, 2), true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("n", DataType::Int64, true),
+            Field::new("u", DataType::UInt64, true),
+            Field::new("big", DataType::Decimal256(50, 2), true),
+            Field::new("p", DataType::Decimal128(15, 2), true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let cast = |column: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
+            Arc::new(CastExpr::new(physical_expr(column, &schema), to, None))
+        };
+        // The casts of TPC-H Q11 (of the sums of its groups, and of a floating
+        // point number, into the type in which it compares them), and of
+        // integers and decimals into decimals that may not hold their values.
+        for expr in [
+            cast("sum", DataType::Decimal128(38, 15)),
+            cast("x", DataType::Decimal128(38, 15)),
+            cast("n", DataType::Decimal128(10, 2)),
+            cast("u", DataType::Decimal128(19, 0)),
+            cast("big", DataType::Decimal128(38, 2)),
+            cast("p", DataType::Decimal128(5, 2)),
+            cast("p", DataType::Decimal64(15, 4)),
+        ] {
+            assert_eq!(fallibility(&expr, &schema), Fallibility::PerRow, "{expr}");
+            assert_eq!(failures(&expr, &schema), Failures::CAST_OVERFLOW, "{expr}");
+            assert!(!depends_on_batches(&expr, &schema), "{expr}");
+        }
+        // Not the casts of strings, which may fail to parse them.
+        let parsed = cast("s", DataType::Decimal128(15, 2));
+        assert!(!failures(&parsed, &schema).only_overflows());
+        assert!(depends_on_batches(&parsed, &schema));
+        // Their overflows are not arithmetic overflows: with other parts that
+        // may fail (but such casts), which error comes first depends on the
+        // batches.
+        for (expr, order_matters) in [
+            (
+                "CAST(sum AS DECIMAL(38, 15)) > CAST(x AS DECIMAL(38, 15))",
+                false,
+            ),
+            ("CAST(p * p AS DECIMAL(10, 2))", true),
+            ("CAST(p AS DECIMAL(5, 2)) + p * p", true),
+            ("CAST(n AS DECIMAL(10, 2)) > 10 / n", true),
+        ] {
+            let expr = physical_expr(expr, &schema);
+            let failures = failures(&expr, &schema);
+            assert!(failures.parts() > 1, "{expr}");
+            assert!(failures.only_overflows() || order_matters, "{expr}");
+            assert_eq!(failures.order_matters(), order_matters, "{expr}");
+            assert_eq!(depends_on_batches(&expr, &schema), order_matters, "{expr}");
+        }
+        let casts = Failures::CAST_OVERFLOW;
+        assert!(casts.only_overflows() && !casts.order_matters());
+        assert!(!casts.and(casts).order_matters());
+        assert!(casts.and(Failures::OVERFLOW).order_matters());
+        assert!(casts.and(Failures::ANY).order_matters());
+        // Arrow casts every value that is not null on its own, and fails on
+        // those that overflow the decimal: with a cast error if the rescaled
+        // value overflows the integer of the decimal, and with an invalid
+        // argument if it only exceeds its precision.
+        let sums = Arc::new(Schema::new(vec![schema.field(0).clone()]));
+        let q11: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
+            Arc::new(Column::new("sum", 0)),
+            DataType::Decimal128(38, 15),
+            None,
+        ));
+        let cast_sums = |values: Vec<Option<i128>>| {
+            let values = arrow::array::Decimal128Array::from(values)
+                .with_precision_and_scale(36, 2)
+                .unwrap();
+            let batch =
+                RecordBatch::try_new(Arc::clone(&sums), vec![Arc::new(values)]).unwrap();
+            q11.evaluate(&batch).and_then(|value| value.into_array(3))
+        };
+        let fitting = 10_i128.pow(24);
+        assert!(cast_sums(vec![Some(fitting), None, Some(-fitting)]).is_ok());
+        for (value, cast_error) in [(10_i128.pow(25), false), (10_i128.pow(30), true)] {
+            let error = cast_sums(vec![Some(1), Some(value), None]).unwrap_err();
+            let overflow = match error.find_root() {
+                datafusion_common::DataFusionError::ArrowError(error, _) => match **error
+                {
+                    arrow::error::ArrowError::CastError(ref message) => {
+                        cast_error && message.contains("Overflowing on")
+                    }
+                    arrow::error::ArrowError::InvalidArgumentError(ref message) => {
+                        !cast_error && message.contains("too large to store")
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            assert!(overflow, "{value}: {error:?}");
+        }
+    }
+
+    #[test]
     fn scalar_subquery_results_are_constants() {
         use datafusion_expr::physical_planning_context::{
             ScalarSubqueryResults, SubqueryIndex,
         };
         let schema = tpch_schema();
-        let results = ScalarSubqueryResults::new(2);
+        let results = ScalarSubqueryResults::new(3);
         let result = |data_type: DataType, index: usize| -> Arc<dyn PhysicalExpr> {
             Arc::new(ScalarSubqueryExpr::new(
                 data_type,
@@ -4104,23 +4364,73 @@ mod tests {
         ));
         assert_eq!(fallibility(&filter, &schema), Fallibility::Infallible);
         assert!(!depends_on_batches(&filter, &schema));
-        // Arithmetic with it only overflows, but the classification does not
-        // evaluate it (before the subquery ran, it fails): whether an
-        // expression with a result that may fail fails on the empty batches
-        // that DataFusion evaluates it on, which the native operators do not,
-        // is not known.
+        // E.g. the filter of TPC-H Q11, which casts the sums of its groups
+        // into the type of the result to compare them: a cast that only fails
+        // on the sums that overflow the decimal, on their rows, and so on no
+        // empty batch.
+        let sums =
+            Schema::new(vec![Field::new("sum", DataType::Decimal128(36, 2), true)]);
+        let threshold = result(DataType::Decimal128(38, 15), 2);
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(CastExpr::new(
+                Arc::new(Column::new("sum", 0)),
+                DataType::Decimal128(38, 15),
+                None,
+            )),
+            Operator::Gt,
+            Arc::clone(&threshold),
+        ));
+        assert_eq!(failures(&filter, &sums), Failures::CAST_OVERFLOW);
+        assert!(!depends_on_batches(&filter, &sums));
+        // Arithmetic with it only overflows. Evaluating it fails before the
+        // subquery ran, but once it ran, Arrow subtracts the result from every
+        // row of the batch, which computes nothing on the empty batches that
+        // DataFusion evaluates it on (and the native operators do not).
         let difference: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             physical_expr("CAST(l_quantity AS DECIMAL(19, 6))", &schema),
             Operator::Minus,
             Arc::clone(&average),
         ));
         assert!(failures(&difference, &schema).only_overflows());
-        assert!(depends_on_batches(&difference, &schema));
+        assert!(!depends_on_batches(&difference, &schema));
         assert!(
             average
                 .evaluate(&RecordBatch::new_empty(Arc::clone(&schema)))
                 .is_err()
         );
+        // But a part that may fail on the value of a result, which it computes
+        // on whatever the rows, also without any, fails on empty batches
+        // depending on that value: arithmetic on results only, a cast of a
+        // result that may overflow, or a pattern, which Arrow compiles before
+        // it matches any row.
+        for computed in [
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&average),
+                Operator::Multiply,
+                Arc::clone(&average),
+            )) as Arc<dyn PhysicalExpr>,
+            Arc::new(CastExpr::new(
+                Arc::clone(&average),
+                DataType::Decimal128(5, 2),
+                None,
+            )),
+            Arc::new(BinaryExpr::new(
+                physical_expr("s", &schema),
+                Operator::RegexMatch,
+                Arc::clone(&name),
+            )),
+        ] {
+            assert_ne!(
+                fallibility(&computed, &schema),
+                Fallibility::Infallible,
+                "{computed}"
+            );
+            assert!(depends_on_batches(&computed, &schema), "{computed}");
+            assert!(!applies_to_rows(&computed, &schema), "{computed}");
+        }
+        // Unlike the difference, which has an operand that is an array on
+        // every batch, to every row of which Arrow applies it.
+        assert!(applies_to_rows(&difference, &schema));
         // A string of any number of bytes, which an expression may copy for
         // every row of a batch (but a comparison does not).
         assert!(depends_on_batches(&name, &schema));
@@ -4675,11 +4985,13 @@ mod tests {
             ("CAST(s AS DATE)", false),
             ("CAST(s AS BOOLEAN)", false),
             ("CAST(n AS VARCHAR) = s", false),
-            // Casts of strings into decimals, or of decimals into narrower
-            // ones, also fail on their precision.
+            // Casts of strings into decimals also fail on their precision.
             ("CAST(s AS DECIMAL(5, 2))", true),
-            ("CAST(l_quantity AS DECIMAL(5, 2))", true),
             ("CAST(s AS TIMESTAMP)", true),
+            // Casts of numbers into decimals only fail on the values that
+            // overflow the decimal (see `casts_only_on_overflows`).
+            ("CAST(l_quantity AS DECIMAL(5, 2))", false),
+            ("CAST(x AS DECIMAL(10, 2))", false),
             // Arithmetic on dates and intervals.
             ("o_orderdate + INTERVAL '1 day'", false),
             ("ts - INTERVAL '1 month'", false),
