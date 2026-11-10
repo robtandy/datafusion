@@ -11,7 +11,8 @@
 //!   pushes and buffers them in its local sink state. Once it buffered
 //!   [`SORT_RUN_ROWS`] rows (or about [`SORT_RUN_BYTES`] bytes), it sorts them
 //!   into a [`SortedRun`] (with `lexsort_to_indices` and `take` for a single
-//!   sort key of a primitive, boolean, string or binary type, by their keys in
+//!   sort key of a primitive, boolean, string or binary type, whose sorted
+//!   values the run keeps and the merge compares directly, by their keys in
 //!   the Arrow row format otherwise), so that the runs fit in Arrow arrays and
 //!   the threads sort while they read their input;
 //! * [`combine`](PhysicalOperator::combine): the thread sorts the rest of its
@@ -39,7 +40,10 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
+use super::{
+    SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk,
+    sorted_local_source_state,
+};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -294,16 +298,24 @@ impl PhysicalOperator for PhysicalSort {
             );
         };
         let global = downcast_state::<SortSinkState>(sink.as_any(), self.name())?;
-        global.output.take_source(self.name())
+        global.output.take_source(ctx, self.name())
+    }
+
+    fn get_local_source_state(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        sorted_local_source_state(ctx, gstate, self.name())
     }
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
-        _lstate: &mut dyn LocalSourceState,
+        lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
-        next_sorted_chunk(gstate, self.name())
+        next_sorted_chunk(ctx, gstate, lstate, self.name())
     }
 }
 
