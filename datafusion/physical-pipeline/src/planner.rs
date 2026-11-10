@@ -2253,11 +2253,13 @@ mod tests {
             let root = assert_parity_with(sql, config.clone(), &setup).await;
             assert_no_native_sort_or_aggregate(sql, &root);
         }
-        // Their native forms, without the expressions whose errors depend on
-        // the batches.
+        // Their native forms, with the left side of the conjunction only, whose
+        // errors do not depend on the batches. (The classification judges the
+        // cast of a boolean to an integer as a part that may fail, whose errors
+        // depend on the batches, so they do without it.)
         for sql in [
-            "SELECT SUM(CAST(a <> 0 AS INT)) AS n FROM g",
-            "SELECT a FROM g ORDER BY CAST(a <> 0 AS INT), a",
+            "SELECT SUM(CASE WHEN a <> 0 THEN 1 ELSE 0 END) AS n FROM g",
+            "SELECT a FROM g ORDER BY a <> 0, a",
         ] {
             let root = assert_parity_with(sql, config.clone(), &setup).await;
             assert_native(sql, &root);
