@@ -1073,10 +1073,12 @@ mod tests {
         // group key (`a`) or a `MIN` / `MAX` aggregate keeps only the top
         // `n` groups in every stage, so the projection between it and the
         // sort only evaluates `1000 / ...` for those, never for `0`. So does
-        // the native aggregation, which produces the same groups, if the final
-        // stage has a single partition (on 1 thread here): DataFusion keeps
-        // the top groups of every partition otherwise, which depend on the
-        // partitioning, and are left to it.
+        // the native aggregation by the group key, which produces the same
+        // groups, if the final stage has a single partition (on 1 thread
+        // here): DataFusion keeps the top groups of every partition otherwise,
+        // which depend on the partitioning, and are left to it. So are the
+        // aggregations by a `MIN` / `MAX`, whose groups depend on the order of
+        // the rows when their values tie.
         let setup = async |ctx: &SessionContext| register_test_tables(ctx);
         let distinct = "SELECT 1000 / a AS v, a FROM (VALUES (0), (1), (2), (3)) AS t(a) \
              GROUP BY a ORDER BY a DESC LIMIT 1";
@@ -1089,7 +1091,7 @@ mod tests {
         for (sql, stages, native_aggregations) in [
             // A single stage on 1 thread, and two stages that are fused on 4.
             (distinct, [single, partitioned], [1, 0]),
-            (max, [single, partitioned], [1, 0]),
+            (max, [single, partitioned], [0, 0]),
             // `t1` has 4 partitions. Its `d` is a `Utf8` string, whose top-k
             // aggregations are left to DataFusion; its `h` a `Utf8View`.
             (

@@ -104,108 +104,76 @@ impl AggregateSpec {
     }
 }
 
-/// The limit of a top-k aggregation, which DataFusion's `TopKAggregation`
-/// rule sets on the stages of an aggregation (`lim=[n]`) below a sort with a
-/// fetch of `limit` rows whose only sort key is
+/// The limit of a top-k aggregation by its group key, which DataFusion's
+/// `TopKAggregation` rule sets on the stages of an aggregation without
+/// aggregates (`lim=[n]`, DataFusion's `TopKDistinct`, e.g. `SELECT DISTINCT
+/// k FROM t ORDER BY k LIMIT 10`) below a sort with a fetch of `limit` rows
+/// whose only sort key is its only group key.
 ///
-/// * the only group key of an aggregation without aggregates (DataFusion's
-///   `TopKDistinct`, e.g. `SELECT DISTINCT k FROM t ORDER BY k LIMIT 10`), or
-/// * the only aggregate of an aggregation by a single group key, a `MAX`
-///   ordered descending or a `MIN` ordered ascending (`TopKMinMax`, e.g.
-///   `SELECT k, MAX(v) FROM t GROUP BY k ORDER BY MAX(v) DESC LIMIT 10`).
-///
-/// The sort keeps the first `limit` groups by that value, so the aggregation
+/// The sort keeps the first `limit` groups by their key, so the aggregation
 /// only produces the groups that can be among them, exactly like DataFusion's
-/// `GroupedTopKAggregateStream` of a single partition: the `limit` groups
-/// with the best non-null values (any of those that tie with the last of
-/// them), and the group of the `NULL` key, which DataFusion keeps whatever the
-/// order of the `NULL`s (the aggregate of a top-k aggregation that the native
-/// operator reproduces is never `NULL`, see
-/// [`PhysicalHashAggregate::try_lower`]). The groups are compared by their
-/// values as the sort compares them, as DataFusion's top-k aggregation does
+/// `GroupedTopKAggregateStream` of a single partition: the `limit` groups of
+/// the best non-null keys, and the group of the `NULL` key, which DataFusion
+/// keeps whatever the order of the `NULL`s. Distinct groups have distinct
+/// keys, so these groups do not depend on the order of the rows. The keys are
+/// compared as the sort compares them, as DataFusion's top-k aggregation does
 /// for the types of [`orders_like_datafusion`]. So the operators between the
 /// aggregation and the sort above it see exactly the groups they see in
-/// DataFusion (but for ties), also the operators that see all of them (e.g. a
-/// window `COUNT(*) OVER ()`: DataFusion's `TopKAggregation` rule passes the
-/// limit through the operators that keep the number of rows, windows
-/// included).
+/// DataFusion, also the operators that see all of them (e.g. a window
+/// `COUNT(*) OVER ()`: DataFusion's `TopKAggregation` rule passes the limit
+/// through the operators that keep the number of rows, windows included).
+///
+/// DataFusion's top-k aggregations by a `MIN` or `MAX` (`TopKMinMax`) are
+/// left to it: the values of distinct groups may tie, and of the groups that
+/// tie with the worst of its top groups, its heap keeps the one whose row came
+/// last (a new group that ties with its worst group replaces it), which
+/// depends on the order of the rows (and decides, e.g., the groups that a
+/// projection `1000 / (a - 1)` above it is evaluated for).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TopK {
     /// The number of groups the sort keeps.
     pub(crate) limit: usize,
-    /// Whether the groups with the greatest values come first.
+    /// Whether the groups with the greatest keys come first.
     pub(crate) descending: bool,
-    /// What orders the groups.
-    pub(crate) order: TopKOrder,
-}
-
-/// What orders the groups of a top-k aggregation, see [`TopK`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TopKOrder {
-    /// The group key (the aggregation has no aggregates).
-    GroupKey,
-    /// The value of the only aggregate, a `MIN` or `MAX`, whose partial state
-    /// is that value too.
-    Aggregate,
 }
 
 impl TopK {
-    /// The rows of `values`, the values that order a set of distinct groups
-    /// (one per group), whose groups may be among the groups the sort keeps
-    /// (see [`TopK`]): the `limit` best non-null values, followed by the
-    /// `NULL`s (of the group key, which is `NULL` for one group at most; at
-    /// most `limit` of an aggregate). Returns `None` if these are all rows.
-    ///
-    /// The values of a group never get worse when more of its rows are
-    /// aggregated (a `MAX` only grows, a `MIN` only shrinks), so a group that
-    /// is not selected from the partial states of some rows (other groups
-    /// beat it already) is not among the groups the sort keeps either, unless
-    /// a better value of it comes from other rows.
-    pub(crate) fn select(&self, values: &dyn Array) -> Result<Option<UInt32Array>> {
-        let nulls = values.null_count();
-        let valid = values.len() - nulls;
-        let null_limit = self.null_limit();
-        if valid <= self.limit && nulls <= null_limit {
+    /// The rows of `keys`, the keys of a set of distinct groups (one per
+    /// group), whose groups may be among the groups the sort keeps (see
+    /// [`TopK`]): the `limit` best non-null keys, followed by the `NULL` key.
+    /// Returns `None` if these are all rows. A group that is not selected
+    /// (`limit` other groups beat it) is not among the groups the sort keeps.
+    pub(crate) fn select(&self, keys: &dyn Array) -> Result<Option<UInt32Array>> {
+        if keys.len() - keys.null_count() <= self.limit {
             return Ok(None);
         }
-        let mut indices = if valid <= self.limit {
-            (0..values.len())
-                .filter(|&row| values.is_valid(row))
-                .map(|row| row as u32)
-                .collect::<Vec<_>>()
-        } else {
-            // With the nulls last, the first `limit` rows are non-null.
-            let options = SortOptions::new(self.descending, false);
-            sort_to_indices(values, Some(options), Some(self.limit))?
-                .values()
-                .to_vec()
-        };
+        // With the nulls last, the first `limit` rows are non-null.
+        let options = SortOptions::new(self.descending, false);
+        let mut indices = sort_to_indices(keys, Some(options), Some(self.limit))?
+            .values()
+            .to_vec();
         indices.extend(
-            (0..values.len())
-                .filter(|&row| values.is_null(row))
-                .take(null_limit)
+            (0..keys.len())
+                .filter(|&row| keys.is_null(row))
                 .map(|row| row as u32),
         );
         Ok(Some(UInt32Array::from(indices)))
     }
 
-    /// The *cutoff* of `values`, the values that order a set of distinct
-    /// groups (one per group): the `limit`-th best of them, if `limit` of them
-    /// are not `NULL`. The values of groups never get worse (see
-    /// [`Self::select`]), so from then on at least `limit` groups have a value
-    /// at least as good as the cutoff: a row whose value is worse can neither
-    /// make its group one of the groups the sort keeps, nor change the value
-    /// of a group that it keeps (see [`Self::candidates`]). (The values of the
-    /// groups of a key are their keys, which do not change.)
-    pub(crate) fn cutoff(&self, values: &dyn Array) -> Result<Option<ArrayRef>> {
-        let valid = values.len() - values.null_count();
+    /// The *cutoff* of `keys`, the keys of a set of distinct groups (one per
+    /// group): the `limit`-th best of them, if `limit` of them are not
+    /// `NULL`. From then on, at least `limit` groups have a key at least as
+    /// good as the cutoff, so a row whose key is worse cannot be of one of the
+    /// groups the sort keeps (see [`Self::candidates`]).
+    pub(crate) fn cutoff(&self, keys: &dyn Array) -> Result<Option<ArrayRef>> {
+        let valid = keys.len() - keys.null_count();
         if self.limit == 0 || valid < self.limit {
             return Ok(None);
         }
         // With the nulls last, the first `limit` rows are non-null.
         let options = SortOptions::new(self.descending, false);
-        let best = sort_to_indices(values, Some(options), Some(self.limit))?;
-        Ok(Some(take(values, &best.slice(self.limit - 1, 1), None)?))
+        let best = sort_to_indices(keys, Some(options), Some(self.limit))?;
+        Ok(Some(take(keys, &best.slice(self.limit - 1, 1), None)?))
     }
 
     /// Whether `cutoff` is a better cutoff than `other` (see [`Self::cutoff`]),
@@ -220,21 +188,20 @@ impl TopK {
         Ok(make_comparator(cutoff, other, options)?(0, 0).is_lt())
     }
 
-    /// The rows of `values`, the values that order the groups of input rows
-    /// (their group keys, or the arguments of the aggregate), whose groups
-    /// may be among the groups the sort keeps given the cutoff `cutoff` (see
-    /// [`Self::cutoff`]): the rows whose value is not worse than the cutoff,
-    /// and those whose value is `NULL` (the group of the `NULL` key is always
-    /// kept). Returns `None` if these are all rows.
+    /// The rows of `keys`, the group keys of input rows, whose groups may be
+    /// among the groups the sort keeps given the cutoff `cutoff` (see
+    /// [`Self::cutoff`]): the rows whose key is not worse than the cutoff, and
+    /// those whose key is `NULL` (whose group is always kept). Returns `None`
+    /// if these are all rows.
     pub(crate) fn candidates(
         &self,
-        values: &ArrayRef,
+        keys: &ArrayRef,
         cutoff: &ArrayRef,
     ) -> Result<Option<BooleanArray>> {
         let cutoff = Scalar::new(Arc::clone(cutoff));
         let selected = match self.descending {
-            true => gt_eq(values, &cutoff)?,
-            false => lt_eq(values, &cutoff)?,
+            true => gt_eq(keys, &cutoff)?,
+            false => lt_eq(keys, &cutoff)?,
         };
         let selected = match selected.nulls() {
             Some(nulls) => BooleanArray::new(selected.values() | &!nulls.inner(), None),
@@ -247,7 +214,7 @@ impl TopK {
     /// distinct groups, that may be among the groups the sort keeps (see
     /// [`Self::select`]).
     pub(crate) fn select_groups(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        match self.select(batch.column(self.column()).as_ref())? {
+        match self.select(batch.column(0).as_ref())? {
             Some(indices) => Ok(take_record_batch(&batch, &indices)?),
             None => Ok(batch),
         }
@@ -265,8 +232,7 @@ impl TopK {
         left: &RecordBatch,
         right: &RecordBatch,
     ) -> Result<RecordBatch> {
-        let (left_values, right_values) =
-            (left.column(self.column()), right.column(self.column()));
+        let (left_values, right_values) = (left.column(0), right.column(0));
         let options = SortOptions::new(self.descending, false);
         // The non-null values of either side, the best first.
         let sorted = |values: &ArrayRef| -> Result<Vec<u32>> {
@@ -307,8 +273,7 @@ impl TopK {
         rows.extend(
             nulls(0, left_values)
                 .into_iter()
-                .chain(nulls(1, right_values))
-                .take(self.null_limit()),
+                .chain(nulls(1, right_values)),
         );
         let columns = left
             .columns()
@@ -322,25 +287,6 @@ impl TopK {
             columns,
             &options,
         )?)
-    }
-
-    /// The column of the output of the aggregation that orders the groups:
-    /// the group key, followed by the aggregate.
-    fn column(&self) -> usize {
-        match self.order {
-            TopKOrder::GroupKey => 0,
-            TopKOrder::Aggregate => 1,
-        }
-    }
-
-    /// The most groups whose value is `NULL` that may be among the groups
-    /// the sort keeps, see [`Self::select`].
-    fn null_limit(&self) -> usize {
-        match self.order {
-            // At most one group has a `NULL` key.
-            TopKOrder::GroupKey => usize::MAX,
-            TopKOrder::Aggregate => self.limit,
-        }
     }
 }
 
@@ -638,20 +584,18 @@ impl PhysicalHashAggregate {
     ///   which may fail on the other groups, or a window, which sees all of
     ///   them) only see these, and so does the native operator, if it
     ///   reproduces them exactly (see [`TopK`]). It does for the top-k
-    ///   aggregations whose stages have the same limit (of at most
-    ///   [`MAX_TOP_K_LIMIT`] groups), that group by a single key and order by
-    ///   it (without aggregates) or by their only aggregate, a `MIN` or `MAX`
-    ///   (without a filter or an order of its own) of an argument that is not
-    ///   nullable, whose partial state is its value, of types that
-    ///   DataFusion's top-k aggregation orders like its sorts (see
-    ///   [`orders_like_datafusion`]) but strings with 32-bit offsets (see
-    ///   [`holds_like_datafusion`]), whose key and argument cannot fail
+    ///   aggregations by their group key, without aggregates, whose stages
+    ///   have the same limit (of at most [`MAX_TOP_K_LIMIT`] groups), of a
+    ///   single key of a type that DataFusion's top-k aggregation orders like
+    ///   its sorts (see [`orders_like_datafusion`]) but strings with 32-bit
+    ///   offsets (see [`holds_like_datafusion`]), which cannot fail
     ///   (conservatively), and whose final stage has a single partition.
     ///   DataFusion's top-k aggregation of several partitions keeps the top
     ///   groups of every partition, which depend on how its rows are
     ///   partitioned (e.g. the number of groups that a window `COUNT(*) OVER
-    ///   ()` above it counts), and it keeps (some of) the groups whose
-    ///   aggregate is `NULL`, which depend on the order of its rows.
+    ///   ()` above it counts); and the groups of its top-k aggregations by a
+    ///   `MIN` or `MAX` depend on the order of its rows when their values tie
+    ///   (see [`TopK`]).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -992,46 +936,12 @@ fn group_limit(raw: &AggregateExec, last: Option<&AggregateExec>) -> GroupLimit 
     {
         return GroupLimit::Unsupported;
     }
-    let order = match raw.aggr_expr() {
-        [] => TopKOrder::GroupKey,
-        [aggregate] => {
-            let value_type = aggregate.field().data_type().clone();
-            // A `MAX` ordered descending, or a `MIN` ordered ascending, whose
-            // partial state is its value.
-            let ordered = matches!(aggregate.fun().name(), "min" | "max")
-                && aggregate
-                    .get_minmax_desc()
-                    .is_some_and(|(_, desc)| desc == descending)
-                && !aggregate.is_distinct()
-                && aggregate.order_bys().is_empty()
-                && aggregate.state_fields().is_ok_and(|fields| {
-                    matches!(fields.as_slice(), [state] if state.data_type() == &value_type)
-                });
-            // DataFusion keeps groups whose aggregate is `NULL` depending on
-            // the order of the rows: with a value that loses to its top groups
-            // first, and a `NULL` once the value is gone, a group is kept with
-            // a `NULL` aggregate.
-            match aggregate.expressions().as_slice() {
-                [argument]
-                    if ordered
-                        && orders(argument)
-                        && argument.nullable(&schema).is_ok_and(|nullable| !nullable)
-                        && argument
-                            .data_type(&schema)
-                            .is_ok_and(|data_type| data_type == value_type) =>
-                {
-                    TopKOrder::Aggregate
-                }
-                _ => return GroupLimit::Unsupported,
-            }
-        }
-        _ => return GroupLimit::Unsupported,
-    };
-    GroupLimit::TopK(TopK {
-        limit,
-        descending,
-        order,
-    })
+    // The groups of a top-k aggregation by a `MIN` or `MAX` depend on the
+    // order of its rows when their values tie (see `TopK`).
+    if !raw.aggr_expr().is_empty() {
+        return GroupLimit::Unsupported;
+    }
+    GroupLimit::TopK(TopK { limit, descending })
 }
 
 /// Whether the native operator holds the values of `data_type` of the groups
@@ -1905,7 +1815,6 @@ mod tests {
         let top_k = Some(Some(TopK {
             limit: 3,
             descending: false,
-            order: TopKOrder::GroupKey,
         }));
         let single = by_v(AggregateMode::Single, input(1, false)?, true)?;
         assert_eq!(lowered_limit(&single)?, top_k);
@@ -2010,55 +1919,25 @@ mod tests {
             Some(3),
             None,
         ]);
-        let select = |limit, descending, order| -> Result<Option<Vec<u32>>> {
-            let top_k = TopK {
-                limit,
-                descending,
-                order,
-            };
+        let select = |limit, descending| -> Result<Option<Vec<u32>>> {
+            let top_k = TopK { limit, descending };
             Ok(top_k.select(&values)?.map(|indices| {
                 let mut indices = indices.values().to_vec();
                 indices.sort_unstable();
                 indices
             }))
         };
-        // The 2 greatest values (9, 7), the 2 least (1, 3), and the nulls:
-        // all of them for a group key, at most `limit` for an aggregate.
-        assert_eq!(
-            select(2, true, TopKOrder::GroupKey)?,
-            Some(vec![1, 2, 4, 5, 7])
-        );
-        assert_eq!(
-            select(2, false, TopKOrder::GroupKey)?,
-            Some(vec![1, 3, 4, 6, 7])
-        );
-        assert_eq!(
-            select(2, true, TopKOrder::Aggregate)?,
-            Some(vec![1, 2, 4, 5])
-        );
-        assert_eq!(select(1, false, TopKOrder::Aggregate)?, Some(vec![1, 3]));
-        assert_eq!(
-            select(3, true, TopKOrder::Aggregate)?,
-            Some(vec![0, 1, 2, 4, 5, 7])
-        );
+        // The 2 greatest keys (9, 7), the 2 least (1, 3), and the `NULL` keys.
+        assert_eq!(select(2, true)?, Some(vec![1, 2, 4, 5, 7]));
+        assert_eq!(select(2, false)?, Some(vec![1, 3, 4, 6, 7]));
+        assert_eq!(select(1, false)?, Some(vec![1, 3, 4, 7]));
         // All rows, if there are not more of them.
-        assert_eq!(select(5, true, TopKOrder::GroupKey)?, None);
-        assert_eq!(select(5, false, TopKOrder::Aggregate)?, None);
-        // All values, but not all nulls.
-        let few = Int64Array::from(vec![None, Some(4), None, None]);
-        let top_k = TopK {
-            limit: 2,
-            descending: false,
-            order: TopKOrder::Aggregate,
-        };
-        let indices = top_k.select(&few)?.expect("a selection");
-        assert_eq!(indices.values().as_ref(), &[1, 0, 2]);
+        assert_eq!(select(5, true)?, None);
         // Strings, by their bytes.
         let strings = StringArray::from(vec![Some("b"), Some("ab"), None, Some("B")]);
         let top_k = TopK {
             limit: 1,
             descending: false,
-            order: TopKOrder::GroupKey,
         };
         let indices = top_k.select(&strings)?.expect("a selection");
         assert_eq!(indices.values().as_ref(), &[3, 2]);
@@ -2118,18 +1997,9 @@ mod tests {
             rows
         };
         let empty = RecordBatch::new_empty(Arc::clone(&schema));
-        for (order, descending) in [
-            (TopKOrder::GroupKey, false),
-            (TopKOrder::GroupKey, true),
-            (TopKOrder::Aggregate, false),
-            (TopKOrder::Aggregate, true),
-        ] {
+        for descending in [false, true] {
             for limit in [1, 2, 3, 10] {
-                let top_k = TopK {
-                    limit,
-                    descending,
-                    order,
-                };
+                let top_k = TopK { limit, descending };
                 for (left, right) in [(&left, &right), (&right, &left), (&left, &empty)] {
                     let merged = top_k.merge_groups(left, right)?;
                     let expected =
@@ -2322,19 +2192,19 @@ mod tests {
                 "SELECT DISTINCT g FROM tk WHERE g > 1000 ORDER BY g LIMIT 3",
                 true,
             ),
-            // By a `MAX` descending or a `MIN` ascending of an argument that is
-            // not nullable, of every supported type.
+            // By a `MAX` descending or a `MIN` ascending: left to DataFusion,
+            // whose groups depend on the order of the rows when values tie.
             (
                 "SELECT g, MAX(id) FROM tk GROUP BY g ORDER BY MAX(id) DESC LIMIT 4",
-                true,
+                false,
             ),
             (
                 "SELECT g, MIN(id) FROM tk GROUP BY g ORDER BY MIN(id) LIMIT 5",
-                true,
+                false,
             ),
             (
                 "SELECT u, MIN(ndec) FROM tk GROUP BY u ORDER BY MIN(ndec) LIMIT 3",
-                true,
+                false,
             ),
             (
                 "SELECT s, MAX(nt) FROM tk GROUP BY s ORDER BY MAX(nt) DESC NULLS LAST \
@@ -2343,15 +2213,15 @@ mod tests {
             ),
             (
                 "SELECT ls, MAX(nt) FROM tk GROUP BY ls ORDER BY MAX(nt) DESC LIMIT 6",
-                true,
+                false,
             ),
             (
                 "SELECT dt, MIN(nsv) FROM tk GROUP BY dt ORDER BY MIN(nsv) LIMIT 4",
-                true,
+                false,
             ),
             (
                 "SELECT g, MAX(nsv) FROM tk GROUP BY g ORDER BY MAX(nsv) DESC LIMIT 1000",
-                true,
+                false,
             ),
             // DataFusion keeps groups whose aggregate is `NULL` depending on
             // the order of its rows: left to it (in no particular order).
@@ -2368,12 +2238,12 @@ mod tests {
             // groups of the aggregation.
             (
                 "SELECT g + 1 AS g1, MAX(id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 5",
-                true,
+                false,
             ),
             (
                 "SELECT COUNT(*), SUM(m), MIN(g) FROM \
                  (SELECT g, MAX(id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 5)",
-                true,
+                false,
             ),
             (
                 "SELECT COUNT(*), MIN(s), MAX(s) FROM \
@@ -2388,7 +2258,7 @@ mod tests {
             (
                 "SELECT g, MAX(id) AS m, COUNT(*) OVER () AS c FROM tk GROUP BY g \
                  ORDER BY m DESC LIMIT 3",
-                true,
+                false,
             ),
             (
                 "SELECT g, COUNT(*) OVER () AS c FROM tk GROUP BY g ORDER BY g DESC LIMIT 3",
@@ -2425,6 +2295,55 @@ mod tests {
                     assert_eq!(planned, top_k, "{sql}");
                 }
                 assert!(planned.is_empty() || planned == top_k || window, "{sql}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_k_aggregations_of_tied_values_are_left_to_datafusion() -> Result<()> {
+        use super::super::test_support::assert_lowered_parity_with_setup;
+        // Of the groups that tie with the worst of its top groups, the heap of
+        // DataFusion's top-k aggregation by a `MIN` / `MAX` keeps the one whose
+        // row came last, which decides the groups that the projection above it
+        // evaluates `1000 / ...` for (and the groups the sort returns).
+        let setup = async |_: &datafusion::prelude::SessionContext| Ok(());
+        let queries = [
+            // DataFusion keeps `a = 3`, not `a = 1`.
+            "SELECT 1000 / (a - 1) AS q, a, MAX(b) AS m \
+             FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY m DESC LIMIT 1",
+            "SELECT 1000 / (a - 1) AS q, a, MIN(b) AS m \
+             FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY m LIMIT 1",
+            // Ties behind a better group.
+            "SELECT 1000 / (a - 3) AS q, a, MAX(b) AS m \
+             FROM (VALUES (1, 5), (2, 3), (3, 3), (4, 3), (5, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY m DESC LIMIT 2",
+            // Groups that drop out and come back with a value that ties.
+            "SELECT 1000 / (a - 2) AS q, a, MAX(b) AS m \
+             FROM (VALUES (1, 1), (2, 2), (3, 1), (2, 1), (1, 2), (3, 2)) AS t(a, b) \
+             GROUP BY a ORDER BY m DESC LIMIT 1",
+            // Without a projection, the sort returns the group it keeps (`a = 3`,
+            // and `a = 2`). (The order in which the sort of the pipeline engine
+            // returns several rows that tie differs from DataFusion's, on the
+            // base too: such queries are not used here.)
+            "SELECT a, MAX(b) AS m FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY m DESC LIMIT 1",
+            "SELECT a, MIN(b) AS m FROM (VALUES (3, 1), (1, 1), (2, 1)) AS t(a, b) \
+             GROUP BY a ORDER BY m LIMIT 1",
+        ];
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            let ctx = crate::test_utils::datafusion_context(config.clone());
+            for sql in queries {
+                if target_partitions == 1 {
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    assert!(top_k_aggregation(&plan).is_some(), "{sql}");
+                }
+                let root =
+                    assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
+                assert!(native_top_k_aggregations(&root).is_empty(), "{sql}");
             }
         }
         Ok(())
@@ -2496,15 +2415,16 @@ mod tests {
             "SELECT DISTINCT asc FROM tkn ORDER BY asc LIMIT 7",
             "SELECT DISTINCT asc FROM tkn ORDER BY asc DESC LIMIT 7",
             "SELECT DISTINCT desc FROM tkn ORDER BY desc LIMIT 7",
-            // By a `MAX` or a `MIN`, of groups of 1 or 2 rows, whose values
-            // are shuffled, or come best (or worst) first.
+            // By a `MAX` or a `MIN` (left to DataFusion), of groups of 1 or 2
+            // rows, whose values are shuffled, or come best (or worst) first.
             "SELECT g, MAX(v) FROM tkn GROUP BY g ORDER BY MAX(v) DESC LIMIT 10",
             "SELECT g, MIN(v) FROM tkn GROUP BY g ORDER BY MIN(v) LIMIT 10",
             "SELECT k, MIN(asc) FROM tkn GROUP BY k ORDER BY MIN(asc) LIMIT 5",
             "SELECT k, MAX(asc) FROM tkn GROUP BY k ORDER BY MAX(asc) DESC LIMIT 5",
             "SELECT sv, MIN(v) FROM tkn GROUP BY sv ORDER BY MIN(v) LIMIT 4",
             "SELECT g, MAX(sv) FROM tkn GROUP BY g ORDER BY MAX(sv) DESC LIMIT 3",
-            // Fewer groups than a table holds.
+            // Fewer groups than a table holds (by a `MIN` or `MAX`, left to
+            // DataFusion, too).
             "SELECT few, MAX(v) FROM tkn GROUP BY few ORDER BY MAX(v) DESC LIMIT 10",
             "SELECT few, MIN(asc) FROM tkn GROUP BY few ORDER BY MIN(asc) LIMIT 3",
             "SELECT few, MAX(asc) FROM tkn GROUP BY few ORDER BY MAX(asc) DESC LIMIT 3",
@@ -2520,7 +2440,12 @@ mod tests {
                 let root =
                     assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
                 let native = native_top_k_aggregations(&root).len();
-                assert_eq!(native, usize::from(target_partitions == 1), "{sql}");
+                let by_key = !sql.contains("MIN(") && !sql.contains("MAX(");
+                assert_eq!(
+                    native,
+                    usize::from(target_partitions == 1 && by_key),
+                    "{sql}"
+                );
             }
         }
         Ok(())
