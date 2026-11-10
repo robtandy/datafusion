@@ -209,7 +209,9 @@ use crate::operator::{
     SinkFinalize, SinkResult, SourceResult, TaskInterrupt, downcast_state,
     downcast_state_mut,
 };
-use crate::operators::adaptive_filter::is_infallible;
+use crate::operators::adaptive_filter::{
+    Failures, depends_on_batches, failures, is_infallible,
+};
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::tuple_data::layout::has_run_end_encoded;
 use crate::tuple_data::{PartitionedTupleData, RowLocation, TupleDataLayout};
@@ -653,15 +655,29 @@ impl PhysicalHashJoin {
     ///   of its probe input right away, which the native join does too, on
     ///   such a copy, to raise the same errors before it reads its probe
     ///   side;
-    /// * a join whose residual filter or probe keys can fail on some rows
-    ///   (conservatively, any expression but columns, literals, comparisons,
-    ///   boolean operators, wrapping arithmetic, divisions by constants
-    ///   other than 0 and -1, and casts that cannot fail): DataFusion
-    ///   evaluates the filter on up to `batch_size` candidate pairs of a
-    ///   probe batch, and the probe keys on whole probe batches, before it
-    ///   emits any of their rows, while a native join evaluates them chunk by
-    ///   chunk and emits as it goes, so that it could stop (e.g. under a
-    ///   limit) before it evaluates them on rows on which DataFusion fails;
+    /// * a join whose probe keys can fail on some rows (conservatively, any
+    ///   expression but columns, literals, comparisons, boolean operators,
+    ///   wrapping arithmetic, divisions by constants other than 0 and -1, and
+    ///   casts that cannot fail): DataFusion evaluates the probe keys on whole
+    ///   probe batches before it emits any of their rows, while a native join
+    ///   evaluates them chunk by chunk and emits as it goes, so that it could
+    ///   stop (e.g. under a limit) before it evaluates them on rows on which
+    ///   DataFusion fails;
+    /// * a join whose residual filter has errors that depend on the candidate
+    ///   pairs it is evaluated on together (see `depends_on_batches`, e.g. the
+    ///   product of decimals of `l.a > 0 AND l.a * r.b > 1`, which DataFusion
+    ///   evaluates on all pairs of a batch unless at most 20% of them are
+    ///   left), or parts that may fail with different errors, or with other
+    ///   errors than arithmetic overflows (see `Failures`): both engines
+    ///   evaluate the filter on all candidate pairs, but DataFusion on up to
+    ///   `batch_size` pairs of a probe batch at once, a native join on up to
+    ///   [`DEFAULT_VECTOR_SIZE`] pairs of a probe chunk, in another order and
+    ///   on all threads of its probe pipeline, so that another pair could fail
+    ///   first (see `fails_like_datafusion_on_threads`). A filter whose parts
+    ///   can only fail with arithmetic overflows (e.g. decimal arithmetic)
+    ///   raises an `ArrowError::ArithmeticOverflow` whichever pair overflows
+    ///   first, and is lowered, e.g. the semi join of TPC-H Q17, whose filter
+    ///   compares quantities cast into decimals of more digits;
     /// * a join whose single build key of an integer type can fail on some
     ///   rows (e.g. `1 / k`), or with a dynamic filter, whose build keys can
     ///   fail on some rows or have a type whose bounds may fail to be computed
@@ -689,6 +705,21 @@ impl PhysicalHashJoin {
     ///   build side;
     /// * a join whose keys have different types on the two sides, or whose
     ///   build columns the [`TupleDataLayout`] cannot store.
+    ///
+    /// A planner must keep a join whose residual filter may overflow in
+    /// DataFusion, with its inputs, below a limit that stops the execution
+    /// early (e.g. the input of a `GlobalLimitExec`), as the
+    /// [`PipelineQueryPlanner`](crate::PipelineQueryPlanner) keeps every plan
+    /// below such a limit: DataFusion evaluates the filter on all candidate
+    /// pairs of a probe batch (up to `batch_size` of them) before it emits any
+    /// of them, a native join emits as it goes, so that it could stop before
+    /// it evaluates the filter on a pair on which DataFusion overflows. And so
+    /// it must if native operators of the probe pipeline of the join, below or
+    /// above it, have parts that may fail with other errors (see `Failures`):
+    /// DataFusion evaluates the nodes below the join, the join and the nodes
+    /// above it each on a whole batch before the next one, a pipeline every
+    /// chunk with all of its operators, so which error comes first depends on
+    /// the batches.
     ///
     /// The inputs of the join are lowered without the nodes directly below
     /// the join that only distribute the rows of the inputs over partitions:
@@ -818,22 +849,39 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        // DataFusion evaluates the residual filter on up to `batch_size`
-        // candidate pairs of a probe batch at once, and the probe keys on
-        // whole probe batches (also empty ones), before it emits any of their
-        // rows. A native join evaluates them chunk by chunk (and never on an
-        // empty chunk) and emits as it goes, so that, e.g. under a limit, it
-        // could stop before it evaluates them on rows on which DataFusion
-        // fails: a filter or probe keys that can fail on some rows (or on no
-        // rows, e.g. `1 / 0`) are left to DataFusion. (Lowering evaluates no
-        // expression: an expression may change its state when evaluated.)
+        // DataFusion evaluates the probe keys on whole probe batches (also
+        // empty ones) before it emits any of their rows. A native join
+        // evaluates them chunk by chunk (and never on an empty chunk) and
+        // emits as it goes, so that, e.g. under a limit, it could stop before
+        // it evaluates them on rows on which DataFusion fails: probe keys that
+        // can fail on some rows (or on no rows, e.g. `1 / 0`) are left to
+        // DataFusion. (Lowering evaluates no expression: an expression may
+        // change its state when evaluated.)
         let probe_schema = join.right().schema();
-        if join
-            .filter()
-            .is_some_and(|filter| can_fail(filter.expression(), filter.schema()))
-            || probe_keys.iter().any(|key| can_fail(key, &probe_schema))
-        {
+        if probe_keys.iter().any(|key| can_fail(key, &probe_schema)) {
             return Ok(None);
+        }
+        // Both engines evaluate the residual filter on all candidate pairs,
+        // but on other pairs together, in another order, and natively on all
+        // threads of the probe pipeline (see `fails_like_datafusion_on_threads`):
+        // a filter whose errors depend on the pairs it is evaluated on
+        // together, or whose parts may fail with different errors, or with
+        // other errors than arithmetic overflows, is left to DataFusion. One
+        // whose parts can only overflow (e.g. decimal arithmetic) fails like
+        // DataFusion's. (`depends_on_batches` comes first: it finds the parts
+        // that must not be evaluated before the execution, volatile or dynamic
+        // ones, before the classification evaluates any, see `failures`.)
+        if let Some(filter) = join.filter() {
+            let (expression, schema) = (filter.expression(), filter.schema().as_ref());
+            if depends_on_batches(expression, schema) {
+                return Ok(None);
+            }
+            let filter_failures = failures(expression, schema);
+            if filter_failures.order_matters()
+                || !fails_like_datafusion_on_threads(filter_failures)
+            {
+                return Ok(None);
+            }
         }
         // DataFusion concatenates its whole build side (all its columns, also
         // those the join does not need), which fails if a dictionary needs
@@ -1866,6 +1914,37 @@ fn local_scan_streams_cannot_fail(config: &FileScanConfig) -> bool {
                             .file_decryption
                             .is_none()
                     })))
+}
+
+/// Whether a native join whose residual filter has the parts that may fail
+/// `failures` (see [`failures`]), and errors that do not depend on the pairs it
+/// is evaluated on together (see [`depends_on_batches`]), raises the errors of
+/// DataFusion's `HashJoinExec` on the threads of its probe pipeline: if these
+/// parts can only fail with arithmetic overflows (see
+/// [`Failures::only_overflows`]), whatever the number of threads.
+///
+/// Both engines evaluate the filter on all candidate pairs of the join (the
+/// pairs of probe and build rows whose keys are equal), and on no other pair.
+/// But DataFusion evaluates it on up to `batch_size` candidate pairs of a probe
+/// batch at once, in the order of its build input, and a native join on up to
+/// [`DEFAULT_VECTOR_SIZE`] candidate pairs of a probe chunk at once, in the
+/// order of its chains (the order in which the threads of its build pipeline
+/// collected the build rows, see [`JoinHashTable`]), on all threads of its
+/// probe pipeline: another pair than in DataFusion may fail first. Whichever
+/// pair overflows first, on whichever thread, the error of parts that can
+/// only overflow (e.g. the decimal arithmetic of TPC-H) is an
+/// `ArrowError::ArithmeticOverflow`, as in DataFusion (although the values
+/// that it names may be those of another pair), as for the native operators
+/// that the planner lowers on several threads (see its
+/// `Lowering::fails_like_datafusion_on_threads`). The planner lowers native
+/// filters and projections with a part that may fail with another error on a
+/// single thread, which evaluates the rows of a partition in DataFusion's
+/// order, but the order of the candidate pairs of a native join is not
+/// DataFusion's on any number of threads: a part that may fail with another
+/// error, e.g. a cast, whose errors name the value that fails, could fail on
+/// another pair first, also on a single thread.
+fn fails_like_datafusion_on_threads(failures: Failures) -> bool {
+    failures.only_overflows()
 }
 
 /// Whether evaluating `expr` on a batch of `schema` can fail on some rows.
