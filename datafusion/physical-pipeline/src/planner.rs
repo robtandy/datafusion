@@ -2298,14 +2298,32 @@ enum TopKFilterPruning {
 /// the nodes below another one that read the filter are still reading, also
 /// if they are settled with respect to the rows of their own child. So the
 /// filter prunes nothing only below a barrier that all rows of the TopK pass:
-/// a settled child of a node that streams several children is not settled.
+/// a settled child of a node that streams several children is not settled. A
+/// join streams its probe side only: it emits rows once it read the matching
+/// part of its build side, which is settled if the join reads all of it first,
+/// and may still be read otherwise. And a node that may emit rows before the
+/// child it streams emits any is no barrier either (see
+/// [`emits_rows_after_its_inputs`]).
 fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilterPruning {
     let read_first = reads_first_child_before_emitting(plan);
+    // A join emits its rows as its probe side (the second child) passes rows
+    // on (or once a partition of it ends), once it read the matching part of
+    // its build side: the timing of its rows is that of its probe side. But
+    // other parts of its build side may still be read then, unless it reads
+    // all of it first.
+    let joins = plan.is::<HashJoinExec>()
+        || plan.is::<CrossJoinExec>()
+        || plan.is::<NestedLoopJoinExec>();
     let mut settled = false;
+    let mut built = TopKFilterPruning::Unread;
     let mut streamed = vec![];
     for (index, child) in plan.children().into_iter().enumerate() {
         if index == 0 && read_first {
             settled = consumes_dynamic_filter(child, filter);
+        } else if index == 0 && joins {
+            if consumes_dynamic_filter(child, filter) {
+                built = TopKFilterPruning::Other;
+            }
         } else {
             streamed.push(topk_filter_pruning(child, filter));
         }
@@ -2320,7 +2338,8 @@ fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilter
     let below = streamed
         .into_iter()
         .max()
-        .unwrap_or(TopKFilterPruning::Unread);
+        .unwrap_or(TopKFilterPruning::Unread)
+        .max(built);
     if below <= TopKFilterPruning::Settled && !reads_dynamic_filter(plan, filter) {
         // A node that may emit rows of its own before the input it streams
         // emits any (e.g. a custom node that emits a row first) can pass a row
@@ -2343,11 +2362,28 @@ fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilter
 /// Whether `plan` emits no row before the inputs that it streams emit theirs:
 /// its rows are rows of its inputs, or computed from the rows of its inputs
 /// that it read before (also at the end of its input, e.g. an aggregation of
-/// no group, or the unmatched rows of an outer join), as for projections,
-/// filters, coalesced batches, repartitionings, merges of partitions, unions,
-/// sorts, aggregations, limits and joins. Any other node, e.g. a custom node,
-/// may emit rows of its own first.
+/// no group, or the unmatched rows of an outer join once all of its probe
+/// side ended), as for projections, filters, coalesced batches,
+/// repartitionings, merges of partitions, unions, sorts, aggregations, limits
+/// and joins. But for a `Partitioned` hash join that emits rows of its build
+/// side at the end of its probe side (e.g. a left join, or a left semi join),
+/// which DataFusion's join does as soon as one partition of its probe side
+/// ends, without rows, while its other partitions are still read. Any other
+/// node, e.g. a custom node, may emit rows of its own first.
 fn emits_rows_after_its_inputs(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    use datafusion_common::JoinType;
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        return join.partition_mode()
+            != &datafusion_physical_plan::joins::PartitionMode::Partitioned
+            || !matches!(
+                join.join_type(),
+                JoinType::Left
+                    | JoinType::LeftAnti
+                    | JoinType::LeftSemi
+                    | JoinType::LeftMark
+                    | JoinType::Full
+            );
+    }
     plan.is::<ProjectionExec>()
         || plan.is::<FilterExec>()
         || is_coalesce_batches(plan)
@@ -2359,7 +2395,6 @@ fn emits_rows_after_its_inputs(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<AggregateExec>()
         || plan.is::<GlobalLimitExec>()
         || plan.is::<LocalLimitExec>()
-        || plan.is::<HashJoinExec>()
         || plan.is::<CrossJoinExec>()
         || plan.is::<NestedLoopJoinExec>()
 }
