@@ -153,6 +153,14 @@ impl TopKDynamicFilter {
 /// executes `plan`, DataFusion's TopK, after all, and emits its output. The
 /// rows of the native TopK are then not used: that costs a second execution
 /// of the input of the TopK, but only if its `k`-th row has a float zero.
+///
+/// That execution comes after the native TopK read the input of `plan`: it
+/// returns what a single execution of DataFusion's TopK returns only if
+/// `plan` executes again as if it had not been executed before, i.e. it reads
+/// data that every execution reads again (e.g. in-memory batches, not a
+/// stream that can only be read once) and calls no volatile function (which
+/// may have state, e.g. count its calls). [`try_lower`](super::try_lower)
+/// only lowers TopKs by float keys over such inputs.
 #[derive(Debug, Clone)]
 pub struct FloatKeyFallback {
     plan: Arc<dyn ExecutionPlan>,
@@ -164,6 +172,8 @@ impl FloatKeyFallback {
     /// Run `plan`, whose output must be the output of the TopK (the rows of
     /// a TopK by the same keys, with the same fetch), if the last row of the
     /// result has a zero in one of the sort keys at the positions `keys`.
+    /// `plan` must execute again, after the TopK read its input, as if it
+    /// had not been executed (see above).
     pub fn new(plan: Arc<dyn ExecutionPlan>, keys: Vec<usize>) -> Self {
         Self {
             plan,

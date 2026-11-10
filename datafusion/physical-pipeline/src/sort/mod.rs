@@ -84,21 +84,27 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err};
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_expr::Operator;
+use datafusion_expr::{Operator, Volatility};
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, IsNotNullExpr, IsNullExpr, Literal,
     NotExpr,
 };
 use datafusion_physical_expr::projection::update_expr;
+use datafusion_physical_expr_common::physical_expr::is_volatile;
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
     ReplaceChildrenOptions,
@@ -170,12 +176,18 @@ pub use topk_sink::{FloatKeyFallback, PhysicalTopK, TopKDynamicFilter};
 ///   it evaluates depends on the order of its batches;
 /// * TopKs with a float key that their threshold compares, unless the native
 ///   TopK keeps the rows of DataFusion's TopK: as many rows (the fetch of the
-///   `SortExec`), by its keys (through the projections above it). Its
-///   threshold compares `-0.0 = 0.0` while it sorts `-0.0` first, so which
-///   rows it returns can depend on the order of its batches, but only if the
-///   last row of the result has a zero in such a key: the native TopK checks
-///   that row, and executes DataFusion's TopK instead if it does (see
-///   [`FloatKeyFallback`]);
+///   `SortExec`), by its keys (through the projections above it), and the
+///   plan executes again as if it had not been executed. Its threshold
+///   compares `-0.0 = 0.0` while it sorts `-0.0` first, so which rows it
+///   returns can depend on the order of its batches, but only if the last row
+///   of the result has a zero in such a key: the native TopK checks that row,
+///   and executes DataFusion's TopK instead if it does (see
+///   [`FloatKeyFallback`]). That second execution of the input returns what a
+///   single execution returns only if every execution reads the same data and
+///   no volatile function is called: in-memory batches (no streams that can
+///   only be read once, nor files, which may change or fail to be read in
+///   between) through nodes that compute their output from their input only,
+///   without volatile functions;
 /// * TopKs whose dynamic filter DataFusion pushed into a node below them (e.g.
 ///   a Parquet scan), if that node or a node between it and the TopK
 ///   evaluates an expression that can fail, is not a scan, projection,
@@ -472,12 +484,18 @@ impl SortPlan {
         // `FloatKeyFallback`), which the native TopK checks: then it runs
         // DataFusion's TopK instead. So its last row must be the last row of
         // DataFusion's TopK: it keeps as many rows, by the keys of the sort
-        // (through the projections, see below).
+        // (through the projections, see below). And DataFusion's TopK then
+        // executes after the native TopK read its input, which must therefore
+        // execute again as if it had not been executed (see
+        // `executes_again_as_if_for_the_first_time`): otherwise, such TopKs are
+        // left to DataFusion, which executes their input once.
         let float_keys = match sort.fetch() {
             Some(_) => compared_float_keys(sort.expr(), &sort_input.schema())?,
             None => vec![],
         };
-        if !float_keys.is_empty() && fetch != sort.fetch() {
+        if !float_keys.is_empty()
+            && (fetch != sort.fetch() || !executes_again_as_if_for_the_first_time(plan)?)
+        {
             return Ok(None);
         }
         // The dynamic filter of DataFusion's TopK prunes the rows of the nodes
@@ -717,6 +735,96 @@ fn dynamic_filter(
         return Ok(None);
     }
     Ok(Some(TopKDynamicFilter::new(filter, keys)))
+}
+
+/// Whether `plan` can be executed again, after an execution (and with
+/// `reset_plan_states`), as if it had not been executed before: whether its
+/// second execution is like a first one, which sees no effect of the first
+/// execution and has none on it, so that it returns rows that a single
+/// execution of `plan` could return (and fails like one).
+///
+/// That is proven for plans that read only in-memory batches, which every
+/// execution reads again (`MemorySourceConfig`s, empty and placeholder rows),
+/// through nodes that compute their output from their input only (filters,
+/// projections, repartitionings, coalesced, merged and interleaved partitions,
+/// unions, aggregations, hash and nested loop joins, cross joins, sorts and
+/// limits), with expressions and aggregate functions that are not volatile.
+/// A volatile function may have state (e.g. count its calls) or return other
+/// values when called again. Any other plan may not execute again as it
+/// executed once: e.g. a stream that can only be read once, a scan of files,
+/// which may change or fail to be read in between, or a write.
+fn executes_again_as_if_for_the_first_time(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<bool> {
+    let computes_from_its_input = match plan.downcast_ref::<DataSourceExec>() {
+        Some(scan) => scan.data_source().is::<MemorySourceConfig>(),
+        None => {
+            plan.is::<EmptyExec>()
+                || plan.is::<PlaceholderRowExec>()
+                || plan.is::<FilterExec>()
+                || plan.is::<ProjectionExec>()
+                || plan.is::<RepartitionExec>()
+                || plan.is::<CoalescePartitionsExec>()
+                || plan.is::<SortPreservingMergeExec>()
+                || plan.is::<InterleaveExec>()
+                || plan.is::<UnionExec>()
+                || plan.is::<AggregateExec>()
+                || plan.is::<HashJoinExec>()
+                || plan.is::<NestedLoopJoinExec>()
+                || plan.is::<CrossJoinExec>()
+                || plan.is::<SortExec>()
+                || plan.is::<GlobalLimitExec>()
+                || plan.is::<LocalLimitExec>()
+        }
+    };
+    if !computes_from_its_input {
+        return Ok(false);
+    }
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && aggregate
+            .aggr_expr()
+            .iter()
+            .any(|expr| expr.fun().signature().volatility == Volatility::Volatile)
+    {
+        return Ok(false);
+    }
+    let mut volatile = false;
+    plan.apply_expressions(&mut |expr| {
+        volatile = volatile || calls_volatile_functions(expr)?;
+        Ok(match volatile {
+            true => TreeNodeRecursion::Stop,
+            false => TreeNodeRecursion::Continue,
+        })
+    })?;
+    if volatile {
+        return Ok(false);
+    }
+    for child in plan.children() {
+        if !executes_again_as_if_for_the_first_time(child)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether `expr` or an expression in it is volatile (see [`is_volatile`]),
+/// also the current expression of a dynamic filter, which is not one of its
+/// children.
+fn calls_volatile_functions(expr: &Arc<dyn PhysicalExpr>) -> Result<bool> {
+    if is_volatile(expr) {
+        return Ok(true);
+    }
+    let mut volatile = false;
+    expr.apply(|node| {
+        if let Some(dynamic) = node.downcast_ref::<DynamicFilterPhysicalExpr>()
+            && calls_volatile_functions(&dynamic.current()?)?
+        {
+            volatile = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(volatile)
 }
 
 /// Whether the sort keys `ordering` of the rows that `projections` (from the
@@ -1825,11 +1933,21 @@ mod tests {
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::{data_batch, data_schema, write_parquet};
     use crate::test_utils::{
-        datafusion_context, run_sql, test_session_config, test_table_t1,
+        assert_byte_eq_with_datafusion_with_config, compare_outputs, datafusion_context,
+        pipeline_context, run_engines, run_sql, test_session_config, test_table_t1,
     };
+    use datafusion::catalog::streaming::StreamingTable;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionConfig;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_expr::{
+        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility,
+    };
     use datafusion_physical_plan::collect;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     // ---------------------------------------------------------------------
     // Sort keys
@@ -3083,6 +3201,290 @@ mod tests {
             assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
             assert!(topk_fallbacks(&root)[0].is_some(), "{sql}\n{tree}");
         }
+    }
+
+    /// A partition of `batches` that can only be read once, like a stream from
+    /// a socket or a queue: executed again, it returns no rows. It counts its
+    /// executions in `executions`.
+    #[derive(Debug)]
+    struct OneShotPartition {
+        schema: SchemaRef,
+        batches: Mutex<Vec<RecordBatch>>,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl PartitionStream for OneShotPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<datafusion_execution::TaskContext>,
+        ) -> SendableRecordBatchStream {
+            self.executions.fetch_add(1, AtomicOrdering::SeqCst);
+            let batches = std::mem::take(&mut *self.batches.lock());
+            let batches = futures::stream::iter(batches.into_iter().map(Ok));
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                batches,
+            ))
+        }
+    }
+
+    /// `first_call()`: whether it is called for the first time (for all
+    /// rows), a volatile function with state. It counts its calls in `calls`.
+    #[derive(Debug)]
+    struct FirstCall {
+        calls: Arc<AtomicUsize>,
+        signature: Signature,
+    }
+
+    impl PartialEq for FirstCall {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.calls, &other.calls)
+        }
+    }
+
+    impl Eq for FirstCall {}
+
+    impl std::hash::Hash for FirstCall {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.calls).hash(state);
+        }
+    }
+
+    impl ScalarUDFImpl for FirstCall {
+        fn name(&self) -> &str {
+            "first_call"
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            let first = self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0;
+            Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(vec![
+                first;
+                args.number_rows
+            ]))))
+        }
+    }
+
+    /// Run `sql` on both engines, set up with `setup`, which registers a
+    /// table or function whose executions or calls it counts in a new counter
+    /// for each engine, which it adds to `counts`: assert that both engines
+    /// return the same bytes, and count the same executions or calls.
+    /// Returns the lowered operator tree.
+    async fn assert_executed_like_datafusion<F>(
+        sql: &str,
+        counts: &Mutex<Vec<Arc<AtomicUsize>>>,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        counts.lock().clear();
+        let (expected, actual) = run_engines(sql, test_session_config(), setup)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let root = Arc::clone(
+            actual
+                .plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator(),
+        );
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!(
+                "Results differ: {message}\nquery: {sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+        let counts = counts
+            .lock()
+            .iter()
+            .map(|count| count.load(AtomicOrdering::SeqCst))
+            .collect::<Vec<_>>();
+        assert_eq!(counts.len(), 2, "{sql}");
+        assert_eq!(counts[1], counts[0], "{sql}: DataFusion, pipeline engine");
+        root
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_of_float_keys_whose_input_cannot_be_executed_again_are_left_to_datafusion()
+    -> Result<()> {
+        // A native TopK by float keys runs DataFusion's TopK, which executes
+        // its input again, if the last row of its result is a zero (see
+        // `FloatKeyFallback`), as it is for these queries. That is the same as
+        // an execution of DataFusion's TopK only for an input that every
+        // execution reads again and that has no state: here, a stream that can
+        // only be read once (DataFusion returns `0.0`, the second execution of
+        // the stream no rows), and a volatile function with state (true for
+        // the rows of its first call). Such TopKs are left to DataFusion,
+        // which executes their input once, like the pipeline engine then.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(vec![1.0, 0.0, 2.0]))],
+        )?;
+        let counts = Mutex::new(vec![]);
+        let stream = async |ctx: &SessionContext| {
+            let executions = Arc::new(AtomicUsize::new(0));
+            counts.lock().push(Arc::clone(&executions));
+            let partition = OneShotPartition {
+                schema: Arc::clone(&schema),
+                batches: Mutex::new(vec![batch.clone()]),
+                executions,
+            };
+            let table =
+                StreamingTable::try_new(Arc::clone(&schema), vec![Arc::new(partition)])?;
+            ctx.register_table("s", Arc::new(table))?;
+            Ok(())
+        };
+        for sql in [
+            "SELECT v FROM s ORDER BY v LIMIT 1",
+            "SELECT v FROM s ORDER BY v NULLS FIRST LIMIT 2",
+            "SELECT v, v + 1 AS w FROM s ORDER BY v LIMIT 1",
+        ] {
+            let root = assert_executed_like_datafusion(sql, &counts, &stream).await;
+            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+        }
+        let volatile = async |ctx: &SessionContext| {
+            let table =
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?;
+            ctx.register_table("t", Arc::new(table))?;
+            let calls = Arc::new(AtomicUsize::new(0));
+            counts.lock().push(Arc::clone(&calls));
+            ctx.register_udf(ScalarUDF::new_from_impl(FirstCall {
+                calls,
+                signature: Signature::nullary(Volatility::Volatile),
+            }));
+            Ok(())
+        };
+        for sql in [
+            "SELECT v FROM t WHERE first_call() ORDER BY v LIMIT 1",
+            "SELECT v, first_call() AS f FROM t ORDER BY v LIMIT 1",
+            "SELECT v FROM (SELECT v FROM t WHERE first_call()) GROUP BY v ORDER BY v LIMIT 1",
+        ] {
+            let root = assert_executed_like_datafusion(sql, &counts, &volatile).await;
+            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+        }
+        // Over a table of in-memory batches without volatile functions, the
+        // TopK is native and runs DataFusion's TopK, as its last row is a zero.
+        let ctx = pipeline_context(test_session_config());
+        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?;
+        ctx.register_table("t", Arc::new(table))?;
+        let sql = "SELECT v FROM t ORDER BY v LIMIT 1";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let output = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_eq!(topk_fallbacks(root.operator()), [Some(1)]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn plans_that_execute_again_as_if_for_the_first_time() -> Result<()> {
+        let again = |plan: &Arc<dyn ExecutionPlan>| {
+            executes_again_as_if_for_the_first_time(plan).unwrap()
+        };
+        // In-memory batches, through nodes that compute their output from
+        // their input.
+        let scan = t1_scan(4);
+        let schema = scan.schema();
+        assert!(again(&scan));
+        let a = col("a", &schema)?;
+        let positive = Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Gt, lit(0)));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExecBuilder::new(positive, Arc::clone(&scan)).build()?);
+        let sort = sort_exec(Arc::clone(&filter), &[("c", false)], true, Some(10));
+        assert!(again(&merge(sort, &[("c", false)], Some(10))));
+        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        assert!(again(&empty));
+        let union = UnionExec::try_new(vec![Arc::clone(&scan), empty])?;
+        assert!(again(&union));
+
+        // Volatile functions (with state), also in a dynamic filter, whose
+        // current expression is not one of its children.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count_calls =
+            crate::operators::filter::test_support::count_calls(&calls, &schema);
+        let first_calls: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(count_calls, Operator::Eq, lit("1")));
+        let dynamic =
+            crate::operators::filter::test_support::dynamic_first_call(&calls, &schema);
+        assert!(
+            !is_volatile(&dynamic),
+            "the dynamic filter hides its function"
+        );
+        for predicate in [first_calls, dynamic] {
+            let filter: Arc<dyn ExecutionPlan> = Arc::new(
+                FilterExecBuilder::new(Arc::clone(&predicate), Arc::clone(&scan))
+                    .build()?,
+            );
+            assert!(!again(&filter), "{predicate}");
+            let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+                vec![(predicate, "p".to_string())],
+                Arc::clone(&scan),
+            )?);
+            assert!(!again(&projection));
+            let sort = sort_exec(projection, &[("p", false)], false, Some(3));
+            assert!(!again(&sort));
+        }
+
+        // A stream that can only be read once, and a scan of files.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(vec![1.0]))],
+        )?;
+        let partition = OneShotPartition {
+            schema: batch.schema(),
+            batches: Mutex::new(vec![batch.clone()]),
+            executions: Arc::new(AtomicUsize::new(0)),
+        };
+        let stream: Arc<dyn ExecutionPlan> = Arc::new(StreamingTableExec::try_new(
+            batch.schema(),
+            vec![Arc::new(partition)],
+            None,
+            vec![],
+            false,
+            None,
+        )?);
+        assert!(!again(&stream));
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p.parquet");
+        write_parquet(&path, data_schema(), &[data_batch(0..100)], None)?;
+        let ctx = datafusion_context(test_session_config());
+        let path = path.to_str().expect("a UTF-8 path");
+        ctx.register_parquet("p", path, ParquetReadOptions::default())
+            .await?;
+        let scan = ctx
+            .sql("SELECT * FROM p")
+            .await?
+            .create_physical_plan()
+            .await?;
+        assert!(scan.is::<DataSourceExec>(), "{}", scan.name());
+        assert!(!again(&scan));
+        // A TopK by float keys over such a scan is left to DataFusion.
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default())
+                .await
+        };
+        let sql = "SELECT id, c FROM p ORDER BY c NULLS FIRST, id LIMIT 10";
+        assert_byte_eq_with_datafusion_with_config(sql, test_session_config(), setup)
+            .await;
+        let root = assert_native_byte_eq(sql, test_session_config(), &setup).await;
+        assert_eq!(sorts(&root), 0, "{}", format_operator_tree(&root));
+        Ok(())
     }
 
     #[test]
