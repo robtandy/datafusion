@@ -2466,20 +2466,30 @@ fn may_fail_to_combine(plan: &Arc<dyn ExecutionPlan>) -> bool {
 
 /// Whether `plan` is a source that may fail to read or decode its rows: every
 /// leaf but a scan of memory, of an empty relation or of placeholder rows, and
-/// a scan of Parquet or CSV files whose expressions (its predicate and its
+/// a scan of Parquet files whose expressions (its predicate and its
 /// projection) cannot fail (see [`file_scan_failures`]), e.g. those of TPC-H
-/// and ClickBench: well-formed files are read without failing, whichever of
-/// their files, row groups and rows the dynamic filters of the operators above
-/// skip. Other scans of files, which may fail to read or parse them, and
-/// streams may fail.
+/// and ClickBench: well-formed files, whose columns have the types of the
+/// table (as DataFusion infers the schema of a table from its files), are
+/// read without failing, whichever of their files, row groups and rows the
+/// dynamic filters of the operators above skip. Scans of CSV files may fail to
+/// parse any value of their rows (also of files whose schema DataFusion
+/// inferred, from their first rows), and other scans of files, which may fail
+/// to read or parse them, and streams may fail too.
 fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let well_formed_parquet = file_scan_failures(plan).is_some_and(|failures| {
+        failures.is_none()
+            && plan
+                .downcast_ref::<DataSourceExec>()
+                .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+                .is_some_and(|config| config.file_source().is::<ParquetSource>())
+    });
     plan.children().is_empty()
         && !(plan.is::<EmptyExec>()
             || plan.is::<PlaceholderRowExec>()
             || plan
                 .downcast_ref::<DataSourceExec>()
                 .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>())
-            || file_scan_failures(plan).is_some_and(|failures| failures.is_none()))
+            || well_formed_parquet)
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
