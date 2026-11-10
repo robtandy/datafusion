@@ -87,7 +87,8 @@ use std::time::Duration;
 use arrow::array::{RecordBatch, RecordBatchOptions, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionMode};
 use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
-use datafusion_common::tree_node::TreeNode;
+use datafusion_common::metadata::FieldMetadata;
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, ScalarValue, config_err};
 use datafusion_expr::{ColumnarValue, Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{
@@ -520,8 +521,10 @@ fn value_fallibility(
 /// evaluated on rows. Unlike a literal, its value is not known before the
 /// execution: it may have any number of bytes (see `is_broadcast_constant`),
 /// and the classification cannot evaluate it (before the subquery ran, it
-/// fails), so an expression with a result that may fail is judged to fail
-/// without rows (see `fails_without_rows`).
+/// fails), so it judges whether an expression with a result fails without
+/// rows with a null of the type of the result, where the value of the result
+/// makes no difference, and otherwise judges that it does (see
+/// `with_populated_subquery_results`).
 fn is_subquery_result(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.is::<ScalarSubqueryExpr>()
 }
@@ -1284,7 +1287,9 @@ fn is_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
 }
 
 /// Whether evaluating `expr` on an empty batch of `schema` fails (or,
-/// conservatively, whether there is no array of a type of `schema`).
+/// conservatively, whether there is no array of a type of `schema`), once the
+/// results of the scalar subqueries that it reads are populated (see
+/// [`with_populated_subquery_results`]).
 fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     if must_not_be_evaluated(expr)
         || !schema
@@ -1294,10 +1299,100 @@ fn fails_without_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     {
         return true;
     }
+    let Some(expr) = with_populated_subquery_results(expr, schema) else {
+        return true;
+    };
     let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
     expr.evaluate(&batch)
         .and_then(|value| value.into_array(0))
         .is_err()
+}
+
+/// `expr`, to be evaluated on an empty batch of `schema` as DataFusion
+/// evaluates it once the results of its scalar subqueries are populated (see
+/// `is_subquery_result`), before any row: with every result (which fails
+/// before its subquery ran) replaced by a null of its type, or `None` if a
+/// part of `expr` may fail on the value of a result without rows, which a null
+/// does not tell.
+///
+/// A result is a scalar. On a batch without rows, a part of `expr` computes
+/// on the value of a result only if an operand of the part with the result
+/// evaluates to a scalar (a constant, see `is_constant_tree`, or an operand
+/// that may evaluate to a scalar, see `may_change_shape`): e.g. `result * 2`,
+/// or `s ~ result`, whose pattern Arrow compiles before it matches any row.
+/// Whether such a part fails without rows depends on the value of the result
+/// if it may fail on the values of its operands (see `value_fallibility`),
+/// but for arithmetic on numbers with an operand that is an array on every
+/// batch, which Arrow applies to every row of the array (see
+/// `applies_to_rows`): without rows, to none, e.g.
+/// `CAST(x AS DECIMAL(19, 6)) - result`. The parts that cannot fail on the
+/// values of their operands, e.g. the comparisons of TPC-H Q11, Q15 and Q22
+/// with the results of their subqueries, can only fail on their types, which
+/// a null of the type of the result tells.
+fn with_populated_subquery_results(
+    expr: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let reads_results = |expr: &Arc<dyn PhysicalExpr>| {
+        expr.exists(|expr| Ok(is_subquery_result(expr)))
+            .unwrap_or(true)
+    };
+    if !reads_results(expr) {
+        return Some(Arc::clone(expr));
+    }
+    let computes_on_results = expr.exists(|part| {
+        let on_scalar_results = part.children().into_iter().any(|operand| {
+            reads_results(operand)
+                && (is_constant_tree(operand) || may_change_shape(operand))
+        });
+        Ok(on_scalar_results
+            && value_fallibility(part, schema, 0) != Fallibility::Infallible
+            && !applies_to_rows(part, schema))
+    });
+    if computes_on_results.unwrap_or(true) {
+        return None;
+    }
+    let populated = Arc::clone(expr).transform_up(|expr| {
+        if !is_subquery_result(&expr) {
+            return Ok(Transformed::no(expr));
+        }
+        let field = expr.return_field(schema)?;
+        let metadata = FieldMetadata::new_from_field(&field);
+        let null = Literal::new_with_metadata(
+            ScalarValue::try_from(field.data_type())?,
+            (!metadata.is_empty()).then_some(metadata),
+        );
+        Ok(Transformed::yes(Arc::new(null) as Arc<dyn PhysicalExpr>))
+    });
+    populated.ok().map(|populated| populated.data)
+}
+
+/// Whether `part` is arithmetic on numbers (`+`, `-`, `*`, `/` or `%` of
+/// integers, floating point numbers or decimals) with an operand that is an
+/// array on every batch (neither a constant, see `is_constant_tree`, nor an
+/// expression that may evaluate to a scalar, see `may_change_shape`): Arrow
+/// applies it to every row of the array, with the value of the other operand
+/// if that is a scalar (see `arithmetic_op`), so it computes nothing on a
+/// batch without rows, whatever that value.
+fn applies_to_rows(part: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let Some(binary) = part.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    let operands = [binary.left(), binary.right()];
+    matches!(
+        binary.op(),
+        Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+    ) && operands.iter().all(|operand| {
+        operand.data_type(schema).is_ok_and(|data_type| {
+            data_type.is_integer() || data_type.is_floating() || data_type.is_decimal()
+        })
+    }) && operands
+        .iter()
+        .any(|operand| !is_constant_tree(operand) && !may_change_shape(operand))
 }
 
 /// Whether `binary` wraps on overflow instead of failing (DataFusion's
@@ -4041,23 +4136,55 @@ mod tests {
         ));
         assert_eq!(fallibility(&filter, &schema), Fallibility::Infallible);
         assert!(!depends_on_batches(&filter, &schema));
-        // Arithmetic with it only overflows, but the classification does not
-        // evaluate it (before the subquery ran, it fails): whether an
-        // expression with a result that may fail fails on the empty batches
-        // that DataFusion evaluates it on, which the native operators do not,
-        // is not known.
+        // Arithmetic with it only overflows. Evaluating it fails before the
+        // subquery ran, but once it ran, Arrow subtracts the result from every
+        // row of the batch, which computes nothing on the empty batches that
+        // DataFusion evaluates it on (and the native operators do not).
         let difference: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             physical_expr("CAST(l_quantity AS DECIMAL(19, 6))", &schema),
             Operator::Minus,
             Arc::clone(&average),
         ));
         assert!(failures(&difference, &schema).only_overflows());
-        assert!(depends_on_batches(&difference, &schema));
+        assert!(!depends_on_batches(&difference, &schema));
         assert!(
             average
                 .evaluate(&RecordBatch::new_empty(Arc::clone(&schema)))
                 .is_err()
         );
+        // But a part that may fail on the value of a result, which it computes
+        // on whatever the rows, also without any, fails on empty batches
+        // depending on that value: arithmetic on results only, a cast of a
+        // result that may overflow, or a pattern, which Arrow compiles before
+        // it matches any row.
+        for computed in [
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&average),
+                Operator::Multiply,
+                Arc::clone(&average),
+            )) as Arc<dyn PhysicalExpr>,
+            Arc::new(CastExpr::new(
+                Arc::clone(&average),
+                DataType::Decimal128(5, 2),
+                None,
+            )),
+            Arc::new(BinaryExpr::new(
+                physical_expr("s", &schema),
+                Operator::RegexMatch,
+                Arc::clone(&name),
+            )),
+        ] {
+            assert_ne!(
+                fallibility(&computed, &schema),
+                Fallibility::Infallible,
+                "{computed}"
+            );
+            assert!(depends_on_batches(&computed, &schema), "{computed}");
+            assert!(!applies_to_rows(&computed, &schema), "{computed}");
+        }
+        // Unlike the difference, which has an operand that is an array on
+        // every batch, to every row of which Arrow applies it.
+        assert!(applies_to_rows(&difference, &schema));
         // A string of any number of bytes, which an expression may copy for
         // every row of a batch (but a comparison does not).
         assert!(depends_on_batches(&name, &schema));
