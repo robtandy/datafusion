@@ -2016,7 +2016,7 @@ impl Judgement {
 fn native_sort_keys(sort: &Arc<dyn PhysicalOperator>) -> Judgement {
     let ordering = if let Some(sort) = sort.downcast_ref::<PhysicalSort>() {
         sort.ordering()
-    } else if let Some(topk) = sort.downcast_ref::<crate::sort::PhysicalTopK>() {
+    } else if let Some(topk) = sort.downcast_ref::<PhysicalTopK>() {
         topk.ordering()
     } else {
         // Conservatively: unknown keys may fail, depending on the batches.
