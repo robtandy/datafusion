@@ -219,19 +219,25 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::format::ExplainFormat;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::{Result, ScalarValue, exec_err, internal_err};
+use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_csv::source::CsvSource;
+use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Explain;
-use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, IsNotNullExpr,
+};
+use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, conjunction};
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateInputMode, AggregateMode,
 };
@@ -245,9 +251,9 @@ use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{
@@ -258,10 +264,15 @@ use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
 use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
+use crate::chunk::DataChunk;
 use crate::explain::{AnalyzedPipelineExec, MetricSelection};
 use crate::join::PhysicalHashJoin;
 use crate::join::nested_loop::{PhysicalCrossJoin, PhysicalNestedLoopJoin};
-use crate::operator::PhysicalOperator;
+use crate::operator::{
+    ExecutionContext, GlobalOperatorState, GlobalSinkState, LocalSinkState,
+    OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
+    downcast_state,
+};
 use crate::operators::adaptive_filter::{Failures, depends_on_batches, failures};
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
@@ -269,6 +280,7 @@ use crate::operators::limit::PhysicalLimit;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
+use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::PhysicalSort;
 use crate::sources::try_create_scan_source;
 use crate::window::PhysicalWindow;
@@ -668,7 +680,8 @@ impl Lowering<'_> {
             // Like `FilterExec` (see `lower_filter`), the nodes that coalesce
             // batches pull later batches of their input, whose errors they
             // raise, before the nodes above them see the rows of earlier ones.
-            if coalesces_batches(plan) && conflict(ctx.fallible_above, subtree_failures(input))
+            if coalesces_batches(plan)
+                && conflict(ctx.fallible_above, subtree_failures(input))
             {
                 return Ok(bridge(plan));
             }
@@ -817,7 +830,8 @@ impl Lowering<'_> {
         // The keys that the native sort evaluates (those of the top merge, over
         // the projections below it, if any).
         let native_keys = native_sort_keys(&lowered);
-        if !native_keys.evaluates_like_datafusion() || !fails_like_datafusion(&native_keys)
+        if !native_keys.evaluates_like_datafusion()
+            || !fails_like_datafusion(&native_keys)
         {
             return Ok(None);
         }
@@ -2025,7 +2039,9 @@ fn pipeline_children(plan: &Arc<dyn ExecutionPlan>) -> Vec<&Arc<dyn ExecutionPla
 }
 
 /// The input of `plan`, if it is a `ScalarSubqueryExec`.
-fn scalar_subquery_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+fn scalar_subquery_input(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<&Arc<dyn ExecutionPlan>> {
     plan.downcast_ref::<ScalarSubqueryExec>()
         .map(ScalarSubqueryExec::input)
 }
@@ -2380,7 +2396,10 @@ impl PhysicalOperator for PhysicalScalarSubquery {
     }
 
     fn description(&self) -> String {
-        format!("PhysicalScalarSubquery: subqueries={}", self.subqueries().len())
+        format!(
+            "PhysicalScalarSubquery: subqueries={}",
+            self.subqueries().len()
+        )
     }
 
     fn build_pipelines(
@@ -2595,7 +2614,9 @@ impl PhysicalOperator for ScalarSubqueryResult {
         }
         let value = match value.take() {
             Some(value) => value,
-            None => ScalarValue::try_from(self.children[0].schema().field(0).data_type())?,
+            None => {
+                ScalarValue::try_from(self.children[0].schema().field(0).data_type())?
+            }
         };
         // An earlier (or concurrent) execution of the plan may have populated
         // the result, which DataFusion keeps.
@@ -2613,7 +2634,9 @@ impl PhysicalOperator for ScalarSubqueryResult {
         _current: &mut PipelineBuilder,
         _meta: &mut MetaPipelineBuilder<'_>,
     ) -> Result<()> {
-        internal_err!("The result of a scalar subquery is built by PhysicalScalarSubquery")
+        internal_err!(
+            "The result of a scalar subquery is built by PhysicalScalarSubquery"
+        )
     }
 }
 
@@ -4476,9 +4499,7 @@ mod tests {
         // By `10 / (sum - sum)`: DataFusion divides by zero, which removing
         // the repartitioning would not.
         let key: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Literal::new(datafusion_common::ScalarValue::Int64(Some(
-                10,
-            )))),
+            Arc::new(Literal::new(ScalarValue::Int64(Some(10)))),
             datafusion_expr::Operator::Divide,
             Arc::new(BinaryExpr::new(
                 Arc::clone(&state),
@@ -4520,9 +4541,7 @@ mod tests {
         let divide = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
             let a = col("a", &input.schema()).unwrap();
             let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-                Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                    10,
-                )))),
+                Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
                 datafusion_expr::Operator::Divide,
                 a,
             ));
@@ -4942,9 +4961,7 @@ mod tests {
                     RepartitionExec::try_new(source, partitioning.clone()).unwrap(),
                 );
                 let divide: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                        10,
-                    )))),
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
                     datafusion_expr::Operator::Divide,
                     Arc::clone(&a),
                 ));
@@ -5119,9 +5136,7 @@ mod tests {
                 let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
                     Arc::clone(&a),
                     datafusion_expr::Operator::GtEq,
-                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                        0,
-                    )))),
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
                 ));
                 let filter: Arc<dyn ExecutionPlan> = Arc::new(
                     datafusion_physical_plan::filter::FilterExecBuilder::new(
@@ -5133,9 +5148,7 @@ mod tests {
                     .unwrap(),
                 );
                 let divide: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                        10,
-                    )))),
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
                     datafusion_expr::Operator::Divide,
                     col("a", &filter.schema()).unwrap(),
                 ));
@@ -5399,9 +5412,7 @@ mod tests {
             let k = col("k", &joined.schema()).unwrap();
             let expr: Arc<dyn PhysicalExpr> = if divide {
                 Arc::new(BinaryExpr::new(
-                    Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                        10,
-                    )))),
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
                     datafusion_expr::Operator::Divide,
                     k,
                 ))
@@ -5620,9 +5631,7 @@ mod tests {
         };
         let v = col("v", &schema)?;
         let fallible: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Literal::new(datafusion_common::ScalarValue::Int32(Some(
-                10,
-            )))),
+            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
             datafusion_expr::Operator::Divide,
             Arc::clone(&v),
         ));
@@ -5687,10 +5696,10 @@ mod tests {
                 let plan = datafusion_plan(sql, test_session_config()).await;
                 plan.transform_down(|node| {
                     let Some(last) = node.downcast_ref::<AggregateExec>() else {
-                        return Ok(datafusion_common::tree_node::Transformed::no(node));
+                        return Ok(Transformed::no(node));
                     };
                     if last.mode() != &AggregateMode::FinalPartitioned {
-                        return Ok(datafusion_common::tree_node::Transformed::no(node));
+                        return Ok(Transformed::no(node));
                     }
                     let repartition = Arc::clone(last.input());
                     let partial = Arc::clone(repartition.children()[0]);
@@ -5711,7 +5720,7 @@ mod tests {
                         Arc::new(coalesce_batches(above, None));
                     let plan = Arc::clone(&node)
                         .replace_children(vec![coalesce], recompute())?;
-                    Ok(datafusion_common::tree_node::Transformed::yes(plan))
+                    Ok(Transformed::yes(plan))
                 })
                 .unwrap()
                 .data
