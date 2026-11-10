@@ -5713,49 +5713,50 @@ mod tests {
         Ok(())
     }
 
+    /// A table `p` of two Parquet files `(k INT, s VARCHAR)` in `dir`, with the
+    /// rows `first` and `second`: the files are well-formed, their columns have
+    /// the types of the table.
+    fn two_parquet_files(
+        dir: &std::path::Path,
+        first: (i32, &str, usize),
+        second: (i32, &str, usize),
+    ) -> Result<String> {
+        let path = dir.join("p");
+        for (file, (k, s, rows)) in [first, second].into_iter().enumerate() {
+            let batch = RecordBatch::try_from_iter([
+                (
+                    "k",
+                    Arc::new(Int32Array::from(vec![k; rows])) as arrow::array::ArrayRef,
+                ),
+                (
+                    "s",
+                    Arc::new(arrow::array::StringViewArray::from(vec![s; rows])) as _,
+                ),
+            ])?;
+            write_parquet(
+                &path.join(format!("{file}.parquet")),
+                batch.schema(),
+                &[batch],
+                None,
+            )?;
+        }
+        Ok(path.to_str().unwrap().to_string())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
     -> Result<()> {
-        // A table `k INT, v INT` of two Parquet files: 100 rows `k = 1` of
-        // integers, and rows `k = 0` of strings that fail to cast to `INT`
-        // when they are read. DataFusion pushes the dynamic filter of the join
-        // (`k = 1`, from its build side) into the scan, which prunes the
-        // second file: it never reads it. A native join does not prune the same
-        // reads, so that it would fail to cast.
+        // A table `k INT, s VARCHAR` of two Parquet files: 100 rows `k = 1` of
+        // integers, and 10 rows `k = 0` of strings that fail to cast to `INT`.
+        // DataFusion pushes the dynamic filter of the join (`k = 1`, from its
+        // build side) into the scan, which prunes the second file: it never
+        // casts its strings. A native join does not prune the same reads, so
+        // that it could fail to cast.
         let dir = tempfile::tempdir()?;
-        let good = RecordBatch::try_from_iter([
-            (
-                "k",
-                Arc::new(Int32Array::from(vec![1; 100])) as arrow::array::ArrayRef,
-            ),
-            ("v", Arc::new(Int32Array::from_iter_values(0..100)) as _),
-        ])?;
-        let bad = RecordBatch::try_from_iter([
-            (
-                "k",
-                Arc::new(Int32Array::from(vec![0; 10])) as arrow::array::ArrayRef,
-            ),
-            (
-                "v",
-                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
-                    as _,
-            ),
-        ])?;
-        let path = dir.path().join("p");
-        write_parquet(&path.join("0.parquet"), good.schema(), &[good], None)?;
-        write_parquet(&path.join("1.parquet"), bad.schema(), &[bad], None)?;
-        let path = path.to_str().unwrap();
-        let schema = Schema::new(vec![
-            Field::new("k", DataType::Int32, true),
-            Field::new("v", DataType::Int32, true),
-        ]);
+        let path = two_parquet_files(dir.path(), (1, "7", 100), (0, "bad_integer", 10))?;
         let setup = async |ctx: &SessionContext| {
-            ctx.register_parquet(
-                "p",
-                path,
-                ParquetReadOptions::default().schema(&schema),
-            )
-            .await?;
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await?;
             ctx.sql("CREATE TABLE b AS SELECT 1 AS x")
                 .await?
                 .collect()
@@ -5763,10 +5764,9 @@ mod tests {
             Ok(())
         };
         let config = test_session_config().with_target_partitions(1);
-        let sql = "SELECT b.x, COUNT(p.v) AS n FROM b JOIN p ON b.x = p.k GROUP BY b.x";
-        let plan = datafusion_context(config.clone());
-        setup(&plan).await?;
-        let plan = plan.sql(sql).await?.create_physical_plan().await?;
+        let sql = "SELECT b.x, COUNT(q.v) AS n FROM b \
+                   JOIN (SELECT k, CAST(s AS INT) AS v FROM p) q ON b.x = q.k GROUP BY b.x";
+        let plan = datafusion_plan_with(sql, config.clone(), &setup).await;
         let mut produced = 0;
         plan.apply(|node| {
             if node.is::<HashJoinExec>() {
@@ -5775,66 +5775,280 @@ mod tests {
             Ok(TreeNodeRecursion::Continue)
         })?;
         assert_eq!(produced, 1, "{}", displayable(plan.as_ref()).indent(false));
-        let root = assert_parity_with(sql, config, &setup).await;
+        let root = assert_parity_with(sql, config.clone(), &setup).await;
         assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        // Without the cast, the work of the probe side cannot fail on the rows
+        // that only one of the engines prunes (the files are well-formed): the
+        // join is native.
+        let sql = "SELECT b.x, COUNT(p.s) AS n FROM b JOIN p ON b.x = p.k GROUP BY b.x";
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
     -> Result<()> {
-        // A table `k INT, v INT` of two Parquet files: 100 rows `k = 0, v =
-        // 100`, and 10 rows `k = 1` of strings that fail to cast to `INT` when
-        // they are read. The TopK of `ORDER BY k LIMIT 1` reads the first file,
-        // whose rows tighten its threshold to `k <= 0`, and DataFusion's scan
-        // prunes the second file with its dynamic filter: it never reads it. A
-        // native TopK does not prune the same reads, so that it would fail to
+        // A table `k INT, s VARCHAR` of two Parquet files: 100 rows `k = 0, s =
+        // '100'`, and 10 rows `k = 1` of strings that fail to cast to `INT`. The
+        // TopK of `ORDER BY k LIMIT 1` reads the first file, whose rows tighten
+        // its threshold to `k < 0`, and DataFusion's scan prunes the second
+        // file with its dynamic filter: it never casts its strings (in the scan
+        // or in the filter above it). A native TopK tightens its threshold at
+        // other times, so that its scan could read the second file and fail to
         // cast.
         let dir = tempfile::tempdir()?;
-        let first = RecordBatch::try_from_iter([
-            (
-                "k",
-                Arc::new(Int32Array::from(vec![0; 100])) as arrow::array::ArrayRef,
-            ),
-            ("v", Arc::new(Int32Array::from(vec![100; 100])) as _),
-        ])?;
-        let second = RecordBatch::try_from_iter([
-            (
-                "k",
-                Arc::new(Int32Array::from(vec![1; 10])) as arrow::array::ArrayRef,
-            ),
-            (
-                "v",
-                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
-                    as _,
-            ),
-        ])?;
-        let path = dir.path().join("p");
-        write_parquet(&path.join("0.parquet"), first.schema(), &[first], None)?;
-        write_parquet(&path.join("1.parquet"), second.schema(), &[second], None)?;
-        let path = path.to_str().unwrap();
-        let schema = Schema::new(vec![
-            Field::new("k", DataType::Int32, true),
-            Field::new("v", DataType::Int32, true),
-        ]);
+        let path =
+            two_parquet_files(dir.path(), (0, "100", 100), (1, "bad_integer", 10))?;
         let setup = async |ctx: &SessionContext| {
             register_view_tables(ctx)?;
-            ctx.register_parquet(
-                "p",
-                path,
-                ParquetReadOptions::default().schema(&schema),
-            )
-            .await?;
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await?;
             Ok(())
         };
         let config = test_session_config().with_target_partitions(1);
-        let sql = "SELECT k, v FROM p ORDER BY k LIMIT 1";
+        for sql in [
+            "SELECT k, CAST(s AS INT) AS v FROM p ORDER BY k LIMIT 1",
+            "SELECT k, s FROM p WHERE CAST(s AS INT) > 0 ORDER BY k LIMIT 1",
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_eq!(
+                count::<PhysicalTopK>(&root),
+                0,
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+        // Without the cast, the work on the rows that only one of the engines
+        // prunes cannot fail (the files are well-formed): the TopK is native.
+        let sql = "SELECT k, s FROM p ORDER BY k LIMIT 1";
         let root = assert_parity_with(sql, config.clone(), &setup).await;
-        assert_eq!(count::<PhysicalTopK>(&root), 0);
+        assert_native(sql, &root);
+        assert_eq!(count::<PhysicalTopK>(&root), 1);
         // Over a scan of memory, which cannot fail, the TopK is native.
         let sql = "SELECT id, a FROM t1 ORDER BY a, id LIMIT 3";
         let root = assert_parity_with(sql, config, &setup).await;
         assert_eq!(count::<PhysicalTopK>(&root), 1);
+        Ok(())
+    }
+
+    /// The plan of `sql` through the [`PipelineQueryPlanner`] (a
+    /// [`PipelineRootExec`]), in a session configured with `config` and set up
+    /// with `setup`, and the session.
+    async fn pipeline_plan<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> (Arc<dyn ExecutionPlan>, SessionContext)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = pipeline_context(config);
+        setup(&ctx).await.unwrap();
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert!(plan.is::<PipelineRootExec>(), "{sql}");
+        (plan, ctx)
+    }
+
+    /// The dynamic filter of the `PhysicalTopK` of `plan`, a
+    /// [`PipelineRootExec`], which must be the dynamic filter of the `SortExec`
+    /// of the plan it was lowered from, which a node of the input of the
+    /// `SortExec` reads.
+    fn filter_of_native_topk(plan: &Arc<dyn ExecutionPlan>) -> Arc<DynamicFilterPhysicalExpr> {
+        let exec = plan.downcast_ref::<PipelineRootExec>().unwrap();
+        topk_updating_the_filter_of(exec.operator(), exec.input())
+    }
+
+    /// The `PhysicalTopK` of the operator tree `root` (through its first
+    /// children), whose dynamic filter must be the dynamic filter of the
+    /// `SortExec` of `plan`, the plan that `root` was lowered from, which a
+    /// node of the input of the `SortExec` reads.
+    fn topk_updating_the_filter_of(
+        root: &Arc<dyn PhysicalOperator>,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Arc<DynamicFilterPhysicalExpr> {
+        let mut sorts = vec![];
+        plan.apply(|node| {
+            if let Some(sort) = node.downcast_ref::<SortExec>() {
+                sorts.extend(read_topk_filter(sort));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        let [(filter, id)] = sorts.as_slice() else {
+            panic!("no TopK whose filter is read: {sorts:?}");
+        };
+        let topk = std::iter::successors(Some(Arc::clone(root)), |operator| {
+            operator.children().first().map(Arc::clone)
+        })
+        .find(|operator| operator.is::<PhysicalTopK>())
+        .unwrap_or_else(|| panic!("no native TopK: {}", format_operator_tree(root)));
+        let topk = topk.downcast_ref::<PhysicalTopK>().unwrap();
+        let updated = topk.dynamic_filter().expect("a dynamic filter").filter();
+        assert_eq!(updated.expression_id(), Some(*id));
+        assert!(Arc::ptr_eq(updated, filter));
+        Arc::clone(filter)
+    }
+
+    /// `files` Parquet files of 500 rows `(k BIGINT, v BIGINT, s VARCHAR)` in
+    /// `dir`, in order of `k` (from 0), with `v = 1` but on the rows `zeros`,
+    /// and `s` the digits of `k`.
+    fn parquet_files_in_order(
+        dir: &std::path::Path,
+        files: i64,
+        zeros: &[i64],
+    ) -> Result<String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        for file in 0..files {
+            let k = (file * 500..(file + 1) * 500).collect::<Vec<_>>();
+            let v = k.iter().map(|k| i64::from(!zeros.contains(k)));
+            let s = k.iter().map(i64::to_string);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(k.clone())),
+                    Arc::new(arrow::array::Int64Array::from_iter_values(v)),
+                    Arc::new(arrow::array::StringViewArray::from_iter_values(s)),
+                ],
+            )?;
+            let path = dir.join(format!("p/{file:02}.parquet"));
+            write_parquet(&path, Arc::clone(&schema), &[batch], None)?;
+        }
+        Ok(dir.join("p").to_str().unwrap().to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_dynamic_filter_prunes_nothing_are_native() -> Result<()> {
+        // DataFusion pushes the dynamic filter of the TopK of `GROUP BY k ORDER
+        // BY k LIMIT 3` through the aggregation by `k` into the scan (as the
+        // filter of the TopK of TPC-H Q18 into the scan of `orders`), but the
+        // aggregation reads all of its input before the TopK sees its first
+        // group: in both engines, the filter has no threshold while the scan
+        // reads its files, so that it prunes nothing. The TopK is native, and
+        // updates the filter, also when the work below the aggregation may fail
+        // (`10 / v`, which divides by zero on a row of the last file), on any
+        // number of threads.
+        let dir = tempfile::tempdir()?;
+        let path = parquet_files_in_order(dir.path(), 8, &[3_900])?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for (sql, error) in [
+                (
+                    "SELECT k, SUM(v) AS n FROM p GROUP BY k ORDER BY k DESC LIMIT 3",
+                    None,
+                ),
+                (
+                    "SELECT k, COUNT(*) AS n FROM p WHERE s LIKE '%7%' \
+                     GROUP BY k ORDER BY k LIMIT 5",
+                    None,
+                ),
+                (
+                    "SELECT k, SUM(10 / v) AS n FROM p GROUP BY k ORDER BY k LIMIT 3",
+                    Some("Divide by zero"),
+                ),
+            ] {
+                match error {
+                    None => {
+                        let root = assert_parity_with(sql, config.clone(), &setup).await;
+                        assert_native(sql, &root);
+                    }
+                    Some(error) => {
+                        assert_fails_like_datafusion(sql, config.clone(), &setup, error)
+                            .await;
+                    }
+                }
+                let (plan, ctx) = pipeline_plan(sql, config.clone(), &setup).await;
+                let filter = filter_of_native_topk(&plan);
+                if error.is_none() {
+                    collect(plan, ctx.task_ctx()).await?;
+                    assert!(filter.is_complete(), "{sql}");
+                    assert_ne!(filter.current()?.to_string(), "true", "{sql}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_scans_through_nodes_that_pass_rows_on_update_their_filter()
+    -> Result<()> {
+        // 20 Parquet files of 500 rows, in order of `k`. Between the TopK and
+        // the scan that reads its dynamic filter, the filter `s LIKE '%7%'` (of
+        // ClickBench's `hits23`) and the projections only pass rows on, and the
+        // work on the rows that the filter prunes cannot fail: the TopK is
+        // native, and updates the filter, so that the scan prunes the files that
+        // its threshold rules out, as in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = parquet_files_in_order(dir.path(), 20, &[])?;
+        let setup = async |ctx: &SessionContext| {
+            register_view_tables(ctx)?;
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for sql in [
+                "SELECT * FROM p WHERE s LIKE '%7%' ORDER BY k LIMIT 10",
+                "SELECT k, s FROM p WHERE s <> '' AND v > 0 ORDER BY v DESC, k LIMIT 7",
+                "SELECT k + 1 AS j, s FROM p WHERE s LIKE '1%' ORDER BY k DESC LIMIT 3",
+            ] {
+                let root = assert_parity_with(sql, config.clone(), &setup).await;
+                assert_native(sql, &root);
+                let (plan, _) = pipeline_plan(sql, config.clone(), &setup).await;
+                filter_of_native_topk(&plan);
+            }
+        }
+        // On a single thread, the files after the first ones are pruned once
+        // the threshold is known.
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT * FROM p WHERE s LIKE '%7%' ORDER BY k LIMIT 10";
+        let (plan, ctx) = pipeline_plan(sql, config.clone(), &setup).await;
+        let filter = filter_of_native_topk(&plan);
+        collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert!(filter.is_complete());
+        let exec = plan.downcast_ref::<PipelineRootExec>().unwrap();
+        let metrics = exec.execution_metrics().expect("metrics");
+        let (_, scan) = metrics
+            .iter()
+            .find(|(operator, _)| operator.is::<ParquetScanSource>())
+            .expect("the scan");
+        assert!(
+            scan.output_rows() < 5_000,
+            "the scan read {} rows",
+            scan.output_rows()
+        );
+        // Through the probe side of a join, which is no node that only passes
+        // rows on (as `crate::sort::try_lower` judges it), the TopK is left to
+        // DataFusion.
+        let sql = "SELECT p.k, t2.name FROM p JOIN t2 ON p.k = t2.k \
+                   ORDER BY p.k DESC, t2.name LIMIT 3";
+        let plan = datafusion_plan_with(sql, config.clone(), &setup).await;
+        let mut read = 0;
+        plan.apply(|node| {
+            if let Some(sort) = node.downcast_ref::<SortExec>() {
+                read += usize::from(read_topk_filter(sort).is_some());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let root = assert_parity_with(sql, config, &setup).await;
+        if read > 0 {
+            assert_eq!(count::<PhysicalTopK>(&root), 0, "{sql}");
+        }
         Ok(())
     }
 
