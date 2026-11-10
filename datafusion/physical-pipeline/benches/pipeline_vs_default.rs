@@ -712,7 +712,11 @@ fn report(config: &BenchConfig, measurements: &[Measurement]) -> String {
         out,
         "\nPipeline engine vs. default DataFusion: TPC-H SF {} and {} ClickBench-style hits, \
          {} threads, median [min] of {} executions in ms, trusted aggregate functions: {}",
-        config.scale, config.hits, config.threads, config.iterations, config.trusted_aggregates
+        config.scale,
+        config.hits,
+        config.threads,
+        config.iterations,
+        config.trusted_aggregates
     );
     let _ = writeln!(
         out,

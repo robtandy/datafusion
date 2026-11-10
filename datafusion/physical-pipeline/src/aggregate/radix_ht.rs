@@ -2426,7 +2426,8 @@ mod tests {
     /// `config`, trusting the built-in aggregate functions of DataFusion (see
     /// `TrustedAggregateFunctions`).
     fn trusting(config: SessionConfig) -> SessionConfig {
-        let functions = datafusion::functions_aggregate::all_default_aggregate_functions();
+        let functions =
+            datafusion::functions_aggregate::all_default_aggregate_functions();
         config.with_option_extension(PhysicalHashAggregate::trusted_aggregate_functions(
             &functions,
         ))
@@ -2547,7 +2548,8 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)] {
+        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)]
+        {
             let mut config =
                 test_session_config().with_target_partitions(target_partitions);
             if trusted {
@@ -3031,9 +3033,18 @@ mod tests {
         // The queries, and whether they have aggregates, whose rows bypass the
         // tables in the sessions that trust them only.
         let queries = [
-            ("SELECT k, COUNT(b), MAX(s), SUM(v) FROM long GROUP BY k", true),
-            ("SELECT k, MIN(b), MAX(b), COUNT(*) FROM long GROUP BY k", true),
-            ("SELECT s, COUNT(*), MIN(k), COUNT(b) FROM long GROUP BY s", true),
+            (
+                "SELECT k, COUNT(b), MAX(s), SUM(v) FROM long GROUP BY k",
+                true,
+            ),
+            (
+                "SELECT k, MIN(b), MAX(b), COUNT(*) FROM long GROUP BY k",
+                true,
+            ),
+            (
+                "SELECT s, COUNT(*), MIN(k), COUNT(b) FROM long GROUP BY s",
+                true,
+            ),
             // Without aggregates, whose rows (binaries and strings of up to 40
             // KB included) bypass the tables in any session.
             ("SELECT k, b FROM long GROUP BY k, b", false),
@@ -3046,7 +3057,8 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)] {
+        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)]
+        {
             let mut config =
                 test_session_config().with_target_partitions(target_partitions);
             if trusted {
@@ -3152,7 +3164,9 @@ mod tests {
         let global = RadixHashAggregate::global_sink_state()?;
         // Two threads.
         let mut locals = (0..2)
-            .map(|_| RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, spec.bypass))
+            .map(|_| {
+                RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, spec.bypass)
+            })
             .collect::<Result<Vec<_>>>()?;
         for batch in 0..30 {
             let keys = (0..10).map(|i| (batch * 10 + i) * 7 % 300);

@@ -128,7 +128,9 @@ impl AggregateSpec {
             .extensions
             .get::<TrustedAggregateFunctions>()
             .is_some_and(|trusted| {
-                self.update.iter().all(|update| trusted.trusts(&update.expr))
+                self.update
+                    .iter()
+                    .all(|update| trusted.trusts(&update.expr))
                     && self.merge.iter().all(|merge| trusted.trusts(merge))
             })
     }
