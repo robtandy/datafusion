@@ -20,7 +20,12 @@
 //! and therefore end up in the same partition, so the tables of the
 //! partitions are independent: threads build them in parallel without any
 //! synchronization ([`JoinHashTableBuilder::build_next_partition`]), and
-//! [`JoinHashTableBuilder::finish`] assembles the [`JoinHashTable`].
+//! [`JoinHashTableBuilder::finish`] assembles the [`JoinHashTable`]. A small
+//! build side gets a single, unpartitioned table
+//! ([`JoinHashTableBuilder::single_partition_up_to`]), and every thread that
+//! builds tables gets thousands of rows to insert
+//! ([`JoinHashTableBuilder::max_threads`]): tiny builds (e.g. the 25 nations of
+//! TPC-H) are not spread over dozens of empty partitions and threads.
 //!
 //! # Pointer tables
 //!
@@ -50,6 +55,25 @@
 //! comparison: like the probe rows, the build rows are inserted by comparing
 //! their keys with the first row of the chains whose salt matches.
 //!
+//! # Integer keys: dense index and key filter
+//!
+//! A join on a single key of an integer type (or `Date32`) whose build keys
+//! are known to lie in a [`KeyRange`] (computed as the build rows are
+//! collected, see [`JoinHashTableBuilder::with_key_range`]) does without
+//! hashing (DuckDB's perfect hash join, DataFusion's `ArrayMap`):
+//!
+//! * If the range spans at most [`MAX_DENSE_SPAN`] keys (and is not much
+//!   sparser than the build side), the table is a *dense index*: one entry
+//!   per key of the range, indexed by `key - min`, with the packed location of
+//!   the first row of the chain of that key. A probe row checks that its key is
+//!   in the range and reads its entry: neither its hash nor a key comparison
+//!   is needed (equal integers are equal keys).
+//! * Otherwise the table is hashed, with a *key filter* that rejects the
+//!   probe keys outside of the range before they are looked up, and, for a
+//!   build side with few keys for its range, the keys outside of the buckets
+//!   of a bitmap of at most 64 KiB (DataFusion's `KeyRangeBitmap`) in which no
+//!   build key falls.
+//!
 //! # Probe
 //!
 //! [`ChainScan`] looks up the chain of every row of a probe chunk (comparing
@@ -70,9 +94,12 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use arrow::array::ArrayRef;
+use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{
+    DataType, Date32Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
+    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{
     NullEquality, Result, exec_err, internal_err, resources_datafusion_err,
@@ -81,7 +108,8 @@ use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::tuple_data::{
-    PartitionedTupleData, RowLocation, RowMatcher, TupleDataCollection, TupleDataLayout,
+    ColumnStorage, PartitionedTupleData, RowLocation, RowMatcher, TupleDataCollection,
+    TupleDataLayout,
 };
 
 /// The seed of the hash of the join keys. Any constant works: the hashes
@@ -104,6 +132,25 @@ const SALT_MASK: u64 = 0xFFFF;
 const LOCATION_MASK: u64 = (1 << RowLocation::BITS) - 1;
 /// The smallest pointer table of a partition with rows.
 const MIN_CAPACITY: usize = 8;
+
+/// The widest [`KeyRange`] (`max - min`) of a [`DenseIndex`]: 262,145 entries
+/// of 8 bytes (2 MiB).
+pub const MAX_DENSE_SPAN: u64 = 262_144;
+/// The key ranges of at most this many keys always get a [`DenseIndex`] (of at
+/// most 512 KiB), however few build rows they have.
+const ALWAYS_DENSE_KEYS: u64 = 1 << 16;
+/// Wider key ranges get a [`DenseIndex`] if they have at most this many keys
+/// per build row: a handful of keys spread over a wide range is better served
+/// by a small hash table than by megabytes of mostly empty entries.
+const DENSE_KEYS_PER_ROW: u64 = 8;
+/// The most buckets of the bitmap of a [`KeyFilter`]: 2^19 bits, 64 KiB.
+const MAX_FILTER_BUCKETS: u64 = 1 << 19;
+/// The build sides of at most this many rows get a single, unpartitioned
+/// table (see [`JoinHashTableBuilder::single_partition_up_to`]).
+pub const SMALL_BUILD_ROWS: usize = 4096;
+/// The number of rows every thread that builds pointer tables in parallel
+/// gets at least (see [`JoinHashTableBuilder::max_threads`]).
+const ROWS_PER_BUILD_THREAD: usize = 4096;
 
 /// The number of radix bits of a hash join built by `threads` threads: about
 /// four partitions per thread, so that the threads that build the pointer
@@ -196,6 +243,365 @@ fn entry_location(entry: u64) -> RowLocation {
     unpack(entry & LOCATION_MASK)
 }
 
+/// The smallest and the largest value of the single join key of the build
+/// rows of a join on a key of an integer type or `Date32` (see
+/// [`KeyRange::supports`]), which lets a [`JoinHashTable`] look the probe keys
+/// up without hashing them (see the [module documentation](self)).
+///
+/// Keys are compared as their *key bits*: the value as a `u64`, sign extended
+/// for signed types. A key is in the range if and only if its bits minus the
+/// bits of the minimum, with wrapping arithmetic, are at most `max - min`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyRange {
+    min: i128,
+    max: i128,
+}
+
+impl KeyRange {
+    /// The range `min..=max` of keys; `None` if `min > max`, or if they are not
+    /// both values of a type that [`Self::supports`] (from `i64::MIN` to
+    /// `i64::MAX`, or from `0` to `u64::MAX`).
+    pub fn new(min: i128, max: i128) -> Option<Self> {
+        let signed = i128::from(i64::MIN)..=i128::from(i64::MAX);
+        let unsigned = 0..=i128::from(u64::MAX);
+        let values_of = |values: &std::ops::RangeInclusive<i128>| {
+            values.contains(&min) && values.contains(&max)
+        };
+        (min <= max && (values_of(&signed) || values_of(&unsigned)))
+            .then_some(Self { min, max })
+    }
+
+    /// Whether a key of `data_type` can have a range: `Int8`, `Int16`,
+    /// `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64` and `Date32`.
+    pub fn supports(data_type: &DataType) -> bool {
+        matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Date32
+        )
+    }
+
+    /// The range of the valid values of `array`, `None` if it has none or if
+    /// its type has no range (see [`Self::supports`]).
+    pub fn of_array(array: &dyn Array) -> Option<Self> {
+        fn range<T: ArrowPrimitiveType>(array: &dyn Array) -> Option<(i128, i128)>
+        where
+            T::Native: Into<i128>,
+        {
+            let array = array.as_primitive::<T>();
+            let min = arrow::compute::min(array)?;
+            let max = arrow::compute::max(array)?;
+            Some((min.into(), max.into()))
+        }
+        let (min, max) = match array.data_type() {
+            DataType::Int8 => range::<Int8Type>(array),
+            DataType::Int16 => range::<Int16Type>(array),
+            DataType::Int32 => range::<Int32Type>(array),
+            DataType::Int64 => range::<Int64Type>(array),
+            DataType::UInt8 => range::<UInt8Type>(array),
+            DataType::UInt16 => range::<UInt16Type>(array),
+            DataType::UInt32 => range::<UInt32Type>(array),
+            DataType::UInt64 => range::<UInt64Type>(array),
+            DataType::Date32 => range::<Date32Type>(array),
+            _ => None,
+        }?;
+        Self::new(min, max)
+    }
+
+    /// The smallest range that holds both ranges.
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+        }
+    }
+
+    /// The smallest key.
+    pub fn min(&self) -> i128 {
+        self.min
+    }
+
+    /// The largest key.
+    pub fn max(&self) -> i128 {
+        self.max
+    }
+
+    /// The key bits of the smallest key.
+    fn offset(&self) -> u64 {
+        // The two's complement of the value, its key bits.
+        self.min as u64
+    }
+
+    /// `max - min`, which a `u64` holds for keys of the supported types.
+    fn span(&self) -> u64 {
+        (self.max - self.min) as u64
+    }
+}
+
+/// Write the key bits (see [`KeyRange`]) of every row of `array` to `bits`
+/// (any bits for the NULL rows). Returns `false` (and writes nothing) if
+/// `array` has a type that [`KeyRange::supports`] not.
+fn key_bits(array: &dyn Array, bits: &mut Vec<u64>) -> bool {
+    fn signed<T: ArrowPrimitiveType>(array: &dyn Array, bits: &mut Vec<u64>)
+    where
+        T::Native: Into<i64>,
+    {
+        let values = array.as_primitive::<T>().values();
+        bits.extend(values.iter().map(|&value| value.into() as u64));
+    }
+    fn unsigned<T: ArrowPrimitiveType>(array: &dyn Array, bits: &mut Vec<u64>)
+    where
+        T::Native: Into<u64>,
+    {
+        let values = array.as_primitive::<T>().values();
+        bits.extend(values.iter().map(|&value| value.into()));
+    }
+    bits.clear();
+    match array.data_type() {
+        DataType::Int8 => signed::<Int8Type>(array, bits),
+        DataType::Int16 => signed::<Int16Type>(array, bits),
+        DataType::Int32 => signed::<Int32Type>(array, bits),
+        DataType::Int64 => signed::<Int64Type>(array, bits),
+        DataType::Date32 => signed::<Date32Type>(array, bits),
+        DataType::UInt8 => unsigned::<UInt8Type>(array, bits),
+        DataType::UInt16 => unsigned::<UInt16Type>(array, bits),
+        DataType::UInt32 => unsigned::<UInt32Type>(array, bits),
+        DataType::UInt64 => unsigned::<UInt64Type>(array, bits),
+        _ => return false,
+    }
+    true
+}
+
+/// Reads the key bits (see [`KeyRange`]) of the single key of stored rows:
+/// the first column of their layout, an integer of 1, 2, 4 or 8 bytes stored
+/// as its Arrow (native) bytes.
+#[derive(Debug, Clone, Copy)]
+struct KeyReader {
+    offset: usize,
+    width: usize,
+    signed: bool,
+}
+
+impl KeyReader {
+    /// The reader of the first column of `layout`, `None` if it is not a key
+    /// of a type that [`KeyRange::supports`].
+    fn try_new(layout: &TupleDataLayout) -> Option<Self> {
+        let column = layout.columns().first()?;
+        let data_type = column.data_type();
+        if !KeyRange::supports(data_type) || column.is_dictionary() {
+            return None;
+        }
+        let ColumnStorage::Fixed(width) = column.storage() else {
+            return None;
+        };
+        let in_rows = column
+            .offset()
+            .checked_add(width)
+            .is_some_and(|end| end <= layout.row_width());
+        (matches!(width, 1 | 2 | 4 | 8) && in_rows).then(|| Self {
+            offset: column.offset(),
+            width,
+            signed: data_type.is_signed_integer() || *data_type == DataType::Date32,
+        })
+    }
+
+    /// The key bits of the (valid) key of the row `row`.
+    #[inline]
+    fn read(self, row: &[u8]) -> u64 {
+        fn bytes<const W: usize>(row: &[u8], offset: usize) -> [u8; W] {
+            let mut bytes = [0; W];
+            bytes.copy_from_slice(&row[offset..offset + W]);
+            bytes
+        }
+        let offset = self.offset;
+        match (self.width, self.signed) {
+            (1, true) => i64::from(i8::from_ne_bytes(bytes(row, offset))) as u64,
+            (1, false) => u64::from(u8::from_ne_bytes(bytes(row, offset))),
+            (2, true) => i64::from(i16::from_ne_bytes(bytes(row, offset))) as u64,
+            (2, false) => u64::from(u16::from_ne_bytes(bytes(row, offset))),
+            (4, true) => i64::from(i32::from_ne_bytes(bytes(row, offset))) as u64,
+            (4, false) => u64::from(u32::from_ne_bytes(bytes(row, offset))),
+            // The bits of an `Int64` are its two's complement.
+            _ => u64::from_ne_bytes(bytes(row, offset)),
+        }
+    }
+}
+
+/// The index of a table whose single integer key has a [`KeyRange`] of at most
+/// [`MAX_DENSE_SPAN`] keys (see the [module documentation](self)): one entry
+/// per key of the range.
+struct DenseIndex {
+    /// The key bits of the smallest key.
+    offset: u64,
+    /// `max - min`: `entries` has `span + 1` entries.
+    span: u64,
+    /// The packed location of the first row of the chain of the key `min + i`
+    /// (`0`: none) in entry `i`.
+    entries: Vec<u64>,
+    /// For every row (by dense row index): the packed location of the next row
+    /// of its chain, `0` for the last row.
+    next: Vec<u64>,
+    /// The chain of the rows with a NULL key, which match the probe rows with
+    /// a NULL key under [`NullEquality::NullEqualsNull`] (`0` otherwise).
+    null_chain: u64,
+}
+
+impl DenseIndex {
+    fn memory_size(&self) -> usize {
+        (self.entries.capacity() + self.next.capacity()) * size_of::<u64>()
+    }
+
+    /// The chain of the key with key bits `bits`, `0` if it has none.
+    #[inline]
+    fn chain(&self, bits: u64) -> u64 {
+        let offset = bits.wrapping_sub(self.offset);
+        if offset <= self.span {
+            self.entries[offset as usize]
+        } else {
+            0
+        }
+    }
+}
+
+/// Rejects the probe keys that no build key equals before they are looked up
+/// in a hashed table: those outside of the [`KeyRange`] of the build keys, and
+/// those in a bucket of keys of the range in which no build key falls.
+struct KeyFilter {
+    /// The key bits of the smallest build key.
+    offset: u64,
+    /// `max - min`.
+    span: u64,
+    /// One bit per bucket of `2^shift` keys of the range (from `min`), set if a
+    /// build key falls in it; `None` to only check the range.
+    buckets: Option<KeyBuckets>,
+}
+
+struct KeyBuckets {
+    shift: u32,
+    words: Vec<u64>,
+}
+
+impl KeyFilter {
+    /// Whether a build key may equal the key with key bits `bits`.
+    #[inline]
+    fn accepts(&self, bits: u64) -> bool {
+        let offset = bits.wrapping_sub(self.offset);
+        offset <= self.span
+            && self.buckets.as_ref().is_none_or(|buckets| {
+                let bucket = (offset >> buckets.shift) as usize;
+                buckets.words[bucket / 64] & (1 << (bucket % 64)) != 0
+            })
+    }
+
+    fn memory_size(&self) -> usize {
+        self.buckets
+            .as_ref()
+            .map_or(0, |buckets| buckets.words.capacity() * size_of::<u64>())
+    }
+}
+
+/// How a [`JoinHashTableBuilder`] indexes the rows of a join on a single
+/// integer key with a [`KeyRange`] (see [`JoinHashTableBuilder::with_key_range`]).
+struct KeyIndexPlan {
+    range: KeyRange,
+    reader: KeyReader,
+    /// The [`DenseIndex`] that the partitions build, if the table is one
+    /// (otherwise, hashed tables with a [`KeyFilter`]).
+    dense: Option<DenseBuild>,
+    /// The number of keys per bucket of the [`KeyFilter`] of hashed tables
+    /// (`2^shift`), and of buckets, if it has buckets (otherwise, it only
+    /// checks the range).
+    buckets: Option<(u32, usize)>,
+}
+
+/// The entries and the chains of a [`DenseIndex`], which the partitions build
+/// in parallel: all rows of a key are in the same partition, which writes the
+/// entry of the key, and the chains of its own rows (a range of dense row
+/// indices).
+struct DenseBuild {
+    entries: Vec<AtomicU64>,
+    next: Vec<AtomicU64>,
+    null_chain: AtomicU64,
+}
+
+impl DenseBuild {
+    /// The entries of `span + 1` keys and the chains of `num_rows` rows, whose
+    /// memory is reserved in `reservation` before it is allocated.
+    fn try_new(
+        span: u64,
+        num_rows: usize,
+        reservation: &MemoryReservation,
+    ) -> Result<Self> {
+        let too_large = || {
+            resources_datafusion_err!(
+                "The dense JoinHashTable of {num_rows} rows and {span} keys is too large"
+            )
+        };
+        let num_keys = usize::try_from(span)
+            .ok()
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(too_large)?;
+        let bytes = num_keys
+            .checked_add(num_rows)
+            .and_then(|entries| entries.checked_mul(size_of::<u64>()))
+            .ok_or_else(too_large)?;
+        reservation.try_grow(bytes)?;
+        let atomics = |len: usize, what: &str| -> Result<Vec<AtomicU64>> {
+            let mut values = Vec::new();
+            values.try_reserve_exact(len).map_err(|e| {
+                resources_datafusion_err!("Failed to allocate {what}: {e}")
+            })?;
+            values.extend((0..len).map(|_| AtomicU64::new(0)));
+            Ok(values)
+        };
+        Ok(Self {
+            entries: atomics(num_keys, "a dense JoinHashTable")?,
+            next: atomics(num_rows, "the chains of a dense JoinHashTable")?,
+            null_chain: AtomicU64::new(0),
+        })
+    }
+
+    /// The dense index, once all partitions are built.
+    fn finish(self, range: KeyRange) -> DenseIndex {
+        let plain = |values: Vec<AtomicU64>| {
+            values
+                .into_iter()
+                .map(AtomicU64::into_inner)
+                .collect::<Vec<_>>()
+        };
+        DenseIndex {
+            offset: range.offset(),
+            span: range.span(),
+            entries: plain(self.entries),
+            next: plain(self.next),
+            null_chain: self.null_chain.into_inner(),
+        }
+    }
+}
+
+impl KeyIndexPlan {
+    /// The offset in the range of the build key with key bits `bits`, which
+    /// must be in the range.
+    #[inline]
+    fn offset(&self, bits: u64) -> Result<u64> {
+        let offset = bits.wrapping_sub(self.range.offset());
+        if offset > self.range.span() {
+            return internal_err!(
+                "A build key of the JoinHashTable is outside of its range {:?}",
+                self.range
+            );
+        }
+        Ok(offset)
+    }
+}
+
 /// The blocks and the rows (dense row indices, see
 /// [`TupleDataCollection::row_index`]) of a partition in the collection of
 /// a [`JoinHashTableBuilder`].
@@ -223,11 +629,15 @@ struct PartitionTable {
     first_row: usize,
     /// The number of rows in the chains of the table.
     num_entries: usize,
+    /// The buckets of the key filter in which the keys of the rows fall (see
+    /// [`KeyIndexPlan::buckets`]), until the filter is built.
+    buckets: Vec<u32>,
 }
 
 impl PartitionTable {
     fn memory_size(&self) -> usize {
         (self.entries.capacity() + self.next.capacity()) * size_of::<u64>()
+            + self.buckets.capacity() * size_of::<u32>()
     }
 }
 
@@ -266,12 +676,18 @@ fn zeroed(len: usize, what: &str) -> Result<Vec<u64>> {
 /// entry, which it claims, or at its next entry with its salt, whose chain
 /// it joins if its keys are equal (otherwise it continues after that entry
 /// in the next round).
+///
+/// With `key_index` (a join on a single integer key with a [`KeyRange`]), the
+/// buckets of the [`KeyFilter`] in which the keys fall are recorded (if it has
+/// buckets), and the keys are checked to be in the range (also in debug
+/// builds).
 fn build_partition(
     collection: &TupleDataCollection,
     range: &PartitionRange,
     matcher: &RowMatcher,
     key_schema: &SchemaRef,
     reservation: &MemoryReservation,
+    key_index: Option<&KeyIndexPlan>,
 ) -> Result<PartitionTable> {
     let num_rows = range.rows.len();
     if num_rows == 0 {
@@ -297,14 +713,30 @@ fn build_partition(
         .and_then(usize::checked_next_power_of_two)
         .map(|capacity| capacity.max(MIN_CAPACITY))
         .ok_or_else(too_large)?;
-    // The table and the chains, reserved before they are allocated.
+    // The table and the chains (and the buckets of the key filter, until it
+    // is built), reserved before they are allocated.
+    let bucket_shift = key_index
+        .and_then(|plan| plan.buckets)
+        .map(|(shift, _)| shift);
     let table_bytes = capacity
         .checked_add(num_rows)
         .and_then(|entries| entries.checked_mul(size_of::<u64>()))
+        .and_then(|bytes| {
+            let buckets = if bucket_shift.is_some() { num_rows } else { 0 };
+            bytes.checked_add(buckets.checked_mul(size_of::<u32>())?)
+        })
         .ok_or_else(too_large)?;
     reservation.try_grow(table_bytes)?;
     let mut entries = zeroed(capacity, "a JoinHashTable")?;
     let mut next = zeroed(num_rows, "the chains of a JoinHashTable")?;
+    let mut buckets = Vec::new();
+    if bucket_shift.is_some() {
+        buckets.try_reserve_exact(num_rows).map_err(|e| {
+            resources_datafusion_err!(
+                "Failed to allocate the key filter of a JoinHashTable: {e}"
+            )
+        })?;
+    }
     let mask = capacity - 1;
     let key_columns = (0..num_keys).collect::<Vec<_>>();
     let mut num_entries = 0;
@@ -343,6 +775,18 @@ fn build_partition(
                     || (0..num_keys).all(|key| row.is_valid(key))
                 {
                     pending.push((i, hash as usize & mask));
+                }
+                // The keys are checked (in debug builds, or as their buckets
+                // are recorded anyway): reading the key of every row of a
+                // large build side costs as much as the range saves.
+                if let Some(plan) = key_index
+                    && (bucket_shift.is_some() || cfg!(debug_assertions))
+                    && row.is_valid(0)
+                {
+                    let key = plan.offset(plan.reader.read(row.row))?;
+                    if let Some(shift) = bucket_shift {
+                        buckets.push((key >> shift) as u32);
+                    }
                 }
             }
             num_entries += pending.len();
@@ -408,7 +852,175 @@ fn build_partition(
         next,
         first_row: range.rows.start,
         num_entries,
+        buckets,
     })
+}
+
+/// The keys of a partition that is added to a [`DenseIndex`], with the first
+/// row of their chains: an open-addressed table of the offsets of the keys in
+/// their range (plus one: `0` is an empty slot), which grows with the keys, and
+/// whose memory is reserved before it is allocated.
+struct PartitionKeys<'a> {
+    keys: Vec<u64>,
+    heads: Vec<u64>,
+    len: usize,
+    /// The bits of the hash of a key that select its first slot.
+    shift: u32,
+    reservation: &'a MemoryReservation,
+}
+
+impl<'a> PartitionKeys<'a> {
+    /// The smallest table.
+    const MIN_CAPACITY: usize = 64;
+
+    fn try_new(reservation: &'a MemoryReservation) -> Result<Self> {
+        let mut keys = Self {
+            keys: vec![],
+            heads: vec![],
+            len: 0,
+            shift: 0,
+            reservation,
+        };
+        keys.resize(Self::MIN_CAPACITY)?;
+        Ok(keys)
+    }
+
+    fn memory_size(&self) -> usize {
+        (self.keys.capacity() + self.heads.capacity()) * size_of::<u64>()
+    }
+
+    /// Reallocate the table with `capacity` slots (a power of two).
+    fn resize(&mut self, capacity: usize) -> Result<()> {
+        let bytes = 2 * capacity * size_of::<u64>();
+        self.reservation.try_grow(bytes)?;
+        let what = "the keys of a dense JoinHashTable";
+        let (keys, heads) = match (zeroed(capacity, what), zeroed(capacity, what)) {
+            (Ok(keys), Ok(heads)) => (keys, heads),
+            (Err(e), _) | (_, Err(e)) => {
+                self.reservation.shrink(bytes);
+                return Err(e);
+            }
+        };
+        let keys = std::mem::replace(&mut self.keys, keys);
+        let heads = std::mem::replace(&mut self.heads, heads);
+        self.reservation
+            .shrink((keys.capacity() + heads.capacity()) * size_of::<u64>());
+        self.shift = u64::BITS - capacity.trailing_zeros();
+        for (key, head) in keys.into_iter().zip(heads) {
+            if key != 0 {
+                let slot = self.slot(key);
+                self.keys[slot] = key;
+                self.heads[slot] = head;
+            }
+        }
+        Ok(())
+    }
+
+    /// The slot of the key `key` (an offset plus one): its slot, or the empty
+    /// slot where it belongs.
+    #[inline]
+    fn slot(&self, key: u64) -> usize {
+        let mask = self.keys.len() - 1;
+        // Fibonacci hashing of the key, then linear probing.
+        let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+        while self.keys[slot] != 0 && self.keys[slot] != key {
+            slot = (slot + 1) & mask;
+        }
+        slot
+    }
+
+    /// The first row of the chain of the key with offset `offset` (packed, `0`
+    /// for a new key).
+    #[inline]
+    fn head(&mut self, offset: u64) -> Result<&mut u64> {
+        let key = offset + 1;
+        let mut slot = self.slot(key);
+        if self.keys[slot] == 0 {
+            // At most half of the slots are used.
+            if 2 * (self.len + 1) > self.keys.len() {
+                self.resize(2 * self.keys.len())?;
+                slot = self.slot(key);
+            }
+            self.keys[slot] = key;
+            self.len += 1;
+        }
+        Ok(&mut self.heads[slot])
+    }
+
+    /// The offsets of the keys and the first rows of their chains.
+    fn chains(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.keys
+            .iter()
+            .zip(&self.heads)
+            .filter(|&(&key, _)| key != 0)
+            .map(|(&key, &head)| ((key - 1) as usize, head))
+    }
+}
+
+impl Drop for PartitionKeys<'_> {
+    fn drop(&mut self) {
+        self.reservation.shrink(self.memory_size());
+    }
+}
+
+/// Build the chains of the rows of the partition `range` of `collection` into
+/// the [`DenseIndex`] `dense` of the keys of `plan` (compared with
+/// `null_equality`), and return the number of rows in the chains.
+///
+/// Like [`build_partition`], the rows are inserted in reverse order and
+/// prepended to their chain, so that the rows of a chain are in the order of
+/// the collection; no key is hashed or compared with the keys of other rows.
+/// The first row of the chain of every key of the partition is kept in a table
+/// of the keys of the partition ([`PartitionKeys`]), and written to the entry
+/// of the key once the partition is built: the threads that build other
+/// partitions write the entries of other keys, and the chains of other rows.
+fn build_dense_partition(
+    collection: &TupleDataCollection,
+    range: &PartitionRange,
+    plan: &KeyIndexPlan,
+    dense: &DenseBuild,
+    null_equality: NullEquality,
+    reservation: &MemoryReservation,
+) -> Result<usize> {
+    if range.rows.is_empty() {
+        return Ok(0);
+    }
+    let mut keys = PartitionKeys::try_new(reservation)?;
+    let null_equals_null = null_equality == NullEquality::NullEqualsNull;
+    let mut null_chain = 0;
+    let mut num_entries = 0;
+    let mut locations = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
+    for block in range.blocks.clone().rev() {
+        let first_row = collection.row_index(RowLocation::new(block, 0));
+        let mut end = collection.block_len(block);
+        while end > 0 {
+            let start = end.saturating_sub(DEFAULT_VECTOR_SIZE);
+            locations.clear();
+            locations.extend((start..end).rev().map(|row| RowLocation::new(block, row)));
+            let rows = collection.row_refs(&locations)?;
+            for (&location, row) in locations.iter().zip(&rows) {
+                let head = if row.is_valid(0) {
+                    keys.head(plan.offset(plan.reader.read(row.row))?)?
+                } else if null_equals_null {
+                    &mut null_chain
+                } else {
+                    // A NULL key matches nothing.
+                    continue;
+                };
+                dense.next[first_row + location.row()].store(*head, Ordering::Relaxed);
+                *head = pack(location);
+                num_entries += 1;
+            }
+            end = start;
+        }
+    }
+    for (key, head) in keys.chains() {
+        dense.entries[key].store(head, Ordering::Relaxed);
+    }
+    if null_chain != 0 {
+        dense.null_chain.store(null_chain, Ordering::Relaxed);
+    }
+    Ok(num_entries)
 }
 
 /// Builds a [`JoinHashTable`] from the combined build rows of all threads.
@@ -418,6 +1030,11 @@ fn build_partition(
 /// [`Self::build_next_partition`] (from any thread) builds the table of a
 /// partition that no other call claimed. [`Self::finish`] builds the tables
 /// that were not built yet and returns the [`JoinHashTable`].
+///
+/// Before the build starts (and the builder is shared), a build side of few
+/// rows can be put in a single partition ([`Self::single_partition_up_to`]),
+/// and a join on a single integer key whose build keys have a known
+/// [`KeyRange`] can be indexed without hashing ([`Self::with_key_range`]).
 pub struct JoinHashTableBuilder {
     collection: TupleDataCollection,
     /// Compares the keys of the rows, the first columns of the layout.
@@ -429,6 +1046,9 @@ pub struct JoinHashTableBuilder {
     /// The number of partitions claimed by [`Self::build_next_partition`].
     claimed: AtomicUsize,
     built: Vec<OnceLock<PartitionTable>>,
+    /// How the rows of a join on a single integer key with a [`KeyRange`] are
+    /// indexed, see [`Self::with_key_range`].
+    key_index: Option<KeyIndexPlan>,
     /// The memory of the pointer tables, the chains and the matched rows,
     /// reserved before they are allocated.
     reservation: MemoryReservation,
@@ -440,6 +1060,8 @@ impl fmt::Debug for JoinHashTableBuilder {
             .field("rows", &self.collection.len())
             .field("radix_bits", &self.radix_bits)
             .field("num_keys", &self.matcher.key_columns().len())
+            .field("key_range", &self.key_index.as_ref().map(|plan| plan.range))
+            .field("dense", &self.has_dense_index())
             .finish()
     }
 }
@@ -507,8 +1129,103 @@ impl JoinHashTableBuilder {
             partitions,
             claimed: AtomicUsize::new(0),
             built,
+            key_index: None,
             reservation,
         })
+    }
+
+    /// Build a single, unpartitioned table (with `0` radix bits) if there are
+    /// at most `max_rows` rows: the rows of all partitions are consecutive in
+    /// the collection, so they form one partition, of which a single thread
+    /// builds the table (e.g. of the 25 nations of TPC-H, which would otherwise
+    /// get tables in up to dozens of partitions, built by as many threads).
+    pub fn single_partition_up_to(mut self, max_rows: usize) -> Self {
+        let num_rows = self.collection.len();
+        if num_rows <= max_rows && self.partitions.len() > 1 {
+            self.partitions = vec![PartitionRange {
+                blocks: 0..self.collection.num_blocks(),
+                rows: 0..num_rows,
+            }];
+            self.built = vec![OnceLock::new()];
+            self.radix_bits = 0;
+        }
+        self
+    }
+
+    /// Index the rows of a join on a single key of an integer type (see
+    /// [`KeyRange::supports`]) all of whose valid build keys are in `range`
+    /// without hashing the probe keys (see the [module documentation](self)).
+    /// The build checks that the keys are in the range as it reads them (for a
+    /// dense index and for the buckets of a key filter, and in debug builds):
+    /// a probe key outside of the range is rejected, so a range that misses a
+    /// build key would lose its matches.
+    ///
+    /// * with a [`DenseIndex`] if the range spans at most [`MAX_DENSE_SPAN`]
+    ///   keys, and at most 65,536 keys or 8 keys per build row (and if the
+    ///   memory pool has room for it);
+    /// * otherwise with the hashed tables of the partitions and a
+    ///   [`KeyFilter`] of the range, and of the buckets of keys in which build
+    ///   keys fall (of at most 2^19 buckets, which the partitions record as
+    ///   they are built) if the build side has few keys for its range: at most
+    ///   one row for two buckets, and at most half of the buckets of the range
+    ///   with a key.
+    ///
+    /// The partitions of a dense index are built in parallel too: all rows of
+    /// a key are in the same partition, which writes its entry.
+    pub fn with_key_range(mut self, range: KeyRange) -> Result<Self> {
+        let layout = self.matcher.layout();
+        let reader = match self.matcher.key_columns() {
+            [0] => KeyReader::try_new(layout),
+            _ => None,
+        };
+        let Some(reader) = reader else {
+            return internal_err!(
+                "A JoinHashTable on {} keys of types {:?} has no key range",
+                self.matcher.key_columns().len(),
+                self.key_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.data_type())
+                    .collect::<Vec<_>>()
+            );
+        };
+        let span = range.span();
+        let num_rows = self.collection.len() as u64;
+        // A dense index is optional too: without room for it in the memory
+        // pool, the rows get hashed tables.
+        let dense = (span <= MAX_DENSE_SPAN
+            && (span < ALWAYS_DENSE_KEYS
+                || span < num_rows.saturating_mul(DENSE_KEYS_PER_ROW)))
+        .then(|| DenseBuild::try_new(span, self.collection.len(), &self.reservation).ok())
+        .flatten();
+        // The buckets of keys are only worth it if many of them have no key:
+        // if there are at most half as many rows as buckets (see also
+        // `key_filter`).
+        let num_buckets = span
+            .saturating_add(1)
+            .min(MAX_FILTER_BUCKETS)
+            .next_power_of_two();
+        let buckets = (dense.is_none() && num_rows.saturating_mul(2) <= num_buckets)
+            .then(|| {
+                let shift = (0..u64::BITS)
+                    .find(|&shift| (span >> shift) < num_buckets)
+                    .unwrap_or(u64::BITS - 1);
+                (shift, num_buckets as usize)
+            });
+        self.key_index = Some(KeyIndexPlan {
+            range,
+            reader,
+            dense,
+            buckets,
+        });
+        Ok(self)
+    }
+
+    /// Whether the table gets a [`DenseIndex`] (see [`Self::with_key_range`]).
+    pub fn has_dense_index(&self) -> bool {
+        self.key_index
+            .as_ref()
+            .is_some_and(|plan| plan.dense.is_some())
     }
 
     /// The number of build rows.
@@ -529,8 +1246,20 @@ impl JoinHashTableBuilder {
             .count()
     }
 
+    /// The number of threads that build the table in parallel with
+    /// [`Self::build_next_partition`] (at least one): one per partition with
+    /// rows, but at most one per [`ROWS_PER_BUILD_THREAD`] rows, so that a
+    /// small build side is not spread over many threads that each insert a
+    /// handful of rows.
+    pub fn max_threads(&self) -> usize {
+        self.num_partitions_with_rows()
+            .min(self.collection.len().div_ceil(ROWS_PER_BUILD_THREAD))
+            .max(1)
+    }
+
     /// Build the table of a partition with rows that no other call claimed
-    /// yet. Returns `false` once every partition is claimed.
+    /// yet (or its part of the dense index, see [`Self::with_key_range`]).
+    /// Returns `false` once every partition is claimed.
     pub fn build_next_partition(&self) -> Result<bool> {
         loop {
             let partition = self.claimed.fetch_add(1, Ordering::Relaxed);
@@ -540,13 +1269,7 @@ impl JoinHashTableBuilder {
             if range.rows.is_empty() {
                 continue;
             }
-            let table = build_partition(
-                &self.collection,
-                range,
-                &self.matcher,
-                &self.key_schema,
-                &self.reservation,
-            )?;
+            let table = self.build_partition(range)?;
             if self.built[partition].set(table).is_err() {
                 return internal_err!(
                     "The table of partition {partition} was built twice"
@@ -556,35 +1279,87 @@ impl JoinHashTableBuilder {
         }
     }
 
+    /// Build the table of the partition `range`: its pointer table, or, with
+    /// a dense index, the chains of its rows in the index (and a table without
+    /// entries, of their number).
+    fn build_partition(&self, range: &PartitionRange) -> Result<PartitionTable> {
+        match self.key_index.as_ref() {
+            Some(
+                plan @ KeyIndexPlan {
+                    dense: Some(dense), ..
+                },
+            ) => {
+                let num_entries = build_dense_partition(
+                    &self.collection,
+                    range,
+                    plan,
+                    dense,
+                    self.matcher.null_equality(),
+                    &self.reservation,
+                )?;
+                Ok(PartitionTable {
+                    first_row: range.rows.start,
+                    num_entries,
+                    ..Default::default()
+                })
+            }
+            key_index => build_partition(
+                &self.collection,
+                range,
+                &self.matcher,
+                &self.key_schema,
+                &self.reservation,
+                key_index,
+            ),
+        }
+    }
+
     /// Build the tables that were not built yet and return the
     /// [`JoinHashTable`]. If `track_matches`, the table tracks which rows
     /// found a match (see [`JoinHashTable::mark_matched`]).
     pub fn finish(self, track_matches: bool) -> Result<JoinHashTable> {
+        let tables = self
+            .built
+            .iter()
+            .zip(&self.partitions)
+            .map(|(built, range)| match built.get() {
+                Some(_) => Ok(None),
+                None => self.build_partition(range).map(Some),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let Self {
             collection,
             matcher,
-            key_schema,
+            key_schema: _,
             radix_bits,
-            partitions,
+            partitions: _,
             built,
             claimed: _,
+            key_index,
             reservation,
         } = self;
         let tables = built
             .into_iter()
-            .zip(&partitions)
-            .map(|(built, range)| match built.into_inner() {
-                Some(table) => Ok(table),
-                None => build_partition(
-                    &collection,
-                    range,
-                    &matcher,
-                    &key_schema,
-                    &reservation,
-                ),
+            .zip(tables)
+            .map(|(built, table)| match (built.into_inner(), table) {
+                (Some(table), _) | (None, Some(table)) => Ok(table),
+                (None, None) => internal_err!("A partition of the table was not built"),
             })
             .collect::<Result<Vec<_>>>()?;
         let num_entries = tables.iter().map(|table| table.num_entries).sum();
+        let (dense, key_filter, tables) = match key_index {
+            Some(KeyIndexPlan {
+                range,
+                dense: Some(dense),
+                ..
+            }) => (Some(dense.finish(range)), None, vec![]),
+            Some(plan) => {
+                let mut tables = tables;
+                let filter = key_filter(&plan, &mut tables, &reservation)?;
+                (None, Some(filter), tables)
+            }
+            None => (None, None, tables),
+        };
         let matched = track_matches
             .then(|| MatchedRows::try_new(collection.len(), &reservation))
             .transpose()?;
@@ -593,11 +1368,70 @@ impl JoinHashTableBuilder {
             matcher,
             radix_bits,
             partitions: tables,
+            dense,
+            key_filter,
             num_entries,
             matched,
             reservation,
         })
     }
+}
+
+/// The [`KeyFilter`] of the hashed tables `tables` of `plan`, with the buckets
+/// in which the build keys fall if `plan` has buckets: those that the tables
+/// recorded as they were built (the tables then release them, and their memory
+/// in `reservation`). The buckets are optional: they are left out (and the
+/// filter only checks the range) if the memory pool has no room for them, and
+/// if more than half of the buckets of the range hold a key (they would reject
+/// few keys that the range does not, and cost a lookup per probe row).
+fn key_filter(
+    plan: &KeyIndexPlan,
+    tables: &mut [PartitionTable],
+    reservation: &MemoryReservation,
+) -> Result<KeyFilter> {
+    let (offset, span) = (plan.range.offset(), plan.range.span());
+    let mut filter = KeyFilter {
+        offset,
+        span,
+        buckets: None,
+    };
+    let Some((shift, num_buckets)) = plan.buckets else {
+        return Ok(filter);
+    };
+    let bytes = num_buckets.div_ceil(64) * size_of::<u64>();
+    let mut words = match reservation.try_grow(bytes) {
+        Ok(()) => Some(zeroed(
+            num_buckets.div_ceil(64),
+            "the key filter of a JoinHashTable",
+        )?),
+        Err(_) => None,
+    };
+    for table in tables {
+        let buckets = std::mem::take(&mut table.buckets);
+        if let Some(words) = &mut words {
+            for &bucket in &buckets {
+                let bucket = bucket as usize;
+                words[bucket / 64] |= 1 << (bucket % 64);
+            }
+        }
+        reservation.shrink(buckets.capacity() * size_of::<u32>());
+    }
+    let Some(words) = words else {
+        return Ok(filter);
+    };
+    // The buckets of the range, of which no other bit is set.
+    let reachable = (span >> shift) as usize + 1;
+    let set = words
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum::<usize>();
+    if set * 2 > reachable {
+        drop(words);
+        reservation.shrink(bytes);
+    } else {
+        filter.buckets = Some(KeyBuckets { shift, words });
+    }
+    Ok(filter)
 }
 
 /// One bit per build row (by dense row index), set by any thread once the
@@ -652,7 +1486,14 @@ pub struct JoinHashTable {
     /// Compares the keys of probe rows with the keys of build rows.
     matcher: RowMatcher,
     radix_bits: u32,
+    /// The hashed tables of the partitions (none with a dense index).
     partitions: Vec<PartitionTable>,
+    /// The index of a join on a single integer key with a narrow
+    /// [`KeyRange`], instead of hashed tables.
+    dense: Option<DenseIndex>,
+    /// The filter of the probe keys of the hashed tables of a join on a single
+    /// integer key with a [`KeyRange`].
+    key_filter: Option<KeyFilter>,
     /// The number of rows in the chains (the rows that can match).
     num_entries: usize,
     /// The rows that found a match, if tracked.
@@ -663,10 +1504,19 @@ pub struct JoinHashTable {
 
 impl fmt::Debug for JoinHashTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let index = match (&self.dense, &self.key_filter) {
+            (Some(_), _) => "dense",
+            (None, Some(filter)) if filter.buckets.is_some() => {
+                "hashed, key range and buckets"
+            }
+            (None, Some(_)) => "hashed, key range",
+            (None, None) => "hashed",
+        };
         f.debug_struct("JoinHashTable")
             .field("rows", &self.collection.len())
             .field("entries", &self.num_entries)
             .field("radix_bits", &self.radix_bits)
+            .field("index", &index)
             .field("tracks_matches", &self.matched.is_some())
             .finish()
     }
@@ -727,6 +1577,29 @@ impl JoinHashTable {
         self.radix_bits
     }
 
+    /// Whether the table is a dense index of the keys of its [`KeyRange`]
+    /// (see [`JoinHashTableBuilder::with_key_range`]), which looks probe keys
+    /// up without their hashes.
+    pub fn has_dense_index(&self) -> bool {
+        self.dense.is_some()
+    }
+
+    /// Whether the probe keys are filtered by the [`KeyRange`] of the build
+    /// keys before they are looked up in the hashed tables, and, if
+    /// `with_buckets`, also by the buckets of keys of the range in which a
+    /// build key falls (see [`JoinHashTableBuilder::with_key_range`]).
+    pub fn filters_keys(&self, with_buckets: bool) -> bool {
+        self.key_filter
+            .as_ref()
+            .is_some_and(|filter| !with_buckets || filter.buckets.is_some())
+    }
+
+    /// Whether [`ChainScan::try_new`] needs the hashes of the probe keys (see
+    /// [`hash_join_keys`]): not for a dense index.
+    pub fn needs_hashes(&self) -> bool {
+        self.dense.is_none()
+    }
+
     /// Whether the table tracks the rows that found a match.
     pub fn tracks_matches(&self) -> bool {
         self.matched.is_some()
@@ -747,6 +1620,8 @@ impl JoinHashTable {
             .iter()
             .map(PartitionTable::memory_size)
             .sum::<usize>()
+            + self.dense.as_ref().map_or(0, DenseIndex::memory_size)
+            + self.key_filter.as_ref().map_or(0, KeyFilter::memory_size)
             + self.matched.as_ref().map_or(0, MatchedRows::memory_size)
     }
 
@@ -766,7 +1641,11 @@ impl JoinHashTable {
     /// its next entry with its salt, and the keys of all these rows are
     /// compared with the first rows of their chains at once; the rows whose
     /// keys differ (a collision of the salt or of the hash) continue after
-    /// that entry in the next round.
+    /// that entry in the next round. The rows whose key the key filter rejects
+    /// are not looked up.
+    ///
+    /// A dense index reads the entry of the key of every probe row instead:
+    /// no hash (`scan.hashes` is not read), no key comparison.
     fn find_chains(
         &self,
         probe_keys: &DataChunk,
@@ -780,19 +1659,74 @@ impl JoinHashTable {
             candidates,
             compared,
             no_match,
+            bits,
             ..
         } = scan;
-        let num_rows = hashes.len();
+        let num_rows = probe_keys.len();
         chains.clear();
         chains.resize(num_rows, 0);
         if self.is_empty() {
             return Ok(());
         }
-        if probe_keys.len() != num_rows || probe_keys.selection().is_some() {
+        if probe_keys.selection().is_some() || probe_keys.num_columns() < self.num_keys()
+        {
             return internal_err!(
                 "The probe keys of a join must be {num_rows} rows without a selection"
             );
         }
+        // The key bits of the single integer key of a dense index or a key
+        // filter.
+        let key = probe_keys.column(0);
+        if (self.dense.is_some() || self.key_filter.is_some())
+            && (key.data_type() != self.layout().column(0).data_type()
+                || !key_bits(key.as_ref(), bits))
+        {
+            return internal_err!(
+                "The probe key of type {} cannot be looked up in a JoinHashTable on {}",
+                key.data_type(),
+                self.layout().column(0).data_type()
+            );
+        }
+        if let Some(dense) = &self.dense {
+            // The entry of the key of every row, without hashing it nor
+            // comparing it with the key of a build row.
+            for (chain, &bits) in chains.iter_mut().zip(bits.iter()) {
+                *chain = dense.chain(bits);
+            }
+            // The rows with a NULL key match the rows of the NULL chain (under
+            // `NullEqualsNull`, otherwise there is none), and those excluded
+            // by `valid` nothing.
+            if let Some(nulls) = key.logical_nulls().filter(|n| n.null_count() > 0) {
+                for (row, chain) in chains.iter_mut().enumerate() {
+                    if nulls.is_null(row) {
+                        *chain = dense.null_chain;
+                    }
+                }
+            }
+            if let Some(valid) = valid.filter(|valid| valid.null_count() > 0) {
+                for (row, chain) in chains.iter_mut().enumerate() {
+                    if valid.is_null(row) {
+                        *chain = 0;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if hashes.len() != num_rows {
+            return internal_err!(
+                "Got {} hashes for {num_rows} probe rows of a join",
+                hashes.len()
+            );
+        }
+        // The rows that the key filter rejects are not looked up (but those
+        // with a NULL key, which a NULL key of a build row may match).
+        let key_nulls = key.logical_nulls();
+        let rejected = |row: usize| {
+            self.key_filter.as_ref().is_some_and(|filter| {
+                key_nulls.as_ref().is_none_or(|nulls| nulls.is_valid(row))
+                    && !filter.accepts(bits[row])
+            })
+        };
         // The slot of the entry with its salt at which every row stopped,
         // and the first row of the chain of that entry.
         slots.clear();
@@ -826,7 +1760,7 @@ impl JoinHashTable {
         };
         compared.clear();
         for (row, &hash) in hashes.iter().enumerate() {
-            if valid.is_some_and(|valid| valid.is_null(row)) {
+            if valid.is_some_and(|valid| valid.is_null(row)) || rejected(row) {
                 continue;
             }
             let table = self.partition(hash);
@@ -927,6 +1861,8 @@ pub struct ChainScan {
     candidates: Vec<RowLocation>,
     compared: Vec<u32>,
     no_match: Vec<u32>,
+    /// The key bits of the probe keys (see [`KeyRange`]).
+    bits: Vec<u64>,
 }
 
 /// The probe rows covered by a batch of [`ChainScan::next_batch`].
@@ -945,8 +1881,9 @@ pub struct ScanBatch {
 impl ChainScan {
     /// Start a scan of the matches of the probe rows whose keys are the
     /// first [`JoinHashTable::num_keys`] columns of `probe_keys` (without a
-    /// selection), with the hashes `hashes` (see [`hash_join_keys`]). The
-    /// rows that are null in `valid` have no matches.
+    /// selection), with the hashes `hashes` (see [`hash_join_keys`]; none if
+    /// the table does not [need them](JoinHashTable::needs_hashes)). The rows
+    /// that are null in `valid` have no matches.
     pub fn try_new(
         table: &JoinHashTable,
         probe_keys: &DataChunk,
@@ -1013,6 +1950,16 @@ impl ChainScan {
         self.chains[row] != 0
     }
 
+    /// Skip the next probe rows (at most `max_rows` of them) without returning
+    /// their matches, e.g. for a join that only needs to know whether they have
+    /// matches (see [`Self::has_matches`]), and return them. Must not be called
+    /// while the matches of a probe row are being returned.
+    pub fn skip_rows(&mut self, max_rows: usize) -> Range<usize> {
+        let start = self.row;
+        self.row = start.saturating_add(max_rows).min(self.chains.len());
+        start..self.row
+    }
+
     /// Returns `true` once the matches of all probe rows were returned.
     pub fn is_done(&self) -> bool {
         self.row >= self.chains.len()
@@ -1056,16 +2003,22 @@ impl ChainScan {
                 }
                 started = true;
             }
-            // All rows of a chain are in the table of the same partition.
-            let partition = table.partition(self.hashes[row]);
+            // The chains of a dense index, or of the table of the partition of
+            // the row (all rows of a chain are in the same partition).
+            let (links, first_row) = match &table.dense {
+                Some(dense) => (dense.next.as_slice(), 0),
+                None => {
+                    let partition = table.partition(self.hashes[row]);
+                    (partition.next.as_slice(), partition.first_row)
+                }
+            };
             let probe_row = row as u32;
             loop {
                 let location = unpack(next);
                 probe_rows.push(probe_row);
                 matches.push(location);
                 cost += 1;
-                next = partition.next
-                    [table.collection.row_index(location) - partition.first_row];
+                next = links[table.collection.row_index(location) - first_row];
                 if next == 0 || cost >= max_cost {
                     break;
                 }
@@ -1091,8 +2044,9 @@ mod tests {
     use super::*;
 
     use arrow::array::{
-        Array, AsArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringViewArray,
+        Array, AsArray, Date32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, RecordBatch, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema, SchemaRef};
     use datafusion_execution::memory_pool::{
@@ -1164,6 +2118,28 @@ mod tests {
         threads: usize,
         hash: impl Fn(&RecordBatch) -> Vec<u64>,
     ) -> JoinHashTable {
+        configured_table(
+            batches,
+            num_keys,
+            null_equality,
+            radix_bits,
+            threads,
+            hash,
+            Ok,
+        )
+        .unwrap()
+    }
+
+    /// [`table`], with the builder configured by `configure` before the build.
+    fn configured_table(
+        batches: &[RecordBatch],
+        num_keys: usize,
+        null_equality: NullEquality,
+        radix_bits: u32,
+        threads: usize,
+        hash: impl Fn(&RecordBatch) -> Vec<u64>,
+        configure: impl FnOnce(JoinHashTableBuilder) -> Result<JoinHashTableBuilder>,
+    ) -> Result<JoinHashTable> {
         let layout = layout(batches[0].schema(), 7);
         let mut locals = (0..threads)
             .map(|_| {
@@ -1180,12 +2156,15 @@ mod tests {
         for local in locals {
             global.combine(local).unwrap();
         }
-        let builder =
-            JoinHashTableBuilder::try_new(global, num_keys, null_equality, reservation())
-                .unwrap();
+        let builder = configure(JoinHashTableBuilder::try_new(
+            global,
+            num_keys,
+            null_equality,
+            reservation(),
+        )?)?;
         // Build a partition "in parallel", the others in `finish`.
-        builder.build_next_partition().unwrap();
-        builder.finish(true).unwrap()
+        builder.build_next_partition()?;
+        builder.finish(true)
     }
 
     /// All (probe row, `v` of the build row) pairs with equal keys, in the
@@ -1205,6 +2184,8 @@ mod tests {
             NullEquality::NullEqualsNothing => valid_keys(probe, num_keys),
             NullEquality::NullEqualsNull => None,
         };
+        // A dense index does not need the hashes.
+        let hashes = if table.needs_hashes() { hashes } else { vec![] };
         let mut scan = ChainScan::try_new(table, &keys, &hashes, valid.as_ref()).unwrap();
         let (mut rows, mut matches) = (vec![], vec![]);
         let mut pairs = vec![];
@@ -1569,6 +2550,15 @@ mod tests {
         assert!(scan.has_matches(1) && scan.has_matches(3));
         assert!(!scan.has_matches(2));
 
+        // Probe rows whose matches are not walked.
+        let mut scan =
+            ChainScan::try_new(&table, &keys, &hashes(&probe_batch, 1), None).unwrap();
+        assert_eq!(scan.skip_rows(3), 0..3);
+        assert!(!scan.is_done());
+        assert_eq!(scan.skip_rows(3), 3..4);
+        assert!(scan.is_done());
+        assert_eq!(scan.skip_rows(3), 4..4);
+
         // Probe rows without matches that cost nothing.
         let mut scan = ChainScan::without_matches(3);
         let next = scan.next_batch(&table, 2, 1, &mut rows, &mut matches);
@@ -1733,5 +2723,600 @@ mod tests {
             );
             assert!(builder.is_err(), "{num_keys} keys");
         }
+    }
+
+    /// The build and probe batches of `probe_finds_all_matches_in_probe_order`:
+    /// keys from -3 to 13 and from -5 to 17, with duplicates and NULLs.
+    fn build_and_probe() -> (Vec<RecordBatch>, RecordBatch) {
+        let build = (0..5)
+            .map(|b| {
+                let keys = (0..40)
+                    .map(|i| ((i + b) % 9 != 4).then_some((i * 3 + b) % 17 - 3))
+                    .collect();
+                batch_with_values(keys, i64::from(b) * 1000)
+            })
+            .collect::<Vec<_>>();
+        let probe_batch = batch(
+            (0..100)
+                .map(|i| (i % 11 != 0).then_some(i % 23 - 5))
+                .collect(),
+        );
+        (build, probe_batch)
+    }
+
+    /// `batch` (of [`schema`]) with its keys `k` mapped to keys of `data_type`
+    /// by `map`, an injective map: the keys are equal if and only if the keys
+    /// of `batch` are.
+    fn with_keys(
+        batch: &RecordBatch,
+        data_type: &DataType,
+        map: impl Fn(i32) -> i128,
+    ) -> RecordBatch {
+        let keys = batch
+            .column(0)
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|key| key.map(&map))
+            .collect::<Vec<_>>();
+        fn array<T>(keys: &[Option<i128>]) -> Vec<Option<T>>
+        where
+            T: TryFrom<i128>,
+            T::Error: fmt::Debug,
+        {
+            keys.iter()
+                .map(|key| key.map(|key| T::try_from(key).unwrap()))
+                .collect()
+        }
+        let keys: ArrayRef = match data_type {
+            DataType::Int8 => Arc::new(Int8Array::from(array::<i8>(&keys))),
+            DataType::Int16 => Arc::new(Int16Array::from(array::<i16>(&keys))),
+            DataType::Int32 => Arc::new(Int32Array::from(array::<i32>(&keys))),
+            DataType::Int64 => Arc::new(Int64Array::from(array::<i64>(&keys))),
+            DataType::UInt8 => Arc::new(UInt8Array::from(array::<u8>(&keys))),
+            DataType::UInt16 => Arc::new(UInt16Array::from(array::<u16>(&keys))),
+            DataType::UInt32 => Arc::new(UInt32Array::from(array::<u32>(&keys))),
+            DataType::UInt64 => Arc::new(UInt64Array::from(array::<u64>(&keys))),
+            DataType::Date32 => Arc::new(Date32Array::from(array::<i32>(&keys))),
+            other => panic!("no keys of type {other}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", data_type.clone(), true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(schema, vec![keys, Arc::clone(batch.column(1))]).unwrap()
+    }
+
+    /// The [`KeyRange`] of the keys of `batches`.
+    fn key_range(batches: &[RecordBatch]) -> KeyRange {
+        batches
+            .iter()
+            .filter_map(|batch| KeyRange::of_array(batch.column(0).as_ref()))
+            .reduce(KeyRange::union)
+            .unwrap()
+    }
+
+    #[test]
+    fn key_ranges_of_integer_keys() {
+        assert_eq!(KeyRange::new(3, 2), None);
+        assert_eq!(KeyRange::new(i128::from(i64::MIN) - 1, 0), None);
+        assert_eq!(KeyRange::new(0, i128::from(u64::MAX) + 1), None);
+        // The values of no type.
+        assert_eq!(KeyRange::new(-1, i128::from(u64::MAX)), None);
+        let range = KeyRange::new(-5, 17).unwrap();
+        assert_eq!((range.min(), range.max()), (-5, 17));
+        assert_eq!((range.offset(), range.span()), ((-5_i64) as u64, 22));
+        for (min, max) in [
+            (i128::from(i64::MIN), i128::from(i64::MAX)),
+            (0, i128::from(u64::MAX)),
+        ] {
+            let full = KeyRange::new(min, max).unwrap();
+            assert_eq!(full.span(), u64::MAX);
+        }
+        assert_eq!(
+            range.union(KeyRange::new(20, 30).unwrap()),
+            KeyRange::new(-5, 30).unwrap()
+        );
+        for data_type in [DataType::Float64, DataType::Utf8, DataType::Date64] {
+            assert!(!KeyRange::supports(&data_type));
+        }
+        let keys = Int32Array::from(vec![Some(4), None, Some(-7), Some(2)]);
+        assert_eq!(KeyRange::of_array(&keys), KeyRange::new(-7, 4));
+        assert_eq!(KeyRange::of_array(&Int32Array::new_null(3)), None);
+        assert_eq!(
+            KeyRange::of_array(&UInt64Array::from(vec![u64::MAX, 1])),
+            KeyRange::new(1, i128::from(u64::MAX))
+        );
+        assert_eq!(KeyRange::of_array(&Float64Array::from(vec![1.0])), None);
+        // The key bits are the values sign extended, as the build stores them.
+        let mut bits = vec![];
+        assert!(key_bits(&keys, &mut bits));
+        assert_eq!(bits[0], 4);
+        assert_eq!(bits[2], (-7_i64) as u64);
+        assert!(!key_bits(&Float64Array::from(vec![1.0]), &mut bits));
+    }
+
+    #[test]
+    fn stored_keys_are_read_with_their_key_bits() {
+        let (build, _) = build_and_probe();
+        for (data_type, map) in integer_key_types() {
+            let batch = with_keys(&build[1], &data_type, map);
+            let layout = layout(batch.schema(), 16);
+            let mut data = PartitionedTupleData::try_new(layout, 0).unwrap();
+            let chunk = DataChunk::from_record_batch(batch.clone());
+            data.append_chunk(&chunk, &hashes(&batch, 1)).unwrap();
+            let (collection, _) = data.into_collection().unwrap();
+            let reader = KeyReader::try_new(collection.layout()).unwrap();
+            let locations = collection.row_locations().collect::<Vec<_>>();
+            let rows = collection.row_refs(&locations).unwrap();
+            let mut bits = vec![];
+            assert!(key_bits(batch.column(0).as_ref(), &mut bits));
+            let keys = batch.column(0);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row.is_valid(0), keys.is_valid(i));
+                if keys.is_valid(i) {
+                    assert_eq!(reader.read(row.row), bits[i], "{data_type}, row {i}");
+                }
+            }
+        }
+        // Only integer keys are read.
+        let floats =
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+        assert!(KeyReader::try_new(&layout(floats, 16)).is_none());
+    }
+
+    type KeyMap = fn(i32) -> i128;
+
+    /// Injective maps of the keys of [`build_and_probe`] to keys of every
+    /// integer type, some at the ends of the values of their types.
+    fn integer_key_types() -> Vec<(DataType, KeyMap)> {
+        vec![
+            (DataType::Int8, |key| i128::from(key)),
+            (DataType::Int16, |key| i128::from(key) * 300),
+            (DataType::Int32, |key| i128::from(key) - 7),
+            (DataType::Int64, |key| {
+                i128::from(i64::MIN) + 10 + i128::from(key)
+            }),
+            (DataType::UInt8, |key| i128::from(key + 5)),
+            (DataType::UInt16, |key| i128::from(key + 5) * 1000),
+            (DataType::UInt32, |key| {
+                i128::from(u32::MAX) - 30 + i128::from(key)
+            }),
+            (DataType::UInt64, |key| {
+                i128::from(u64::MAX) - 30 + i128::from(key)
+            }),
+            (DataType::Date32, |key| i128::from(key) - 1000),
+        ]
+    }
+
+    #[test]
+    fn integer_keys_are_looked_up_without_hashes() {
+        let (build, probe_batch) = build_and_probe();
+        // Narrow ranges get dense indexes; wide ones hashed tables with a key
+        // filter, whose buckets have room for the 17 distinct keys.
+        let mut cases = integer_key_types()
+            .into_iter()
+            .map(|(data_type, map)| (data_type, map, "dense"))
+            .collect::<Vec<_>>();
+        let wide: [(DataType, KeyMap); 3] = [
+            (DataType::Int32, |key| i128::from(key) * 100_000),
+            (DataType::Int64, |key| i128::from(key) << 50),
+            (DataType::UInt64, |key| i128::from(key + 5) << 58),
+        ];
+        cases.extend(
+            wide.into_iter()
+                .map(|(data_type, map)| (data_type, map, "buckets")),
+        );
+        for (data_type, map, index) in cases {
+            let typed_build = build
+                .iter()
+                .map(|batch| with_keys(batch, &data_type, map))
+                .collect::<Vec<_>>();
+            let typed_probe = with_keys(&probe_batch, &data_type, map);
+            let range = key_range(&typed_build);
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let expected = expected(&build, &probe_batch, null_equality);
+                assert!(expected.len() > 100);
+                for (radix_bits, threads) in [(0, 1), (2, 3), (5, 2)] {
+                    let table = configured_table(
+                        &typed_build,
+                        1,
+                        null_equality,
+                        radix_bits,
+                        threads,
+                        |b| hashes(b, 1),
+                        |builder| builder.with_key_range(range),
+                    )
+                    .unwrap();
+                    let case = format!(
+                        "{data_type}, {index}, {null_equality:?}, {radix_bits} bits, {threads} threads"
+                    );
+                    assert_eq!(table.has_dense_index(), index == "dense", "{case}");
+                    assert_eq!(!table.needs_hashes(), index == "dense", "{case}");
+                    assert_eq!(table.filters_keys(true), index == "buckets", "{case}");
+                    assert_eq!(table.num_rows(), 200);
+                    let entries = table.num_entries();
+                    assert_eq!(
+                        entries,
+                        table_entries(&typed_build, null_equality),
+                        "{case}"
+                    );
+                    for max_cost in [1, 7, 2048] {
+                        let actual = probe_one_key(&table, &typed_probe, max_cost);
+                        assert!(actual.windows(2).all(|w| w[0].0 <= w[1].0), "{case}");
+                        if threads == 1 {
+                            // The rows of a chain are in build order.
+                            assert_eq!(actual, expected, "{case}");
+                        } else {
+                            assert_eq!(
+                                sorted(actual),
+                                sorted(expected.clone()),
+                                "{case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The number of rows of `batches` that a probe row can match: all of
+    /// them, but those with a NULL key under `NullEqualsNothing`.
+    fn table_entries(batches: &[RecordBatch], null_equality: NullEquality) -> usize {
+        batches
+            .iter()
+            .map(|batch| match null_equality {
+                NullEquality::NullEqualsNothing => {
+                    batch.num_rows() - batch.column(0).null_count()
+                }
+                NullEquality::NullEqualsNull => batch.num_rows(),
+            })
+            .sum()
+    }
+
+    #[test]
+    fn key_filters_reject_the_keys_of_empty_buckets() {
+        // 10 keys spread over a range of 9 billion keys: the buckets of the
+        // filter have about 17,000 keys each, and hold at most one build key.
+        let build = batch_with_values((0..10).map(Some).collect(), 0);
+        let build = vec![with_keys(&build, &DataType::Int64, |key| {
+            i128::from(key) * 1_000_000_000
+        })];
+        let range = key_range(&build);
+        assert_eq!((range.min(), range.max()), (0, 9_000_000_000));
+        let table = configured_table(
+            &build,
+            1,
+            NullEquality::NullEqualsNothing,
+            2,
+            1,
+            |b| hashes(b, 1),
+            |builder| builder.with_key_range(range),
+        )
+        .unwrap();
+        assert!(table.filters_keys(true));
+        assert!(
+            format!("{table:?}").contains("key range and buckets"),
+            "{table:?}"
+        );
+        let filter = table.key_filter.as_ref().unwrap();
+        // The keys of the build rows, the keys of their buckets, and other
+        // keys of the range or outside of it.
+        let bucket = 1 << filter.buckets.as_ref().unwrap().shift;
+        for (key, accepted) in [
+            (0, true),
+            (3_000_000_000, true),
+            (9_000_000_000, true),
+            (bucket - 1, true),
+            (bucket, false),
+            (5_000_000_001 + bucket, false),
+            (-1, false),
+            (9_000_000_001 + bucket, false),
+            (i64::MIN, false),
+            (i64::MAX, false),
+        ] {
+            assert_eq!(filter.accepts(key as u64), accepted, "{key}");
+        }
+        // Only the keys of the build rows match.
+        let probe_keys = Int64Array::from(vec![
+            Some(4_000_000_000),
+            Some(bucket),
+            None,
+            Some(-1),
+            Some(9_000_000_000),
+        ]);
+        let probe_batch = RecordBatch::try_new(
+            build[0].schema(),
+            vec![Arc::new(probe_keys), Arc::new(Int64Array::from(vec![0; 5]))],
+        )
+        .unwrap();
+        let actual = probe_one_key(&table, &probe_batch, 100);
+        assert_eq!(actual, vec![(0, 4), (4, 9)]);
+
+        // The buckets are optional: without room for them in the memory pool,
+        // the filter only checks the range.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1000));
+        let mut data =
+            PartitionedTupleData::try_new(layout(build[0].schema(), 7), 2).unwrap();
+        let chunk = DataChunk::from_record_batch(build[0].clone());
+        data.append_chunk(&chunk, &hashes(&build[0], 1)).unwrap();
+        let table = JoinHashTableBuilder::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            MemoryConsumer::new("JoinHashTable").register(&pool),
+        )
+        .unwrap()
+        .with_key_range(range)
+        .unwrap()
+        .finish(false)
+        .unwrap();
+        assert!(table.filters_keys(false) && !table.filters_keys(true));
+        assert!(!table.has_dense_index());
+        assert!(
+            format!("{table:?}").contains("\"hashed, key range\""),
+            "{table:?}"
+        );
+        let actual = probe_one_key(&table, &probe_batch, 100);
+        assert_eq!(actual, vec![(0, 4), (4, 9)]);
+    }
+
+    #[test]
+    fn buckets_with_keys_in_most_of_them_are_dropped() {
+        // The keys 0 to 15, in 4 buckets of 4 keys, recorded by two tables.
+        let filter = |buckets: [Vec<u32>; 2]| {
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let reservation = MemoryConsumer::new("JoinHashTable").register(&pool);
+            let mut tables = buckets.map(|buckets| {
+                reservation.grow(buckets.capacity() * size_of::<u32>());
+                PartitionTable {
+                    buckets,
+                    ..Default::default()
+                }
+            });
+            let reader = KeyReader {
+                offset: 0,
+                width: 4,
+                signed: true,
+            };
+            let plan = KeyIndexPlan {
+                range: KeyRange::new(0, 15).unwrap(),
+                reader,
+                dense: None,
+                buckets: Some((2, 4)),
+            };
+            let filter = key_filter(&plan, &mut tables, &reservation).unwrap();
+            assert!(tables.iter().all(|table| table.buckets.is_empty()));
+            (filter, reservation.size())
+        };
+        // Two buckets of four hold a key.
+        let (half, reserved) = filter([vec![0, 3], vec![0]]);
+        assert_eq!(reserved, size_of::<u64>());
+        let accepted = (0..20).filter(|&key| half.accepts(key)).collect::<Vec<_>>();
+        assert_eq!(accepted, vec![0, 1, 2, 3, 12, 13, 14, 15]);
+        let (most, reserved) = filter([vec![0], vec![1, 3]]);
+        assert!(most.buckets.is_none());
+        assert_eq!(reserved, 0);
+        let accepted = (0..20).filter(|&key| most.accepts(key)).count();
+        assert_eq!(accepted, 16);
+    }
+
+    #[test]
+    fn build_keys_outside_of_their_range_are_internal_errors() {
+        let (build, _) = build_and_probe();
+        for (map, range) in [
+            // A dense index of the keys from 0 (the build keys start at -3).
+            (
+                (|key| i128::from(key)) as KeyMap,
+                KeyRange::new(0, 13).unwrap(),
+            ),
+            // Hashed tables of keys up to 100,000 (they go up to 1,300,000).
+            (
+                |key| i128::from(key) * 100_000,
+                KeyRange::new(-300_000, 100_000).unwrap(),
+            ),
+        ] {
+            let typed = build
+                .iter()
+                .map(|batch| with_keys(batch, &DataType::Int64, map))
+                .collect::<Vec<_>>();
+            let err = configured_table(
+                &typed,
+                1,
+                NullEquality::NullEqualsNothing,
+                2,
+                2,
+                |b| hashes(b, 1),
+                |builder| builder.with_key_range(range),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("outside of its range"), "{err}");
+        }
+        // Only a single key of an integer type has a range.
+        let strings = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let data = PartitionedTupleData::try_new(layout(strings, 16), 0).unwrap();
+        let builder = JoinHashTableBuilder::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            reservation(),
+        )
+        .unwrap();
+        assert!(
+            builder
+                .with_key_range(KeyRange::new(0, 1).unwrap())
+                .is_err()
+        );
+        let data = PartitionedTupleData::try_new(layout(schema(), 16), 0).unwrap();
+        let builder = JoinHashTableBuilder::try_new(
+            data,
+            2,
+            NullEquality::NullEqualsNothing,
+            reservation(),
+        )
+        .unwrap();
+        assert!(
+            builder
+                .with_key_range(KeyRange::new(0, 1).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn small_builds_get_a_single_table() {
+        let (build, probe_batch) = build_and_probe();
+        let expected = expected(&build, &probe_batch, NullEquality::NullEqualsNothing);
+        let data = |radix_bits: u32, batches: &[RecordBatch]| {
+            let mut data =
+                PartitionedTupleData::try_new(layout(schema(), 7), radix_bits).unwrap();
+            for batch in batches {
+                let chunk = DataChunk::from_record_batch(batch.clone());
+                data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+            }
+            data
+        };
+        let builder = |radix_bits: u32, batches: &[RecordBatch]| {
+            JoinHashTableBuilder::try_new(
+                data(radix_bits, batches),
+                1,
+                NullEquality::NullEqualsNothing,
+                reservation(),
+            )
+            .unwrap()
+        };
+        // All rows are in one partition if all hashes collide (see
+        // `hashes_are_forced_to_collide`).
+        let collide = hashes_are_forced_to_collide();
+        // 200 rows in up to 32 partitions get a single table, which one
+        // thread builds.
+        let partitioned = builder(5, &build);
+        assert_eq!(partitioned.num_partitions(), 32);
+        assert!(collide || partitioned.num_partitions_with_rows() > 1);
+        assert_eq!(partitioned.max_threads(), 1);
+        let single = builder(5, &build).single_partition_up_to(SMALL_BUILD_ROWS);
+        assert_eq!(single.num_partitions(), 1);
+        assert_eq!(single.max_threads(), 1);
+        assert!(single.build_next_partition().unwrap());
+        assert!(!single.build_next_partition().unwrap());
+        let table = single.finish(false).unwrap();
+        assert_eq!(table.radix_bits(), 0);
+        assert_eq!(probe_one_key(&table, &probe_batch, 2048), expected);
+        // Larger builds keep their partitions, and get a thread per 4096 rows
+        // at most.
+        let large = (0..250).map(|b| build[b % 5].clone()).collect::<Vec<_>>();
+        let partitioned = builder(3, &large).single_partition_up_to(SMALL_BUILD_ROWS);
+        assert_eq!(partitioned.num_rows(), 10_000);
+        assert_eq!(partitioned.num_partitions(), 8);
+        assert_eq!(partitioned.max_threads(), if collide { 1 } else { 3 });
+        // A dense index is built by partition, in parallel.
+        let dense = builder(3, &large)
+            .with_key_range(key_range(&build))
+            .unwrap();
+        assert!(dense.has_dense_index());
+        assert_eq!(dense.max_threads(), if collide { 1 } else { 3 });
+        let mut built = 0;
+        while dense.build_next_partition().unwrap() {
+            built += 1;
+        }
+        assert_eq!(built, dense.num_partitions_with_rows());
+        let table = dense.finish(false).unwrap();
+        assert!(table.has_dense_index());
+        // The build rows 50 times: every match 50 times.
+        let large_expected = expected
+            .iter()
+            .flat_map(|&(row, value)| (0..50).map(move |_| (row, value)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sorted(probe_one_key(&table, &probe_batch, 2048))
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>(),
+            sorted(large_expected)
+                .into_iter()
+                .map(|(row, _)| row)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_dense_index_memory_is_reserved_before_it_is_allocated() {
+        // 200 rows, of which 17 keys from -3 to 13: 17 entries and 200 chains.
+        let (build, _) = build_and_probe();
+        let data = || {
+            let mut data = PartitionedTupleData::try_new(layout(schema(), 7), 2).unwrap();
+            for batch in &build {
+                let chunk = DataChunk::from_record_batch(batch.clone());
+                data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+            }
+            data
+        };
+        let index = (17 + 200) * size_of::<u64>();
+        // The index, and the keys of a partition while it is built (of at most
+        // 512 slots of 16 bytes for the 200 rows). Without room for the index,
+        // the rows get hashed tables, which need more memory here.
+        for (limit, dense, fits) in [
+            (0, false, false),
+            (index - 1, false, false),
+            (index + 8192, true, true),
+        ] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let reservation = MemoryConsumer::new("JoinHashTable").register(&pool);
+            let builder = JoinHashTableBuilder::try_new(
+                data(),
+                1,
+                NullEquality::NullEqualsNothing,
+                reservation,
+            )
+            .unwrap()
+            .with_key_range(key_range(&build))
+            .unwrap();
+            assert_eq!(builder.has_dense_index(), dense, "{limit}");
+            let result = builder.finish(false);
+            assert!(pool.reserved() <= limit);
+            match result {
+                Ok(table) => {
+                    assert!(fits, "{limit}");
+                    assert!(table.has_dense_index());
+                    assert_eq!(table.reserved_memory(), index);
+                    assert_eq!(table.index_memory_size(), index);
+                    drop(table);
+                    assert_eq!(pool.reserved(), 0);
+                }
+                Err(err) => {
+                    assert!(!fits, "{limit}: {err}");
+                    assert!(err.to_string().contains("JoinHashTable"), "{err}");
+                }
+            }
+        }
+        // Hashed tables of 200 rows fit in 16 KiB, a dense index of 50,000 keys
+        // does not.
+        let wide = build
+            .iter()
+            .map(|batch| with_keys(batch, &DataType::Int32, |key| i128::from(key) * 3000))
+            .collect::<Vec<_>>();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024));
+        let mut data =
+            PartitionedTupleData::try_new(layout(wide[0].schema(), 7), 2).unwrap();
+        for batch in &wide {
+            let chunk = DataChunk::from_record_batch(batch.clone());
+            data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+        }
+        let builder = JoinHashTableBuilder::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            MemoryConsumer::new("JoinHashTable").register(&pool),
+        )
+        .unwrap()
+        .with_key_range(key_range(&wide))
+        .unwrap();
+        assert!(!builder.has_dense_index());
+        let table = builder.finish(false).unwrap();
+        assert!(!table.has_dense_index() && table.filters_keys(true));
     }
 }
