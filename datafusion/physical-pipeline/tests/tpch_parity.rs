@@ -2179,16 +2179,13 @@ enum Why {
     /// arithmetic of Q1, are evaluated on any number of threads).
     ParallelErrors,
     /// `PhysicalProjection::supports_projection_exec` refuses the projection:
-    /// the classification of errors does not know its functions (`date_part`
-    /// and `substr`, which the sessions of the suite do not trust, see
-    /// `TrustedFunctions`) or judges that its parts may fail with different
-    /// kinds of errors (the decimal division of Q8, by a sum that may be 0).
+    /// the classification of errors judges that its parts may fail with
+    /// different kinds of errors (the decimal division of Q8, by a sum that
+    /// may be 0, which fails with a division by zero or with an overflow), of
+    /// which DataFusion raises the error of the first row of its partition
+    /// that fails, but a pipeline the error of the chunk that fails first on
+    /// any of its threads.
     Projection,
-    /// A plan that evaluates a function that the classification of errors
-    /// does not know (the `substr` of Q22, which the sessions of the suite do
-    /// not trust, see `TrustedFunctions`), or a repartitioning that spreads
-    /// such a bridged plan over more partitions.
-    UntrustedFunction,
     /// `PhysicalHashJoin::try_lower` refuses the join: its residual filter
     /// has decimal arithmetic, which may fail on some rows, and which
     /// DataFusion evaluates on up to `batch_size` candidate pairs of a probe
@@ -2228,9 +2225,9 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (4, 10, 10, 0, &[]),
         (5, 18, 18, 0, &[]),
         (6, 5, 5, 0, &[]),
-        (7, 3, 4, 22, &[("ProjectionExec", Why::Projection)]),
+        (7, 21, 21, 0, &[]),
         (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
-        (9, 3, 4, 19, &[("ProjectionExec", Why::Projection)]),
+        (9, 17, 17, 0, &[]),
         (10, 14, 14, 0, &[]),
         (11, 4, 6, 24, &[
             ("FilterExec", Why::ParallelErrors),
@@ -2246,10 +2243,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (19, 9, 9, 0, &[]),
         (20, 18, 18, 0, &[]),
         (21, 22, 22, 0, &[]),
-        (22, 6, 8, 9, &[
-            ("ProjectionExec", Why::Projection),
-            ("RepartitionExec", Why::UntrustedFunction),
-        ]),
+        (22, 15, 15, 0, &[]),
     ]),
     ("Parquet", [
         (1, 7, 7, 0, &[]),
@@ -2258,9 +2252,9 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (4, 10, 10, 0, &[]),
         (5, 18, 18, 0, &[]),
         (6, 5, 5, 0, &[]),
-        (7, 3, 4, 23, &[("ProjectionExec", Why::Projection)]),
+        (7, 21, 21, 0, &[]),
         (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
-        (9, 3, 4, 18, &[("ProjectionExec", Why::Projection)]),
+        (9, 17, 17, 0, &[]),
         (10, 14, 14, 0, &[]),
         (11, 4, 6, 26, &[
             ("FilterExec", Why::ParallelErrors),
@@ -2276,10 +2270,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (19, 9, 9, 0, &[]),
         (20, 1, 2, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (21, 22, 22, 0, &[]),
-        (22, 6, 8, 10, &[
-            ("ProjectionExec", Why::Projection),
-            ("FilterExec", Why::UntrustedFunction),
-        ]),
+        (22, 15, 15, 0, &[]),
     ]),
 ];
 
