@@ -91,8 +91,7 @@ pub(crate) struct AggregateSpec {
     /// Whether the input rows of a thread whose groups hardly repeat may
     /// bypass its thread-local table, and be aggregated by the final
     /// aggregation of their radix partitions directly (see
-    /// [`rows_can_bypass_tables`]): those of the partial stage of an
-    /// aggregation of two stages, whose aggregation DataFusion skips too.
+    /// [`rows_can_bypass_tables`]): those of aggregations without aggregates.
     pub(crate) bypass: bool,
 }
 
@@ -704,8 +703,7 @@ impl PhysicalHashAggregate {
             GroupLimit::TopK(top_k) => Some(top_k),
             GroupLimit::None | GroupLimit::Unsupported => None,
         };
-        let bypass = !single_stage
-            && top_k.is_none()
+        let bypass = top_k.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
         Ok(Self {
@@ -949,36 +947,41 @@ fn orders_like_datafusion(data_type: &DataType) -> bool {
     )
 }
 
-/// Whether the input rows of the partial stage of an aggregation of two
-/// stages without an input order or a limit may bypass the thread-local
-/// tables of a thread whose groups hardly repeat (see
-/// `RadixLocalState::aggregate`), and be aggregated by the final aggregation
-/// of their radix partitions directly.
+/// Whether the input rows of an aggregation without an input order or a
+/// limit may bypass the thread-local tables of a thread whose groups hardly
+/// repeat (see `RadixLocalState::aggregate`), and be aggregated by the final
+/// aggregation of their radix partitions directly:
 ///
-/// Like DataFusion, which skips the aggregation of the partial stages (of a
-/// single grouping set, without an order) whose groups hardly repeat, and
-/// passes their rows on to the final stage as partial states: the bypassed
-/// rows are converted to partial states (and dropped) when they are consumed,
-/// so that the accumulators fail on them then (see `validate_rows`), and the
-/// final aggregation of their partition aggregates them. DataFusion does not
-/// skip the aggregation of a single stage, whose accumulators aggregate every
-/// row when it is consumed (and may fail on the groups it aggregated so far),
-/// so its rows do not bypass the tables either.
+/// * the aggregation has group keys, no grouping sets, and **no aggregates**;
+/// * the keys (of the rows of a thread, which the radix partitioning gathers
+///   from several chunks) are of flat types, which are gathered without
+///   merging dictionaries or nested offsets.
 ///
-/// * the aggregation has group keys, and no grouping sets;
-/// * the aggregates of the final aggregation (`merge`), which aggregate the
-///   rows that bypass the tables, are those of the stage that consumes the
-///   input rows (`update`), as in DataFusion's plans;
-/// * the keys and the arguments (of the rows of a thread, which the radix
-///   partitioning gathers from several chunks) are of flat types, which are
-///   gathered without merging dictionaries or nested offsets.
+/// The accumulators of aggregates aggregate every row in the tables, when it
+/// is consumed, with the rows of its group that the table aggregated so far,
+/// like DataFusion's: an accumulator may fail depending on the rows that it
+/// aggregates together (e.g. a user-defined sum that rejects negative running
+/// totals), so that deferring its rows to the final aggregation fails later
+/// than DataFusion (after the rows that follow them), and converting them to
+/// partial states one by one (like DataFusion's partial stage when it skips
+/// its aggregation, which it decides by its own counts) fails where
+/// DataFusion does not. The native operator cannot verify that the function
+/// of an aggregate is one of DataFusion's (whose accumulators do not fail): it
+/// does not depend on DataFusion's function crates, and a user-defined
+/// function may have the name and the type name of one. (The final
+/// aggregation of a partition still aggregates the arguments of aggregates of
+/// bypassed rows, see `GroupedHashTable::update_rows`, for aggregates whose
+/// accumulators are known not to fail.)
 fn rows_can_bypass_tables(
     group_by: &PhysicalGroupBy,
     update: &[AggregateUpdate],
     merge: &[Arc<AggregateFunctionExpr>],
     schema: &SchemaRef,
 ) -> bool {
-    if !group_by.is_single() || group_by.expr().is_empty() || update.len() != merge.len()
+    if !group_by.is_single()
+        || group_by.expr().is_empty()
+        || !update.is_empty()
+        || update.len() != merge.len()
     {
         return false;
     }
@@ -1198,17 +1201,14 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
     fn get_local_sink_state(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
-            return UngroupedAggregate::local_sink_state(&self.spec);
+            UngroupedAggregate::local_sink_state(&self.spec)
+        } else {
+            RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity)
         }
-        // DataFusion never skips the aggregation of a partial stage with a
-        // ratio threshold of at least 1.
-        let options = &ctx.task_ctx.session_config().options().execution;
-        let skips = options.skip_partial_aggregation_probe_ratio_threshold < 1.0;
-        RadixHashAggregate::local_sink_state_with(&self.spec, self.table_capacity, skips)
     }
 
     fn sink(
@@ -2519,41 +2519,32 @@ mod tests {
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
         for (sql, bypass) in [
+            // Without aggregates.
+            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
+            ("SELECT a, d FROM t1 GROUP BY a, d", true),
+            // The accumulators of aggregates aggregate every row in the tables
+            // (see `rows_can_bypass_tables`).
             (
                 "SELECT a, COUNT(*), SUM(b), MIN(d), AVG(g) FROM t1 GROUP BY a",
-                true,
+                false,
             ),
             (
                 "SELECT d, h, COUNT(DISTINCT a), MEDIAN(b) FILTER (WHERE e) FROM t1 \
                  GROUP BY d, h",
-                true,
+                false,
             ),
-            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
             (
                 "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
-                true,
+                false,
             ),
             // Grouping sets.
+            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false),
+            // Keys of nested types and dictionaries.
+            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false),
             (
-                "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
+                "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 GROUP BY dd",
                 false,
             ),
-            // The rows of an aggregate with a hard order are sorted.
-            (
-                "SELECT e, NTH_VALUE(a, 3 ORDER BY id) FROM t1 GROUP BY e",
-                false,
-            ),
-            // Keys and arguments of nested types and dictionaries.
-            (
-                "SELECT [a, b] AS ab, COUNT(*) FROM t1 GROUP BY [a, b]",
-                false,
-            ),
-            (
-                "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd, COUNT(*) FROM t1 \
-                 GROUP BY dd",
-                false,
-            ),
-            ("SELECT d, ARRAY_AGG([a, b]) FROM t1 GROUP BY d", false),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let mut aggregate = None;
