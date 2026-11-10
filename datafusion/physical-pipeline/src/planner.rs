@@ -2322,6 +2322,13 @@ fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilter
         .max()
         .unwrap_or(TopKFilterPruning::Unread);
     if below <= TopKFilterPruning::Settled && !reads_dynamic_filter(plan, filter) {
+        // A node that may emit rows of its own before the input it streams
+        // emits any (e.g. a custom node that emits a row first) can pass a row
+        // to the TopK, and tighten its filter, while the nodes below it are
+        // still reading.
+        if below == TopKFilterPruning::Settled && !emits_rows_after_its_inputs(plan) {
+            return TopKFilterPruning::Other;
+        }
         return match settled {
             true => TopKFilterPruning::Settled,
             false => below,
@@ -2331,6 +2338,30 @@ fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilter
         true => below.max(TopKFilterPruning::Rows),
         false => TopKFilterPruning::Other,
     }
+}
+
+/// Whether `plan` emits no row before the inputs that it streams emit theirs:
+/// its rows are rows of its inputs, or computed from the rows of its inputs
+/// that it read before (also at the end of its input, e.g. an aggregation of
+/// no group, or the unmatched rows of an outer join), as for projections,
+/// filters, coalesced batches, repartitionings, merges of partitions, unions,
+/// sorts, aggregations, limits and joins. Any other node, e.g. a custom node,
+/// may emit rows of its own first.
+fn emits_rows_after_its_inputs(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || is_coalesce_batches(plan)
+        || plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<SortPreservingMergeExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<SortExec>()
+        || plan.is::<AggregateExec>()
+        || plan.is::<GlobalLimitExec>()
+        || plan.is::<LocalLimitExec>()
+        || plan.is::<HashJoinExec>()
+        || plan.is::<CrossJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
 }
 
 /// Whether an expression of `plan` itself (not of its children) reads the
@@ -6152,6 +6183,187 @@ mod tests {
                 format_operator_tree(&root)
             );
         }
+        Ok(())
+    }
+
+    /// A node of one partition that emits `row` before it reads its input,
+    /// whose rows it then passes on, and that passes the filters of the nodes
+    /// above it on to its input.
+    #[derive(Debug)]
+    struct EmitsRowFirst {
+        row: RecordBatch,
+        input: Arc<dyn ExecutionPlan>,
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
+    }
+
+    impl EmitsRowFirst {
+        fn new(row: RecordBatch, input: Arc<dyn ExecutionPlan>) -> Self {
+            use datafusion_physical_expr::EquivalenceProperties;
+            use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+            let properties = datafusion_physical_plan::PlanProperties::new(
+                EquivalenceProperties::new(input.schema()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            );
+            Self {
+                row,
+                input,
+                properties: Arc::new(properties),
+            }
+        }
+    }
+
+    impl datafusion_physical_plan::DisplayAs for EmitsRowFirst {
+        fn fmt_as(
+            &self,
+            _t: datafusion_physical_plan::DisplayFormatType,
+            f: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(f, "EmitsRowFirst")
+        }
+    }
+
+    impl ExecutionPlan for EmitsRowFirst {
+        fn name(&self) -> &str {
+            "EmitsRowFirst"
+        }
+
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(
+                self.row.clone(),
+                Arc::clone(&children[0]),
+            )))
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<datafusion_execution::SendableRecordBatchStream> {
+            use futures::StreamExt;
+            let input = self.input.execute(partition, context)?;
+            let row = self.row.clone();
+            let stream = futures::stream::once(async move { Ok(row) }).chain(input);
+            Ok(Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    stream,
+                ),
+            ))
+        }
+
+        fn gather_filters_for_pushdown(
+            &self,
+            _phase: datafusion_physical_plan::filter_pushdown::FilterPushdownPhase,
+            parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+            _config: &ConfigOptions,
+        ) -> Result<datafusion_physical_plan::filter_pushdown::FilterDescription>
+        {
+            datafusion_physical_plan::filter_pushdown::FilterDescription::from_children(
+                parent_filters,
+                &self.children(),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_filter_is_read_below_nodes_that_emit_rows_first_stay_in_datafusion()
+    -> Result<()> {
+        // A TopK of `ORDER BY k LIMIT 1` over a node that emits the row `(-1,
+        // 7)` before it reads the groups of an aggregation of 40 Parquet files
+        // of `k >= 0`, with `v = 0` on a row of the last file. DataFusion pushes
+        // the dynamic filter of the TopK through the node and the aggregation
+        // into the scan, and tightens it to `k < -1` with the first row of the
+        // node, before the aggregation reads any file: its scan skips all of
+        // them, and never divides by zero. The aggregation reads all of its
+        // input before it emits any group, but the node above it does not wait
+        // for it: the native TopK would tighten the filter only after the
+        // aggregation read all files. Such a TopK stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = parquet_files_in_order(dir.path(), 40, &[19_999])?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let options = config.options();
+        // The TopK, with its dynamic filter pushed down (every execution needs
+        // a plan of its own, as the TopK counts the partitions that complete
+        // its filter).
+        let make_topk = async || -> Result<Arc<dyn ExecutionPlan>> {
+            let groups = datafusion_plan_with(
+                "SELECT k, SUM(10 / v) AS n FROM p GROUP BY k",
+                config.clone(),
+                &setup,
+            )
+            .await;
+            let schema = groups.schema();
+            let row = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(vec![-1])),
+                    Arc::new(arrow::array::Int64Array::from(vec![7])),
+                ],
+            )?;
+            let keys =
+                LexOrdering::new(vec![PhysicalSortExpr::new_default(col("k", &schema)?)])
+                    .expect("a sort key");
+            let topk: Arc<dyn ExecutionPlan> = Arc::new(
+                SortExec::new(keys, Arc::new(EmitsRowFirst::new(row, groups)))
+                    .with_fetch(Some(1)),
+            );
+            datafusion_physical_optimizer::PhysicalOptimizerRule::optimize(
+                &datafusion_physical_optimizer::filter_pushdown::FilterPushdown::new_post_optimization(),
+                topk,
+                options,
+            )
+        };
+        let topk = make_topk().await?;
+        let sort = topk.downcast_ref::<SortExec>().expect("the TopK");
+        assert!(
+            read_topk_filter(sort).is_some(),
+            "{}",
+            displayable(topk.as_ref()).indent(false)
+        );
+        let task_ctx =
+            Arc::new(TaskContext::default().with_session_config(config.clone()));
+        let expected = collect(Arc::clone(&topk), Arc::clone(&task_ctx)).await?;
+        let runtime = RuntimeEnv::default();
+        let root =
+            create_pipeline_plan_with_runtime(make_topk().await?, options, &runtime)?;
+        let tree = format_operator_tree(root.operator());
+        let topks = count::<PhysicalTopK>(root.operator());
+        let actual = collect(root as Arc<dyn ExecutionPlan>, task_ctx)
+            .await
+            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
+        let output = |batches| crate::test_utils::EngineOutput {
+            schema: topk.schema(),
+            plan: Arc::clone(&topk),
+            batches,
+            ordered: true,
+        };
+        compare_outputs(&output(expected), &output(actual))
+            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
+        assert_eq!(topks, 0, "{tree}");
         Ok(())
     }
 
