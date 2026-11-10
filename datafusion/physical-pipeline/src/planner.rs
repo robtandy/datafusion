@@ -2254,21 +2254,43 @@ enum TopKFilterPruning {
 /// How the dynamic filter with id `filter` of a TopK prunes the rows of
 /// `plan`, the input of the TopK or a node below it whose rows reach the TopK
 /// as `plan` produces them (see [`TopKFilterPruning`]).
+///
+/// The nodes that read the filter below the child that `plan` reads all of
+/// before it emits any row (see [`reads_first_child_before_emitting`]) are
+/// settled with respect to the rows of `plan`. `plan` emits the rows of its
+/// other children as they come: if it streams several children (e.g. a union),
+/// the rows of one of them can reach the TopK, and tighten its filter, while
+/// the nodes below another one that read the filter are still reading, also
+/// if they are settled with respect to the rows of their own child. So the
+/// filter prunes nothing only below a barrier that all rows of the TopK pass:
+/// a settled child of a node that streams several children is not settled.
 fn topk_filter_pruning(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> TopKFilterPruning {
     let read_first = reads_first_child_before_emitting(plan);
-    let below = plan
-        .children()
+    let mut settled = false;
+    let mut streamed = vec![];
+    for (index, child) in plan.children().into_iter().enumerate() {
+        if index == 0 && read_first {
+            settled = consumes_dynamic_filter(child, filter);
+        } else {
+            streamed.push(topk_filter_pruning(child, filter));
+        }
+    }
+    if streamed.len() > 1 {
+        for pruning in &mut streamed {
+            if *pruning == TopKFilterPruning::Settled {
+                *pruning = TopKFilterPruning::Other;
+            }
+        }
+    }
+    let below = streamed
         .into_iter()
-        .enumerate()
-        .map(|(index, child)| match index == 0 && read_first {
-            true if consumes_dynamic_filter(child, filter) => TopKFilterPruning::Settled,
-            true => TopKFilterPruning::Unread,
-            false => topk_filter_pruning(child, filter),
-        })
         .max()
         .unwrap_or(TopKFilterPruning::Unread);
     if below <= TopKFilterPruning::Settled && !reads_dynamic_filter(plan, filter) {
-        return below;
+        return match settled {
+            true => TopKFilterPruning::Settled,
+            false => below,
+        };
     }
     match passes_rows_on(plan) {
         true => below.max(TopKFilterPruning::Rows),
