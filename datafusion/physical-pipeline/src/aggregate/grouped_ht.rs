@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, UInt32Array, new_null_array};
 use arrow::compute::{filter, prep_null_mask_filter, take};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
@@ -46,8 +46,7 @@ use datafusion_physical_plan::aggregates::evaluate_group_by;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
-use super::hash_aggregate::{AggregateSpec, literal_value};
-use crate::chunk::DEFAULT_VECTOR_SIZE;
+use super::hash_aggregate::{AggregateSpec, rebuilt_literal};
 
 /// The group keys and the aggregate states of a set of groups, emitted by a
 /// [`GroupedHashTable`]: row `i` of every array belongs to the same group.
@@ -87,8 +86,8 @@ impl GroupedStates {
 /// The group keys and the aggregate arguments of the input rows of `batch`
 /// (of the input of `spec`, an aggregation without grouping sets), aligned
 /// with its rows, for [`GroupedHashTable::update_rows`]: the group columns,
-/// followed by the arguments of every aggregate that are not literals (see
-/// [`literal_value`]) and, for an aggregate with a filter, the filter result
+/// followed by the arguments of every aggregate that are not rebuilt (see
+/// [`rebuilt_literal`]) and, for an aggregate with a filter, the filter result
 /// (see [`AggregateUpdate::evaluate_row_aligned`]).
 ///
 /// [`AggregateUpdate::evaluate_row_aligned`]: super::hash_aggregate::AggregateUpdate::evaluate_row_aligned
@@ -237,7 +236,7 @@ impl GroupedHashTable {
                     let stored = update
                         .arguments
                         .iter()
-                        .filter(|argument| literal_value(argument).is_none())
+                        .filter(|argument| rebuilt_literal(argument).is_none())
                         .count();
                     stored + usize::from(update.filter.is_some())
                 })
@@ -253,47 +252,16 @@ impl GroupedHashTable {
         }
         let (keys, mut rest) = columns.split_at(num_keys);
         let num_rows = keys.first().map_or(0, |keys| keys.len());
-        // The arguments that are literals are rebuilt for the rows, like the
-        // regular path evaluates them on chunks of at most
-        // `DEFAULT_VECTOR_SIZE` rows: literals of variable length (strings,
-        // lists...) for as many rows at most, so that their arrays do not
-        // overflow their offsets where DataFusion's (of its batches) do not.
-        let variable_literals = spec.update.iter().any(|update| {
-            update.arguments.iter().any(|argument| {
-                literal_value(argument).is_some_and(|value| {
-                    let data_type = value.data_type();
-                    !(data_type.is_primitive()
-                        || matches!(data_type, DataType::Boolean | DataType::Null))
-                })
-            })
-        });
-        if variable_literals && num_rows > DEFAULT_VECTOR_SIZE {
-            for offset in (0..num_rows).step_by(DEFAULT_VECTOR_SIZE) {
-                let len = DEFAULT_VECTOR_SIZE.min(num_rows - offset);
-                let slice = columns
-                    .iter()
-                    .map(|column| column.slice(offset, len))
-                    .collect::<Vec<_>>();
-                self.update_rows(spec, &slice)?;
-            }
-            return Ok(());
-        }
         self.group_values.intern(keys, &mut self.group_indices)?;
         let num_groups = self.group_values.len();
         for (accumulator, update) in self.accumulators.iter_mut().zip(&spec.update) {
-            let values = update
+            let stored = update
                 .arguments
                 .iter()
-                .map(|argument| match literal_value(argument) {
-                    Some(value) => value.to_array_of_size(num_rows),
-                    None => {
-                        let (value, tail) = rest.split_at(1);
-                        rest = tail;
-                        Ok(Arc::clone(&value[0]))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let values = values.as_slice();
+                .filter(|argument| rebuilt_literal(argument).is_none())
+                .count();
+            let (values, tail) = rest.split_at(stored);
+            rest = tail;
             let selection = match update.filter {
                 Some(_) => {
                     let (selection, tail) = rest.split_at(1);
@@ -302,27 +270,37 @@ impl GroupedHashTable {
                 }
                 None => None,
             };
-            // The group indices of the rows that pass the filter.
+            // The rows that pass the filter, and their group indices.
             let selected = selection.and_then(|selection| {
                 compact_group_indices(&self.group_indices, selection)
                     .map(|indices| (selection, indices))
             });
-            match selected {
-                None => accumulator.update_batch(
-                    values,
-                    &self.group_indices,
-                    None,
-                    num_groups,
-                )?,
-                Some((selection, indices)) => {
-                    // The arguments of the rows that pass the filter.
-                    let values = values
-                        .iter()
-                        .map(|value| Ok(filter(value.as_ref(), selection)?))
-                        .collect::<Result<Vec<_>>>()?;
-                    accumulator.update_batch(&values, &indices, None, num_groups)?
-                }
+            let (indices, rows) = match &selected {
+                Some((_, indices)) => (indices.as_slice(), indices.len()),
+                None => (self.group_indices.as_slice(), num_rows),
+            };
+            // The arguments of these rows: the literals rebuilt for them.
+            let mut values = values.iter();
+            let mut arguments = Vec::with_capacity(update.arguments.len());
+            for argument in &update.arguments {
+                let array = match rebuilt_literal(argument) {
+                    Some(value) => value.to_array_of_size(rows)?,
+                    None => {
+                        let Some(value) = values.next() else {
+                            return internal_err!(
+                                "PhysicalHashAggregate is missing an argument of {}",
+                                update.expr.name()
+                            );
+                        };
+                        match &selected {
+                            Some((selection, _)) => filter(value.as_ref(), selection)?,
+                            None => Arc::clone(value),
+                        }
+                    }
+                };
+                arguments.push(array);
             }
+            accumulator.update_batch(&arguments, indices, None, num_groups)?;
         }
         Ok(())
     }
@@ -734,49 +712,54 @@ mod tests {
     }
 
     #[test]
-    fn rows_with_literal_arguments_are_aggregated_in_chunks() -> Result<()> {
-        // `COUNT('...') GROUP BY a`, whose literal argument is not stored with
-        // the rows, but rebuilt for chunks of their rows.
+    fn literal_arguments_of_bypassed_rows_are_rebuilt_or_evaluated() -> Result<()> {
+        // `COUNT(1) GROUP BY a` and `COUNT('a literal') GROUP BY a`: the
+        // literal of a fixed width is rebuilt for the rows that the aggregate
+        // aggregates, the string is evaluated (and stored) like the other
+        // arguments.
         let schema = input_schema();
-        let count = AggregateExprBuilder::new(count_udaf(), vec![lit("a literal")])
-            .schema(Arc::clone(&schema))
-            .alias("count('a literal')")
-            .build()?;
-        let aggregate = AggregateExec::try_new(
-            AggregateMode::Single,
-            PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".into())]),
-            vec![Arc::new(count)],
-            vec![None],
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
-            Arc::clone(&schema),
-        )?;
-        let input = Arc::new(BridgeOperator::new(Arc::clone(aggregate.input())));
-        let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
-        let rows = 5_000;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int32Array::from_iter_values((0..rows).map(|i| i % 3))),
-                Arc::new(StringArray::from_iter_values(
-                    (0..rows).map(|i| format!("{i}")),
-                )),
-            ],
-        )?;
-        let columns = evaluate_rows(&spec, &batch)?;
-        // The key only.
-        assert_eq!(columns.len(), 1);
-        let mut table = GroupedHashTable::try_new_merge(&spec)?;
-        table.update_rows(&spec, &columns)?;
-        let output = table.evaluate()?.expect("groups");
-        let mut counts = output[0]
-            .as_primitive::<arrow::datatypes::Int32Type>()
-            .values()
-            .iter()
-            .zip(output[1].as_primitive::<Int64Type>().values())
-            .map(|(&key, &count)| (key, count))
-            .collect::<Vec<_>>();
-        counts.sort_unstable();
-        assert_eq!(counts, [(0, 1_667), (1, 1_667), (2, 1_666)]);
+        for (literal, stored) in [(lit(1i64), 0), (lit("a literal"), 1)] {
+            let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
+                .schema(Arc::clone(&schema))
+                .alias("count(literal)")
+                .build()?;
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(col("a", &schema)?, "a".into())]),
+                vec![Arc::new(count)],
+                vec![None],
+                Arc::new(EmptyExec::new(Arc::clone(&schema))),
+                Arc::clone(&schema),
+            )?;
+            let input = Arc::new(BridgeOperator::new(Arc::clone(aggregate.input())));
+            let spec =
+                PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+            let rows = 5_000;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values((0..rows).map(|i| i % 3))),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..rows).map(|i| format!("{i}")),
+                    )),
+                ],
+            )?;
+            let columns = evaluate_rows(&spec, &batch)?;
+            // The key, and the stored literal.
+            assert_eq!(columns.len(), 1 + stored);
+            let mut table = GroupedHashTable::try_new_merge(&spec)?;
+            table.update_rows(&spec, &columns)?;
+            let output = table.evaluate()?.expect("groups");
+            let mut counts = output[0]
+                .as_primitive::<arrow::datatypes::Int32Type>()
+                .values()
+                .iter()
+                .zip(output[1].as_primitive::<Int64Type>().values())
+                .map(|(&key, &count)| (key, count))
+                .collect::<Vec<_>>();
+            counts.sort_unstable();
+            assert_eq!(counts, [(0, 1_667), (1, 1_667), (2, 1_666)]);
+        }
         Ok(())
     }
 

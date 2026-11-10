@@ -369,8 +369,8 @@ impl AggregateUpdate {
             .collect()
     }
 
-    /// Evaluate the arguments of the aggregate that are not literals (see
-    /// [`literal_value`]) for the rows of `batch` that pass its filter, like
+    /// Evaluate the arguments of the aggregate that are not rebuilt (see
+    /// [`rebuilt_literal`]) for the rows of `batch` that pass its filter, like
     /// [`Self::evaluate_filtered`], aligned with the rows of `batch`: the
     /// arguments of the rows that do not pass the filter are `NULL` (they are
     /// not evaluated, so they cannot cause errors). Returns the arguments and
@@ -383,7 +383,7 @@ impl AggregateUpdate {
         let arguments = self
             .arguments
             .iter()
-            .filter(|argument| literal_value(argument).is_none());
+            .filter(|argument| rebuilt_literal(argument).is_none());
         let evaluate = |argument: &Arc<dyn PhysicalExpr>, batch: &RecordBatch| {
             argument.evaluate(batch)?.into_array(batch.num_rows())
         };
@@ -420,11 +420,19 @@ impl AggregateUpdate {
     }
 }
 
-/// The value of `argument`, an argument of an aggregate, if it is a literal,
-/// which has the same value for every row (e.g. the `1` of `COUNT(*)`,
-/// `count(Int64(1))`).
-pub(crate) fn literal_value(argument: &Arc<dyn PhysicalExpr>) -> Option<&ScalarValue> {
-    argument.downcast_ref::<Literal>().map(Literal::value)
+/// The value of `argument`, an argument of an aggregate, if it is a literal
+/// of a fixed width (e.g. the `1` of `COUNT(*)`, `count(Int64(1))`), which
+/// the input rows that bypass the thread-local tables do not store: it is
+/// rebuilt for the rows that the aggregate aggregates (see
+/// `GroupedHashTable::update_rows`). Literals of variable length (e.g.
+/// strings) are evaluated like the other arguments, for the rows that pass
+/// the filter of the aggregate only, so that no more of their bytes are built
+/// at once than the regular path, and DataFusion, build.
+pub(crate) fn rebuilt_literal(argument: &Arc<dyn PhysicalExpr>) -> Option<&ScalarValue> {
+    let value = argument.downcast_ref::<Literal>()?.value();
+    let data_type = value.data_type();
+    (data_type.is_primitive() || matches!(data_type, DataType::Boolean | DataType::Null))
+        .then_some(value)
 }
 
 /// The input rows of a thread, buffered so that they can be aggregated in the

@@ -1986,6 +1986,85 @@ mod tests {
         Ok(())
     }
 
+    /// `COUNT(<1,100,000-byte string>) FILTER (WHERE p) GROUP BY k` over a
+    /// single partition: 32,768 distinct keys (which fill the thread-local
+    /// table of a thread, whose rows then bypass it), followed by 2,048 rows of
+    /// a new key; `p` is true for the rows of `selected`. As many copies of the
+    /// literal as there are rows of a chunk would overflow the offsets of an
+    /// array of strings: DataFusion builds them for the selected rows only.
+    fn count_of_long_literal(
+        selected: fn(i64) -> bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::ScalarValue;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("p", DataType::Boolean, false),
+        ]));
+        let batch = |keys: Vec<i64>, rows: std::ops::Range<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(BooleanArray::from_iter(
+                        rows.map(|row| Some(selected(row))),
+                    )),
+                ],
+            )
+        };
+        let partitions = vec![vec![
+            batch((0..32_768).collect(), 0..32_768)?,
+            batch(vec![100_000; 2_048], 32_768..34_816)?,
+        ]];
+        let input =
+            MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
+        let literal = lit(ScalarValue::Utf8(Some("x".repeat(1_100_000))));
+        let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
+            .schema(Arc::clone(&schema))
+            .alias("count(literal)")
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![Arc::new(count)],
+            vec![Some(col("p", &schema)?)],
+            input,
+            schema,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn literal_arguments_of_filtered_aggregates_are_built_for_their_rows()
+    -> Result<()> {
+        // No row passes the filter, and a few do; on 1 thread (whose rows bypass
+        // its table) and on 4.
+        let selections: [fn(i64) -> bool; 2] = [|_| false, |row| row % 1_000 == 7];
+        for (selected, threads) in selections.into_iter().flat_map(|s| [(s, 1), (s, 4)]) {
+            let plan = count_of_long_literal(selected)?;
+            let root = lower(&plan)?;
+            let aggregate = root
+                .downcast_ref::<PhysicalHashAggregate>()
+                .expect("a native aggregation");
+            assert!(aggregate.spec().bypass);
+            let task_ctx = Arc::new(TaskContext::default());
+            let actual = Executor::collect(root, Arc::clone(&task_ctx), threads).await?;
+            let expected = datafusion_physical_plan::collect(
+                count_of_long_literal(selected)?,
+                task_ctx,
+            )
+            .await?;
+            let schema = plan.schema();
+            assert_eq!(
+                canonical_batch(&schema, &actual, false)?,
+                canonical_batch(&schema, &expected, false)?
+            );
+            assert_eq!(
+                actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                32_769
+            );
+        }
+        Ok(())
+    }
+
     /// Register table `u`: 3,000 rows in 3 partitions of batches of 50 rows
     /// (and a few of other sizes), with a high-cardinality key `k` (with
     /// nulls), strings `s` and `sv` (a string view), values `v`, decimals `d`
