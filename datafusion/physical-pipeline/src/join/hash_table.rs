@@ -1161,7 +1161,8 @@ impl JoinHashTableBuilder {
     /// build key would lose its matches.
     ///
     /// * with a [`DenseIndex`] if the range spans at most [`MAX_DENSE_SPAN`]
-    ///   keys, and at most 65,536 keys or 8 keys per build row;
+    ///   keys, and at most 65,536 keys or 8 keys per build row (and if the
+    ///   memory pool has room for it);
     /// * otherwise with the hashed tables of the partitions and a
     ///   [`KeyFilter`] of the range, and of the buckets of keys in which build
     ///   keys fall (of at most 2^19 buckets, which the partitions record as
@@ -1190,11 +1191,13 @@ impl JoinHashTableBuilder {
         };
         let span = range.span();
         let num_rows = self.collection.len() as u64;
+        // A dense index is optional too: without room for it in the memory
+        // pool, the rows get hashed tables.
         let dense = (span <= MAX_DENSE_SPAN
             && (span < ALWAYS_DENSE_KEYS
                 || span < num_rows.saturating_mul(DENSE_KEYS_PER_ROW)))
-        .then(|| DenseBuild::try_new(span, self.collection.len(), &self.reservation))
-        .transpose()?;
+        .then(|| DenseBuild::try_new(span, self.collection.len(), &self.reservation).ok())
+        .flatten();
         // The buckets of keys are only worth it if many of them have no key:
         // if there are at most half as many rows as buckets (see also
         // `key_filter`).
@@ -3186,11 +3189,14 @@ mod tests {
             )
             .unwrap()
         };
+        // All rows are in one partition if all hashes collide (see
+        // `hashes_are_forced_to_collide`).
+        let collide = hashes_are_forced_to_collide();
         // 200 rows in up to 32 partitions get a single table, which one
         // thread builds.
         let partitioned = builder(5, &build);
         assert_eq!(partitioned.num_partitions(), 32);
-        assert!(partitioned.num_partitions_with_rows() > 1);
+        assert!(collide || partitioned.num_partitions_with_rows() > 1);
         assert_eq!(partitioned.max_threads(), 1);
         let single = builder(5, &build).single_partition_up_to(SMALL_BUILD_ROWS);
         assert_eq!(single.num_partitions(), 1);
@@ -3206,13 +3212,13 @@ mod tests {
         let partitioned = builder(3, &large).single_partition_up_to(SMALL_BUILD_ROWS);
         assert_eq!(partitioned.num_rows(), 10_000);
         assert_eq!(partitioned.num_partitions(), 8);
-        assert_eq!(partitioned.max_threads(), 3);
+        assert_eq!(partitioned.max_threads(), if collide { 1 } else { 3 });
         // A dense index is built by partition, in parallel.
         let dense = builder(3, &large)
             .with_key_range(key_range(&build))
             .unwrap();
         assert!(dense.has_dense_index());
-        assert_eq!(dense.max_threads(), 3);
+        assert_eq!(dense.max_threads(), if collide { 1 } else { 3 });
         let mut built = 0;
         while dense.build_next_partition().unwrap() {
             built += 1;
@@ -3251,11 +3257,16 @@ mod tests {
         };
         let index = (17 + 200) * size_of::<u64>();
         // The index, and the keys of a partition while it is built (of at most
-        // 512 slots of 16 bytes for the 200 rows).
-        for (limit, fits) in [(0, false), (index - 1, false), (index + 8192, true)] {
+        // 512 slots of 16 bytes for the 200 rows). Without room for the index,
+        // the rows get hashed tables, which need more memory here.
+        for (limit, dense, fits) in [
+            (0, false, false),
+            (index - 1, false, false),
+            (index + 8192, true, true),
+        ] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
             let reservation = MemoryConsumer::new("JoinHashTable").register(&pool);
-            let result = JoinHashTableBuilder::try_new(
+            let builder = JoinHashTableBuilder::try_new(
                 data(),
                 1,
                 NullEquality::NullEqualsNothing,
@@ -3263,10 +3274,9 @@ mod tests {
             )
             .unwrap()
             .with_key_range(key_range(&build))
-            .and_then(|builder| {
-                assert!(builder.has_dense_index());
-                builder.finish(false)
-            });
+            .unwrap();
+            assert_eq!(builder.has_dense_index(), dense, "{limit}");
+            let result = builder.finish(false);
             assert!(pool.reserved() <= limit);
             match result {
                 Ok(table) => {
@@ -3283,5 +3293,30 @@ mod tests {
                 }
             }
         }
+        // Hashed tables of 200 rows fit in 16 KiB, a dense index of 50,000 keys
+        // does not.
+        let wide = build
+            .iter()
+            .map(|batch| with_keys(batch, &DataType::Int32, |key| i128::from(key) * 3000))
+            .collect::<Vec<_>>();
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024));
+        let mut data =
+            PartitionedTupleData::try_new(layout(wide[0].schema(), 7), 2).unwrap();
+        for batch in &wide {
+            let chunk = DataChunk::from_record_batch(batch.clone());
+            data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+        }
+        let builder = JoinHashTableBuilder::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            MemoryConsumer::new("JoinHashTable").register(&pool),
+        )
+        .unwrap()
+        .with_key_range(key_range(&wide))
+        .unwrap();
+        assert!(!builder.has_dense_index());
+        let table = builder.finish(false).unwrap();
+        assert!(!table.has_dense_index() && table.filters_keys(true));
     }
 }
