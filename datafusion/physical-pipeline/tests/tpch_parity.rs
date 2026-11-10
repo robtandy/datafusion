@@ -2170,33 +2170,42 @@ async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
 /// DataFusion's results and errors exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
-    /// The arguments of its aggregates have more than one part that may fail
-    /// (decimal arithmetic), whose errors could come in another order than in
-    /// DataFusion (see `PipelineQueryPlanner`).
-    AggregateArguments,
-    /// An operator with a part that may fail (decimal arithmetic), which the
-    /// native operators would evaluate on the chunks of a partition in
-    /// parallel, on several threads, so that another row than in DataFusion
-    /// could fail first (see `PipelineQueryPlanner`).
+    /// An operator with a part that may fail with other errors than arithmetic
+    /// overflows (the casts of decimals of Q11, whose errors name the values
+    /// that fail), which the native operators would evaluate on the chunks of
+    /// a partition in parallel, on several threads, so that another row than
+    /// in DataFusion could fail first (see `PipelineQueryPlanner`; the parts
+    /// that can only fail with arithmetic overflows, e.g. the decimal
+    /// arithmetic of Q1, are evaluated on any number of threads).
     ParallelErrors,
     /// `PhysicalProjection::supports_projection_exec` refuses the projection:
-    /// the classification of errors does not know its functions (`date_part`,
-    /// which the sessions of the suite do not trust) or judges that its parts
-    /// may fail with different kinds of errors (the decimal division of Q8).
+    /// the classification of errors does not know its functions (`date_part`
+    /// and `substr`, which the sessions of the suite do not trust, see
+    /// `TrustedFunctions`) or judges that its parts may fail with different
+    /// kinds of errors (the decimal division of Q8, by a sum that may be 0).
     Projection,
-    /// There is no native operator for `ScalarSubqueryExec`, and the native
-    /// filters and projections do not evaluate the `ScalarSubqueryExpr`s that
-    /// read its results (the classification of errors does not know them).
-    ScalarSubquery,
+    /// A plan that evaluates a function that the classification of errors
+    /// does not know (the `substr` of Q22, which the sessions of the suite do
+    /// not trust, see `TrustedFunctions`), or a repartitioning that spreads
+    /// such a bridged plan over more partitions.
+    UntrustedFunction,
     /// `PhysicalHashJoin::try_lower` refuses the join: its residual filter
     /// has decimal arithmetic, which may fail on some rows, and which
-    /// DataFusion evaluates on other candidate pairs together.
+    /// DataFusion evaluates on up to `batch_size` candidate pairs of a probe
+    /// batch before it emits any of them, while the native join emits chunk by
+    /// chunk (and could stop before it reaches a row on which DataFusion
+    /// fails).
     JoinFilter,
     /// A hash join whose dynamic filter a Parquet scan of its probe side
     /// uses: the scan skips the reads that the filter rejects, a native join
-    /// does not, and the reads of files may fail (see `PipelineQueryPlanner`).
+    /// sets its filter to other values, and the probe side has decimal
+    /// arithmetic that may fail on the rows that DataFusion skips (see
+    /// `PipelineQueryPlanner`).
     JoinDynamicFilter,
-    /// A TopK whose dynamic filter a Parquet scan uses.
+    /// A TopK whose dynamic filter the Parquet scan of orders uses, below
+    /// hash joins and an aggregation, which `crate::sort::try_lower` leaves to
+    /// DataFusion: the work of these nodes on the rows that the filter prunes
+    /// depends on when its threshold tightens.
     TopKDynamicFilter,
 }
 
@@ -2213,55 +2222,64 @@ type Coverage = (usize, usize, usize, usize, &'static [(&'static str, Why)]);
 #[rustfmt::skip]
 const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
     ("MemTable", [
-        (1, 2, 3, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (1, 7, 7, 0, &[]),
         (2, 26, 26, 0, &[]),
-        (3, 2, 3, 13, &[("AggregateExec", Why::AggregateArguments)]),
+        (3, 14, 14, 0, &[]),
         (4, 10, 10, 0, &[]),
-        (5, 2, 3, 21, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, 1, 2, 5, &[("AggregateExec", Why::ParallelErrors)]),
+        (5, 18, 18, 0, &[]),
+        (6, 5, 5, 0, &[]),
         (7, 3, 4, 22, &[("ProjectionExec", Why::Projection)]),
         (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
         (9, 3, 4, 19, &[("ProjectionExec", Why::Projection)]),
-        (10, 2, 3, 15, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, 0, 1, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (10, 14, 14, 0, &[]),
+        (11, 4, 6, 24, &[
+            ("FilterExec", Why::ParallelErrors),
+            ("ProjectionExec", Why::ParallelErrors),
+        ]),
         (12, 8, 8, 0, &[]),
         (13, 10, 10, 0, &[]),
-        (14, 2, 3, 6, &[("ProjectionExec", Why::ParallelErrors)]),
-        (15, 0, 1, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (14, 8, 8, 0, &[]),
+        (15, 18, 18, 0, &[]),
         (16, 13, 13, 0, &[]),
         (17, 2, 3, 12, &[("HashJoinExec", Why::JoinFilter)]),
         (18, 12, 12, 0, &[]),
-        (19, 1, 2, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (19, 9, 9, 0, &[]),
         (20, 18, 18, 0, &[]),
         (21, 22, 22, 0, &[]),
-        (22, 0, 1, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (22, 6, 8, 9, &[
+            ("ProjectionExec", Why::Projection),
+            ("RepartitionExec", Why::UntrustedFunction),
+        ]),
     ]),
     ("Parquet", [
-        (1, 2, 3, 6, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, 4, 6, 28, &[
-            ("HashJoinExec", Why::JoinDynamicFilter),
-            ("HashJoinExec", Why::JoinDynamicFilter),
-        ]),
-        (3, 2, 3, 14, &[("AggregateExec", Why::AggregateArguments)]),
-        (4, 3, 4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (5, 2, 3, 22, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, 1, 2, 5, &[("AggregateExec", Why::ParallelErrors)]),
+        (1, 7, 7, 0, &[]),
+        (2, 26, 26, 0, &[]),
+        (3, 14, 14, 0, &[]),
+        (4, 10, 10, 0, &[]),
+        (5, 18, 18, 0, &[]),
+        (6, 5, 5, 0, &[]),
         (7, 3, 4, 23, &[("ProjectionExec", Why::Projection)]),
         (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
         (9, 3, 4, 18, &[("ProjectionExec", Why::Projection)]),
-        (10, 2, 3, 15, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, 0, 1, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (12, 3, 4, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (13, 5, 6, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (14, 2, 3, 6, &[("ProjectionExec", Why::ParallelErrors)]),
-        (15, 0, 1, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, 8, 9, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (10, 14, 14, 0, &[]),
+        (11, 4, 6, 26, &[
+            ("FilterExec", Why::ParallelErrors),
+            ("ProjectionExec", Why::ParallelErrors),
+        ]),
+        (12, 8, 8, 0, &[]),
+        (13, 10, 10, 0, &[]),
+        (14, 8, 8, 0, &[]),
+        (15, 9, 10, 10, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (16, 13, 13, 0, &[]),
+        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinFilter)]),
         (18, 0, 1, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
-        (19, 1, 2, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (19, 9, 9, 0, &[]),
         (20, 1, 2, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (21, 7, 8, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (22, 0, 1, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (21, 22, 22, 0, &[]),
+        (22, 6, 8, 10, &[
+            ("ProjectionExec", Why::Projection),
+            ("FilterExec", Why::UntrustedFunction),
+        ]),
     ]),
 ];
 
