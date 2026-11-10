@@ -1102,7 +1102,7 @@ fn rows_can_bypass_tables(
 /// `DISTINCT` aggregates and aggregates with an `ORDER BY` are not trusted
 /// (see [`TrustedAggregateFunctions::trusts`]): their accumulators keep sets
 /// or ordered lists of values, of other states.
-const BUILTIN_AGGREGATES: [(&str, fn() -> Arc<AggregateUDF>); 15] = [
+const BUILTIN_AGGREGATES: [(&str, BuiltinAggregate); 15] = [
     ("count", count::count_udaf),
     ("sum", sum::sum_udaf),
     ("min", min_max::min_udaf),
@@ -1119,6 +1119,10 @@ const BUILTIN_AGGREGATES: [(&str, fn() -> Arc<AggregateUDF>); 15] = [
     ("median", median::median_udaf),
     ("array_agg", array_agg::array_agg_udaf),
 ];
+
+/// The function of `datafusion-functions-aggregate` that returns a built-in
+/// aggregate function (see [`BUILTIN_AGGREGATES`]).
+type BuiltinAggregate = fn() -> Arc<AggregateUDF>;
 
 /// The type that implements `udaf`.
 fn implementation_type(udaf: &AggregateUDF) -> TypeId {
