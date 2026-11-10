@@ -308,6 +308,28 @@ impl RadixLocalState {
         global: &RadixSinkState,
         batch: &RecordBatch,
     ) -> Result<()> {
+        // The common case, as small as it can be: the rows of the thread are
+        // aggregated into its table.
+        if self.bypass.is_some() || spec.top_k.is_some() {
+            return self.aggregate_bypassed_or_top_k(spec, global, batch);
+        }
+        self.table.update(spec, batch)?;
+        self.table_rows += batch.num_rows();
+        if self.table.num_groups() < self.capacity {
+            return Ok(());
+        }
+        self.flush_or_grow(spec, global)
+    }
+
+    /// [`Self::aggregate`] of a thread whose rows bypass its table, or of a
+    /// top-k aggregation.
+    #[inline(never)]
+    fn aggregate_bypassed_or_top_k(
+        &mut self,
+        spec: &AggregateSpec,
+        global: &RadixSinkState,
+        batch: &RecordBatch,
+    ) -> Result<()> {
         if let Some(bypass) = &mut self.bypass {
             let scattered =
                 bypass.push(spec, global, batch, &mut self.distinct_flushed)?;
@@ -362,12 +384,24 @@ impl RadixLocalState {
             }
             return Ok(());
         }
+        self.flush_or_grow(spec, global)
+    }
+
+    /// Grow the full table of the thread if its flushed groups came back,
+    /// flush it otherwise (and bypass it from then on if its rows hardly
+    /// repeat their groups), see [`Self::aggregate`].
+    #[inline(never)]
+    fn flush_or_grow(
+        &mut self,
+        spec: &AggregateSpec,
+        global: &RadixSinkState,
+    ) -> Result<()> {
         if let Some(capacity) = self.grown_capacity() {
             self.capacity = capacity;
             return Ok(());
         }
-        let bypass =
-            spec.bypass && num_groups as f64 > BYPASS_RATIO * self.table_rows as f64;
+        let bypass = spec.bypass
+            && self.table.num_groups() as f64 > BYPASS_RATIO * self.table_rows as f64;
         self.flush(spec, global)?;
         if bypass {
             self.bypass = Some(BypassBuffer::new(self.bypass_bytes));
@@ -894,26 +928,25 @@ fn scatter(
             .map(|columns| (partition, columns))
             .collect());
     }
-    // The position of every row in the order of the partitions.
     let mut next = offsets.clone();
-    let positions = partitions
-        .iter()
-        .map(|&partition| {
+    let sorted = if let [columns] = chunks.as_slice() {
+        // The rows of a single chunk (e.g. the groups of a flushed table) are
+        // gathered in the order of the partitions by Arrow's `take`, whose
+        // kernels write every value once (and its validity by words).
+        let mut indices = vec![0u32; num_rows];
+        for (row, &partition) in partitions.iter().enumerate() {
             let position = &mut next[usize::from(partition)];
+            indices[*position] = row as u32;
             *position += 1;
-            (*position - 1) as u32
-        })
-        .collect::<Vec<_>>();
-    let num_columns = chunks.first().map_or(0, Vec::len);
-    let sorted = (0..num_columns)
-        .map(|column| {
-            let arrays = chunks
-                .iter()
-                .map(|columns| columns[column].as_ref())
-                .collect::<Vec<_>>();
-            scatter_column(&arrays, &positions)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        }
+        let indices = UInt32Array::from(indices);
+        columns
+            .iter()
+            .map(|column| Ok(take(column.as_ref(), &indices, None)?))
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        scatter_chunks(&chunks, partitions, &mut next)?
+    };
     Ok(offsets
         .windows(2)
         .enumerate()
@@ -927,6 +960,35 @@ fn scatter(
             (partition, columns)
         })
         .collect())
+}
+
+/// The columns of the rows of `chunks` (several chunks) in the order of their
+/// partitions `partitions`, `next` the first position of every partition:
+/// every column is reordered once (see [`scatter_column`]).
+fn scatter_chunks(
+    chunks: &[Vec<ArrayRef>],
+    partitions: &[u8],
+    next: &mut [usize],
+) -> Result<Vec<ArrayRef>> {
+    // The position of every row in the order of the partitions.
+    let positions = partitions
+        .iter()
+        .map(|&partition| {
+            let position = &mut next[usize::from(partition)];
+            *position += 1;
+            (*position - 1) as u32
+        })
+        .collect::<Vec<_>>();
+    let num_columns = chunks.first().map_or(0, Vec::len);
+    (0..num_columns)
+        .map(|column| {
+            let arrays = chunks
+                .iter()
+                .map(|columns| columns[column].as_ref())
+                .collect::<Vec<_>>();
+            scatter_column(&arrays, &positions)
+        })
+        .collect()
 }
 
 /// The rows of `arrays` (of the same type, the rows of consecutive chunks)
