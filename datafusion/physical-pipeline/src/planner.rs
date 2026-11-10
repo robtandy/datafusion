@@ -5969,6 +5969,151 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    -> Result<()> {
+        // A table `k INT, v INT` of two Parquet files: 100 rows `k = 1` of
+        // integers, and rows `k = 0` of strings that fail to cast to `INT`
+        // when they are read. DataFusion pushes the dynamic filter of the join
+        // (`k = 1`, from its build side) into the scan, which prunes the
+        // second file: it never reads it. A native join does not prune the same
+        // reads, so that it would fail to cast.
+        let dir = tempfile::tempdir()?;
+        let good = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![1; 100])) as arrow::array::ArrayRef,
+            ),
+            ("v", Arc::new(Int32Array::from_iter_values(0..100)) as _),
+        ])?;
+        let bad = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![0; 10])) as arrow::array::ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
+                    as _,
+            ),
+        ])?;
+        let path = dir.path().join("p");
+        write_parquet(&path.join("0.parquet"), good.schema(), &[good], None)?;
+        write_parquet(&path.join("1.parquet"), bad.schema(), &[bad], None)?;
+        let path = path.to_str().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+        ]);
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet(
+                "p",
+                path,
+                ParquetReadOptions::default().schema(&schema),
+            )
+            .await?;
+            ctx.sql("CREATE TABLE b AS SELECT 1 AS x")
+                .await?
+                .collect()
+                .await?;
+            Ok(())
+        };
+        let config = test_session_config().with_target_partitions(1);
+        let sql = "SELECT b.x, COUNT(p.v) AS n FROM b JOIN p ON b.x = p.k GROUP BY b.x";
+        let plan = datafusion_context(config.clone());
+        setup(&plan).await?;
+        let plan = plan.sql(sql).await?.create_physical_plan().await?;
+        let mut produced = 0;
+        plan.apply(|node| {
+            if node.is::<HashJoinExec>() {
+                produced += node.dynamic_expressions_produced().len();
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(produced, 1, "{}", displayable(plan.as_ref()).indent(false));
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    -> Result<()> {
+        // A table `k INT, v INT, s VARCHAR` (its schema given when it is
+        // registered) of two Parquet files: 100 rows `k = 0, v = 100`, and 10
+        // rows `k = 1` of strings `v` that fail to cast to `INT` when they are
+        // read. The TopK of `ORDER BY k LIMIT 1` reads the first file,
+        // whose rows tighten its threshold to `k <= 0`, and DataFusion's scan
+        // prunes the second file with its dynamic filter: it never reads it. A
+        // native TopK does not prune the same reads, so that it would fail to
+        // cast.
+        let dir = tempfile::tempdir()?;
+        let first = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![0; 100])) as arrow::array::ArrayRef,
+            ),
+            ("v", Arc::new(Int32Array::from(vec![100; 100])) as _),
+            (
+                "s",
+                Arc::new(arrow::array::StringViewArray::from(vec!["foo"; 100])) as _,
+            ),
+        ])?;
+        let second = RecordBatch::try_from_iter([
+            (
+                "k",
+                Arc::new(Int32Array::from(vec![1; 10])) as arrow::array::ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10]))
+                    as _,
+            ),
+            (
+                "s",
+                Arc::new(arrow::array::StringViewArray::from(vec!["foo"; 10])) as _,
+            ),
+        ])?;
+        let path = dir.path().join("p");
+        write_parquet(&path.join("0.parquet"), first.schema(), &[first], None)?;
+        write_parquet(&path.join("1.parquet"), second.schema(), &[second], None)?;
+        let path = path.to_str().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("s", DataType::Utf8View, true),
+        ]);
+        let setup = async |ctx: &SessionContext| {
+            register_view_tables(ctx)?;
+            ctx.register_parquet(
+                "p",
+                path,
+                ParquetReadOptions::default().schema(&schema),
+            )
+            .await?;
+            Ok(())
+        };
+        // The scan casts the strings of the second file into the integers of
+        // the table: its expressions cannot fail, but its reads can. So they
+        // can below the filter `s LIKE '%foo%'` (on batches of 64 rows, the
+        // first of which tightens the threshold of DataFusion's TopK).
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        for sql in [
+            "SELECT k, v FROM p ORDER BY k LIMIT 1",
+            "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_eq!(count::<PhysicalTopK>(&root), 0, "{sql}");
+        }
+        // Over a scan of memory, which cannot fail, the TopK is native.
+        let sql = "SELECT id, a FROM t1 ORDER BY a, id LIMIT 3";
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(count::<PhysicalTopK>(&root), 1);
+        Ok(())
+    }
+
     /// A table `p` of two Parquet files `(k INT, s VARCHAR)` in `dir`, with the
     /// rows `first` and `second`: the files are well-formed, their columns have
     /// the types of the table.
@@ -6000,7 +6145,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    async fn joins_whose_dynamic_filter_prunes_casts_that_may_fail_stay_in_datafusion()
     -> Result<()> {
         // A table `k INT, s VARCHAR` of two Parquet files: 100 rows `k = 1` of
         // integers, and 10 rows `k = 0` of strings that fail to cast to `INT`.
@@ -6044,7 +6189,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    async fn topks_whose_dynamic_filter_prunes_casts_that_may_fail_stay_in_datafusion()
     -> Result<()> {
         // A table `k INT, s VARCHAR` of two Parquet files: 100 rows `k = 0, s =
         // '100'`, and 10 rows `k = 1` of strings that fail to cast to `INT`. The
