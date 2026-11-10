@@ -83,7 +83,7 @@ use arrow::array::{
     downcast_primitive,
 };
 use arrow::buffer::NullBuffer;
-use arrow::compute::{interleave, take};
+use arrow::compute::{filter_record_batch, interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
@@ -255,6 +255,11 @@ struct RadixLocalState {
     /// partitions.
     hashes: Vec<u64>,
     partitions: Vec<u8>,
+    /// For a top-k aggregation, the best cutoff of the groups that the thread
+    /// flushed so far (see [`TopK::cutoff`]): the input rows whose value is
+    /// worse are not aggregated, like those that DataFusion's top-k
+    /// aggregation rules out by the worst of its top groups.
+    cutoff: Option<ArrayRef>,
 }
 
 impl LocalSinkState for RadixLocalState {}
@@ -291,6 +296,12 @@ impl RadixLocalState {
     /// sketch of the flushed groups, and once it shows that the groups of
     /// the thread came back after all (by the same rule), the thread
     /// aggregates its rows again, in a table that holds its groups.
+    ///
+    /// The rows of a top-k aggregation that its cutoff rules out (see
+    /// [`TopK::candidates`]) are not aggregated, and its table is also flushed
+    /// once it aggregated as many rows as it can hold groups, even if it is
+    /// not full: the flush of a table keeps its top groups, whose values are
+    /// at least as good as those of the other groups of the table so far.
     fn aggregate(
         &mut self,
         spec: &AggregateSpec,
@@ -309,10 +320,37 @@ impl RadixLocalState {
             }
             return Ok(());
         }
+        let candidates;
+        let batch = match (&spec.top_k, &self.cutoff) {
+            (Some(top_k), Some(cutoff)) => {
+                let values = top_k_input_values(spec, top_k, batch)?;
+                match top_k.candidates(&values, cutoff)? {
+                    Some(selected) => {
+                        candidates = filter_record_batch(batch, &selected)?;
+                        &candidates
+                    }
+                    None => batch,
+                }
+            }
+            _ => batch,
+        };
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         self.table.update(spec, batch)?;
         self.table_rows += batch.num_rows();
         let num_groups = self.table.num_groups();
         if num_groups < self.capacity {
+            // A table of a top-k aggregation that aggregated as many rows as
+            // it can hold groups is flushed even if it is not full (if its
+            // flush keeps a cutoff), so that the flushes of a thread whose
+            // groups fit into its table set its cutoff too.
+            if let Some(top_k) = &spec.top_k
+                && self.table_rows >= self.capacity
+                && num_groups >= top_k.limit
+            {
+                self.flush(spec, global)?;
+            }
             return Ok(());
         }
         if let Some(capacity) = self.grown_capacity() {
@@ -349,10 +387,21 @@ impl RadixLocalState {
         let Some(mut states) = self.table.emit_states()? else {
             return Ok(());
         };
-        if let Some(top_k) = &spec.top_k
-            && let Some(indices) = top_k.select(top_k_values(top_k, &states)?)?
-        {
-            states = states.take(&indices)?;
+        if let Some(top_k) = &spec.top_k {
+            if let Some(indices) = top_k.select(top_k_values(top_k, &states)?)? {
+                states = states.take(&indices)?;
+            }
+            if let Some(cutoff) = top_k.cutoff(top_k_values(top_k, &states)?)? {
+                let better = match &self.cutoff {
+                    Some(current) => {
+                        top_k.is_better(cutoff.as_ref(), current.as_ref())?
+                    }
+                    None => true,
+                };
+                if better {
+                    self.cutoff = Some(cutoff);
+                }
+            }
         }
         hash_keys(&states.keys, &mut self.hashes, &mut self.partitions)?;
         self.flushed += states.num_groups();
@@ -372,6 +421,26 @@ fn top_k_values<'a>(top_k: &TopK, states: &'a GroupedStates) -> Result<&'a dyn A
     match values {
         Some(values) => Ok(values.as_ref()),
         None => internal_err!("{OPERATOR} found no value to order the groups by"),
+    }
+}
+
+/// The values that order the groups of the input rows of `batch`, of a top-k
+/// aggregation: their group keys, or the arguments of its aggregate.
+fn top_k_input_values(
+    spec: &AggregateSpec,
+    top_k: &TopK,
+    batch: &RecordBatch,
+) -> Result<ArrayRef> {
+    let expr = match top_k.order {
+        TopKOrder::GroupKey => spec.group_by.expr().first().map(|(expr, _)| expr),
+        TopKOrder::Aggregate => spec
+            .update
+            .first()
+            .and_then(|update| update.arguments.first()),
+    };
+    match expr {
+        Some(expr) => expr.evaluate(batch)?.into_array(batch.num_rows()),
+        None => internal_err!("{OPERATOR} found no value to order the input rows by"),
     }
 }
 
@@ -591,6 +660,7 @@ impl RadixHashAggregate {
                 .min(BYPASS_BYTES),
             hashes: vec![],
             partitions: vec![],
+            cutoff: None,
         }))
     }
 
@@ -2514,6 +2584,174 @@ mod tests {
         }
         keys.sort_unstable();
         assert_eq!(keys, [297, 298, 299]);
+        Ok(())
+    }
+
+    /// The sink of the top-k aggregation `aggregate` (of a single stage),
+    /// with tables of [`SMALL_TABLES`].
+    fn top_k_sink(aggregate: AggregateExec) -> Result<Sink> {
+        let input = Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(
+            aggregate.input(),
+        )));
+        let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
+        assert!(spec.top_k.is_some() && !spec.bypass);
+        let local = RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES)?;
+        Ok((spec, local, RadixHashAggregate::global_sink_state()?))
+    }
+
+    /// Combine the local sink state of `sink`, finalize the aggregation and
+    /// return its output, from a single source thread.
+    fn top_k_output(sink: Sink) -> Result<RecordBatch> {
+        let (spec, mut local, global) = sink;
+        RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut())?;
+        let mut batches = vec![];
+        if RadixHashAggregate::finalize(global.as_ref())? == SinkFinalize::Ready {
+            let source = RadixHashAggregate::global_source_state(&spec, global)?;
+            let mut local = RadixHashAggregate::local_source_state()?;
+            while let SourceResult::Chunk(chunk) =
+                RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
+            {
+                batches.push(chunk.compact()?);
+            }
+        }
+        let schema = batches.first().map(RecordBatch::schema);
+        let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+        Ok(arrow::compute::concat_batches(&schema, &batches)?)
+    }
+
+    /// The cutoff of the thread of `sink`, an `Int64`.
+    fn cutoff(sink: &Sink) -> Option<i64> {
+        let cutoff = local_state(sink).cutoff.as_ref()?;
+        Some(cutoff.as_primitive::<Int64Type>().value(0))
+    }
+
+    #[test]
+    fn cutoffs_of_top_k_aggregations_rule_out_rows_before_they_are_aggregated()
+    -> Result<()> {
+        let sink_batch = |sink: &mut Sink, batch: RecordBatch| -> Result<()> {
+            let (spec, local, global) = sink;
+            RadixHashAggregate::sink(spec, batch, global.as_ref(), local.as_mut())
+        };
+        // `SELECT k FROM t GROUP BY k ORDER BY k DESC LIMIT 3`, of nullable keys.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let aggregate_by_key = |schema: &SchemaRef| -> Result<AggregateExec> {
+            Ok(AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(col("k", schema)?, "k".into())]),
+                vec![],
+                vec![],
+                MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(schema), None)?,
+                Arc::clone(schema),
+            )?
+            .try_optimize_topk(3, "k", SortOptions::new(true, false))
+            .expect("a top-k aggregation")
+            .data)
+        };
+        let mut sink = top_k_sink(aggregate_by_key(&schema)?)?;
+        let key_rows = |keys: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(keys))],
+            )
+        };
+        assert_eq!(cutoff(&sink), None);
+        // 16 groups fill the table, whose flush keeps 15, 14 and 13: at least
+        // 3 groups are 13 or more from then on.
+        sink_batch(&mut sink, key_rows((0..16).map(Some).collect())?)?;
+        assert_eq!(cutoff(&sink), Some(13));
+        assert_eq!(local_state(&sink).table.num_groups(), 0);
+        // Only the rows of keys that are not worse are aggregated: 13 (not
+        // worse), 20, and the `NULL` key (whose group is always kept).
+        let batch = key_rows(vec![Some(5), Some(13), Some(20), None, Some(1), Some(-4)])?;
+        sink_batch(&mut sink, batch)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 3);
+        assert_eq!(local_state(&sink).table_rows, 3);
+        sink_batch(&mut sink, key_rows((0..13).map(Some).collect())?)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 3);
+        let output = top_k_output(sink)?;
+        let mut keys = output
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .iter()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, [None, Some(14), Some(15), Some(20)]);
+
+        // A table that aggregated as many rows as it can hold groups (16) is
+        // flushed even if it is not full, once it holds 3 groups at least.
+        let mut sink = top_k_sink(aggregate_by_key(&schema)?)?;
+        sink_batch(&mut sink, key_rows((0..15).map(|i| Some(i % 2)).collect())?)?;
+        sink_batch(&mut sink, key_rows(vec![Some(0), Some(1)])?)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 2);
+        assert_eq!(cutoff(&sink), None);
+        // Its flush keeps 7, 1 and 0.
+        sink_batch(&mut sink, key_rows(vec![Some(7); 9])?)?;
+        assert_eq!(cutoff(&sink), Some(0));
+        assert_eq!(local_state(&sink).table.num_groups(), 0);
+        sink_batch(&mut sink, key_rows(vec![Some(4); 8])?)?;
+        sink_batch(&mut sink, key_rows(vec![Some(-1), Some(3), Some(9)])?)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 3);
+        assert_eq!(local_state(&sink).table_rows, 10);
+        let output = top_k_output(sink)?;
+        let mut keys = output
+            .column(0)
+            .as_primitive::<Int64Type>()
+            .values()
+            .to_vec();
+        keys.sort_unstable();
+        assert_eq!(keys, [4, 7, 9]);
+
+        // `SELECT k, MAX(v) FROM t GROUP BY k ORDER BY MAX(v) DESC LIMIT 2`:
+        // the groups of the rows that are ruled out may still get better.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let max = AggregateExprBuilder::new(
+            datafusion::functions_aggregate::min_max::max_udaf(),
+            vec![col("v", &schema)?],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("max(v)")
+        .build()?;
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![Arc::new(max)],
+            vec![None],
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+            Arc::clone(&schema),
+        )?
+        .try_optimize_topk(2, "max(v)", SortOptions::new(true, false))
+        .expect("a top-k aggregation")
+        .data;
+        let mut sink = top_k_sink(aggregate)?;
+        let rows = |rows: &[(i64, i64)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                ],
+            )
+        };
+        // Groups 0 to 15 of maximum 0 to 15: at least 2 groups are 14 or more.
+        let first = (0..16).map(|k| (k, k)).collect::<Vec<_>>();
+        sink_batch(&mut sink, rows(&first)?)?;
+        assert_eq!(cutoff(&sink), Some(14));
+        // Group 3 gets better, the rows of groups 5 and 20 are ruled out, and
+        // that of group 14 is not worse.
+        sink_batch(&mut sink, rows(&[(5, 2), (3, 100), (20, 13), (14, 14)])?)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 2);
+        // Group 5, whose rows were ruled out (or flushed away), gets better.
+        sink_batch(&mut sink, rows(&[(5, 200), (7, 1), (9, 13)])?)?;
+        assert_eq!(local_state(&sink).table.num_groups(), 3);
+        let output = top_k_output(sink)?;
+        let groups = output.column(0).as_primitive::<Int64Type>().values();
+        let maxima = output.column(1).as_primitive::<Int64Type>().values();
+        let mut groups = groups.iter().zip(maxima.iter()).collect::<Vec<_>>();
+        groups.sort_unstable_by_key(|(_, max)| std::cmp::Reverse(**max));
+        assert_eq!(groups[..2], [(&5, &200), (&3, &100)]);
         Ok(())
     }
 }
