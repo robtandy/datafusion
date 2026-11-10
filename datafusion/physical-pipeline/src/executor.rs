@@ -8,14 +8,17 @@
 //!   tight push loop that pulls chunks from the source and pushes them
 //!   through the operators into the sink (DuckDB's `PipelineExecutor`).
 //! * [`Executor`] schedules the pipelines of a query: every pipeline runs on
-//!   up to `num_threads` worker tasks once all of its dependencies are
-//!   complete, and the sink of a [`MetaPipeline`] is finalized once all of
-//!   its pipelines completed.
+//!   up to `num_threads` threads once all of its dependencies are complete,
+//!   and the sink of a [`MetaPipeline`] is finalized once all of its
+//!   pipelines completed. The execution runs on the task that polls its
+//!   [`PipelineStream`]; a pipeline that runs alone runs its first thread on
+//!   that task too, and only its other threads on worker tasks.
 //! * [`CollectorSink`] is the sink of the root pipeline: it hands the result
 //!   chunks, as [`RecordBatch`]es, to a [`PipelineStream`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
@@ -24,7 +27,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::instant::Instant;
 use datafusion_common::{DataFusionError, Result, internal_err};
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::JoinSet;
 use datafusion_execution::{RecordBatchStream, TaskContext};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -150,6 +153,11 @@ pub struct PipelineExecutor {
     /// The `finish_epoch` of the registry when this thread last checked
     /// whether an operator or the sink of the pipeline finished.
     finish_epoch: usize,
+    /// Yield as soon as the source produced a second chunk (see
+    /// [`Self::yield_on_more_input`]); cleared once it did.
+    yield_on_more_input: bool,
+    /// The number of non-empty chunks the source produced on this thread.
+    source_chunks: usize,
     done: bool,
 }
 
@@ -184,6 +192,8 @@ impl PipelineExecutor {
                 budget: 0,
                 thread: ctx.registry().next_thread_id(),
                 finish_epoch: 0,
+                yield_on_more_input: false,
+                source_chunks: 0,
                 done: false,
                 shared,
                 ctx,
@@ -214,10 +224,20 @@ impl PipelineExecutor {
             budget: 0,
             thread: ctx.registry().next_thread_id(),
             finish_epoch: 0,
+            yield_on_more_input: false,
+            source_chunks: 0,
             done: false,
             shared,
             ctx,
         })
+    }
+
+    /// Yield (end the current poll with [`Progress::Yield`]) as soon as the
+    /// source produces a second chunk, before pushing it: the source has more
+    /// work than this thread did so far, so that the executor can start the
+    /// other threads of the pipeline. Once.
+    fn yield_on_more_input(&mut self) {
+        self.yield_on_more_input = true;
     }
 
     /// Run the pipeline until it is complete or blocked.
@@ -395,6 +415,14 @@ impl PipelineExecutor {
                 self.shared.source_metrics.record_output(chunk.len());
                 self.chunks[0] = chunk;
                 self.push_stage = 0;
+                self.source_chunks += 1;
+                if self.yield_on_more_input && self.source_chunks > 1 {
+                    // End the poll before the first operator call: the push
+                    // resumes from the `in_process_operators` stack (or the
+                    // pending sink chunk).
+                    self.yield_on_more_input = false;
+                    self.budget = 0;
+                }
                 let outcome = self.push(0)?;
                 self.handle_push_outcome(outcome)
             }
@@ -648,12 +676,20 @@ impl ExecutionMetrics {
 ///
 /// Every pipeline becomes runnable once the pipelines it depends on are
 /// complete and the child meta pipelines it depends on are finalized. A
-/// runnable pipeline is executed by up to `num_threads` [`PipelineExecutor`]
-/// tasks; independent pipelines run concurrently, except pipelines that share
-/// a sink, operator or source that does not support parallel execution,
-/// which run one after the other. Once all pipelines of a meta pipeline
-/// completed (and every thread combined its local sink state), the sink of
-/// the meta pipeline is finalized.
+/// runnable pipeline is executed by up to `num_threads` [`PipelineExecutor`]s
+/// (its threads), each on a worker task; independent pipelines run
+/// concurrently, except pipelines that share a sink, operator or source that
+/// does not support parallel execution, which run one after the other. Once
+/// all pipelines of a meta pipeline completed (and every thread combined its
+/// local sink state), the sink of the meta pipeline is finalized.
+///
+/// The tasks are sized to the work: a pipeline that runs while no other
+/// pipeline does runs its first thread on the task of the execution (the task
+/// that polls the [`PipelineStream`]), so that a pipeline on a single thread
+/// spawns no task, and a source that does not bound its threads (e.g. the
+/// result of an aggregation, which may be a single row) only gets more
+/// threads once the first one found more than a chunk of work, see
+/// [`Executor::execute`].
 #[derive(Debug)]
 pub struct Executor {
     graph: Arc<PipelineGraph>,
@@ -728,6 +764,14 @@ impl Executor {
     }
 
     /// Run all pipelines to completion.
+    ///
+    /// A pipeline that runs while no other pipeline does runs its first
+    /// thread on the task that awaits this future, and its other threads on
+    /// worker tasks: right away if its source bounds its threads
+    /// ([`GlobalSourceState::max_threads`]), otherwise once the first thread
+    /// got a second chunk from the source, used up the call budget of a poll
+    /// or is blocked. Other pipelines run all of their threads on worker
+    /// tasks, concurrently.
     pub async fn execute(&self) -> Result<()> {
         let registry = Arc::new(ExecutionRegistry::new(
             self.metrics.by_key(),
@@ -744,15 +788,26 @@ impl Executor {
             ..
         } = Events::try_new(graph)?;
         let num_events = dependencies.len();
+        let num_pipelines = graph.pipelines().len();
+        let is_pipeline = |event: usize| event < num_pipelines;
 
         let mut running = FuturesUnordered::new();
-        for (event, &count) in dependencies.iter().enumerate() {
-            if count == 0 {
-                running.push(self.run_event(event, &registry));
-            }
-        }
+        // The pipelines among the events in `running`.
+        let mut running_pipelines = 0;
+        let mut ready = (0..num_events)
+            .filter(|&event| dependencies[event] == 0)
+            .collect::<Vec<_>>();
         let mut completed = 0;
         while completed < num_events {
+            // A pipeline that runs while no other pipeline does (the events
+            // that become ready later wait for it) runs its first thread on
+            // this task, see `run_pipeline`.
+            let ready_pipelines = ready.iter().filter(|&&event| is_pipeline(event));
+            let alone = running_pipelines == 0 && ready_pipelines.count() == 1;
+            for event in ready.drain(..) {
+                running_pipelines += usize::from(is_pipeline(event));
+                running.push(self.run_event(event, &registry, alone));
+            }
             let Some(result) = running.next().await else {
                 return internal_err!(
                     "Pipeline dependency cycle: {completed} of {num_events} events completed"
@@ -760,10 +815,11 @@ impl Executor {
             };
             let event = result?;
             completed += 1;
+            running_pipelines -= usize::from(is_pipeline(event));
             for &dependent in &dependents[event] {
                 dependencies[dependent] -= 1;
                 if dependencies[dependent] == 0 {
-                    running.push(self.run_event(dependent, &registry));
+                    ready.push(dependent);
                 }
             }
         }
@@ -772,15 +828,17 @@ impl Executor {
 
     /// Run event `event`: pipeline `event` for `event < #pipelines`,
     /// otherwise the finalization of meta pipeline `event - #pipelines`.
+    /// `alone`: no other pipeline runs while pipeline `event` does.
     fn run_event<'a>(
         &'a self,
         event: usize,
         registry: &'a Arc<ExecutionRegistry>,
+        alone: bool,
     ) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             let num_pipelines = self.graph.pipelines().len();
             if event < num_pipelines {
-                self.run_pipeline(self.graph.pipeline(event), registry)
+                self.run_pipeline(self.graph.pipeline(event), registry, alone)
                     .await?;
             } else {
                 let meta = self.graph.meta_pipeline(event - num_pipelines);
@@ -804,10 +862,22 @@ impl Executor {
         )
     }
 
+    /// Run `pipeline` on its threads (see [`Self::pipeline_threads`]).
+    ///
+    /// If no other pipeline runs at the same time (`alone`), the first thread
+    /// runs on the task of the execution itself, instead of a worker task of
+    /// its own, which spares a pipeline on a single thread (e.g. the pipeline
+    /// that reads a sort, or a small table) all task overhead. The other
+    /// threads run on worker tasks. If the source does not bound its threads
+    /// (`GlobalSourceState::max_threads` is `usize::MAX`, e.g. the result of an
+    /// aggregation, which may be a single row), they only start once the
+    /// first thread found more work than one chunk (or is blocked), so that a
+    /// source with little output does not spawn tasks that immediately exit.
     async fn run_pipeline(
         &self,
         pipeline: &Pipeline,
         registry: &Arc<ExecutionRegistry>,
+        alone: bool,
     ) -> Result<()> {
         let ctx = self.context(0, self.num_threads, registry);
         // The pipeline is a no-op (its sink still combines an empty state) if
@@ -857,21 +927,38 @@ impl Executor {
         });
 
         let mut workers = JoinSet::new();
-        for thread_id in 0..num_threads {
-            let shared = Arc::clone(&shared);
-            let ctx = self.context(thread_id, num_threads, registry);
-            workers.spawn(async move {
-                PipelineExecutor::try_new(shared, ctx)?.execute().await
-            });
+        let spawn = |workers: &mut JoinSet<Result<()>>, threads: Range<usize>| {
+            for thread_id in threads {
+                let shared = Arc::clone(&shared);
+                let ctx = self.context(thread_id, num_threads, registry);
+                workers.spawn(async move {
+                    PipelineExecutor::try_new(shared, ctx)?.execute().await
+                });
+            }
+        };
+        if !alone {
+            spawn(&mut workers, 0..num_threads);
+            return join_workers(workers).await;
         }
-        // Dropping `workers` on error aborts the remaining threads.
-        while let Some(result) = workers.join_next().await {
-            match result {
-                Ok(result) => result?,
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(e) => return Err(DataFusionError::ExecutionJoin(Box::new(e))),
+
+        let mut first = PipelineExecutor::try_new(
+            Arc::clone(&shared),
+            self.context(0, num_threads, registry),
+        )?;
+        if num_threads > 1 && shared.source_state.max_threads() == usize::MAX {
+            // Run the first thread until the source produced a second chunk,
+            // the thread is blocked, or it used up the budget of a poll.
+            first.yield_on_more_input();
+            match futures::future::poll_fn(|cx| Poll::Ready(first.poll_run(cx))).await {
+                Poll::Ready(Ok(Progress::Done)) => return Ok(()),
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(Progress::Yield)) | Poll::Pending => {}
             }
         }
+        spawn(&mut workers, 1..num_threads);
+        // Dropping `workers` (on error, or when the execution is dropped)
+        // aborts the other threads.
+        futures::future::try_join(first.execute(), join_workers(workers)).await?;
         Ok(())
     }
 
@@ -907,6 +994,20 @@ impl Executor {
         registry.set_finalize_result(sink.as_ref(), result?);
         Ok(())
     }
+}
+
+/// Wait for the threads `workers` of a pipeline: the first error of any of
+/// them, or the panic of any of them, which is resumed. Dropping the future
+/// aborts the threads.
+async fn join_workers(mut workers: JoinSet<Result<()>>) -> Result<()> {
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(result) => result?,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => return Err(DataFusionError::ExecutionJoin(Box::new(e))),
+        }
+    }
+    Ok(())
 }
 
 /// The pipelines of `graph` in terms of operator keys.
@@ -1220,7 +1321,10 @@ impl PhysicalOperator for CollectorSink {
 enum StreamState {
     /// The execution has not started yet.
     Pending(Executor),
-    Running(SpawnedTask<Result<()>>),
+    /// The execution, which the stream drives: it runs on the task that polls
+    /// the stream, and the threads of the pipelines on worker tasks (see
+    /// [`Executor::execute`]).
+    Running(BoxFuture<'static, Result<()>>),
     Done,
 }
 
@@ -1255,33 +1359,33 @@ impl Stream for PipelineStream {
         loop {
             match std::mem::replace(&mut this.state, StreamState::Done) {
                 StreamState::Pending(executor) => {
-                    this.state = StreamState::Running(SpawnedTask::spawn(async move {
+                    // The execution runs on the task that polls the stream, as
+                    // DataFusion's streams do: a query whose pipelines run on a
+                    // single thread spawns no task at all.
+                    this.state = StreamState::Running(Box::pin(async move {
                         executor.execute().await
                     }));
                 }
-                StreamState::Running(mut task) => {
+                StreamState::Running(mut execution) => {
                     if let Some(batch) = this.queue.pop(cx.waker()) {
-                        this.state = StreamState::Running(task);
+                        this.state = StreamState::Running(execution);
                         return Poll::Ready(Some(Ok(batch)));
                     }
-                    match Pin::new(&mut task).poll(cx) {
+                    match execution.as_mut().poll(cx) {
                         Poll::Pending => {
-                            this.state = StreamState::Running(task);
-                            return Poll::Pending;
+                            this.state = StreamState::Running(execution);
+                            // The execution may have produced batches before
+                            // it had to wait (e.g. for room in the queue).
+                            return match this.queue.pop(cx.waker()) {
+                                Some(batch) => Poll::Ready(Some(Ok(batch))),
+                                None => Poll::Pending,
+                            };
                         }
                         // All producers are done: drain the remaining batches.
-                        Poll::Ready(Ok(Ok(()))) => {}
-                        Poll::Ready(Ok(Err(e))) => {
+                        Poll::Ready(Ok(())) => {}
+                        Poll::Ready(Err(e)) => {
                             this.queue.close();
                             return Poll::Ready(Some(Err(e)));
-                        }
-                        Poll::Ready(Err(e)) if e.is_panic() => {
-                            std::panic::resume_unwind(e.into_panic())
-                        }
-                        Poll::Ready(Err(e)) => {
-                            return Poll::Ready(Some(Err(
-                                DataFusionError::ExecutionJoin(Box::new(e)),
-                            )));
                         }
                     }
                 }
@@ -1301,8 +1405,8 @@ impl RecordBatchStream for PipelineStream {
 
 impl Drop for PipelineStream {
     fn drop(&mut self) {
-        // Producers that are still running (the task is aborted when it is
-        // dropped) must not block on a queue nobody reads.
+        // Producers that are still running (dropping the execution aborts
+        // its worker tasks) must not block on a queue nobody reads.
         self.queue.close();
     }
 }
@@ -1316,6 +1420,7 @@ mod tests {
     use arrow::array::{AsArray, BooleanArray, Int64Array};
     use arrow::datatypes::{DataType, Field, Int64Type, Schema};
     use datafusion_common::exec_err;
+    use datafusion_common_runtime::SpawnedTask;
 
     use crate::chunk::SelectionVector;
     use crate::operator::{GlobalSinkState, SinkFinalize, downcast_state};
@@ -1376,13 +1481,17 @@ mod tests {
     }
 
     /// A parallel source that hands out `batches`, optionally interrupting
-    /// itself with all kinds of [`TaskInterrupt`]s.
+    /// itself with all kinds of [`TaskInterrupt`]s. It records its calls, its
+    /// threads (local states) and the tasks that call it.
     #[derive(Debug)]
     struct VecSource {
         batches: Vec<RecordBatch>,
         interrupts: bool,
         max_threads: usize,
         calls: AtomicUsize,
+        local_states: AtomicUsize,
+        /// The tasks that called `get_data` (`None` outside of a task).
+        tasks: Mutex<HashSet<Option<tokio::task::Id>>>,
     }
 
     impl VecSource {
@@ -1392,7 +1501,16 @@ mod tests {
                 interrupts: false,
                 max_threads: usize::MAX,
                 calls: AtomicUsize::new(0),
+                local_states: AtomicUsize::new(0),
+                tasks: Mutex::default(),
             }
+        }
+
+        /// The number of tasks that called `get_data`, and whether one of
+        /// them is the current task.
+        fn tasks(&self) -> (usize, bool) {
+            let tasks = self.tasks.lock();
+            (tasks.len(), tasks.contains(&tokio::task::try_id()))
         }
 
         fn with_interrupts(mut self) -> Self {
@@ -1460,6 +1578,7 @@ mod tests {
             _ctx: &ExecutionContext,
             _gstate: &dyn GlobalSourceState,
         ) -> Result<Box<dyn LocalSourceState>> {
+            self.local_states.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(VecSourceLocal::default()))
         }
 
@@ -1470,6 +1589,7 @@ mod tests {
             lstate: &mut dyn LocalSourceState,
         ) -> Result<SourceResult> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.tasks.lock().insert(tokio::task::try_id());
             let gstate = downcast_state::<VecSourceGlobal>(gstate.as_any(), self.name())?;
             let lstate = lstate.downcast_mut::<VecSourceLocal>().unwrap();
             if self.interrupts {
@@ -2766,6 +2886,149 @@ mod tests {
             err.to_string().contains("FailAt failed as requested"),
             "{err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelines_get_the_threads_their_work_needs() -> Result<()> {
+        // A source that does not bound its threads, with a single chunk, on 4
+        // threads: the first thread runs on the task that polls the stream
+        // (here the test, which is not a task) and finds no more work, so no
+        // other thread starts, and no task is spawned.
+        let source = Arc::new(VecSource::new(batches(0, 1, 10)));
+        let output = run(Arc::clone(&source) as _, 4).await?;
+        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
+        assert_eq!(source.local_states.load(Ordering::Relaxed), 1);
+        // The chunk, then the end of the source.
+        assert_eq!(source.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(source.tasks(), (1, true));
+        // Also when a task polls the stream, and for every pipeline that runs
+        // alone: here the pipelines into and out of a pipeline breaker.
+        let source = Arc::new(VecSource::new(batches(0, 1, 10)));
+        let materialize = Arc::new(Materialize::new(Arc::clone(&source) as _));
+        let task = {
+            let (source, materialize) = (Arc::clone(&source), Arc::clone(&materialize));
+            SpawnedTask::spawn(async move {
+                let output = run(materialize, 4).await?;
+                Ok::<_, DataFusionError>((output, source.tasks()))
+            })
+        };
+        let (output, tasks) = task.join().await.unwrap()?;
+        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
+        assert_eq!(tasks, (1, true));
+        assert_eq!(materialize.combines.load(Ordering::Relaxed), 1);
+        assert_eq!(materialize.get_data_calls.load(Ordering::Relaxed), 2);
+
+        // With more chunks, the other threads start (on worker tasks) once the
+        // first thread got a second chunk.
+        let source = Arc::new(VecSource::new(batches(0, 40, 10)));
+        let output = run(Arc::clone(&source) as _, 4).await?;
+        assert_eq!(sorted_values(&output), (0..400).collect::<Vec<_>>());
+        assert_eq!(source.local_states.load(Ordering::Relaxed), 4);
+        assert_eq!(source.tasks(), (4, true));
+        // A source that bounds its threads gets them right away.
+        let source = Arc::new(VecSource::new(batches(0, 1, 10)).with_max_threads(2));
+        let output = run(Arc::clone(&source) as _, 4).await?;
+        assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
+        assert_eq!(source.local_states.load(Ordering::Relaxed), 2);
+        assert_eq!(source.tasks(), (2, true));
+
+        // Pipelines that run at the same time (the inputs of a union) run all
+        // their threads on worker tasks; one after the other (an ordered
+        // union), each of them runs alone.
+        for order_matters in [false, true] {
+            let inputs =
+                [0, 100].map(|start| Arc::new(VecSource::new(batches(start, 1, 10))));
+            let root: Arc<dyn PhysicalOperator> = Arc::new(Union {
+                children: inputs.iter().map(|input| Arc::clone(input) as _).collect(),
+                order_matters,
+            });
+            let output = run(root, 4).await?;
+            assert_eq!(values(&output).len(), 20);
+            for input in &inputs {
+                let (threads, tasks) = match order_matters {
+                    false => (4, (4, false)),
+                    true => (1, (1, true)),
+                };
+                assert_eq!(input.local_states.load(Ordering::Relaxed), threads);
+                assert_eq!(input.tasks(), tasks, "order matters: {order_matters}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Panics when the threads `threads` create their operator state.
+    #[derive(Debug)]
+    struct PanicOnThreads {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        threads: Range<usize>,
+    }
+
+    impl PhysicalOperator for PanicOnThreads {
+        fn name(&self) -> &str {
+            "PanicOnThreads"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_operator_state(
+            &self,
+            ctx: &ExecutionContext,
+            _gstate: &dyn GlobalOperatorState,
+        ) -> Result<Box<dyn OperatorState>> {
+            assert!(
+                !self.threads.contains(&ctx.thread_id),
+                "PanicOnThreads panicked as requested"
+            );
+            Ok(Box::new(EmptyState))
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn panics_are_propagated() {
+        // A panic of the first thread (on the task that polls the stream), of
+        // the other threads (on worker tasks), and of pipelines that do not
+        // run alone.
+        for (threads, order_matters) in [(0..1, None), (1..4, None), (0..4, Some(false))]
+        {
+            let input = || source(batches(0, 40, 10));
+            let input = match order_matters {
+                Some(order_matters) => Arc::new(Union {
+                    children: vec![input(), input()],
+                    order_matters,
+                }),
+                None => input(),
+            };
+            let root: Arc<dyn PhysicalOperator> = Arc::new(PanicOnThreads {
+                children: vec![input],
+                threads: threads.clone(),
+            });
+            let error = SpawnedTask::spawn(run(root, 4)).join().await.unwrap_err();
+            assert!(error.is_panic(), "threads {threads:?}: {error}");
+            let panic = error.into_panic();
+            let message = panic
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+            assert_eq!(message, Some("PanicOnThreads panicked as requested"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
