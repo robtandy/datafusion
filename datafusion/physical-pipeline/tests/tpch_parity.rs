@@ -24,22 +24,12 @@
 //! 2. the TPC-H results are not trivial: every TPC-H query returns rows and
 //!    every column of its result has non-null values, so that the parity
 //!    holds on real data;
-//! 3. the pipeline engine runs the TPC-H queries with native operators only,
-//!    without falling back to a `BridgeOperator` (on both sources), except
-//!    for the nodes listed in [`EXPECTED_FALLBACKS`].
-//!
-//! The third assertion (`tpch_queries_run_without_bridge_operator`) is
-//! deferred while `PipelineQueryPlanner` does not lower plans to native
-//! operators: until the full plan lowering lands, the planner runs every plan
-//! in a single `BridgeOperator`, which the test detects (no operator of any
-//! TPC-H plan is native) and reports on stderr. As soon as any operator of any
-//! TPC-H plan is native, the test enforces that all 22 queries run natively
-//! over both sources, except for the fallbacks of [`EXPECTED_FALLBACKS`] (the
-//! nodes that the native operators leave to DataFusion to keep its results
-//! and errors exact), and lists every other fallback of every query
-//! otherwise. The queries that run fewer nodes in `BridgeOperator`s than
-//! listed are reported on stderr, so that the operators can run more nodes
-//! natively without changing this file, and the list can then be tightened.
+//! 3. the pipeline engine lowers every TPC-H query over both sources exactly
+//!    as [`TPCH_COVERAGE`] lists: the same numbers of native operators and of
+//!    all operators, and the same DataFusion nodes in `BridgeOperator`s (the
+//!    nodes that the native operators leave to DataFusion to keep its results
+//!    and errors exact, each listed with the reason), so that any change of
+//!    the native coverage, in either direction, updates the list.
 //!
 //! The benchmark `benches/pipeline_vs_default.rs` includes this file as a
 //! module to reuse the data generator and the queries.
@@ -47,7 +37,6 @@
 #[path = "../src/test_utils.rs"]
 pub(crate) mod test_utils;
 
-use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{AsArray, RecordBatch};
@@ -1810,6 +1799,29 @@ pub(crate) mod stress {
          FROM customer",
     ];
 
+    /// Joins without equi-join keys (nested loop joins) and cross joins, of
+    /// several join types, with residual filters, and aggregations, sorts and
+    /// windows of them.
+    pub(crate) const LOOP_JOINS: &[&str] = &[
+        "SELECT n1.n_nationkey AS a, n2.n_nationkey AS b
+         FROM nation n1 JOIN nation n2 ON n1.n_nationkey + 3 < n2.n_nationkey",
+        "SELECT r_name, n_name FROM region CROSS JOIN nation WHERE n_regionkey <> r_regionkey",
+        "SELECT s_suppkey, COUNT(n_nationkey) AS later_nations
+         FROM supplier LEFT JOIN nation ON s_nationkey < n_nationkey AND n_regionkey = 2
+         GROUP BY s_suppkey",
+        "SELECT c_custkey, c_nationkey FROM customer
+         WHERE NOT EXISTS (SELECT 1 FROM nation WHERE n_nationkey > c_nationkey + 20)",
+        "SELECT n_name, r_name FROM nation RIGHT JOIN region ON n_regionkey < r_regionkey - 2",
+        "SELECT p1.p_partkey AS small, p2.p_partkey AS large
+         FROM part p1 JOIN part p2 ON p2.p_size > p1.p_size + 45
+         WHERE p1.p_partkey <= 300 AND p2.p_partkey <= 300",
+        "SELECT COUNT(*) AS pairs, SUM(p_size + s_nationkey) AS total
+         FROM part CROSS JOIN (SELECT s_nationkey FROM supplier WHERE s_suppkey <= 3)",
+        "SELECT r_name, n_name, ROW_NUMBER() OVER (PARTITION BY r_name ORDER BY n_name) AS rn
+         FROM region CROSS JOIN nation WHERE n_regionkey <> r_regionkey
+         ORDER BY r_name, rn",
+    ];
+
     /// Hash joins on skewed keys (hot parts and customers), with null keys,
     /// outer joins, residual filters and composite keys.
     pub(crate) const SKEWED_HASH_JOINS: &[&str] = &[
@@ -2074,6 +2086,7 @@ stress_parity_tests!(
     multi_stage_aggregations: super::stress::MULTI_STAGE_AGGREGATIONS,
     grouping_sets: super::stress::GROUPING_SETS,
     window_functions: super::stress::WINDOW_FUNCTIONS,
+    loop_joins: super::stress::LOOP_JOINS,
     skewed_hash_joins: super::stress::SKEWED_HASH_JOINS,
     topk_sorts: super::stress::TOPK_SORTS,
     set_operations_and_ctes: super::stress::SET_OPERATIONS_AND_CTES,
@@ -2104,6 +2117,9 @@ pub(crate) struct Lowering {
     /// The number of nodes of the DataFusion plans that run in
     /// `BridgeOperator`s.
     pub(crate) bridged_nodes: usize,
+    /// The names of the roots of the DataFusion plans that run in
+    /// `BridgeOperator`s.
+    pub(crate) roots: Vec<String>,
 }
 
 impl Lowering {
@@ -2126,6 +2142,7 @@ impl Lowering {
             operators: count_operators(root.operator()),
             bridged,
             bridged_nodes: plans.iter().map(count_nodes).sum(),
+            roots: plans.iter().map(|plan| plan.name().to_string()).collect(),
         })
     }
 
@@ -2148,59 +2165,10 @@ async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
     Ok(lowerings)
 }
 
-/// The verdict of the zero-fallback check on the lowerings of the TPC-H
-/// queries over all sources.
-#[derive(Debug, PartialEq, Eq)]
-enum ZeroFallback {
-    /// No operator of any plan is native: `PipelineQueryPlanner` does not
-    /// lower plans yet (it runs every plan in a single `BridgeOperator`), so
-    /// the check is deferred.
-    Deferred,
-    /// Native lowering started, so the check is enforced: the plans that
-    /// still fall back to `BridgeOperator`s (none if it passes).
-    Enforced(Vec<String>),
-}
-
-impl ZeroFallback {
-    /// Judge `lowerings`: for every source (by name), the lowerings of the
-    /// TPC-H queries in query order. As soon as any operator of any plan is
-    /// native, every query must be native over every source.
-    fn judge(lowerings: &[(&str, Vec<Lowering>)]) -> Self {
-        let native = lowerings
-            .iter()
-            .flat_map(|(_, queries)| queries)
-            .map(Lowering::native_operators)
-            .sum::<usize>();
-        if native == 0 {
-            return Self::Deferred;
-        }
-        let fallbacks = lowerings
-            .iter()
-            .flat_map(|(source, queries)| {
-                queries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, lowering)| !lowering.bridged.is_empty())
-                    .map(move |(i, lowering)| {
-                        format!(
-                            "Q{} over {source}: {} of {} operators are BridgeOperators, \
-                             which run\n  {}",
-                            i + 1,
-                            lowering.bridged.len(),
-                            lowering.operators,
-                            lowering.bridged.join("\n  ")
-                        )
-                    })
-            })
-            .collect();
-        Self::Enforced(fallbacks)
-    }
-}
-
-/// Why the native operators leave a node of a TPC-H plan to DataFusion: as
-/// they handle it today, running it natively would not keep DataFusion's
-/// results and errors exact.
-#[derive(Debug)]
+/// Why the native operators leave the root of a bridged plan of a TPC-H query
+/// to DataFusion: as they handle it today, running it natively would not keep
+/// DataFusion's results and errors exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Why {
     /// The arguments of its aggregates have more than one part that may fail
     /// (decimal arithmetic), whose errors could come in another order than in
@@ -2211,12 +2179,19 @@ enum Why {
     /// parallel, on several threads, so that another row than in DataFusion
     /// could fail first (see `PipelineQueryPlanner`).
     ParallelErrors,
-    /// `PhysicalProjection::supports_projection_exec` refuses the projection
-    /// (`date_part`, decimal arithmetic with more than one part that may
-    /// fail).
+    /// `PhysicalProjection::supports_projection_exec` refuses the projection:
+    /// the classification of errors does not know its functions (`date_part`,
+    /// which the sessions of the suite do not trust) or judges that its parts
+    /// may fail with different kinds of errors (the decimal division of Q8).
     Projection,
-    /// There is no native operator for `ScalarSubqueryExec`.
+    /// There is no native operator for `ScalarSubqueryExec`, and the native
+    /// filters and projections do not evaluate the `ScalarSubqueryExpr`s that
+    /// read its results (the classification of errors does not know them).
     ScalarSubquery,
+    /// `PhysicalHashJoin::try_lower` refuses the join: its residual filter
+    /// has decimal arithmetic, which may fail on some rows, and which
+    /// DataFusion evaluates on other candidate pairs together.
+    JoinFilter,
     /// A hash join whose dynamic filter a Parquet scan of its probe side
     /// uses: the scan skips the reads that the filter rejects, a native join
     /// does not, and the reads of files may fail (see `PipelineQueryPlanner`).
@@ -2225,210 +2200,247 @@ enum Why {
     TopKDynamicFilter,
 }
 
-/// A query (by number) that falls back to `BridgeOperator`s: the number of
-/// DataFusion nodes that its `BridgeOperator`s run at most, and the roots of
-/// its bridged plans, each with why the native operators leave it to
-/// DataFusion.
-type Fallback = (usize, usize, &'static [(&'static str, Why)]);
+/// The exact lowering of a TPC-H query (by number) over a source: the numbers
+/// of the native operators and of all operators of its operator tree, the
+/// number of the DataFusion nodes that its `BridgeOperator`s run, and the
+/// roots of the plans that they run, each with why the native operators leave
+/// it to DataFusion.
+type Coverage = (usize, usize, usize, usize, &'static [(&'static str, Why)]);
 
-/// The TPC-H plans that still run parts in `BridgeOperator`s once
-/// `PipelineQueryPlanner` lowers plans, for every source.
-///
-/// The zero-fallback check fails on any other fallback: a query that is not
-/// listed with a `BridgeOperator`, or that runs more DataFusion nodes in its
-/// `BridgeOperator`s than listed. (Once an operator learns to run the root of
-/// a bridged plan natively, the other nodes of that plan run natively or in
-/// smaller bridged plans below it, with other roots: the number of nodes can
-/// only decrease.) It reports the queries that run fewer nodes than listed on
-/// stderr: update (or remove) their entries, so that the list only shrinks.
+/// How the pipeline engine lowers every TPC-H query, for every source (with
+/// the configuration of the suite, on 4 threads): see
+/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly.
 #[rustfmt::skip]
-const EXPECTED_FALLBACKS: &[(&str, &[Fallback])] = &[
-    ("MemTable", &[
-        (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
-        (3, 13, &[("AggregateExec", Why::AggregateArguments)]),
-        (5, 21, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, 5, &[("AggregateExec", Why::ParallelErrors)]),
-        (7, 22, &[("ProjectionExec", Why::Projection)]),
-        (8, 31, &[("ProjectionExec", Why::ParallelErrors)]),
-        (9, 19, &[("ProjectionExec", Why::Projection)]),
-        (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (14, 10, &[("ProjectionExec", Why::Projection)]),
-        (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (17, 16, &[("ProjectionExec", Why::ParallelErrors)]),
-        (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
-        (20, 6, &[("ProjectionExec", Why::ParallelErrors)]),
-        (22, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
+    ("MemTable", [
+        (1, 2, 3, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, 26, 26, 0, &[]),
+        (3, 2, 3, 13, &[("AggregateExec", Why::AggregateArguments)]),
+        (4, 10, 10, 0, &[]),
+        (5, 2, 3, 21, &[("AggregateExec", Why::AggregateArguments)]),
+        (6, 1, 2, 5, &[("AggregateExec", Why::ParallelErrors)]),
+        (7, 3, 4, 22, &[("ProjectionExec", Why::Projection)]),
+        (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
+        (9, 3, 4, 19, &[("ProjectionExec", Why::Projection)]),
+        (10, 2, 3, 15, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, 0, 1, 28, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (12, 8, 8, 0, &[]),
+        (13, 10, 10, 0, &[]),
+        (14, 2, 3, 6, &[("ProjectionExec", Why::ParallelErrors)]),
+        (15, 0, 1, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, 13, 13, 0, &[]),
+        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinFilter)]),
+        (18, 12, 12, 0, &[]),
+        (19, 1, 2, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, 18, 18, 0, &[]),
+        (21, 22, 22, 0, &[]),
+        (22, 0, 1, 19, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
-    ("Parquet", &[
-        (1, 6, &[("AggregateExec", Why::AggregateArguments)]),
-        (2, 28, &[
+    ("Parquet", [
+        (1, 2, 3, 6, &[("AggregateExec", Why::AggregateArguments)]),
+        (2, 4, 6, 28, &[
             ("HashJoinExec", Why::JoinDynamicFilter),
             ("HashJoinExec", Why::JoinDynamicFilter),
         ]),
-        (3, 14, &[("AggregateExec", Why::AggregateArguments)]),
-        (4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (5, 22, &[("AggregateExec", Why::AggregateArguments)]),
-        (6, 5, &[("AggregateExec", Why::ParallelErrors)]),
-        (7, 23, &[("ProjectionExec", Why::Projection)]),
-        (8, 33, &[("ProjectionExec", Why::ParallelErrors)]),
-        (9, 18, &[("ProjectionExec", Why::Projection)]),
-        (10, 15, &[("AggregateExec", Why::AggregateArguments)]),
-        (11, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (12, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (13, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (14, 10, &[("ProjectionExec", Why::Projection)]),
-        (15, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
-        (16, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (17, 16, &[("ProjectionExec", Why::ParallelErrors)]),
-        (18, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
-        (19, 9, &[("AggregateExec", Why::AggregateArguments)]),
-        (20, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (21, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (22, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (3, 2, 3, 14, &[("AggregateExec", Why::AggregateArguments)]),
+        (4, 3, 4, 6, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (5, 2, 3, 22, &[("AggregateExec", Why::AggregateArguments)]),
+        (6, 1, 2, 5, &[("AggregateExec", Why::ParallelErrors)]),
+        (7, 3, 4, 23, &[("ProjectionExec", Why::Projection)]),
+        (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
+        (9, 3, 4, 18, &[("ProjectionExec", Why::Projection)]),
+        (10, 2, 3, 15, &[("AggregateExec", Why::AggregateArguments)]),
+        (11, 0, 1, 30, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (12, 3, 4, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (13, 5, 6, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (14, 2, 3, 6, &[("ProjectionExec", Why::ParallelErrors)]),
+        (15, 0, 1, 22, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
+        (16, 8, 9, 5, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (18, 0, 1, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
+        (19, 1, 2, 9, &[("AggregateExec", Why::AggregateArguments)]),
+        (20, 1, 2, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (21, 7, 8, 17, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (22, 0, 1, 20, &[("ScalarSubqueryExec", Why::ScalarSubquery)]),
     ]),
 ];
 
-/// No TPC-H query falls back to a `BridgeOperator`, over both sources, other
-/// than as [`EXPECTED_FALLBACKS`] lists: every other node of every plan runs
-/// on a native pipeline operator.
-///
-/// The check is deferred while `PipelineQueryPlanner` does not lower plans,
-/// and enforced on Q1 to Q22 over both sources as soon as any operator of
-/// any TPC-H plan is native (see [`ZeroFallback::judge`]). It fails on every
-/// query that runs more DataFusion nodes in `BridgeOperator`s than
-/// [`EXPECTED_FALLBACKS`] lists for it (none, if it does not list the query),
-/// and reports the queries that run fewer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tpch_queries_run_without_bridge_operator() -> Result<()> {
-    let mut lowerings = vec![];
-    for source in [Source::memtable(), Source::parquet()] {
-        lowerings.push((source.name(), tpch_lowerings(&source).await?));
+/// The differences between `lowerings`, the lowerings of the queries (Q1,
+/// Q2, ...) over the source `source`, and `expected`, their coverage (see
+/// [`Coverage`]): one message per query that is lowered differently, with
+/// the entry that describes its lowering (to update the list with, with the
+/// reasons of new bridged plans).
+fn coverage_differences(
+    source: &str,
+    lowerings: &[Lowering],
+    expected: &[Coverage],
+) -> Vec<String> {
+    let mut differences = vec![];
+    if lowerings.len() != expected.len() {
+        differences.push(format!(
+            "{} queries over {source}, {} listed",
+            lowerings.len(),
+            expected.len()
+        ));
     }
-    match ZeroFallback::judge(&lowerings) {
-        ZeroFallback::Deferred => {
-            // Bypass the output capture of libtest, so that every test run
-            // shows that the check is deferred.
-            writeln!(
-                std::io::stderr().lock(),
-                "tpch_parity: deferring the zero-BridgeOperator check of the TPC-H \
-                 queries: PipelineQueryPlanner does not lower plans to native operators \
-                 yet (every plan runs in a single BridgeOperator)"
-            )?;
+    for (i, (lowering, listed)) in lowerings.iter().zip(expected).enumerate() {
+        let query = i + 1;
+        let &(number, native, operators, bridged_nodes, roots) = listed;
+        let listed_roots = roots.iter().map(|(root, _)| *root).collect::<Vec<_>>();
+        if number == query
+            && lowering.native_operators() == native
+            && lowering.operators == operators
+            && lowering.bridged_nodes == bridged_nodes
+            && lowering.roots == listed_roots
+        {
+            continue;
         }
-        ZeroFallback::Enforced(fallbacks) => {
-            let mut unexpected = vec![];
-            let mut fewer = vec![];
-            for (source, queries) in &lowerings {
-                let expected = EXPECTED_FALLBACKS
-                    .iter()
-                    .find(|(name, _)| name == source)
-                    .map_or(&[][..], |(_, expected)| expected);
-                for (i, lowering) in queries.iter().enumerate() {
-                    let query = i + 1;
-                    let listed = expected.iter().find(|(listed, ..)| *listed == query);
-                    let nodes = listed.map_or(0, |(_, nodes, _)| *nodes);
-                    if lowering.bridged_nodes > nodes {
-                        unexpected.push(format!(
-                            "Q{query} over {source}: {} DataFusion nodes (at most {nodes} \
-                             listed) run in BridgeOperators ({} of {} operators), \
-                             whose plans are\n  {}",
-                            lowering.bridged_nodes,
-                            lowering.bridged.len(),
-                            lowering.operators,
-                            lowering.bridged.join("\n  ")
-                        ));
-                    } else if let Some((_, nodes, roots)) = listed
-                        && lowering.bridged_nodes < *nodes
-                    {
-                        fewer.push(format!(
-                            "Q{query} over {source}: {} of the {nodes} listed DataFusion \
-                             nodes ({roots:?}) run in BridgeOperators",
-                            lowering.bridged_nodes
-                        ));
-                    }
-                }
+        let actual_roots = lowering
+            .roots
+            .iter()
+            .map(|root| format!("(\"{root}\", Why::?)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        differences.push(format!(
+            "Q{query} over {source} is lowered to {} native of {} operators, with {} \
+             DataFusion nodes in BridgeOperators, but {listed:?} is listed; it is \
+             ({query}, {}, {}, {}, &[{actual_roots}]), whose bridged plans are\n  {}",
+            lowering.native_operators(),
+            lowering.operators,
+            lowering.bridged_nodes,
+            lowering.native_operators(),
+            lowering.operators,
+            lowering.bridged_nodes,
+            lowering.bridged.join("\n  ")
+        ));
+    }
+    differences
+}
+
+/// The pipeline engine lowers every TPC-H query over both sources exactly as
+/// [`TPCH_COVERAGE`] lists: the same numbers of native operators and of all
+/// operators, the same number of DataFusion nodes in `BridgeOperator`s, and
+/// bridged plans with the same roots, so that every change of the native
+/// coverage of TPC-H, in either direction, updates the list (with the reasons
+/// of the plans that are left to DataFusion).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tpch_queries_are_lowered_as_listed() -> Result<()> {
+    let mut differences = vec![];
+    for source in [Source::memtable(), Source::parquet()] {
+        let lowerings = tpch_lowerings(&source).await?;
+        let expected = TPCH_COVERAGE
+            .iter()
+            .find(|(name, _)| *name == source.name())
+            .map_or(&[][..], |(_, expected)| &expected[..]);
+        differences.extend(coverage_differences(source.name(), &lowerings, expected));
+    }
+    assert!(
+        differences.is_empty(),
+        "{} TPC-H plans are lowered otherwise than TPCH_COVERAGE lists:\n{}",
+        differences.len(),
+        differences.join("\n")
+    );
+    Ok(())
+}
+
+/// The names of the operators of the operator tree below (and including)
+/// `operator`.
+fn operator_names(operator: &Arc<dyn PhysicalOperator>) -> Vec<String> {
+    let mut names = vec![operator.name().to_string()];
+    for child in operator.children() {
+        names.extend(operator_names(child));
+    }
+    names
+}
+
+/// The window functions and the loop joins of the stress corpus run on the
+/// native windows ([`PhysicalWindow`]), nested loop joins and cross joins,
+/// over both sources, without `BridgeOperator`s: all but the queries of
+/// windows stacked on windows of other partitions or orders that DataFusion
+/// sorts or merges in between (2 and 5 of `WINDOW_FUNCTIONS`), which
+/// `PhysicalWindow::try_lower` leaves to DataFusion (it does not judge whether
+/// DataFusion's window below reads all of its input before it emits).
+///
+/// [`PhysicalWindow`]: datafusion_physical_pipeline::window::PhysicalWindow
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_and_loop_joins_of_the_stress_corpus_are_native() -> Result<()> {
+    for source in [Source::memtable(), Source::parquet()] {
+        let ctx = pipeline_context(test_session_config());
+        source.register(&ctx).await?;
+        for (queries, operators, bridged) in [
+            (
+                stress::WINDOW_FUNCTIONS,
+                &["PhysicalWindow"][..],
+                &[2, 5][..],
+            ),
+            (
+                stress::LOOP_JOINS,
+                &["PhysicalNestedLoopJoin", "PhysicalCrossJoin"][..],
+                &[][..],
+            ),
+        ] {
+            for (i, sql) in queries.iter().enumerate() {
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let lowering = Lowering::of(&plan)?;
+                let root = plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .expect("a pipeline plan");
+                let names = operator_names(root.operator());
+                let native = lowering.bridged.is_empty()
+                    && names.iter().any(|name| operators.contains(&name.as_str()));
+                assert_eq!(
+                    native,
+                    !bridged.contains(&i),
+                    "over {}: {sql}\n{names:?}\nbridged: {:?}",
+                    source.name(),
+                    lowering.bridged
+                );
             }
-            if !fewer.is_empty() {
-                // Bypass the output capture of libtest, so that every test run
-                // shows the entries to update.
-                writeln!(
-                    std::io::stderr().lock(),
-                    "tpch_parity: {} TPC-H plans run fewer DataFusion nodes in \
-                     BridgeOperators than EXPECTED_FALLBACKS lists, update their \
-                     entries:\n{}",
-                    fewer.len(),
-                    fewer.join("\n")
-                )?;
-            }
-            assert!(
-                unexpected.is_empty(),
-                "{} TPC-H plans fall back to BridgeOperator, more than \
-                 EXPECTED_FALLBACKS lists:\n{}",
-                fallbacks.len(),
-                unexpected.join("\n")
-            );
         }
     }
     Ok(())
 }
 
-/// The zero-fallback check is deferred while no operator of any TPC-H plan is
-/// native, and enforced on every query over every source as soon as one is.
+/// [`coverage_differences`] finds every query that is lowered otherwise than
+/// listed, in either direction, which is what the exact coverage assertion
+/// relies on.
 #[test]
-fn zero_fallback_check_is_enforced_once_native_lowering_starts() {
-    let bridged = || Lowering {
-        operators: 1,
-        bridged: vec!["SortPreservingMergeExec: [a@0 ASC]".to_string()],
-        bridged_nodes: 3,
+fn coverage_differences_find_every_difference() {
+    let lowering = |operators, bridged: &[&str], bridged_nodes| Lowering {
+        operators,
+        bridged: bridged.iter().map(|root| format!("{root}: ...")).collect(),
+        bridged_nodes,
+        roots: bridged.iter().map(|root| (*root).to_string()).collect(),
     };
-    let partly_native = || Lowering {
-        operators: 3,
-        bridged: vec!["ProjectionExec: expr=[a@0 * b@1 as c]".to_string()],
-        bridged_nodes: 2,
-    };
-    let native = || Lowering {
-        operators: 2,
-        bridged: vec![],
-        bridged_nodes: 0,
-    };
-
-    // The planner does not lower plans yet.
-    assert_eq!(
-        ZeroFallback::judge(&[
-            ("MemTable", vec![bridged(), bridged()]),
-            ("Parquet", vec![bridged(), bridged()]),
-        ]),
-        ZeroFallback::Deferred
-    );
-
-    // A single native operator anywhere enforces the check on all plans,
-    // including the plans that run in a single `BridgeOperator`.
-    let ZeroFallback::Enforced(fallbacks) = ZeroFallback::judge(&[
-        ("MemTable", vec![bridged(), native()]),
-        ("Parquet", vec![partly_native(), bridged()]),
-    ]) else {
-        panic!("the check is not enforced");
-    };
-    let queries = fallbacks
-        .iter()
-        .map(|fallback| fallback.split(':').next().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        queries,
-        ["Q1 over MemTable", "Q1 over Parquet", "Q2 over Parquet"]
-    );
-    assert!(
-        fallbacks[1].contains("1 of 3 operators")
-            && fallbacks[1].contains("ProjectionExec"),
-        "{fallbacks:?}"
-    );
-
-    // All plans are native: the check passes.
-    assert_eq!(
-        ZeroFallback::judge(&[("MemTable", vec![native()]), ("Parquet", vec![native()])]),
-        ZeroFallback::Enforced(vec![])
-    );
+    let expected: [Coverage; 2] = [
+        (1, 2, 3, 6, &[("AggregateExec", Why::ParallelErrors)]),
+        (2, 4, 4, 0, &[]),
+    ];
+    let lowerings = || vec![lowering(3, &["AggregateExec"], 6), lowering(4, &[], 0)];
+    assert!(coverage_differences("MemTable", &lowerings(), &expected).is_empty());
+    // Each of these lowerings of Q1 differs from the list, by fewer or more
+    // bridged nodes, another root, more operators or a fully native plan.
+    for q1 in [
+        lowering(3, &["AggregateExec"], 5),
+        lowering(3, &["AggregateExec"], 7),
+        lowering(3, &["ProjectionExec"], 6),
+        lowering(4, &["AggregateExec"], 6),
+        lowering(3, &[], 0),
+    ] {
+        let mut lowerings = lowerings();
+        lowerings[0] = q1;
+        let differences = coverage_differences("MemTable", &lowerings, &expected);
+        assert_eq!(differences.len(), 1, "{differences:?}");
+        assert!(
+            differences[0].starts_with("Q1 over MemTable is lowered to "),
+            "{differences:?}"
+        );
+    }
+    // A query that is not listed.
+    let mut lowerings = lowerings();
+    lowerings.push(lowering(1, &[], 0));
+    let differences = coverage_differences("Parquet", &lowerings, &expected);
+    assert_eq!(differences, ["3 queries over Parquet, 2 listed"]);
 }
 
 /// The single `BIGINT` value that `sql` returns on `ctx`.
