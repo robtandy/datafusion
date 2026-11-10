@@ -600,7 +600,8 @@ struct TopKGroups {
 
 impl TopKGroups {
     /// Add `outputs`, the groups of a finalized partition. Returns the top
-    /// groups of all partitions once all of them were added.
+    /// groups of all partitions once all of them were added, in the order of
+    /// DataFusion's (see [`TopK::sort_groups`]).
     fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
         for output in outputs {
             let output = self.top_k.select_groups(output)?;
@@ -612,7 +613,10 @@ impl TopKGroups {
             *groups = Some(merged);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            return Ok(self.groups.lock().take());
+            let groups = self.groups.lock().take();
+            return groups
+                .map(|groups| self.top_k.sort_groups(&groups))
+                .transpose();
         }
         Ok(None)
     }

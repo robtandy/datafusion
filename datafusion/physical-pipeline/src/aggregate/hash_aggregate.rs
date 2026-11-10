@@ -219,6 +219,18 @@ impl TopK {
         }
     }
 
+    /// The groups of `batch`, the top groups of the aggregation, in the order
+    /// in which DataFusion's top-k aggregation produces them: it drains its
+    /// heap from the best group to the worst, and the group of the `NULL` key
+    /// comes last. The operators between the aggregation and the sort above
+    /// it see the groups in that order, e.g. a projection that fails on
+    /// several of them fails on the first one, whose value its error shows.
+    pub(crate) fn sort_groups(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let options = SortOptions::new(self.descending, false);
+        let indices = sort_to_indices(batch.column(0), Some(options), None)?;
+        Ok(take_record_batch(batch, &indices)?)
+    }
+
     /// The groups of `left` and `right`, outputs of the aggregation for two
     /// sets of distinct groups (selected by [`Self::select_groups`]), that may
     /// be among the groups the sort keeps: [`Self::select_groups`] of all of
@@ -2268,6 +2280,97 @@ mod tests {
                 }
                 assert!(planned.is_empty() || planned == top_k || window, "{sql}");
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_k_aggregations_produce_their_groups_in_the_order_of_datafusion()
+    -> Result<()> {
+        use super::super::test_support::{
+            assert_aggregate_fails_like_datafusion_with_setup, lower,
+        };
+        use arrow::array::StringViewArray;
+        // DataFusion's top-k aggregation produces its groups from the best one
+        // to the worst (and the `NULL` key last): a projection above it that
+        // fails on several of them fails on the first one, whose value its
+        // error shows. So does the native one, also when it keeps all of its
+        // groups (without selecting or merging them).
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8View, true)]));
+        let cases = [
+            (
+                vec!["invalid0021", "invalid0011"],
+                "LIMIT 2",
+                "'invalid0011'",
+            ),
+            (
+                vec!["invalid0011", "invalid0021"],
+                "DESC LIMIT 2",
+                "'invalid0021'",
+            ),
+            (
+                vec![
+                    "invalid0050",
+                    "invalid0030",
+                    "invalid0010",
+                    "invalid0040",
+                    "invalid0020",
+                ],
+                "LIMIT 10",
+                "'invalid0010'",
+            ),
+            (
+                vec![
+                    "invalid0010",
+                    "invalid0030",
+                    "invalid0050",
+                    "invalid0020",
+                    "invalid0040",
+                ],
+                "DESC LIMIT 3",
+                "'invalid0050'",
+            ),
+        ];
+        for (keys, order, message) in cases {
+            let sql = format!(
+                "SELECT CAST(k AS BIGINT) AS i, k FROM t GROUP BY k ORDER BY k {order}"
+            );
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringViewArray::from(keys.clone()))],
+            )?;
+            let setup = async |ctx: &datafusion::prelude::SessionContext| -> Result<()> {
+                let table = datafusion::datasource::MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![batch.clone()]],
+                )?;
+                ctx.register_table("t", Arc::new(table))?;
+                Ok(())
+            };
+            let config = test_session_config().with_target_partitions(1);
+            // The top-k aggregation is native.
+            let ctx = crate::test_utils::datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+            assert_eq!(native_top_k_aggregations(&lower(&plan)?).len(), 1, "{sql}");
+            assert_aggregate_fails_like_datafusion_with_setup(
+                &sql,
+                config.clone(),
+                &setup,
+                message,
+            )
+            .await;
+            // And through the planner.
+            let pipeline = crate::test_utils::pipeline_context(config);
+            setup(&pipeline).await?;
+            let error = pipeline
+                .sql(&sql)
+                .await?
+                .collect()
+                .await
+                .expect_err("a cast error");
+            assert!(error.to_string().contains(message), "{sql}: {error}");
         }
         Ok(())
     }
