@@ -567,25 +567,29 @@ engines, and asserts their byte parity. `tpch_queries_are_lowered_as_listed`
 asserts the exact lowering of every TPC-H query (`TPCH_COVERAGE`): the
 numbers of native and of all operators, and the DataFusion plans that run in
 `BridgeOperator`s, each with why the native operators leave it to DataFusion.
-On 4 threads:
+On 4 threads, with the sessions of the suite (which do not trust DataFusion's
+built-in functions, see `TrustedFunctions`):
 
-- Over `MemTable`s, Q2, Q4, Q12, Q13, Q16, Q18, Q20 and Q21 run fully
-  natively.
-- Q1, Q3, Q5, Q10 and Q19 aggregate decimal arithmetic with more than one part
-  that may overflow, Q6 (an aggregation) and Q14 (a projection) decimal
-  arithmetic with one part, on several threads: these operators stay in
-  DataFusion, with their inputs.
+- Over `MemTable`s, 16 of the 22 queries run fully natively: Q1 to Q6, Q10,
+  Q12 to Q16 and Q18 to Q21. Their decimal arithmetic, which can only fail
+  with arithmetic overflows, is evaluated natively on any number of threads,
+  and so are the scalar subqueries of Q15 (`ScalarSubqueryExec`).
 - The native projection refuses the projections of Q7 and Q9 (`date_part`,
   which the classification of errors only knows in sessions that trust
-  DataFusion's built-in functions; their decimal arithmetic would keep them in
-  DataFusion on several threads anyway) and of Q8 (a decimal division, which
-  may fail with several kinds of errors).
-- Q11, Q15 and Q22 have scalar subqueries (`ScalarSubqueryExec`), and the
-  semi join of Q17 a residual filter with decimal arithmetic.
-- Over Parquet, the hash joins of Q2, Q4, Q12, Q13, Q16, Q17, Q20 and Q21 and
-  the TopK of Q18 have dynamic filters that prune the reads of the Parquet
-  scans below them (which may fail to read or decode the rows that DataFusion
-  skips): they stay in DataFusion too, so no query runs fully natively.
+  DataFusion's built-in functions), of Q8 (a decimal division by a sum that
+  may be 0, which may fail with several kinds of errors) and of Q22
+  (`substr`, likewise untrusted, whose repartitioning over `MemTable`s, and
+  filter over Parquet, stay in DataFusion too).
+- The filter and the projection of Q11 cast decimals, which may fail with
+  other errors than overflows (whose messages name the values that fail), so
+  they stay in DataFusion on several threads; the semi join of Q17 has a
+  residual filter with decimal arithmetic, which DataFusion evaluates on whole
+  batches of candidate pairs.
+- Over Parquet, 13 queries run fully natively: the hash joins of Q15 and Q20
+  have dynamic filters that prune the reads of the Parquet scans below them
+  (whose decimal arithmetic may fail on the rows that DataFusion skips), and
+  the TopK of Q18 a dynamic filter that prunes the scan of `orders`: they stay
+  in DataFusion too.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
