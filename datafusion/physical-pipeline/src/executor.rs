@@ -11,8 +11,8 @@
 //!   up to `num_threads` threads once all of its dependencies are complete,
 //!   and the sink of a [`MetaPipeline`] is finalized once all of its
 //!   pipelines completed. The execution runs on the task that polls its
-//!   [`PipelineStream`]; a pipeline that runs alone runs its first thread on
-//!   that task too, and only its other threads on worker tasks.
+//!   [`PipelineStream`], and so does a pipeline on a single thread that runs
+//!   alone.
 //! * [`CollectorSink`] is the sink of the root pipeline: it hands the result
 //!   chunks, as [`RecordBatch`]es, to a [`PipelineStream`].
 
@@ -235,7 +235,7 @@ impl PipelineExecutor {
     /// Yield (end the current poll with [`Progress::Yield`]) as soon as the
     /// source produces a second chunk, before pushing it: the source has more
     /// work than this thread did so far, so that the executor can start the
-    /// other threads of the pipeline. Once.
+    /// threads of the pipeline. Once.
     fn yield_on_more_input(&mut self) {
         self.yield_on_more_input = true;
     }
@@ -683,13 +683,11 @@ impl ExecutionMetrics {
 /// all pipelines of a meta pipeline completed (and every thread combined its
 /// local sink state), the sink of the meta pipeline is finalized.
 ///
-/// The tasks are sized to the work: a pipeline that runs while no other
-/// pipeline does runs its first thread on the task of the execution (the task
-/// that polls the [`PipelineStream`]), so that a pipeline on a single thread
-/// spawns no task, and a source that does not bound its threads (e.g. the
-/// result of an aggregation, which may be a single row) only gets more
-/// threads once the first one found more than a chunk of work, see
-/// [`Executor::execute`].
+/// The tasks are sized to the work: a pipeline on a single thread that runs
+/// while no other pipeline does runs on the task of the execution (the task
+/// that polls the [`PipelineStream`]) and spawns no task, and a source that
+/// does not bound its threads only gets them once it produced a second chunk,
+/// see [`Executor::execute`].
 #[derive(Debug)]
 pub struct Executor {
     graph: Arc<PipelineGraph>,
@@ -765,13 +763,12 @@ impl Executor {
 
     /// Run all pipelines to completion.
     ///
-    /// A pipeline that runs while no other pipeline does runs its first
-    /// thread on the task that awaits this future, and its other threads on
-    /// worker tasks: right away if its source bounds its threads
-    /// ([`GlobalSourceState::max_threads`]), otherwise once the first thread
-    /// got a second chunk from the source, used up the call budget of a poll
-    /// or is blocked. Other pipelines run all of their threads on worker
-    /// tasks, concurrently.
+    /// A pipeline on a single thread that runs while no other pipeline does
+    /// runs on the task that awaits this future, and so does a pipeline whose
+    /// source does not bound its threads, until the source produced a second
+    /// chunk, the thread used up the call budget of a poll or is blocked.
+    /// Otherwise all threads of a pipeline run on worker tasks, and pipelines
+    /// that do not depend on each other run concurrently.
     pub async fn execute(&self) -> Result<()> {
         let registry = Arc::new(ExecutionRegistry::new(
             self.metrics.by_key(),
@@ -864,15 +861,16 @@ impl Executor {
 
     /// Run `pipeline` on its threads (see [`Self::pipeline_threads`]).
     ///
-    /// If no other pipeline runs at the same time (`alone`), the first thread
-    /// runs on the task of the execution itself, instead of a worker task of
-    /// its own, which spares a pipeline on a single thread (e.g. the pipeline
-    /// that reads a sort, or a small table) all task overhead. The other
-    /// threads run on worker tasks. If the source does not bound its threads
-    /// (`GlobalSourceState::max_threads` is `usize::MAX`, e.g. the result of an
-    /// aggregation, which may be a single row), they only start once the
-    /// first thread found more work than one chunk (or is blocked), so that a
-    /// source with little output does not spawn tasks that immediately exit.
+    /// If no other pipeline runs at the same time (`alone`), a pipeline on a
+    /// single thread (e.g. the pipeline that reads a sort, or the result of an
+    /// ungrouped aggregation, or a table of a single chunk) runs on the task
+    /// of the execution itself, which spares it all task overhead. So does a
+    /// pipeline on several threads whose source does not bound its threads
+    /// (`GlobalSourceState::max_threads` is `usize::MAX`), until its source
+    /// produces a second chunk (or its first thread is blocked or used up the
+    /// call budget of a poll): if it has little work, it completes without
+    /// spawning tasks that would immediately exit. Otherwise (and if the
+    /// pipeline does not run alone) all of its threads run on worker tasks.
     async fn run_pipeline(
         &self,
         pipeline: &Pipeline,
@@ -945,9 +943,14 @@ impl Executor {
             Arc::clone(&shared),
             self.context(0, num_threads, registry),
         )?;
-        if num_threads > 1 && shared.source_state.max_threads() == usize::MAX {
-            // Run the first thread until the source produced a second chunk,
-            // the thread is blocked, or it used up the budget of a poll.
+        if num_threads == 1 {
+            return first.execute().await;
+        }
+        if shared.source_state.max_threads() == usize::MAX {
+            // The source does not know how much work it has: run the first
+            // thread on this task until the source produced a second chunk,
+            // the thread is blocked, or it used up the call budget of a poll.
+            // A pipeline with less work is complete by then, without tasks.
             first.yield_on_more_input();
             match futures::future::poll_fn(|cx| Poll::Ready(first.poll_run(cx))).await {
                 Poll::Ready(Ok(Progress::Done)) => return Ok(()),
@@ -955,11 +958,13 @@ impl Executor {
                 Poll::Ready(Ok(Progress::Yield)) | Poll::Pending => {}
             }
         }
+        // All threads run on worker tasks, also the first one, so that they
+        // start at about the same time: a thread that started earlier would
+        // claim more of the input (e.g. buffer more rows to sort, which it then
+        // sorts alone).
+        workers.spawn(first.execute());
         spawn(&mut workers, 1..num_threads);
-        // Dropping `workers` (on error, or when the execution is dropped)
-        // aborts the other threads.
-        futures::future::try_join(first.execute(), join_workers(workers)).await?;
-        Ok(())
+        join_workers(workers).await
     }
 
     /// The number of threads that execute `pipeline`.
@@ -2918,19 +2923,25 @@ mod tests {
         assert_eq!(materialize.combines.load(Ordering::Relaxed), 1);
         assert_eq!(materialize.get_data_calls.load(Ordering::Relaxed), 2);
 
-        // With more chunks, the other threads start (on worker tasks) once the
-        // first thread got a second chunk.
+        // With more chunks, all threads run on worker tasks once the first
+        // thread got a second chunk (which it got on the task of the test).
         let source = Arc::new(VecSource::new(batches(0, 40, 10)));
         let output = run(Arc::clone(&source) as _, 4).await?;
         assert_eq!(sorted_values(&output), (0..400).collect::<Vec<_>>());
         assert_eq!(source.local_states.load(Ordering::Relaxed), 4);
-        assert_eq!(source.tasks(), (4, true));
-        // A source that bounds its threads gets them right away.
+        assert_eq!(source.tasks(), (5, true));
+        // A source that bounds its threads to one runs on the task of the test,
+        // to several on worker tasks right away.
+        let source = Arc::new(VecSource::new(batches(0, 40, 10)).with_max_threads(1));
+        let output = run(Arc::clone(&source) as _, 4).await?;
+        assert_eq!(values(&output), (0..400).collect::<Vec<_>>());
+        assert_eq!(source.local_states.load(Ordering::Relaxed), 1);
+        assert_eq!(source.tasks(), (1, true));
         let source = Arc::new(VecSource::new(batches(0, 1, 10)).with_max_threads(2));
         let output = run(Arc::clone(&source) as _, 4).await?;
         assert_eq!(values(&output), (0..10).collect::<Vec<_>>());
         assert_eq!(source.local_states.load(Ordering::Relaxed), 2);
-        assert_eq!(source.tasks(), (2, true));
+        assert_eq!(source.tasks(), (2, false));
 
         // Pipelines that run at the same time (the inputs of a union) run all
         // their threads on worker tasks; one after the other (an ordered
@@ -3004,8 +3015,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn panics_are_propagated() {
         // A panic of the first thread (on the task that polls the stream), of
-        // the other threads (on worker tasks), and of pipelines that do not
-        // run alone.
+        // the other threads (on worker tasks, once the first thread got a
+        // second chunk), and of pipelines that do not run alone.
         for (threads, order_matters) in [(0..1, None), (1..4, None), (0..4, Some(false))]
         {
             let input = || source(batches(0, 40, 10));

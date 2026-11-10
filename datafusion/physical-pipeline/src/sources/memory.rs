@@ -437,6 +437,112 @@ mod tests {
         Ok(())
     }
 
+    /// A parallel sink that counts the rows it sinks, and records its threads
+    /// (local states) and the tasks that sink chunks (`None` outside a task).
+    #[derive(Debug)]
+    struct ThreadProbe {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        local_states: AtomicUsize,
+        rows: AtomicUsize,
+        tasks: parking_lot::Mutex<std::collections::HashSet<Option<tokio::task::Id>>>,
+    }
+
+    impl PhysicalOperator for ThreadProbe {
+        fn name(&self) -> &str {
+            "ThreadProbe"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn is_sink(&self) -> bool {
+            true
+        }
+
+        fn parallel_sink(&self) -> bool {
+            true
+        }
+
+        fn get_local_sink_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn crate::operator::GlobalSinkState,
+        ) -> Result<Box<dyn crate::operator::LocalSinkState>> {
+            self.local_states.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(EmptyState))
+        }
+
+        fn sink(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            _gstate: &dyn crate::operator::GlobalSinkState,
+            _lstate: &mut dyn crate::operator::LocalSinkState,
+        ) -> Result<crate::operator::SinkResult> {
+            self.rows.fetch_add(input.len(), Ordering::SeqCst);
+            self.tasks.lock().insert(tokio::task::try_id());
+            Ok(crate::operator::SinkResult::NeedMoreInput)
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+            _lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            Ok(SourceResult::Finished)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_scans_run_on_as_many_threads_as_they_have_chunks() -> Result<()> {
+        // A scan of a small table runs on one thread per chunk, even on 16
+        // threads, and a table of a single chunk on the task that polls the
+        // output (here the test itself, which is not a task), without spawning
+        // any task.
+        for (partitions, threads) in [
+            (vec![vec![batch(0..100)]], 1),
+            (vec![vec![], vec![batch(0..3000)], vec![]], 2),
+            (skewed_partitions(5000), 3),
+            (vec![vec![batch(0..0)]], 1),
+        ] {
+            let source = MemoryScanSource::try_new(&partitions, schema(), None, None)?;
+            let rows = source.num_rows;
+            let probe = Arc::new(ThreadProbe {
+                children: vec![Arc::new(source)],
+                local_states: AtomicUsize::new(0),
+                rows: AtomicUsize::new(0),
+                tasks: parking_lot::Mutex::default(),
+            });
+            Executor::collect(Arc::clone(&probe) as _, task_ctx(), 16).await?;
+            assert_eq!(probe.rows.load(Ordering::SeqCst), rows);
+            assert_eq!(
+                probe.local_states.load(Ordering::SeqCst),
+                threads,
+                "{rows} rows"
+            );
+            let tasks = probe.tasks.lock();
+            if threads == 1 && rows > 0 {
+                assert_eq!(tasks.iter().collect::<Vec<_>>(), [&None], "{rows} rows");
+            }
+            assert!(tasks.len() <= threads, "{rows} rows: {tasks:?}");
+            assert!(
+                threads == 1 || !tasks.contains(&None),
+                "{rows} rows: {tasks:?}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn executes_on_many_threads() -> Result<()> {
         let mut partitions = skewed_partitions(20_000);
