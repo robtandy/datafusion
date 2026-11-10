@@ -1368,7 +1368,6 @@ mod tests {
 
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{assert_aggregate_parity_with_setup, lower};
-    use super::super::hash_aggregate::TrustedAggregateFunctions;
     use crate::executor::Executor;
     use crate::test_utils::{canonical_batch, datafusion_context, test_session_config};
 
@@ -2262,19 +2261,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn literal_arguments_of_filtered_aggregates_are_built_for_their_rows()
     -> Result<()> {
-        // No row passes the filter, and a few do; on 1 thread and on 4. (The
-        // rows of an aggregation with aggregates do not bypass the tables, see
-        // `AggregateSpec::bypass`: the regular path evaluates the arguments
-        // for the rows that pass the filter only, like DataFusion.)
+        // No row passes the filter, and a few do; on 1 thread and on 4; in a
+        // session that does not trust `count`, whose rows do not bypass the
+        // tables (the regular path evaluates the arguments for the rows that
+        // pass the filter only, like DataFusion), and in a session that does,
+        // whose rows bypass them (see `AggregateSpec::rows_bypass_tables`, and
+        // `evaluate_row_aligned`).
         let selections: [fn(i64) -> bool; 2] = [|_| false, |row| row % 1_000 == 7];
-        for (selected, threads) in selections.into_iter().flat_map(|s| [(s, 1), (s, 4)]) {
+        let runs = selections.into_iter().flat_map(|selected| {
+            [(1, false), (4, false), (1, true), (4, true)]
+                .map(|(threads, trusted)| (selected, threads, trusted))
+        });
+        for (selected, threads, trusted) in runs {
             let plan = count_of_long_literal(selected)?;
             let root = lower(&plan)?;
             let aggregate = root
                 .downcast_ref::<PhysicalHashAggregate>()
                 .expect("a native aggregation");
-            assert!(!aggregate.spec().bypass);
-            let task_ctx = Arc::new(TaskContext::default());
+            let config = if trusted {
+                trusting(SessionConfig::new())
+            } else {
+                SessionConfig::new()
+            };
+            let options = Arc::clone(config.options());
+            assert_eq!(aggregate.spec().rows_bypass_tables(&options), trusted);
+            let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
             let actual = Executor::collect(root, Arc::clone(&task_ctx), threads).await?;
             let expected = datafusion_physical_plan::collect(
                 count_of_long_literal(selected)?,
@@ -2413,7 +2424,7 @@ mod tests {
     }
 
     /// `config`, trusting the built-in aggregate functions of DataFusion (see
-    /// [`TrustedAggregateFunctions`]).
+    /// `TrustedAggregateFunctions`).
     fn trusting(config: SessionConfig) -> SessionConfig {
         let functions = datafusion::functions_aggregate::all_default_aggregate_functions();
         config.with_option_extension(PhysicalHashAggregate::trusted_aggregate_functions(
@@ -2771,9 +2782,11 @@ mod tests {
         // is not an integer, whose cast fails: DataFusion fails on the negative
         // value. So does the native aggregation, on a single thread, of a
         // single stage (of a partition) and of two (of two partitions, one of
-        // them empty): the rows of aggregations with aggregates do not bypass
-        // the tables (see `AggregateSpec::bypass`), whose accumulators
-        // aggregate every row when it is consumed.
+        // them empty), also in a session that trusts DataFusion's built-in
+        // aggregate functions: the rows of aggregations with aggregates whose
+        // functions the session does not trust do not bypass the tables (see
+        // `AggregateSpec::rows_bypass_tables`), whose accumulators aggregate
+        // every row when it is consumed.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -2797,10 +2810,7 @@ mod tests {
         ];
         let sql =
             "SELECT k, non_negative_sum(v), SUM(CAST(s AS BIGINT)) FROM t GROUP BY k";
-        for (partitions, bypass) in [
-            (vec![batches.clone()], false),
-            (vec![batches.clone(), vec![]], false),
-        ] {
+        for partitions in [vec![batches.clone()], vec![batches.clone(), vec![]]] {
             let setup = async |ctx: &SessionContext| -> Result<()> {
                 let table = datafusion::datasource::MemTable::try_new(
                     Arc::clone(&schema),
@@ -2815,7 +2825,7 @@ mod tests {
                 ctx.register_udaf(datafusion_expr::AggregateUDF::from(udaf));
                 Ok(())
             };
-            let config = test_session_config().with_target_partitions(1);
+            let config = trusting(test_session_config().with_target_partitions(1));
             let ctx = datafusion_context(config.clone());
             setup(&ctx).await?;
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
@@ -2824,9 +2834,8 @@ mod tests {
                 lower,
             )?
             .expect("a lowered aggregation");
-            assert_eq!(
-                aggregate.spec().bypass,
-                bypass,
+            assert!(
+                !aggregate.spec().rows_bypass_tables(config.options()),
                 "{} partitions",
                 partitions.len()
             );
