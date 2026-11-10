@@ -53,7 +53,13 @@
 //!   `CoalescePartitionsExec`s that DataFusion puts below the join). The
 //!   output keeps the order of the probe side; a probe chunk whose matches
 //!   do not fit in a chunk of [`DEFAULT_VECTOR_SIZE`] rows is continued with
-//!   [`OperatorResult::HaveMoreOutput`].
+//!   [`OperatorResult::HaveMoreOutput`]. The probe keys of a chunk with a
+//!   selection are taken from its selected rows, but its other columns are not
+//!   compacted: only the probe rows of the output are taken from them, and the
+//!   `RightSemi`, `RightAnti` and `RightMark` joins (whose output has no build
+//!   columns) output the columns of the probe chunk themselves, with a
+//!   selection of the probe rows they emit (see
+//!   [`PhysicalHashJoin::start_chunk`]).
 //! * **Final build rows** (the join as source, pipeline 3): the `Left`,
 //!   `Full`, `LeftSemi`, `LeftAnti` and `LeftMark` joins track the build
 //!   rows that found a match in an atomic bitset, and once the probe
@@ -121,6 +127,7 @@
 
 use std::any::Any;
 use std::fmt::Write;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -172,7 +179,7 @@ use datafusion_physical_plan::{
 };
 use parking_lot::Mutex;
 
-use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, Gather, SelectionVector};
 use crate::join::hash_table::{
     ChainScan, JoinHashTable, JoinHashTableBuilder, hash_join_keys,
     radix_bits_for_threads,
@@ -185,6 +192,7 @@ use crate::operator::{
 };
 use crate::operators::adaptive_filter::is_infallible;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::tuple_data::layout::has_run_end_encoded;
 use crate::tuple_data::{PartitionedTupleData, RowLocation, TupleDataLayout};
 
 /// A hash join that builds a shared hash table on its left input and probes
@@ -244,6 +252,17 @@ struct JoinSpec {
     /// clears this for the joins that have one), or for a single key of an
     /// integer type, a candidate for its perfect hash join (`ArrayMap`).
     defers_build_key_errors: bool,
+    /// The probe columns of the probe keys, if all of them are columns: the
+    /// join then only compacts these columns of a probe chunk with a selection
+    /// (see [`PhysicalHashJoin::start_chunk`]).
+    probe_key_columns: Option<Vec<usize>>,
+    /// Whether the join compacts the probe chunks with a selection, also if
+    /// its probe keys are columns: if it outputs (or filters on) probe columns
+    /// with run-end encoded values, which Arrow's `take` encodes again (runs
+    /// of equal values are merged), so that taking the rows of the compacted
+    /// chunk, as DataFusion takes the rows of its filtered batches, can differ
+    /// from taking them from the chunk directly.
+    compacts_probe_chunks: bool,
 }
 
 impl JoinSpec {
@@ -398,6 +417,26 @@ impl JoinSpec {
             ),
             _ => true,
         };
+        let num_probe_columns = probe_schema.fields().len();
+        let probe_key_columns = on
+            .iter()
+            .map(|(_, probe_key)| {
+                probe_key
+                    .downcast_ref::<Column>()
+                    .map(Column::index)
+                    .filter(|&index| index < num_probe_columns)
+            })
+            .collect::<Option<Vec<_>>>();
+        let compacts_probe_chunks = column_indices
+            .iter()
+            .chain(filter.iter().flat_map(|filter| filter.column_indices()))
+            .filter(|column| column.side == JoinSide::Right)
+            .any(|column| {
+                probe_schema
+                    .fields()
+                    .get(column.index)
+                    .is_none_or(|field| has_run_end_encoded(field.data_type()))
+            });
         Ok(Self {
             join_type,
             on,
@@ -413,6 +452,8 @@ impl JoinSpec {
             payload,
             build_columns,
             defers_build_key_errors,
+            probe_key_columns,
+            compacts_probe_chunks,
         })
     }
 
@@ -884,6 +925,42 @@ impl PhysicalHashJoin {
         let Some(chunk) = current.as_mut() else {
             return internal_err!("PhysicalHashJoin has no probe chunk");
         };
+        // Without a filter, a probe row has a match if and only if it has a
+        // chain: the joins that emit every probe row at most once (and no
+        // build column) emit all of their output for the chunk at once,
+        // without walking the chains.
+        if spec.filter.is_none()
+            && matches!(
+                spec.join_type,
+                JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+            )
+        {
+            let rows = chain_scan.skip_rows(DEFAULT_VECTOR_SIZE);
+            *output = match spec.join_type {
+                JoinType::RightMark => {
+                    let marks = rows.clone().map(|row| chain_scan.has_matches(row));
+                    self.marked_probe_chunk(chunk, rows, marks)?
+                }
+                join_type => {
+                    let semi = join_type == JoinType::RightSemi;
+                    let rows = rows
+                        .filter(|&row| {
+                            if chain_scan.has_matches(row) {
+                                semi
+                            } else {
+                                !semi && chunk.emits_unmatched(row)
+                            }
+                        })
+                        .map(|row| row as u32)
+                        .collect();
+                    self.selected_probe_chunk(chunk, rows)?
+                }
+            };
+            if chain_scan.is_done() {
+                *current = None;
+            }
+            return Ok(());
+        }
         let unmatched_cost = usize::from(spec.emits_unmatched_probe_rows());
         let scan = chain_scan.next_batch(
             table,
@@ -893,7 +970,7 @@ impl PhysicalHashJoin {
             matches,
         );
         if let Some(filter) = &spec.filter {
-            self.apply_filter(filter, table, &chunk.batch, probe_rows, matches)?;
+            self.apply_filter(filter, table, chunk, probe_rows, matches)?;
         }
         table.mark_matched(matches);
 
@@ -910,14 +987,19 @@ impl PhysicalHashJoin {
         };
         match spec.join_type {
             JoinType::Inner | JoinType::Left => {
-                let probe = UInt32Array::from(probe_rows.clone());
+                // The probe rows of the pairs are taken by the output (no copy
+                // of them), and their buffer is reused for the next batch.
+                let mut rows = std::mem::take(probe_rows);
+                chunk.to_physical(&mut rows);
+                let probe = UInt32Array::from(rows);
                 *output = self.output_chunk(
                     table,
                     probe.len(),
                     Some((matches.as_slice(), None)),
-                    Some((&chunk.batch, &probe)),
+                    Some((&chunk.columns, &probe)),
                     None,
                 )?;
+                *probe_rows = into_indices(probe);
             }
             JoinType::Right | JoinType::Full => {
                 // The matches of every probe row, followed by the probe row
@@ -944,12 +1026,13 @@ impl PhysicalHashJoin {
                     output_build.push(Some(pair as u32));
                 }
                 let build_take = padded.then(|| UInt32Array::from(output_build));
+                chunk.to_physical(&mut output_probe);
                 let probe = UInt32Array::from(output_probe);
                 *output = self.output_chunk(
                     table,
                     probe.len(),
                     Some((matches.as_slice(), build_take.as_ref())),
-                    Some((&chunk.batch, &probe)),
+                    Some((&chunk.columns, &probe)),
                     None,
                 )?;
             }
@@ -968,23 +1051,16 @@ impl PhysicalHashJoin {
                         JoinType::RightAnti if !matched && chunk.emits_unmatched(row) => {
                             rows.push(row as u32)
                         }
-                        JoinType::RightMark => {
-                            rows.push(row as u32);
-                            marks.push(matched);
-                        }
+                        JoinType::RightMark => marks.push(matched),
                         _ => {}
                     }
                 }
-                let mark = (spec.join_type == JoinType::RightMark)
-                    .then(|| Arc::new(BooleanArray::from(marks)) as ArrayRef);
-                let probe = UInt32Array::from(rows);
-                *output = self.output_chunk(
-                    table,
-                    probe.len(),
-                    None,
-                    Some((&chunk.batch, &probe)),
-                    mark.as_ref(),
-                )?;
+                *output = match spec.join_type {
+                    JoinType::RightMark => {
+                        self.marked_probe_chunk(chunk, scan.start..scan.end, marks)?
+                    }
+                    _ => self.selected_probe_chunk(chunk, rows)?,
+                };
             }
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
                 // The build rows are emitted once the probe side is exhausted.
@@ -1002,7 +1078,7 @@ impl PhysicalHashJoin {
         &self,
         filter: &JoinFilter,
         table: &JoinHashTable,
-        batch: &RecordBatch,
+        chunk: &ProbeChunk,
         probe_rows: &mut Vec<u32>,
         matches: &mut Vec<RowLocation>,
     ) -> Result<()> {
@@ -1020,7 +1096,9 @@ impl PhysicalHashJoin {
             .collection()
             .gather_columns(matches, &build_columns)?
             .into_iter();
-        let probe_indices = UInt32Array::from(probe_rows.clone());
+        let mut physical_rows = probe_rows.clone();
+        chunk.to_physical(&mut physical_rows);
+        let probe_indices = UInt32Array::from(physical_rows);
         let columns = filter
             .column_indices()
             .iter()
@@ -1028,7 +1106,7 @@ impl PhysicalHashJoin {
                 JoinSide::Left => build_arrays.next().ok_or_else(|| {
                     internal_datafusion_err!("Missing build column of the join filter")
                 }),
-                JoinSide::Right => take_rows(batch.column(column.index), &probe_indices),
+                JoinSide::Right => take_rows(chunk.column(column.index)?, &probe_indices),
                 JoinSide::None => {
                     internal_err!("A join filter cannot read the mark column")
                 }
@@ -1064,15 +1142,15 @@ impl PhysicalHashJoin {
     ///   taken at the indices `build.1` (into `build.0`) if given, which are
     ///   NULL for the rows without a build row; NULL if `build` is `None` or
     ///   has no rows;
-    /// * the probe columns are taken from the rows `probe.1` of `probe.0`;
-    ///   NULL if `probe` is `None`;
+    /// * the probe columns are taken from the rows `probe.1` of the (physical)
+    ///   probe columns `probe.0`; NULL if `probe` is `None`;
     /// * the mark column is `mark`.
     fn output_chunk(
         &self,
         table: &JoinHashTable,
         num_rows: usize,
         build: Option<(&[RowLocation], Option<&UInt32Array>)>,
-        probe: Option<(&RecordBatch, &UInt32Array)>,
+        probe: Option<(&[ArrayRef], &UInt32Array)>,
         mark: Option<&ArrayRef>,
     ) -> Result<DataChunk> {
         let spec = &self.spec;
@@ -1125,9 +1203,10 @@ impl PhysicalHashJoin {
                     None => Ok(new_null_array(field.data_type(), num_rows)),
                 },
                 JoinSide::Right => match probe {
-                    Some((batch, indices)) => {
-                        take_rows(batch.column(column.index), indices)
-                    }
+                    Some((columns, indices)) => match columns.get(column.index) {
+                        Some(array) => take_rows(array, indices),
+                        None => internal_err!("Missing probe column of the join"),
+                    },
                     None => Ok(new_null_array(field.data_type(), num_rows)),
                 },
                 JoinSide::None => mark.map(Arc::clone).ok_or_else(|| {
@@ -1138,9 +1217,96 @@ impl PhysicalHashJoin {
         DataChunk::try_new(Arc::clone(&spec.schema), columns, None)
     }
 
+    /// The output chunk of the probe rows `rows` (logical rows of `chunk`) of
+    /// a join whose output has probe columns only (`RightSemi` and
+    /// `RightAnti`): the probe columns of `chunk` (no copy), with a selection
+    /// of the physical rows of `rows` (none if they are all physical rows, in
+    /// order). The columns are taken when the chunk is compacted, e.g. by the
+    /// operator above, as DataFusion takes them from its probe batches.
+    fn selected_probe_chunk(
+        &self,
+        chunk: &ProbeChunk,
+        mut rows: Vec<u32>,
+    ) -> Result<DataChunk> {
+        let spec = &self.spec;
+        if rows.is_empty() {
+            return Ok(DataChunk::empty(Arc::clone(&spec.schema)));
+        }
+        if spec.schema.fields().is_empty() {
+            return DataChunk::try_new_without_columns(
+                Arc::clone(&spec.schema),
+                rows.len(),
+            );
+        }
+        let columns = spec
+            .column_indices
+            .iter()
+            .map(|column| match column.side {
+                JoinSide::Right => chunk.column(column.index).map(Arc::clone),
+                _ => {
+                    internal_err!("A {} join only outputs probe columns", spec.join_type)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        chunk.to_physical(&mut rows);
+        let selection = chunk.selection_of(rows);
+        DataChunk::try_new(Arc::clone(&spec.schema), columns, selection)
+    }
+
+    /// The output chunk of a `RightMark` join of the probe rows `rows` of
+    /// `chunk`, whose marks are `marks` (one per row of `rows`): like
+    /// [`Self::selected_probe_chunk`], the probe columns of `chunk` (no copy)
+    /// with a selection of the physical rows of `rows`, and a mark column with
+    /// a value for every physical row (`false` for the rows not in `rows`).
+    fn marked_probe_chunk(
+        &self,
+        chunk: &ProbeChunk,
+        rows: Range<usize>,
+        marks: impl IntoIterator<Item = bool>,
+    ) -> Result<DataChunk> {
+        let spec = &self.spec;
+        if rows.is_empty() {
+            return Ok(DataChunk::empty(Arc::clone(&spec.schema)));
+        }
+        if spec.schema.fields().is_empty() {
+            return DataChunk::try_new_without_columns(
+                Arc::clone(&spec.schema),
+                rows.len(),
+            );
+        }
+        let mut physical_rows = rows.map(|row| row as u32).collect::<Vec<_>>();
+        chunk.to_physical(&mut physical_rows);
+        let mut physical_marks = vec![false; chunk.physical_len];
+        for (&row, mark) in physical_rows.iter().zip(marks) {
+            physical_marks[row as usize] = mark;
+        }
+        let mark: ArrayRef = Arc::new(BooleanArray::from(physical_marks));
+        let columns = spec
+            .column_indices
+            .iter()
+            .map(|column| match column.side {
+                JoinSide::Right => chunk.column(column.index).map(Arc::clone),
+                JoinSide::None => Ok(Arc::clone(&mark)),
+                JoinSide::Left => {
+                    internal_err!("A RightMark join does not output build columns")
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let selection = chunk.selection_of(physical_rows);
+        DataChunk::try_new(Arc::clone(&spec.schema), columns, selection)
+    }
+
     /// Start probing the rows of `input`, resetting `scan` to the scan of
     /// their matches. Returns `None` if the rows cannot produce any output
     /// and do not need to be looked up.
+    ///
+    /// The keys are evaluated on the logical rows only: a key of a row that a
+    /// filter removed must not raise an error. Probe keys that are columns
+    /// (see [`JoinSpec::probe_key_columns`]) are taken from the logical rows of
+    /// the chunk, whose other columns are not compacted: the join only takes
+    /// the probe rows that it outputs from them (or, for `RightSemi`,
+    /// `RightAnti` and `RightMark` joins, selects them, see
+    /// [`Self::selected_probe_chunk`]), not the rows that match nothing.
     fn start_chunk(
         &self,
         state: &mut ProbeState,
@@ -1155,14 +1321,36 @@ impl PhysicalHashJoin {
         } = state;
         let table: &JoinHashTable = table;
         let spec = &self.spec;
-        // Evaluate the keys on the logical rows only: a key of a row that a
-        // filter removed must not raise an error.
-        let batch = input.compact()?;
-        let num_rows = batch.num_rows();
-        let keys = evaluate_expressions_to_arrays(
-            spec.on.iter().map(|(_, probe)| probe),
-            &batch,
-        )?;
+        let num_rows = input.len();
+        let (columns, selection, keys) =
+            match (input.selection(), &spec.probe_key_columns) {
+                (Some(selection), Some(key_columns))
+                    if !spec.compacts_probe_chunks && !input.columns().is_empty() =>
+                {
+                    let gather = Gather::new(
+                        selection,
+                        input.physical_len(),
+                        key_columns
+                            .iter()
+                            .map(|&column| input.column(column).data_type()),
+                    );
+                    let keys = key_columns
+                        .iter()
+                        .map(|&column| gather.column(input.column(column)))
+                        .collect::<Result<Vec<_>>>()?;
+                    (input.columns().to_vec(), Some(selection.clone()), keys)
+                }
+                _ => {
+                    let batch = input.compact()?;
+                    let keys = evaluate_expressions_to_arrays(
+                        spec.on.iter().map(|(_, probe)| probe),
+                        &batch,
+                    )?;
+                    let (_, columns, _) = batch.into_parts();
+                    (columns, None, keys)
+                }
+            };
+        let physical_len = columns.first().map_or(num_rows, |column| column.len());
         let mut exclude_null_keys = false;
         if spec.null_aware {
             match spec.join_type {
@@ -1221,7 +1409,9 @@ impl PhysicalHashJoin {
             }
         }
         Ok(Some(ProbeChunk {
-            batch,
+            columns,
+            selection,
+            physical_len,
             matched_in_progress: false,
             excluded,
         }))
@@ -1350,6 +1540,15 @@ fn select(
         .filter(|&(_, &flag)| keep(flag))
         .map(|(&value, _)| value)
         .collect()
+}
+
+/// The buffer of the indices `indices`, to reuse it (a new one if the buffer is
+/// shared, e.g. by a slice).
+fn into_indices(indices: UInt32Array) -> Vec<u32> {
+    let (_, values, _) = indices.into_parts();
+    let mut indices = values.into_inner().into_vec().unwrap_or_default();
+    indices.clear();
+    indices
 }
 
 /// The rows `indices` of `array`: zero copy if they are a contiguous range.
@@ -1988,10 +2187,16 @@ struct ProbeState {
 
 impl OperatorState for ProbeState {}
 
-/// A probe chunk being joined.
+/// A probe chunk being joined. Its (logical) rows are the probe rows of the
+/// [`ChainScan`] of their matches.
 struct ProbeChunk {
-    /// The (logical) rows of the chunk.
-    batch: RecordBatch,
+    /// The physical columns of the chunk.
+    columns: Vec<ArrayRef>,
+    /// The physical row of every probe row, if the chunk was not compacted
+    /// (see [`PhysicalHashJoin::start_chunk`]).
+    selection: Option<SelectionVector>,
+    /// The number of physical rows of the columns.
+    physical_len: usize,
     /// Whether the probe row in progress of the scan of the matches found a
     /// match in a previous batch.
     matched_in_progress: bool,
@@ -2007,6 +2212,31 @@ impl ProbeChunk {
         self.excluded
             .as_ref()
             .is_none_or(|valid| valid.is_valid(row))
+    }
+
+    /// The physical column `index`.
+    fn column(&self, index: usize) -> Result<&ArrayRef> {
+        self.columns.get(index).ok_or_else(|| {
+            internal_datafusion_err!("Missing probe column {index} of the join")
+        })
+    }
+
+    /// Replace the probe rows `rows` by their physical rows.
+    fn to_physical(&self, rows: &mut [u32]) {
+        if let Some(selection) = &self.selection {
+            let physical = selection.indices();
+            for row in rows {
+                *row = physical[*row as usize];
+            }
+        }
+    }
+
+    /// The selection of the physical rows `rows` of the columns: `None` if
+    /// they are all physical rows, in order.
+    fn selection_of(&self, rows: Vec<u32>) -> Option<SelectionVector> {
+        let all = rows.len() == self.physical_len
+            && rows.iter().enumerate().all(|(i, &row)| row as usize == i);
+        (!all).then(|| SelectionVector::from(rows))
     }
 }
 
@@ -4099,6 +4329,225 @@ mod tests {
                 schema: plan.schema(),
                 batches,
                 plan,
+                ordered: false,
+            };
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!("{join_type}: {message}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A streaming operator that passes its input chunks on unchanged, and
+    /// records them.
+    #[derive(Debug)]
+    struct Recorder {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        chunks: Arc<Mutex<Vec<DataChunk>>>,
+    }
+
+    impl PhysicalOperator for Recorder {
+        fn name(&self) -> &str {
+            "Recorder"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn execute(
+            &self,
+            _ctx: &ExecutionContext,
+            input: &DataChunk,
+            output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            self.chunks.lock().push(input.clone());
+            *output = input.clone();
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    /// DataFusion's join of the (logical) rows of `build` and `probe` (chunks
+    /// of the test inputs) on `l<key> = r<key>`, with the filter `filter`.
+    async fn datafusion_join_of_chunks(
+        build: &DataChunk,
+        probe: &DataChunk,
+        join_type: JoinType,
+        key: &str,
+        filter: Option<JoinFilter>,
+    ) -> Result<EngineOutput> {
+        let scan = |chunk: &DataChunk| -> Result<Arc<dyn ExecutionPlan>> {
+            let batch = chunk.compact()?;
+            Ok(MemorySourceConfig::try_new_exec(
+                &[vec![batch.clone()]],
+                batch.schema(),
+                None,
+            )?)
+        };
+        let (left, right) = (scan(build)?, scan(probe)?);
+        let on = vec![(
+            col(&format!("l{key}"), &left.schema())?,
+            col(&format!("r{key}"), &right.schema())?,
+        )];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            filter,
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+        Ok(EngineOutput {
+            schema: plan.schema(),
+            batches: collect(Arc::clone(&plan), task_ctx()).await?,
+            plan,
+            ordered: false,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_chunks_with_a_selection_are_not_compacted() -> Result<()> {
+        // Probe chunks with and without a selection (of two thirds of their
+        // rows), with keys of integers (a dense index) and strings (hashed
+        // tables), with and without a filter. The joins whose output only has
+        // probe columns (and a mark) select the probe rows: their output has
+        // the probe columns themselves, with a selection; the others take the
+        // probe rows of their output from the columns.
+        let build = DataChunk::from_record_batch(data_batch("l", 0..60, 0));
+        let probe = data_batch("r", 0..900, 1);
+        let rows = (0..900).filter(|i| i % 3 != 1).collect::<Vec<u32>>();
+        let probes = [
+            DataChunk::from_record_batch(probe.clone()),
+            DataChunk::from_record_batch(probe.clone())
+                .with_selection(SelectionVector::from(rows))?,
+        ];
+        for probe_chunk in &probes {
+            for key in ["k", "s"] {
+                for filter in [None, Some(("id", Operator::Lt, "id"))] {
+                    for join_type in ALL_JOIN_TYPES {
+                        let case = format!(
+                            "{join_type} on {key}, filter {filter:?}, selection {}",
+                            probe_chunk.selection().is_some()
+                        );
+                        let on = vec![(
+                            col(&format!("l{key}"), &data_schema("l"))?,
+                            col(&format!("r{key}"), &data_schema("r"))?,
+                        )];
+                        let join_filter =
+                            filter.map(|(left, op, right)| join_filter(left, op, right));
+                        let join = Arc::new(PhysicalHashJoin::try_new(
+                            Arc::new(TestSource::with_schema(
+                                data_schema("l"),
+                                vec![build.clone()],
+                            )),
+                            Arc::new(TestSource::with_schema(
+                                data_schema("r"),
+                                vec![probe_chunk.clone()],
+                            )),
+                            on,
+                            join_filter.clone(),
+                            join_type,
+                            None,
+                            NullEquality::NullEqualsNothing,
+                            false,
+                        )?);
+                        let chunks = Arc::new(Mutex::new(vec![]));
+                        let recorder = Arc::new(Recorder {
+                            children: vec![join],
+                            chunks: Arc::clone(&chunks),
+                        });
+                        let batches =
+                            with_timeout(Executor::collect(recorder, task_ctx(), 3))
+                                .await?;
+                        let expected = datafusion_join_of_chunks(
+                            &build,
+                            probe_chunk,
+                            join_type,
+                            key,
+                            join_filter,
+                        )
+                        .await?;
+                        let actual = EngineOutput {
+                            schema: expected.schema.clone(),
+                            batches,
+                            plan: Arc::clone(&expected.plan),
+                            ordered: false,
+                        };
+                        if let Err(message) = compare_outputs(&expected, &actual) {
+                            panic!("{case}: {message}");
+                        }
+                        let selects = matches!(
+                            join_type,
+                            JoinType::RightSemi
+                                | JoinType::RightAnti
+                                | JoinType::RightMark
+                        );
+                        let chunks = chunks.lock();
+                        assert!(chunks.iter().any(|chunk| !chunk.is_empty()), "{case}");
+                        for chunk in chunks.iter().filter(|chunk| !chunk.is_empty()) {
+                            // The first columns of the output of the other
+                            // joins are build columns.
+                            let shared = (0..probe.num_columns())
+                                .all(|i| Arc::ptr_eq(chunk.column(i), probe.column(i)));
+                            assert_eq!(shared, selects, "{case}");
+                            // A selection, unless all rows are selected.
+                            if selects {
+                                assert!(
+                                    chunk.selection().is_some()
+                                        || chunk.len() == probe.num_rows(),
+                                    "{case}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn semi_anti_and_mark_joins_of_large_probe_chunks() -> Result<()> {
+        // A probe chunk of more than `DEFAULT_VECTOR_SIZE` rows: the joins that
+        // select their probe rows still output chunks of at most that many.
+        let build = DataChunk::from_record_batch(data_batch("l", 0..50, 0));
+        let probe = DataChunk::from_record_batch(data_batch("r", 0..5000, 1));
+        for join_type in [
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+            JoinType::RightMark,
+        ] {
+            let join = join_of(
+                Arc::new(TestSource::with_schema(
+                    data_schema("l"),
+                    vec![build.clone()],
+                )),
+                Arc::new(TestSource::with_schema(
+                    data_schema("r"),
+                    vec![probe.clone()],
+                )),
+                join_type,
+            )?;
+            let batches = with_timeout(Executor::collect(join, task_ctx(), 2)).await?;
+            assert!(
+                batches.iter().all(|b| b.num_rows() <= DEFAULT_VECTOR_SIZE),
+                "{join_type}"
+            );
+            let expected =
+                datafusion_join_of_chunks(&build, &probe, join_type, "k", None).await?;
+            let actual = EngineOutput {
+                schema: expected.schema.clone(),
+                batches,
+                plan: Arc::clone(&expected.plan),
                 ordered: false,
             };
             if let Err(message) = compare_outputs(&expected, &actual) {
