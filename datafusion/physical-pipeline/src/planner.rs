@@ -123,10 +123,20 @@
 //!   DataFusion's join coalesces its output, like `FilterExec`. And one whose
 //!   build side (all of its columns) may fail to concatenate, which
 //!   DataFusion's join does with its whole build side. And one with
-//!   a dynamic filter whose probe side may fail (e.g. a scan of files):
-//!   DataFusion's scans skip the reads that the filter rejects. So do they
-//!   for the dynamic filter of a TopK: a TopK whose dynamic filter a node of
-//!   its input consumes is left to DataFusion if its input may fail.
+//!   a dynamic filter whose probe side may fail (e.g. decimal arithmetic
+//!   above a scan of Parquet files): DataFusion's scans skip the reads that
+//!   the filter rejects, which the native join sets to other values.
+//! * A TopK whose dynamic filter a node of its input reads (a scan of Parquet
+//!   files), through other nodes than those that only pass rows on (scans,
+//!   projections, filters, unions, merges and repartitionings of partitions,
+//!   without a fetch), or above work that may fail: DataFusion's TopK
+//!   tightens the filter, and its scans skip the reads that it rejects, at
+//!   other times than the native TopK, so that they read other rows. But for
+//!   a TopK whose filter is only read below nodes that read all of their
+//!   input before the TopK sees a row (aggregations, sorts and the build
+//!   sides of joins, e.g. the aggregation of TPC-H Q18): the filter prunes
+//!   nothing in either engine. The native TopK updates the filter, so that the
+//!   scans skip the reads that its threshold rules out.
 //! * A `FilterExec`, or a node that coalesces batches (a `CoalesceBatchesExec`,
 //!   or a `RepartitionExec` over a bounded input, which coalesces the batches
 //!   of its output partitions, also below a hash join, which removes the
@@ -778,6 +788,13 @@ impl Lowering<'_> {
     /// [`conflict`]): DataFusion evaluates the keys once it read all of its
     /// input, the native sort whenever it sorts a run of its input, before it
     /// read all of it.
+    ///
+    /// A TopK whose dynamic filter a node of its input reads (a scan of
+    /// Parquet files, which skips the reads that the filter rejects) is lowered
+    /// if the filter prunes nothing in either engine, or only rows on which the
+    /// work of its input cannot fail (see [`TopKFilterPruning`]), so that the
+    /// scans read other rows in the two engines without making a difference:
+    /// the native TopK then updates the filter, as DataFusion's TopK does.
     fn try_lower_sort(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1019,8 +1036,8 @@ impl Lowering<'_> {
         // side may fail on the rows that DataFusion skips is left to
         // DataFusion (see [`subtree_failures`]: e.g. a probe side with an
         // expression that may fail, or a source that may fail to read its
-        // rows, but for scans of Parquet and CSV files whose expressions
-        // cannot fail, as in TPC-H).
+        // rows, but for scans of well-formed Parquet files whose expressions
+        // cannot fail, as in TPC-H, see [`source_may_fail`]).
         if !plan.dynamic_expressions_produced().is_empty()
             && !subtree_failures(join.right()).is_none()
         {
