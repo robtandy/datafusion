@@ -1986,16 +1986,25 @@ mod tests {
         Ok(())
     }
 
-    /// `COUNT(<1,100,000-byte string>) FILTER (WHERE p) GROUP BY k` over a
-    /// single partition: 32,768 distinct keys (which fill the thread-local
-    /// table of a thread, whose rows then bypass it), followed by 2,048 rows of
-    /// a new key; `p` is true for the rows of `selected`. As many copies of the
-    /// literal as there are rows of a chunk would overflow the offsets of an
-    /// array of strings: DataFusion builds them for the selected rows only.
+    /// `COUNT(<1,100,000-byte string>) FILTER (WHERE p) GROUP BY k`, see
+    /// [`count_of_literal`]. As many copies of the literal as there are rows of
+    /// a chunk would overflow the offsets of an array of strings: DataFusion
+    /// builds them for the selected rows only.
     fn count_of_long_literal(
         selected: fn(i64) -> bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        use datafusion_common::ScalarValue;
+        let literal = datafusion_common::ScalarValue::Utf8(Some("x".repeat(1_100_000)));
+        count_of_literal(literal, selected)
+    }
+
+    /// `COUNT(<literal>) FILTER (WHERE p) GROUP BY k` over a single partition:
+    /// 32,768 distinct keys (which fill the thread-local table of a thread,
+    /// whose rows then bypass it, if they may), followed by 2,048 rows of a new
+    /// key; `p` is true for the rows of `selected`.
+    fn count_of_literal(
+        literal: datafusion_common::ScalarValue,
+        selected: fn(i64) -> bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("p", DataType::Boolean, false),
@@ -2017,8 +2026,7 @@ mod tests {
         ]];
         let input =
             MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-        let literal = lit(ScalarValue::Utf8(Some("x".repeat(1_100_000))));
-        let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
+        let count = AggregateExprBuilder::new(count_udaf(), vec![lit(literal)])
             .schema(Arc::clone(&schema))
             .alias("count(literal)")
             .build()?;
@@ -2062,6 +2070,58 @@ mod tests {
                 32_769
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wide_fixed_size_binary_arguments_do_not_bypass_the_tables() -> Result<()> {
+        // `COUNT(<a NULL fixed-size binary of i32::MAX bytes>) FILTER (WHERE p)`
+        // with `p` false: aligned with the rows of a chunk, the argument would
+        // hold a `NULL` as wide as a value for each of its 2,048 rows (4 TiB),
+        // where DataFusion (and the regular path) evaluate it for no row.
+        let literal = datafusion_common::ScalarValue::FixedSizeBinary(i32::MAX, None);
+        let plan = count_of_literal(literal.clone(), |_| false)?;
+        let root = lower(&plan)?;
+        let aggregate = root
+            .downcast_ref::<PhysicalHashAggregate>()
+            .expect("a native aggregation");
+        // Checked before the execution, which would fail to allocate otherwise.
+        assert!(!aggregate.spec().bypass);
+        let narrow = count_of_literal(
+            datafusion_common::ScalarValue::FixedSizeBinary(256, None),
+            |_| false,
+        )?;
+        let narrow = lower(&narrow)?;
+        let narrow = narrow
+            .downcast_ref::<PhysicalHashAggregate>()
+            .expect("a native aggregation");
+        assert!(narrow.spec().bypass);
+        // Like DataFusion: 32,769 groups that count no row.
+        let task_ctx = Arc::new(TaskContext::default());
+        let actual = Executor::collect(root, Arc::clone(&task_ctx), 1).await?;
+        let expected = datafusion_physical_plan::collect(
+            count_of_literal(literal, |_| false)?,
+            task_ctx,
+        )
+        .await?;
+        let schema = plan.schema();
+        assert_eq!(
+            canonical_batch(&schema, &actual, false)?,
+            canonical_batch(&schema, &expected, false)?
+        );
+        let counts = actual
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(counts.len(), 32_769);
+        assert!(counts.iter().all(|&count| count == 0));
         Ok(())
     }
 
