@@ -849,12 +849,12 @@ fn compared_float_keys(ordering: &LexOrdering, schema: &Schema) -> Result<Vec<us
 }
 
 /// The most rows of a TopK whose rows have `Utf8` or `Binary` values that the
-/// native operators lower, see [`topk_rows_fit_into_arrays`].
+/// native operators lower (see [`try_lower`]).
 pub const MAX_TOPK_ROWS_WITH_OFFSETS: usize = 65_536;
 
 /// The most bytes of the `Utf8` and `Binary` values of the in-memory input of
-/// a TopK whose rows have such values that the native operators lower, see
-/// [`topk_rows_fit_into_arrays`]: half of what their 32-bit offsets address.
+/// a TopK whose rows have such values that the native operators lower (see
+/// [`try_lower`]): half of what their 32-bit offsets address.
 pub const MAX_TOPK_INPUT_OFFSET_BYTES: usize = 1 << 30;
 
 /// Whether the rows of `sort`, DataFusion's TopK of `fetch` rows, cannot
