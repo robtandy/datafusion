@@ -567,29 +567,40 @@ engines, and asserts their byte parity. `tpch_queries_are_lowered_as_listed`
 asserts the exact lowering of every TPC-H query (`TPCH_COVERAGE`): the
 numbers of native and of all operators, and the DataFusion plans that run in
 `BridgeOperator`s, each with why the native operators leave it to DataFusion.
-On 4 threads, with the sessions of the suite (which do not trust DataFusion's
-built-in functions, see `TrustedFunctions`):
+On 4 threads, with the sessions of the suite (which trust DataFusion's
+built-in functions by default, see `TrustedFunctions`):
 
-- Over `MemTable`s, 16 of the 22 queries run fully natively: Q1 to Q6, Q10,
-  Q12 to Q16 and Q18 to Q21. Their decimal arithmetic, which can only fail
-  with arithmetic overflows, is evaluated natively on any number of threads,
-  and so are the scalar subqueries of Q15 (`ScalarSubqueryExec`).
-- The native projection refuses the projections of Q7 and Q9 (`date_part`,
-  which the classification of errors only knows in sessions that trust
-  DataFusion's built-in functions), of Q8 (a decimal division by a sum that
-  may be 0, which may fail with several kinds of errors) and of Q22
-  (`substr`, likewise untrusted, whose repartitioning over `MemTable`s, and
-  filter over Parquet, stay in DataFusion too).
-- The filter and the projection of Q11 cast decimals, which may fail with
-  other errors than overflows (whose messages name the values that fail), so
-  they stay in DataFusion on several threads; the semi join of Q17 has a
-  residual filter with decimal arithmetic, which DataFusion evaluates on whole
-  batches of candidate pairs.
-- Over Parquet, 13 queries run fully natively: the hash joins of Q15 and Q20
-  have dynamic filters that prune the reads of the Parquet scans below them
-  (whose decimal arithmetic may fail on the rows that DataFusion skips), and
-  the TopK of Q18 a dynamic filter that prunes the scan of `orders`: they stay
-  in DataFusion too.
+- Over `MemTable`s, 21 of the 22 queries run fully natively: all but Q8. Their
+  decimal arithmetic, and the casts of numbers into decimals with which Q11
+  compares the sums of its groups with its scalar subquery, can only fail
+  with overflows, and are evaluated natively on any number of threads, as are
+  the scalar subqueries of Q11, Q15 and Q22 (`ScalarSubqueryExec`), the
+  `date_part` of Q7 to Q9, the `substr` of Q22 and the residual filter of the
+  semi join of Q17. The native projection refuses the projection of Q8: a
+  decimal division by a sum that may be 0, which may fail with several kinds
+  of errors.
+- Over Parquet, 18 queries run fully natively: all but Q8 and the queries
+  whose hash joins have dynamic filters that prune the reads of the Parquet
+  scans of their probe sides, below work that may fail on the rows that
+  DataFusion skips (the native join sets its filter to other values, the
+  bounds of its build keys): the decimal arithmetic of the revenues of Q15,
+  the cast into a decimal of the average quantities of Q17, and the residual
+  filter of the semi join of Q20.
+- The TopK of Q18 has a dynamic filter that the scan of `orders` reads, below
+  hash joins and an aggregation, which reads all of its input before the
+  TopK sees its first group: in both engines, the filter prunes nothing, and
+  the TopK is native (see `Lowering::try_lower_sort`). So are the TopKs whose
+  dynamic filters scans read through nodes that only pass rows on, without
+  work that may fail on the rows they prune, e.g. the `LIKE` of ClickBench's
+  `hits23`: the native TopK updates the filter, so that the scans of Parquet
+  files skip the reads that its threshold rules out.
+
+The scans of Parquet files are judged to read well-formed files: files whose
+columns have the types of their table, as DataFusion infers the schema of a
+table from its files. A file whose columns DataFusion casts into the types
+of its table (when the schema of the table is given) may fail to be read, on
+rows that a dynamic filter prunes in only one of the engines. The scans of
+CSV files may fail to parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
