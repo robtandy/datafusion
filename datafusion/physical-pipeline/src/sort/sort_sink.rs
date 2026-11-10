@@ -11,7 +11,8 @@
 //!   pushes and buffers them in its local sink state. Once it buffered
 //!   [`SORT_RUN_ROWS`] rows (or about [`SORT_RUN_BYTES`] bytes), it sorts them
 //!   into a [`SortedRun`] (with `lexsort_to_indices` and `take` for a single
-//!   sort key of a primitive, boolean, string or binary type, by their keys in
+//!   sort key of a primitive, boolean, string or binary type, whose sorted
+//!   values the run keeps and the merge compares directly, by their keys in
 //!   the Arrow row format otherwise), so that the runs fit in Arrow arrays and
 //!   the threads sort while they read their input;
 //! * [`combine`](PhysicalOperator::combine): the thread sorts the rest of its

@@ -28,9 +28,14 @@
 //!   thread, which keeps the order, as DataFusion reads the single partition
 //!   of the merge.
 //!
-//! The sort keys of the runs are encoded in the Arrow row format, in which
-//! comparing two keys is a `memcmp`, so the merge works for every sort key
-//! the row format supports (sorts of other keys are left to DataFusion).
+//! A single sort key of a type that [`compares_directly`] (integers, floats,
+//! decimals, temporal values, booleans, strings and binary values) is not
+//! encoded: the runs hold its sorted values, which the merge compares
+//! directly in the typed arrays (in the order of the row format, floats in
+//! their total order). The keys of all other sorts are encoded in the Arrow
+//! row format, in which comparing two keys is a `memcmp`, so the merge works
+//! for every sort key the row format supports (sorts of other keys are left
+//! to DataFusion).
 //!
 //! # Lowering
 //!
@@ -65,13 +70,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
-use arrow::compute::{SortColumn, concat, lexsort_to_indices, take};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt32Array};
+use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
-use arrow_row::{RowConverter, SortField};
+use arrow_row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{Result, exec_datafusion_err, internal_err};
+use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err};
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::LexOrdering;
@@ -102,8 +107,8 @@ pub mod merge;
 pub mod sort_sink;
 pub mod topk_sink;
 
-pub use merge::{RunMerger, SortedRun};
-use merge::{gather_rows_in_batches, is_capacity_error};
+pub use merge::{KeyColumn, RunKeys, RunMerger, SortedRun, compares_directly};
+use merge::{gather_rows_in_batches, gather_values, is_capacity_error};
 pub use sort_sink::PhysicalSort;
 pub use topk_sink::{PhysicalTopK, TopKDynamicFilter};
 
@@ -901,17 +906,38 @@ fn has_floats(data_type: &DataType) -> bool {
 }
 
 /// The sort keys of a native sort: evaluates the sort expressions and sorts
-/// rows into [`SortedRun`]s, whose keys it encodes in the Arrow row format
-/// (with the same [`RowConverter`] for all runs, so that they can be
-/// merged).
+/// rows into [`SortedRun`]s.
+///
+/// A single sort key of a type that [`compares_directly`] (e.g. an integer,
+/// float, decimal, date, timestamp or string) is sorted with the sort kernel
+/// (`lexsort_to_indices`), and its runs hold the sorted key values
+/// ([`RunKeys::Column`]), which the merge compares directly: the keys are
+/// never encoded. Other sort keys are encoded in the Arrow row format, with
+/// the same [`RowConverter`] for all runs, so that they can be merged.
 #[derive(Debug)]
 pub(crate) struct SortKeys {
     ordering: LexOrdering,
     converter: RowConverter,
-    /// Sort with `lexsort_to_indices` rather than by the encoded keys: a
-    /// single sort key of a type that `sort_to_indices` orders exactly like
-    /// the row format (primitive, boolean, string and binary types).
-    sort_with_kernel: bool,
+    /// A single sort key that [`compares_directly`]: sorted with
+    /// `lexsort_to_indices`, which orders it exactly like the row format, and
+    /// compared directly in the runs.
+    direct: bool,
+    /// The column of the rows that the single direct sort key is, if it is
+    /// one: the runs take their keys from their rows.
+    key_column: Option<usize>,
+}
+
+/// The sorted keys of the rows of [`SortKeys::sort`].
+enum SortedKeys {
+    /// Encoded rows.
+    Rows(arrow_row::Rows),
+    /// The values of the single sort key.
+    Values(ArrayRef),
+    /// The single sort key is this column of the rows.
+    Column(usize),
+    /// The values of the single sort key, which do not fit into one array:
+    /// gathered with the rows of every run.
+    Gather,
 }
 
 impl SortKeys {
@@ -926,12 +952,19 @@ impl SortKeys {
             })
             .collect::<Vec<_>>();
         let converter = RowConverter::new(fields)?;
-        let sort_with_kernel =
-            matches!(types.as_slice(), [data_type] if sorts_like_rows(data_type));
+        let direct =
+            matches!(types.as_slice(), [data_type] if compares_directly(data_type));
+        let key_column = ordering
+            .first()
+            .expr
+            .downcast_ref::<Column>()
+            .map(Column::index)
+            .filter(|_| direct);
         Ok(Self {
             ordering,
             converter,
-            sort_with_kernel,
+            direct,
+            key_column,
         })
     }
 
@@ -958,6 +991,18 @@ impl SortKeys {
             .collect()
     }
 
+    /// The sort key of row `row` of `run` (a run of these sort keys), encoded
+    /// in the Arrow row format.
+    pub(crate) fn encoded_key(&self, run: &SortedRun, row: usize) -> Result<OwnedRow> {
+        match run.keys() {
+            RunKeys::Rows(rows) => Ok(rows.row(row).owned()),
+            RunKeys::Column(column) => {
+                let values = column.values().slice(row, 1);
+                Ok(self.converter.convert_columns(&[values])?.row(0).owned())
+            }
+        }
+    }
+
     /// Sort the rows of `batches` into runs with schema `schema`, keeping
     /// only the first `limit` rows (all rows if `None`). The runs hold
     /// consecutive rows of the sort, in order: a single run, unless the rows
@@ -978,41 +1023,43 @@ impl SortKeys {
         if len == 0 {
             return Ok(vec![]);
         }
-        let num_rows_u32 = u32::try_from(num_rows)
-            .map_err(|_| exec_datafusion_err!("Cannot sort {num_rows} rows at once"))?;
+        if u32::try_from(num_rows).is_err() {
+            return exec_err!("Cannot sort {num_rows} rows at once");
+        }
         let limit = (len < num_rows).then_some(len);
-        let keys = batches
+        let key_values = batches
             .iter()
             .map(|batch| self.evaluate(batch))
             .collect::<Result<Vec<_>>>()?;
 
         // The positions of the sorted rows in the concatenation of `batches`,
-        // and the encoded keys of the sorted rows.
-        let sorted = match self.sort_with_kernel {
-            true => self.sort_with_kernel(&keys, limit)?,
-            false => None,
-        };
-        let (order, sorted_keys) = match sorted {
-            Some(sorted) => sorted,
-            None => {
-                let mut rows = self.converter.empty_rows(num_rows, 0);
-                for keys in &keys {
-                    self.converter.append(&mut rows, keys)?;
+        // and the sorted keys.
+        let (order, sorted_keys) = match self.direct {
+            true => match self.sort_with_kernel(&key_values, limit)? {
+                Some((indices, key)) => {
+                    let sorted_keys = match self.key_column {
+                        Some(column) => SortedKeys::Column(column),
+                        None => SortedKeys::Values(take(key.as_ref(), &indices, None)?),
+                    };
+                    (indices.values().to_vec(), sorted_keys)
                 }
-                let mut order = (0..num_rows_u32).collect::<Vec<_>>();
-                let compare =
-                    |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
-                if len < num_rows {
-                    order.select_nth_unstable_by(len - 1, compare);
-                    order.truncate(len);
+                None => {
+                    let (order, _) = self.order_by_rows(&key_values, num_rows, len)?;
+                    let sorted_keys = match self.key_column {
+                        Some(column) => SortedKeys::Column(column),
+                        None => SortedKeys::Gather,
+                    };
+                    (order, sorted_keys)
                 }
-                order.sort_unstable_by(compare);
+            },
+            false => {
+                let (order, rows) = self.order_by_rows(&key_values, num_rows, len)?;
                 let data_len = order.iter().map(|&i| rows.row_len(i as usize)).sum();
-                let mut sorted_keys = self.converter.empty_rows(len, data_len);
+                let mut sorted_rows = self.converter.empty_rows(len, data_len);
                 for &i in &order {
-                    sorted_keys.push(rows.row(i as usize));
+                    sorted_rows.push(rows.row(i as usize));
                 }
-                (order, sorted_keys)
+                (order, SortedKeys::Rows(sorted_rows))
             }
         };
 
@@ -1032,36 +1079,94 @@ impl SortKeys {
             })
             .collect::<Vec<_>>();
         let gathered = gather_rows_in_batches(schema, &batches, &positions)?;
-        if let [_] = gathered.as_slice() {
-            let batch = gathered.into_iter().next().expect("one batch");
-            return Ok(vec![SortedRun::try_new(batch, sorted_keys)?]);
-        }
-        // Split the keys like the rows.
+        let sorted_keys = match sorted_keys {
+            SortedKeys::Rows(rows) if gathered.len() == 1 => {
+                return gathered
+                    .into_iter()
+                    .zip([rows])
+                    .map(|(batch, rows)| SortedRun::try_new(batch, rows))
+                    .collect();
+            }
+            sorted_keys => sorted_keys,
+        };
+        let options = self.ordering[0].options;
         let mut runs = Vec::with_capacity(gathered.len());
         let mut start = 0;
         for batch in gathered {
             let rows = start..start + batch.num_rows();
-            let data_len = rows.clone().map(|row| sorted_keys.row_len(row)).sum();
-            let mut keys = self.converter.empty_rows(rows.len(), data_len);
-            for row in rows {
-                keys.push(sorted_keys.row(row));
-            }
-            start += batch.num_rows();
-            runs.push(SortedRun::try_new(batch, keys)?);
+            start = rows.end;
+            let keys = match &sorted_keys {
+                // Split the keys like the rows.
+                SortedKeys::Rows(sorted_rows) => {
+                    let data_len = rows.clone().map(|row| sorted_rows.row_len(row)).sum();
+                    let mut keys = self.converter.empty_rows(rows.len(), data_len);
+                    for row in rows {
+                        keys.push(sorted_rows.row(row));
+                    }
+                    RunKeys::Rows(keys)
+                }
+                SortedKeys::Values(values) => {
+                    let values = values.slice(rows.start, rows.len());
+                    RunKeys::Column(KeyColumn::try_new(values, options)?)
+                }
+                SortedKeys::Column(column) => {
+                    let values = Arc::clone(batch.column(*column));
+                    RunKeys::Column(KeyColumn::try_new(values, options)?)
+                }
+                SortedKeys::Gather => {
+                    let values = key_values
+                        .iter()
+                        .map(|keys| keys[0].as_ref())
+                        .collect::<Vec<_>>();
+                    let positions = &positions[rows];
+                    runs_with_gathered_keys(
+                        &mut runs, batch, positions, &values, options,
+                    )?;
+                    continue;
+                }
+            };
+            runs.push(SortedRun::try_new_with_keys(batch, keys)?);
         }
         Ok(runs)
     }
 
+    /// The positions of the first `len` rows (of `num_rows`) in the
+    /// concatenation of the batches whose sort keys are `keys`, sorted by
+    /// their keys encoded in the row format, and the encoded keys of all
+    /// rows.
+    fn order_by_rows(
+        &self,
+        keys: &[Vec<ArrayRef>],
+        num_rows: usize,
+        len: usize,
+    ) -> Result<(Vec<u32>, arrow_row::Rows)> {
+        let mut rows = self.converter.empty_rows(num_rows, 0);
+        for keys in keys {
+            self.converter.append(&mut rows, keys)?;
+        }
+        let num_rows_u32 = u32::try_from(num_rows)
+            .map_err(|_| exec_datafusion_err!("Cannot sort {num_rows} rows at once"))?;
+        let mut order = (0..num_rows_u32).collect::<Vec<_>>();
+        let compare =
+            |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
+        if len < num_rows {
+            order.select_nth_unstable_by(len - 1, compare);
+            order.truncate(len);
+        }
+        order.sort_unstable_by(compare);
+        Ok((order, rows))
+    }
+
     /// Sort the single sort key `keys` (of every batch) with
     /// `lexsort_to_indices`: the positions of the first `limit` rows in the
-    /// concatenation of the batches, and their encoded keys. `None` if the
-    /// keys of all batches do not fit into one array (then they are sorted by
-    /// their encoded rows, which have no such limit).
+    /// concatenation of the batches, and the concatenated keys. `None` if
+    /// the keys of all batches do not fit into one array (then they are sorted
+    /// by their encoded rows, which have no such limit).
     fn sort_with_kernel(
         &self,
         keys: &[Vec<ArrayRef>],
         limit: Option<usize>,
-    ) -> Result<Option<(Vec<u32>, arrow_row::Rows)>> {
+    ) -> Result<Option<(UInt32Array, ArrayRef)>> {
         let key = match keys {
             [keys] => Arc::clone(&keys[0]),
             _ => {
@@ -1086,10 +1191,37 @@ impl SortKeys {
             options: Some(self.ordering[0].options),
         };
         let indices = lexsort_to_indices(&[column], limit)?;
-        let sorted = take(key.as_ref(), &indices, None)?;
-        let sorted_keys = self.converter.convert_columns(&[sorted])?;
-        Ok(Some((indices.values().to_vec(), sorted_keys)))
+        Ok(Some((indices, key)))
     }
+}
+
+/// Add the runs of the sorted rows `batch`, the rows `positions` (`(batch,
+/// row)`) of batches whose values of a single sort key (with `options`) are
+/// `keys`, to `runs`: the rows with their key values, gathered at the same
+/// positions, in a single run, or in several runs if the key values do not
+/// fit into one array.
+fn runs_with_gathered_keys(
+    runs: &mut Vec<SortedRun>,
+    batch: RecordBatch,
+    positions: &[(usize, usize)],
+    keys: &[&dyn Array],
+    options: SortOptions,
+) -> Result<()> {
+    match gather_values(keys, positions) {
+        Ok(values) => {
+            let keys = RunKeys::Column(KeyColumn::try_new(values, options)?);
+            runs.push(SortedRun::try_new_with_keys(batch, keys)?);
+        }
+        Err(error) if positions.len() > 1 && is_capacity_error(&error) => {
+            let half = positions.len().div_ceil(2);
+            let (first, second) = positions.split_at(half);
+            runs_with_gathered_keys(runs, batch.slice(0, half), first, keys, options)?;
+            let rest = batch.slice(half, second.len());
+            runs_with_gathered_keys(runs, rest, second, keys, options)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 /// The bytes of the values of `array` if it is a `Utf8` or `Binary` array,
@@ -1125,23 +1257,6 @@ fn data_types(ordering: &LexOrdering, schema: &Schema) -> Result<Vec<DataType>> 
         .iter()
         .map(|sort_expr| sort_expr.expr.data_type(schema))
         .collect()
-}
-
-/// Whether `sort_to_indices` sorts values of `data_type` exactly like the row
-/// format orders them (types without children and dictionaries).
-fn sorts_like_rows(data_type: &DataType) -> bool {
-    data_type.is_primitive()
-        || matches!(
-            data_type,
-            DataType::Boolean
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Utf8View
-                | DataType::Binary
-                | DataType::LargeBinary
-                | DataType::BinaryView
-                | DataType::FixedSizeBinary(_)
-        )
 }
 
 /// The sorted output of a [`PhysicalSort`] or [`PhysicalTopK`], set up when
@@ -1576,24 +1691,43 @@ mod tests {
                     keys.push((name.as_str(), all_options[rng.random_range(0..4)]));
                 }
             }
-            let sort_keys = sort_keys(&schema, &keys);
+            let mut sort_keys = sort_keys(&schema, &keys);
+            if case % 2 == 1 {
+                // A computed key (a cast to the same type): sorted directly
+                // if there is a single key, by its values rather than by a
+                // column of the rows.
+                let ordering = LexOrdering::new(sort_keys.ordering.iter().map(|key| {
+                    let data_type = key.expr.data_type(&schema).unwrap();
+                    let cast =
+                        Arc::new(CastExpr::new(Arc::clone(&key.expr), data_type, None));
+                    PhysicalSortExpr::new(cast, key.options)
+                }))
+                .unwrap();
+                sort_keys = SortKeys::try_new(ordering, &schema)?;
+                assert!(sort_keys.key_column.is_none());
+            }
             for limit in [None, Some(1), Some(77), Some(499), Some(500), Some(800)] {
                 let mut runs = sort_keys.sort(&schema, &batches, limit)?;
                 assert_eq!(runs.len(), 1, "the rows fit into one run");
                 let run = runs.pop().expect("a run");
                 assert_eq!(run.num_rows(), limit.unwrap_or(500).min(500));
-                // The keys are the encoded keys of the rows of the run, in
-                // order.
+                // A single key of a simple type is compared directly, other
+                // keys are encoded.
+                assert_eq!(
+                    matches!(run.keys(), RunKeys::Column(_)),
+                    sort_keys.direct,
+                    "case {case}: {keys:?}"
+                );
+                // The keys are the keys of the rows of the run, in order.
                 let encoded = sort_keys
                     .converter
                     .convert_columns(&sort_keys.evaluate(run.batch())?)?;
+                let key = |row| sort_keys.encoded_key(&run, row).unwrap();
                 for row in 0..run.num_rows() {
-                    assert_eq!(run.key(row), encoded.row(row), "case {case}");
+                    assert_eq!(key(row).row(), encoded.row(row), "case {case}");
                     if row > 0 {
-                        assert!(
-                            run.key(row - 1) <= run.key(row),
-                            "case {case}: {keys:?}"
-                        );
+                        assert!(key(row - 1) <= key(row), "case {case}: {keys:?}");
+                        assert!(run.compare_rows(row - 1, &run, row)?.is_le());
                     }
                 }
                 // The first rows: no row left out comes before the last row.
@@ -1601,21 +1735,28 @@ mod tests {
                     .converter
                     .convert_columns(&sort_keys.evaluate(&batch)?)?;
                 if let Some(last) = run.num_rows().checked_sub(1) {
-                    let before = (0..500).filter(|&i| all.row(i) < run.key(last)).count();
+                    let before =
+                        (0..500).filter(|&i| all.row(i) < key(last).row()).count();
                     assert!(before <= last, "case {case}: {keys:?}, limit {limit:?}");
                 }
                 // A single key of a simple type is sorted with the sort
                 // kernel, in the same order as by the row format.
-                if sort_keys.sort_with_kernel {
+                if sort_keys.direct {
                     let mut by_rows =
                         SortKeys::try_new(sort_keys.ordering.clone(), &schema)?;
-                    by_rows.sort_with_kernel = false;
+                    by_rows.direct = false;
+                    by_rows.key_column = None;
                     let other = by_rows
                         .sort(&schema, &batches, limit)?
                         .pop()
                         .expect("a run");
+                    assert!(matches!(other.keys(), RunKeys::Rows(_)));
                     for row in 0..run.num_rows() {
-                        assert_eq!(run.key(row), other.key(row), "case {case}: {keys:?}");
+                        assert_eq!(
+                            Some(key(row).row()),
+                            other.encoded_key(row),
+                            "case {case}: {keys:?}"
+                        );
                     }
                 }
             }
@@ -1812,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_single_keys_are_sorted_with_the_kernel() {
+    fn simple_single_keys_are_sorted_with_the_kernel_and_compared_directly() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("i", DataType::Int64, true),
             Field::new("s", DataType::Utf8View, true),
@@ -1823,10 +1964,58 @@ mod tests {
             ),
         ]));
         let options = SortOptions::default();
-        assert!(sort_keys(&schema, &[("i", options)]).sort_with_kernel);
-        assert!(sort_keys(&schema, &[("s", options)]).sort_with_kernel);
-        assert!(!sort_keys(&schema, &[("d", options)]).sort_with_kernel);
-        assert!(!sort_keys(&schema, &[("i", options), ("s", options)]).sort_with_kernel);
+        let direct = |keys: &[(&str, SortOptions)]| {
+            let keys = sort_keys(&schema, keys);
+            (keys.direct, keys.key_column)
+        };
+        assert_eq!(direct(&[("i", options)]), (true, Some(0)));
+        assert_eq!(direct(&[("s", options)]), (true, Some(1)));
+        assert_eq!(direct(&[("d", options)]), (false, None));
+        assert_eq!(direct(&[("i", options), ("s", options)]), (false, None));
+        // A computed key is compared directly, by its values.
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(
+            BinaryExpr::new(col("i", &schema).unwrap(), Operator::Plus, lit(1_i64)),
+        ))])
+        .unwrap();
+        let keys = SortKeys::try_new(ordering, &schema).unwrap();
+        assert_eq!((keys.direct, keys.key_column), (true, None));
+    }
+
+    #[test]
+    fn direct_keys_that_do_not_fit_into_one_array_are_gathered_with_their_rows() {
+        // 1025 one-row batches whose strings share a 2 MiB buffer, sorted by a
+        // computed string key (a cast to the same type, which keeps the
+        // buffer): the keys do not fit into one array, so they are sorted by
+        // their encoded rows, and the key values of every run are gathered
+        // with its rows, in runs whose keys fit.
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(2 << 20)]));
+        let batches = (0..1025)
+            .map(|_| RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&s)]))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let cast = CastExpr::new(col("s", &schema).unwrap(), DataType::Utf8, None);
+        let ordering =
+            LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(cast))]).unwrap();
+        let sort_keys = SortKeys::try_new(ordering, &schema).unwrap();
+        assert_eq!((sort_keys.direct, sort_keys.key_column), (true, None));
+        let runs = sort_keys.sort(&schema, &batches, None).unwrap();
+        assert_eq!(
+            runs.iter().map(SortedRun::num_rows).collect::<Vec<_>>(),
+            [513, 512]
+        );
+        for run in &runs {
+            let RunKeys::Column(keys) = run.keys() else {
+                panic!("the keys of the run are not compared directly");
+            };
+            assert_eq!(keys.values().as_ref(), run.batch().column(0).as_ref());
+        }
+        let mut merger = RunMerger::new(Arc::clone(&schema), runs, None);
+        let mut rows = 0;
+        while let Some(batch) = merger.next_batch(2048).unwrap() {
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 1025);
     }
 
     // ---------------------------------------------------------------------
@@ -3277,7 +3466,7 @@ mod tests {
         // Keys that do not fit into one array are not sorted by the kernel,
         // but by their encoded rows.
         let sort_keys = sort_keys(&schema, &[("s", SortOptions::default())]);
-        assert!(sort_keys.sort_with_kernel);
+        assert!(sort_keys.direct);
         let keys = partition
             .iter()
             .map(|batch| sort_keys.evaluate(batch))

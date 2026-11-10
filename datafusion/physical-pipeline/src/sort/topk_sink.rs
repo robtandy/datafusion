@@ -248,21 +248,22 @@ impl PhysicalTopK {
             return Ok(());
         };
         let row = last.num_rows() - 1;
-        let key = last.key(row);
+        let key = self.keys.encoded_key(last, row)?;
         if state
             .threshold
             .as_ref()
-            .is_some_and(|threshold| threshold.key.row() <= key)
+            .is_some_and(|threshold| threshold.key <= key)
         {
             return Ok(());
         }
-        let threshold = Arc::new(self.threshold(last, row)?);
+        let threshold = Arc::new(self.threshold(last, row, key)?);
         state.threshold = Some(Arc::clone(&threshold));
         self.publish(global, &threshold)
     }
 
-    /// The threshold of a top-k whose `k`-th row is row `row` of `run`.
-    fn threshold(&self, run: &SortedRun, row: usize) -> Result<Threshold> {
+    /// The threshold of a top-k whose `k`-th row is row `row` of `run`, whose
+    /// encoded sort key is `key`.
+    fn threshold(&self, run: &SortedRun, row: usize, key: OwnedRow) -> Result<Threshold> {
         let batch = run.batch().slice(row, 1);
         let values = self
             .ordering()
@@ -279,7 +280,7 @@ impl PhysicalTopK {
             .collect::<Vec<_>>();
         let predicate = threshold_predicate(&keys, &values)?;
         Ok(Threshold {
-            key: run.key(row).owned(),
+            key,
             values,
             predicate,
         })
