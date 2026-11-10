@@ -22,8 +22,11 @@
 //!   table ([`GroupedHashTable::update`], DataFusion's partial aggregation);
 //! * every radix partition is finalized by merging the partial states of
 //!   its groups from all threads into a new table
-//!   ([`GroupedHashTable::merge`]) and evaluating it
-//!   ([`GroupedHashTable::evaluate`], DataFusion's final aggregation).
+//!   ([`GroupedHashTable::merge`]), aggregating the input rows that
+//!   bypassed the thread-local tables into it
+//!   ([`GroupedHashTable::update_rows`], of rows evaluated by
+//!   [`evaluate_rows`]), and evaluating it ([`GroupedHashTable::evaluate`],
+//!   DataFusion's final aggregation).
 //!
 //! [`Accumulator`]: datafusion_expr::Accumulator
 
@@ -31,10 +34,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
-use arrow::compute::prep_null_mask_filter;
+use arrow::compute::{filter, prep_null_mask_filter};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, ScalarValue, not_impl_err};
+use datafusion_common::cast::as_boolean_array;
+use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
 use datafusion_expr::{EmitTo, GroupsAccumulator};
 use datafusion_physical_expr::GroupsAccumulatorAdapter;
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
@@ -42,7 +46,7 @@ use datafusion_physical_plan::aggregates::evaluate_group_by;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
-use super::hash_aggregate::AggregateSpec;
+use super::hash_aggregate::{AggregateSpec, literal_value};
 
 /// The group keys and the aggregate states of a set of groups, emitted by a
 /// [`GroupedHashTable`]: row `i` of every array belongs to the same group.
@@ -59,6 +63,37 @@ impl GroupedStates {
     pub(crate) fn num_groups(&self) -> usize {
         self.keys.first().map_or(0, |keys| keys.len())
     }
+}
+
+/// The group keys and the aggregate arguments of the input rows of `batch`
+/// (of the input of `spec`, an aggregation without grouping sets), aligned
+/// with its rows, for [`GroupedHashTable::update_rows`]: the group columns,
+/// followed by the arguments of every aggregate that are not literals (see
+/// [`literal_value`]) and, for an aggregate with a filter, the filter result
+/// (see [`AggregateUpdate::evaluate_row_aligned`]).
+///
+/// [`AggregateUpdate::evaluate_row_aligned`]: super::hash_aggregate::AggregateUpdate::evaluate_row_aligned
+pub(crate) fn evaluate_rows(
+    spec: &AggregateSpec,
+    batch: &RecordBatch,
+) -> Result<Vec<ArrayRef>> {
+    let mut grouping_sets = evaluate_group_by(&spec.group_by, batch)?;
+    if grouping_sets.len() != 1 {
+        return internal_err!(
+            "Only the input rows of an aggregation without grouping sets can be \
+             evaluated on their own, got {} grouping sets",
+            grouping_sets.len()
+        );
+    }
+    let mut columns = grouping_sets.swap_remove(0);
+    for update in &spec.update {
+        let (values, selection) = update.evaluate_row_aligned(batch)?;
+        columns.extend(values);
+        if let Some(selection) = selection {
+            columns.push(Arc::new(selection));
+        }
+    }
+    Ok(columns)
 }
 
 /// Maps group keys to group indices, and keeps the aggregate states of the
@@ -155,6 +190,94 @@ impl GroupedHashTable {
                     None,
                     num_groups,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Aggregate input rows evaluated by [`evaluate_rows`] (`columns`, of the
+    /// input of `spec`) into the table, like [`Self::update`]: the group keys
+    /// of every row are interned, and the accumulator of every aggregate is
+    /// updated with its arguments for the rows that pass its filter.
+    ///
+    /// The final table of a partition aggregates the rows that bypassed the
+    /// thread-local tables so, with the accumulators of the final
+    /// aggregation: only for aggregations whose final aggregates are those
+    /// that consume the input rows (see `AggregateSpec::bypass`).
+    pub(crate) fn update_rows(
+        &mut self,
+        spec: &AggregateSpec,
+        columns: &[ArrayRef],
+    ) -> Result<()> {
+        let num_keys = spec.group_by.expr().len();
+        let expected = num_keys
+            + spec
+                .update
+                .iter()
+                .map(|update| {
+                    let stored = update
+                        .arguments
+                        .iter()
+                        .filter(|argument| literal_value(argument).is_none())
+                        .count();
+                    stored + usize::from(update.filter.is_some())
+                })
+                .sum::<usize>();
+        if columns.len() != expected || self.accumulators.len() != spec.update.len() {
+            return internal_err!(
+                "PhysicalHashAggregate expected {expected} columns of input rows for \
+                 {} accumulators, got {} columns for {}",
+                spec.update.len(),
+                columns.len(),
+                self.accumulators.len()
+            );
+        }
+        let (keys, mut rest) = columns.split_at(num_keys);
+        let num_rows = keys.first().map_or(0, |keys| keys.len());
+        self.group_values.intern(keys, &mut self.group_indices)?;
+        let num_groups = self.group_values.len();
+        for (accumulator, update) in self.accumulators.iter_mut().zip(&spec.update) {
+            let values = update
+                .arguments
+                .iter()
+                .map(|argument| match literal_value(argument) {
+                    Some(value) => value.to_array_of_size(num_rows),
+                    None => {
+                        let (value, tail) = rest.split_at(1);
+                        rest = tail;
+                        Ok(Arc::clone(&value[0]))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let values = values.as_slice();
+            let selection = match update.filter {
+                Some(_) => {
+                    let (selection, tail) = rest.split_at(1);
+                    rest = tail;
+                    Some(as_boolean_array(&selection[0])?)
+                }
+                None => None,
+            };
+            // The group indices of the rows that pass the filter.
+            let selected = selection.and_then(|selection| {
+                compact_group_indices(&self.group_indices, selection)
+                    .map(|indices| (selection, indices))
+            });
+            match selected {
+                None => accumulator.update_batch(
+                    values,
+                    &self.group_indices,
+                    None,
+                    num_groups,
+                )?,
+                Some((selection, indices)) => {
+                    // The arguments of the rows that pass the filter.
+                    let values = values
+                        .iter()
+                        .map(|value| Ok(filter(value.as_ref(), selection)?))
+                        .collect::<Result<Vec<_>>>()?;
+                    accumulator.update_batch(&values, &indices, None, num_groups)?
+                }
             }
         }
         Ok(())

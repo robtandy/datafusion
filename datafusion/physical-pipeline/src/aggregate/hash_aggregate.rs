@@ -10,15 +10,18 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array,
+    new_null_array,
 };
 use arrow::compute::{
     SortColumn, concat, filter_record_batch, lexsort_to_indices, take_record_batch,
 };
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr_common::utils::scatter;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy,
 };
@@ -79,6 +82,11 @@ pub(crate) struct AggregateSpec {
     /// Whether the aggregation has a single stage (`Single`,
     /// `SinglePartitioned`), whose accumulators update and evaluate.
     pub(crate) single_stage: bool,
+    /// Whether the input rows of a thread whose groups hardly repeat may
+    /// bypass its thread-local table, and be aggregated by the final
+    /// aggregation of their radix partitions directly (see
+    /// [`rows_can_bypass_tables`]).
+    pub(crate) bypass: bool,
 }
 
 impl AggregateSpec {
@@ -169,6 +177,63 @@ impl AggregateUpdate {
             .map(|argument| argument.evaluate(batch)?.into_array(batch.num_rows()))
             .collect()
     }
+
+    /// Evaluate the arguments of the aggregate that are not literals (see
+    /// [`literal_value`]) for the rows of `batch` that pass its filter, like
+    /// [`Self::evaluate_filtered`], aligned with the rows of `batch`: the
+    /// arguments of the rows that do not pass the filter are `NULL` (they are
+    /// not evaluated, so they cannot cause errors). Returns the arguments and
+    /// the filter result, `None` without a filter.
+    pub(crate) fn evaluate_row_aligned(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<(Vec<ArrayRef>, Option<BooleanArray>)> {
+        let num_rows = batch.num_rows();
+        let arguments = self
+            .arguments
+            .iter()
+            .filter(|argument| literal_value(argument).is_none());
+        let evaluate = |argument: &Arc<dyn PhysicalExpr>, batch: &RecordBatch| {
+            argument.evaluate(batch)?.into_array(batch.num_rows())
+        };
+        let Some(filter) = &self.filter else {
+            let values = arguments
+                .map(|argument| evaluate(argument, batch))
+                .collect::<Result<_>>()?;
+            return Ok((values, None));
+        };
+        let mask = filter.evaluate(batch)?.into_array(num_rows)?;
+        let mask = as_boolean_array(&mask)?.clone();
+        let values = match mask.true_count() {
+            0 => arguments
+                .map(|argument| {
+                    Ok(new_null_array(
+                        &argument.data_type(batch.schema_ref())?,
+                        num_rows,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            selected if selected == num_rows => arguments
+                .map(|argument| evaluate(argument, batch))
+                .collect::<Result<_>>()?,
+            _ => {
+                let selected = filter_record_batch(batch, &mask)?;
+                arguments
+                    .map(|argument| {
+                        scatter(&mask, evaluate(argument, &selected)?.as_ref())
+                    })
+                    .collect::<Result<_>>()?
+            }
+        };
+        Ok((values, Some(mask)))
+    }
+}
+
+/// The value of `argument`, an argument of an aggregate, if it is a literal,
+/// which has the same value for every row (e.g. the `1` of `COUNT(*)`,
+/// `count(Int64(1))`).
+pub(crate) fn literal_value(argument: &Arc<dyn PhysicalExpr>) -> Option<&ScalarValue> {
+    argument.downcast_ref::<Literal>().map(Literal::value)
 }
 
 /// The input rows of a thread, buffered so that they can be aggregated in the
@@ -409,7 +474,7 @@ impl PhysicalHashAggregate {
             .into_iter()
             .zip(raw.filter_expr())
             .map(|(expr, filter)| AggregateUpdate::new(expr, filter.clone()))
-            .collect();
+            .collect::<Vec<_>>();
         let num_fields = group_schema.fields().len() + merge.len();
         if schema.fields().len() != num_fields {
             return internal_err!(
@@ -417,6 +482,8 @@ impl PhysicalHashAggregate {
                 schema.fields().len()
             );
         }
+        let bypass = input_order.is_none()
+            && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),
@@ -429,6 +496,7 @@ impl PhysicalHashAggregate {
                 schema,
                 input_order,
                 single_stage,
+                bypass,
             }),
         })
     }
@@ -541,6 +609,86 @@ fn is_final_of(last: &AggregateExec, partial: &AggregateExec) -> bool {
                     _ => false,
                 },
             )
+}
+
+/// Whether the input rows of an aggregation without an input order may
+/// bypass the thread-local tables of a thread whose groups hardly
+/// repeat (see `RadixLocalState::aggregate`), and be aggregated by the final
+/// aggregation of their radix partitions directly:
+///
+/// * the aggregation has group keys, and no grouping sets;
+/// * the aggregates of the final aggregation (`merge`), which aggregate the
+///   rows that bypass the tables, are those of the stage that consumes the
+///   input rows (`update`), as in DataFusion's plans;
+/// * the keys and the arguments (of the rows of a thread, which the radix
+///   partitioning gathers from several chunks) are of flat types, which are
+///   gathered without merging dictionaries or nested offsets.
+fn rows_can_bypass_tables(
+    group_by: &PhysicalGroupBy,
+    update: &[AggregateUpdate],
+    merge: &[Arc<AggregateFunctionExpr>],
+    schema: &SchemaRef,
+) -> bool {
+    if !group_by.is_single() || group_by.expr().is_empty() || update.len() != merge.len()
+    {
+        return false;
+    }
+    let aggregates_rows = update.iter().zip(merge).all(|(update, merge)| {
+        let update = &update.expr;
+        Arc::ptr_eq(update, merge)
+            || (update.as_ref() == merge.as_ref()
+                && update.is_distinct() == merge.is_distinct()
+                && update.ignore_nulls() == merge.ignore_nulls()
+                && update.is_reversed() == merge.is_reversed()
+                && update.order_bys() == merge.order_bys())
+    });
+    let is_flat = |expr: &Arc<dyn PhysicalExpr>| {
+        expr.data_type(schema)
+            .is_ok_and(|data_type| is_flat_type(&data_type))
+    };
+    aggregates_rows
+        && group_by.expr().iter().all(|(key, _)| is_flat(key))
+        && update
+            .iter()
+            .all(|update| update.arguments.iter().all(is_flat))
+}
+
+/// Whether arrays of `data_type` have no children and no dictionary.
+fn is_flat_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
 }
 
 /// The aggregates `exprs`, with the aggregates whose accumulators may rely
@@ -1291,6 +1439,64 @@ mod tests {
                 .await?;
                 assert_eq!(canonical(&actual), canonical(&expected), "{name}");
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rows_of_simple_aggregations_may_bypass_the_tables() -> Result<()> {
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        crate::test_utils::register_test_tables(&ctx)?;
+        for (sql, bypass) in [
+            (
+                "SELECT a, COUNT(*), SUM(b), MIN(d), AVG(g) FROM t1 GROUP BY a",
+                true,
+            ),
+            (
+                "SELECT d, h, COUNT(DISTINCT a), MEDIAN(b) FILTER (WHERE e) FROM t1 \
+                 GROUP BY d, h",
+                true,
+            ),
+            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
+            (
+                "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
+                true,
+            ),
+            // Grouping sets.
+            (
+                "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
+                false,
+            ),
+            // The rows of an aggregate with a hard order are sorted.
+            (
+                "SELECT e, NTH_VALUE(a, 3 ORDER BY id) FROM t1 GROUP BY e",
+                false,
+            ),
+            // Keys and arguments of nested types and dictionaries.
+            (
+                "SELECT [a, b] AS ab, COUNT(*) FROM t1 GROUP BY [a, b]",
+                false,
+            ),
+            (
+                "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd, COUNT(*) FROM t1 \
+                 GROUP BY dd",
+                false,
+            ),
+            ("SELECT d, ARRAY_AGG([a, b]) FROM t1 GROUP BY d", false),
+        ] {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let mut aggregate = None;
+            let mut node = Arc::clone(&plan);
+            while aggregate.is_none() {
+                aggregate = try_lower(&node)?;
+                let Some(child) = node.children().first().map(|&child| Arc::clone(child))
+                else {
+                    break;
+                };
+                node = child;
+            }
+            let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
+            assert_eq!(aggregate.spec.bypass, bypass, "{sql}");
         }
         Ok(())
     }
