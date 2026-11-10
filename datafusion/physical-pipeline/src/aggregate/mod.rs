@@ -1090,9 +1090,15 @@ mod tests {
             // A single stage on 1 thread, and two stages that are fused on 4.
             (distinct, [single, partitioned], [1, 0]),
             (max, [single, partitioned], [1, 0]),
-            // `t1` has 4 partitions.
+            // `t1` has 4 partitions. Its `d` is a `Utf8` string, whose top-k
+            // aggregations are left to DataFusion; its `h` a `Utf8View`.
             (
                 "SELECT DISTINCT d FROM t1 ORDER BY d LIMIT 3",
+                [coalesced, partitioned],
+                [0, 0],
+            ),
+            (
+                "SELECT DISTINCT h FROM t1 ORDER BY h LIMIT 3",
                 [coalesced, partitioned],
                 [1, 0],
             ),

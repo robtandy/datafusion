@@ -537,7 +537,8 @@ impl PhysicalHashAggregate {
     ///   (without a filter or an order of its own) of an argument that is not
     ///   nullable, whose partial state is its value, of types that
     ///   DataFusion's top-k aggregation orders like its sorts (see
-    ///   [`orders_like_datafusion`]), whose key and argument cannot fail
+    ///   [`orders_like_datafusion`]) but strings with 32-bit offsets (see
+    ///   [`holds_like_datafusion`]), whose key and argument cannot fail
     ///   (conservatively), and whose final stage has a single partition.
     ///   DataFusion's top-k aggregation of several partitions keeps the top
     ///   groups of every partition, which depend on how its rows are
@@ -863,9 +864,9 @@ fn group_limit(raw: &AggregateExec, last: Option<&AggregateExec>) -> GroupLimit 
     let schema = raw.input().schema();
     let orders = |expr: &Arc<dyn PhysicalExpr>| {
         is_infallible(expr, &schema)
-            && expr
-                .data_type(&schema)
-                .is_ok_and(|data_type| orders_like_datafusion(&data_type))
+            && expr.data_type(&schema).is_ok_and(|data_type| {
+                orders_like_datafusion(&data_type) && holds_like_datafusion(&data_type)
+            })
     };
     let [(key, _)] = group_by.expr() else {
         return GroupLimit::Unsupported;
@@ -924,6 +925,20 @@ fn group_limit(raw: &AggregateExec, last: Option<&AggregateExec>) -> GroupLimit 
         descending,
         order,
     })
+}
+
+/// Whether the native operator holds the values of `data_type` of the groups
+/// of a top-k aggregation wherever DataFusion's top-k aggregation does. The
+/// native operator holds all groups of a thread-local table (and the top
+/// groups of every flush of a partition) before it keeps their top groups,
+/// DataFusion's top-k aggregation its top groups only: strings with 32-bit
+/// offsets (`Utf8`) of more groups than DataFusion holds may overflow the
+/// offsets of the arrays of the native tables (e.g. two distinct keys of 1.1
+/// GB), so their aggregations are left to DataFusion. Fixed-width values,
+/// `LargeUtf8` (64-bit offsets) and `Utf8View` (views of several buffers) do
+/// not overflow.
+fn holds_like_datafusion(data_type: &DataType) -> bool {
+    data_type != &DataType::Utf8
 }
 
 /// Whether DataFusion's top-k aggregation compares the values of
@@ -1701,28 +1716,22 @@ mod tests {
             Limit::TopKDistinct,
             Limit::TopKMax,
         ] {
-            // The expected limit of an aggregation whose final stage has one
-            // partition or several.
-            let expected = |single_partition: bool| match limit {
-                Limit::None => Some(None),
-                Limit::TopKDistinct if single_partition => Some(Some(TopK {
-                    limit: 3,
-                    descending: true,
-                    order: TopKOrder::GroupKey,
-                })),
-                // `MAX(v)` of a nullable `v`.
-                Limit::Soft | Limit::TopKDistinct | Limit::TopKMax => None,
+            // The key `k` is a `Utf8` string (see `holds_like_datafusion`), the
+            // argument `v` of `MAX(v)` nullable: only the aggregations without
+            // a limit are lowered.
+            let expected = |limited: bool| {
+                if limited && limit != Limit::None {
+                    None
+                } else {
+                    Some(None)
+                }
             };
             for apply in [false, true] {
                 let single =
                     limited(AggregateMode::Single, limit, apply, input(1, false)?)?;
-                let lowered = lowered_limit(&plan(single))?;
-                let expected = if apply { expected(true) } else { Some(None) };
-                assert_eq!(lowered, expected, "{limit:?}");
+                assert_eq!(lowered_limit(&plan(single))?, expected(apply), "{limit:?}");
             }
-            // A limit of the partial or of the final stage, or of both: only
-            // the same limit of both is lowered, if the final stage has a
-            // single partition.
+            // A limit of the partial or of the final stage, or of both.
             for (mode, single_partition) in [
                 (AggregateMode::FinalPartitioned, false),
                 (AggregateMode::Final, true),
@@ -1742,17 +1751,57 @@ mod tests {
                         hash_repartition(plan(partial))?
                     };
                     let last = limited(mode, limit, limit_final, states)?;
-                    let lowered = lowered_limit(&plan(last))?;
-                    let expected = match (limit_partial, limit_final) {
-                        (false, false) => Some(None),
-                        (true, true) => expected(single_partition),
-                        _ if limit == Limit::None => Some(None),
-                        _ => None,
-                    };
-                    assert_eq!(lowered, expected, "{limit:?} {mode:?}");
+                    assert_eq!(
+                        lowered_limit(&plan(last))?,
+                        expected(limit_partial || limit_final),
+                        "{limit:?} {mode:?}"
+                    );
                 }
             }
         }
+        // A top-k aggregation by the integer key `v` is lowered: of a single
+        // stage, or of two stages with the same limit and a single final
+        // partition.
+        let schema = input_schema();
+        let by_v = |mode: AggregateMode, input: Plan, top_k: bool| -> Result<Plan> {
+            let key = col("v", &input.schema())?;
+            let aggregate = AggregateExec::try_new(
+                mode,
+                PhysicalGroupBy::new_single(vec![(key, "v".into())]),
+                vec![],
+                vec![],
+                input,
+                Arc::clone(&schema),
+            )?;
+            if !top_k {
+                return Ok(Arc::new(aggregate));
+            }
+            let limited = aggregate
+                .try_optimize_topk(3, "v", SortOptions::new(false, false))
+                .expect("a top-k aggregation")
+                .data;
+            Ok(Arc::new(limited))
+        };
+        let top_k = Some(Some(TopK {
+            limit: 3,
+            descending: false,
+            order: TopKOrder::GroupKey,
+        }));
+        let single = by_v(AggregateMode::Single, input(1, false)?, true)?;
+        assert_eq!(lowered_limit(&single)?, top_k);
+        let partial = || by_v(AggregateMode::Partial, input(4, false)?, true);
+        let last = by_v(AggregateMode::Final, coalesce(partial()?), true)?;
+        assert_eq!(lowered_limit(&last)?, top_k);
+        let last = by_v(AggregateMode::Final, coalesce(partial()?), false)?;
+        assert_eq!(lowered_limit(&last)?, None);
+        let states = partial()?;
+        let key = col("v", &states.schema())?;
+        let states = Arc::new(RepartitionExec::try_new(
+            states,
+            Partitioning::Hash(vec![key], 3),
+        )?);
+        let last = by_v(AggregateMode::FinalPartitioned, states, true)?;
+        assert_eq!(lowered_limit(&last)?, None);
         Ok(())
     }
 
@@ -2001,7 +2050,8 @@ mod tests {
     /// distinct values (but for nulls), and distinct values `v` (`NULL` for
     /// all rows of some groups of `g`), `dec` (decimals) and `t` (timestamps
     /// with a time zone), and distinct values that are not nullable: `id`,
-    /// `nsv` (`Utf8View`), `ndec` (decimals) and `nt` (timestamps).
+    /// `nsv` (`Utf8View`), `ns` (`Utf8`), `ndec` (decimals) and `nt`
+    /// (timestamps).
     fn register_tk(ctx: &datafusion::prelude::SessionContext) -> Result<()> {
         use arrow::array::{
             Date32Array, Decimal128Array, Int32Array, LargeStringArray, StringViewArray,
@@ -2024,6 +2074,7 @@ mod tests {
                 true,
             ),
             Field::new("nsv", DataType::Utf8View, false),
+            Field::new("ns", DataType::Utf8, false),
             Field::new("ndec", DataType::Decimal128(20, 4), false),
             Field::new(
                 "nt",
@@ -2073,6 +2124,9 @@ mod tests {
                 Arc::new(StringViewArray::from_iter_values(rows.clone().map(|i| {
                     format!("a string that is not nullable {:05}", (i * 13) % 3_001)
                 }))),
+                Arc::new(StringArray::from_iter_values(
+                    rows.clone().map(|i| format!("s{:05}", (i * 17) % 3_001)),
+                )),
                 Arc::new(
                     Decimal128Array::from_iter_values(
                         rows.clone()
@@ -2130,9 +2184,10 @@ mod tests {
             ("SELECT g FROM tk GROUP BY g ORDER BY g LIMIT 1", true),
             ("SELECT DISTINCT u FROM tk ORDER BY u DESC LIMIT 4", true),
             ("SELECT DISTINCT dt FROM tk ORDER BY dt LIMIT 6", true),
+            // Strings with 32-bit offsets are left to DataFusion.
             (
                 "SELECT DISTINCT s FROM tk ORDER BY s DESC NULLS LAST LIMIT 3",
-                true,
+                false,
             ),
             ("SELECT DISTINCT sv FROM tk ORDER BY sv LIMIT 8", true),
             ("SELECT DISTINCT ls FROM tk ORDER BY ls DESC LIMIT 2", true),
@@ -2164,6 +2219,10 @@ mod tests {
             (
                 "SELECT s, MAX(nt) FROM tk GROUP BY s ORDER BY MAX(nt) DESC NULLS LAST \
                  LIMIT 6",
+                false,
+            ),
+            (
+                "SELECT ls, MAX(nt) FROM tk GROUP BY ls ORDER BY MAX(nt) DESC LIMIT 6",
                 true,
             ),
             (
@@ -2199,6 +2258,11 @@ mod tests {
             (
                 "SELECT COUNT(*), MIN(s), MAX(s) FROM \
                  (SELECT DISTINCT s FROM tk ORDER BY s LIMIT 10)",
+                false,
+            ),
+            (
+                "SELECT COUNT(*), MIN(sv), MAX(sv) FROM \
+                 (SELECT DISTINCT sv FROM tk ORDER BY sv LIMIT 10)",
                 true,
             ),
             (
@@ -2230,21 +2294,70 @@ mod tests {
                     assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
                 let top_k = native_top_k_aggregations(&root);
                 assert_eq!(top_k.len(), usize::from(native && !window), "{sql}");
-                // The planner lowers it natively too (but it leaves the
-                // aggregations whose partial states are strings with 32-bit
-                // offsets to DataFusion, and the windows here).
+                // The planner lowers it natively too (but the windows here).
                 let plan = pipeline.sql(sql).await?.create_physical_plan().await?;
                 let root = plan
                     .downcast_ref::<crate::bridge::PipelineRootExec>()
                     .expect("a pipeline plan")
                     .operator();
                 let planned = native_top_k_aggregations(root);
-                let utf8 = sql.contains(" s ") || sql.contains(" s,");
                 if !window {
-                    assert_eq!(planned.len(), usize::from(native && !utf8), "{sql}");
+                    assert_eq!(planned, top_k, "{sql}");
                 }
                 assert!(planned.is_empty() || planned == top_k || window, "{sql}");
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "allocates more than 8 GiB"]
+    async fn top_k_aggregations_of_huge_strings_produce_the_results_of_datafusion()
+    -> Result<()> {
+        use arrow::array::{LargeStringArray, StringArray};
+        use arrow::buffer::{Buffer, OffsetBuffer};
+
+        use super::super::test_support::assert_lowered_parity_with_setup;
+        // Two distinct keys of 1,100,000,000 bytes, in batches of their own of
+        // a single partition: together, more than an array of strings with
+        // 32-bit offsets can hold. DataFusion's top-k aggregation holds the
+        // best of them only.
+        let len = 1_100_000_000;
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("k", data_type.clone(), false)]));
+            let key = |byte: u8| -> Result<RecordBatch> {
+                let bytes = Buffer::from_vec(vec![byte; len]);
+                let key: ArrayRef = match data_type {
+                    DataType::Utf8 => Arc::new(StringArray::new(
+                        OffsetBuffer::new(vec![0, len as i32].into()),
+                        bytes,
+                        None,
+                    )),
+                    _ => {
+                        let key = LargeStringArray::new(
+                            OffsetBuffer::new(vec![0, len as i64].into()),
+                            bytes,
+                            None,
+                        );
+                        arrow::compute::cast(&key, &data_type)?
+                    }
+                };
+                Ok(RecordBatch::try_new(Arc::clone(&schema), vec![key])?)
+            };
+            let partitions = vec![vec![key(b'b')?, key(b'a')?]];
+            let setup = async |ctx: &datafusion::prelude::SessionContext| {
+                let table = datafusion::datasource::MemTable::try_new(
+                    Arc::clone(&schema),
+                    partitions.clone(),
+                )?;
+                ctx.register_table("wide", Arc::new(table))?;
+                Ok(())
+            };
+            let config = test_session_config().with_target_partitions(1);
+            let sql =
+                "SELECT COUNT(*) FROM (SELECT DISTINCT k FROM wide ORDER BY k LIMIT 1)";
+            assert_lowered_parity_with_setup(sql, config, setup).await;
         }
         Ok(())
     }
@@ -2273,6 +2386,9 @@ mod tests {
             "SELECT g, MAX(1000 / id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
             // A nullable argument of a `MIN` / `MAX`.
             "SELECT g, MAX(v) AS m FROM tk GROUP BY g ORDER BY m DESC NULLS LAST LIMIT 3",
+            // Strings with 32-bit offsets, as keys and as values.
+            "SELECT DISTINCT s FROM tk ORDER BY s LIMIT 3",
+            "SELECT g, MAX(ns) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
             // A soft limit.
             "SELECT DISTINCT d FROM t1 LIMIT 3",
         ] {
