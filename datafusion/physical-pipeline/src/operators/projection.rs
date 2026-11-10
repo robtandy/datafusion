@@ -33,8 +33,8 @@
 //! batches of its input plan. The analytical expressions of TPC-H are
 //! lowered: chains of decimal arithmetic, which can only fail with arithmetic
 //! overflows (e.g. `l_extendedprice * (1 - l_discount) * (1 + l_tax)`), the
-//! built-in functions whose implementations are known, in the sessions that
-//! trust them (e.g. `extract(year from o_orderdate)` or
+//! built-in functions whose implementations are known, which sessions trust
+//! by default (e.g. `extract(year from o_orderdate)` or
 //! `substring(c_phone from 1 for 2)`, see
 //! [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions)), and
 //! constant strings of bounded sizes, which are copied for every row, on
@@ -133,7 +133,8 @@ impl PhysicalProjection {
     /// So the projections of analytical queries are lowered, e.g. the decimal
     /// arithmetic `l_extendedprice * (1 - l_discount) * (1 + l_tax)`, the
     /// built-in functions `extract(year from o_orderdate)` and
-    /// `substring(c_phone from 1 for 2)` in a session that trusts them (see
+    /// `substring(c_phone from 1 for 2)` in the sessions that trust them, as
+    /// sessions do by default (see
     /// [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions)), or
     /// `CASE WHEN ... THEN '1-URGENT' ELSE '2-HIGH' END` on batches of known
     /// sizes.
@@ -2472,6 +2473,143 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn builtin_functions_of_tpch_projections_are_native_by_default() {
+        // The sessions of `test_session_config` (4 threads) do not register the
+        // functions they trust (see `TrustedFunctions`): by default, they trust
+        // the built-in functions of DataFusion, so that the
+        // `PipelineQueryPlanner` lowers the projections of TPC-H natively, with
+        // every node of their plans (see
+        // `builtin_functions_of_tpch_filters_are_native_by_default` for the
+        // filters).
+        let config = crate::test_utils::test_session_config();
+        assert!(
+            config
+                .options()
+                .extensions
+                .get::<crate::operators::adaptive_filter::TrustedFunctions>()
+                .is_none()
+        );
+        for sql in [
+            // `extract(year from ...)` (Q7 to Q9), with decimal arithmetic.
+            "SELECT extract(year from l_shipdate) AS l_year, \
+             l_extendedprice * (1 - l_discount) AS volume FROM lineitem \
+             WHERE l_shipdate BETWEEN DATE '1995-01-01' AND DATE '1996-12-31'",
+            "SELECT o_year, sum(volume) AS revenue FROM (\
+             SELECT extract(year from o_orderdate) AS o_year, \
+             l_extendedprice * (1 - l_discount) AS volume \
+             FROM lineitem, orders WHERE l_orderkey = o_orderkey) \
+             GROUP BY o_year ORDER BY o_year",
+            // `substring(c_phone from 1 for 2)` (Q22), in a projection and in a
+            // filter.
+            "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (\
+             SELECT substring(c_phone from 1 for 2) AS cntrycode, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > 0.00) GROUP BY cntrycode ORDER BY cntrycode",
+            // Constant strings of bounded sizes, on the batches of a scan of
+            // memory (which the plan bounds).
+            "SELECT o_orderkey, CASE WHEN o_orderpriority = '1-URGENT' \
+             OR o_orderpriority = '2-HIGH' THEN '1-URGENT' ELSE '2-HIGH' END AS priority \
+             FROM orders",
+            // The decimal division of Q8 by a divisor that is not 0 where it
+            // divides (a `NULLIF` of `0`, a built-in function, or a `CASE`),
+            // which can only fail with arithmetic overflows: on any number of
+            // threads.
+            "SELECT o_year, sum(CASE WHEN o_orderpriority = '1-URGENT' THEN volume ELSE 0 END) \
+             / NULLIF(sum(volume), 0) AS mkt_share FROM (\
+             SELECT extract(year from o_orderdate) AS o_year, \
+             l_extendedprice * (1 - l_discount) AS volume, o_orderpriority \
+             FROM lineitem, orders WHERE l_orderkey = o_orderkey) \
+             GROUP BY o_year ORDER BY o_year",
+            "SELECT o_year, CASE WHEN sum(volume) <> 0 THEN \
+             sum(CASE WHEN o_orderpriority = '1-URGENT' THEN volume ELSE 0 END) \
+             / sum(volume) END AS mkt_share FROM (\
+             SELECT extract(year from o_orderdate) AS o_year, \
+             l_extendedprice * (1 - l_discount) AS volume, o_orderpriority \
+             FROM lineitem, orders WHERE l_orderkey = o_orderkey) \
+             GROUP BY o_year ORDER BY o_year",
+        ] {
+            let (plan, root) =
+                assert_planned_byte_eq(sql, config.clone(), tpch_tables).await;
+            let (projections, filters) = assert_all_lowerable(&plan);
+            assert!(projections > 0, "no projection: {sql}");
+            assert!(
+                crate::bridge::bridged_plans(&root).is_empty(),
+                "{sql}\n{}",
+                crate::explain::format_operator_tree(&root)
+            );
+            let native = NativeOperators::of(&root);
+            assert_eq!(
+                (native.projections, native.filters),
+                (projections, filters),
+                "{sql}"
+            );
+        }
+        // Unless the session trusts no function: then `substr` is opaque.
+        let untrusting = config.clone().with_option_extension(
+            crate::operators::adaptive_filter::TrustedFunctions::default(),
+        );
+        let sql = "SELECT substring(c_phone from 1 for 2) AS cntrycode, c_acctbal \
+                   FROM customer";
+        let (plan, root) = assert_planned_byte_eq(sql, untrusting, tpch_tables).await;
+        let projection = plan.downcast_ref::<ProjectionExec>().expect("a projection");
+        assert!(!PhysicalProjection::supports_projection_exec(projection));
+        assert_eq!(NativeOperators::of(&root).projections, 0, "{sql}");
+        // But the decimal division of Q8 by a sum that may be 0: it may fail
+        // with a division by zero (on a sum of 0) and with an overflow (on a
+        // quotient beyond the precision of its type), of which DataFusion
+        // raises the error of the first row of its partition that fails, but
+        // a pipeline the error of the chunk that fails first on any of its
+        // threads (see `parts_that_fail_with_several_kinds_of_errors_stay_in_datafusion`):
+        // DataFusion executes it, with its input.
+        let sql = "SELECT o_year, sum(CASE WHEN o_orderpriority = '1-URGENT' THEN volume ELSE 0 END) \
+                   / sum(volume) AS mkt_share FROM (\
+                   SELECT extract(year from o_orderdate) AS o_year, \
+                   l_extendedprice * (1 - l_discount) AS volume, o_orderpriority \
+                   FROM lineitem, orders WHERE l_orderkey = o_orderkey) \
+                   GROUP BY o_year ORDER BY o_year";
+        let (plan, root) = assert_planned_byte_eq(sql, config, tpch_tables).await;
+        let mut divisions = vec![];
+        plan.apply(|node| {
+            if let Some(projection) = node.downcast_ref::<ProjectionExec>()
+                && projection
+                    .expr()
+                    .iter()
+                    .any(|expr| expr.expr.to_string().contains(" / "))
+            {
+                divisions.push(Arc::clone(node));
+            }
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        let [division] = divisions.as_slice() else {
+            panic!("one projection of the division: {divisions:?}");
+        };
+        let projection = division.downcast_ref::<ProjectionExec>().unwrap();
+        let input_schema = projection.input().schema();
+        let failures = projection
+            .expr()
+            .iter()
+            .map(|expr| {
+                crate::operators::adaptive_filter::failures(&expr.expr, &input_schema)
+            })
+            .fold(Failures::NONE, Failures::and);
+        assert!(!failures.only_overflows() && failures.order_matters());
+        assert!(!PhysicalProjection::supports_projection_exec(projection));
+        let bridged = crate::bridge::bridged_plans(&root);
+        let tree = crate::explain::format_operator_tree(&root);
+        assert_eq!(bridged.len(), 1, "{tree}");
+        assert_eq!(
+            datafusion_physical_plan::displayable(bridged[0].as_ref())
+                .one_line()
+                .to_string(),
+            datafusion_physical_plan::displayable(division.as_ref())
+                .one_line()
+                .to_string(),
+            "{tree}"
+        );
+    }
+
     /// A session configuration whose plans scan the 3 partitions of the
     /// tables of the tests without repartitioning them, so that their nodes
     /// bound the rows of the batches of DataFusion (see `max_batch_rows`).
@@ -2913,9 +3051,12 @@ mod tests {
         // which may be the second one, with another kind of error:
         // `to_timestamp` without formats fails on a date beyond the range of
         // nanoseconds with an execution error, but to parse a string with a
-        // parse error; and a division of integers fails on the smallest
-        // integer divided by -1 with an overflow, but on a divisor of 0 with a
-        // division by zero.
+        // parse error; a division of integers fails on the smallest integer
+        // divided by -1 with an overflow, but on a divisor of 0 with a division
+        // by zero; and so does a division of decimals by a divisor that may be
+        // 0, e.g. the `sum(...) / sum(volume)` of TPC-H Q8 (of decimals of
+        // scale 4): on a divisor of 0 with a division by zero, but on a
+        // quotient beyond the values of its type with an overflow.
         let rows = 4096;
         let strings = StringArray::from_iter_values((0..rows).map(|row| match row {
             0..2047 => "2020-01-01",
@@ -2930,6 +3071,14 @@ mod tests {
             2047 => -1,
             _ => 0,
         }));
+        // The sums of TPC-H Q8, `DECIMAL(38, 4)`.
+        let decimals = |values: Vec<i128>| -> ArrayRef {
+            Arc::new(
+                arrow::array::Decimal128Array::from(values)
+                    .with_precision_and_scale(38, 4)
+                    .unwrap(),
+            )
+        };
         for (expr, batch, kinds) in [
             (
                 "to_timestamp(s)",
@@ -2945,6 +3094,25 @@ mod tests {
                 ])
                 .unwrap(),
                 ["ArrowError::ArithmeticOverflow", "ArrowError::DivideByZero"],
+            ),
+            (
+                "x / y",
+                RecordBatch::try_from_iter([
+                    (
+                        "x",
+                        decimals(
+                            (0..rows)
+                                .map(|row| if row < 2048 { 1 } else { 10_i128.pow(37) })
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "y",
+                        decimals((0..rows).map(|row| i128::from(row != 2047)).collect()),
+                    ),
+                ])
+                .unwrap(),
+                ["ArrowError::DivideByZero", "ArrowError::ArithmeticOverflow"],
             ),
         ] {
             let (plan, supported, native) = project_batch(expr, &batch);

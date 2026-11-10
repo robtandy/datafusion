@@ -60,13 +60,14 @@
 //!
 //! Functions are opaque, but for the built-in scalar functions of DataFusion
 //! whose implementations are known (e.g. `date_part`, `substr` or `abs`, see
-//! `BuiltinFunction`) in the sessions that trust them (see
+//! `BuiltinFunction`), which sessions trust by default (see
 //! [`TrustedFunctions`]): they fail on the values of a row independently of
 //! the other rows, if at all, in a single step over the rows of a batch, and
 //! only build strings from the bytes of their arguments (see
-//! `function_fallibility`). They are identified by the types that implement
-//! them, which the sessions register, so that a user-defined function that
-//! shadows one (e.g. Spark's `abs`) stays opaque.
+//! `function_fallibility`). They are identified by their names and the names
+//! of the types that implement them, or, in the sessions that register the
+//! functions they trust, by these types, so that a user-defined function that
+//! shadows one (e.g. Spark's `abs`, of `SparkAbs`) stays opaque.
 //!
 //! String constants are copied for every row of a batch by whoever evaluates
 //! them, so they overflow the 32-bit offsets of strings on batches of enough
@@ -391,8 +392,8 @@ pub enum Fallibility {
 /// out of dictionaries, see `cast_fallibility`), arithmetic on integers and
 /// floating point numbers that wraps on overflow (DataFusion's default),
 /// divisions of numbers by a constant that is neither `0` nor `-1`, and the
-/// built-in functions that cannot fail on values, in the sessions that trust
-/// them (e.g. `date_part` or `strpos`, see `function_fallibility` and
+/// built-in functions that cannot fail on values, which sessions trust by
+/// default (e.g. `date_part` or `strpos`, see `function_fallibility` and
 /// [`TrustedFunctions`]) are infallible, if Arrow supports
 /// the types of their operands: they fail uniformly otherwise (e.g. `NOT` of
 /// an integer, or a comparison of dictionaries of dictionaries, see
@@ -691,16 +692,21 @@ fn decimal_parts(data_type: &DataType) -> Option<(u8, u8, i8)> {
 
 /// The built-in scalar functions of DataFusion (of `datafusion-functions`)
 /// whose implementations the classification knows (see
-/// [`function_fallibility`]), in the sessions that trust them (see
-/// [`TrustedFunctions`]).
+/// [`function_fallibility`]), in the sessions that trust them, which sessions
+/// do by default (see [`TrustedFunctions`]).
 ///
-/// A function is one of them only if it is implemented by the very type of a
-/// built-in function that the session that planned it trusts: a user-defined
-/// function may shadow a built-in one under its name, e.g. the `abs` of
-/// `datafusion-spark` (`SparkAbs`), which fails on overflows in ANSI mode, also
-/// with a type of the same name (but of another crate), and stays opaque.
-/// (This crate does not depend on `datafusion-functions`, so it cannot name
-/// their types: the sessions register them.)
+/// A function is one of them only if the session that planned it trusts it: a
+/// user-defined function may shadow a built-in one under its name, e.g. the
+/// `abs` of `datafusion-spark` (`SparkAbs`), which fails on overflows in ANSI
+/// mode, and stays opaque. By default, a function is trusted if it is
+/// implemented by a type of the name of the type that implements the built-in
+/// function of its name (e.g. a type named `AbsFunc` for `abs`, see
+/// [`BuiltinFunction::named`]); in a session that registers the functions it
+/// trusts, only if it is implemented by the very type of one of them, so that
+/// a user-defined function that shadows a built-in one with a type of the same
+/// name (but of another crate) stays opaque too. (This crate does not depend
+/// on `datafusion-functions`, so it cannot name their types: the sessions
+/// register them.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuiltinFunction {
     Abs,
@@ -775,18 +781,37 @@ impl BuiltinFunction {
     ];
 
     /// The built-in function that `function` calls, if the session that
-    /// planned it (whose configuration it holds) trusts the type that
-    /// implements it (see [`TrustedFunctions`]).
+    /// planned it (whose configuration it holds) trusts it (see
+    /// [`TrustedFunctions`]): if the session registers the functions it
+    /// trusts, if it trusts the type that implements it, and otherwise (by
+    /// default) if the type that implements it has the name of the type of
+    /// DataFusion that implements the built-in function of its name (see
+    /// [`Self::named`]).
     fn of(function: &ScalarFunctionExpr) -> Option<Self> {
         let udf = function.fun();
-        let &(builtin, ..) = Self::ALL.iter().find(|(_, name, _)| *name == udf.name())?;
-        let trusted = function
+        let Some(trusted) = function
             .config_options()
             .extensions
-            .get::<TrustedFunctions>()?;
+            .get::<TrustedFunctions>()
+        else {
+            return Self::named(udf);
+        };
+        let &(builtin, ..) = Self::ALL.iter().find(|(_, name, _)| *name == udf.name())?;
         trusted
             .trusts(builtin, implementation_type(udf))
             .then_some(builtin)
+    }
+
+    /// The built-in function of the name of `udf`, if `udf` is implemented by
+    /// a type of the name of the type of DataFusion that implements it (see
+    /// [`implementation_name`]), e.g. a function named `date_part` of a type
+    /// named `DatePartFunc`: the functions that [`TrustedFunctions::new`]
+    /// trusts, and that the sessions that do not register the functions they
+    /// trust trust by default.
+    fn named(udf: &ScalarUDF) -> Option<Self> {
+        let &(builtin, _, type_name) =
+            Self::ALL.iter().find(|(_, name, _)| *name == udf.name())?;
+        (implementation_name(udf) == type_name).then_some(builtin)
     }
 
     /// The name of the function.
@@ -853,8 +878,10 @@ fn implementation_type(udf: &ScalarUDF) -> TypeId {
 /// The name of the type that implements `udf`, which its `Debug` output
 /// starts with (the built-in functions of DataFusion derive `Debug`), e.g.
 /// `UpperFunc`: [`TrustedFunctions::new`] only trusts functions implemented
-/// by types of the names of the built-in ones (it does not identify them, see
-/// [`BuiltinFunction::of`]).
+/// by types of the names of the built-in ones, and so do the sessions that do
+/// not register the functions they trust, by default (see
+/// [`BuiltinFunction::named`]; a type of another crate may have the name too,
+/// see [`BuiltinFunction::of`]).
 fn implementation_name(udf: &ScalarUDF) -> String {
     /// Collects the identifier that the output written to it starts with, and
     /// stops the formatting at the first other character.
@@ -882,34 +909,53 @@ fn implementation_name(udf: &ScalarUDF) -> String {
 
 /// The built-in scalar functions of DataFusion whose implementations a
 /// session trusts the native operators to know: a configuration extension of
-/// the session (see `BuiltinFunction` for the functions that they know).
+/// the session (see `BuiltinFunction` for the functions that they know). The
+/// calls of functions hold the configuration of the session that planned
+/// them, which tells which functions the session trusts:
 ///
-/// The classification knows the built-in functions by the types that
-/// implement them, which this crate cannot name (it does not depend on
-/// `datafusion-functions`), so a session registers the built-in functions
-/// that it plans with: they are known in the plans of the session, and in no
-/// other (where every function is opaque, see [`depends_on_batches`]). Their
-/// calls hold the configuration of the session that planned them.
+/// * Without this extension (by default, e.g. in a session with the default
+///   configuration, whose `PipelineQueryPlanner` plans with
+///   `DefaultPhysicalPlanner` and the built-in functions that the session
+///   registers), a session trusts the functions of the names of the built-in
+///   ones (e.g. `date_part` and `substr`, also called as `extract` and
+///   `substring`) that are implemented by types of the names of the types of
+///   DataFusion that implement them (e.g. `DatePartFunc` and `SubstrFunc`),
+///   as [`Self::new`] does for the functions it is given. A user-defined
+///   function that shadows a built-in one under its name stays opaque (see
+///   [`depends_on_batches`]) if its type has another name, e.g. Spark's `abs`,
+///   of `SparkAbs`.
+/// * With this extension, a session trusts exactly the functions that it
+///   registers, which are known in the plans of the session by the types that
+///   implement them (which this crate cannot name, as it does not depend on
+///   `datafusion-functions`): a user-defined function that shadows a built-in
+///   one under its name stays opaque also if its type has the name of the
+///   built-in one (but is of another crate). [`Self::new`] only trusts
+///   functions of the names, and implemented by types of the names, of the
+///   built-in ones (so that a session whose registry has, e.g., Spark's `abs`,
+///   of `SparkAbs`, does not trust it): the caller vouches that they are
+///   DataFusion's. A session that registers `TrustedFunctions::default()`
+///   trusts none.
 ///
 /// ```
 /// use datafusion::prelude::{SessionConfig, SessionContext};
 /// use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
 ///
-/// // The built-in functions of DataFusion, which a session registers by default.
+/// // Trusts the built-in functions by their names and the names of their
+/// // types (by default).
+/// let by_names = SessionContext::new();
+///
+/// // Trusts the built-in functions of DataFusion (which a session registers by
+/// // default) by their types.
 /// let functions = datafusion::functions::all_default_functions();
 /// let trusted = TrustedFunctions::new(&functions);
 /// assert!(trusted.names().contains(&"date_part"));
 /// let config = SessionConfig::new().with_option_extension(trusted);
-/// let ctx = SessionContext::new_with_config(config);
-/// ```
+/// let by_types = SessionContext::new_with_config(config);
 ///
-/// A call is known only if its function is implemented by the type of a
-/// trusted function of its name: a user-defined function that shadows a
-/// built-in one under its name stays opaque, also if its type has the name of
-/// the built-in one. [`Self::new`] only trusts functions of the names, and
-/// implemented by types of the names, of the built-in ones (so that a
-/// session whose registry has, e.g., Spark's `abs`, of `SparkAbs`, does not
-/// trust it): the caller vouches that they are DataFusion's.
+/// // Trusts no function.
+/// let config = SessionConfig::new().with_option_extension(TrustedFunctions::default());
+/// let untrusting = SessionContext::new_with_config(config);
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct TrustedFunctions {
     /// The trusted functions, and the types that implement them.
@@ -924,16 +970,11 @@ impl TrustedFunctions {
     pub fn new(functions: &[Arc<ScalarUDF>]) -> Self {
         let mut implementations: Vec<(BuiltinFunction, TypeId)> = vec![];
         for function in functions {
-            let Some(&(builtin, _, type_name)) = BuiltinFunction::ALL
-                .iter()
-                .find(|(_, name, _)| *name == function.name())
-            else {
+            let Some(builtin) = BuiltinFunction::named(function) else {
                 continue;
             };
             let implementation = (builtin, implementation_type(function));
-            if implementation_name(function) == type_name
-                && !implementations.contains(&implementation)
-            {
+            if !implementations.contains(&implementation) {
                 implementations.push(implementation);
             }
         }
@@ -3970,6 +4011,28 @@ mod tests {
                 assert!(!depends(&expr, &schema), "{expr}");
             }
         }
+        // `NULLIF` is a built-in function, which sessions trust by default: a
+        // division by a `NULLIF` of `0` only overflows in the sessions that do
+        // not register the functions they trust too, but not in those that
+        // trust none, where `NULLIF` is opaque.
+        let untrusting = datafusion::prelude::SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new()
+                .with_option_extension(TrustedFunctions::default()),
+        );
+        for (session, only_overflows) in [
+            (datafusion::prelude::SessionContext::new(), true),
+            (untrusting, false),
+        ] {
+            let expr = physical_expr_in(
+                &session,
+                "l_extendedprice / NULLIF(l_discount, 0)",
+                &schema,
+            );
+            let failures = failures(&expr, &schema);
+            assert_eq!(failures.only_overflows(), only_overflows, "{expr}");
+            assert_eq!(failures.order_matters(), !only_overflows, "{expr}");
+            assert_eq!(depends(&expr, &schema), !only_overflows, "{expr}");
+        }
         // Arrow divides such divisors without failing on the rows of `0`,
         // and fails with arithmetic overflows only.
         let decimals = Arc::new(Schema::new(vec![
@@ -4169,8 +4232,15 @@ mod tests {
     #[test]
     fn builtin_functions_are_known() {
         use Fallibility::*;
+        use datafusion::prelude::{SessionConfig, SessionContext};
         let schema = tpch_schema();
         let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
+        // The built-in functions are known in the sessions that register the
+        // functions they trust, and by default in those that do not.
+        let sessions = [
+            SessionContext::new_with_config(trusting(SessionConfig::new())),
+            SessionContext::new(),
+        ];
         for (expr, expected, depends_on) in [
             // Infallible built-in functions (but for the types and the
             // constant arguments they do not support).
@@ -4309,9 +4379,11 @@ mod tests {
             // But calls of functions of columns are arrays.
             ("abs(abs(x))".to_owned(), Infallible, false),
         ] {
-            let expr = physical_expr(&expr, &schema);
-            assert_eq!(fallibility_on_rows(&expr, &schema), expected, "{expr}");
-            assert_eq!(depends(&expr, &schema), depends_on, "{expr}");
+            for session in &sessions {
+                let expr = physical_expr_in(session, &expr, &schema);
+                assert_eq!(fallibility_on_rows(&expr, &schema), expected, "{expr}");
+                assert_eq!(depends(&expr, &schema), depends_on, "{expr}");
+            }
         }
         // After other conjuncts, those that may fail on some rows depend on
         // the batches, the others do not.
@@ -4325,8 +4397,10 @@ mod tests {
             ("n > 0 AND sqrt(x) > 1", true),
             ("n > 0 AND date_trunc('month', ts) > ts", true),
         ] {
-            let expr = physical_expr(expr, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+            for session in &sessions {
+                let expr = physical_expr_in(session, expr, &schema);
+                assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
+            }
         }
         // A function whose arguments are all constants returns an array on a
         // batch of one row, and a scalar on others: `-` negates them
@@ -4444,16 +4518,26 @@ mod tests {
 
     #[test]
     fn builtin_functions_are_identified_by_their_implementations() {
+        use datafusion::prelude::{SessionConfig, SessionContext};
         use datafusion_common::config::ConfigOptions;
         // Every known function is the built-in function of its name, which a
-        // session registers by default, in the sessions that trust it.
-        let ctx = datafusion::prelude::SessionContext::new();
+        // session registers by default, in the sessions that trust it: by
+        // default, those that do not register the functions they trust, and
+        // those that register it.
+        let ctx = SessionContext::new();
         let trusted =
             TrustedFunctions::new(&datafusion::functions::all_default_functions());
         assert_eq!(trusted.names().len(), BuiltinFunction::ALL.len());
-        let mut trusting_options = ConfigOptions::default();
-        trusting_options.extensions.insert(trusted);
-        let trusting_options = Arc::new(trusting_options);
+        let options_with = |trusted: Option<TrustedFunctions>| {
+            let mut options = ConfigOptions::default();
+            if let Some(trusted) = trusted {
+                options.extensions.insert(trusted);
+            }
+            Arc::new(options)
+        };
+        let trusting_options = options_with(Some(trusted));
+        let default_options = options_with(None);
+        let untrusting_options = options_with(Some(TrustedFunctions::default()));
         for (builtin, name, implementation) in BuiltinFunction::ALL {
             let udf = datafusion::execution::FunctionRegistry::udf(&ctx, name)
                 .unwrap_or_else(|_| panic!("no built-in function {name}"));
@@ -4474,20 +4558,32 @@ mod tests {
                 Some(builtin),
                 "{name}"
             );
-            // Not in a session that does not trust it.
-            let untrusting_options = Arc::new(ConfigOptions::default());
-            assert_eq!(BuiltinFunction::of(&call(&untrusting_options)), None);
+            // By default, by the names of the function and of its type.
+            assert_eq!(BuiltinFunction::named(&udf), Some(builtin), "{name}");
+            assert_eq!(
+                BuiltinFunction::of(&call(&default_options)),
+                Some(builtin),
+                "{name}"
+            );
+            // Not in a session that trusts no function.
+            assert_eq!(
+                BuiltinFunction::of(&call(&untrusting_options)),
+                None,
+                "{name}"
+            );
         }
         // A function that shadows a built-in one under its name is opaque in
         // a session that trusts the built-in one, also if its type has the
-        // name of the type of the built-in one.
+        // name of the type of the built-in one, and by default if its type has
+        // another name.
         let schema = tpch_schema();
-        let session = datafusion::prelude::SessionContext::new_with_config(trusting(
-            datafusion::prelude::SessionConfig::new(),
-        ));
+        let session = SessionContext::new_with_config(trusting(SessionConfig::new()));
         let builtin = physical_expr_in(&session, "abs(x)", &schema);
         assert!(!depends(&builtin, &schema));
         assert_eq!(fallibility(&builtin, &schema), Fallibility::Infallible);
+        let by_default = physical_expr_in(&SessionContext::new(), "abs(x)", &schema);
+        assert!(!depends(&by_default, &schema));
+        assert_eq!(fallibility(&by_default, &schema), Fallibility::Infallible);
         let signature =
             datafusion_expr::Signature::any(1, datafusion_expr::Volatility::Immutable);
         let shadowing = ScalarUDF::new_from_impl(ShadowingAbs {
@@ -4496,14 +4592,27 @@ mod tests {
         assert_eq!(implementation_name(&shadowing), "ShadowingAbs");
         let same_name = ScalarUDF::new_from_impl(AbsFunc { signature });
         assert_eq!(implementation_name(&same_name), "AbsFunc");
-        for udf in [shadowing.clone(), same_name] {
-            session.register_udf(udf);
+        for (udf, opaque_by_default) in [(shadowing.clone(), true), (same_name, false)] {
+            session.register_udf(udf.clone());
             let call = physical_expr_in(&session, "abs(x)", &schema);
             assert_eq!(call.to_string(), builtin.to_string());
             let function = call.downcast_ref::<ScalarFunctionExpr>().unwrap();
             assert_eq!(BuiltinFunction::of(function), None);
             assert!(depends(&call, &schema));
             assert_eq!(fallibility(&call, &schema), Fallibility::PerRow);
+            // By default, a function is known by the name of its type, which
+            // may also be that of a type of another crate: only the sessions
+            // that register the functions they trust tell them apart.
+            let by_default = SessionContext::new();
+            by_default.register_udf(udf);
+            let call = physical_expr_in(&by_default, "abs(x)", &schema);
+            let function = call.downcast_ref::<ScalarFunctionExpr>().unwrap();
+            assert_eq!(
+                BuiltinFunction::of(function).is_none(),
+                opaque_by_default,
+                "{function:?}"
+            );
+            assert_eq!(depends(&call, &schema), opaque_by_default);
         }
         // The functions of the names of built-in ones whose types do not have
         // the names of theirs are not trusted.
@@ -4527,12 +4636,11 @@ mod tests {
             .find(|entry| entry.key == "pipeline_trusted_functions.functions")
             .unwrap();
         assert!(entry.value.as_deref().unwrap().contains("date_part"));
-        // Nor are any in the sessions that do not trust them.
-        let untrusted = physical_expr_in(
-            &datafusion::prelude::SessionContext::new(),
-            "abs(x)",
-            &schema,
+        // Nor are any in the sessions that trust none.
+        let untrusting = SessionContext::new_with_config(
+            SessionConfig::new().with_option_extension(TrustedFunctions::default()),
         );
+        let untrusted = physical_expr_in(&untrusting, "abs(x)", &schema);
         assert!(depends(&untrusted, &schema));
         assert_eq!(fallibility(&untrusted, &schema), Fallibility::PerRow);
     }

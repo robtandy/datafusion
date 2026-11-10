@@ -162,7 +162,12 @@ impl PhysicalFilter {
     ///   `exec`. String constants, which the predicate may copy for every row
     ///   (e.g. `CASE WHEN x THEN 'HIGH' ELSE 'LOW' END = 'HIGH'`), only do not
     ///   if the plan bounds the rows of these batches (see
-    ///   [`depends_on_batches_with_rows`]);
+    ///   [`depends_on_batches_with_rows`]). Functions are opaque, but for the
+    ///   built-in functions of DataFusion whose implementations are known
+    ///   (e.g. `extract(year from o_orderdate)` or
+    ///   `substring(c_phone from 1 for 2)`), in the sessions that trust them,
+    ///   as sessions do by default (see
+    ///   [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions));
     /// * the input of `exec` has lists of values that take less than a byte
     ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans, or empty
     ///   lists or binaries), which the native operators cannot gather with
@@ -1033,7 +1038,7 @@ pub(crate) mod test_support {
     use crate::operators::projection::PhysicalProjection;
     use crate::test_utils::{
         EngineOutput, compare_outputs, datafusion_context, has_top_level_order_by,
-        register_test_tables, run_sql, test_session_config,
+        register_test_tables, run_engines, run_sql, test_session_config,
     };
 
     /// Lower `plan` into an operator tree that executes the `FilterExec`s
@@ -1482,6 +1487,35 @@ pub(crate) mod test_support {
         run
     }
 
+    /// Run `sql` with DataFusion and with the
+    /// [`PipelineQueryPlanner`](crate::PipelineQueryPlanner), in sessions
+    /// configured with `config` (as is: unlike [`run_native`], this does not
+    /// make them trust the built-in functions, see [`trusting`]) and set up
+    /// with `setup`, assert that the results are byte-identical, and return
+    /// the plan of DataFusion and the operator tree that the planner lowered
+    /// it to.
+    pub(crate) async fn assert_planned_byte_eq<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> (Arc<dyn ExecutionPlan>, Arc<dyn PhysicalOperator>)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let (expected, actual) = match run_engines(sql, config, setup).await {
+            Ok(outputs) => outputs,
+            Err(e) => panic!("Failed to run query on both engines: {e}\nquery: {sql}"),
+        };
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("Results differ: {message}\nquery: {sql}");
+        }
+        let root = actual
+            .plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("the pipeline engine planned the query");
+        (expected.plan, Arc::clone(root.operator()))
+    }
+
     /// Execute `plan`, created by `make_plan`, with DataFusion and with its
     /// native operators (see [`lower`]), and assert that the results are
     /// byte-identical (in the same order if `ordered`).
@@ -1696,7 +1730,8 @@ pub(crate) mod test_support {
     }
 
     /// `config`, trusting the built-in functions of DataFusion, which the
-    /// sessions of the tests register (see [`TrustedFunctions`]).
+    /// sessions of the tests register, by their types (see
+    /// [`TrustedFunctions`]: by default, sessions trust them by their names).
     pub(crate) fn trusting(config: SessionConfig) -> SessionConfig {
         config.with_option_extension(TrustedFunctions::new(
             &datafusion::functions::all_default_functions(),
@@ -4252,6 +4287,61 @@ mod tests {
                    WHERE l_extendedprice * (1 - l_discount) * (1 + l_tax) < l_quantity * 1000";
         let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
         assert_eq!(run.operators.filters, 0, "{sql}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn builtin_functions_of_tpch_filters_are_native_by_default() {
+        // The sessions of `test_session_config` (4 threads) do not register the
+        // functions they trust (see `TrustedFunctions`): by default, they trust
+        // the built-in functions of DataFusion, so that the
+        // `PipelineQueryPlanner` lowers the filters of TPC-H natively, with
+        // every node of their plans.
+        let config = test_session_config();
+        assert!(
+            config
+                .options()
+                .extensions
+                .get::<crate::operators::adaptive_filter::TrustedFunctions>()
+                .is_none()
+        );
+        for sql in [
+            // `extract(year from ...)` (Q7 to Q9).
+            "SELECT o_orderkey, o_orderdate FROM orders \
+             WHERE extract(year from o_orderdate) = 1995",
+            // `substring(c_phone from 1 for 2)` (Q22), also after other
+            // conjuncts, and Q22 itself (with its scalar subquery and its anti
+            // join).
+            "SELECT c_custkey, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > 0.00",
+            "SELECT c_custkey FROM customer WHERE c_acctbal > 0.00 \
+             AND substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17')",
+            "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (\
+             SELECT substring(c_phone from 1 for 2) AS cntrycode, c_acctbal FROM customer \
+             WHERE substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17') \
+             AND c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00 \
+             AND substring(c_phone from 1 for 2) IN ('13', '31', '23', '29', '30', '18', '17')) \
+             AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale \
+             GROUP BY cntrycode ORDER BY cntrycode",
+            // Constant strings of bounded sizes.
+            "SELECT o_orderkey FROM orders WHERE CASE WHEN o_orderpriority = '1-URGENT' \
+             OR o_orderpriority = '2-HIGH' THEN '1-URGENT' ELSE '2-HIGH' END = '1-URGENT'",
+            // A decimal division by a `NULLIF` of `0` (a built-in function),
+            // which can only fail with arithmetic overflows.
+            "SELECT l_orderkey FROM lineitem \
+             WHERE l_extendedprice / NULLIF(l_discount, 0) > 100000.00",
+        ] {
+            let (plan, root) =
+                assert_planned_byte_eq(sql, config.clone(), tpch_tables).await;
+            let (_, filters) = assert_all_lowerable(&plan);
+            assert!(filters > 0, "no filter: {sql}");
+            assert!(
+                crate::bridge::bridged_plans(&root).is_empty(),
+                "{sql}\n{}",
+                crate::explain::format_operator_tree(&root)
+            );
+            assert_eq!(NativeOperators::of(&root).filters, filters, "{sql}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
