@@ -209,7 +209,9 @@ use crate::operator::{
     SinkFinalize, SinkResult, SourceResult, TaskInterrupt, downcast_state,
     downcast_state_mut,
 };
-use crate::operators::adaptive_filter::is_infallible;
+use crate::operators::adaptive_filter::{
+    Failures, depends_on_batches, failures, is_infallible,
+};
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::tuple_data::layout::has_run_end_encoded;
 use crate::tuple_data::{PartitionedTupleData, RowLocation, TupleDataLayout};
@@ -653,15 +655,29 @@ impl PhysicalHashJoin {
     ///   of its probe input right away, which the native join does too, on
     ///   such a copy, to raise the same errors before it reads its probe
     ///   side;
-    /// * a join whose residual filter or probe keys can fail on some rows
-    ///   (conservatively, any expression but columns, literals, comparisons,
-    ///   boolean operators, wrapping arithmetic, divisions by constants
-    ///   other than 0 and -1, and casts that cannot fail): DataFusion
-    ///   evaluates the filter on up to `batch_size` candidate pairs of a
-    ///   probe batch, and the probe keys on whole probe batches, before it
-    ///   emits any of their rows, while a native join evaluates them chunk by
-    ///   chunk and emits as it goes, so that it could stop (e.g. under a
-    ///   limit) before it evaluates them on rows on which DataFusion fails;
+    /// * a join whose probe keys can fail on some rows (conservatively, any
+    ///   expression but columns, literals, comparisons, boolean operators,
+    ///   wrapping arithmetic, divisions by constants other than 0 and -1, and
+    ///   casts that cannot fail): DataFusion evaluates the probe keys on whole
+    ///   probe batches before it emits any of their rows, while a native join
+    ///   evaluates them chunk by chunk and emits as it goes, so that it could
+    ///   stop (e.g. under a limit) before it evaluates them on rows on which
+    ///   DataFusion fails;
+    /// * a join whose residual filter has errors that depend on the candidate
+    ///   pairs it is evaluated on together (see `depends_on_batches`, e.g. the
+    ///   product of decimals of `l.a > 0 AND l.a * r.b > 1`, which DataFusion
+    ///   evaluates on all pairs of a batch unless at most 20% of them are
+    ///   left), or parts that may fail with different errors, or with other
+    ///   errors than arithmetic overflows (see `Failures`): both engines
+    ///   evaluate the filter on all candidate pairs, but DataFusion on up to
+    ///   `batch_size` pairs of a probe batch at once, a native join on up to
+    ///   [`DEFAULT_VECTOR_SIZE`] pairs of a probe chunk, in another order and
+    ///   on all threads of its probe pipeline, so that another pair could fail
+    ///   first (see `fails_like_datafusion_on_threads`). A filter whose parts
+    ///   can only fail with arithmetic overflows (e.g. decimal arithmetic)
+    ///   raises an `ArrowError::ArithmeticOverflow` whichever pair overflows
+    ///   first, and is lowered, e.g. the semi join of TPC-H Q17, whose filter
+    ///   compares quantities cast into decimals of more digits;
     /// * a join whose single build key of an integer type can fail on some
     ///   rows (e.g. `1 / k`), or with a dynamic filter, whose build keys can
     ///   fail on some rows or have a type whose bounds may fail to be computed
@@ -689,6 +705,21 @@ impl PhysicalHashJoin {
     ///   build side;
     /// * a join whose keys have different types on the two sides, or whose
     ///   build columns the [`TupleDataLayout`] cannot store.
+    ///
+    /// A planner must keep a join whose residual filter may overflow in
+    /// DataFusion, with its inputs, below a limit that stops the execution
+    /// early (e.g. the input of a `GlobalLimitExec`), as the
+    /// [`PipelineQueryPlanner`](crate::PipelineQueryPlanner) keeps every plan
+    /// below such a limit: DataFusion evaluates the filter on all candidate
+    /// pairs of a probe batch (up to `batch_size` of them) before it emits any
+    /// of them, a native join emits as it goes, so that it could stop before
+    /// it evaluates the filter on a pair on which DataFusion overflows. And so
+    /// it must if native operators of the probe pipeline of the join, below or
+    /// above it, have parts that may fail with other errors (see `Failures`):
+    /// DataFusion evaluates the nodes below the join, the join and the nodes
+    /// above it each on a whole batch before the next one, a pipeline every
+    /// chunk with all of its operators, so which error comes first depends on
+    /// the batches.
     ///
     /// The inputs of the join are lowered without the nodes directly below
     /// the join that only distribute the rows of the inputs over partitions:
@@ -818,22 +849,39 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        // DataFusion evaluates the residual filter on up to `batch_size`
-        // candidate pairs of a probe batch at once, and the probe keys on
-        // whole probe batches (also empty ones), before it emits any of their
-        // rows. A native join evaluates them chunk by chunk (and never on an
-        // empty chunk) and emits as it goes, so that, e.g. under a limit, it
-        // could stop before it evaluates them on rows on which DataFusion
-        // fails: a filter or probe keys that can fail on some rows (or on no
-        // rows, e.g. `1 / 0`) are left to DataFusion. (Lowering evaluates no
-        // expression: an expression may change its state when evaluated.)
+        // DataFusion evaluates the probe keys on whole probe batches (also
+        // empty ones) before it emits any of their rows. A native join
+        // evaluates them chunk by chunk (and never on an empty chunk) and
+        // emits as it goes, so that, e.g. under a limit, it could stop before
+        // it evaluates them on rows on which DataFusion fails: probe keys that
+        // can fail on some rows (or on no rows, e.g. `1 / 0`) are left to
+        // DataFusion. (Lowering evaluates no expression: an expression may
+        // change its state when evaluated.)
         let probe_schema = join.right().schema();
-        if join
-            .filter()
-            .is_some_and(|filter| can_fail(filter.expression(), filter.schema()))
-            || probe_keys.iter().any(|key| can_fail(key, &probe_schema))
-        {
+        if probe_keys.iter().any(|key| can_fail(key, &probe_schema)) {
             return Ok(None);
+        }
+        // Both engines evaluate the residual filter on all candidate pairs,
+        // but on other pairs together, in another order, and natively on all
+        // threads of the probe pipeline (see `fails_like_datafusion_on_threads`):
+        // a filter whose errors depend on the pairs it is evaluated on
+        // together, or whose parts may fail with different errors, or with
+        // other errors than arithmetic overflows, is left to DataFusion. One
+        // whose parts can only overflow (e.g. decimal arithmetic) fails like
+        // DataFusion's. (`depends_on_batches` comes first: it finds the parts
+        // that must not be evaluated before the execution, volatile or dynamic
+        // ones, before the classification evaluates any, see `failures`.)
+        if let Some(filter) = join.filter() {
+            let (expression, schema) = (filter.expression(), filter.schema().as_ref());
+            if depends_on_batches(expression, schema) {
+                return Ok(None);
+            }
+            let filter_failures = failures(expression, schema);
+            if filter_failures.order_matters()
+                || !fails_like_datafusion_on_threads(filter_failures)
+            {
+                return Ok(None);
+            }
         }
         // DataFusion concatenates its whole build side (all its columns, also
         // those the join does not need), which fails if a dictionary needs
@@ -1866,6 +1914,37 @@ fn local_scan_streams_cannot_fail(config: &FileScanConfig) -> bool {
                             .file_decryption
                             .is_none()
                     })))
+}
+
+/// Whether a native join whose residual filter has the parts that may fail
+/// `failures` (see [`failures`]), and errors that do not depend on the pairs it
+/// is evaluated on together (see [`depends_on_batches`]), raises the errors of
+/// DataFusion's `HashJoinExec` on the threads of its probe pipeline: if these
+/// parts can only fail with arithmetic overflows (see
+/// [`Failures::only_overflows`]), whatever the number of threads.
+///
+/// Both engines evaluate the filter on all candidate pairs of the join (the
+/// pairs of probe and build rows whose keys are equal), and on no other pair.
+/// But DataFusion evaluates it on up to `batch_size` candidate pairs of a probe
+/// batch at once, in the order of its build input, and a native join on up to
+/// [`DEFAULT_VECTOR_SIZE`] candidate pairs of a probe chunk at once, in the
+/// order of its chains (the order in which the threads of its build pipeline
+/// collected the build rows, see [`JoinHashTable`]), on all threads of its
+/// probe pipeline: another pair than in DataFusion may fail first. Whichever
+/// pair overflows first, on whichever thread, the error of parts that can
+/// only overflow (e.g. the decimal arithmetic of TPC-H) is an
+/// `ArrowError::ArithmeticOverflow`, as in DataFusion (although the values
+/// that it names may be those of another pair), as for the native operators
+/// that the planner lowers on several threads (see its
+/// `Lowering::fails_like_datafusion_on_threads`). The planner lowers native
+/// filters and projections with a part that may fail with another error on a
+/// single thread, which evaluates the rows of a partition in DataFusion's
+/// order, but the order of the candidate pairs of a native join is not
+/// DataFusion's on any number of threads: a part that may fail with another
+/// error, e.g. a cast, whose errors name the value that fails, could fail on
+/// another pair first, also on a single thread.
+fn fails_like_datafusion_on_threads(failures: Failures) -> bool {
+    failures.only_overflows()
 }
 
 /// Whether evaluating `expr` on a batch of `schema` can fail on some rows.
@@ -3216,6 +3295,7 @@ mod tests {
     };
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{DataType, Int64Type, TimeUnit};
+    use datafusion::datasource::MemTable;
     use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
     use datafusion_datasource::PartitionedFile;
     use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -3257,7 +3337,8 @@ mod tests {
     use crate::sources::test_harness::write_parquet;
     use crate::test_utils::{
         EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
-        datafusion_context, register_test_tables, run_sql, test_session_config,
+        datafusion_context, pipeline_context, register_test_tables, run_sql,
+        test_session_config,
     };
 
     // ---------------------------------------------------------------------
@@ -3666,6 +3747,18 @@ mod tests {
         }
 
         fn plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+            let filter = self
+                .filter
+                .map(|(left, op, right)| join_filter(left, op, right));
+            self.plan_with_filter(filter)
+        }
+
+        /// The plan of the join with the residual filter `filter` instead of
+        /// [`Self::filter`].
+        fn plan_with_filter(
+            &self,
+            filter: Option<JoinFilter>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
             let left = data_scan("l", self.left_rows, 0);
             let right = data_scan("r", self.right_rows, 3);
             let left_keys = self
@@ -3693,9 +3786,6 @@ mod tests {
                     _ => (Arc::new(CoalescePartitionsExec::new(left)), right),
                 };
             let on = left_keys.into_iter().zip(right_keys).collect();
-            let filter = self
-                .filter
-                .map(|(left, op, right)| join_filter(left, op, right));
             Ok(Arc::new(HashJoinExec::try_new(
                 left,
                 right,
@@ -3836,6 +3926,219 @@ mod tests {
                 assert_case(&case).await;
             }
         }
+    }
+
+    /// A residual filter of the test inputs (see [`data_schema`]) on the
+    /// columns `columns` (of the left input if their name starts with `l`, of
+    /// the right input otherwise): the expression that `expression` builds on
+    /// the schema of its intermediate batch.
+    fn filter_on(
+        columns: &[&str],
+        expression: impl FnOnce(&Schema) -> Result<PhysicalExprRef>,
+    ) -> Result<JoinFilter> {
+        let mut fields = Vec::with_capacity(columns.len());
+        let mut column_indices = Vec::with_capacity(columns.len());
+        for name in columns {
+            let (side, schema) = if name.starts_with('l') {
+                (JoinSide::Left, data_schema("l"))
+            } else {
+                (JoinSide::Right, data_schema("r"))
+            };
+            let index = schema.index_of(name)?;
+            fields.push(schema.field(index).clone());
+            column_indices.push(ColumnIndex { index, side });
+        }
+        let schema = Arc::new(Schema::new(fields));
+        Ok(JoinFilter::new(
+            expression(&schema)?,
+            column_indices,
+            schema,
+        ))
+    }
+
+    fn binary_expr(
+        left: PhysicalExprRef,
+        op: Operator,
+        right: PhysicalExprRef,
+    ) -> PhysicalExprRef {
+        Arc::new(BinaryExpr::new(left, op, right))
+    }
+
+    fn cast_expr(expr: PhysicalExprRef, to: DataType) -> PhysicalExprRef {
+        Arc::new(CastExpr::new(expr, to, None))
+    }
+
+    /// The decimal `value * 10^-scale` of precision `precision`.
+    fn decimal_lit(value: i128, precision: u8, scale: i8) -> PhysicalExprRef {
+        lit(ScalarValue::Decimal128(Some(value), precision, scale))
+    }
+
+    /// Residual filters of the decimals (`DECIMAL(12, 2)`) of the test inputs,
+    /// with their names, and whether [`PhysicalHashJoin::try_lower`] lowers
+    /// the joins with them: those whose parts can only fail with arithmetic
+    /// overflows (or cannot fail), on any number of threads, and whose errors
+    /// do not depend on the candidate pairs that they are evaluated on
+    /// together (see `fails_like_datafusion_on_threads`).
+    fn decimal_filters() -> Result<Vec<(&'static str, JoinFilter, bool)>> {
+        let ten = || decimal_lit(100_000, 25, 4);
+        Ok(vec![
+            // Like TPC-H Q17's `CAST(l_quantity AS Decimal128(30, 15)) < ...`:
+            // casts into decimals of more digits, which cannot fail.
+            (
+                "widening casts",
+                filter_on(&["ld", "rd"], |schema| {
+                    let wide = DataType::Decimal128(30, 15);
+                    Ok(binary_expr(
+                        cast_expr(col("ld", schema)?, wide.clone()),
+                        Operator::Lt,
+                        cast_expr(col("rd", schema)?, wide),
+                    ))
+                })?,
+                true,
+            ),
+            // A product, which can only overflow.
+            (
+                "product",
+                filter_on(&["ld", "rd"], |schema| {
+                    let product = binary_expr(
+                        col("ld", schema)?,
+                        Operator::Multiply,
+                        col("rd", schema)?,
+                    );
+                    Ok(binary_expr(product, Operator::Gt, ten()))
+                })?,
+                true,
+            ),
+            // Two divisions by a constant that is not 0 (like the `/ 7.0` of
+            // Q17), which can only overflow.
+            (
+                "quotients",
+                filter_on(&["ld", "rd"], |schema| {
+                    let seventh = |column: &str| -> Result<PhysicalExprRef> {
+                        Ok(binary_expr(
+                            col(column, schema)?,
+                            Operator::Divide,
+                            decimal_lit(70, 2, 1),
+                        ))
+                    };
+                    Ok(binary_expr(seventh("ld")?, Operator::Lt, seventh("rd")?))
+                })?,
+                true,
+            ),
+            // A division by a column, which fails with an overflow, or with a
+            // division by zero: which error comes first depends on the order
+            // of the pairs (see `Failures::order_matters`).
+            (
+                "division by a column",
+                filter_on(&["ld", "rd"], |schema| {
+                    let quotient = binary_expr(
+                        col("ld", schema)?,
+                        Operator::Divide,
+                        col("rd", schema)?,
+                    );
+                    let zero = ScalarValue::new_zero(&quotient.data_type(schema)?)?;
+                    Ok(binary_expr(quotient, Operator::Gt, lit(zero)))
+                })?,
+                false,
+            ),
+            // A single part that fails with cast errors, which name the value
+            // that fails: which pair fails first depends on the order of the
+            // pairs, also on a single thread.
+            (
+                "cast of strings",
+                filter_on(&["ls", "rk"], |schema| {
+                    Ok(binary_expr(
+                        cast_expr(col("ls", schema)?, DataType::Int32),
+                        Operator::Gt,
+                        col("rk", schema)?,
+                    ))
+                })?,
+                false,
+            ),
+            // A product that DataFusion evaluates on the pairs on which the
+            // left side of the `AND` is true, or on all pairs of a batch,
+            // depending on how many of them it is true on.
+            (
+                "conditional product",
+                filter_on(&["ld", "rd"], |schema| {
+                    let positive = binary_expr(
+                        col("ld", schema)?,
+                        Operator::Gt,
+                        decimal_lit(0, 12, 2),
+                    );
+                    let product = binary_expr(
+                        col("ld", schema)?,
+                        Operator::Multiply,
+                        col("rd", schema)?,
+                    );
+                    let large = binary_expr(product, Operator::Gt, ten());
+                    Ok(binary_expr(positive, Operator::And, large))
+                })?,
+                false,
+            ),
+        ])
+    }
+
+    #[test]
+    fn residual_filters_that_can_only_overflow_are_lowered() -> Result<()> {
+        for (name, filter, native) in decimal_filters()? {
+            let (expression, schema) = (filter.expression(), filter.schema().as_ref());
+            let filter_failures = failures(expression, schema);
+            let batch_dependent = depends_on_batches(expression, schema);
+            // Why the joins with the other filters are left to DataFusion.
+            match name {
+                "division by a column" => assert!(filter_failures.order_matters()),
+                // A single part, but with another error than an overflow.
+                "cast of strings" => assert!(
+                    !filter_failures.order_matters() && !filter_failures.only_overflows()
+                ),
+                "conditional product" => {
+                    assert!(filter_failures.only_overflows() && batch_dependent)
+                }
+                _ => assert!(
+                    native && filter_failures.only_overflows() && !batch_dependent,
+                    "{name}: {filter_failures:?}"
+                ),
+            }
+            for join_type in ALL_JOIN_TYPES {
+                for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+                    let case = JoinCase {
+                        mode,
+                        ..JoinCase::new(join_type, vec!["k"])
+                    };
+                    let plan = case.plan_with_filter(Some(filter.clone()))?;
+                    let lowered = PhysicalHashJoin::try_lower(&plan, lower)?;
+                    assert_eq!(lowered.is_some(), native, "{name}: {case:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn residual_filters_that_can_only_overflow_match_datafusion() -> Result<()> {
+        // On the 4 threads of the test configuration. The chunk of the first
+        // partition of the probe side (250 rows) has 2,694 candidate pairs,
+        // more than the join filters at once (`DEFAULT_VECTOR_SIZE`): it
+        // filters them in two batches.
+        for (name, filter, native) in decimal_filters()? {
+            if !native {
+                continue;
+            }
+            for join_type in ALL_JOIN_TYPES {
+                for mode in [PartitionMode::CollectLeft, PartitionMode::Partitioned] {
+                    let case = JoinCase {
+                        mode,
+                        ..JoinCase::new(join_type, vec!["k"])
+                    };
+                    let make = || case.plan_with_filter(Some(filter.clone()));
+                    let root =
+                        assert_lowered_plan_byte_eq(make, lower, task_ctx(), false).await;
+                    assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{name}: {case:?}");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4627,6 +4930,212 @@ mod tests {
                 assert!(rows > 0, "{name} has no rows");
             }
         }
+    }
+
+    /// TPC-H Q17. DataFusion decorrelates its subquery into a `LeftSemi` hash
+    /// join of `lineitem JOIN part` (the build side) with the average
+    /// quantities of the parts (the probe side), on the part keys, with the
+    /// residual filter `CAST(l_quantity AS Decimal128(30, 15)) < Float64(0.2)
+    /// * avg(lineitem.l_quantity)`.
+    const TPCH_Q17: &str = "select
+            sum(l_extendedprice) / 7.0 as avg_yearly
+        from
+            lineitem,
+            part
+        where
+            p_partkey = l_partkey
+            and p_brand = 'Brand#23'
+            and p_container = 'MED BOX'
+            and l_quantity < (
+                select
+                    0.2 * avg(l_quantity)
+                from
+                    lineitem
+                where
+                    l_partkey = p_partkey
+            )";
+
+    /// Register the columns of `part` and `lineitem` that TPC-H Q17 reads,
+    /// with the types of TPC-H (`BIGINT` keys, `DECIMAL(15, 2)` quantities and
+    /// prices, `Utf8View` strings), as `MemTable`s of skewed partitions (one
+    /// of them empty): 400 parts, every 21st of which is a `MED BOX` of
+    /// `Brand#23`, and 30,000 lineitems, every 5th of which is of part 42 (one
+    /// of those), whose 6,000 build rows span several chunks of candidate
+    /// pairs of the semi join.
+    fn register_tpch_q17_tables(ctx: &SessionContext) -> Result<()> {
+        let keys = 1..=400_i64;
+        let part = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("p_partkey", DataType::Int64, false),
+                Field::new("p_brand", DataType::Utf8View, false),
+                Field::new("p_container", DataType::Utf8View, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(keys.clone())),
+                Arc::new(StringViewArray::from_iter_values(keys.clone().map(|key| {
+                    if key % 7 == 0 {
+                        "Brand#23".to_string()
+                    } else {
+                        format!("Brand#{}", 11 + key % 5)
+                    }
+                }))),
+                Arc::new(StringViewArray::from_iter_values(
+                    keys.map(|key| if key % 3 == 0 { "MED BOX" } else { "SM CASE" }),
+                )),
+            ],
+        )?;
+        let rows = 0..30_000_i64;
+        let part_keys = rows
+            .clone()
+            .map(|row| {
+                if row % 5 == 0 {
+                    42
+                } else {
+                    1 + row * 7919 % 400
+                }
+            })
+            .collect::<Vec<_>>();
+        let quantities = rows
+            .clone()
+            .map(|row| row * 37 % 50 + 1)
+            .collect::<Vec<_>>();
+        let decimals = |cents: Vec<i64>| -> Result<ArrayRef> {
+            let cents = cents.into_iter().map(i128::from);
+            Ok(Arc::new(
+                Decimal128Array::from_iter_values(cents)
+                    .with_precision_and_scale(15, 2)?,
+            ))
+        };
+        let prices = quantities
+            .iter()
+            .zip(&part_keys)
+            .map(|(quantity, key)| quantity * (90_000 + key * 10))
+            .collect();
+        let lineitem = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("l_partkey", DataType::Int64, false),
+                Field::new("l_quantity", DataType::Decimal128(15, 2), false),
+                Field::new("l_extendedprice", DataType::Decimal128(15, 2), false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(part_keys)),
+                decimals(quantities.iter().map(|quantity| quantity * 100).collect())?,
+                decimals(prices)?,
+            ],
+        )?;
+        let part_partitions =
+            vec![vec![part.slice(0, 250)], vec![], vec![part.slice(250, 150)]];
+        ctx.register_table(
+            "part",
+            Arc::new(MemTable::try_new(part.schema(), part_partitions)?),
+        )?;
+        let lineitem_partitions = vec![
+            vec![lineitem.slice(0, 9_000), lineitem.slice(9_000, 6_000)],
+            vec![],
+            vec![lineitem.slice(15_000, 9_000)],
+            vec![lineitem.slice(24_000, 4_000)],
+            vec![lineitem.slice(28_000, 2_000)],
+        ];
+        ctx.register_table(
+            "lineitem",
+            Arc::new(MemTable::try_new(lineitem.schema(), lineitem_partitions)?),
+        )?;
+        Ok(())
+    }
+
+    /// The native hash joins of the operator tree below (and including)
+    /// `operator`.
+    fn native_hash_joins(operator: &Arc<dyn PhysicalOperator>) -> Vec<&PhysicalHashJoin> {
+        let mut joins = operator
+            .downcast_ref::<PhysicalHashJoin>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for child in operator.children() {
+            joins.extend(native_hash_joins(child));
+        }
+        joins
+    }
+
+    /// The `HashJoinExec`s of `plan`.
+    fn hash_join_execs(plan: &Arc<dyn ExecutionPlan>) -> Vec<&HashJoinExec> {
+        let mut joins = plan
+            .downcast_ref::<HashJoinExec>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for child in plan.children() {
+            joins.extend(hash_join_execs(child));
+        }
+        joins
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tpch_q17_semi_join_with_its_decimal_filter_is_native() -> Result<()> {
+        // The residual filter of the semi join of Q17 casts quantities into
+        // decimals of more digits, which cannot fail. The other parts of Q17
+        // are native too, but for the projection of the probe side of the semi
+        // join, which casts `0.2 * avg(l_quantity)` from floats into decimals
+        // (see `PhysicalProjection::supports_projection_exec`).
+        let setup = async |ctx: &SessionContext| register_tpch_q17_tables(ctx);
+        let semi_join_filter = |filter: Option<&JoinFilter>| {
+            filter.is_some_and(|filter| {
+                filter
+                    .expression()
+                    .to_string()
+                    .starts_with("CAST(l_quantity@0 AS Decimal128(30, 15)) < ")
+            })
+        };
+        for target_partitions in [4, 1] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            assert_byte_eq_with_datafusion_with_config(TPCH_Q17, config.clone(), &setup)
+                .await;
+
+            // DataFusion plans a semi join with that filter, and the average
+            // yearly price is not NULL: some lineitems pass the filter.
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let expected = run_sql(&ctx, TPCH_Q17).await?;
+            let joins = hash_join_execs(&expected.plan);
+            assert!(
+                joins
+                    .iter()
+                    .any(|join| *join.join_type() == JoinType::LeftSemi
+                        && semi_join_filter(join.filter())),
+                "{}",
+                displayable(expected.plan.as_ref()).indent(true)
+            );
+            assert_eq!(count_rows(&expected.batches), 1);
+            assert!(
+                expected
+                    .batches
+                    .iter()
+                    .all(|batch| batch.column(0).null_count() == 0)
+            );
+
+            // The pipeline engine lowers it to a native join, with the filter,
+            // and runs no `HashJoinExec` in a `BridgeOperator`.
+            let ctx = pipeline_context(config);
+            setup(&ctx).await?;
+            let plan = ctx.sql(TPCH_Q17).await?.create_physical_plan().await?;
+            let root = plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator();
+            let tree = format_operator_tree(root);
+            assert!(
+                native_hash_joins(root).iter().any(|join| {
+                    join.join_type() == JoinType::LeftSemi
+                        && semi_join_filter(join.filter())
+                }),
+                "{target_partitions} threads: {tree}"
+            );
+            assert!(
+                bridged_plans(root)
+                    .iter()
+                    .all(|plan| hash_join_execs(plan).is_empty()),
+                "{target_partitions} threads: {tree}"
+            );
+        }
+        Ok(())
     }
 
     /// Whether a `HashJoinExec` of `plan` produces a dynamic filter.
@@ -7453,6 +7962,120 @@ mod tests {
         )
         .await;
         assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn residual_filters_that_overflow_fail_like_datafusion() -> Result<()> {
+        // 5,000 build rows of key 7, all with `v = 1` but row 3,000 (`v =
+        // 10^37`), a probe row of key 7 with `v = 1000`, and the filter
+        // `l.v * r.v > 0` of `DECIMAL(38, 0)`s, which overflows on the pair
+        // of row 3,000 (and can fail in no other way), with or without a
+        // limit of one row above the join.
+        let make_plan = |limit: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("v", DataType::Decimal128(38, 0), true),
+            ]));
+            let batch = |keys: Vec<i32>, values: Vec<i128>| -> Result<RecordBatch> {
+                let values =
+                    Decimal128Array::from(values).with_precision_and_scale(38, 0)?;
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(keys)), Arc::new(values)],
+                )?)
+            };
+            let values = (0..5000)
+                .map(|i| if i == 3000 { 10_i128.pow(37) } else { 1 })
+                .collect();
+            let build: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+                &[vec![batch(vec![7; 5000], values)?]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let probe: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+                &[vec![batch(vec![7], vec![1000])?]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let filter_schema = Arc::new(Schema::new(vec![
+                Field::new("lv", DataType::Decimal128(38, 0), true),
+                Field::new("rv", DataType::Decimal128(38, 0), true),
+            ]));
+            let product = binary_expr(
+                col("lv", &filter_schema)?,
+                Operator::Multiply,
+                col("rv", &filter_schema)?,
+            );
+            let filter = JoinFilter::new(
+                binary_expr(product, Operator::Gt, decimal_lit(0, 38, 0)),
+                vec![
+                    ColumnIndex {
+                        index: 1,
+                        side: JoinSide::Left,
+                    },
+                    ColumnIndex {
+                        index: 1,
+                        side: JoinSide::Right,
+                    },
+                ],
+                filter_schema,
+            );
+            let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+            let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+                build,
+                probe,
+                on,
+                Some(filter),
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )?);
+            Ok(if limit {
+                Arc::new(GlobalLimitExec::new(join, 0, Some(1)))
+            } else {
+                join
+            })
+        };
+        let config = test_session_config().with_batch_size(8192);
+        let options = Arc::clone(config.options());
+        let planner = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::planner::lower_execution_plan_with_options(plan, &options)
+        };
+        // On the 4 threads of the configuration, the join is native, also when
+        // the planner lowers it, and fails like DataFusion's: whichever thread
+        // evaluates the pair of row 3,000, it overflows.
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || make_plan(false),
+            lower,
+            config.clone(),
+            "Arithmetic overflow",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || make_plan(false),
+            planner,
+            config.clone(),
+            "Arithmetic overflow",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
+        // Under the limit, DataFusion evaluates the filter on all 5,000
+        // candidate pairs (fewer than `batch_size`) before it emits any row,
+        // and overflows, while a native join, which emits as it goes, would
+        // stop after its first chunk of pairs: the planner keeps the plans
+        // below a limit in DataFusion (see `PhysicalHashJoin::try_lower`).
+        let root = assert_lowered_plan_fails_like_datafusion(
+            || make_plan(true),
+            planner,
+            config,
+            "Arithmetic overflow",
+        )
+        .await;
+        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
         Ok(())
     }
 
