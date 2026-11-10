@@ -6159,6 +6159,117 @@ mod tests {
         Ok(path.to_str().unwrap().to_string())
     }
 
+    /// A Parquet file at `path` of `rows` rows `(k INT32, v INT96, s UTF8)`: of
+    /// `k`, of the INT96 timestamp of midnight of the Julian day `day`, and of
+    /// `s`.
+    fn write_int96_parquet(
+        path: &std::path::Path,
+        (k, day, s): (i32, u32, &str),
+        rows: usize,
+    ) -> Result<()> {
+        use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int96, Int96Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        let schema = Arc::new(parquet::schema::parser::parse_message_type(
+            "message schema { REQUIRED INT32 k; REQUIRED INT96 v; \
+             REQUIRED BYTE_ARRAY s (UTF8); }",
+        )?);
+        std::fs::create_dir_all(path.parent().expect("a directory"))?;
+        let file = std::fs::File::create(path)?;
+        let properties = Arc::new(WriterProperties::builder().build());
+        let mut writer = SerializedFileWriter::new(file, schema, properties)?;
+        let mut row_group = writer.next_row_group()?;
+        let mut column = row_group.next_column()?.expect("k");
+        column
+            .typed::<Int32Type>()
+            .write_batch(&vec![k; rows], None, None)?;
+        column.close()?;
+        let mut column = row_group.next_column()?.expect("v");
+        let mut timestamp = Int96::new();
+        timestamp.set_data(0, 0, day);
+        column
+            .typed::<Int96Type>()
+            .write_batch(&vec![timestamp; rows], None, None)?;
+        column.close()?;
+        let mut column = row_group.next_column()?.expect("s");
+        column.typed::<ByteArrayType>().write_batch(
+            &vec![ByteArray::from(s); rows],
+            None,
+            None,
+        )?;
+        column.close()?;
+        row_group.close()?;
+        writer.close()?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_int96_files_that_the_scan_casts_stay_in_datafusion() -> Result<()>
+    {
+        // A table `k INT, v TIMESTAMP (ns), s VARCHAR` (its schema given when it
+        // is registered) of two Parquet files of INT96 timestamps: 100 rows `k =
+        // 0` at the epoch, and 10 rows `k = 1` on the Julian day 3,000,000 (in
+        // the year 3501). The session reads INT96 timestamps in microseconds
+        // (`coerce_int96`), from which the scan casts them into the
+        // nanoseconds of the table: the timestamps of the second file overflow.
+        // The TopK of `ORDER BY k LIMIT 1` reads the first file, whose first
+        // batch of 64 rows tightens its threshold to `k < 0`, and DataFusion's
+        // scan prunes the second file. Its reads may fail (the files do not have
+        // the types of the table, once read as the session reads them), so the
+        // TopK stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p");
+        write_int96_parquet(&path.join("0.parquet"), (0, 2_440_588, "foo"), 100)?;
+        write_int96_parquet(&path.join("1.parquet"), (1, 3_000_000, "foo"), 10)?;
+        let path = path.to_str().unwrap();
+        let schema = Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new(
+                "v",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("s", DataType::Utf8View, false),
+        ]);
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+                .await
+        };
+        let mut config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        config
+            .options_mut()
+            .set("datafusion.execution.parquet.coerce_int96", "us")?;
+        for sql in [
+            "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+            "SELECT k, v FROM p ORDER BY k LIMIT 1",
+        ] {
+            let root = assert_parity_with(sql, config.clone(), &setup).await;
+            assert_eq!(
+                count::<PhysicalTopK>(&root),
+                0,
+                "{sql}\n{}",
+                format_operator_tree(&root)
+            );
+        }
+        // Without `coerce_int96`, the reader reads the timestamps in the
+        // nanoseconds of the table (the second file, whose timestamps do not
+        // fit, is then read as DataFusion reads it), and the TopK is native.
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let sql = "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(
+            count::<PhysicalTopK>(&root),
+            1,
+            "{}",
+            format_operator_tree(&root)
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_whose_dynamic_filter_prunes_casts_that_may_fail_stay_in_datafusion()
     -> Result<()> {
