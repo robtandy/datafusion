@@ -242,6 +242,9 @@ struct RadixLocalState {
     distinct_flushed: DistinctEstimate,
     /// The input rows, if they must be sorted before they are aggregated.
     buffer: InputBuffer,
+    /// Whether the rows of the thread may bypass its table (see
+    /// [`AggregateSpec::rows_bypass_tables`]).
+    may_bypass: bool,
     /// The rows that bypass the table, while the thread does not aggregate
     /// its rows (see [`Self::aggregate`]).
     bypass: Option<BypassBuffer>,
@@ -289,8 +292,8 @@ impl RadixLocalState {
     /// hash table for nothing, and the final aggregation of the partitions
     /// interns their groups once more (DataFusion skips its partial
     /// aggregation then). So the thread flushes its table and stops
-    /// aggregating its rows (for the aggregations of
-    /// [`AggregateSpec::bypass`]): the rows *bypass* the table, they are
+    /// aggregating its rows (if they may, see
+    /// [`AggregateSpec::rows_bypass_tables`]): the rows *bypass* the table, they are
     /// scattered to the radix partitions directly (see [`BypassBuffer`]),
     /// whose final aggregation aggregates them. Their hashes are added to the
     /// sketch of the flushed groups, and once it shows that the groups of
@@ -400,7 +403,7 @@ impl RadixLocalState {
             self.capacity = capacity;
             return Ok(());
         }
-        let bypass = spec.bypass
+        let bypass = self.may_bypass
             && self.table.num_groups() as f64 > BYPASS_RATIO * self.table_rows as f64;
         self.flush(spec, global)?;
         if bypass {
@@ -673,7 +676,9 @@ impl RadixHashAggregate {
         Ok(Arc::new(RadixSinkState::new()))
     }
 
-    /// The local sink state of a thread, with a table of capacity `capacity`.
+    /// The local sink state of a thread, with a table of capacity `capacity`,
+    /// whose rows may bypass the table if `may_bypass` (see
+    /// [`AggregateSpec::rows_bypass_tables`]).
     ///
     /// The table of a top-k aggregation holds twice its limit at least (up
     /// to the maximum capacity), so that every flush keeps the best half of
@@ -683,6 +688,7 @@ impl RadixHashAggregate {
     pub(crate) fn local_sink_state(
         spec: &AggregateSpec,
         capacity: TableCapacity,
+        may_bypass: bool,
     ) -> Result<Box<dyn LocalSinkState>> {
         let mut initial = capacity.initial.max(1);
         if let Some(top_k) = &spec.top_k {
@@ -697,6 +703,7 @@ impl RadixHashAggregate {
             flushed: 0,
             distinct_flushed: DistinctEstimate::default(),
             buffer: InputBuffer::default(),
+            may_bypass,
             bypass: None,
             bypass_rows: initial.saturating_mul(4),
             bypass_bytes: initial
@@ -1711,7 +1718,7 @@ mod tests {
         let mut spec = two_stage_spec(&aggregate)?;
         assert!(!spec.bypass);
         Arc::get_mut(&mut spec).expect("a single owner").bypass = bypass;
-        let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
     }
 
@@ -1910,7 +1917,7 @@ mod tests {
         )?;
         let mut spec = two_stage_spec(&aggregate)?;
         Arc::get_mut(&mut spec).expect("a single owner").bypass = true;
-        let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
     }
 
@@ -3056,7 +3063,7 @@ mod tests {
         let global = RadixHashAggregate::global_sink_state()?;
         // Two threads.
         let mut locals = (0..2)
-            .map(|_| RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES))
+            .map(|_| RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, spec.bypass))
             .collect::<Result<Vec<_>>>()?;
         for batch in 0..30 {
             let keys = (0..10).map(|i| (batch * 10 + i) * 7 % 300);
@@ -3142,7 +3149,7 @@ mod tests {
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
-        let local = RadixHashAggregate::local_sink_state(&spec, capacity)?;
+        let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
         Ok((spec, local, RadixHashAggregate::global_sink_state()?))
     }
 
@@ -3299,7 +3306,7 @@ mod tests {
             let spec =
                 PhysicalHashAggregate::try_new_single_stage(&aggregate(limit)?, input)?
                     .spec();
-            let local = RadixHashAggregate::local_sink_state(&spec, tables)?;
+            let local = RadixHashAggregate::local_sink_state(&spec, tables, spec.bypass)?;
             Ok(local.downcast_ref::<RadixLocalState>().unwrap().capacity)
         };
         // A table of more groups than the limit would set no cutoff (40,000
