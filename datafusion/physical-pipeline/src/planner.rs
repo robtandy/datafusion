@@ -2350,8 +2350,7 @@ fn reads_first_child_before_emitting(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// that reads all rows of a partition of `plan` before it emits any row then
 /// emits no row before the nodes below `plan` read all of their input.
 fn ends_with_all_partitions(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if plan.output_partitioning().partition_count() <= 1 || plan.is::<RepartitionExec>()
-    {
+    if plan.output_partitioning().partition_count() <= 1 || plan.is::<RepartitionExec>() {
         return true;
     }
     let passes_partitions_on = (plan.is::<ProjectionExec>()
@@ -5874,7 +5873,9 @@ mod tests {
     /// [`PipelineRootExec`], which must be the dynamic filter of the `SortExec`
     /// of the plan it was lowered from, which a node of the input of the
     /// `SortExec` reads.
-    fn filter_of_native_topk(plan: &Arc<dyn ExecutionPlan>) -> Arc<DynamicFilterPhysicalExpr> {
+    fn filter_of_native_topk(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Arc<DynamicFilterPhysicalExpr> {
         let exec = plan.downcast_ref::<PipelineRootExec>().unwrap();
         topk_updating_the_filter_of(exec.operator(), exec.input())
     }
