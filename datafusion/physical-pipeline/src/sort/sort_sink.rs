@@ -40,7 +40,10 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
+use super::{
+    SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk,
+    sorted_local_source_state,
+};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -295,16 +298,24 @@ impl PhysicalOperator for PhysicalSort {
             );
         };
         let global = downcast_state::<SortSinkState>(sink.as_any(), self.name())?;
-        global.output.take_source(self.name())
+        global.output.take_source(ctx, self.name())
+    }
+
+    fn get_local_source_state(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        sorted_local_source_state(ctx, gstate, self.name())
     }
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
-        _lstate: &mut dyn LocalSourceState,
+        lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
-        next_sorted_chunk(gstate, self.name())
+        next_sorted_chunk(ctx, gstate, lstate, self.name())
     }
 }
 
