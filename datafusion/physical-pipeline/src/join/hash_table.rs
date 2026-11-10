@@ -677,8 +677,10 @@ fn zeroed(len: usize, what: &str) -> Result<Vec<u64>> {
 /// it joins if its keys are equal (otherwise it continues after that entry
 /// in the next round).
 ///
-/// With `key_index` (a join on a single integer key with a [`KeyRange`]), every
-/// inserted key is checked to be in the range.
+/// With `key_index` (a join on a single integer key with a [`KeyRange`]), the
+/// buckets of the [`KeyFilter`] in which the keys fall are recorded (if it has
+/// buckets), and the keys are checked to be in the range (also in debug
+/// builds).
 fn build_partition(
     collection: &TupleDataCollection,
     range: &PartitionRange,
@@ -774,7 +776,11 @@ fn build_partition(
                 {
                     pending.push((i, hash as usize & mask));
                 }
+                // The keys are checked (in debug builds, or as their buckets
+                // are recorded anyway): reading the key of every row of a
+                // large build side costs as much as the range saves.
                 if let Some(plan) = key_index
+                    && (bucket_shift.is_some() || cfg!(debug_assertions))
                     && row.is_valid(0)
                 {
                     let key = plan.offset(plan.reader.read(row.row))?;
@@ -1148,8 +1154,11 @@ impl JoinHashTableBuilder {
 
     /// Index the rows of a join on a single key of an integer type (see
     /// [`KeyRange::supports`]) all of whose valid build keys are in `range`
-    /// (which the build checks) without hashing the probe keys (see the
-    /// [module documentation](self)):
+    /// without hashing the probe keys (see the [module documentation](self)).
+    /// The build checks that the keys are in the range as it reads them (for a
+    /// dense index and for the buckets of a key filter, and in debug builds):
+    /// a probe key outside of the range is rejected, so a range that misses a
+    /// build key would lose its matches.
     ///
     /// * with a [`DenseIndex`] if the range spans at most [`MAX_DENSE_SPAN`]
     ///   keys, and at most 65,536 keys or 8 keys per build row;
