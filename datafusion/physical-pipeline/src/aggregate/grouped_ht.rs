@@ -87,8 +87,9 @@ impl GroupedStates {
 /// (of the input of `spec`, an aggregation without grouping sets), aligned
 /// with its rows, for [`GroupedHashTable::update_rows`]: the group columns,
 /// followed by the arguments of every aggregate that are not rebuilt (see
-/// [`rebuilt_literal`]) and, for an aggregate with a filter, the filter result
-/// (see [`AggregateUpdate::evaluate_row_aligned`]).
+/// [`rebuilt_literal`]), their validity for a `COUNT`, and, for an aggregate
+/// with a filter, the filter result (see
+/// [`AggregateUpdate::evaluate_row_aligned`]).
 ///
 /// [`AggregateUpdate::evaluate_row_aligned`]: super::hash_aggregate::AggregateUpdate::evaluate_row_aligned
 pub(crate) fn evaluate_rows(
@@ -715,8 +716,8 @@ mod tests {
     fn literal_arguments_of_bypassed_rows_are_rebuilt_or_evaluated() -> Result<()> {
         // `COUNT(1) GROUP BY a` and `COUNT('a literal') GROUP BY a`: the
         // literal of a fixed width is rebuilt for the rows that the aggregate
-        // aggregates, the string is evaluated (and stored) like the other
-        // arguments.
+        // aggregates, the string is evaluated like the other arguments (and
+        // its validity stored, as the argument of a `COUNT`).
         let schema = input_schema();
         for (literal, stored) in [(lit(1i64), 0), (lit("a literal"), 1)] {
             let count = AggregateExprBuilder::new(count_udaf(), vec![literal])
@@ -745,8 +746,13 @@ mod tests {
                 ],
             )?;
             let columns = evaluate_rows(&spec, &batch)?;
-            // The key, and the stored literal.
+            // The key, and the validity of the string.
             assert_eq!(columns.len(), 1 + stored);
+            assert!(
+                columns[1..]
+                    .iter()
+                    .all(|c| c.data_type() == &DataType::Boolean)
+            );
             let mut table = GroupedHashTable::try_new_merge(&spec)?;
             table.update_rows(&spec, &columns)?;
             let output = table.evaluate()?.expect("groups");
@@ -760,6 +766,128 @@ mod tests {
             counts.sort_unstable();
             assert_eq!(counts, [(0, 1_667), (1, 1_667), (2, 1_666)]);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bypassed_rows_hold_the_validity_of_the_arguments_of_counts() -> Result<()> {
+        // `COUNT(b)`, `COUNT(a, b)`, `COUNT(DISTINCT b)` and `MIN(b)` of
+        // strings of 1,000 bytes, a third of them `NULL`, grouped by `a`: the
+        // bypassed rows hold the validity of the arguments of the counts
+        // (which only read their nulls, like DataFusion's counts hold no
+        // string), the strings for the others.
+        use datafusion::functions_aggregate::min_max::min_udaf;
+        let schema = input_schema();
+        let aggregate = |udaf, arguments, distinct, alias: &str| {
+            AggregateExprBuilder::new(udaf, arguments)
+                .schema(Arc::clone(&schema))
+                .alias(alias)
+                .with_distinct(distinct)
+                .build()
+                .map(Arc::new)
+        };
+        let (a, b) = (col("a", &schema)?, col("b", &schema)?);
+        let aggregates = vec![
+            aggregate(count_udaf(), vec![Arc::clone(&b)], false, "count(b)")?,
+            aggregate(
+                count_udaf(),
+                vec![Arc::clone(&a), Arc::clone(&b)],
+                false,
+                "count(a, b)",
+            )?,
+            aggregate(
+                count_udaf(),
+                vec![Arc::clone(&b)],
+                true,
+                "count(distinct b)",
+            )?,
+            aggregate(min_udaf(), vec![Arc::clone(&b)], false, "min(b)")?,
+        ];
+        let aggregation = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(Arc::clone(&a), "a".into())]),
+            aggregates,
+            vec![None; 4],
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::clone(&schema),
+        )?;
+        let input = Arc::new(BridgeOperator::new(Arc::clone(aggregation.input())));
+        let spec =
+            PhysicalHashAggregate::try_new_single_stage(&aggregation, input)?.spec();
+        let counts = spec.update.iter().map(|update| update.counts_non_nulls);
+        assert_eq!(counts.collect::<Vec<_>>(), [true, true, false, false]);
+        let rows = 2_048;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter((0..rows).map(|i| {
+                    // Some `NULL` keys too, which `COUNT(a, b)` does not count.
+                    (i % 10 != 9).then_some(i % 4)
+                }))),
+                Arc::new(StringArray::from_iter((0..rows).map(|i| {
+                    (i % 3 != 0).then(|| format!("{i:04}{}", "x".repeat(996)))
+                }))),
+            ],
+        )?;
+        let columns = evaluate_rows(&spec, &batch)?;
+        // The key; the validity of `b`; that of `a` and `b`; `b`; `b`.
+        let types = columns.iter().map(|column| column.data_type().clone());
+        assert_eq!(
+            types.collect::<Vec<_>>(),
+            [
+                DataType::Int32,
+                DataType::Boolean,
+                DataType::Boolean,
+                DataType::Boolean,
+                DataType::Utf8,
+                DataType::Utf8,
+            ]
+        );
+        for validity in &columns[1..4] {
+            // Bits, not bytes of strings.
+            assert!(validity.get_array_memory_size() < 2_048);
+        }
+        assert_eq!(columns[1].logical_nulls(), batch.column(1).logical_nulls());
+        assert_eq!(columns[2].logical_nulls(), batch.column(0).logical_nulls());
+        assert_eq!(columns[3].logical_nulls(), batch.column(1).logical_nulls());
+        // Counted like DataFusion counts the rows themselves.
+        let mut table = GroupedHashTable::try_new_merge(&spec)?;
+        table.update_rows(&spec, &columns)?;
+        let output = table.evaluate()?.expect("groups");
+        let keys = output[0].as_primitive::<arrow::datatypes::Int32Type>();
+        let mut actual = (0..keys.len())
+            .map(|row| {
+                let count =
+                    |column: &ArrayRef| column.as_primitive::<Int64Type>().value(row);
+                (
+                    keys.is_valid(row).then(|| keys.value(row)),
+                    count(&output[1]),
+                    count(&output[2]),
+                    count(&output[3]),
+                )
+            })
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = std::collections::BTreeMap::<
+            _,
+            (i64, i64, std::collections::BTreeSet<_>),
+        >::new();
+        for i in 0..rows {
+            let key = (i % 10 != 9).then_some(i % 4);
+            let (count, both, distinct) = expected.entry(key).or_default();
+            if i % 3 != 0 {
+                *count += 1;
+                *both += i64::from(key.is_some());
+                distinct.insert(i);
+            }
+        }
+        let expected = expected
+            .into_iter()
+            .map(|(key, (count, both, distinct))| {
+                (key, count, both, distinct.len() as i64)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
         Ok(())
     }
 

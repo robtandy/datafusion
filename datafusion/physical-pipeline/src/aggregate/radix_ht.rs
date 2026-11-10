@@ -1709,18 +1709,25 @@ mod tests {
         ]))
     }
 
-    /// The sink of `COUNT(b) GROUP BY k`, with tables of capacity `capacity`.
-    fn count_binaries_by_key(capacity: TableCapacity) -> Result<Sink> {
+    /// The sink of `COUNT(*), MAX(b) GROUP BY k`, with tables of capacity
+    /// `capacity`: its bypassed rows hold the binaries (those of `COUNT(b)`
+    /// would hold their validity only).
+    fn max_binaries_by_key(capacity: TableCapacity) -> Result<Sink> {
+        use datafusion::functions_aggregate::min_max::max_udaf;
         let schema = binary_schema();
-        let count = AggregateExprBuilder::new(count_udaf(), vec![col("b", &schema)?])
+        let count = AggregateExprBuilder::new(count_udaf(), vec![lit(1i64)])
             .schema(Arc::clone(&schema))
-            .alias("count(b)")
+            .alias("count(*)")
+            .build()?;
+        let max = AggregateExprBuilder::new(max_udaf(), vec![col("b", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("max(b)")
             .build()?;
         let aggregate = AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
-            vec![Arc::new(count)],
-            vec![None],
+            vec![Arc::new(count), Arc::new(max)],
+            vec![None, None],
             MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
             schema,
         )?;
@@ -1750,7 +1757,7 @@ mod tests {
     -> Result<()> {
         // Tables of 16 groups: the binaries of several chunks of rows that
         // bypass them are scattered together while they have at most 32 KiB.
-        let mut sink = count_binaries_by_key(SMALL_TABLES)?;
+        let mut sink = max_binaries_by_key(SMALL_TABLES)?;
         let max_bytes = 16 * BYPASS_BYTES_PER_ROW;
         let sink_batch = |sink: &mut Sink, batch: RecordBatch| -> Result<()> {
             let (spec, local, global) = sink;
@@ -2249,6 +2256,11 @@ mod tests {
             "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
              FROM u GROUP BY k % 50",
             "SELECT sv, COUNT(*), MAX(s), BIT_XOR(v) FROM u GROUP BY sv",
+            // Counts, whose bypassed rows hold the validity of their arguments
+            // only: filtered, of several arguments, and distinct ones.
+            "SELECT k, COUNT(s), COUNT(sv) FILTER (WHERE v > 0), COUNT(d, s), \
+             COUNT(b) FILTER (WHERE false), COUNT(v) FILTER (WHERE true), \
+             COUNT(DISTINCT s), COUNT(NULL) FROM u GROUP BY k",
         ];
         let tables = [
             SMALL_TABLES,
@@ -2404,7 +2416,10 @@ mod tests {
             Ok(())
         };
         let config = test_session_config().with_target_partitions(1);
-        let sql = "SELECT k, COUNT(b) FROM wide GROUP BY k";
+        // `APPROX_DISTINCT(b)` holds the binaries of the bypassed rows (those
+        // of `COUNT(b)` hold their validity only), whose sketches DataFusion
+        // builds without holding them.
+        let sql = "SELECT k, COUNT(b), APPROX_DISTINCT(b) FROM wide GROUP BY k";
         assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
     }
