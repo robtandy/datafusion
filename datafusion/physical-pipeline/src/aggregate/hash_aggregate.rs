@@ -1024,8 +1024,22 @@ fn rows_can_bypass_tables(
             .all(|update| update.arguments.iter().all(is_flat))
 }
 
-/// Whether arrays of `data_type` have no children and no dictionary.
+/// The widest fixed-size binaries of the keys and arguments of rows that may
+/// bypass the thread-local tables (see [`is_flat_type`]).
+const MAX_FIXED_SIZE_BINARY: i32 = 256;
+
+/// Whether keys and arguments of `data_type` may bypass the thread-local
+/// tables: arrays without children or dictionaries (which gathering the rows
+/// of several chunks could fail to merge), whose `NULL`s are narrow. The
+/// bypassed rows hold the arguments of an aggregate aligned with their rows,
+/// with a `NULL` for every row that does not pass its filter, where
+/// DataFusion (and the regular path) evaluate the arguments of the rows that
+/// pass it only; a `NULL` of a fixed-size binary is as wide as its values, so
+/// these are at most [`MAX_FIXED_SIZE_BINARY`] bytes wide.
 fn is_flat_type(data_type: &DataType) -> bool {
+    if let DataType::FixedSizeBinary(width) = data_type {
+        return *width <= MAX_FIXED_SIZE_BINARY;
+    }
     matches!(
         data_type,
         DataType::Null
@@ -1055,7 +1069,6 @@ fn is_flat_type(data_type: &DataType) -> bool {
             | DataType::Binary
             | DataType::LargeBinary
             | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
             | DataType::Utf8
             | DataType::LargeUtf8
             | DataType::Utf8View
@@ -2464,6 +2477,12 @@ mod tests {
             let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
             assert_eq!(aggregate.spec.bypass, bypass, "{sql}");
         }
+        // Narrow fixed-size binaries only.
+        assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
+        assert!(is_flat_type(&DataType::FixedSizeBinary(
+            MAX_FIXED_SIZE_BINARY
+        )));
+        assert!(!is_flat_type(&DataType::FixedSizeBinary(1_100_000)));
         // Nor do the rows of a top-k aggregation (of a single partition).
         let ctx = crate::test_utils::datafusion_context(
             test_session_config().with_target_partitions(1),
