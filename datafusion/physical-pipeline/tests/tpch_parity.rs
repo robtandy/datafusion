@@ -2193,7 +2193,9 @@ enum Why {
     /// probe side has work that may fail on the rows that DataFusion skips
     /// (see `PipelineQueryPlanner`): the decimal arithmetic of the revenues of
     /// Q15 and the cast into a decimal of the average quantities of Q17, which
-    /// may overflow, and the sums of the quantities of Q20.
+    /// may overflow, and the residual filter of the semi join of Q20 (which
+    /// the planner judges conservatively, without the schema of the pairs it
+    /// filters, as the expressions of all nodes with several inputs).
     JoinDynamicFilter,
 }
 
