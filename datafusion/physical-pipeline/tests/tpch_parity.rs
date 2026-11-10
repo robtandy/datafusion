@@ -2193,9 +2193,7 @@ enum Why {
     /// probe side has work that may fail on the rows that DataFusion skips
     /// (see `PipelineQueryPlanner`): the decimal arithmetic of the revenues of
     /// Q15 and the cast into a decimal of the average quantities of Q17, which
-    /// may overflow, and the residual filter of the semi join of Q20 (which
-    /// the planner judges conservatively, without the schema of the pairs it
-    /// filters, as the expressions of all nodes with several inputs).
+    /// may overflow.
     JoinDynamicFilter,
 }
 
@@ -2255,7 +2253,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (17, 2, 3, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (18, 12, 12, 0, &[]),
         (19, 9, 9, 0, &[]),
-        (20, 1, 2, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (20, 18, 18, 0, &[]),
         (21, 22, 22, 0, &[]),
         (22, 15, 15, 0, &[]),
     ]),

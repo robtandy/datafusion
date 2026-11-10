@@ -1952,9 +1952,12 @@ struct Judgement {
 
 impl Judgement {
     /// The judgement of the expressions that `plan` evaluates on its input:
-    /// judged on the schema of its input if it has a single child, and without
-    /// schema otherwise, which is conservative (expressions that may fail then
-    /// fail on empty batches). The aggregations that merge partial states
+    /// judged on the schema of its input if it has a single child, the keys and
+    /// the filter of a join on the schemas of the rows they are evaluated on
+    /// (the keys of each side on its rows, the filter on the columns of the
+    /// candidate pairs that it reads, see [`join_expression_schema`]), and
+    /// without schema otherwise, which is conservative (expressions that may
+    /// fail then fail on empty batches). The aggregations that merge partial states
     /// evaluate no expression on their input (the arguments of their aggregate
     /// functions are those of the partial aggregations), and the dynamic
     /// filters that `plan` produces (e.g. the threshold of a TopK) compare the
@@ -1980,7 +1983,10 @@ impl Judgement {
                 .iter()
                 .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
             {
-                judgement.add(expr, &schema);
+                match join_expression_schema(plan, expr) {
+                    Some(join_schema) => judgement.add(expr, &join_schema),
+                    None => judgement.add(expr, &schema),
+                }
             }
             Ok(TreeNodeRecursion::Continue)
         });
@@ -2024,6 +2030,36 @@ impl Judgement {
     fn evaluates_like_datafusion(&self) -> bool {
         !self.batch_dependent && !self.failures.order_matters()
     }
+}
+
+/// The schema of the rows on which `plan`, a hash join or a nested loop join,
+/// evaluates its expression `expr`: the schema of its left (build) input for
+/// one of its left keys, of its right (probe) input for one of its right keys,
+/// and the schema of its filter (the columns of both sides that the filter
+/// reads) for its filter. `None` for any other node or expression.
+fn join_expression_schema(
+    plan: &dyn ExecutionPlan,
+    expr: &Arc<dyn PhysicalExpr>,
+) -> Option<SchemaRef> {
+    let is = |candidate: &Arc<dyn PhysicalExpr>| Arc::ptr_eq(candidate, expr);
+    let (keys, filter) = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        (join.on(), join.filter())
+    } else if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
+        (&[][..], join.filter())
+    } else {
+        return None;
+    };
+    let children = plan.children();
+    if let Some(filter) = filter.filter(|filter| is(filter.expression())) {
+        return Some(Arc::clone(filter.schema()));
+    }
+    if keys.iter().any(|(left, _)| is(left)) {
+        return children.first().map(|left| left.schema());
+    }
+    if keys.iter().any(|(_, right)| is(right)) {
+        return children.get(1).map(|right| right.schema());
+    }
+    None
 }
 
 /// The judgement of the keys that `sort`, a [`PhysicalSort`] or a
