@@ -73,7 +73,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch, UInt32Array};
+use arrow::array::{
+    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array,
+};
 use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -1252,7 +1254,7 @@ impl SortKeys {
         let options = self.ordering[0].options;
         let mut runs = Vec::with_capacity(gathered.len());
         let mut start = 0;
-        for batch in gathered {
+        for mut batch in gathered {
             let rows = start..start + batch.num_rows();
             start = rows.end;
             let keys = match &sorted_keys {
@@ -1266,11 +1268,24 @@ impl SortKeys {
                     RunKeys::Rows(keys)
                 }
                 SortedKeys::Values(values) => {
-                    let values = values.slice(rows.start, rows.len());
+                    let values = compact_views(&values.slice(rows.start, rows.len()));
                     RunKeys::Column(KeyColumn::try_new(values, options)?)
                 }
                 SortedKeys::Column(column) => {
-                    let values = Arc::clone(batch.column(*column));
+                    // The rows keep the compacted views too, which release the
+                    // buffers of the unsorted rows.
+                    let values = compact_views(batch.column(*column));
+                    if !Arc::ptr_eq(&values, batch.column(*column)) {
+                        let mut columns = batch.columns().to_vec();
+                        columns[*column] = Arc::clone(&values);
+                        let batch_options = RecordBatchOptions::new()
+                            .with_row_count(Some(batch.num_rows()));
+                        batch = RecordBatch::try_new_with_options(
+                            batch.schema(),
+                            columns,
+                            &batch_options,
+                        )?;
+                    }
                     RunKeys::Column(KeyColumn::try_new(values, options)?)
                 }
                 SortedKeys::Gather => {
@@ -1355,6 +1370,19 @@ impl SortKeys {
     }
 }
 
+/// The sorted key values `values` of a run, with the data of their views
+/// (of `Utf8View` and `BinaryView` values) copied into compact buffers, in
+/// order: the merge compares the keys of a run in order, so it reads them
+/// from consecutive memory, rather than from the buffers of the unsorted
+/// rows, in random order. Other arrays are returned as they are.
+fn compact_views(values: &ArrayRef) -> ArrayRef {
+    match values.data_type() {
+        DataType::Utf8View => Arc::new(values.as_string_view().gc()),
+        DataType::BinaryView => Arc::new(values.as_binary_view().gc()),
+        _ => Arc::clone(values),
+    }
+}
+
 /// Add the runs of the sorted rows `batch`, the rows `positions` (`(batch,
 /// row)`) of batches whose values of a single sort key (with `options`) are
 /// `keys`, to `runs`: the rows with their key values, gathered at the same
@@ -1369,7 +1397,8 @@ fn runs_with_gathered_keys(
 ) -> Result<()> {
     match gather_values(keys, positions) {
         Ok(values) => {
-            let keys = RunKeys::Column(KeyColumn::try_new(values, options)?);
+            let keys =
+                RunKeys::Column(KeyColumn::try_new(compact_views(&values), options)?);
             runs.push(SortedRun::try_new_with_keys(batch, keys)?);
         }
         Err(error) if positions.len() > 1 && is_capacity_error(&error) => {
