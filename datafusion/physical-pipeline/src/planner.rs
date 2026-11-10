@@ -2695,9 +2695,10 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) 
 /// dictionaries: such files may fail.) The schema of a table that DataFusion
 /// inferred from its files has their types, but a schema given when the table
 /// was registered may have others, into which the scan casts the values of the
-/// files (and fails on those that it cannot cast). `false` if the metadata of a
-/// file is not cached (or not for its current version), or if the runtime is
-/// not known.
+/// files (and fails on those that it cannot cast), or no nulls where the files
+/// have nulls. `false` if the metadata of a file is not cached (or not for its
+/// current version), if the runtime is not known, and for scans with a custom
+/// adapter of their expressions to the schemas of their files.
 fn reads_files_of_the_types_of_their_table(
     config: &FileScanConfig,
     runtime: Option<&RuntimeEnv>,
@@ -2710,6 +2711,11 @@ fn reads_files_of_the_types_of_their_table(
     let Some(source) = config.file_source().downcast_ref::<ParquetSource>() else {
         return false;
     };
+    // A custom adapter of the expressions of the scan to the schemas of its
+    // files may rewrite them otherwise than casting columns.
+    if config.expr_adapter_factory.is_some() {
+        return false;
+    }
     let options = &source.table_parquet_options().global;
     let int96 = options.coerce_int96.map(arrow::datatypes::TimeUnit::from);
     let int96_timezone = options
@@ -2750,10 +2756,14 @@ fn reads_files_of_the_types_of_their_table(
         {
             file_schema = coerced;
         }
+        // Of the type of the table, and without nulls if the table has none.
         table.fields().iter().all(|field| {
             file_schema
                 .field_with_name(field.name())
-                .is_ok_and(|file_field| file_field.data_type() == field.data_type())
+                .is_ok_and(|file_field| {
+                    file_field.data_type() == field.data_type()
+                        && (field.is_nullable() || !file_field.is_nullable())
+                })
         })
     };
     config
