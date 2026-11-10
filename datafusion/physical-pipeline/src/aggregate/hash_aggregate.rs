@@ -5,6 +5,7 @@
 //! [`PhysicalHashAggregate`]: the pipeline breaker that replaces DataFusion's
 //! `AggregateExec`s, see the [module documentation](super).
 
+use std::any::{Any, TypeId};
 use std::fmt;
 use std::sync::Arc;
 
@@ -19,7 +20,15 @@ use arrow::compute::{
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::{Result, ScalarValue, internal_err};
+use datafusion_common::config::{
+    ConfigEntry, ConfigExtension, ConfigOptions, ExtensionOptions,
+};
+use datafusion_common::{Result, ScalarValue, config_err, internal_err};
+use datafusion_expr::AggregateUDF;
+use datafusion_functions_aggregate::{
+    approx_distinct, array_agg, average, bit_and_or_xor, bool_and_or, count, first_last,
+    median, min_max, sum,
+};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
@@ -91,7 +100,8 @@ pub(crate) struct AggregateSpec {
     /// Whether the input rows of a thread whose groups hardly repeat may
     /// bypass its thread-local table, and be aggregated by the final
     /// aggregation of their radix partitions directly (see
-    /// [`rows_can_bypass_tables`]): those of aggregations without aggregates.
+    /// [`rows_can_bypass_tables`]), if the session trusts the accumulators of
+    /// all aggregates (see [`Self::rows_bypass_tables`]).
     pub(crate) bypass: bool,
 }
 
@@ -100,6 +110,29 @@ impl AggregateSpec {
     /// aggregation produces exactly one row.
     pub(crate) fn is_ungrouped(&self) -> bool {
         self.group_by.is_true_no_grouping()
+    }
+
+    /// Whether the input rows of a thread whose groups hardly repeat bypass
+    /// its thread-local table in an execution with the configuration
+    /// `options`: if they may (see [`Self::bypass`]), and the aggregation has
+    /// no aggregates, or the session trusts the accumulators of all of them
+    /// (see [`TrustedAggregateFunctions`]).
+    pub(crate) fn rows_bypass_tables(&self, options: &ConfigOptions) -> bool {
+        if !self.bypass {
+            return false;
+        }
+        if self.update.is_empty() && self.merge.is_empty() {
+            return true;
+        }
+        options
+            .extensions
+            .get::<TrustedAggregateFunctions>()
+            .is_some_and(|trusted| {
+                self.update
+                    .iter()
+                    .all(|update| trusted.trusts(&update.expr))
+                    && self.merge.iter().all(|merge| trusted.trusts(merge))
+            })
     }
 }
 
@@ -736,6 +769,35 @@ impl PhysicalHashAggregate {
         })
     }
 
+    /// The configuration extension of a session that trusts `functions`, the
+    /// built-in aggregate functions of DataFusion (e.g.
+    /// `datafusion::functions_aggregate::all_default_aggregate_functions()`),
+    /// whose accumulators cannot fail: `count`, `sum`, `min`, `max`, `avg`,
+    /// `first_value`, `last_value`, `bool_and`, `bool_or`, `bit_and`,
+    /// `bit_or`, `bit_xor`, `approx_distinct`, `median` and `array_agg`, if
+    /// they are implemented by DataFusion's types. In the sessions that trust
+    /// the functions of all aggregates of an aggregation (that are neither
+    /// `DISTINCT` nor ordered), the input rows of the threads whose groups
+    /// hardly repeat bypass their thread-local tables.
+    ///
+    /// ```
+    /// use datafusion::prelude::{SessionConfig, SessionContext};
+    /// use datafusion_physical_pipeline::aggregate::PhysicalHashAggregate;
+    ///
+    /// // The built-in aggregate functions of DataFusion, which a session
+    /// // registers by default.
+    /// let functions = datafusion::functions_aggregate::all_default_aggregate_functions();
+    /// let trusted = PhysicalHashAggregate::trusted_aggregate_functions(&functions);
+    /// assert!(trusted.names().contains(&"count"));
+    /// let config = SessionConfig::new().with_option_extension(trusted);
+    /// let ctx = SessionContext::new_with_config(config);
+    /// ```
+    pub fn trusted_aggregate_functions(
+        functions: &[Arc<AggregateUDF>],
+    ) -> TrustedAggregateFunctions {
+        TrustedAggregateFunctions::new(functions)
+    }
+
     /// The input of the aggregation.
     pub fn input(&self) -> &Arc<dyn PhysicalOperator> {
         &self.children[0]
@@ -964,36 +1026,38 @@ fn orders_like_datafusion(data_type: &DataType) -> bool {
 /// repeat (see `RadixLocalState::aggregate`), and be aggregated by the final
 /// aggregation of their radix partitions directly:
 ///
-/// * the aggregation has group keys, no grouping sets, and **no aggregates**;
-/// * the keys (of the rows of a thread, which the radix partitioning gathers
-///   from several chunks) are of flat types, which are gathered without
-///   merging dictionaries or nested offsets.
+/// * the aggregation has group keys and no grouping sets;
+/// * the aggregates of the final aggregation (`merge`), which aggregate the
+///   bypassed rows (see `GroupedHashTable::update_rows`), are those of the
+///   stage that consumes the input rows (`update`), as in DataFusion's plans;
+/// * the keys and the arguments (of the rows of a thread, which the radix
+///   partitioning gathers from several chunks) are of flat types, which are
+///   gathered without merging dictionaries or nested offsets.
 ///
-/// The accumulators of aggregates aggregate every row in the tables, when it
-/// is consumed, with the rows of its group that the table aggregated so far,
-/// like DataFusion's: an accumulator may fail depending on the rows that it
-/// aggregates together (e.g. a user-defined sum that rejects negative running
-/// totals), so that deferring its rows to the final aggregation fails later
-/// than DataFusion (after the rows that follow them), and converting them to
-/// partial states one by one (like DataFusion's partial stage when it skips
-/// its aggregation, which it decides by its own counts) fails where
-/// DataFusion does not. The native operator cannot verify that the function
-/// of an aggregate is one of DataFusion's (whose accumulators do not fail): it
-/// does not depend on DataFusion's function crates, and a user-defined
-/// function may have the name and the type name of one. (The final
-/// aggregation of a partition still aggregates the arguments of aggregates of
-/// bypassed rows, see `GroupedHashTable::update_rows`, for aggregates whose
-/// accumulators are known not to fail.)
+/// The rows of an aggregation with aggregates bypass the tables only in the
+/// sessions that trust the accumulators of all of its aggregates (see
+/// [`AggregateSpec::rows_bypass_tables`]). The accumulators of aggregates
+/// aggregate every row in the tables, when it is consumed, with the rows of
+/// its group that the table aggregated so far, like DataFusion's: an
+/// accumulator may fail depending on the rows that it aggregates together
+/// (e.g. a user-defined sum that rejects negative running totals), so that
+/// deferring its rows to the final aggregation fails later than DataFusion
+/// (after the rows that follow them), and converting them to partial states
+/// one by one (like DataFusion's partial stage when it skips its
+/// aggregation, which it decides by its own counts) fails where DataFusion
+/// does not. The accumulators of the built-in aggregate functions of
+/// [`TrustedAggregateFunctions`] cannot fail on the rows they aggregate, nor
+/// on the partial states they merge: the final aggregation of a partition
+/// aggregates the bypassed rows into exactly the states that the tables
+/// would have merged, so that the rows of their aggregations bypass the
+/// tables where the session trusts them.
 fn rows_can_bypass_tables(
     group_by: &PhysicalGroupBy,
     update: &[AggregateUpdate],
     merge: &[Arc<AggregateFunctionExpr>],
     schema: &SchemaRef,
 ) -> bool {
-    if !group_by.is_single()
-        || group_by.expr().is_empty()
-        || !update.is_empty()
-        || update.len() != merge.len()
+    if !group_by.is_single() || group_by.expr().is_empty() || update.len() != merge.len()
     {
         return false;
     }
@@ -1015,6 +1079,154 @@ fn rows_can_bypass_tables(
         && update
             .iter()
             .all(|update| update.arguments.iter().all(is_flat))
+}
+
+/// The built-in aggregate functions of DataFusion whose accumulators cannot
+/// fail on the rows that they aggregate, nor on the partial states that they
+/// merge (see [`TrustedAggregateFunctions`]): their name, and the function of
+/// `datafusion-functions-aggregate` that returns them.
+///
+/// * `count`, `sum`, `avg`, `bit_and`, `bit_or` and `bit_xor` add up (with
+///   wrapping arithmetic) or combine fixed-width values, `min`, `max`,
+///   `bool_and` and `bool_or` compare them, `first_value` and `last_value`
+///   keep one of them, `approx_distinct` adds their hashes to a
+///   HyperLogLog sketch, and `median` and `array_agg` collect them. None of
+///   them fails on the values of its rows, or on how its rows are grouped
+///   into batches and partial states.
+/// * Evaluating the final value of a group may fail (e.g. the average of
+///   decimals that does not fit the output precision), but on the final state
+///   of the group only, which is the same whether its rows were aggregated
+///   in the thread-local tables or bypassed them: the states are sums,
+///   counts, extremes or collections of the same values.
+///
+/// `DISTINCT` aggregates and aggregates with an `ORDER BY` are not trusted
+/// (see [`TrustedAggregateFunctions::trusts`]): their accumulators keep sets
+/// or ordered lists of values, of other states.
+const BUILTIN_AGGREGATES: [(&str, BuiltinAggregate); 15] = [
+    ("count", count::count_udaf),
+    ("sum", sum::sum_udaf),
+    ("min", min_max::min_udaf),
+    ("max", min_max::max_udaf),
+    ("avg", average::avg_udaf),
+    ("first_value", first_last::first_value_udaf),
+    ("last_value", first_last::last_value_udaf),
+    ("bool_and", bool_and_or::bool_and_udaf),
+    ("bool_or", bool_and_or::bool_or_udaf),
+    ("bit_and", bit_and_or_xor::bit_and_udaf),
+    ("bit_or", bit_and_or_xor::bit_or_udaf),
+    ("bit_xor", bit_and_or_xor::bit_xor_udaf),
+    ("approx_distinct", approx_distinct::approx_distinct_udaf),
+    ("median", median::median_udaf),
+    ("array_agg", array_agg::array_agg_udaf),
+];
+
+/// The function of `datafusion-functions-aggregate` that returns a built-in
+/// aggregate function (see [`BUILTIN_AGGREGATES`]).
+type BuiltinAggregate = fn() -> Arc<AggregateUDF>;
+
+/// The type that implements `udaf`.
+fn implementation_type(udaf: &AggregateUDF) -> TypeId {
+    let implementation: &dyn Any = udaf.inner().as_ref();
+    implementation.type_id()
+}
+
+/// The built-in aggregate functions of DataFusion whose accumulators a
+/// session trusts the native aggregation not to fail (see
+/// [`BUILTIN_AGGREGATES`]): a configuration extension of the session, created
+/// with [`PhysicalHashAggregate::trusted_aggregate_functions`].
+///
+/// In the sessions that trust the aggregate functions of all aggregates of an
+/// aggregation, the input rows of a thread whose groups hardly repeat bypass
+/// its thread-local table, like the rows of aggregations without aggregates
+/// (see `rows_can_bypass_tables`): they are aggregated once, by the final
+/// aggregation of their radix partition, rather than in the thread-local
+/// table first (DataFusion skips its partial aggregation then).
+///
+/// A function is trusted if it is implemented by the type of
+/// `datafusion-functions-aggregate` that implements the built-in function of
+/// its name (the type of `count_udaf()` for `count`, ...): a user-defined
+/// function that shadows a built-in one under its name, also with a type of
+/// the same name, is not trusted, and neither is a built-in function of
+/// another version of DataFusion than the one of this crate.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedAggregateFunctions {
+    /// The trusted functions: their names, and the types that implement them.
+    implementations: Vec<(&'static str, TypeId)>,
+}
+
+impl TrustedAggregateFunctions {
+    /// Trust `functions`, the built-in aggregate functions of DataFusion
+    /// (e.g. `datafusion::functions_aggregate::all_default_aggregate_functions()`):
+    /// those whose accumulators cannot fail (see [`BUILTIN_AGGREGATES`]), if
+    /// they are implemented by DataFusion's types.
+    fn new(functions: &[Arc<AggregateUDF>]) -> Self {
+        let mut implementations: Vec<(&'static str, TypeId)> = vec![];
+        for function in functions {
+            let Some(&(name, builtin)) = BUILTIN_AGGREGATES
+                .iter()
+                .find(|(name, _)| *name == function.name())
+            else {
+                continue;
+            };
+            let implementation = (name, implementation_type(&builtin()));
+            if implementation_type(function) == implementation.1
+                && !implementations.contains(&implementation)
+            {
+                implementations.push(implementation);
+            }
+        }
+        Self { implementations }
+    }
+
+    /// The names of the trusted functions.
+    pub fn names(&self) -> Vec<&'static str> {
+        self.implementations.iter().map(|(name, _)| *name).collect()
+    }
+
+    /// Whether the accumulators of `aggregate` cannot fail: whether it is
+    /// neither `DISTINCT` nor ordered (`ORDER BY`), and its function is a
+    /// trusted one.
+    pub(crate) fn trusts(&self, aggregate: &AggregateFunctionExpr) -> bool {
+        let function = aggregate.fun();
+        !aggregate.is_distinct()
+            && aggregate.order_bys().is_empty()
+            && self
+                .implementations
+                .contains(&(function.name(), implementation_type(function)))
+    }
+}
+
+impl ExtensionOptions for TrustedAggregateFunctions {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn cloned(&self) -> Box<dyn ExtensionOptions> {
+        Box::new(self.clone())
+    }
+
+    fn set(&mut self, key: &str, _value: &str) -> Result<()> {
+        config_err!(
+            "{key} cannot be set: aggregate functions are trusted with \
+             `PhysicalHashAggregate::trusted_aggregate_functions`"
+        )
+    }
+
+    fn entries(&self) -> Vec<ConfigEntry> {
+        vec![ConfigEntry {
+            key: format!("{}.functions", Self::PREFIX),
+            value: Some(self.names().join(",")),
+            description: "The built-in aggregate functions whose accumulators the native aggregation of the pipeline engine trusts not to fail",
+        }]
+    }
+}
+
+impl ConfigExtension for TrustedAggregateFunctions {
+    const PREFIX: &'static str = "pipeline_trusted_aggregate_functions";
 }
 
 /// The widest fixed-size binaries of the keys and arguments of rows that may
@@ -1213,14 +1425,15 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
     fn get_local_sink_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
-            UngroupedAggregate::local_sink_state(&self.spec)
-        } else {
-            RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity)
+            return UngroupedAggregate::local_sink_state(&self.spec);
         }
+        let options = ctx.task_ctx.session_config().options();
+        let bypass = self.spec.rows_bypass_tables(options);
+        RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity, bypass)
     }
 
     fn sink(
@@ -2627,33 +2840,76 @@ mod tests {
     async fn rows_of_simple_aggregations_may_bypass_the_tables() -> Result<()> {
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
-        for (sql, bypass) in [
+        let untrusting = ConfigOptions::default();
+        let mut trusting = ConfigOptions::default();
+        trusting
+            .extensions
+            .insert(PhysicalHashAggregate::trusted_aggregate_functions(
+                &datafusion::functions_aggregate::all_default_aggregate_functions(),
+            ));
+        // The queries, and whether their rows bypass the tables in a session
+        // that does not trust DataFusion's built-in aggregate functions, and
+        // in a session that does.
+        for (sql, untrusted, trusted) in [
             // Without aggregates.
-            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
-            ("SELECT a, d FROM t1 GROUP BY a, d", true),
-            // The accumulators of aggregates aggregate every row in the tables
-            // (see `rows_can_bypass_tables`).
+            ("SELECT DISTINCT id, c, f, ts FROM t1", true, true),
+            ("SELECT a, d FROM t1 GROUP BY a, d", true, true),
+            // The accumulators of aggregates aggregate every row in the tables,
+            // but in the sessions that trust their functions (see
+            // `rows_can_bypass_tables`).
             (
                 "SELECT a, COUNT(*), SUM(b), MIN(d), AVG(g) FROM t1 GROUP BY a",
                 false,
+                true,
             ),
+            (
+                "SELECT h, MAX(c), BOOL_AND(e), BOOL_OR(e), BIT_AND(b), BIT_OR(a), \
+                 BIT_XOR(b), APPROX_DISTINCT(d), MEDIAN(b) FILTER (WHERE e), \
+                 ARRAY_AGG(a), FIRST_VALUE(d), LAST_VALUE(f), COUNT(a, b) \
+                 FROM t1 GROUP BY h",
+                false,
+                true,
+            ),
+            // `DISTINCT` and ordered aggregates, whose accumulators are not
+            // trusted.
             (
                 "SELECT d, h, COUNT(DISTINCT a), MEDIAN(b) FILTER (WHERE e) FROM t1 \
                  GROUP BY d, h",
+                false,
                 false,
             ),
             (
                 "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
                 false,
+                false,
+            ),
+            (
+                "SELECT d, FIRST_VALUE(a ORDER BY id) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
+            // Functions that are not trusted.
+            ("SELECT d, STDDEV(b) FROM t1 GROUP BY d", false, false),
+            (
+                "SELECT d, COUNT(*), STRING_AGG(h, ',') FROM t1 GROUP BY d",
+                false,
+                false,
             ),
             // Grouping sets.
-            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false),
-            // Keys of nested types and dictionaries.
-            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false),
+            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false, false),
+            (
+                "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
+                false,
+                false,
+            ),
+            // Keys and arguments of nested types and dictionaries.
+            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false, false),
             (
                 "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 GROUP BY dd",
                 false,
+                false,
             ),
+            ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false, false),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let mut aggregate = None;
@@ -2667,7 +2923,9 @@ mod tests {
                 node = child;
             }
             let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
-            assert_eq!(aggregate.spec.bypass, bypass, "{sql}");
+            let spec = &aggregate.spec;
+            assert_eq!(spec.rows_bypass_tables(&untrusting), untrusted, "{sql}");
+            assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));

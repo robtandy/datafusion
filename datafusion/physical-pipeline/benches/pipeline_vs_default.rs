@@ -15,8 +15,11 @@
 //!
 //! The sessions of both engines trust DataFusion's built-in functions (see
 //! `TrustedFunctions`), so that the native operators can evaluate the calls of
-//! the functions that they know, as a session of the pipeline engine would,
-//! and the strings of all tables are `Utf8View`, the string type of
+//! the functions that they know, and DataFusion's built-in aggregate functions
+//! (see `PhysicalHashAggregate::trusted_aggregate_functions`), so that the
+//! rows of the native aggregations of high-cardinality groups bypass their
+//! thread-local tables, as a session of the pipeline engine would, and the
+//! strings of all tables are `Utf8View`, the string type of
 //! DataFusion's SQL tables and Parquet scans (DataFusion's ClickBench reads
 //! `hits.parquet` so).
 //!
@@ -49,6 +52,7 @@
 //! | `PIPELINE_BENCH_THREADS`    | threads (and target partitions)                                  | available parallelism             |
 //! | `PIPELINE_BENCH_SOURCE`     | `memory` (`MemTable`s), `parquet` (files in a `TempDir`), `both` | `both`                            |
 //! | `PIPELINE_BENCH_QUERIES`    | comma-separated names of the queries to run, e.g. `q1,q18,hits4` | all                               |
+//! | `PIPELINE_BENCH_TRUSTED_AGGREGATES` | whether the sessions trust DataFusion's built-in aggregate functions (`true` / `false`) | `true`        |
 
 #[path = "../tests/tpch_parity.rs"]
 mod tpch_parity;
@@ -63,6 +67,7 @@ use arrow::array::RecordBatch;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::instant::Instant;
 use datafusion_common::{DataFusionError, Result};
+use datafusion_physical_pipeline::aggregate::PhysicalHashAggregate;
 use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
 use datafusion_physical_plan::collect;
 use tempfile::TempDir;
@@ -419,6 +424,8 @@ struct BenchConfig {
     threads: usize,
     sources: Vec<SourceKind>,
     queries: Option<Vec<String>>,
+    /// Whether the sessions trust DataFusion's built-in aggregate functions.
+    trusted_aggregates: bool,
 }
 
 /// Where the tables of the benchmark are stored.
@@ -486,6 +493,7 @@ impl BenchConfig {
             threads: env_or("PIPELINE_BENCH_THREADS", threads).max(1),
             sources,
             queries,
+            trusted_aggregates: env_or("PIPELINE_BENCH_TRUSTED_AGGREGATES", true),
         }
     }
 
@@ -508,14 +516,22 @@ impl BenchConfig {
     }
 
     /// The configuration of the sessions of both engines: `threads` target
-    /// partitions, trusting DataFusion's built-in functions (see the module
-    /// documentation).
+    /// partitions, trusting DataFusion's built-in functions, and its built-in
+    /// aggregate functions unless `PIPELINE_BENCH_TRUSTED_AGGREGATES` is
+    /// `false` (see the module documentation).
     fn session_config(&self) -> SessionConfig {
         let trusted =
             TrustedFunctions::new(&datafusion::functions::all_default_functions());
-        SessionConfig::new()
+        let config = SessionConfig::new()
             .with_target_partitions(self.threads)
-            .with_option_extension(trusted)
+            .with_option_extension(trusted);
+        if !self.trusted_aggregates {
+            return config;
+        }
+        let aggregates = PhysicalHashAggregate::trusted_aggregate_functions(
+            &datafusion::functions_aggregate::all_default_aggregate_functions(),
+        );
+        config.with_option_extension(aggregates)
     }
 }
 
@@ -695,8 +711,12 @@ fn report(config: &BenchConfig, measurements: &[Measurement]) -> String {
     let _ = writeln!(
         out,
         "\nPipeline engine vs. default DataFusion: TPC-H SF {} and {} ClickBench-style hits, \
-         {} threads, median [min] of {} executions in ms",
-        config.scale, config.hits, config.threads, config.iterations
+         {} threads, median [min] of {} executions in ms, trusted aggregate functions: {}",
+        config.scale,
+        config.hits,
+        config.threads,
+        config.iterations,
+        config.trusted_aggregates
     );
     let _ = writeln!(
         out,
