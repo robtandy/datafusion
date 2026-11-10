@@ -50,7 +50,9 @@
 //!   DataFusion still creates the streams of its probe side, so a join
 //!   lowered from a `HashJoinExec` creates the DataFusion streams of that
 //!   probe input too, without polling them, to raise the same errors (e.g.
-//!   of a scan of an object store that is not registered).
+//!   of a scan of an object store that is not registered), unless creating
+//!   them cannot fail (e.g. of scans of memory or of local files, see
+//!   [`PhysicalHashJoin::create_probe_streams`]).
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
 //!   table concurrently: neither side is shuffled
@@ -158,7 +160,10 @@ use datafusion_common::{
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_csv::source::CsvSource;
+use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_expr::Operator;
 use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 use datafusion_physical_expr::expressions::{
@@ -170,19 +175,24 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
 };
-use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+use datafusion_physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode,
+};
+use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::memory::LazyMemoryExec;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, displayable,
 };
@@ -220,6 +230,10 @@ pub struct PhysicalHashJoin {
     /// join creates them too (see [`Self::create_probe_streams`]), to raise
     /// the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
+    /// Whether creating the streams of `probe_plan` cannot fail (see
+    /// [`probe_streams_cannot_fail`]), if the local file system is registered
+    /// in the runtime (which it is by default): the join then creates none.
+    probe_streams_cannot_fail: bool,
     /// The dynamic filters of the `HashJoinExec` the join was lowered from
     /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
     /// its probe side read: the join sets them to the bounds of its build keys
@@ -582,6 +596,7 @@ impl PhysicalHashJoin {
             children: vec![build, probe],
             spec,
             probe_plan: None,
+            probe_streams_cannot_fail: true,
             dynamic_filters: vec![],
         })
     }
@@ -871,6 +886,7 @@ impl PhysicalHashJoin {
         Ok(Some(Self {
             children,
             spec,
+            probe_streams_cannot_fail: probe_streams_cannot_fail(join.right()),
             probe_plan: Some(Arc::clone(join.right())),
             dynamic_filters,
         }))
@@ -889,10 +905,24 @@ impl PhysicalHashJoin {
     /// `CoalescePartitionsExec`), which must not take, for instance, the
     /// channels of a `RepartitionExec` of the probe input that the probe side
     /// still reads.
+    ///
+    /// The streams of probe inputs whose streams are created without failing
+    /// (see [`probe_streams_cannot_fail`]), e.g. of scans of memory and of
+    /// local files, are not created (nor is the input copied): with the local
+    /// file system registered in the runtime, creating them would not fail.
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
         };
+        if self.probe_streams_cannot_fail
+            && ctx
+                .task_ctx
+                .runtime_env()
+                .object_store(ObjectStoreUrl::local_filesystem())
+                .is_ok()
+        {
+            return Ok(());
+        }
         let probe = reset_plan_states(Arc::clone(probe))?;
         for partition in 0..probe.output_partitioning().partition_count() {
             drop(probe.execute(partition, Arc::clone(&ctx.task_ctx))?);
@@ -1752,6 +1782,90 @@ fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
                 .all(|(child, copy)| replayed(child, copy))
     }
     reset_plan_states(Arc::clone(plan)).is_ok_and(|copy| replayed(plan, &copy))
+}
+
+/// Whether creating the streams of all partitions of `plan`, the probe input of
+/// a `HashJoinExec`, cannot fail (so that a native join need not create them,
+/// see [`PhysicalHashJoin::create_probe_streams`]):
+///
+/// * its leaves are scans of memory, generators or no rows, or Parquet (without
+///   virtual columns or decryption) and CSV scans of the local file system,
+///   whose object store is registered by default (unlike, e.g., the store of a
+///   scan of `s3://`, which may not be);
+/// * its other nodes create their streams without failing, but for failing to
+///   create the streams of their inputs: projections, filters,
+///   repartitionings, coalescings of partitions, hash joins (of valid
+///   partitionings, without a prepared build), nested loop and cross joins,
+///   aggregations, sorts, merges, unions, limits and cooperative nodes.
+///
+/// Creating the streams of such inputs reads nothing, but creating the streams
+/// of a copy of a deep input (as the joins below a join, in a chain of joins)
+/// starts the tasks that, e.g., coalesce partitions, which read until they are
+/// dropped: not creating them saves that work, the copy, and the pipeline that
+/// creates them.
+fn probe_streams_cannot_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let children = plan.children();
+    if children.is_empty() {
+        return plan.is::<EmptyExec>()
+            || plan.is::<PlaceholderRowExec>()
+            || plan.is::<LazyMemoryExec>()
+            || plan.downcast_ref::<DataSourceExec>().is_some_and(|scan| {
+                let source = scan.data_source();
+                source.is::<MemorySourceConfig>()
+                    || source
+                        .downcast_ref::<FileScanConfig>()
+                        .is_some_and(local_scan_streams_cannot_fail)
+            });
+    }
+    let partitions =
+        |plan: &Arc<dyn ExecutionPlan>| plan.output_partitioning().partition_count();
+    let cannot_fail = plan.is::<ProjectionExec>()
+        || plan.is::<FilterExec>()
+        || plan.is::<RepartitionExec>()
+        || plan.is::<CooperativeExec>()
+        || plan.is::<AggregateExec>()
+        || plan.is::<SortExec>()
+        || plan.is::<SortPreservingMergeExec>()
+        || plan.is::<UnionExec>()
+        || plan.is::<InterleaveExec>()
+        || plan.is::<GlobalLimitExec>()
+        || plan.is::<LocalLimitExec>()
+        || plan.is::<CrossJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
+        || plan
+            .downcast_ref::<CoalescePartitionsExec>()
+            .is_some_and(|coalesce| partitions(coalesce.input()) > 0)
+        || plan.downcast_ref::<HashJoinExec>().is_some_and(|join| {
+            !has_prepared_build(plan)
+                && match join.partition_mode() {
+                    PartitionMode::CollectLeft => partitions(join.left()) == 1,
+                    PartitionMode::Partitioned => {
+                        partitions(join.left()) == partitions(join.right())
+                    }
+                    PartitionMode::Auto => false,
+                }
+        });
+    cannot_fail && children.into_iter().all(probe_streams_cannot_fail)
+}
+
+/// Whether the streams of the scan of files `config` cannot fail to be
+/// created: a scan of the local file system, by a Parquet source without
+/// virtual columns or decryption properties (which are checked when its
+/// streams are created), or by a CSV source.
+fn local_scan_streams_cannot_fail(config: &FileScanConfig) -> bool {
+    let source = config.file_source();
+    config.object_store_url == ObjectStoreUrl::local_filesystem()
+        && (source.is::<CsvSource>()
+            || (source.table_schema().virtual_columns().is_empty()
+                && source
+                    .downcast_ref::<ParquetSource>()
+                    .is_some_and(|parquet| {
+                        parquet
+                            .table_parquet_options()
+                            .crypto
+                            .file_decryption
+                            .is_none()
+                    })))
 }
 
 /// Whether evaluating `expr` on a batch of `schema` can fail on some rows.
@@ -2926,8 +3040,8 @@ impl PhysicalOperator for PhysicalHashJoin {
             )?;
             // The probe streams of a join lowered from a `HashJoinExec` are
             // created as soon as the execution starts, in a pipeline that
-            // depends on nothing.
-            if self.probe_plan.is_some() {
+            // depends on nothing (unless creating them cannot fail).
+            if self.probe_plan.is_some() && !self.probe_streams_cannot_fail {
                 let init_pipeline =
                     build.create_union_pipeline(&build_pipeline, false)?;
                 build.set_source(
@@ -3048,7 +3162,8 @@ impl PhysicalOperator for JoinHashTableBuild {
 }
 
 /// The source of a pipeline of the build meta pipeline of a
-/// [`PhysicalHashJoin`] lowered from a `HashJoinExec`, which depends on
+/// [`PhysicalHashJoin`] lowered from a `HashJoinExec` whose probe streams may
+/// fail to be created (see [`probe_streams_cannot_fail`]), which depends on
 /// nothing, so that it runs as soon as the execution starts. It produces no
 /// rows: its sink, the join, creates the streams of its DataFusion probe
 /// input when it creates the local sink state of the pipeline (see
@@ -3110,7 +3225,9 @@ mod tests {
     use datafusion_execution::SendableRecordBatchStream;
     use datafusion_execution::TaskContext;
     use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_execution::object_store::{
+        DefaultObjectStoreRegistry, ObjectStoreRegistry, ObjectStoreUrl,
+    };
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, col, lit};
@@ -6749,6 +6866,111 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_streams_that_cannot_fail_are_not_created() -> Result<()> {
+        // The probe inputs whose streams are created without failing: scans of
+        // memory, of no rows and of local files, below nodes that create their
+        // streams without failing.
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_p(dir.path())?;
+        let ctx = datafusion_context(test_session_config());
+        register_tables_p_and_b(&ctx, dir.path()).await?;
+        for (sql, cannot_fail) in [
+            ("SELECT k FROM b", true),
+            ("SELECT k, d FROM p WHERE s <> 's1'", true),
+            (
+                "SELECT p.k, COUNT(*) FROM p JOIN b ON p.k = b.k GROUP BY p.k ORDER BY p.k",
+                true,
+            ),
+            ("SELECT k FROM b UNION ALL SELECT k FROM p", true),
+            ("SELECT k FROM p ORDER BY k LIMIT 10", true),
+            // A window, which is not known to create its streams without failing.
+            ("SELECT k, ROW_NUMBER() OVER (ORDER BY k) FROM p", false),
+        ] {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            assert_eq!(
+                probe_streams_cannot_fail(&plan),
+                cannot_fail,
+                "{sql}\n{}",
+                displayable(plan.as_ref()).indent(true)
+            );
+        }
+        let no_partitions =
+            MemorySourceConfig::try_new_exec(&[], int32_k_schema(), None)?;
+        let empty_after = EmptyAfter {
+            schema: int32_k_schema(),
+            delay: Duration::ZERO,
+        };
+        for (name, plan, cannot_fail) in [
+            (
+                "scan of an unregistered store",
+                unregistered_csv_scan()?,
+                false,
+            ),
+            (
+                "JSON scan",
+                unregistered_store_scan(int32_k_schema())?,
+                false,
+            ),
+            ("scan of a local file", missing_csv_scan()?, true),
+            ("streaming table", partition_plan(empty_after)?, false),
+            (
+                "coalescing of no partitions",
+                Arc::new(CoalescePartitionsExec::new(no_partitions)) as _,
+                false,
+            ),
+            (
+                "empty",
+                Arc::new(EmptyExec::new(int32_k_schema())) as _,
+                true,
+            ),
+        ] {
+            assert_eq!(probe_streams_cannot_fail(&plan), cannot_fail, "{name}");
+        }
+
+        // A join of scans of memory has no pipeline that creates its probe
+        // streams.
+        let root = lower(&JoinCase::new(JoinType::Inner, vec!["k"]).plan()?)?;
+        let pipelines = format_pipelines(&root)?;
+        assert!(!pipelines.contains("ProbeStreamsInit"), "{pipelines}");
+
+        // In a runtime without the local file system, creating the streams of
+        // a scan of local files fails: the native join creates them, and fails
+        // like DataFusion, also without build rows (and without reading its
+        // probe side).
+        let registry = DefaultObjectStoreRegistry::new();
+        registry.deregister_store(ObjectStoreUrl::local_filesystem().as_ref())?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(registry))
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(test_session_config())
+                .with_runtime(runtime),
+        );
+        let make_plan =
+            || join_on_k(int32_k_scan(vec![])?, missing_csv_scan()?, JoinType::Inner);
+        let error = collect(make_plan()?, Arc::clone(&task_ctx))
+            .await
+            .expect_err("DataFusion fails");
+        assert!(
+            error.to_string().contains("No suitable object store"),
+            "{error}"
+        );
+        let plan = make_plan()?;
+        let root = lower(&plan)?;
+        assert!(root.is::<PhysicalHashJoin>());
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let native = with_timeout(collect(exec, task_ctx))
+            .await
+            .expect_err("the pipeline engine fails");
+        assert!(
+            native.to_string().contains("No suitable object store"),
+            "{native}"
+        );
+        Ok(())
+    }
+
     /// A partition that produces `batch` after `delay`.
     #[derive(Debug)]
     struct DelayedBatch {
@@ -7207,9 +7429,7 @@ mod tests {
                 NullEquality::NullEqualsNothing,
                 false,
             )?);
-            Ok(Arc::new(
-                datafusion_physical_plan::limit::GlobalLimitExec::new(join, 0, Some(1)),
-            ))
+            Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
         };
         let config = test_session_config()
             .with_target_partitions(1)
@@ -7301,9 +7521,7 @@ mod tests {
                 NullEquality::NullEqualsNothing,
                 false,
             )?);
-            Ok(Arc::new(
-                datafusion_physical_plan::limit::GlobalLimitExec::new(join, 0, Some(1)),
-            ))
+            Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
         };
         let config = test_session_config()
             .with_target_partitions(1)
