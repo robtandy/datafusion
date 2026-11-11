@@ -212,6 +212,10 @@ use crate::operators::caching::CachingOperator;
 use crate::operators::data_sink::PhysicalDataSink;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
+use crate::operators::materialized_cte::{
+    MaterializedCteScan, MaterializedCtes, PhysicalMaterializedCte,
+    hoist_materialized_ctes,
+};
 use crate::operators::partial_sort::PhysicalPartialSort;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
@@ -487,6 +491,9 @@ struct Lowering<'a> {
     /// fetch or an aggregation with a soft limit, or in the subquery of a
     /// scalar subquery, which fails at its second row.
     early_stop: Cell<bool>,
+    /// The materialized CTEs whose continuations are being lowered, which
+    /// their scans read.
+    materialized_ctes: MaterializedCtes,
 }
 
 impl<'a> Lowering<'a> {
@@ -495,6 +502,7 @@ impl<'a> Lowering<'a> {
             options,
             runtime,
             early_stop: Cell::new(false),
+            materialized_ctes: MaterializedCtes::default(),
         }
     }
 }
@@ -586,8 +594,26 @@ impl Lowering<'_> {
                 return Ok(join);
             }
         }
+        // The materialized CTEs that the subqueries of a scalar subquery scan
+        // run before them.
+        if let Some(hoisted) = hoist_materialized_ctes(plan)? {
+            return self.lower_natively(&hoisted);
+        }
         if let Some(subquery) = self.try_lower_scalar_subquery(plan)? {
             return Ok(subquery);
+        }
+        // The body of a materialized CTE reads all of its input.
+        if let Some(cte) = PhysicalMaterializedCte::try_lower(
+            plan,
+            &self.materialized_ctes,
+            |body| self.lower_in(body, false),
+            |continuation| self.lower(continuation),
+        )? {
+            return Ok(Arc::new(cte));
+        }
+        if let Some(scan) = MaterializedCteScan::try_lower(plan, &self.materialized_ctes)
+        {
+            return Ok(Arc::new(scan));
         }
         // A limit with a fetch stops its pipeline once it has its rows.
         let early_stop = self.early_stop.get() || plan.fetch().is_some();
