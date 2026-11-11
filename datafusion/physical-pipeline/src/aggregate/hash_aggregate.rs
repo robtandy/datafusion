@@ -136,9 +136,8 @@ pub(crate) struct AggregateSpec {
     /// `pipeline_parts`): its pipelines then run on a single thread, which
     /// evaluates the rows in order, and so fails on the first of them that
     /// fails in DataFusion (the threads of a pipeline evaluate the chunks of a
-    /// partition in parallel, and any of them may fail first). (DataFusion
-    /// evaluates several partitions in parallel, and fails on the first of
-    /// them that fails.)
+    /// partition in parallel, and any of them may fail first). (Those of
+    /// several partitions read them through a bridge, see `try_lower`.)
     pub(crate) evaluates_in_order: bool,
 }
 
@@ -771,10 +770,29 @@ impl PhysicalHashAggregate {
         // and merges them), so that the other aggregates may see another
         // sequence. It aggregates the rows in the order of its input otherwise,
         // which must then be DataFusion's.
-        if !exact && (raw.input().is::<SortExec>() || hard_input_order(raw)?.is_some()) {
+        //
+        // An aggregation that may fail itself (see `own_parts`) fails on the
+        // row that fails first, which depends on the order of the rows too:
+        // DataFusion evaluates every partition in order, all of them at once,
+        // and fails on a row of the partition that fails first (with a single
+        // partition that fails, on its first row that fails). The native
+        // sources read all partitions as a single queue of chunks, and other
+        // native operators (e.g. an aggregation below) may reorder the rows:
+        // such aggregations read the rows of DataFusion's input through a
+        // bridge instead, whose threads read every partition in order. (Those
+        // of a single partition evaluate it in order, on a single thread, see
+        // `AggregateSpec::evaluates_in_order`. The order in which the native
+        // operators of a pipeline fail, e.g. a projection below an aggregation
+        // that cannot fail, is the planner's.)
+        let own = own_parts(raw);
+        let sorted = raw.input().is::<SortExec>() || hard_input_order(raw)?.is_some();
+        if (!exact || own > 0) && sorted {
             return Ok(None);
         }
-        let input = lower_input(raw.input())?;
+        let mut input = lower_input(raw.input())?;
+        if own > 0 && (!single_partition || !keeps_datafusion_order(&input)) {
+            input = Arc::new(BridgeOperator::new(Arc::clone(raw.input())));
+        }
         if !exact && !keeps_datafusion_order(&input) {
             return Ok(None);
         }
@@ -1550,22 +1568,30 @@ fn cannot_overflow(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
 }
 
 /// An upper bound of the number of digits of the unscaled values of `expr`,
-/// of type `Decimal128` (over `schema`), and its scale, if known: the
-/// precision of its type, for a column (of a precision below the maximum of
-/// 38, which the type of a result may only cap), a literal or a cast into the
-/// decimal (which fails on the values of more digits); or that of the
-/// operands of an addition, a subtraction or a multiplication that cannot
-/// overflow (see [`cannot_overflow`]): `max(d1 - s1, d2 - s2) + max(s1, s2) +
-/// 1` and `d1 + d2` digits.
+/// of type `Decimal128` (over `schema`), and its scale, if known: the digits of
+/// the value of a literal; the precision of its type, for a column (of a
+/// precision below the maximum of 38, which the type of a result may only
+/// cap) or a cast into the decimal (which fails on the values of more
+/// digits); or that of the operands of an addition, a subtraction or a
+/// multiplication that cannot overflow (see [`cannot_overflow`]):
+/// `max(d1 - s1, d2 - s2) + max(s1, s2) + 1` and `d1 + d2` digits.
 fn decimal_digits(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<(i32, i32)> {
     let DataType::Decimal128(precision, scale) = expr.data_type(schema).ok()? else {
         return None;
     };
     let (precision, scale) = (i32::from(precision), i32::from(scale));
-    if expr.is::<Literal>()
-        || expr.is::<CastExpr>()
-        || (expr.is::<Column>() && precision < 38)
-    {
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
+        // The digits of its value (e.g. of the `1` of `1 - l_discount`, of a
+        // `DECIMAL(20, 0)` once DataFusion coerced it).
+        let ScalarValue::Decimal128(value, _, _) = literal.value() else {
+            return None;
+        };
+        let digits = value.map_or(1, |value| {
+            value.unsigned_abs().checked_ilog10().unwrap_or(0) + 1
+        });
+        return Some((i32::try_from(digits).ok()?, scale));
+    }
+    if expr.is::<CastExpr>() || (expr.is::<Column>() && precision < 38) {
         return Some((precision, scale));
     }
     let binary = expr.downcast_ref::<BinaryExpr>()?;

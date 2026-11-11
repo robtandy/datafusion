@@ -4011,11 +4011,6 @@ mod tests {
                         "Failed to cast field",
                     ),
                     (
-                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) FROM t \
-                         WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1 GROUP BY k",
-                        x_fails,
-                    ),
-                    (
                         "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))), SUM(d) FROM \
                          (SELECT k, y, CAST(x AS DECIMAL(3, 0)) + 0.5 AS d FROM t) \
                          GROUP BY k",
@@ -4062,17 +4057,50 @@ mod tests {
                         "{sql}"
                     );
                 }
+                // A filter of the pipeline: over several partitions, the
+                // aggregation reads DataFusion's input, filtered by DataFusion,
+                // through a bridge (whose threads read every partition in
+                // order), and only evaluates its argument.
+                let sql = "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) FROM t \
+                     WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1 GROUP BY k";
+                assert_lowered_fails_like_datafusion_with_setup(
+                    sql,
+                    config.clone(),
+                    &setup,
+                    x_fails,
+                )
+                .await;
+                let (planned, bridged) =
+                    planned_aggregations_over_bridges(sql, &config, &setup).await?;
+                assert_eq!(planned, bridged, "{sql}");
+                // A single part that may fail, also next to TPC-H Q9's
+                // arithmetic, whose literal `1` (a `DECIMAL(20, 0)` once
+                // coerced) has a digit: it cannot overflow. (The planner leaves
+                // that one to DataFusion: its own analysis counts the
+                // overflows of the arithmetic too.)
                 for sql in [
                     "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), COUNT(*) FROM t GROUP BY k",
                     "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))) FROM t WHERE y > 0 GROUP BY k",
+                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), SUM(p * (1 - q) - q * p) \
+                     FROM t GROUP BY k",
                 ] {
+                    let message =
+                        "1000 is too large to store in a Decimal128 of precision 3";
                     assert_aggregate_fails_like_datafusion_with_setup(
                         sql,
                         config.clone(),
                         &setup,
-                        "1000 is too large to store in a Decimal128 of precision 3",
+                        message,
                     )
                     .await;
+                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        message,
+                    )
+                    .await;
+                    assert!(lowered > 0, "{sql}");
                 }
                 let sql = "SELECT k, SUM(p * (1 - q)), SUM(p * (1 - q) * (1 + q)) FROM t \
                            GROUP BY k";
@@ -4105,6 +4133,161 @@ mod tests {
         Ok(crate::operators::union::test_support::count::<
             PhysicalHashAggregate,
         >(root.operator()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_that_may_fail_read_the_rows_of_datafusion_in_its_order()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // The review of 4c99a7f4a. An aggregation that may fail fails on the
+        // row that fails first, which depends on the order of its rows: those
+        // that DataFusion evaluates partition by partition, in order (see
+        // `try_lower`). `CAST(x AS DECIMAL(38, 25))` fails on `10^13 + 2` and
+        // on `10^13` with the invalid argument of a value too large for the
+        // precision, and on `i64::MAX` with the arithmetic overflow of
+        // rescaling it. Such aggregations read DataFusion's input through a
+        // bridge (whose threads read every partition in order) if the native
+        // operators would read its rows otherwise:
+        let runs =
+            async |sql: &str, config: &SessionConfig, setup, message| -> Result<()> {
+                for _ in 0..5 {
+                    assert_aggregate_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        setup,
+                        message,
+                    )
+                    .await;
+                }
+                let (planned, bridged) =
+                    planned_aggregations_over_bridges(sql, config, setup).await?;
+                assert!(
+                    planned > 0 && bridged == planned,
+                    "{sql}: {planned} {bridged}"
+                );
+                Ok(())
+            };
+        // - An aggregation below, whose rows the native operator emits in
+        //   another order: with one partition `x = [10^13 + 2, i64::MAX]`,
+        //   the aggregation of the groups of `x` failed on `i64::MAX` natively.
+        //   (On several target partitions, DataFusion aggregates the groups in
+        //   several partitions, and fails on the first of either: with
+        //   aggregations of a single partition.)
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![
+                10_000_000_000_002,
+                i64::MAX,
+            ]))],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(target_partitions == 1);
+                if trusted {
+                    config = trusting(config);
+                }
+                for sql in [
+                    "SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM (SELECT x FROM t GROUP BY x)",
+                    "SELECT x > 0, SUM(CAST(x AS DECIMAL(38, 25))) FROM \
+                     (SELECT x FROM t GROUP BY x) GROUP BY x > 0",
+                ] {
+                    runs(
+                        sql,
+                        &config,
+                        &setup,
+                        "10000000000002.0000000000000000000000000 is too large to store \
+                         in a Decimal128 of precision 38",
+                    )
+                    .await?;
+                }
+            }
+        }
+        // - Several partitions, of which the native sources read the chunks as
+        //   a single queue: one batch of 8,192 rows, `x = 1` but
+        //   `x[2047] = 10^13` and `x[2048] = i64::MAX`, and an empty partition.
+        //   The threads failed on the chunk of `i64::MAX` first.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let mut x = vec![1; 8_192];
+        x[2_047] = 10_000_000_000_000;
+        x[2_048] = i64::MAX;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from(x)),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch], vec![]]);
+        for target_partitions in [4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false)
+                    .set_bool("datafusion.optimizer.repartition_file_scans", false)
+                    .set_bool(
+                        "datafusion.optimizer.enable_round_robin_repartition",
+                        false,
+                    );
+                if trusted {
+                    config = trusting(config);
+                }
+                for sql in [
+                    "SELECT k, SUM(CAST(x AS DECIMAL(38, 25))) FROM t GROUP BY k",
+                    "SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM t",
+                ] {
+                    runs(
+                        sql,
+                        &config,
+                        &setup,
+                        "10000000000000.0000000000000000000000000 is too large to store in a \
+                         Decimal128 of precision 38",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of native aggregations that the planner plans for `sql`, and
+    /// of those of them that read their input through a bridge.
+    async fn planned_aggregations_over_bridges<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<(usize, usize)>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        use crate::bridge::BridgeOperator;
+        use crate::operator::PhysicalOperator;
+        fn walk(operator: &Arc<dyn PhysicalOperator>, counts: &mut (usize, usize)) {
+            if operator.is::<PhysicalHashAggregate>() {
+                counts.0 += 1;
+                if operator.children()[0].is::<BridgeOperator>() {
+                    counts.1 += 1;
+                }
+            }
+            for child in operator.children() {
+                walk(child, counts);
+            }
+        }
+        let ctx = crate::test_utils::pipeline_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
+            return internal_err!("The pipeline engine did not plan {sql}");
+        };
+        let mut counts = (0, 0);
+        walk(root.operator(), &mut counts);
+        Ok(counts)
     }
 
     /// Table `hc`: 34,816 distinct keys `k`, values `v`, strings `s` (views)
