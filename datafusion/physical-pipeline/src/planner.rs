@@ -25,6 +25,9 @@
 //! | `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)`        | [`PhysicalHashAggregate`]                          |
 //! | `AggregateExec(Single \| SinglePartitioned)`                                       | [`PhysicalHashAggregate`]                          |
 //! | `HashJoinExec` (`CollectLeft` or `Partitioned`)                                    | [`PhysicalHashJoin`]                               |
+//! | `SortMergeJoinExec`                                                                | [`PhysicalHashJoin`], or [`PhysicalMergeJoin`]     |
+//! | `SortPreservingMergeExec` of the sorted partitions of a `SortMergeJoinExec`        | the [`PhysicalMergeJoin`] of the join              |
+//! | `SymmetricHashJoinExec`                                                            | [`PhysicalSymmetricHashJoin`], or a hash join      |
 //! | `WindowAggExec`, `BoundedWindowAggExec` (with the sorts and repartitionings below) | [`PhysicalWindow`]                                 |
 //! | `SortPreservingMergeExec` of the partitions of a window                            | [`PhysicalSort`] of the [`PhysicalWindow`]         |
 //! | `NestedLoopJoinExec`                                                               | [`PhysicalNestedLoopJoin`]                         |
@@ -65,9 +68,15 @@
 //! exhausted): they are only lowered for sessions whose memory pool has no
 //! limit, see [`lower_execution_plan_with_runtime`].
 //!
+//! A sort-merge join is a hash join unless a node above it relies on its order:
+//! a `SortPreservingMergeExec` that merges its sorted partitions (through
+//! projections and filters, e.g. of `ORDER BY key NULLS FIRST`), which the
+//! merge join replaces, or the nodes above a join of a single partition (see
+//! [`merge_join::try_lower`] and `Lowering::try_lower_merge_of_sort_merge_join`).
+//!
 //! Every native operator documents (in its `try_lower` or `supports_*`
-//! function) which nodes it lowers; any other node, such as a sort-merge join,
-//! a recursive query or a custom node, is executed by DataFusion: it is
+//! function) which nodes it lowers; any other node, such as a recursive query
+//! or a custom node, is executed by DataFusion: it is
 //! wrapped, with its whole subtree, in a [`BridgeOperator`], so that every
 //! plan can be executed. Native operators above a bridged plan read its output
 //! as the source of their pipeline.
@@ -108,10 +117,9 @@
 //!
 //! DataFusion still executes
 //!
-//! * the nodes that no native operator implements yet (e.g. sort-merge and
-//!   symmetric hash joins, recursive queries, and user-defined
-//!   `ExecutionPlan`s), and the nodes that the native operators refuse
-//!   themselves (see their `try_lower` functions);
+//! * the nodes that no native operator implements yet (e.g. recursive queries,
+//!   and user-defined `ExecutionPlan`s), and the nodes that the native
+//!   operators refuse themselves (see their `try_lower` functions);
 //! * the windows and loop joins of sessions whose memory pool has a limit
 //!   (see above);
 //! * the sorts, windows, aggregations and joins of values that address more
@@ -158,8 +166,11 @@
 //! ```
 //!
 //! [`PhysicalTopK`]: crate::sort::PhysicalTopK
+//! [`PhysicalMergeJoin`]: crate::join::PhysicalMergeJoin
+//! [`PhysicalSymmetricHashJoin`]: crate::join::PhysicalSymmetricHashJoin
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -198,8 +209,8 @@ use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
 use crate::chunk::DataChunk;
 use crate::explain::{AnalyzedPipelineExec, MetricSelection};
-use crate::join::PhysicalHashJoin;
 use crate::join::nested_loop::{PhysicalCrossJoin, PhysicalNestedLoopJoin};
+use crate::join::{PhysicalHashJoin, merge_join, symmetric_hash_join};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, GlobalSinkState, LocalSinkState,
     OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
@@ -478,6 +489,10 @@ struct Lowering<'a> {
     /// fetch or an aggregation with a soft limit, or in the subquery of a
     /// scalar subquery, which fails at its second row.
     early_stop: Cell<bool>,
+    /// The sort-merge joins whose order a merge above them relies on (by the
+    /// address of their node), which are lowered to merge joins: see
+    /// [`Self::try_lower_merge_of_sort_merge_join`].
+    ordered_joins: RefCell<HashSet<usize>>,
 }
 
 impl<'a> Lowering<'a> {
@@ -486,6 +501,7 @@ impl<'a> Lowering<'a> {
             options,
             runtime,
             early_stop: Cell::new(false),
+            ordered_joins: RefCell::new(HashSet::new()),
         }
     }
 }
@@ -564,10 +580,19 @@ impl Lowering<'_> {
             if let Some(sort) = self.try_lower_merge_of_window(plan)? {
                 return Ok(sort);
             }
+            if let Some(join) = self.try_lower_merge_of_sort_merge_join(plan)? {
+                return Ok(join);
+            }
             if let Some(aggregate) = self.try_lower_aggregate(plan)? {
                 return Ok(aggregate);
             }
             if let Some(join) = self.try_lower_hash_join(plan)? {
+                return Ok(join);
+            }
+            if let Some(join) = self.try_lower_sort_merge_join(plan)? {
+                return Ok(join);
+            }
+            if let Some(join) = self.try_lower_symmetric_hash_join(plan)? {
                 return Ok(join);
             }
             if let Some(join) = self.try_lower_loop_join(plan)? {
@@ -739,6 +764,76 @@ impl Lowering<'_> {
             |input: &Arc<dyn ExecutionPlan>| self.lower_join_input(plan, input);
         Ok(PhysicalHashJoin::try_lower(plan, lower_input)?
             .map(|lowered| Arc::new(lowered) as Arc<dyn PhysicalOperator>))
+    }
+
+    /// Lower a sort-merge join with [`merge_join::try_lower`]: to a
+    /// [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin) if a merge above
+    /// it relies on its order (see
+    /// [`Self::try_lower_merge_of_sort_merge_join`]) or if it has a single
+    /// partition with an order, and to a [`PhysicalHashJoin`] otherwise. The
+    /// inputs that run in the pipeline of the join (the probe side of a hash
+    /// join) are lowered in it, see [`Self::lower_in`].
+    fn try_lower_sort_merge_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let key = Arc::as_ptr(plan).cast::<()>().addr();
+        let ordered = self.ordered_joins.borrow().contains(&key);
+        let early_stop = self.early_stop.get();
+        merge_join::try_lower(plan, ordered, |input, in_pipeline| {
+            self.lower_in(input, in_pipeline && early_stop)
+        })
+    }
+
+    /// Lower a `SortPreservingMergeExec` that merges the sorted partitions of
+    /// a sort-merge join (through projections and filters, see
+    /// [`merge_join::ordered_join_below`]) to its input, in which the join is
+    /// a [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin), whose rows the
+    /// native operators above it emit
+    /// in order, on a single thread (and to a limit of its input, in its order,
+    /// for a merge with a fetch). Merging the sorted partitions of the join is
+    /// emitting the rows of the merge join in order.
+    ///
+    /// Only if the input of the merge is lowered to the rows of a merge join
+    /// in its order (see [`merge_join::emits_merge_join_order`]).
+    fn try_lower_merge_of_sort_merge_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(join) = merge_join::ordered_join_below(plan)? else {
+            return Ok(None);
+        };
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        let key = Arc::as_ptr(join).cast::<()>().addr();
+        self.ordered_joins.borrow_mut().insert(key);
+        let early_stop = self.early_stop.get() || merge.fetch().is_some();
+        let input = self.lower_in(merge.input(), early_stop)?;
+        if !merge_join::emits_merge_join_order(&input) {
+            return Ok(None);
+        }
+        Ok(Some(match merge.fetch() {
+            Some(fetch) => Arc::new(
+                PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true),
+            ),
+            None => input,
+        }))
+    }
+
+    /// Lower a symmetric hash join with [`symmetric_hash_join::try_lower`]: to
+    /// a [`PhysicalHashJoin`] that builds on an input that ends, or to a
+    /// [`PhysicalSymmetricHashJoin`](crate::join::PhysicalSymmetricHashJoin) of
+    /// two inputs that never end, which
+    /// streams both of them in its pipelines (see [`Self::lower_in`]).
+    fn try_lower_symmetric_hash_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let early_stop = self.early_stop.get();
+        symmetric_hash_join::try_lower(plan, |input, in_pipeline| {
+            self.lower_in(input, in_pipeline && early_stop)
+        })
     }
 
     /// Lower a window (a `WindowAggExec` or a `BoundedWindowAggExec`, with the
