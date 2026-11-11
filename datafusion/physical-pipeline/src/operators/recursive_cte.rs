@@ -1252,6 +1252,7 @@ mod tests {
         )
     }
 
+    /// Execute the statement `sql` in `ctx`.
     async fn execute(ctx: &SessionContext, sql: &str) -> Result<()> {
         ctx.sql(sql).await?.collect().await?;
         Ok(())
