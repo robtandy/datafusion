@@ -669,7 +669,10 @@ impl PhysicalHashJoin {
     ///   product of decimals of `l.a > 0 AND l.a * r.b > 1`, which DataFusion
     ///   evaluates on all pairs of a batch unless at most 20% of them are
     ///   left), or parts that may fail with different errors, or with other
-    ///   errors than arithmetic overflows (see `Failures`): both engines
+    ///   errors than arithmetic overflows (see `Failures`; e.g. a division by
+    ///   a column, which may be zero, or a cast, also of numbers into a
+    ///   decimal that may not hold them, which fails with a cast error or with
+    ///   an invalid argument, depending on the value): both engines
     ///   evaluate the filter on all candidate pairs, but DataFusion on up to
     ///   `batch_size` pairs of a probe batch at once, a native join on up to
     ///   [`DEFAULT_VECTOR_SIZE`] pairs of a probe chunk, in another order and
@@ -867,11 +870,14 @@ impl PhysicalHashJoin {
         // threads of the probe pipeline (see `fails_like_datafusion_on_threads`):
         // a filter whose errors depend on the pairs it is evaluated on
         // together, or whose parts may fail with different errors, or with
-        // other errors than arithmetic overflows, is left to DataFusion. One
-        // whose parts can only overflow (e.g. decimal arithmetic) fails like
-        // DataFusion's. (`depends_on_batches` comes first: it finds the parts
-        // that must not be evaluated before the execution, volatile or dynamic
-        // ones, before the classification evaluates any, see `failures`.)
+        // other errors than arithmetic overflows (also with the overflows of
+        // casts into decimals, which are cast errors or invalid arguments), is
+        // left to DataFusion. One whose parts can only fail with arithmetic
+        // overflows (e.g. decimal arithmetic) fails like DataFusion's, with an
+        // `ArrowError::ArithmeticOverflow`. (`depends_on_batches` comes first:
+        // it finds the parts that must not be evaluated before the execution,
+        // volatile or dynamic ones, before the classification evaluates any,
+        // see `failures`.)
         if let Some(filter) = join.filter() {
             let (expression, schema) = (filter.expression(), filter.schema().as_ref());
             if depends_on_batches(expression, schema) {
@@ -1965,8 +1971,16 @@ fn local_scan_streams_cannot_fail(config: &FileScanConfig) -> bool {
 /// `failures` (see [`failures`]), and errors that do not depend on the pairs it
 /// is evaluated on together (see [`depends_on_batches`]), raises the errors of
 /// DataFusion's `HashJoinExec` on the threads of its probe pipeline: if these
-/// parts can only fail with arithmetic overflows (see
-/// [`Failures::only_overflows`]), whatever the number of threads.
+/// parts can only fail with arithmetic overflows, whatever the number of
+/// threads. That is, if the order in which they fail would not matter (see
+/// [`Failures::order_matters`]) even together with another part that can
+/// only fail with arithmetic overflows ([`Failures::OVERFLOW`]): not the
+/// casts of numbers into decimals ([`Failures::CAST_OVERFLOW`]), although
+/// they only overflow too (see [`Failures::only_overflows`]), as Arrow reports
+/// the overflow of a value whose rescaled integer overflows the integer of
+/// the decimal as a cast error, and the overflow of a value that only exceeds
+/// the precision of the decimal as an invalid argument: which kind of error
+/// such a cast raises depends on the value of the pair that fails first.
 ///
 /// Both engines evaluate the filter on all candidate pairs of the join (the
 /// pairs of probe and build rows whose keys are equal), and on no other pair.
@@ -1989,7 +2003,7 @@ fn local_scan_streams_cannot_fail(config: &FileScanConfig) -> bool {
 /// error, e.g. a cast, whose errors name the value that fails, could fail on
 /// another pair first, also on a single thread.
 fn fails_like_datafusion_on_threads(failures: Failures) -> bool {
-    failures.only_overflows()
+    !failures.and(Failures::OVERFLOW).order_matters()
 }
 
 /// Whether evaluating `expr` on a batch of `schema` can fail on some rows.
@@ -3346,6 +3360,7 @@ mod tests {
     };
     use arrow::compute::filter_record_batch;
     use arrow::datatypes::{DataType, Int64Type, TimeUnit};
+    use arrow::error::ArrowError;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
     use datafusion_datasource::PartitionedFile;
@@ -4092,6 +4107,23 @@ mod tests {
                 })?,
                 false,
             ),
+            // Casts into decimals that may not hold the values, which can only
+            // fail on the values that overflow, but not with arithmetic
+            // overflows: with a cast error or with an invalid argument,
+            // depending on the value that fails first (see
+            // `Failures::CAST_OVERFLOW`).
+            (
+                "casts into narrow decimals",
+                filter_on(&["ld", "rd"], |schema| {
+                    let narrow = DataType::Decimal128(5, 2);
+                    Ok(binary_expr(
+                        cast_expr(col("ld", schema)?, narrow.clone()),
+                        Operator::Lt,
+                        cast_expr(col("rd", schema)?, narrow),
+                    ))
+                })?,
+                false,
+            ),
             // A single part that fails with cast errors, which name the value
             // that fails: which pair fails first depends on the order of the
             // pairs, also on a single thread.
@@ -4142,6 +4174,17 @@ mod tests {
                 // A single part, but with another error than an overflow.
                 "cast of strings" => assert!(
                     !filter_failures.order_matters() && !filter_failures.only_overflows()
+                ),
+                // Parts that only overflow, in any order, but not with
+                // arithmetic overflows.
+                "casts into narrow decimals" => assert!(
+                    filter_failures
+                        == Failures::CAST_OVERFLOW.and(Failures::CAST_OVERFLOW)
+                        && filter_failures.only_overflows()
+                        && !filter_failures.order_matters()
+                        && !batch_dependent
+                        && !fails_like_datafusion_on_threads(filter_failures),
+                    "{filter_failures:?}"
                 ),
                 "conditional product" => {
                     assert!(filter_failures.only_overflows() && batch_dependent)
@@ -8191,6 +8234,160 @@ mod tests {
         Ok(())
     }
 
+    /// The schema `(k INT, v DECIMAL(38, 0))` of the inputs of
+    /// [`decimal_filter_join`].
+    fn k_v_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Decimal128(38, 0), true),
+        ]))
+    }
+
+    /// A scan of a single partition of [`k_v_schema`] with the keys `keys` and
+    /// the values `values` (without any batch if there are none).
+    fn k_v_scan(keys: Vec<i32>, values: Vec<i128>) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = k_v_schema();
+        let batches = if keys.is_empty() {
+            vec![]
+        } else {
+            let values = Decimal128Array::from(values).with_precision_and_scale(38, 0)?;
+            vec![RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(keys)), Arc::new(values)],
+            )?]
+        };
+        Ok(MemorySourceConfig::try_new_exec(&[batches], schema, None)?)
+    }
+
+    /// 5,000 build rows of key 7, all with `v = 1` but row 3,000, with
+    /// `v = value`.
+    fn build_with_value_at_3000(value: i128) -> Result<Arc<dyn ExecutionPlan>> {
+        let values = (0..5000)
+            .map(|i| if i == 3000 { value } else { 1 })
+            .collect();
+        k_v_scan(vec![7; 5000], values)
+    }
+
+    /// A residual filter of [`decimal_filter_join`]: the expression of the
+    /// values `v` of the build row (`lv`) and of the probe row (`rv`) of a
+    /// pair, on the schema of the intermediate batch.
+    type DecimalFilter =
+        fn(PhysicalExprRef, PhysicalExprRef, &Schema) -> Result<PhysicalExprRef>;
+
+    /// `lv * rv > 0`, which can only fail with an arithmetic overflow.
+    fn product_filter(
+        lv: PhysicalExprRef,
+        rv: PhysicalExprRef,
+        _: &Schema,
+    ) -> Result<PhysicalExprRef> {
+        let product = binary_expr(lv, Operator::Multiply, rv);
+        Ok(binary_expr(product, Operator::Gt, decimal_lit(0, 38, 0)))
+    }
+
+    /// A `join_type` join on `k` of `build` and `probe` (scans of
+    /// [`k_v_schema`]), with the residual filter that `filter` builds of the
+    /// values `v` of the build row and of the probe row of a pair, under a
+    /// limit of one row if `limit`.
+    fn decimal_filter_join(
+        build: Arc<dyn ExecutionPlan>,
+        probe: Arc<dyn ExecutionPlan>,
+        join_type: JoinType,
+        filter: DecimalFilter,
+        limit: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let filter_schema = Arc::new(Schema::new(vec![
+            Field::new("lv", DataType::Decimal128(38, 0), true),
+            Field::new("rv", DataType::Decimal128(38, 0), true),
+        ]));
+        let expression = filter(
+            col("lv", &filter_schema)?,
+            col("rv", &filter_schema)?,
+            &filter_schema,
+        )?;
+        let filter = JoinFilter::new(
+            expression,
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            filter_schema,
+        );
+        let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
+        let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            build,
+            probe,
+            on,
+            Some(filter),
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )?);
+        Ok(if limit {
+            Arc::new(GlobalLimitExec::new(join, 0, Some(1)))
+        } else {
+            join
+        })
+    }
+
+    /// The lowering functions of the tests of residual filters, with their
+    /// names: [`lower`], and the planner's, for the options `options`.
+    type Lowering<'a> = (
+        &'static str,
+        Box<dyn Fn(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>> + 'a>,
+    );
+
+    fn lowerings(
+        options: &Arc<datafusion_common::config::ConfigOptions>,
+    ) -> [Lowering<'_>; 2] {
+        [
+            ("lower", Box::new(lower)),
+            (
+                "planner",
+                Box::new(|plan: &Arc<dyn ExecutionPlan>| {
+                    crate::planner::lower_execution_plan_with_options(plan, options)
+                }),
+            ),
+        ]
+    }
+
+    /// The errors with which DataFusion, and the pipeline engine with the
+    /// plan lowered by `lower`, fail to execute the plan of `make_plan` with
+    /// `config` (whose target partitions are the threads of the pipeline
+    /// engine), and the lowered operator tree.
+    async fn errors_of_both_engines(
+        make_plan: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        lower: impl Fn(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
+        config: SessionConfig,
+    ) -> Result<(DataFusionError, DataFusionError, Arc<dyn PhysicalOperator>)> {
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let expected = with_timeout(collect(make_plan()?, Arc::clone(&task_ctx)))
+            .await
+            .expect_err("DataFusion fails");
+        let plan = make_plan()?;
+        let root = lower(&plan)?;
+        let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan)?);
+        let actual = with_timeout(collect(exec, task_ctx))
+            .await
+            .expect_err("the pipeline engine fails");
+        Ok((expected, actual, root))
+    }
+
+    /// The Arrow error at the root of `error`, if it has one.
+    fn root_arrow_error(error: &DataFusionError) -> Option<&ArrowError> {
+        match error.find_root() {
+            DataFusionError::ArrowError(error, _) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn residual_filters_that_overflow_fail_like_datafusion() -> Result<()> {
         // 5,000 build rows of key 7, all with `v = 1` but row 3,000 (`v =
@@ -8198,110 +8395,252 @@ mod tests {
         // `l.v * r.v > 0` of `DECIMAL(38, 0)`s, which overflows on the pair
         // of row 3,000 (and can fail in no other way), with or without a
         // limit of one row above the join.
-        let make_plan = |limit: bool| -> Result<Arc<dyn ExecutionPlan>> {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int32, true),
-                Field::new("v", DataType::Decimal128(38, 0), true),
-            ]));
-            let batch = |keys: Vec<i32>, values: Vec<i128>| -> Result<RecordBatch> {
-                let values =
-                    Decimal128Array::from(values).with_precision_and_scale(38, 0)?;
-                Ok(RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![Arc::new(Int32Array::from(keys)), Arc::new(values)],
-                )?)
+        let make_plan = |limit: bool| {
+            decimal_filter_join(
+                build_with_value_at_3000(10_i128.pow(37))?,
+                k_v_scan(vec![7], vec![1000])?,
+                JoinType::Inner,
+                product_filter,
+                limit,
+            )
+        };
+        for threads in [4, 1] {
+            let config = test_session_config()
+                .with_target_partitions(threads)
+                .with_batch_size(8192);
+            let options = Arc::clone(config.options());
+            // On 4 threads and on 1, the join is native, also when the planner
+            // lowers it, and fails like DataFusion's, with an arithmetic
+            // overflow: whichever thread evaluates the pair of row 3,000, it
+            // overflows.
+            for (name, lowering) in lowerings(&options) {
+                let (expected, actual, root) =
+                    errors_of_both_engines(|| make_plan(false), lowering, config.clone())
+                        .await?;
+                assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{threads}, {name}");
+                for error in [&expected, &actual] {
+                    assert!(
+                        matches!(
+                            root_arrow_error(error),
+                            Some(ArrowError::ArithmeticOverflow(_))
+                        ),
+                        "{threads} threads, {name}: {error:?}"
+                    );
+                }
+            }
+            // Under the limit, DataFusion evaluates the filter on all 5,000
+            // candidate pairs (fewer than `batch_size`) before it emits any
+            // row, and overflows, while a native join, which emits as it goes,
+            // would stop after its first chunk of pairs: the planner keeps the
+            // plans below a limit in DataFusion (see
+            // `PhysicalHashJoin::try_lower`).
+            let planner = |plan: &Arc<dyn ExecutionPlan>| {
+                crate::planner::lower_execution_plan_with_options(plan, &options)
             };
-            let values = (0..5000)
-                .map(|i| if i == 3000 { 10_i128.pow(37) } else { 1 })
-                .collect();
-            let build: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
-                &[vec![batch(vec![7; 5000], values)?]],
-                Arc::clone(&schema),
-                None,
-            )?;
-            let probe: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
-                &[vec![batch(vec![7], vec![1000])?]],
-                Arc::clone(&schema),
-                None,
-            )?;
-            let filter_schema = Arc::new(Schema::new(vec![
-                Field::new("lv", DataType::Decimal128(38, 0), true),
-                Field::new("rv", DataType::Decimal128(38, 0), true),
-            ]));
-            let product = binary_expr(
-                col("lv", &filter_schema)?,
-                Operator::Multiply,
-                col("rv", &filter_schema)?,
-            );
-            let filter = JoinFilter::new(
-                binary_expr(product, Operator::Gt, decimal_lit(0, 38, 0)),
-                vec![
-                    ColumnIndex {
-                        index: 1,
-                        side: JoinSide::Left,
-                    },
-                    ColumnIndex {
-                        index: 1,
-                        side: JoinSide::Right,
-                    },
-                ],
-                filter_schema,
-            );
-            let on = vec![(col("k", &build.schema())?, col("k", &probe.schema())?)];
-            let join: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
-                build,
-                probe,
-                on,
-                Some(filter),
-                &JoinType::Inner,
-                None,
-                PartitionMode::CollectLeft,
-                NullEquality::NullEqualsNothing,
+            let root = assert_lowered_plan_fails_like_datafusion(
+                || make_plan(true),
+                planner,
+                config,
+                "Arithmetic overflow",
+            )
+            .await;
+            assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{threads} threads");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn residual_filters_that_overflow_without_build_rows_do_not_fail() -> Result<()>
+    {
+        // No build rows, and probe rows of `v = 10^37` (of which the product
+        // with any `v` above 10 overflows): no candidate pair, so neither
+        // engine evaluates the filter, also for the joins that emit the probe
+        // rows without a match. The join is native, on 4 threads and on 1.
+        let make_plan = |join_type: JoinType| {
+            decimal_filter_join(
+                k_v_scan(vec![], vec![])?,
+                k_v_scan(vec![7, 8, 7], vec![10_i128.pow(37), 1, 10_i128.pow(37)])?,
+                join_type,
+                product_filter,
                 false,
-            )?);
-            Ok(if limit {
-                Arc::new(GlobalLimitExec::new(join, 0, Some(1)))
-            } else {
-                join
-            })
+            )
         };
-        let config = test_session_config().with_batch_size(8192);
-        let options = Arc::clone(config.options());
-        let planner = |plan: &Arc<dyn ExecutionPlan>| {
-            crate::planner::lower_execution_plan_with_options(plan, &options)
+        for threads in [4, 1] {
+            let config = test_session_config().with_target_partitions(threads);
+            let options = Arc::clone(config.options());
+            let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+            for (name, lowering) in lowerings(&options) {
+                for join_type in ALL_JOIN_TYPES {
+                    let root = assert_lowered_plan_byte_eq(
+                        || make_plan(join_type),
+                        &lowering,
+                        Arc::clone(&task_ctx),
+                        false,
+                    )
+                    .await;
+                    assert_eq!(
+                        count::<PhysicalHashJoin>(&root),
+                        1,
+                        "{threads} threads, {name}, {join_type}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn residual_filters_that_may_fail_otherwise_stay_in_datafusion() -> Result<()> {
+        // The filters of `v` that may fail with other errors than arithmetic
+        // overflows, with the value of build row 3,000 (of 5,000 rows of key
+        // 7, see `build_with_value_at_3000`) on which they fail, and the error
+        // with which both engines then fail: the join is left to DataFusion,
+        // on 4 threads and on 1, whether `PhysicalHashJoin::try_lower` or the
+        // planner lowers it.
+        let division: DecimalFilter = |lv, rv, schema| {
+            // A division by a column that may be zero, which fails with a
+            // division by zero, or with an overflow.
+            let quotient = binary_expr(rv, Operator::Divide, lv);
+            let zero = ScalarValue::new_zero(&quotient.data_type(schema)?)?;
+            Ok(binary_expr(quotient, Operator::Gt, lit(zero)))
         };
-        // On the 4 threads of the configuration, the join is native, also when
-        // the planner lowers it, and fails like DataFusion's: whichever thread
-        // evaluates the pair of row 3,000, it overflows.
-        let root = assert_lowered_plan_fails_like_datafusion(
-            || make_plan(false),
-            lower,
-            config.clone(),
-            "Arithmetic overflow",
-        )
-        .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
-        let root = assert_lowered_plan_fails_like_datafusion(
-            || make_plan(false),
-            planner,
-            config.clone(),
-            "Arithmetic overflow",
-        )
-        .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 1);
-        // Under the limit, DataFusion evaluates the filter on all 5,000
-        // candidate pairs (fewer than `batch_size`) before it emits any row,
-        // and overflows, while a native join, which emits as it goes, would
-        // stop after its first chunk of pairs: the planner keeps the plans
-        // below a limit in DataFusion (see `PhysicalHashJoin::try_lower`).
-        let root = assert_lowered_plan_fails_like_datafusion(
-            || make_plan(true),
-            planner,
-            config,
-            "Arithmetic overflow",
-        )
-        .await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
+        let narrowing: DecimalFilter = |lv, _, _| {
+            // A cast into a decimal that may not hold the values, which fails
+            // with a cast error (`Overflowing on`), or with an invalid argument
+            // (`too large to store`), depending on the value that fails.
+            let narrow = cast_expr(lv, DataType::Decimal128(10, 0));
+            Ok(binary_expr(narrow, Operator::Gt, decimal_lit(0, 10, 0)))
+        };
+        let parsing: DecimalFilter = |lv, _, _| {
+            // A cast of strings into integers, which fails to parse them.
+            let integer = cast_expr(cast_expr(lv, DataType::Utf8), DataType::Int32);
+            Ok(binary_expr(integer, Operator::Gt, lit(0_i32)))
+        };
+        let cases: [(&str, DecimalFilter, i128, &str); 3] = [
+            ("division by a column", division, 0, "Divide by zero"),
+            (
+                "cast into a narrower decimal",
+                narrowing,
+                10_i128.pow(37),
+                "too large to store",
+            ),
+            (
+                "cast of strings",
+                parsing,
+                10_i128.pow(37),
+                "Cannot cast string",
+            ),
+        ];
+        for (name, filter, value, message) in cases {
+            let make_plan = || {
+                decimal_filter_join(
+                    build_with_value_at_3000(value)?,
+                    k_v_scan(vec![7], vec![1000])?,
+                    JoinType::Inner,
+                    filter,
+                    false,
+                )
+            };
+            // Why the join refuses the filter: its parts may fail with other
+            // errors than arithmetic overflows.
+            let plan = make_plan()?;
+            let join = plan.downcast_ref::<HashJoinExec>().expect("a hash join");
+            let join_filter = join.filter().expect("a filter");
+            let filter_failures =
+                failures(join_filter.expression(), join_filter.schema());
+            assert!(!filter_failures.is_none(), "{name}");
+            assert!(!fails_like_datafusion_on_threads(filter_failures), "{name}");
+            assert!(
+                PhysicalHashJoin::try_lower(&plan, lower)?.is_none(),
+                "{name}"
+            );
+            for threads in [4, 1] {
+                let config = test_session_config()
+                    .with_target_partitions(threads)
+                    .with_batch_size(8192);
+                let options = Arc::clone(config.options());
+                for (lowering_name, lowering) in lowerings(&options) {
+                    let root = assert_lowered_plan_fails_like_datafusion(
+                        make_plan,
+                        lowering,
+                        config.clone(),
+                        message,
+                    )
+                    .await;
+                    assert_eq!(
+                        count::<PhysicalHashJoin>(&root),
+                        0,
+                        "{name}, {threads} threads, {lowering_name}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn residual_filters_whose_casts_overflow_fail_like_datafusion() -> Result<()> {
+        // 1,000 build rows of key 7, and a batch of 4,096 probe rows of key 7,
+        // all with `v = 1` but rows 2,047 (`v = 10^28`) and 2,048 (`v =
+        // 10^30`), with the filter `CAST(r.v AS DECIMAL(38, 10)) > 0`. Its
+        // cast can only fail on the values that overflow the decimal (see
+        // `Failures::CAST_OVERFLOW`), but with two kinds of errors: 10^28
+        // exceeds its precision (an invalid argument, `too large to store`),
+        // 10^30 overflows its integer once rescaled (a cast error, `Overflowing
+        // on`). DataFusion evaluates the filter on the candidate pairs of the
+        // batch in order, and fails on the pairs of row 2,047, with an invalid
+        // argument. A native join on 4 threads would evaluate the pairs of the
+        // chunk of rows from 2,048 on another thread than the 2,048,000 pairs
+        // before them, and fail on row 2,048 first, with a cast error: the
+        // join is left to DataFusion, whatever the number of threads.
+        let make_plan = || {
+            let values = (0..4096)
+                .map(|row| match row {
+                    2047 => 10_i128.pow(28),
+                    2048 => 10_i128.pow(30),
+                    _ => 1,
+                })
+                .collect();
+            decimal_filter_join(
+                k_v_scan(vec![7; 1000], vec![1; 1000])?,
+                k_v_scan(vec![7; 4096], values)?,
+                JoinType::Inner,
+                |_, rv, _| {
+                    let wide = cast_expr(rv, DataType::Decimal128(38, 10));
+                    Ok(binary_expr(wide, Operator::Gt, decimal_lit(0, 38, 10)))
+                },
+                false,
+            )
+        };
+        let plan = make_plan()?;
+        let join = plan.downcast_ref::<HashJoinExec>().expect("a hash join");
+        let filter = join.filter().expect("a filter");
+        let filter_failures = failures(filter.expression(), filter.schema());
+        assert_eq!(filter_failures, Failures::CAST_OVERFLOW);
+        assert!(!depends_on_batches(filter.expression(), filter.schema()));
+        assert!(!fails_like_datafusion_on_threads(filter_failures));
+        for threads in [4, 1] {
+            let config = test_session_config()
+                .with_target_partitions(threads)
+                .with_batch_size(8192);
+            let options = Arc::clone(config.options());
+            for (name, lowering) in lowerings(&options) {
+                let (expected, actual, root) =
+                    errors_of_both_engines(make_plan, lowering, config.clone()).await?;
+                for error in [&expected, &actual] {
+                    assert!(
+                        matches!(
+                            root_arrow_error(error),
+                            Some(ArrowError::InvalidArgumentError(message))
+                                if message.contains("too large to store")
+                        ),
+                        "{threads} threads, {name}: {error}\n{}",
+                        format_operator_tree(&root)
+                    );
+                }
+                assert_eq!(count::<PhysicalHashJoin>(&root), 0, "{threads}, {name}");
+            }
+        }
         Ok(())
     }
 
