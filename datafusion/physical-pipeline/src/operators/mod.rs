@@ -12,6 +12,7 @@ pub mod filter;
 pub mod limit;
 #[cfg(test)]
 pub(crate) mod lowering_tests;
+pub mod partial_sort;
 pub mod placeholder_row;
 pub mod projection;
 pub mod union;

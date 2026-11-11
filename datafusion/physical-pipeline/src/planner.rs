@@ -212,6 +212,7 @@ use crate::operators::caching::CachingOperator;
 use crate::operators::data_sink::PhysicalDataSink;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
+use crate::operators::partial_sort::PhysicalPartialSort;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
@@ -609,6 +610,11 @@ impl Lowering<'_> {
         if let Some(unnest) = PhysicalUnnest::try_lower(plan, |input| self.lower(input))?
         {
             return Ok(Arc::new(unnest));
+        }
+        if let Some(sort) =
+            PhysicalPartialSort::try_lower(plan, |input| self.lower(input))?
+        {
+            return Ok(Arc::new(sort));
         }
         // A sink reads all of its input.
         if let Some(sink) =
@@ -1865,7 +1871,6 @@ mod tests {
     use datafusion_physical_plan::aggregates::PhysicalGroupBy;
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion_physical_plan::limit::GlobalLimitExec;
-    use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
     use datafusion_physical_plan::{PhysicalExpr, collect, displayable};
 
     use crate::bridge::bridged_plans;
@@ -2094,14 +2099,13 @@ mod tests {
 
     #[test]
     fn unsupported_plans_are_bridged() -> Result<()> {
+        // A user-defined plan.
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let scan: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
-        let ordering =
-            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("a", &schema)?)])
-                .unwrap();
         let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(PartialSortExec::new(ordering, scan, 1));
+            Arc::new(datafusion_physical_plan::test::exec::MockExec::new(
+                vec![],
+                Arc::clone(&schema),
+            ));
         let operator = lower_execution_plan(&plan)?;
         let bridge = operator.downcast_ref::<BridgeOperator>().unwrap();
         assert!(Arc::ptr_eq(bridge.plan(), &plan));
