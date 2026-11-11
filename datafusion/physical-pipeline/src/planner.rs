@@ -207,12 +207,14 @@ use crate::operator::{
     OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
     downcast_state,
 };
+use crate::operators::async_func::PhysicalAsyncFunc;
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
+use crate::operators::unnest::PhysicalUnnest;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
 use crate::sources::{
@@ -597,6 +599,15 @@ impl Lowering<'_> {
         }
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
             return self.lower_filter(plan, filter);
+        }
+        if let Some(functions) =
+            PhysicalAsyncFunc::try_lower(plan, |input| self.lower(input))?
+        {
+            return Ok(Arc::new(functions));
+        }
+        if let Some(unnest) = PhysicalUnnest::try_lower(plan, |input| self.lower(input))?
+        {
+            return Ok(Arc::new(unnest));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             return self.lower_projection(plan, projection);

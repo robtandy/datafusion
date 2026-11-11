@@ -7,13 +7,18 @@
 
 use std::sync::Arc;
 
+use datafusion::execution::SessionStateBuilder;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_common::Result;
+use datafusion_common::{DataFusionError, Result};
+use datafusion_execution::memory_pool::GreedyMemoryPool;
 
+use crate::PipelineQueryPlanner;
 use crate::bridge::{PipelineRootExec, bridged_plans};
 use crate::explain::format_operator_tree;
 use crate::operator::PhysicalOperator;
-use crate::test_utils::{compare_outputs, run_engines};
+use crate::test_utils::{compare_outputs, run_engines, test_session_config};
 
 /// The number of operators of type `T` in the operator tree `operator`.
 pub(crate) fn count<T: PhysicalOperator>(operator: &Arc<dyn PhysicalOperator>) -> usize {
@@ -60,4 +65,49 @@ where
         format_operator_tree(&root)
     );
     root
+}
+
+/// A `SessionContext` that runs queries with the pipeline engine, with the
+/// configuration of the tests and a memory pool of `limit` bytes.
+pub(crate) fn pipeline_context_with_memory_limit(limit: usize) -> SessionContext {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(limit)))
+        .build_arc()
+        .unwrap();
+    let planner = PipelineQueryPlanner::new(Arc::new(DefaultPhysicalPlanner::default()));
+    let state = SessionStateBuilder::new()
+        .with_config(test_session_config())
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .with_query_planner(Arc::new(planner))
+        .build();
+    SessionContext::new_with_state(state)
+}
+
+/// The operator tree that the pipeline engine of `ctx` lowers `sql` to.
+pub(crate) async fn lowered(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Arc<dyn PhysicalOperator>> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let root = plan
+        .downcast_ref::<PipelineRootExec>()
+        .expect("a pipeline plan");
+    Ok(Arc::clone(root.operator()))
+}
+
+/// Assert that `sql` fails with `ResourcesExhausted` in `ctx`, whose memory
+/// pool cannot hold what its native operators reserve.
+pub(crate) async fn assert_resources_exhausted(ctx: &SessionContext, sql: &str) {
+    let result = match ctx.sql(sql).await {
+        Ok(df) => df.collect().await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(_) => panic!("{sql} succeeds, expected ResourcesExhausted"),
+        Err(error) => assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{sql}: {error}"
+        ),
+    }
 }

@@ -5,6 +5,7 @@
 //! Native streaming operators.
 
 pub mod adaptive_filter;
+pub mod async_func;
 pub mod caching;
 pub mod filter;
 pub mod limit;
@@ -13,3 +14,4 @@ pub(crate) mod lowering_tests;
 pub mod placeholder_row;
 pub mod projection;
 pub mod union;
+pub mod unnest;
