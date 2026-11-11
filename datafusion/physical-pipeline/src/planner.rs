@@ -59,6 +59,15 @@
 //! the subqueries of scalar subqueries) are not cached: see
 //! `Lowering::lower_in`.
 //!
+//! The dynamic filter of every native hash join is routed, like DuckDB's join
+//! filters, to the scans below its probe side that produce its probe keys
+//! unchanged: through projections, filters, sorts, unions, other joins and
+//! aggregations grouped by the keys, but never into the null side of an outer
+//! join, nor across a node that changes the values of the keys or limits its
+//! rows. The scans skip the rows that no build key matches, which the join
+//! would drop anyway, also several joins below it: see
+//! `Lowering::try_lower_hash_join`.
+//!
 //! Windows, nested loop joins and cross joins keep all of their rows in
 //! memory without reserving it in the memory pool, while the DataFusion nodes
 //! they replace reserve their memory (and fail or spill once the pool is
@@ -159,34 +168,46 @@
 //!
 //! [`PhysicalTopK`]: crate::sort::PhysicalTopK
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 
+use arrow::array::Array as _;
+use arrow::compute::{and, prep_null_mask_filter};
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{Result, ScalarValue, exec_err, internal_err};
+use datafusion_common::{
+    JoinSide, JoinType, Result, ScalarValue, exec_err, internal_err,
+};
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_csv::source::CsvSource;
+use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Explain;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
-use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
+use datafusion_physical_plan::joins::utils::{ColumnIndex, build_join_schema};
+use datafusion_physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
@@ -196,14 +217,15 @@ use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
 use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
-use crate::chunk::DataChunk;
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::explain::{AnalyzedPipelineExec, MetricSelection};
 use crate::join::PhysicalHashJoin;
+use crate::join::hash_join::JoinFilterTarget;
 use crate::join::nested_loop::{PhysicalCrossJoin, PhysicalNestedLoopJoin};
 use crate::operator::{
-    ExecutionContext, GlobalOperatorState, GlobalSinkState, LocalSinkState,
-    OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
-    downcast_state,
+    ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
+    LocalSinkState, LocalSourceState, OperatorResult, OperatorState, PhysicalOperator,
+    SinkFinalize, SinkResult, SourceResult, downcast_state,
 };
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
@@ -478,6 +500,10 @@ struct Lowering<'a> {
     /// fetch or an aggregation with a soft limit, or in the subquery of a
     /// scalar subquery, which fails at its second row.
     early_stop: Cell<bool>,
+    /// The dynamic filters of the hash joins whose probe sides are being
+    /// lowered, routed to the scans below them (see
+    /// [`Self::try_lower_hash_join`]).
+    join_filters: RefCell<Vec<ScanJoinFilter>>,
 }
 
 impl<'a> Lowering<'a> {
@@ -486,6 +512,7 @@ impl<'a> Lowering<'a> {
             options,
             runtime,
             early_stop: Cell::new(false),
+            join_filters: RefCell::new(vec![]),
         }
     }
 }
@@ -596,7 +623,7 @@ impl Lowering<'_> {
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             return self.lower_projection(plan, projection);
         }
-        if let Some(scan) = try_create_scan_source(plan)? {
+        if let Some(scan) = self.lower_scan(plan)? {
             return Ok(scan);
         }
         if let Some(input) = redistributed_input(plan) {
@@ -730,15 +757,115 @@ impl Lowering<'_> {
     /// Lower a hash join with [`PhysicalHashJoin::try_lower`], which lowers
     /// its inputs without the nodes that only distribute their rows, and sets
     /// the dynamic filters of the join (that the scans of its probe side read)
-    /// to the bounds of its build keys.
+    /// to the bounds and the membership of its build keys.
+    ///
+    /// The filter of the join is routed, like DuckDB's join filters, to every
+    /// scan below its probe side that produces some of its probe keys
+    /// unchanged (see [`route_join_filters`]): through projections, filters,
+    /// sorts, unions, both inputs of other joins (and from one key of an inner
+    /// or semi join to the other) and aggregations grouped by the keys, but
+    /// into no input of a join whose unmatched rows it emits (the null side of
+    /// an outer join), and across no node that changes their values or limits
+    /// its rows. Every such scan gets a filter of the keys it produces, over
+    /// its own columns, which the join sets with its own (see
+    /// [`PhysicalHashJoin::with_filter_targets`]), and is lowered with it (see
+    /// [`Self::lower_scan`]): the scans then skip the rows that cannot match.
+    /// E.g. in TPC-H Q21 over memory tables, the scan of `supplier` on the
+    /// build side of its join with `lineitem`, two joins below the join with
+    /// the nation of the query, produces the suppliers of that nation only, so
+    /// that the joins below do not join the lines of the other suppliers. The
+    /// pipelines of these scans wait for the build side of the join (see
+    /// [`MetaPipelineBuilder::build_with_dependency`]), so its filters are
+    /// complete before they open their files.
     fn try_lower_hash_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
-        let lower_input =
-            |input: &Arc<dyn ExecutionPlan>| self.lower_join_input(plan, input);
-        Ok(PhysicalHashJoin::try_lower(plan, lower_input)?
-            .map(|lowered| Arc::new(lowered) as Arc<dyn PhysicalOperator>))
+        let routes = route_join_filters(plan)?;
+        let probe = plan.children().get(1).copied();
+        let lower_input = |input: &Arc<dyn ExecutionPlan>| {
+            if routes.is_empty() || !probe.is_some_and(|probe| is_within(probe, input)) {
+                return self.lower_join_input(plan, input);
+            }
+            // The scans of the probe side are lowered with the filters routed to
+            // them.
+            let outer = self.join_filters.borrow().len();
+            self.join_filters
+                .borrow_mut()
+                .extend(routes.iter().map(|route| route.scan_filter.clone()));
+            let lowered = self.lower_join_input(plan, input);
+            self.join_filters.borrow_mut().truncate(outer);
+            lowered
+        };
+        let Some(join) = PhysicalHashJoin::try_lower(plan, lower_input)? else {
+            return Ok(None);
+        };
+        // The join sets the filters of the scans that were lowered with them.
+        let targets = routes
+            .into_iter()
+            .filter(|route| route.scan_filter.attached.get())
+            .map(|route| route.target)
+            .collect();
+        Ok(Some(Arc::new(join.with_filter_targets(targets)?)))
+    }
+
+    /// Lower a scan to a native source (see [`try_create_scan_source`]), with
+    /// the dynamic filters of the hash joins above it that are routed to it
+    /// (see [`Self::try_lower_hash_join`]):
+    ///
+    /// * a Parquet scan reads them in its predicate, like the dynamic filters
+    ///   that DataFusion pushes into it: it skips the files, row groups and
+    ///   pages (by their statistics, page indexes and bloom filters) that they
+    ///   reject, and filters its rows with them with `pushdown_filters`;
+    /// * the chunks of a scan of a memory table or of CSV files, which cannot
+    ///   filter its rows itself, are filtered with them (see
+    ///   [`JoinFilteredScan`]).
+    fn lower_scan(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let filters = self
+            .join_filters
+            .borrow()
+            .iter()
+            .filter(|filter| Arc::ptr_eq(&filter.scan, plan))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(exec) = plan
+            .downcast_ref::<DataSourceExec>()
+            .filter(|_| !filters.is_empty())
+        else {
+            return try_create_scan_source(plan);
+        };
+        if exec.downcast_to_file_source::<ParquetSource>().is_some() {
+            let predicates = filters
+                .iter()
+                .map(|filter| Arc::clone(&filter.filter))
+                .collect();
+            let pushed = exec
+                .data_source()
+                .try_pushdown_filters(predicates, self.options)?;
+            let Some(source) = pushed.updated_node else {
+                return try_create_scan_source(plan);
+            };
+            let filtered: Arc<dyn ExecutionPlan> =
+                Arc::new(exec.clone().with_data_source(source));
+            let lowered = try_create_scan_source(&filtered)?;
+            if lowered.is_some() {
+                for filter in &filters {
+                    filter.attached.set(true);
+                }
+            }
+            return Ok(lowered);
+        }
+        let Some(source) = try_create_scan_source(plan)? else {
+            return Ok(None);
+        };
+        for filter in &filters {
+            filter.attached.set(true);
+        }
+        let filters = filters.into_iter().map(|filter| filter.filter).collect();
+        Ok(Some(Arc::new(JoinFilteredScan::new(source, filters))))
     }
 
     /// Lower a window (a `WindowAggExec` or a `BoundedWindowAggExec`, with the
@@ -1454,6 +1581,549 @@ fn updating_filter(
         dynamic_filter.keys().to_vec(),
     ))?;
     Ok(Arc::new(updating))
+}
+
+/// The dynamic filter of a hash join routed to a scan below its probe side
+/// (see [`route_join_filters`]).
+#[derive(Debug)]
+struct JoinFilterRoute {
+    /// The filter that the join sets: of its probe keys that the scan
+    /// produces.
+    target: JoinFilterTarget,
+    /// The same filter, over the columns of the scan, that the scan is lowered
+    /// with.
+    scan_filter: ScanJoinFilter,
+}
+
+/// The dynamic filter of a hash join that a scan is lowered with (see
+/// [`Lowering::lower_scan`]).
+#[derive(Debug, Clone)]
+struct ScanJoinFilter {
+    /// The scan, a `DataSourceExec` of the plan.
+    scan: Arc<dyn ExecutionPlan>,
+    /// The filter, over the output columns of the scan.
+    filter: Arc<dyn PhysicalExpr>,
+    /// Whether the scan was lowered with the filter, which the join then sets.
+    attached: Rc<Cell<bool>>,
+}
+
+/// The scans below the probe side of `plan`, a hash join, that its dynamic
+/// filter is routed to, DuckDB's join filter pushdown: the scans whose output
+/// columns are probe keys of the join, unchanged (see [`scan_targets`]), each
+/// with a new dynamic filter of these keys (see
+/// [`JoinFilterTarget::filter_of`]), over its columns. The join prunes its
+/// probe rows that no build key matches, which the scans then skip:
+///
+/// * only joins that drop their probe rows without a match route filters:
+///   none that emits them (the side of an outer join whose rows must be
+///   kept), nor a null-aware one, whose probe rows count also if they do not
+///   match (their native joins publish no filters either);
+/// * only probe keys that are columns, whose filters cannot fail on any row
+///   of the scans;
+/// * a Parquet scan gets the filter unless it reads the dynamic filter of the
+///   join already (which DataFusion pushes into the scans that it reaches,
+///   with all the keys): it prunes its files, row groups and pages with it;
+/// * a scan of a memory table or of CSV files, which does not prune, gets
+///   the filter only if its rows reach the join through other joins,
+///   aggregations or sorts, whose work on the rows that the filter rejects it
+///   saves: the probe of the join right above it would reject them anyway;
+/// * no scan that occurs several times in the probe side (a node that the
+///   plan shares between several inputs), which might also be read through
+///   nodes that the filter cannot go through.
+fn route_join_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<JoinFilterRoute>> {
+    let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
+        return Ok(vec![]);
+    };
+    let keeps_unmatched_probe_rows = matches!(
+        join.join_type(),
+        JoinType::Right | JoinType::Full | JoinType::RightAnti | JoinType::RightMark
+    );
+    if join.null_aware || keeps_unmatched_probe_rows || join.fetch().is_some() {
+        return Ok(vec![]);
+    }
+    let probe = join.right();
+    let columns = join
+        .on()
+        .iter()
+        .map(|(_, probe_key)| probe_key.downcast_ref::<Column>().map(Column::index))
+        .collect();
+    let mut targets = vec![];
+    scan_targets(probe, columns, false, &mut targets);
+    let join_filters = plan
+        .dynamic_expressions_produced()
+        .iter()
+        .filter_map(|filter| filter.expression_id())
+        .collect::<Vec<_>>();
+    let probe_schema = probe.schema();
+    let mut routes = vec![];
+    for ScanTarget {
+        scan,
+        columns,
+        deep,
+    } in targets
+    {
+        let Some(exec) = scan.downcast_ref::<DataSourceExec>() else {
+            continue;
+        };
+        let useful = if exec.downcast_to_file_source::<ParquetSource>().is_some() {
+            !join_filters
+                .iter()
+                .any(|&filter| consumes_dynamic_filter(&scan, filter))
+        } else {
+            deep && (exec.data_source().is::<MemorySourceConfig>()
+                || exec.downcast_to_file_source::<CsvSource>().is_some())
+        };
+        if !useful || occurrences(probe, &scan) != 1 {
+            continue;
+        }
+        // The keys that the scan produces, with the same types.
+        let scan_schema = scan.schema();
+        let (keys, scan_columns): (Vec<usize>, Vec<Arc<dyn PhysicalExpr>>) = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(key, column)| {
+                let field = scan_schema.field(column.as_ref().copied()?);
+                let probe_key = &join.on()[key].1;
+                let same_type = probe_key
+                    .data_type(&probe_schema)
+                    .is_ok_and(|data_type| &data_type == field.data_type());
+                same_type.then(|| {
+                    let column = Column::new(field.name(), (*column)?);
+                    Some((key, Arc::new(column) as Arc<dyn PhysicalExpr>))
+                })?
+            })
+            .unzip();
+        if keys.is_empty() {
+            continue;
+        }
+        let filter = JoinFilterTarget::filter_of(join.on(), &keys)?;
+        let scan_filter = Arc::clone(&filter).with_new_children(scan_columns)?;
+        routes.push(JoinFilterRoute {
+            target: JoinFilterTarget::new(filter, keys),
+            scan_filter: ScanJoinFilter {
+                scan,
+                filter: scan_filter,
+                attached: Rc::new(Cell::new(false)),
+            },
+        });
+    }
+    Ok(routes)
+}
+
+/// How many times `node` occurs in the plan `plan`.
+fn occurrences(plan: &Arc<dyn ExecutionPlan>, node: &Arc<dyn ExecutionPlan>) -> usize {
+    usize::from(Arc::ptr_eq(plan, node))
+        + plan
+            .children()
+            .into_iter()
+            .map(|child| occurrences(child, node))
+            .sum::<usize>()
+}
+
+/// A scan below the probe side of a hash join whose output columns are probe
+/// keys of the join, unchanged (see [`scan_targets`]).
+#[derive(Debug)]
+struct ScanTarget {
+    /// The scan, a `DataSourceExec`.
+    scan: Arc<dyn ExecutionPlan>,
+    /// For every probe key of the join, the output column of the scan that
+    /// holds its values, if any.
+    columns: Vec<Option<usize>>,
+    /// Whether the rows of the scan reach the join through another join, an
+    /// aggregation or a sort.
+    deep: bool,
+}
+
+/// Add to `targets` the scans below `plan` (see [`ScanTarget`]) whose output
+/// columns hold the values of the output columns `columns` of `plan` (for
+/// every probe key of a hash join above, the column that holds its values,
+/// if any), unchanged, along a path on which removing the rows of the scan
+/// whose keys no build key of the join matches only removes rows of `plan`
+/// whose keys no build key matches (which the join drops anyway). `deep` is
+/// whether the rows of `plan` reach the join through other joins,
+/// aggregations or sorts.
+///
+/// The columns are followed through
+///
+/// * projections (of columns, not of other expressions), filters, the nodes
+///   that only distribute or coalesce rows, sorts, and unions (into all their
+///   inputs);
+/// * hash joins, nested loop joins and cross joins, into the input of each
+///   column whose rows the join emits only with their matches (see
+///   [`preserved_inputs`]: both inputs of inner and semi joins, the input of
+///   an outer join whose unmatched rows it emits, the output input of an
+///   anti or mark join, not the null side of an outer join), and from the
+///   key of an inner or semi hash join on one input to the key on the other
+///   input, which every pair of rows of the join shares (as DataFusion
+///   transfers filters, see `HashJoinExec::gather_filters_for_pushdown`);
+/// * aggregations, from the columns of their groups that are columns of
+///   their input in all their grouping sets: removing rows of a group
+///   removes the group, but changes no other group.
+///
+/// They are not followed through any other node, nor through nodes with a
+/// limit (whose rows other rows would replace), aggregations with a limit on
+/// their groups, windows (whose values are computed over other rows), or into
+/// scans with a limit.
+fn scan_targets(
+    plan: &Arc<dyn ExecutionPlan>,
+    columns: Vec<Option<usize>>,
+    deep: bool,
+    targets: &mut Vec<ScanTarget>,
+) {
+    if columns.iter().all(Option::is_none) || plan.fetch().is_some() {
+        return;
+    }
+    if plan.is::<DataSourceExec>() {
+        targets.push(ScanTarget {
+            scan: Arc::clone(plan),
+            columns,
+            deep,
+        });
+        return;
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let input_columns = columns
+            .iter()
+            .map(|column| {
+                let expr = &projection.expr().get((*column)?)?.expr;
+                expr.downcast_ref::<Column>().map(Column::index)
+            })
+            .collect();
+        return scan_targets(projection.input(), input_columns, deep, targets);
+    }
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        let input_columns = match filter.projection() {
+            Some(projection) => columns
+                .iter()
+                .map(|column| projection.get((*column)?).copied())
+                .collect(),
+            None => columns,
+        };
+        return scan_targets(filter.input(), input_columns, deep, targets);
+    }
+    let passes_rows_on = plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || is_coalesce_batches(plan);
+    let sorts = plan.is::<SortExec>() || plan.is::<SortPreservingMergeExec>();
+    if passes_rows_on || sorts {
+        if let [input] = plan.children().as_slice() {
+            scan_targets(input, columns, deep || sorts, targets);
+        }
+        return;
+    }
+    if plan.is::<UnionExec>() || plan.is::<InterleaveExec>() {
+        for input in plan.children() {
+            scan_targets(input, columns.clone(), deep, targets);
+        }
+        return;
+    }
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+        if aggregate.limit_options().is_some() {
+            return;
+        }
+        let group_by = aggregate.group_expr();
+        let input_columns = columns
+            .iter()
+            .map(|column| {
+                let column = (*column)?;
+                let (expr, _) = group_by.expr().get(column)?;
+                let in_all_sets = group_by
+                    .groups()
+                    .iter()
+                    .all(|nulls| !nulls.get(column).copied().unwrap_or(true));
+                in_all_sets
+                    .then(|| expr.downcast_ref::<Column>().map(Column::index))
+                    .flatten()
+            })
+            .collect();
+        return scan_targets(aggregate.input(), input_columns, true, targets);
+    }
+    let (join_type, projection, on) =
+        if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+            (*join.join_type(), join.projection.as_deref(), join.on())
+        } else if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
+            (*join.join_type(), join.projection().as_deref(), &[][..])
+        } else if plan.is::<CrossJoinExec>() {
+            (JoinType::Inner, None, &[][..])
+        } else {
+            return;
+        };
+    let [left, right] = plan.children()[..] else {
+        return;
+    };
+    let (_, column_indices) =
+        build_join_schema(&left.schema(), &right.schema(), &join_type);
+    let (left_preserved, right_preserved) = preserved_inputs(join_type);
+    let transfers = matches!(
+        join_type,
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
+    );
+    let mut left_columns = vec![None; columns.len()];
+    let mut right_columns = vec![None; columns.len()];
+    for (key, column) in columns.iter().enumerate() {
+        let Some(column) = *column else {
+            continue;
+        };
+        let column =
+            projection.map_or(Some(column), |projection| projection.get(column).copied());
+        let Some(ColumnIndex { index, side }) =
+            column.and_then(|column| column_indices.get(column))
+        else {
+            continue;
+        };
+        let (preserved, own, other) = match side {
+            JoinSide::Left => (left_preserved, &mut left_columns, &mut right_columns),
+            JoinSide::Right => (right_preserved, &mut right_columns, &mut left_columns),
+            JoinSide::None => continue,
+        };
+        if preserved {
+            own[key] = Some(*index);
+        }
+        // The key on the other input, which every row of the join shares.
+        if transfers {
+            other[key] = on.iter().find_map(|(left_key, right_key)| {
+                let (own_key, other_key) = match side {
+                    JoinSide::Left => (left_key, right_key),
+                    _ => (right_key, left_key),
+                };
+                own_key
+                    .downcast_ref::<Column>()
+                    .filter(|own_key| own_key.index() == *index)?;
+                other_key.downcast_ref::<Column>().map(Column::index)
+            });
+        }
+    }
+    scan_targets(left, left_columns, true, targets);
+    scan_targets(right, right_columns, true, targets);
+}
+
+/// Whether removing the rows of the left and of the right input of a join of
+/// type `join_type` whose keys no build key of a hash join above matches only
+/// removes rows of the join whose keys no build key matches: whether the join
+/// emits the rows of the input only with their matches, or alone (both inputs
+/// of inner and semi joins, the inputs of outer joins whose unmatched rows
+/// they emit, the output inputs of anti and mark joins). Not the null side of
+/// an outer join, which other rows would be emitted without (with nulls in its
+/// columns). DataFusion's `lr_is_preserved` of hash joins.
+fn preserved_inputs(join_type: JoinType) -> (bool, bool) {
+    match join_type {
+        JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi => (true, true),
+        JoinType::Left | JoinType::LeftAnti | JoinType::LeftMark => (true, false),
+        JoinType::Right | JoinType::RightAnti | JoinType::RightMark => (false, true),
+        JoinType::Full => (false, false),
+    }
+}
+
+/// The rows that a [`JoinFilteredScan`] evaluates a filter on before it
+/// decides whether to keep it: 32 chunks.
+const JOIN_FILTER_SAMPLE_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
+
+/// A [`JoinFilteredScan`] keeps evaluating a filter that rejects at least one
+/// in this many of the rows it sampled.
+const JOIN_FILTER_MIN_REJECTED: usize = 8;
+
+/// A native scan of a memory table or of CSV files whose chunks are filtered
+/// with the dynamic filters of hash joins above it, which the planner routed
+/// to it (see [`Lowering::try_lower_hash_join`]), as DuckDB applies its join
+/// filters in its table scans. The rows of the scan reach the joins through
+/// other joins, aggregations or sorts: the rows that a filter rejects (which
+/// no build key of its join matches) are not joined, aggregated or sorted
+/// before the join drops them.
+///
+/// A filter is evaluated on the logical rows of every chunk, and the chunk
+/// gets a selection of the rows that every filter accepts (a `NULL` rejects a
+/// row). As DuckDB's selectivity-optional filters, the scan stops evaluating
+/// a filter that rejects fewer than one in [`JOIN_FILTER_MIN_REJECTED`] of the
+/// first [`JOIN_FILTER_SAMPLE_ROWS`] rows that it evaluated it on, on all
+/// threads: then it would cost more than the work it saves (e.g. the lookup
+/// in the hash table of a join whose build side has nearly all the keys).
+/// Which rows a filter rejects is not part of the result.
+///
+/// It has the name of the scan, and describes the filters after it.
+#[derive(Debug)]
+struct JoinFilteredScan {
+    scan: Arc<dyn PhysicalOperator>,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+}
+
+impl JoinFilteredScan {
+    fn new(scan: Arc<dyn PhysicalOperator>, filters: Vec<Arc<dyn PhysicalExpr>>) -> Self {
+        Self { scan, filters }
+    }
+
+    /// The chunk of the rows of `chunk` that every filter that `state` keeps
+    /// accepts.
+    fn filter(
+        &self,
+        chunk: DataChunk,
+        state: &JoinFilteredScanState,
+    ) -> Result<DataChunk> {
+        let mut batch = None;
+        let mut selected: Option<arrow::array::BooleanArray> = None;
+        for (filter, selectivity) in self.filters.iter().zip(&state.selectivities) {
+            if !selectivity.is_evaluated() {
+                continue;
+            }
+            let batch = match &batch {
+                Some(batch) => batch,
+                None => batch.insert(chunk.compact()?),
+            };
+            let accepted = filter.evaluate(batch)?.into_array(batch.num_rows())?;
+            // A `NULL` rejects its row.
+            let accepted = as_boolean_array(&accepted)?;
+            let accepted = match accepted.nulls() {
+                Some(_) => prep_null_mask_filter(accepted),
+                None => accepted.clone(),
+            };
+            selectivity.record(batch.num_rows(), accepted.true_count());
+            selected = Some(match selected {
+                Some(selected) => and(&selected, &accepted)?,
+                None => accepted,
+            });
+        }
+        let (Some(batch), Some(selected)) = (batch, selected) else {
+            return Ok(chunk);
+        };
+        match selected.true_count() {
+            rows if rows == batch.num_rows() => Ok(chunk),
+            0 => Ok(DataChunk::empty(Arc::clone(chunk.schema()))),
+            _ => DataChunk::from_record_batch(batch)
+                .with_selection(SelectionVector::from_boolean_mask(&selected)),
+        }
+    }
+}
+
+/// The global state of a [`JoinFilteredScan`].
+struct JoinFilteredScanState {
+    scan: Arc<dyn GlobalSourceState>,
+    /// For every filter, whether it is evaluated.
+    selectivities: Vec<FilterSelectivity>,
+}
+
+impl GlobalSourceState for JoinFilteredScanState {
+    fn max_threads(&self) -> usize {
+        self.scan.max_threads()
+    }
+}
+
+/// How many of the rows that a [`JoinFilteredScan`] sampled a filter on it
+/// rejected, and whether the scan keeps evaluating it.
+#[derive(Debug, Default)]
+struct FilterSelectivity {
+    rows: AtomicUsize,
+    rejected: AtomicUsize,
+    /// [`Self::SAMPLING`], [`Self::KEPT`] or [`Self::DROPPED`].
+    decision: AtomicU8,
+}
+
+impl FilterSelectivity {
+    const SAMPLING: u8 = 0;
+    const KEPT: u8 = 1;
+    const DROPPED: u8 = 2;
+
+    fn is_evaluated(&self) -> bool {
+        self.decision.load(AtomicOrdering::Relaxed) != Self::DROPPED
+    }
+
+    /// Record that the filter accepted `accepted` of `rows` rows, and decide
+    /// whether to keep it once it was evaluated on enough rows.
+    fn record(&self, rows: usize, accepted: usize) {
+        if self.decision.load(AtomicOrdering::Relaxed) != Self::SAMPLING {
+            return;
+        }
+        let rejected = rows - accepted;
+        let rejected =
+            self.rejected.fetch_add(rejected, AtomicOrdering::Relaxed) + rejected;
+        let rows = self.rows.fetch_add(rows, AtomicOrdering::Relaxed) + rows;
+        if rows >= JOIN_FILTER_SAMPLE_ROWS {
+            let decision = if rejected * JOIN_FILTER_MIN_REJECTED >= rows {
+                Self::KEPT
+            } else {
+                Self::DROPPED
+            };
+            let _ = self.decision.compare_exchange(
+                Self::SAMPLING,
+                decision,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+}
+
+impl PhysicalOperator for JoinFilteredScan {
+    fn name(&self) -> &str {
+        self.scan.name()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.scan.schema()
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &[]
+    }
+
+    fn description(&self) -> String {
+        let filters = self
+            .filters
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        format!(
+            "{}, join_filters=[{}]",
+            self.scan.description(),
+            filters.join(", ")
+        )
+    }
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn parallel_source(&self) -> bool {
+        self.scan.parallel_source()
+    }
+
+    fn get_global_source_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSourceState>> {
+        Ok(Arc::new(JoinFilteredScanState {
+            scan: self.scan.get_global_source_state(ctx)?,
+            selectivities: self
+                .filters
+                .iter()
+                .map(|_| FilterSelectivity::default())
+                .collect(),
+        }))
+    }
+
+    fn get_local_source_state(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        let gstate =
+            downcast_state::<JoinFilteredScanState>(gstate.as_any(), self.name())?;
+        self.scan.get_local_source_state(ctx, gstate.scan.as_ref())
+    }
+
+    fn get_data(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+        lstate: &mut dyn LocalSourceState,
+    ) -> Result<SourceResult> {
+        let gstate =
+            downcast_state::<JoinFilteredScanState>(gstate.as_any(), self.name())?;
+        match self.scan.get_data(ctx, gstate.scan.as_ref(), lstate)? {
+            SourceResult::Chunk(chunk) if !chunk.is_empty() => {
+                Ok(SourceResult::Chunk(self.filter(chunk, gstate)?))
+            }
+            result => Ok(result),
+        }
+    }
 }
 
 /// The native operator of an uncorrelated scalar subquery (DataFusion's
@@ -7671,6 +8341,528 @@ mod tpch {
         // and aggregations, which the native operators would evaluate in
         // parallel on several threads (e.g. the `SUM` of Q6).
         assert!(native.contains(&13), "Q13 is not native: {native:?}");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod join_filters {
+    //! The routing of the dynamic filters of native hash joins to the scans
+    //! below their probe sides (see `Lowering::try_lower_hash_join`).
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::bridge::bridged_plans;
+    use crate::explain::format_operator_tree;
+    use crate::sources::test_harness::write_parquet;
+    use crate::test_utils::{
+        EngineOutput, compare_outputs, datafusion_context, run_engines,
+        test_session_config,
+    };
+    use arrow::array::RecordBatch;
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::SchemaRef;
+    use datafusion::datasource::MemTable;
+    use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+    use datafusion_common::Result;
+
+    /// The SQL that generates the tables of the TPC-H queries of the tests,
+    /// and the column that the rows of a table are sorted by in its Parquet
+    /// file: 25 nations of 5 regions, 1,000 suppliers (40 of every nation),
+    /// 2,000 customers (80 of every nation), 500 parts (50 of them green), 4
+    /// suppliers of every part (of 4 nations), 6,000 orders of 1992 to 1998, 4
+    /// lines of every order (of the suppliers of their parts).
+    const TABLES: &[(&str, &str, &str)] = &[
+        (
+            "region",
+            "SELECT * FROM (VALUES (0, 'AFRICA'), (1, 'AMERICA'), (2, 'ASIA'), \
+             (3, 'EUROPE'), (4, 'MIDDLE EAST')) AS r(r_regionkey, r_name)",
+            "r_regionkey",
+        ),
+        (
+            "nation",
+            "SELECT * FROM (VALUES (0, 'ALGERIA', 0), (1, 'ARGENTINA', 1), \
+             (2, 'BRAZIL', 1), (3, 'CANADA', 1), (4, 'EGYPT', 4), (5, 'ETHIOPIA', 0), \
+             (6, 'FRANCE', 3), (7, 'GERMANY', 3), (8, 'INDIA', 2), (9, 'INDONESIA', 2), \
+             (10, 'IRAN', 4), (11, 'IRAQ', 4), (12, 'JAPAN', 2), (13, 'JORDAN', 4), \
+             (14, 'KENYA', 0), (15, 'MOROCCO', 0), (16, 'MOZAMBIQUE', 0), (17, 'PERU', 1), \
+             (18, 'CHINA', 2), (19, 'ROMANIA', 3), (20, 'SAUDI ARABIA', 4), \
+             (21, 'VIETNAM', 2), (22, 'RUSSIA', 3), (23, 'UNITED KINGDOM', 3), \
+             (24, 'UNITED STATES', 1)) AS n(n_nationkey, n_name, n_regionkey)",
+            "n_regionkey",
+        ),
+        (
+            "supplier",
+            "SELECT value AS s_suppkey, 'Supplier#' || CAST(value AS VARCHAR) AS s_name, \
+             (value - 1) / 40 AS s_nationkey FROM generate_series(1, 1000)",
+            "s_nationkey",
+        ),
+        (
+            "customer",
+            "SELECT value AS c_custkey, 'Customer#' || CAST(value AS VARCHAR) AS c_name, \
+             (value - 1) / 80 AS c_nationkey FROM generate_series(1, 2000)",
+            "c_nationkey",
+        ),
+        (
+            "part",
+            "SELECT value AS p_partkey, CASE WHEN value % 10 = 0 THEN 'forest green ' \
+             ELSE 'navy chiffon ' END || CAST(value AS VARCHAR) AS p_name \
+             FROM generate_series(1, 500)",
+            "p_partkey",
+        ),
+        (
+            "partsupp",
+            "SELECT p.value AS ps_partkey, (p.value + s.value * 251) % 1000 + 1 AS ps_suppkey, \
+             CAST((p.value * 7 + s.value) % 100 + 1 AS DECIMAL(15, 2)) AS ps_supplycost \
+             FROM generate_series(1, 500) AS p CROSS JOIN generate_series(0, 3) AS s",
+            "ps_suppkey",
+        ),
+        (
+            "orders",
+            "SELECT value AS o_orderkey, value * 7 % 2000 + 1 AS o_custkey, \
+             arrow_cast(CAST(8035 + value * 13 % 2405 AS INT), 'Date32') AS o_orderdate, \
+             CASE value % 3 WHEN 0 THEN 'F' WHEN 1 THEN 'O' ELSE 'P' END AS o_orderstatus \
+             FROM generate_series(1, 6000)",
+            "o_orderkey",
+        ),
+        (
+            "lineitem",
+            "WITH lines AS (SELECT o.value AS o, l.value AS l, \
+               (o.value * 13 + l.value * 7) % 500 + 1 AS partkey, \
+               8035 + o.value * 13 % 2405 AS orderdate \
+               FROM generate_series(1, 6000) AS o CROSS JOIN generate_series(1, 4) AS l) \
+             SELECT o AS l_orderkey, partkey AS l_partkey, \
+             (partkey + (o + l) % 4 * 251) % 1000 + 1 AS l_suppkey, \
+             CAST(1 + (o + l) % 50 AS DECIMAL(15, 2)) AS l_quantity, \
+             CAST(100 + (o * 7 + l) % 900 AS DECIMAL(15, 2)) AS l_extendedprice, \
+             CAST((o + l) % 11 / 100.0 AS DECIMAL(15, 2)) AS l_discount, \
+             arrow_cast(CAST(orderdate + 1 + (o + l * 7) % 121 AS INT), 'Date32') \
+               AS l_shipdate, \
+             arrow_cast(CAST(orderdate + 30 + (o * 3 + l) % 61 AS INT), 'Date32') \
+               AS l_commitdate, \
+             arrow_cast(CAST(orderdate + 2 + (o + l * 7) % 121 + (o + l) % 30 AS INT), \
+               'Date32') AS l_receiptdate \
+             FROM lines",
+            "l_suppkey",
+        ),
+    ];
+
+    /// A generated table: its name, schema, rows, and the column that its
+    /// Parquet file is sorted by.
+    struct Table {
+        name: &'static str,
+        schema: SchemaRef,
+        batch: RecordBatch,
+        sort_column: &'static str,
+    }
+
+    /// The tables of [`TABLES`].
+    async fn tables() -> Result<Vec<Table>> {
+        let ctx = datafusion_context(test_session_config());
+        let mut tables = vec![];
+        for &(name, sql, sort_column) in TABLES {
+            let df = ctx.sql(sql).await?;
+            let schema = Arc::clone(df.schema().inner());
+            let batch = concat_batches(&schema, &df.collect().await?)?;
+            tables.push(Table {
+                name,
+                schema,
+                batch,
+                sort_column,
+            });
+        }
+        Ok(tables)
+    }
+
+    /// Register `tables` in `ctx` as memory tables of 3 partitions.
+    fn register_memtables(ctx: &SessionContext, tables: &[Table]) -> Result<()> {
+        for table in tables {
+            let rows = table.batch.num_rows();
+            let partitions = vec![
+                vec![table.batch.slice(0, rows / 2)],
+                vec![table.batch.slice(rows / 2, rows / 8)],
+                vec![
+                    table
+                        .batch
+                        .slice(rows / 2 + rows / 8, rows - rows / 2 - rows / 8),
+                ],
+            ];
+            let memtable = MemTable::try_new(Arc::clone(&table.schema), partitions)?;
+            ctx.register_table(table.name, Arc::new(memtable))?;
+        }
+        Ok(())
+    }
+
+    /// Write `tables` to Parquet files in `dir`, one per table, sorted by
+    /// their sort columns, in row groups of `row_group_rows` rows.
+    async fn write_parquet_tables(
+        dir: &Path,
+        tables: &[Table],
+        row_group_rows: usize,
+    ) -> Result<()> {
+        let ctx = datafusion_context(test_session_config());
+        for table in tables {
+            ctx.register_batch(table.name, table.batch.clone())?;
+            let sql = format!(
+                "SELECT * FROM {} ORDER BY {}",
+                table.name, table.sort_column
+            );
+            let sorted = ctx.sql(&sql).await?.collect().await?;
+            let properties = ::parquet::file::properties::WriterProperties::builder()
+                .set_max_row_group_row_count(Some(row_group_rows))
+                .build();
+            let path = dir.join(table.name).join("part-0.parquet");
+            write_parquet(&path, Arc::clone(&table.schema), &sorted, Some(properties))?;
+        }
+        Ok(())
+    }
+
+    /// Register the Parquet tables of `dir` (see [`write_parquet_tables`]).
+    async fn register_parquet_tables(ctx: &SessionContext, dir: &Path) -> Result<()> {
+        for &(name, _, _) in TABLES {
+            let path = dir.join(name);
+            ctx.register_parquet(
+                name,
+                path.to_str().expect("a path"),
+                ParquetReadOptions::default(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The TPC-H query `q{number}.sql` of `benchmarks/queries`.
+    fn query(number: usize) -> String {
+        let path = format!(
+            "{}/../../benchmarks/queries/q{number}.sql",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    /// Run `sql` on both engines (with `config`, over the tables of `setup`),
+    /// and assert that their results are the same.
+    async fn assert_same_results<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> (EngineOutput, Arc<dyn PhysicalOperator>)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let (expected, actual) = run_engines(sql, config, setup)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let root = Arc::clone(
+            actual
+                .plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator(),
+        );
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("{sql}: {message}\n{}", format_operator_tree(&root));
+        }
+        assert!(bridged_plans(&root).is_empty(), "{sql}");
+        (actual, root)
+    }
+
+    /// A native scan of an execution of the pipeline engine.
+    #[derive(Debug)]
+    struct Scan {
+        /// The names of its columns.
+        columns: Vec<String>,
+        /// The rows it produced.
+        rows: usize,
+        /// The dynamic filters of joins that it filters its chunks with (if it
+        /// is a [`JoinFilteredScan`]).
+        filtered_with: Vec<String>,
+        /// The dynamic filters that it reads in its predicate (of a Parquet
+        /// scan) that the planner routed to it: not those of the plan.
+        routed: Vec<String>,
+        /// The row groups that it pruned by their statistics, of all row
+        /// groups (of a Parquet scan).
+        pruned_row_groups: (usize, usize),
+    }
+
+    impl Scan {
+        fn has_column(&self, column: &str) -> bool {
+            self.columns.iter().any(|name| name == column)
+        }
+    }
+
+    /// The dynamic filters that the expressions `exprs` read, by expression
+    /// id.
+    fn dynamic_filters_in<'a>(
+        exprs: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>>,
+    ) -> Vec<(u64, String)> {
+        let mut filters = vec![];
+        for expr in exprs {
+            let _ = expr.apply(|expr| {
+                if expr.is::<DynamicFilterPhysicalExpr>()
+                    && let Some(id) = expr.expression_id()
+                {
+                    filters.push((id, expr.to_string()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+        }
+        filters
+    }
+
+    /// The native scans of `output`, an execution of the pipeline engine (in
+    /// the order of the operator tree).
+    fn scans(output: &EngineOutput) -> Vec<Scan> {
+        let exec = output
+            .plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        let metrics = exec.execution_metrics().expect("an execution");
+        // The dynamic filters that the scans of the plan read.
+        let mut planned = vec![];
+        let _ = exec.input().apply(|node| {
+            if node.is::<DataSourceExec>() {
+                let _ = node.apply_expressions(&mut |expr| {
+                    planned
+                        .extend(dynamic_filters_in([expr]).into_iter().map(|(id, _)| id));
+                    Ok(TreeNodeRecursion::Continue)
+                });
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        let mut scans = vec![];
+        let mut operators = vec![Arc::clone(exec.operator())];
+        while let Some(operator) = operators.pop() {
+            operators.extend(operator.children().iter().rev().cloned());
+            if !operator.is_source() || !operator.children().is_empty() {
+                continue;
+            }
+            let rows = metrics
+                .get(operator.as_ref())
+                .map_or(0, |metrics| metrics.output_rows());
+            let filtered_with = operator
+                .downcast_ref::<JoinFilteredScan>()
+                .map(|scan| scan.filters.iter().map(ToString::to_string).collect())
+                .unwrap_or_default();
+            let (routed, pruned_row_groups) =
+                match operator.downcast_ref::<crate::sources::ParquetScanSource>() {
+                    Some(scan) => {
+                        use datafusion_datasource::source::DataSource;
+                        use datafusion_physical_plan::metrics::MetricValue;
+                        let predicate = scan.config().file_source().filter();
+                        let routed = dynamic_filters_in(predicate.as_ref())
+                            .into_iter()
+                            .filter(|(id, _)| !planned.contains(id))
+                            .map(|(_, filter)| filter)
+                            .collect();
+                        let pruned = match scan
+                            .config()
+                            .metrics()
+                            .clone_inner()
+                            .sum_by_name("row_groups_pruned_statistics")
+                        {
+                            Some(MetricValue::PruningMetrics {
+                                pruning_metrics, ..
+                            }) => (
+                                pruning_metrics.pruned(),
+                                pruning_metrics.pruned() + pruning_metrics.matched(),
+                            ),
+                            _ => (0, 0),
+                        };
+                        (routed, pruned)
+                    }
+                    None => (vec![], (0, 0)),
+                };
+            scans.push(Scan {
+                columns: operator
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+                rows,
+                filtered_with,
+                routed,
+                pruned_row_groups,
+            });
+        }
+        scans
+    }
+
+    /// The scan of `scans` with the column `column`.
+    fn scan_of<'a>(scans: &'a [Scan], column: &str, sql: &str) -> &'a Scan {
+        let mut found = scans.iter().filter(|scan| scan.has_column(column));
+        match (found.next(), found.next()) {
+            (Some(scan), None) => scan,
+            _ => panic!("not a single scan of {column} in {scans:#?}\n{sql}"),
+        }
+    }
+
+    /// TPC-H Q9 of the profits of the suppliers of one nation.
+    fn q9_of_germany() -> String {
+        let sql = query(9);
+        let restricted = sql.replace(
+            "p_name like '%green%'",
+            "p_name like '%green%' and n_name = 'GERMANY'",
+        );
+        assert_ne!(sql, restricted);
+        restricted
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deep_scans_of_tpch_join_chains_skip_the_rows_that_cannot_match() -> Result<()>
+    {
+        // TPC-H Q5, Q7, Q9 (of the suppliers of one nation) and Q21 over memory
+        // tables, whose plans join the scans of the dimensions with the nations
+        // of the queries several joins below the joins with these nations: the
+        // filters of the joins with the nations (and with the suppliers of
+        // these nations) are routed to the scans of these dimensions, which
+        // produce the rows of the nations of the queries only, and the results
+        // are those of DataFusion (which pushes no dynamic filters into memory
+        // tables):
+        //
+        // * Q5 (`r_name = 'ASIA'`, of the nations 8, 9, 12, 18 and 21): the
+        //   join with the region filters the scan of `nation` (on the probe
+        //   side of the join with `supplier`); its join with the nations
+        //   filters the scan of `supplier`, two joins below, and, through the
+        //   key `s_nationkey = c_nationkey` of the join of `supplier` with the
+        //   join of `customer`, `orders` and `lineitem`, the scan of
+        //   `customer`, three joins below: of 5 of the 25 nations, of their 200
+        //   suppliers of 1,000, of their 400 customers of 2,000;
+        // * Q7 (`FRANCE` and `GERMANY`): the scan of `supplier`, on the build
+        //   side of its join with `lineitem`, on the build side of the join with
+        //   `orders`, on the build side of the join with `customer`, on the
+        //   build side of the join with the nations: their 80 suppliers;
+        // * Q9 of `GERMANY`: the scan of `supplier`, on the probe side of its
+        //   join with `part` and `lineitem`, three joins below: its 40
+        //   suppliers;
+        // * Q21 (`SAUDI ARABIA`): the scan of `supplier` on the build side of
+        //   its join with `lineitem`, on the build side of the join with
+        //   `orders`, on the probe side of the join with the nation: its 40
+        //   suppliers.
+        let tables = tables().await?;
+        let setup = async |ctx: &SessionContext| register_memtables(ctx, &tables);
+        for (sql, expected) in [
+            (
+                query(5),
+                &[("n_nationkey", 5), ("s_suppkey", 200), ("c_custkey", 400)][..],
+            ),
+            (query(7), &[("s_suppkey", 80)][..]),
+            (q9_of_germany(), &[("s_suppkey", 40)][..]),
+            (query(21), &[("s_suppkey", 40)][..]),
+        ] {
+            let (actual, _) =
+                assert_same_results(&sql, test_session_config(), setup).await;
+            assert!(!actual.batches.is_empty(), "{sql}");
+            let scans = scans(&actual);
+            for &(column, rows) in expected {
+                let scan = scan_of(&scans, column, &sql);
+                assert_eq!(scan.filtered_with.len(), 1, "{scan:?}\n{sql}");
+                assert_eq!(scan.rows, rows, "{scan:?}\n{sql}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deep_scans_of_tpch_join_chains_prune_their_row_groups() -> Result<()> {
+        // The same queries over Parquet files sorted by the nations (and
+        // `lineitem` by its suppliers), in row groups of 40 rows, so that the
+        // scans prune the row groups of the other nations and suppliers by
+        // their statistics.
+        //
+        // * Q5, with `pushdown_filters`: the scan of `nation` filters its rows
+        //   with the filter of the join with the region, so that the join of
+        //   the nations filters `supplier` (20 of its 25 row groups pruned) and
+        //   `customer` (40 of 50, through the key of the join of `supplier`).
+        //   The keys of the join of `supplier` with the join of `customer`,
+        //   `orders` and `lineitem`, `l_suppkey = s_suppkey AND c_nationkey =
+        //   s_nationkey`, are columns of two inputs of the joins below:
+        //   DataFusion pushes its filter nowhere, while the planner routes the
+        //   filter of `l_suppkey` to the scan of `lineitem` (the bounds of the
+        //   200 suppliers of the nations of Asia, 321 to 880, so that it prunes
+        //   the 265 row groups of the other suppliers of 600), and the filter
+        //   of `c_nationkey` to the scan of `customer`;
+        // * Q7, Q9 of `GERMANY` and Q21: the scan of `supplier` prunes the row
+        //   groups of the other nations, and the scan of `lineitem` those of
+        //   the other suppliers, with the filters that DataFusion pushes into
+        //   them (through the joins below the joins with the nations), which the
+        //   native joins set, and which the planner does not route again. In
+        //   Q9, the filter of the keys `ps_suppkey = l_suppkey AND ps_partkey =
+        //   l_partkey` of the join of `partsupp`, which DataFusion pushes into
+        //   `lineitem`, is routed to `supplier` and `part` too, by one key
+        //   each, through the keys `s_suppkey = l_suppkey` and `p_partkey =
+        //   l_partkey` of their joins with `lineitem` (it prunes nothing:
+        //   `partsupp` has all suppliers and parts).
+        let tables = tables().await?;
+        let dir = tempfile::tempdir()?;
+        write_parquet_tables(dir.path(), &tables, 40).await?;
+        let setup =
+            async |ctx: &SessionContext| register_parquet_tables(ctx, dir.path()).await;
+        for (sql, pushdown, pruned, routed) in [
+            (
+                query(5),
+                true,
+                &[
+                    ("s_suppkey", 20, 25),
+                    ("c_custkey", 40, 50),
+                    ("l_orderkey", 265, 600),
+                ][..],
+                &[
+                    ("c_custkey", "c_nationkey@2 >= 8 AND c_nationkey@2 <= 21"),
+                    ("l_orderkey", "l_suppkey@2 >= 321 AND l_suppkey@2 <= 880"),
+                ][..],
+            ),
+            (
+                query(7),
+                false,
+                &[("s_suppkey", 23, 25), ("l_orderkey", 550, 600)][..],
+                &[][..],
+            ),
+            (
+                q9_of_germany(),
+                false,
+                &[("s_suppkey", 24, 25), ("l_orderkey", 575, 600)][..],
+                &[
+                    ("s_suppkey", "s_suppkey@0 >= 1 AND s_suppkey@0 <= 1000"),
+                    ("p_partkey", "p_partkey@0 >= 1 AND p_partkey@0 <= 500"),
+                ][..],
+            ),
+            (query(21), false, &[("s_name", 24, 25)][..], &[][..]),
+        ] {
+            let mut config = test_session_config();
+            config.options_mut().execution.parquet.pushdown_filters = pushdown;
+            let (actual, _) = assert_same_results(&sql, config, setup).await;
+            let scans = scans(&actual);
+            for &(column, pruned, row_groups) in pruned {
+                let scan = scan_of(&scans, column, &sql);
+                assert_eq!(
+                    scan.pruned_row_groups,
+                    (pruned, row_groups),
+                    "{scan:?}\n{sql}"
+                );
+            }
+            let mut expected = routed
+                .iter()
+                .map(|(column, filter)| {
+                    let scan = scan_of(&scans, column, &sql);
+                    (scan.columns.clone(), format!("DynamicFilter [ {filter} ]"))
+                })
+                .collect::<Vec<_>>();
+            let mut routed = scans
+                .iter()
+                .flat_map(|scan| {
+                    scan.routed
+                        .iter()
+                        .map(|filter| (scan.columns.clone(), filter.clone()))
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            routed.sort();
+            assert_eq!(routed, expected, "{sql}");
+        }
         Ok(())
     }
 }
