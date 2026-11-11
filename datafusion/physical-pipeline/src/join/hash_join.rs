@@ -54,7 +54,10 @@
 //!   aggregation whose accumulators fail to be created), unless creating
 //!   them cannot fail (e.g. of scans of memory, or of local files in a
 //!   runtime with the local file system, see
-//!   [`PhysicalHashJoin::create_probe_streams`]).
+//!   [`PhysicalHashJoin::create_probe_streams`]). Like
+//!   `HashJoinExec::execute`, it creates the streams of its build input
+//!   before (if that may fail too), and before its build side is read, so
+//!   that the same error comes first.
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
 //!   table concurrently: neither side is shuffled
@@ -194,6 +197,7 @@ use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::streaming::StreamingTableExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, Partitioning, displayable,
@@ -235,8 +239,16 @@ pub struct PhysicalHashJoin {
     /// the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
     /// When creating the streams of `probe_plan` can fail (see
-    /// [`probe_stream_failures`]): the join creates none where it cannot.
-    probe_stream_failures: ProbeStreamFailures,
+    /// [`stream_failures`]): the join creates none where it cannot.
+    probe_stream_failures: StreamFailures,
+    /// The build input of the `HashJoinExec` the join was lowered from, whose
+    /// streams `HashJoinExec::execute` creates before the streams of its
+    /// probe input, and its partition mode: the join creates them first too,
+    /// if creating them can fail and the probe streams are created (see
+    /// [`Self::create_probe_streams`]), so that their errors come first.
+    build_plan: Option<(Arc<dyn ExecutionPlan>, PartitionMode)>,
+    /// When creating the streams of `build_plan` can fail.
+    build_stream_failures: StreamFailures,
     /// The dynamic filters of the `HashJoinExec` the join was lowered from
     /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
     /// its probe side read: the join sets them to the bounds of its build keys
@@ -599,7 +611,9 @@ impl PhysicalHashJoin {
             children: vec![build, probe],
             spec,
             probe_plan: None,
-            probe_stream_failures: ProbeStreamFailures::Never,
+            probe_stream_failures: StreamFailures::Never,
+            build_plan: None,
+            build_stream_failures: StreamFailures::Never,
             dynamic_filters: vec![],
         })
     }
@@ -655,7 +669,11 @@ impl PhysicalHashJoin {
     ///   node that is not copied. `HashJoinExec::execute` creates the streams
     ///   of its probe input right away, which the native join does too, on
     ///   such a copy, to raise the same errors before it reads its probe
-    ///   side;
+    ///   side. And so for the build input of a join whose streams of both
+    ///   inputs may fail to be created (see `stream_failures`):
+    ///   `HashJoinExec::execute` creates the build streams first, whose errors
+    ///   then come first, so the native join creates them first too, on a
+    ///   copy;
     /// * a join whose probe keys can fail on some rows (conservatively, any
     ///   expression but columns, literals, comparisons, boolean operators,
     ///   wrapping arithmetic, divisions by constants other than 0 and -1, and
@@ -769,7 +787,19 @@ impl PhysicalHashJoin {
         if !executable
             || join.fetch().is_some()
             || has_prepared_build(plan)
-            || !probe_streams_can_be_replayed(join.right())
+            || !streams_can_be_replayed(join.right())
+        {
+            return Ok(None);
+        }
+        // `HashJoinExec::execute` creates the streams of its build input before
+        // those of its probe input: a native join that creates the probe
+        // streams (if that may fail) creates the build streams before, on a
+        // copy too, if that may fail, so that their errors come first.
+        let probe_stream_failures = stream_failures(join.right());
+        let build_stream_failures = stream_failures(join.left());
+        if probe_stream_failures != StreamFailures::Never
+            && build_stream_failures != StreamFailures::Never
+            && !streams_can_be_replayed(join.left())
         {
             return Ok(None);
         }
@@ -941,8 +971,10 @@ impl PhysicalHashJoin {
         Ok(Some(Self {
             children,
             spec,
-            probe_stream_failures: probe_stream_failures(join.right()),
+            probe_stream_failures,
             probe_plan: Some(Arc::clone(join.right())),
+            build_stream_failures,
+            build_plan: Some((Arc::clone(join.left()), *join.partition_mode())),
             dynamic_filters,
         }))
     }
@@ -955,37 +987,75 @@ impl PhysicalHashJoin {
     /// store that is not registered), nothing read.
     ///
     /// The streams are those of a copy of the probe input with its own state
-    /// (see `reset_plan_states`, and [`probe_streams_can_be_replayed`]):
+    /// (see `reset_plan_states`, and [`streams_can_be_replayed`]):
     /// creating them can start tasks that already read (e.g. those of a
     /// `CoalescePartitionsExec`), which must not take, for instance, the
     /// channels of a `RepartitionExec` of the probe input that the probe side
     /// still reads.
     ///
     /// The streams of probe inputs whose streams are created without failing
-    /// (see [`probe_stream_failures`]) are not created (nor is the input
+    /// (see [`stream_failures`]) are not created (nor is the input
     /// copied): e.g. of scans of memory, and of scans of local files if the
     /// local file system is registered in the runtime (which it is by
     /// default).
+    ///
+    /// `HashJoinExec::execute` creates the stream of its build input before
+    /// the stream of its probe input (once, of the single build partition, in
+    /// `PartitionMode::CollectLeft`; of the partition of the probe stream, in
+    /// `PartitionMode::Partitioned`), so that the errors of creating the build
+    /// streams come first (e.g. of an aggregation that fails to reserve the
+    /// memory of its accumulators): the join creates the streams of a copy of
+    /// its build input first, in the same order, if creating them may fail
+    /// (see [`PhysicalHashJoin::try_lower`], which leaves the join to
+    /// DataFusion if the build input cannot be copied then). All streams are
+    /// dropped once all are created, as the consumers of the partitions of the
+    /// join hold them (and the memory they reserve) meanwhile.
+    ///
+    /// Copying an input resets the dynamic filters that its joins produce (see
+    /// `HashJoinExec::reset_state`). The joins of the probe side publish theirs
+    /// only once the build side of this join is collected, after the copies
+    /// are made; a native join of the build side may publish its filter before
+    /// (its build pipelines do not wait for the copies), which then only
+    /// prunes fewer rows, which its probe side, of expressions that cannot
+    /// fail, reads and drops.
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
         };
-        let cannot_fail = match self.probe_stream_failures {
-            ProbeStreamFailures::Never => true,
-            ProbeStreamFailures::WithoutLocalFileSystem => ctx
+        let may_fail = |failures: StreamFailures| match failures {
+            StreamFailures::Never => false,
+            StreamFailures::WithoutLocalFileSystem => ctx
                 .task_ctx
                 .runtime_env()
                 .object_store(ObjectStoreUrl::local_filesystem())
-                .is_ok(),
-            ProbeStreamFailures::Possible => false,
+                .is_err(),
+            StreamFailures::Possible => true,
         };
-        if cannot_fail {
+        if !may_fail(self.probe_stream_failures) {
             return Ok(());
         }
+        let build = match &self.build_plan {
+            Some((build, mode)) if may_fail(self.build_stream_failures) => {
+                Some((reset_plan_states(Arc::clone(build))?, *mode))
+            }
+            _ => None,
+        };
         let probe = reset_plan_states(Arc::clone(probe))?;
+        let task_ctx = || Arc::clone(&ctx.task_ctx);
+        let mut streams = vec![];
         for partition in 0..probe.output_partitioning().partition_count() {
-            drop(probe.execute(partition, Arc::clone(&ctx.task_ctx))?);
+            match &build {
+                Some((build, PartitionMode::CollectLeft)) if partition == 0 => {
+                    streams.push(build.execute(0, task_ctx())?);
+                }
+                Some((build, PartitionMode::Partitioned)) => {
+                    streams.push(build.execute(partition, task_ctx())?);
+                }
+                _ => {}
+            }
+            streams.push(probe.execute(partition, task_ctx())?);
         }
+        drop(streams);
         Ok(())
     }
 
@@ -1821,7 +1891,7 @@ fn take_rows(array: &ArrayRef, indices: &UInt32Array) -> Result<ArrayRef> {
 /// (of files or memory, or of no rows), and all its other nodes are copied.
 /// Other leaves, e.g. a `StreamingTableExec`, whose partitions may open a
 /// file or take a channel when they are executed, are not replayed.
-fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
     fn replayed(plan: &Arc<dyn ExecutionPlan>, copy: &Arc<dyn ExecutionPlan>) -> bool {
         let (children, copies) = (plan.children(), copy.children());
         if children.is_empty() {
@@ -1843,13 +1913,14 @@ fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
     reset_plan_states(Arc::clone(plan)).is_ok_and(|copy| replayed(plan, &copy))
 }
 
-/// When creating the streams of the probe input of a `HashJoinExec` can fail
-/// (see [`probe_stream_failures`]), which decides whether a native join creates
-/// them (see [`PhysicalHashJoin::create_probe_streams`]), and whether it has a
-/// pipeline that creates them as soon as the execution starts (see
-/// [`ProbeStreamsInit`]).
+/// When creating the streams of an input of a `HashJoinExec` can fail (see
+/// [`stream_failures`]): of the probe input, which decides whether a native
+/// join creates them (see [`PhysicalHashJoin::create_probe_streams`]), and
+/// whether it has a pipeline that creates them as soon as the execution
+/// starts (see [`ProbeStreamsInit`]); and of the build input, which decides
+/// whether it creates the build streams before (whose errors come first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProbeStreamFailures {
+enum StreamFailures {
     /// Creating them cannot fail: the join creates none, and has no pipeline
     /// that would.
     Never,
@@ -1864,22 +1935,24 @@ enum ProbeStreamFailures {
     Possible,
 }
 
-/// When creating the streams of all partitions of `plan`, the probe input of a
+/// When creating the streams of all partitions of `plan`, an input of a
 /// `HashJoinExec`, can fail (so that a native join need not create them where
 /// they cannot, see [`PhysicalHashJoin::create_probe_streams`]):
 ///
-/// * [never](ProbeStreamFailures::Never) if its leaves are scans of memory,
-///   generators or no rows, and its other nodes create their streams without
-///   failing, but for failing to create the streams of their inputs:
-///   projections, filters, repartitionings, coalescings of partitions, hash
-///   joins (of valid partitionings, without a prepared build), nested loop and
-///   cross joins, sorts, merges, unions, limits and cooperative nodes;
+/// * [never](StreamFailures::Never) if its leaves are scans of memory,
+///   generators, streams (which create the streams of their partitions, see
+///   `PartitionStream::execute`, without failing) or no rows, and its other
+///   nodes create their streams without failing, but for failing to create
+///   the streams of their inputs: projections, filters, repartitionings,
+///   coalescings of partitions, hash joins (of valid partitionings, without a
+///   prepared build), nested loop and cross joins, sorts, merges, unions,
+///   limits and cooperative nodes;
 /// * [only without the local file
-///   system](ProbeStreamFailures::WithoutLocalFileSystem) if, in addition,
+///   system](StreamFailures::WithoutLocalFileSystem) if, in addition,
 ///   some of its leaves are Parquet (without virtual columns or decryption) or
 ///   CSV scans of the local file system, whose object store is registered by
 ///   default (unlike, e.g., the store of a scan of `s3://`, which may not be);
-/// * [possibly](ProbeStreamFailures::Possible) otherwise, e.g. for an
+/// * [possibly](StreamFailures::Possible) otherwise, e.g. for an
 ///   aggregation, which creates its accumulators, and reserves their memory,
 ///   when its streams are created: e.g. the accumulator of
 ///   `approx_percentile_cont` fails on a percentile outside of `[0, 1]`.
@@ -1889,7 +1962,7 @@ enum ProbeStreamFailures {
 /// starts the tasks that, e.g., coalesce partitions, which read until they are
 /// dropped: not creating them saves that work and the copy (and, if creating
 /// them can never fail, the pipeline that creates them).
-fn probe_stream_failures(plan: &Arc<dyn ExecutionPlan>) -> ProbeStreamFailures {
+fn stream_failures(plan: &Arc<dyn ExecutionPlan>) -> StreamFailures {
     let children = plan.children();
     if children.is_empty() {
         let source = plan
@@ -1898,16 +1971,17 @@ fn probe_stream_failures(plan: &Arc<dyn ExecutionPlan>) -> ProbeStreamFailures {
         return if plan.is::<EmptyExec>()
             || plan.is::<PlaceholderRowExec>()
             || plan.is::<LazyMemoryExec>()
+            || plan.is::<StreamingTableExec>()
             || source.is_some_and(|source| source.is::<MemorySourceConfig>())
         {
-            ProbeStreamFailures::Never
+            StreamFailures::Never
         } else if source
             .and_then(|source| source.downcast_ref::<FileScanConfig>())
             .is_some_and(local_scan_streams_cannot_fail)
         {
-            ProbeStreamFailures::WithoutLocalFileSystem
+            StreamFailures::WithoutLocalFileSystem
         } else {
-            ProbeStreamFailures::Possible
+            StreamFailures::Possible
         };
     }
     let partitions =
@@ -1938,13 +2012,13 @@ fn probe_stream_failures(plan: &Arc<dyn ExecutionPlan>) -> ProbeStreamFailures {
                 }
         });
     if !cannot_fail {
-        return ProbeStreamFailures::Possible;
+        return StreamFailures::Possible;
     }
     children
         .into_iter()
-        .map(probe_stream_failures)
+        .map(stream_failures)
         .max()
-        .unwrap_or(ProbeStreamFailures::Never)
+        .unwrap_or(StreamFailures::Never)
 }
 
 /// Whether the streams of the scan of files `config` cannot fail to be
@@ -3181,8 +3255,8 @@ impl PhysicalOperator for PhysicalHashJoin {
             // depends on nothing (unless creating them cannot fail). Whether
             // the runtime has the local file system, which scans of local
             // files need, is only known then.
-            if self.probe_plan.is_some()
-                && self.probe_stream_failures != ProbeStreamFailures::Never
+            let init_pipeline = if self.probe_plan.is_some()
+                && self.probe_stream_failures != StreamFailures::Never
             {
                 let init_pipeline =
                     build.create_union_pipeline(&build_pipeline, false)?;
@@ -3192,11 +3266,25 @@ impl PhysicalOperator for PhysicalHashJoin {
                         schema: Arc::new(Schema::empty()),
                     }),
                 )?;
-            }
+                Some(init_pipeline)
+            } else {
+                None
+            };
             build.build(&mut build_pipeline, self.build_side())?;
             for pipeline in build.pipelines() {
                 if pipeline != finalize_pipeline {
                     build.add_dependency(&finalize_pipeline, &pipeline)?;
+                }
+                // `HashJoinExec::execute` creates the streams of both inputs
+                // before any of them is read: the pipelines that read the
+                // build side wait for the streams to be created, so that
+                // their errors come before the errors of reading the build
+                // side (e.g. of a bridged plan that fails on its first batch).
+                if let Some(init_pipeline) = &init_pipeline
+                    && pipeline != finalize_pipeline
+                    && pipeline != *init_pipeline
+                {
+                    build.add_dependency(&pipeline, init_pipeline)?;
                 }
             }
             build_meta
@@ -3305,7 +3393,7 @@ impl PhysicalOperator for JoinHashTableBuild {
 
 /// The source of a pipeline of the build meta pipeline of a
 /// [`PhysicalHashJoin`] lowered from a `HashJoinExec` whose probe streams may
-/// fail to be created (see [`probe_stream_failures`]), which depends on
+/// fail to be created (see [`stream_failures`]), which depends on
 /// nothing, so that it runs as soon as the execution starts. It produces no
 /// rows: its sink, the join, creates the streams of its DataFusion probe
 /// input when it creates the local sink state of the pipeline (see
@@ -3313,7 +3401,11 @@ impl PhysicalOperator for JoinHashTableBuild {
 /// does right away, also when the build pipelines wait for pipeline breakers
 /// of the build side. (A join whose probe streams can only fail without the
 /// local file system in the runtime checks the runtime then, and creates them
-/// only if it has none.)
+/// only if it has none.) Like `HashJoinExec::execute`, it creates the streams
+/// of the build input before them, if creating them may fail, and the other
+/// pipelines of the meta pipeline, which read the build side, wait for it: the
+/// errors of creating the streams come first, those of the build streams
+/// before those of the probe streams.
 #[derive(Debug)]
 struct ProbeStreamsInit {
     schema: SchemaRef,
@@ -3362,6 +3454,8 @@ mod tests {
     use arrow::datatypes::{DataType, Int64Type, TimeUnit};
     use arrow::error::ArrowError;
     use datafusion::datasource::MemTable;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::physical_planner::DefaultPhysicalPlanner;
     use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
     use datafusion_datasource::PartitionedFile;
     use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
@@ -3380,6 +3474,7 @@ mod tests {
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
     use datafusion_physical_optimizer::PhysicalOptimizerRule;
     use datafusion_physical_optimizer::filter_pushdown::FilterPushdown;
+    use datafusion_physical_plan::aggregates::PhysicalGroupBy;
     use datafusion_physical_plan::collect;
     use datafusion_physical_plan::empty::EmptyExec;
     use datafusion_physical_plan::filter::FilterExec;
@@ -3390,6 +3485,7 @@ mod tests {
     use datafusion_physical_plan::union::UnionExec;
     use futures::StreamExt;
 
+    use crate::PipelineQueryPlanner;
     use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
@@ -7181,8 +7277,14 @@ mod tests {
     /// A CSV scan of `k` of a file in an object store that is not registered:
     /// creating its stream fails.
     fn unregistered_csv_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        csv_scan_of_unregistered_store("unregistered://store")
+    }
+
+    /// A CSV scan of `k` of a file in the object store `url`, which is not
+    /// registered: creating its stream fails, with an error that names `url`.
+    fn csv_scan_of_unregistered_store(url: &str) -> Result<Arc<dyn ExecutionPlan>> {
         let config = FileScanConfigBuilder::new(
-            ObjectStoreUrl::parse("unregistered://store")?,
+            ObjectStoreUrl::parse(url)?,
             Arc::new(CsvSource::new(int32_k_schema())),
         )
         .with_file(PartitionedFile::new("data.csv", 10))
@@ -7475,7 +7577,7 @@ mod tests {
         // memory and of no rows, and, if the runtime has the local file
         // system, of local files, below nodes that create their streams
         // without failing.
-        use ProbeStreamFailures::{Never, Possible, WithoutLocalFileSystem};
+        use StreamFailures::{Never, Possible, WithoutLocalFileSystem};
         let dir = tempfile::tempdir()?;
         write_parquet_table_p(dir.path())?;
         let ctx = datafusion_context(test_session_config());
@@ -7507,7 +7609,7 @@ mod tests {
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             assert_eq!(
-                probe_stream_failures(&plan),
+                stream_failures(&plan),
                 failures,
                 "{sql}\n{}",
                 displayable(plan.as_ref()).indent(true)
@@ -7535,7 +7637,10 @@ mod tests {
                 missing_csv_scan()?,
                 WithoutLocalFileSystem,
             ),
-            ("streaming table", partition_plan(empty_after)?, Possible),
+            // `PartitionStream::execute` returns the streams of a streaming
+            // table (whose plan cannot be copied, see
+            // `streams_can_be_replayed`) without failing.
+            ("streaming table", partition_plan(empty_after)?, Never),
             (
                 "coalescing of no partitions",
                 Arc::new(CoalescePartitionsExec::new(no_partitions)) as _,
@@ -7547,7 +7652,7 @@ mod tests {
                 Never,
             ),
         ] {
-            assert_eq!(probe_stream_failures(&plan), failures, "{name}");
+            assert_eq!(stream_failures(&plan), failures, "{name}");
         }
 
         // A join of scans of memory has no pipeline that creates its probe
@@ -7660,7 +7765,7 @@ mod tests {
             assert!(join.build_side().is::<PhysicalHashJoin>(), "{name}");
             assert_eq!(
                 join.probe_stream_failures,
-                ProbeStreamFailures::WithoutLocalFileSystem,
+                StreamFailures::WithoutLocalFileSystem,
                 "{name}"
             );
             let pipelines = format_pipelines(&root)?;
@@ -7733,7 +7838,7 @@ mod tests {
             });
             assert_eq!(
                 join.probe_stream_failures,
-                ProbeStreamFailures::Possible,
+                StreamFailures::Possible,
                 "{tree}"
             );
             let bridged_aggregations = bridged_plans(root)
@@ -7746,6 +7851,266 @@ mod tests {
                 "{tree}"
             );
         }
+        Ok(())
+    }
+
+    /// A session of DataFusion, or of the pipeline engine if `pipeline`, with
+    /// the configuration `config` and the memory pool `pool`.
+    fn context_with_pool(
+        config: SessionConfig,
+        pool: Arc<dyn MemoryPool>,
+        pipeline: bool,
+    ) -> Result<SessionContext> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()?;
+        let mut state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features();
+        if pipeline {
+            let planner =
+                PipelineQueryPlanner::new(Arc::new(DefaultPhysicalPlanner::default()));
+            state = state.with_query_planner(Arc::new(planner));
+        }
+        Ok(SessionContext::new_with_state(state.build()))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn build_stream_errors_come_before_probe_stream_errors() -> Result<()> {
+        // Joins of two aggregations of the strings `v` of `s`, in a memory pool
+        // of 0 bytes: `COUNT(CAST(v AS INT))`, whose stream fails to reserve
+        // the memory of its accumulator when it is created, and
+        // `approx_percentile_cont(CAST(v AS DOUBLE), 2.0)`, whose accumulator
+        // fails to be created (the percentile is not in `[0, 1]`).
+        // `HashJoinExec::execute` creates the stream of its build side before
+        // the stream of its probe side: DataFusion fails with the error of the
+        // build side. So does the native join, which creates the streams of
+        // its build side before those of its probe side (on copies), on 4
+        // threads (where both aggregations stay in DataFusion, in
+        // `BridgeOperator`s) and on 1 (where they are native).
+        let setup = |ctx: &SessionContext| -> Result<()> {
+            let strings = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8View, true)])),
+                vec![Arc::new(StringViewArray::from_iter_values(
+                    (0..100).map(|i| i.to_string()),
+                ))],
+            )?;
+            ctx.register_batch("s", strings)?;
+            Ok(())
+        };
+        let count = "SELECT CAST(COUNT(CAST(v AS INT)) AS DOUBLE) AS n FROM s";
+        let percentile =
+            "SELECT approx_percentile_cont(CAST(v AS DOUBLE), 2.0) AS p, 1 AS one FROM s";
+        let exhausted = "Resources exhausted";
+        let invalid = "Percentile value must be between 0.0 and 1.0 inclusive";
+        // The `COUNT` on the build side (as DataFusion plans the smaller side
+        // there), and the other way around.
+        let cases = [
+            (
+                format!(
+                    "SELECT b.n, x.p FROM ({count}) b JOIN ({percentile}) x ON b.n = x.p"
+                ),
+                "count",
+                exhausted,
+            ),
+            (
+                format!(
+                    "SELECT b.n, x.p FROM ({percentile}) x JOIN ({count}) b ON b.n = x.p"
+                ),
+                "approx_percentile_cont",
+                invalid,
+            ),
+        ];
+        for (sql, build, message) in cases {
+            for threads in [4, 1] {
+                let config = test_session_config().with_target_partitions(threads);
+                let pool = || Arc::new(GreedyMemoryPool::new(0)) as Arc<dyn MemoryPool>;
+                let ctx = context_with_pool(config.clone(), pool(), false)?;
+                setup(&ctx)?;
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                let join = find_hash_join(&plan).expect("a hash join");
+                let build_side = displayable(join.children()[0].as_ref()).indent(true);
+                assert!(
+                    build_side.to_string().contains(build),
+                    "{sql}\n{build_side}"
+                );
+                let expected = with_timeout(collect(plan, ctx.task_ctx()))
+                    .await
+                    .expect_err("DataFusion fails");
+                assert!(expected.to_string().contains(message), "{expected}");
+
+                let ctx = context_with_pool(config, pool(), true)?;
+                setup(&ctx)?;
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                let root = plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .expect("a pipeline plan")
+                    .operator();
+                let tree = format_operator_tree(root);
+                let actual = with_timeout(collect(Arc::clone(&plan), ctx.task_ctx()))
+                    .await
+                    .map(|batches| count_rows(&batches));
+                match actual {
+                    Err(e) => assert!(
+                        e.to_string().contains(message),
+                        "{threads} threads, build side {build}: the pipeline engine \
+                         fails with {e}, DataFusion with {expected}\n{tree}"
+                    ),
+                    Ok(rows) => panic!("{threads} threads: {rows} rows\n{tree}"),
+                }
+                assert!(root.is::<PhysicalHashJoin>(), "{tree}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bridged_builds_that_fail_at_once_fail_like_datafusion() -> Result<()> {
+        // A join whose build side, a plan that stays in DataFusion (in a
+        // `BridgeOperator`), fails as soon as it is executed, and whose probe
+        // side fails to create its stream. `HashJoinExec::execute` creates the
+        // streams of both sides, the build side first, before it reads either.
+        type MakePlan = fn() -> Result<Arc<dyn ExecutionPlan>>;
+        let cases: [(&str, MakePlan, MakePlan, &str); 2] = [
+            // A JSON scan of an unregistered store, whose stream fails to be
+            // created: DataFusion fails with its error, before it creates the
+            // stream of the probe side, a scan of another unregistered store.
+            (
+                "build stream that fails to be created",
+                || unregistered_store_scan(int32_k_schema()),
+                || csv_scan_of_unregistered_store("other://store"),
+                "unregistered://store",
+            ),
+            // A stream that fails once it produced a batch: DataFusion creates
+            // it, then fails to create the stream of the probe side, before it
+            // reads the build side.
+            (
+                "build stream that fails when it is read",
+                || {
+                    let one = Arc::new(Int32Array::from(vec![1]));
+                    let batch = RecordBatch::try_new(int32_k_schema(), vec![one])?;
+                    batch_plan(batch, AfterBatch::Fail)
+                },
+                unregistered_csv_scan,
+                UNREGISTERED_STORE,
+            ),
+        ];
+        for (name, build, probe, message) in cases {
+            let make_plan = || join_on_k(build()?, probe()?, JoinType::Inner);
+            for threads in [4, 1] {
+                let config = test_session_config().with_target_partitions(threads);
+                let options = Arc::clone(config.options());
+                for (lowering_name, lowering) in lowerings(&options) {
+                    let (expected, actual, root) =
+                        errors_of_both_engines(make_plan, lowering, config.clone())
+                            .await?;
+                    let context = format!("{name}, {threads} threads, {lowering_name}");
+                    assert!(
+                        expected.to_string().contains(message),
+                        "{context}: {expected}"
+                    );
+                    assert!(
+                        actual.to_string().contains(message),
+                        "{context}: the pipeline engine fails with {actual}, \
+                         DataFusion with {expected}\n{}",
+                        format_operator_tree(&root)
+                    );
+                    let join = root
+                        .downcast_ref::<PhysicalHashJoin>()
+                        .unwrap_or_else(|| panic!("{context}: a native join"));
+                    assert!(join.build_side().is::<BridgeOperator>(), "{context}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A partition of `k` that produces the single row 1 the first time its
+    /// stream is created, and fails every later time, like a partition that
+    /// takes a channel when it is executed.
+    #[derive(Debug, Default)]
+    struct ExecutedOnce {
+        executed: AtomicBool,
+    }
+
+    impl PartitionStream for ExecutedOnce {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: OnceLock<SchemaRef> = OnceLock::new();
+            SCHEMA.get_or_init(int32_k_schema)
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let once = !self.executed.swap(true, Ordering::SeqCst);
+            let batch = RecordBatch::try_new(
+                int32_k_schema(),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .map_err(DataFusionError::from)
+            .and_then(|batch| {
+                if once {
+                    Ok(batch)
+                } else {
+                    datafusion_common::exec_err!("the partition was executed twice")
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                int32_k_schema(),
+                futures::stream::iter([batch]),
+            ))
+        }
+    }
+
+    /// The aggregation `SELECT k FROM input GROUP BY k` (without aggregates),
+    /// which may fail to create its streams (see `stream_failures`).
+    fn group_by_k(input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let group_by =
+            PhysicalGroupBy::new_single(vec![(col("k", &input.schema())?, "k".into())]);
+        let schema = input.schema();
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            group_by,
+            vec![],
+            vec![],
+            input,
+            schema,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_whose_failing_build_input_cannot_be_copied_stay_in_datafusion()
+    -> Result<()> {
+        // A build input whose streams may fail to be created (an aggregation)
+        // and that cannot be copied (over a partition that can only be
+        // executed once), joined to a probe input whose streams may fail to be
+        // created too (another aggregation, which does not fail). The native
+        // join would create the build streams before the probe streams (see
+        // `PhysicalHashJoin::create_probe_streams`), on a copy, which executes
+        // the partition: the join is left to DataFusion, which executes it
+        // once, and returns the row 1. With a probe input whose streams cannot
+        // fail, the join creates no streams, and is native.
+        let make_plan = |probe: Arc<dyn ExecutionPlan>| -> Result<_> {
+            let build = group_by_k(partition_plan(ExecutedOnce::default())?)?;
+            assert_eq!(stream_failures(&build), StreamFailures::Possible);
+            assert!(!streams_can_be_replayed(&build));
+            join_on_k(build, probe, JoinType::Inner)
+        };
+        let failing = || make_plan(group_by_k(int32_k_scan(vec![Some(1), Some(2)])?)?);
+        assert!(PhysicalHashJoin::try_lower(&failing()?, lower)?.is_none());
+        let root = assert_lowered_plan_byte_eq(failing, lower, task_ctx(), false).await;
+        assert!(
+            root.is::<BridgeOperator>(),
+            "{}",
+            format_operator_tree(&root)
+        );
+        let infallible = || make_plan(int32_k_scan(vec![Some(1), Some(2)])?);
+        let root =
+            assert_lowered_plan_byte_eq(infallible, lower, task_ctx(), false).await;
+        assert!(
+            root.is::<PhysicalHashJoin>(),
+            "{}",
+            format_operator_tree(&root)
+        );
         Ok(())
     }
 
