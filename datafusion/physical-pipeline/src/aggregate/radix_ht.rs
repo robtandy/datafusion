@@ -2597,6 +2597,12 @@ mod tests {
     /// -1e16 + 1)` (`1 + -1e16` rounds to `-1e16`) and `(1e16 + 0 + 0 + 0 + 1) +
     /// (-1e16 + 1)`.
     fn seven_passes() -> Result<Vec<RecordBatch>> {
+        seven_passes_over(32_768)
+    }
+
+    /// The rows of [`seven_passes`], over the keys `0..keys` (a multiple of
+    /// 2,048).
+    fn seven_passes_over(keys: i64) -> Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -2604,10 +2610,11 @@ mod tests {
         ]));
         let passes = [1e16, 0.0, 0.0, 0.0, 1.0, -1e16, 1.0];
         let mut batches = vec![];
+        let num_keys = keys;
         for (pass, value) in passes.into_iter().enumerate() {
-            for start in (0..32_768).step_by(DEFAULT_VECTOR_SIZE) {
+            for start in (0..num_keys).step_by(DEFAULT_VECTOR_SIZE) {
                 let keys = start..start + DEFAULT_VECTOR_SIZE as i64;
-                let first = pass as i64 * 32_768;
+                let first = pass as i64 * num_keys;
                 let columns: Vec<ArrayRef> = vec![
                     Arc::new(Int64Array::from_iter_values(keys.clone())),
                     Arc::new(Int64Array::from_iter_values(keys.map(|k| first + k))),
@@ -2733,6 +2740,160 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_states_of_other_aggregations_are_aggregated_like_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // The rows of [`seven_passes`] over 2,048 keys with a few more group
+        // columns, on one thread (whose aggregates do not split their rows
+        // exactly, see `TableCapacity::UNBOUNDED`): grouping sets (and the grand
+        // total of an aggregation without input rows), aggregates that require
+        // their rows in an order (which the thread sorts once it saw all of
+        // them), and the two stages of an aggregation of a single partition
+        // (whose final stage merges the single states of the groups rather than
+        // evaluating them, as DataFusion's merges the partial states of its
+        // partition).
+        let batches = seven_passes_over(2_048)?
+            .into_iter()
+            .map(|batch| {
+                let k = batch.column(0).as_primitive::<Int64Type>();
+                let a: ArrayRef = Arc::new(Int64Array::from_iter_values(
+                    k.values().iter().map(|k| k % 3),
+                ));
+                let b: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    k.values().iter().map(|k| format!("b{}", k % 5)),
+                ));
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Int64, false),
+                    Field::new("v", DataType::Int64, false),
+                    Field::new("f", DataType::Float64, false),
+                    Field::new("a", DataType::Int64, false),
+                    Field::new("b", DataType::Utf8, false),
+                ]));
+                let mut columns = batch.columns().to_vec();
+                columns.extend([a, b]);
+                Ok(RecordBatch::try_new(schema, columns)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                batches[0].schema(),
+                vec![batches.clone()],
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        };
+        // The queries, and whether rows pass their filter (which the sink of
+        // the aggregation that `planned_aggregation_thread` drives does not
+        // evaluate: it consumes the rows that pass it).
+        let queries = [
+            (
+                "SELECT a, b, SUM(f), AVG(f), COUNT(*) FROM t GROUP BY ROLLUP (a, b)",
+                true,
+            ),
+            (
+                "SELECT k, a, SUM(f) FROM t GROUP BY GROUPING SETS ((k), (a), ())",
+                true,
+            ),
+            (
+                "SELECT a, SUM(f), LAST_VALUE(v) FROM t WHERE v < 0 GROUP BY ROLLUP (a)",
+                false,
+            ),
+            (
+                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), SUM(f) FROM t GROUP BY a",
+                true,
+            ),
+            (
+                "SELECT k, NTH_VALUE(v, 6 ORDER BY v), SUM(f) FROM t GROUP BY k",
+                true,
+            ),
+            (
+                "SELECT k, ARRAY_AGG(f ORDER BY v DESC), FIRST_VALUE(v ORDER BY f, v) \
+                 FROM t GROUP BY k",
+                true,
+            ),
+        ];
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let pipeline = crate::test_utils::pipeline_context(config.clone());
+            setup(&pipeline).await?;
+            for (sql, rows) in queries {
+                let rows = if rows { &batches[..] } else { &[] };
+                let thread = planned_aggregation_thread(&pipeline, sql, rows, 1).await?;
+                // (DataFusion aggregates grouping sets in two stages.)
+                assert!(thread.whole && thread.flushed == 0, "{sql}: {thread:?}");
+                assert_eq!(thread.evaluated, thread.single_stage, "{sql}");
+                assert_eq!(thread.output, datafusion_aggregation(&ctx, sql).await?);
+                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+            // `SUM(f)` (and `LAST_VALUE(v)`) of two stages over a single
+            // partition: DataFusion's final stage merges the partial states of the
+            // groups, `1.0` (and the values of the last pass).
+            let schema = batches[0].schema();
+            let aggregates = [
+                (
+                    "sum(f)",
+                    datafusion::functions_aggregate::sum::sum_udaf(),
+                    "f",
+                ),
+                (
+                    "last_value(v)",
+                    datafusion::functions_aggregate::first_last::last_value_udaf(),
+                    "v",
+                ),
+            ]
+            .into_iter()
+            .map(|(alias, function, argument)| {
+                Ok(Arc::new(
+                    AggregateExprBuilder::new(function, vec![col(argument, &schema)?])
+                        .schema(Arc::clone(&schema))
+                        .alias(alias)
+                        .build()?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+            let single = AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+                aggregates,
+                vec![None, None],
+                MemorySourceConfig::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?,
+                Arc::clone(&schema),
+            )?;
+            let last: Arc<dyn ExecutionPlan> = Arc::new(two_stages(&single)?.1);
+            let expected =
+                datafusion_physical_plan::collect(Arc::clone(&last), ctx.task_ctx())
+                    .await?;
+            let sums = canonical_batch(&last.schema(), &expected, false)?;
+            assert!(
+                sums.column(1)
+                    .as_primitive::<arrow::datatypes::Float64Type>()
+                    .values()
+                    .iter()
+                    .all(|&sum| sum == 1.0)
+            );
+            let operator: Arc<dyn crate::PhysicalOperator> = Arc::new(
+                PhysicalHashAggregate::try_lower(&last, lower)?.expect("an aggregation"),
+            );
+            let thread = aggregation_thread(&operator, ctx.task_ctx(), &batches, 1)?;
+            assert!(thread.whole && !thread.evaluated && thread.flushed == 0);
+            assert_eq!(thread.output, sums);
+            let actual =
+                Executor::collect(Arc::clone(&operator), ctx.task_ctx(), 1).await?;
+            assert_eq!(canonical_batch(&last.schema(), &actual, false)?, sums);
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations of the plan of `sql` that the planner
     /// lowers in a session of configuration `config` set up by `setup`.
     async fn planned_aggregations<F>(
@@ -2808,6 +2969,8 @@ mod tests {
         /// Whether the final aggregation evaluates that table, rather than
         /// merging partial states (see [`RadixHashAggregate::finalize`]).
         evaluated: bool,
+        /// Whether the aggregation has a single stage.
+        single_stage: bool,
         /// Whether its rows bypassed its table at some point.
         bypassed: bool,
         /// The groups its table flushed before it finished.
@@ -2899,6 +3062,7 @@ mod tests {
             splits_exactly: spec.splits_exactly,
             whole,
             evaluated,
+            single_stage: spec.single_stage,
             bypassed,
             flushed,
             groups,
