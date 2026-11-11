@@ -18,20 +18,20 @@ use arrow::compute::{
     SortColumn, SortOptions, concat, filter_record_batch, interleave, lexsort_to_indices,
     sort_to_indices, take, take_record_batch,
 };
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::{
     ConfigEntry, ConfigExtension, ConfigOptions, ExtensionOptions,
 };
 use datafusion_common::stats::Precision;
 use datafusion_common::{Result, ScalarValue, config_err, internal_err};
-use datafusion_expr::AggregateUDF;
+use datafusion_expr::{AggregateUDF, Operator};
 use datafusion_functions_aggregate::{
     approx_distinct, array_agg, average, bit_and_or_xor, bool_and_or, count, first_last,
     median, min_max, sum,
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::utils::scatter;
@@ -58,7 +58,7 @@ use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
 };
-use crate::operators::adaptive_filter::{Failures, failures, is_infallible};
+use crate::operators::adaptive_filter::{failures, is_infallible};
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
@@ -614,11 +614,10 @@ impl PhysicalHashAggregate {
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
     ///   input only, or fails;
-    /// * aggregations with several parts that may fail (group keys, arguments
-    ///   and filters of aggregates, and the expressions of the native
-    ///   operators of their pipeline), not all of them only with arithmetic
-    ///   overflows, whose first error depends on DataFusion's batches (see
-    ///   `fail_in_the_order_of_the_batches`);
+    /// * aggregations that may fail with several parts that may fail (group
+    ///   keys, arguments and filters of aggregates, and the expressions of the
+    ///   native operators of their pipeline), whose first error depends on
+    ///   DataFusion's batches (see `fail_in_the_order_of_the_batches`);
     /// * aggregations with an aggregate whose accumulators may get other
     ///   values from the chunks of the native operator than from DataFusion's
     ///   batches, or fail with other errors (see `updates_like_datafusion`):
@@ -1257,6 +1256,13 @@ fn builtin_name(function: &AggregateUDF) -> Option<&'static str> {
 /// * A user-defined aggregate may compute anything from the rows of a call of
 ///   its accumulator (e.g. add up the values of a batch first, then add that
 ///   sum to its total): its aggregations are left to DataFusion.
+/// * A `DISTINCT` aggregate collects its distinct values in a hash set, which
+///   reserves room for every batch it extends it with: the order of its
+///   values depends on the batches, and so does the value of an aggregate
+///   that does not split its rows exactly (see [`splits_exactly`]), e.g. a
+///   `SUM(DISTINCT f)` of floating point values (that DataFusion does not
+///   rewrite, next to a `COUNT(*)`), or an `ARRAY_AGG(DISTINCT x)`: their
+///   aggregations are left to DataFusion.
 /// * The accumulators of DataFusion's `percentile_cont`,
 ///   `approx_percentile_cont` and `approx_percentile_cont_with_weight` of a
 ///   percentile of a column validate it on every call, the range of its first
@@ -1286,6 +1292,9 @@ fn updates_like_datafusion(
     let Some(name) = builtin_name(aggregate.fun()) else {
         return false;
     };
+    if aggregate.is_distinct() && !splits_exactly(aggregate, input, max_rows) {
+        return false;
+    }
     if matches!(
         name,
         "percentile_cont"
@@ -1378,22 +1387,21 @@ fn sums_exactly_as_floats(
 /// Whether the first error of `raw`, the `AggregateExec` that consumes the input
 /// rows, which `input` (its lowered input) evaluates, may depend on the
 /// batches of its input: if `raw` may fail, and several of the parts that it
-/// and the native operators of its pipeline (see [`pipeline_failures`])
-/// evaluate may fail, not all of them only with arithmetic overflows (see
-/// [`failures`]). DataFusion evaluates the parts of an operator (the group
-/// keys of an aggregation, then the arguments of its aggregates, then their
-/// filters), each on all rows of a batch before the next one, and an operator
-/// on a batch before the operator above it; the native operators evaluate
-/// them on their chunks. E.g. of `SUM(CAST(x AS DECIMAL(3, 0)))` and
-/// `SUM(CAST(y AS DECIMAL(38, 25)))` (or of a filter `CAST(x AS DECIMAL(3,
-/// 0)) + 0.5 > 1` below `SUM(CAST(y AS DECIMAL(38, 25)))`), of a batch in
-/// which `x` overflows on its last row, and `y` on its first, DataFusion
-/// raises the invalid argument of `x` (a value too large for the precision),
-/// the native operators the arithmetic overflow of `y` (of its rescaled
-/// value). (The planner accepts several casts into decimals, see
-/// `Failures::order_matters`, whose errors are of these two kinds, depending
-/// on the values; and several arithmetic overflows, e.g. of the decimal
-/// arithmetic of TPC-H, whichever of them comes first.)
+/// and the native operators of its pipeline (see [`pipeline_parts`]) evaluate
+/// may fail (see [`refined_parts`]). DataFusion evaluates the parts of an
+/// operator (the group keys of an aggregation, then the arguments of its
+/// aggregates, then their filters), each on all rows of a batch before the
+/// next one, and an operator on a batch before the operator above it; the
+/// native operators evaluate them on their chunks, so that another of them
+/// may fail first, also with an error of the same kind: e.g. of `SUM(CAST(x
+/// AS DECIMAL(3, 0)))` and `SUM(CAST(y AS DECIMAL(38, 25)))` (or of a filter
+/// `CAST(x AS DECIMAL(3, 0)) + 0.5 > 1` below `SUM(CAST(y AS DECIMAL(38,
+/// 25)))`), of a batch in which `x` overflows on its last row, and `y` on its
+/// first, DataFusion raises the invalid argument of `x`, the native operators
+/// the arithmetic overflow of `y`; and of `SUM(p * 10)` and `SUM(q * 10)` of
+/// `DECIMAL(38, 0)`s, the arithmetic overflow of `p` and of `q`. (The planner
+/// accepts several casts into decimals and several arithmetic overflows, see
+/// `Failures::order_matters`, whichever of them comes first.)
 fn fail_in_the_order_of_the_batches(
     raw: &AggregateExec,
     input: &Arc<dyn PhysicalOperator>,
@@ -1410,93 +1418,182 @@ fn fail_in_the_order_of_the_batches(
                 .flat_map(|aggregate| aggregate.expressions()),
         )
         .chain(raw.filter_expr().iter().flatten().cloned())
-        .map(|expr| failures(&expr, &schema))
-        .fold(Failures::NONE, Failures::and);
-    if own.is_none() {
-        return false;
-    }
-    let parts = own.and(pipeline_failures(input));
-    let overflows = (0..parts.parts()).fold(Failures::NONE, |overflows, _| {
-        overflows.and(Failures::OVERFLOW)
-    });
-    parts.parts() > 1 && parts != overflows
+        .map(|expr| refined_parts(&expr, &schema))
+        .sum::<usize>();
+    own > 0 && own + pipeline_parts(input) > 1
 }
 
-/// The parts that may fail (see [`failures`]) of the native operators that
-/// evaluate the chunks of the pipeline of `operator`, from `operator` down to
-/// the source of the pipeline, as the planner's `native_failures` counts
-/// them: the filters, the projections and the probe keys and filters of hash
-/// joins, through the operators that pass on the chunks of their inputs, down
-/// to the sources and pipeline breakers, which belong to other pipelines (and
-/// bridged plans, which DataFusion evaluates on whole batches).
-fn pipeline_failures(operator: &Arc<dyn PhysicalOperator>) -> Failures {
+/// The number of the parts of `expr` (over `schema`) that may fail (see
+/// [`failures`]), but the decimal additions, subtractions and
+/// multiplications that cannot overflow (see [`cannot_overflow`]), which
+/// [`failures`] counts as parts that may overflow: e.g. of TPC-H's
+/// `l_extendedprice * (1 - l_discount)`, of `DECIMAL(15, 2)`s.
+fn refined_parts(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
+    failures(expr, schema)
+        .parts()
+        .saturating_sub(overflows_ruled_out(expr, schema))
+}
+
+/// The number of the operations of `expr` that [`failures`] counts as parts
+/// that may fail, but that cannot overflow (see [`cannot_overflow`]).
+fn overflows_ruled_out(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
+    let children = expr.children();
+    let own = if cannot_overflow(expr, schema) {
+        let below = children
+            .iter()
+            .map(|child| failures(child, schema).parts())
+            .sum::<usize>();
+        failures(expr, schema).parts().saturating_sub(below).min(1)
+    } else {
+        0
+    };
+    children
+        .iter()
+        .map(|child| overflows_ruled_out(child, schema))
+        .fold(own, |ruled_out, child| ruled_out + child)
+}
+
+/// Whether `expr` (over `schema`) is an addition, a subtraction or a
+/// multiplication of `Decimal128`s that cannot overflow, whatever the values
+/// of its operands (within the precisions of their types, see
+/// [`decimal_digits`]). Arrow rescales the operands of an addition (and a
+/// subtraction) to their larger scale `s` and adds them up as `i128`s, which
+/// overflow only above `2^127`: the unscaled values of operands of at most
+/// `d1` and `d2` digits and of scales `s1` and `s2` add up to less than
+/// `2 * 10^e`, with `e = max(d1 - s1, d2 - s2) + s`, which fits for `e <= 37`.
+/// It multiplies them as `i128`s, to less than `10^(d1 + d2)`, which fits for
+/// `d1 + d2 <= 38` (if the scale `s1 + s2` of the product is valid). Arrow does
+/// not validate the precisions of the results.
+fn cannot_overflow(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+        return false;
+    };
+    let (Some((d1, s1)), Some((d2, s2))) = (
+        decimal_digits(binary.left(), schema),
+        decimal_digits(binary.right(), schema),
+    ) else {
+        return false;
+    };
+    match binary.op() {
+        Operator::Plus | Operator::Minus => {
+            let scale = s1.max(s2);
+            (d1 - s1).max(d2 - s2) + scale <= 37
+        }
+        Operator::Multiply => d1 + d2 <= 38 && s1 + s2 <= 38,
+        _ => false,
+    }
+}
+
+/// An upper bound of the number of digits of the unscaled values of `expr`,
+/// of type `Decimal128` (over `schema`), and its scale, if known: the
+/// precision of its type, for a column (of a precision below the maximum of
+/// 38, which the type of a result may only cap), a literal or a cast into the
+/// decimal (which fails on the values of more digits); or that of the
+/// operands of an addition, a subtraction or a multiplication that cannot
+/// overflow (see [`cannot_overflow`]): `max(d1 - s1, d2 - s2) + max(s1, s2) +
+/// 1` and `d1 + d2` digits.
+fn decimal_digits(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<(i32, i32)> {
+    let DataType::Decimal128(precision, scale) = expr.data_type(schema).ok()? else {
+        return None;
+    };
+    let (precision, scale) = (i32::from(precision), i32::from(scale));
+    if expr.is::<Literal>()
+        || expr.is::<CastExpr>()
+        || (expr.is::<Column>() && precision < 38)
+    {
+        return Some((precision, scale));
+    }
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    let (d1, s1) = decimal_digits(binary.left(), schema)?;
+    let (d2, s2) = decimal_digits(binary.right(), schema)?;
+    if !cannot_overflow(expr, schema) {
+        return None;
+    }
+    match binary.op() {
+        Operator::Plus | Operator::Minus => {
+            Some(((d1 - s1).max(d2 - s2) + s1.max(s2) + 1, s1.max(s2)))
+        }
+        Operator::Multiply => Some((d1 + d2, s1 + s2)),
+        _ => None,
+    }
+}
+
+/// The number of the parts that may fail (see [`refined_parts`]) of the
+/// native operators that evaluate the chunks of the pipeline of `operator`,
+/// from `operator` down to the source of the pipeline, as the planner's
+/// `native_failures` counts them: the filters, the projections and the probe
+/// keys and filters of hash joins, through the operators that pass on the
+/// chunks of their inputs, down to the sources and pipeline breakers, which
+/// belong to other pipelines (and bridged plans, which DataFusion evaluates on
+/// whole batches).
+fn pipeline_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
     if let Some(join) = operator.downcast_ref::<PhysicalHashJoin>() {
         let probe_schema = join.probe_side().schema();
-        let mut own = join
+        let keys = join
             .on()
             .iter()
-            .map(|(_, key)| failures(key, &probe_schema))
-            .fold(Failures::NONE, Failures::and);
-        if let Some(filter) = join.filter() {
-            own = own.and(failures(filter.expression(), filter.schema()));
-        }
-        return own.and(pipeline_failures(join.probe_side()));
+            .map(|(_, key)| refined_parts(key, &probe_schema))
+            .sum::<usize>();
+        let filter = join.filter().map_or(0, |filter| {
+            refined_parts(filter.expression(), filter.schema())
+        });
+        return keys + filter + pipeline_parts(join.probe_side());
     }
     if let Some(join) = operator.downcast_ref::<PhysicalNestedLoopJoin>() {
-        return pipeline_failures(join.probe_side());
+        return pipeline_parts(join.probe_side());
     }
     if let Some(join) = operator.downcast_ref::<PhysicalCrossJoin>() {
-        return pipeline_failures(join.probe_side());
+        return pipeline_parts(join.probe_side());
     }
     if let Some(subquery) = operator.downcast_ref::<PhysicalScalarSubquery>() {
-        return pipeline_failures(subquery.input());
+        return pipeline_parts(subquery.input());
     }
     if operator.is_source() || operator.is_sink() {
-        return Failures::NONE;
+        return 0;
     }
     let input_schema = || operator.children()[0].schema();
     let own = if let Some(filter) = operator.downcast_ref::<PhysicalFilter>() {
-        failures(filter.predicate(), &input_schema())
+        refined_parts(filter.predicate(), &input_schema())
     } else if let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
         let input_schema = input_schema();
         projection
             .exprs()
             .iter()
-            .map(|(expr, _)| failures(expr, &input_schema))
-            .fold(Failures::NONE, Failures::and)
+            .map(|(expr, _)| refined_parts(expr, &input_schema))
+            .sum()
     } else {
-        test_operator_failures(operator)
+        test_operator_parts(operator)
     };
     operator
         .children()
         .iter()
-        .map(pipeline_failures)
-        .fold(own, Failures::and)
+        .map(pipeline_parts)
+        .fold(own, |parts, child| parts + child)
 }
 
-/// The parts that may fail of `operator`, a stand-in of the tests for the
-/// native filter or projection (see [`pipeline_failures`]).
+/// The number of the parts that may fail of `operator`, a stand-in of the
+/// tests for the native filter or projection (see [`pipeline_parts`]).
 #[cfg(test)]
-fn test_operator_failures(operator: &Arc<dyn PhysicalOperator>) -> Failures {
+fn test_operator_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
     use super::test_support::{TestFilter, TestProjection};
     let input_schema = || operator.children()[0].schema();
     if let Some(filter) = operator.downcast_ref::<TestFilter>() {
-        return failures(filter.predicate(), &input_schema());
+        return refined_parts(filter.predicate(), &input_schema());
     }
     if let Some(projection) = operator.downcast_ref::<TestProjection>() {
         let input_schema = input_schema();
         return projection
             .exprs()
             .iter()
-            .map(|expr| failures(expr, &input_schema))
-            .fold(Failures::NONE, Failures::and);
+            .map(|expr| refined_parts(expr, &input_schema))
+            .sum();
     }
-    Failures::NONE
+    0
 }
 
 #[cfg(not(test))]
-fn test_operator_failures(_operator: &Arc<dyn PhysicalOperator>) -> Failures {
-    Failures::NONE
+fn test_operator_parts(_operator: &Arc<dyn PhysicalOperator>) -> usize {
+    0
 }
 
 /// An upper bound of the number of rows of `plan`, from DataFusion's

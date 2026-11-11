@@ -3677,6 +3677,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn distinct_aggregates_that_depend_on_the_order_of_their_values_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // The review of abaaba6a6: one batch of 8,192 rows, `k = 1`, and `f =
+        // 0` but `f[0] = 1e16`, `f[2048] = -1e16` and `f[2049] = 1`. A `DISTINCT`
+        // aggregate collects its distinct values in a hash set, which reserves
+        // room for every batch it extends it with, so that the order of its
+        // values depends on the batches: DataFusion's `SUM(DISTINCT f)` of its
+        // batch is `1.0` (and `AVG(DISTINCT f)` `0.25`), the native one of the
+        // chunks of 2,048 rows was `0.0`, although a single thread aggregated
+        // all rows into a single state (next to `COUNT(*)`, which keeps
+        // DataFusion from rewriting the `DISTINCT` aggregates into an
+        // aggregation of an aggregation). The `DISTINCT` aggregates that may not
+        // split their rows exactly (see `splits_exactly`) are left to DataFusion
+        // (see `updates_like_datafusion`); those that do stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let mut f = vec![0.0; 8_192];
+        f[0] = 1e16;
+        f[2_048] = -1e16;
+        f[2_049] = 1.0;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(arrow::array::Float64Array::from(f)),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4] {
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                let sql = "SELECT k, SUM(DISTINCT f), AVG(DISTINCT f), COUNT(*) FROM t \
+                           GROUP BY k";
+                // (DataFusion's values in a single stage, of a single target
+                // partition.)
+                if target_partitions == 1 {
+                    assert_eq!(datafusion_floats(sql, &config, &setup, 1).await?, [1.0]);
+                    assert_eq!(datafusion_floats(sql, &config, &setup, 2).await?, [0.25]);
+                }
+                for sql in [
+                    sql,
+                    "SELECT k, ARRAY_AGG(DISTINCT f), COUNT(*) FROM t GROUP BY k",
+                    "SELECT SUM(DISTINCT f), COUNT(*) FROM t",
+                ] {
+                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                }
+                // (On several partitions, the planner leaves the aggregations of
+                // `DISTINCT` aggregates to DataFusion anyway, see the module
+                // documentation of `planner`.)
+                if target_partitions == 1 {
+                    let sql = "SELECT k, COUNT(DISTINCT f), MEDIAN(DISTINCT f), \
+                               SUM(DISTINCT k), COUNT(*) FROM t GROUP BY k";
+                    assert!(
+                        planned_aggregations(sql, &config, &setup).await? > 0,
+                        "{sql}"
+                    );
+                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn competing_failures_of_aggregates_are_left_to_datafusion() -> Result<()> {
         use super::super::test_support::{
             assert_aggregate_fails_like_datafusion_with_setup,
@@ -3692,23 +3763,46 @@ mod tests {
         // first, with the arithmetic overflow of rescaling `i64::MAX`. Likewise
         // if one of the casts is evaluated by a native filter or projection
         // below the aggregation, in its pipeline: DataFusion evaluates it on
-        // the whole batch before the aggregation sees it. Such aggregations,
-        // with several parts that may fail not only with arithmetic
-        // overflows, are left to DataFusion (see
+        // the whole batch before the aggregation sees it. And arithmetic
+        // overflows of the same kind name other values (the review of
+        // abaaba6a6): of `SUM(p * 10)` and `SUM(q * 10)` of `DECIMAL(38, 0)`s,
+        // `p = q = 1` but `p[8191] = 9 * 10^37` and `q[0] = 8 * 10^37`, the
+        // overflow of `p` in DataFusion, of `q` natively. Such aggregations,
+        // with several parts that may fail, are left to DataFusion (see
         // `fail_in_the_order_of_the_batches`), on any number of threads; with
-        // a single cast, or with decimal arithmetic only (as in TPC-H), they
-        // stay native.
+        // a single cast, or with decimal arithmetic that cannot overflow but
+        // once (as in TPC-H, see `cannot_overflow`), they stay native.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("x", DataType::Int64, false),
             Field::new("y", DataType::Int64, false),
             Field::new("p", DataType::Decimal128(15, 2), false),
             Field::new("q", DataType::Decimal128(15, 2), false),
+            Field::new("p38", DataType::Decimal128(38, 0), false),
+            Field::new("q38", DataType::Decimal128(38, 0), false),
+            Field::new("a20", DataType::Decimal128(20, 0), false),
+            Field::new("b20", DataType::Decimal128(20, 0), false),
+            Field::new("c37", DataType::Decimal128(37, 0), false),
+            Field::new("d37", DataType::Decimal128(37, 0), false),
         ]));
         let mut x = vec![1; 8_192];
         x[8_191] = 1_000;
         let mut y = vec![1; 8_192];
         y[0] = i64::MAX;
+        let mut p38 = vec![1; 8_192];
+        p38[8_191] = 9 * 10i128.pow(37);
+        let mut q38 = vec![1; 8_192];
+        q38[0] = 8 * 10i128.pow(37);
+        // Products of 40 digits, and sums rescaled to 47 digits, which may
+        // overflow (see `cannot_overflow`).
+        let mut a20 = vec![1; 8_192];
+        a20[8_191] = 10i128.pow(20) - 1;
+        let mut b20 = vec![1; 8_192];
+        b20[0] = 10i128.pow(20) - 2;
+        let mut c37 = vec![1; 8_192];
+        c37[8_191] = 10i128.pow(37) - 1;
+        let mut d37 = vec![1; 8_192];
+        d37[0] = 10i128.pow(37) - 2;
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -3723,6 +3817,12 @@ mod tests {
                     Decimal128Array::from(vec![5; 8_192])
                         .with_precision_and_scale(15, 2)?,
                 ),
+                Arc::new(Decimal128Array::from(p38).with_precision_and_scale(38, 0)?),
+                Arc::new(Decimal128Array::from(q38).with_precision_and_scale(38, 0)?),
+                Arc::new(Decimal128Array::from(a20).with_precision_and_scale(20, 0)?),
+                Arc::new(Decimal128Array::from(b20).with_precision_and_scale(20, 0)?),
+                Arc::new(Decimal128Array::from(c37).with_precision_and_scale(37, 0)?),
+                Arc::new(Decimal128Array::from(d37).with_precision_and_scale(37, 0)?),
             ],
         )?;
         let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
@@ -3761,6 +3861,20 @@ mod tests {
                          (SELECT k, y, CAST(x AS DECIMAL(3, 0)) + 0.5 AS d FROM t) \
                          GROUP BY k",
                         x_fails,
+                    ),
+                    (
+                        "SELECT k, SUM(p38 * CAST(10 AS DECIMAL(2, 0))), \
+                         SUM(q38 * CAST(10 AS DECIMAL(2, 0))) FROM t GROUP BY k",
+                        "Overflow happened on: 90000000000000000000000000000000000000 * 10",
+                    ),
+                    (
+                        "SELECT k, SUM(a20 * a20), SUM(b20 * b20) FROM t GROUP BY k",
+                        "Overflow happened on: 99999999999999999999 * 99999999999999999999",
+                    ),
+                    (
+                        "SELECT k, SUM(c37 + CAST(1 AS DECIMAL(11, 10))), \
+                         SUM(d37 + CAST(1 AS DECIMAL(11, 10))) FROM t GROUP BY k",
+                        "Overflow happened on: 9999999999999999999999999999999999999 * 10000000000",
                     ),
                 ] {
                     let lowered = assert_lowered_fails_like_datafusion_with_setup(
