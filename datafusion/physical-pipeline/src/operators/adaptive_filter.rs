@@ -20,63 +20,35 @@
 //!
 //! # Fallible conjuncts
 //!
-//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), must fail
-//! exactly when it fails in DataFusion. DataFusion evaluates the conjuncts in
-//! the order of the predicate, and the rows a fallible conjunct is evaluated
-//! on depend on the conjuncts before it (see
-//! [`PhysicalFilter`](super::filter::PhysicalFilter)). So a fallible conjunct
-//! never moves, and no conjunct moves across it: only runs of consecutive
-//! infallible conjuncts between fallible ones (the *segments* of the filter)
-//! are reordered. Within a segment the order has no observable effect: the
-//! conjuncts cannot fail, and the rows that the next fallible conjunct sees
-//! are those that no conjunct of the segment rejects, whatever their order.
-//! DuckDB is stricter and does not reorder at all if a conjunct can fail. A
-//! conjunct is considered infallible only if it is built from expressions
-//! that are known to never fail, see [`fallibility`].
+//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), is only
+//! evaluated on the rows that the conjuncts before it in the predicate select
+//! (see [`PhysicalFilter`](super::filter::PhysicalFilter)), so that guards
+//! such as `x <> 0 AND 10 / x > 1` keep it from the rows on which it fails. So
+//! a fallible conjunct never moves, and no conjunct moves across it: only runs
+//! of consecutive infallible conjuncts between fallible ones (the *segments*
+//! of the filter) are reordered. Within a segment the order has no observable
+//! effect: the conjuncts cannot fail, and the rows that the next fallible
+//! conjunct sees are those that no conjunct of the segment rejects, whatever
+//! their order. DuckDB is stricter and does not reorder at all if a conjunct
+//! can fail. A conjunct is considered infallible only if it is built from
+//! expressions that are known to never fail, see [`fallibility`].
 //!
-//! # Errors that depend on DataFusion's batches
+//! # Functions
 //!
-//! DataFusion decides per batch, from the share of rows that are left, on
-//! which rows it evaluates the conjuncts after the first one of an `AND`, and
-//! the right side of an `OR` (see `BinaryExpr::evaluate_conjunction` and
-//! `check_short_circuit`), if on any: on an empty batch, it evaluates the
-//! right side of an `OR`. Likewise, it evaluates a value after the first one
-//! of an `IN` list on all rows of a batch unless the values before it match
-//! all of them. If such an operand can fail on some rows and not on others,
-//! or fails whenever it is evaluated (e.g. a pattern that does not compile),
-//! whether a query fails depends on how the rows are split into batches,
-//! which differs between DataFusion and a pipeline, and so does an
-//! expression that fails on DataFusion's empty batches, which pipelines do
-//! not keep: see [`depends_on_batches`].
+//! Functions are opaque, and may fail on any row, but for the built-in scalar
+//! functions of DataFusion whose implementations are known (e.g. `date_part`,
+//! `substr` or `abs`, see `BuiltinFunction`), which sessions trust by default
+//! (see [`TrustedFunctions`]): they fail on the values of a row independently
+//! of the other rows, if at all, and only build strings from the bytes of
+//! their arguments (see `function_fallibility`). They are identified by their
+//! names and the names of the types that implement them, or, in the sessions
+//! that register the functions they trust, by these types, so that a
+//! user-defined function that shadows one (e.g. Spark's `abs`, of `SparkAbs`)
+//! stays opaque: the filter never moves it, nor any conjunct across it.
 //!
-//! DataFusion also evaluates each part of an expression on all rows of a
-//! batch before the next one: if several parts may fail, which error it
-//! raises first depends on its batches, unless all of them raise the same
-//! error. Arithmetic that fails on overflows does: `+`, `-` and `*` of
-//! decimals (which Arrow computes with overflow checks) only fail with an
-//! arithmetic overflow, so chains of them, e.g.
-//! `l_extendedprice * (1 - l_discount) * (1 + l_tax)`, do not depend on the
-//! batches (see [`Failures`]). Nor do the casts of numbers into decimals, which
-//! only fail on the values that overflow the decimal, e.g. the casts with which
-//! TPC-H Q11 compares the sums of its groups with the result of its scalar
-//! subquery.
-//!
-//! Functions are opaque, but for the built-in scalar functions of DataFusion
-//! whose implementations are known (e.g. `date_part`, `substr` or `abs`, see
-//! `BuiltinFunction`), which sessions trust by default (see
-//! [`TrustedFunctions`]): they fail on the values of a row independently of
-//! the other rows, if at all, in a single step over the rows of a batch, and
-//! only build strings from the bytes of their arguments (see
-//! `function_fallibility`). They are identified by their names and the names
-//! of the types that implement them, or, in the sessions that register the
-//! functions they trust, by these types, so that a user-defined function that
-//! shadows one (e.g. Spark's `abs`, of `SparkAbs`) stays opaque.
-//!
-//! String constants are copied for every row of a batch by whoever evaluates
-//! them, so they overflow the 32-bit offsets of strings on batches of enough
-//! rows: constants of a few bytes are only evaluated natively if the plan
-//! bounds the rows of the batches of DataFusion (see
-//! [`depends_on_batches_with_rows`]).
+//! The classification only decides which conjuncts the filter may reorder:
+//! neither the planner nor the other native operators judge how expressions
+//! may fail (see `docs/compatibility.md`).
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
@@ -94,17 +66,14 @@ use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, ScalarValue, config_err};
-use datafusion_expr::{ColumnarValue, Operator, ScalarUDF};
+use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_physical_expr::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
-    LikeExpr, Literal, NegativeExpr, NotExpr, TryCastExpr,
+    LikeExpr, Literal, NotExpr,
 };
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
-use datafusion_physical_expr::utils::split_disjunction;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
-
-use crate::chunk::DEFAULT_VECTOR_SIZE;
 
 /// Number of chunks a thread evaluates in the order of the predicate, to
 /// collect statistics, before it reorders the conjuncts for the first time.
@@ -417,7 +386,7 @@ pub fn fallibility(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility
 
 /// How evaluating `expr` can fail (see [`fallibility`]), if it may copy
 /// string and binary constants of at most `bytes` bytes for every row of the
-/// batches it is evaluated on (see `constant_bytes`).
+/// batches it is evaluated on (see `has_bounded_bytes`).
 fn fallibility_with(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
@@ -429,15 +398,9 @@ fn fallibility_with(
         .fold(node_fallibility(expr, schema, bytes), Ord::max)
 }
 
-/// Whether evaluating `expr` (on `schema`) can never fail, whatever the
-/// values of its input rows (see [`fallibility`]).
-pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    fallibility(expr, schema) == Fallibility::Infallible
-}
-
 /// How `expr` itself (not its children) can fail, if it may copy string and
 /// binary constants of at most `bytes` bytes for every row of the batches it is
-/// evaluated on (see [`depends_on_batches_with_rows`]).
+/// evaluated on (see `has_bounded_bytes`).
 fn node_fallibility(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
@@ -863,16 +826,6 @@ impl BuiltinFunction {
             _ => false,
         }
     }
-
-    /// Whether the function fails, if at all, with the same kind of error on
-    /// all rows (see `fails_with_one_kind`): all of them but `to_timestamp`
-    /// without formats, which fails to parse a string with a parse error of
-    /// Arrow (see `string_to_datetime`), but on a date beyond the range of
-    /// nanoseconds with an execution error. (With formats, it fails with
-    /// execution errors only, see `string_to_datetime_formatted`.)
-    fn fails_with_one_kind(self, args: &[Arc<dyn PhysicalExpr>]) -> bool {
-        self != Self::ToTimestamp || args.len() > 1
-    }
 }
 
 /// The type that implements `udf`.
@@ -915,9 +868,12 @@ fn implementation_name(udf: &ScalarUDF) -> String {
 
 /// The built-in scalar functions of DataFusion whose implementations a
 /// session trusts the native operators to know: a configuration extension of
-/// the session (see `BuiltinFunction` for the functions that they know). The
-/// calls of functions hold the configuration of the session that planned
-/// them, which tells which functions the session trusts:
+/// the session (see `BuiltinFunction` for the functions that they know).
+/// Trust only tells which calls [`fallibility`] knows (e.g. whether the
+/// filter may reorder a conjunct): the native operators evaluate the calls of
+/// every function, user-defined ones included, whether the session trusts
+/// them or not. The calls of functions hold the configuration of the session
+/// that planned them, which tells which functions the session trusts:
 ///
 /// * Without this extension (by default, e.g. in a session with the default
 ///   configuration, whose `PipelineQueryPlanner` plans with
@@ -928,7 +884,7 @@ fn implementation_name(udf: &ScalarUDF) -> String {
 ///   DataFusion that implement them (e.g. `DatePartFunc` and `SubstrFunc`),
 ///   as [`Self::new`] does for the functions it is given. A user-defined
 ///   function that shadows a built-in one under its name stays opaque (see
-///   [`depends_on_batches`]) if its type has another name, e.g. Spark's `abs`,
+///   [`fallibility`]) if its type has another name, e.g. Spark's `abs`,
 ///   of `SparkAbs`.
 /// * With this extension, a session trusts exactly the functions that it
 ///   registers, which are known in the plans of the session by the types that
@@ -1036,7 +992,7 @@ impl ConfigExtension for TrustedFunctions {
 /// How a call of a built-in function that the classification knows (see
 /// [`BuiltinFunction`]) can fail on the values of its arguments, if
 /// DataFusion supports their types (see [`fails_on_operand_types`]), or
-/// `None` if the function is opaque (see `is_opaque`): if it is not one of
+/// `None` if the function is opaque: if it is not one of
 /// them, or if its arguments
 ///
 /// * are not all flat (lists, structs, unions, maps, dictionaries or run-end
@@ -1058,9 +1014,7 @@ impl ConfigExtension for TrustedFunctions {
 /// * or, for some of them, are not constants, see below.
 ///
 /// The known functions compute the value of a row from the values of its
-/// arguments on the row, and fail, if at all, on these values only: their
-/// errors do not depend on the batches (unless several parts of an
-/// expression may fail with different errors, see [`Failures`]). These cannot
+/// arguments on the row, and fail, if at all, on these values only. These cannot
 /// fail on values, only on types or constant arguments that they do not
 /// support (e.g. `date_part('epoch', t)` of times, which
 /// `fails_on_operand_types` finds), whatever the rows:
@@ -1177,11 +1131,6 @@ fn is_flat(data_type: &DataType) -> bool {
         )
 }
 
-/// Whether `data_type` is a type of intervals or of durations.
-fn is_interval_or_duration(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Interval(_) | DataType::Duration(_))
-}
-
 /// Whether `to_timestamp_seconds` converts values of `data_type` into
 /// timestamps without failing: integers that `Int64` holds (all but
 /// `UInt64`) and nulls, which it casts into `Timestamp(Second, _)` (see
@@ -1260,19 +1209,6 @@ fn constant_pattern_fallibility(
         None => Fallibility::Infallible,
         Some(Ok(probe)) if !fails_on_one_row(&probe) => Fallibility::Infallible,
         Some(_) => Fallibility::PerRow,
-    }
-}
-
-/// Whether `expr` is a case-insensitive `LIKE` with a constant pattern.
-fn is_case_insensitive_constant_like(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    match expr.downcast_ref::<BinaryExpr>() {
-        Some(binary) => {
-            matches!(binary.op(), Operator::ILikeMatch | Operator::NotILikeMatch)
-                && is_constant(binary.right())
-        }
-        None => expr
-            .downcast_ref::<LikeExpr>()
-            .is_some_and(|like| like.case_insensitive() && is_constant(like.pattern())),
     }
 }
 
@@ -1484,152 +1420,6 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
             .is_ok_and(|minus_one| *divisor == minus_one)
 }
 
-/// Whether the errors of `expr` (on `schema`) may depend on how its input
-/// rows are split into batches, empty batches included.
-///
-/// DataFusion's `FilterExec` and `ProjectionExec` evaluate their expressions
-/// on every batch of their input, empty ones included. Native operators
-/// evaluate them on chunks, which are not DataFusion's batches, and never on
-/// empty chunks, so they only lower expressions for which this is `false`.
-/// It is `true` if:
-///
-/// * `expr` is volatile: it may observe how often it is evaluated, e.g. a
-///   function that counts its calls. It is never evaluated here either;
-/// * a part of `expr` is dynamic (see `PhysicalExpr::snapshot`), e.g. a
-///   `DynamicFilterPhysicalExpr`, which a `TopK` or a join updates during the
-///   execution: its children are the columns it reads, not the expression it
-///   evaluates, which is not known before the execution (nor evaluated here:
-///   it may be volatile);
-/// * several parts of `expr` may fail, with different errors (see
-///   [`Failures`]): which error DataFusion raises first depends on its
-///   batches, e.g. on a batch of `("1", 0)` then `("invalid", 1)` rows,
-///   `CAST(s AS INT) + 10 / x` fails to cast in DataFusion, but divides by
-///   zero on the first chunk of a pipeline (but parts that can only fail with
-///   arithmetic overflows, e.g. `a * (1 - b) * (1 + c)` of decimals, raise the
-///   same error whatever the batches);
-/// * a part of `expr` may fail with different kinds of errors on different
-///   rows (see `fails_with_one_kind`): a pipeline evaluates the chunks of a
-///   partition on several threads, and raises the error of the chunk that
-///   fails first, which may not be the first chunk that fails, e.g. on rows
-///   of `'3000-01-01'` then `'invalid'`, `to_timestamp(s)` fails in DataFusion
-///   on the date beyond the range of nanoseconds (an execution error), but
-///   may fail to parse `'invalid'` first in a pipeline (a parse error);
-/// * the right side of an `AND` or an `OR`, or a value after the first one
-///   of an `IN` list, may fail on some rows and not on others
-///   ([`Fallibility::PerRow`]). DataFusion evaluates the right side of an
-///   `AND` or an `OR` on all rows of a batch, on the rows that are left if at
-///   most 20% of them are, or on no row at all if none is left, and a value of
-///   an `IN` list on all rows of a batch unless the values before it match
-///   all of them, so whether it fails depends on the batches: e.g.
-///   `x <> 0 AND 10 / x > 1` fails on a batch with 25% of zeros, but not on a
-///   batch with 85% of them;
-/// * a part of `expr` fails whenever it is evaluated
-///   ([`Fallibility::Uniform`]), which may depend on the batches: e.g.
-///   DataFusion evaluates the right side of
-///   `x = 0 OR (y = 0 OR s ~ 'a{1000000}')` unless `x = 0` on all rows of the
-///   batch, and then `s ~ 'a{1000000}'` unless `y = 0` on all of them, so it
-///   fails on rows with `x = 0` then rows with `y = 0` in one batch, but not
-///   in two; and it evaluates the right side of an `OR` on empty batches;
-/// * a case-insensitive `LIKE` fails only on strings that are not all ASCII
-///   (see `constant_pattern_fallibility`): what Arrow considers ASCII depends
-///   on how the strings are represented, e.g. on the bytes beneath nulls,
-///   which DataFusion's `filter` keeps and the `take` of a native operator
-///   drops;
-/// * `expr` may fail and fails on an empty batch, e.g.
-///   `regexp_like(s, 'a{1000000}')` (unlike `regexp_count`, which only
-///   compiles its pattern if there are rows);
-/// * a part of `expr` other than a column produces lists with 32-bit offsets
-///   or run-end encoded arrays with run ends of less than 64 bits (at any
-///   depth): building them overflows their offsets or run ends beyond as many
-///   values in a batch as they can count, which nulls and runs reach without
-///   memory, e.g. when `CASE WHEN x THEN a ELSE b END` merges lists of `a` and
-///   of `b`, or when a constant list is broadcast to the rows of a batch, so
-///   whether it fails depends on the number of rows of the batches;
-/// * a part of `expr` other than a column copies values that its operands
-///   share between rows (the values of dictionaries and of runs, and what
-///   views point to), or a constant (that is not null, nor an empty string or
-///   binary, nor, if the batches are known to have few enough rows, a string
-///   or binary of at most [`MAX_CONSTANT_BYTES`] bytes, see
-///   [`depends_on_batches_with_rows`]), into strings or binaries with 32-bit
-///   offsets (at any depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a
-///   single string of 2 MiB, which 1024 rows, but not 1023, overflow, without
-///   taking more memory than one row, `CASE WHEN x THEN '…' END` copies a
-///   constant of 2 MiB for every row with `x`, and a constant of 1 KiB
-///   overflows on a batch of 2^21 rows;
-/// * `expr` is such a constant (e.g. a string that a projection outputs),
-///   which whoever evaluates it copies for every row of the batch;
-/// * a part of `expr` other than a column builds strings or binaries with
-///   32-bit offsets from more bytes than one of its operands has, e.g.
-///   `s || s`, which overflows on a batch of more than 1 GiB of strings, but
-///   not on a chunk of a quarter of its rows (but for casts into the type of
-///   their operand, functions that return parts of the values of their first
-///   argument, e.g. `substr`, and `CASE` expressions whose values come from a
-///   single column of their type, or are all constants that the batches can
-///   hold for each of their rows, see [`depends_on_batches_with_rows`], e.g.
-///   `CASE WHEN x THEN '1-URGENT' ELSE '2-HIGH' END`);
-/// * a part of `expr` negates an operand that may evaluate to a scalar on some
-///   batches and to an array on others (e.g. a `CASE`, which returns the
-///   value of a branch as is if all rows take it): `-` negates a scalar with
-///   overflow checks, but an array wrapping, so
-///   `-(CASE WHEN x THEN y ELSE -9223372036854775808 END)` fails on a chunk
-///   whose rows all take the `ELSE` branch, not on a batch with others;
-/// * a part of `expr` matches strings with patterns (`LIKE` or a regular
-///   expression) that may evaluate to a scalar on some batches and to an
-///   array on others (or such strings): Arrow compiles the case-insensitive
-///   patterns of an array, but may match a scalar one with ASCII strings
-///   without compiling it, so `s ILIKE CASE WHEN x THEN 'sss…' ELSE p END`
-///   fails on a batch with rows of both branches (the pattern is too big to
-///   compile), not on a chunk whose rows all take the first one;
-/// * a `CASE` of `expr` returns unions (at any depth): it merges the values of
-///   its branches with nulls for the rows that none takes, which Arrow cannot
-///   do with unions without nullable fields, so
-///   `CASE b WHEN true THEN u END` fails on a batch with rows of both kinds,
-///   not on chunks whose rows all take the branch, or none;
-/// * a part of `expr` is opaque to the classification (a function, but for
-///   the built-in functions it knows, see `function_fallibility`): whatever
-///   it returns, its implementation may fail depending on the rows it is
-///   evaluated on together, e.g. `repeat` fails on more than 4 GiB of strings
-///   in a batch (8192 rows of `repeat(s, 1 << 19)`), which a chunk of 2048
-///   rows does not reach, and a function that returns the lengths of `s || s`
-///   overflows the offsets of the strings it builds;
-/// * a part of `expr` that may fail is evaluated on, or produces,
-///   dictionaries, e.g. `CAST(d AS INT)`, which casts all values of the
-///   dictionary of `d`, even those that no row references (when DataFusion
-///   coalesces batches, e.g. the output of a `FilterExec`, it merges their
-///   dictionaries without these values, while chunks keep the dictionaries
-///   of their batches), or `CAST(s AS Dictionary(Int8, Utf8))`, which fails
-///   on batches with more than 128 distinct values.
-pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    depends_on_batches_with_rows(expr, schema, None)
-}
-
-/// Whether the errors of `expr` (on `schema`) may depend on how its input
-/// rows are split into batches, empty batches included (see
-/// [`depends_on_batches`]), knowing that DataFusion evaluates `expr` on
-/// batches of at most `max_rows` rows (if known): then string and binary
-/// constants of at most [`MAX_CONSTANT_BYTES`] bytes, of which these batches
-/// (and the chunks of the native operators) can hold a copy for each of their
-/// rows, do not depend on the batches. Otherwise, only null and empty ones do
-/// not, but for the parameters of functions that they do not copy (e.g. the
-/// part of `date_part`, see `function_fallibility`): e.g. a constant of 1 KiB
-/// overflows the 32-bit offsets of strings on a batch of 2^21 rows, which a
-/// batch without columns has without memory.
-pub fn depends_on_batches_with_rows(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    max_rows: Option<usize>,
-) -> bool {
-    let bytes = constant_bytes(max_rows);
-    if must_not_be_evaluated(expr) || failures_with(expr, schema, bytes).order_matters() {
-        return true;
-    }
-    let (fallibility, depends_on_batches) = analyze(expr, schema, bytes);
-    depends_on_batches
-        || (fallibility != Fallibility::Infallible && fails_without_rows(expr, schema))
-        // Whoever evaluates it copies it for every row of the batch.
-        || is_broadcast_constant(expr, schema, bytes)
-}
-
 /// Whether `expr` must not be evaluated before the execution (to classify
 /// it): a volatile part may observe how often it is evaluated (e.g. count
 /// its calls), and a dynamic part (see [`is_dynamic`]) evaluates an
@@ -1645,701 +1435,6 @@ fn must_not_be_evaluated(expr: &Arc<dyn PhysicalExpr>) -> bool {
 fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.exists(|expr| Ok(!matches!(expr.snapshot(), Ok(None))))
         .unwrap_or(true)
-}
-
-/// The parts of one or more expressions that may fail, on some rows or on all
-/// of them (see [`failures`]), and whether they may fail with different
-/// errors.
-///
-/// DataFusion evaluates each part of an expression on all rows of a batch
-/// before the next one, and each operator on a whole batch before the next
-/// one, while a pipeline evaluates them on chunks: if several parts may fail
-/// with different errors, which error comes first depends on the batches
-/// (see [`Self::order_matters`]).
-///
-/// But parts that can only fail with arithmetic overflows (see
-/// `fails_only_on_overflows`) raise the same error, whatever the batches
-/// and the order in which they are evaluated: `+`, `-` and `*` of decimals,
-/// which Arrow computes with overflow checks (also when DataFusion asks it to
-/// wrap on overflow, its default), and of integers that DataFusion asks to
-/// fail on overflow, fail with `ArrowError::ArithmeticOverflow` on the rows
-/// whose values overflow, and in no other way if Arrow supports the types of
-/// their operands (otherwise they fail whenever they are evaluated, see
-/// [`Fallibility::Uniform`]). So DataFusion fails on a batch with such a row
-/// exactly when a pipeline fails on the chunk with it, with an arithmetic
-/// overflow, which does not depend on the order in which the parts or the
-/// rows are evaluated: e.g. in the chains of TPC-H,
-/// `l_extendedprice * (1 - l_discount) * (1 + l_tax)`. So do the divisions of
-/// decimals by divisors that are not zero (Arrow rescales the dividend, which
-/// may overflow, and divides with checks, which only fail on divisors of `0`
-/// otherwise): by a constant that is not `0`, by a `NULLIF` of a value and
-/// `0`, or in a branch of a `CASE` that only takes the rows on which the
-/// divisor is not `0` (see `divides_by_non_zero`), e.g.
-/// `CASE WHEN b <> 0 THEN a / b END`.
-///
-/// The casts of numbers into decimals (see `casts_only_on_overflows`) fail
-/// likewise only on the rows whose values overflow, whatever the batches: on
-/// the values that the decimal cannot hold, e.g. the sums of the groups of
-/// TPC-H Q11, which it casts into the type in which it compares them with the
-/// result of its scalar subquery, `CAST(sum(...) AS Decimal128(38, 15))`.
-/// Arrow reports the overflow of a value whose rescaled integer overflows the
-/// integer of the decimal as a cast error (`Cannot cast to Decimal128(38, 15).
-/// Overflowing on ...`), and of a value that only exceeds the precision of the
-/// decimal as an invalid argument (`... is too large to store in a Decimal128
-/// of precision 38 ...`): as the arithmetic overflow that a pipeline raises
-/// first may be of another row than in DataFusion, and name other values, the
-/// overflow of a cast may be of another row, and so be reported as the other
-/// one, but it is the overflow of a value of the cast. It is not an arithmetic
-/// overflow, though: if such casts and other parts may fail, which error comes
-/// first depends on the batches.
-///
-/// And a pipeline evaluates the chunks of a partition of DataFusion on
-/// several threads, so it raises the error of the chunk that fails first,
-/// which may be any chunk that fails, while DataFusion raises the error of the
-/// first row of the partition that fails: even a single part that may fail
-/// with different kinds of errors on different rows (see
-/// `fails_with_one_kind`), e.g. `to_timestamp(s)`, which fails to parse a
-/// string with a parse error, but on a date beyond the range of nanoseconds
-/// with an execution error, raises an error whose kind depends on the
-/// threads.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Failures {
-    /// The number of parts that may fail.
-    parts: usize,
-    /// The number of the parts that may fail with other errors than arithmetic
-    /// overflows and overflows of casts into decimals.
-    others: usize,
-    /// The number of the parts that may fail with different kinds of errors
-    /// on different rows.
-    mixed: usize,
-    /// The number of the parts that can only fail on the values that overflow
-    /// the decimals that they cast them into (see `casts_only_on_overflows`).
-    casts: usize,
-}
-
-impl Failures {
-    /// No part may fail.
-    pub const NONE: Self = Self {
-        parts: 0,
-        others: 0,
-        mixed: 0,
-        casts: 0,
-    };
-
-    /// A part that can only fail with arithmetic overflows.
-    pub const OVERFLOW: Self = Self {
-        parts: 1,
-        others: 0,
-        mixed: 0,
-        casts: 0,
-    };
-
-    /// A cast into a decimal that can only fail on the values that overflow
-    /// the decimal (see `casts_only_on_overflows`).
-    pub const CAST_OVERFLOW: Self = Self {
-        parts: 1,
-        others: 0,
-        mixed: 0,
-        casts: 1,
-    };
-
-    /// A part that may fail with another error, the same on all rows.
-    pub const ANY: Self = Self {
-        parts: 1,
-        others: 1,
-        mixed: 0,
-        casts: 0,
-    };
-
-    /// A part that may fail with different kinds of errors on different rows,
-    /// e.g. a source that may fail to read or to decode its rows.
-    pub const MIXED: Self = Self {
-        parts: 1,
-        others: 1,
-        mixed: 1,
-        casts: 0,
-    };
-
-    /// The number of parts that may fail.
-    pub fn parts(&self) -> usize {
-        self.parts
-    }
-
-    /// Whether no part may fail.
-    pub fn is_none(&self) -> bool {
-        self.parts == 0
-    }
-
-    /// Whether all parts that may fail can only fail with overflows:
-    /// arithmetic overflows, or overflows of the values that they cast into
-    /// decimals (also if no part may fail).
-    pub fn only_overflows(&self) -> bool {
-        self.others == 0
-    }
-
-    /// Whether which error DataFusion raises first may depend on the order in
-    /// which it evaluates the parts, and so on its batches: several parts may
-    /// fail, not all of them only with arithmetic overflows, or not all of
-    /// them only with overflows of casts into decimals. Or which kind of error
-    /// a pipeline raises first may depend on the order in which its threads
-    /// evaluate the chunks of a partition: a part may fail with different
-    /// kinds of errors on different rows.
-    pub fn order_matters(&self) -> bool {
-        (self.parts > 1 && self.others > 0)
-            || self.mixed > 0
-            || (self.casts > 0 && self.parts > self.casts)
-    }
-
-    /// The parts of `self` and of `other`.
-    #[must_use]
-    pub fn and(self, other: Self) -> Self {
-        Self {
-            parts: self.parts.saturating_add(other.parts),
-            others: self.others.saturating_add(other.others),
-            mixed: self.mixed.saturating_add(other.mixed),
-            casts: self.casts.saturating_add(other.casts),
-        }
-    }
-}
-
-/// The parts of `expr` that may fail (on some rows or on all of them), see
-/// [`Failures`]: if several may fail with different errors, which error
-/// DataFusion raises first depends on its batches, as it evaluates each part
-/// on all rows of a batch before the next one, while a pipeline evaluates each
-/// part on a chunk. A `CASE` does not fail itself, but its branches may.
-pub fn failures(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Failures {
-    failures_with(expr, schema, 0)
-}
-
-/// The parts of `expr` that may fail (see [`failures`]), knowing that
-/// DataFusion evaluates `expr` on batches of at most `max_rows` rows (if
-/// known, see [`depends_on_batches_with_rows`]).
-pub fn failures_with_rows(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    max_rows: Option<usize>,
-) -> Failures {
-    failures_with(expr, schema, constant_bytes(max_rows))
-}
-
-/// The parts of `expr` that may fail, if it may copy constants of at most
-/// `bytes` bytes for every row.
-fn failures_with(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    bytes: usize,
-) -> Failures {
-    failures_where(expr, schema, bytes, &[])
-}
-
-/// The parts of `expr` that may fail (see [`failures_with`]), evaluated on
-/// rows on which the expressions `non_zero` are not `0` (or are null): a
-/// division of decimals by one of them can only overflow (see
-/// `divides_by_non_zero`).
-fn failures_where(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    bytes: usize,
-    non_zero: &[&Arc<dyn PhysicalExpr>],
-) -> Failures {
-    if let Some(case) = expr.downcast_ref::<CaseExpr>()
-        && case.expr().is_none()
-    {
-        return case_failures(case, schema, bytes, non_zero);
-    }
-    let itself = if expr.is::<CaseExpr>() {
-        Failures::NONE
-    } else {
-        match node_fallibility(expr, schema, bytes) {
-            Fallibility::Infallible => Failures::NONE,
-            Fallibility::PerRow if fails_only_on_overflows(expr, schema, non_zero) => {
-                Failures::OVERFLOW
-            }
-            Fallibility::PerRow if casts_only_on_overflows(expr, schema) => {
-                Failures::CAST_OVERFLOW
-            }
-            Fallibility::PerRow if !fails_with_one_kind(expr, schema) => Failures::MIXED,
-            _ => Failures::ANY,
-        }
-    };
-    expr.children()
-        .into_iter()
-        .map(|child| failures_where(child, schema, bytes, non_zero))
-        .fold(itself, Failures::and)
-}
-
-/// The parts of `case`, a `CASE` without a base expression (which does not
-/// fail itself), that may fail on rows on which the expressions `non_zero`
-/// are not `0` (see [`failures_where`]). DataFusion evaluates every `WHEN` on
-/// the rows that no `WHEN` before it matched (on which it is false or null),
-/// its `THEN` only on the rows that it matches (see
-/// `CaseExpr::case_when_no_expr` and `CaseExpr::expr_or_expr`), and the
-/// `ELSE` on the rows that no `WHEN` matched: e.g. the `THEN` of
-/// `WHEN b <> 0` and the branches after `WHEN b = 0` only take rows on which
-/// `b` is not `0`.
-fn case_failures(
-    case: &CaseExpr,
-    schema: &Schema,
-    bytes: usize,
-    non_zero: &[&Arc<dyn PhysicalExpr>],
-) -> Failures {
-    let mut unmatched = non_zero.to_vec();
-    let mut failures = Failures::NONE;
-    for (when, then) in case.when_then_expr() {
-        failures = failures.and(failures_where(when, schema, bytes, &unmatched));
-        let mut matched = unmatched.clone();
-        matched.extend(non_zero_where_true(when));
-        failures = failures.and(failures_where(then, schema, bytes, &matched));
-        unmatched.extend(non_zero_where_not_true(when));
-    }
-    match case.else_expr() {
-        Some(else_expr) => {
-            failures.and(failures_where(else_expr, schema, bytes, &unmatched))
-        }
-        None => failures,
-    }
-}
-
-/// The expressions that are not `0` (nor null) on the rows on which
-/// `predicate` is true: the operands compared with a constant `0` by the
-/// conjuncts of `predicate` that are `<>`, `<` or `>`, e.g. `b` for
-/// `a > 1 AND b <> 0`.
-fn non_zero_where_true(predicate: &Arc<dyn PhysicalExpr>) -> Vec<&Arc<dyn PhysicalExpr>> {
-    split_conjunction(predicate)
-        .into_iter()
-        .filter_map(|conjunct| {
-            let binary = conjunct.downcast_ref::<BinaryExpr>()?;
-            match binary.op() {
-                Operator::NotEq | Operator::Lt | Operator::Gt => {
-                    compared_with_zero(binary)
-                }
-                _ => None,
-            }
-        })
-        .collect()
-}
-
-/// The expressions that are not `0` (or are null) on the rows on which
-/// `predicate` is false or null: the operands compared with a constant `0` by
-/// the disjuncts of `predicate` that are `=`, e.g. `b` for `b = 0 OR a > 1`.
-fn non_zero_where_not_true(
-    predicate: &Arc<dyn PhysicalExpr>,
-) -> Vec<&Arc<dyn PhysicalExpr>> {
-    split_disjunction(predicate)
-        .into_iter()
-        .filter_map(|disjunct| {
-            let binary = disjunct.downcast_ref::<BinaryExpr>()?;
-            (binary.op() == &Operator::Eq)
-                .then(|| compared_with_zero(binary))
-                .flatten()
-        })
-        .collect()
-}
-
-/// The operand that the comparison `binary` compares with a constant `0`, if
-/// one of its operands is one.
-fn compared_with_zero(binary: &BinaryExpr) -> Option<&Arc<dyn PhysicalExpr>> {
-    if is_zero_constant(binary.right()) {
-        Some(binary.left())
-    } else if is_zero_constant(binary.left()) {
-        Some(binary.right())
-    } else {
-        None
-    }
-}
-
-/// The value of `expr`, if it is a constant (see `is_constant`, e.g. a
-/// literal that DataFusion casts into the type of the other operand of an
-/// operation).
-fn constant_value(expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
-    if !is_constant(expr) {
-        return None;
-    }
-    let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-    match expr.evaluate(&batch) {
-        Ok(ColumnarValue::Scalar(value)) => Some(value),
-        _ => None,
-    }
-}
-
-/// Whether `expr` is a constant `0` (see `constant_value`).
-fn is_zero_constant(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    constant_value(expr).is_some_and(|value| {
-        ScalarValue::new_zero(&value.data_type()).is_ok_and(|zero| value == zero)
-    })
-}
-
-/// Whether the divisor `divisor` is not `0` on the rows on which it divides,
-/// on which the expressions `non_zero` are not `0` (see [`failures_where`]),
-/// or null (Arrow does not divide the rows of nulls): a constant that is
-/// neither null nor `0`, a `NULLIF` of a value and a constant `0` (a built-in
-/// function that the session trusts, see [`BuiltinFunction`]), which is null
-/// where the value is `0`, or one of `non_zero`, e.g. `b` in the `THEN` of
-/// `CASE WHEN b <> 0 THEN a / b END` (up to the casts that keep the values
-/// that are not `0`, see `without_exact_casts`, e.g. the cast of an integer
-/// `n` into a decimal in `CASE WHEN n <> 0 THEN a / n END`).
-fn divides_by_non_zero(
-    divisor: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    non_zero: &[&Arc<dyn PhysicalExpr>],
-) -> bool {
-    if let Some(value) = constant_value(divisor) {
-        return !value.is_null()
-            && ScalarValue::new_zero(&value.data_type()).is_ok_and(|zero| value != zero);
-    }
-    if let Some(function) = divisor.downcast_ref::<ScalarFunctionExpr>()
-        && BuiltinFunction::of(function) == Some(BuiltinFunction::NullIf)
-        && let [_, compared] = function.args()
-        && is_zero_constant(compared)
-    {
-        return true;
-    }
-    let divisor = without_exact_casts(divisor, schema);
-    non_zero
-        .iter()
-        .any(|guarded| without_exact_casts(guarded, schema) == divisor)
-}
-
-/// `expr` (on `schema`) without the casts at its top that turn every value
-/// that is not `0` into a value that is not `0` (or fail): of integers into
-/// integers or decimals, and of decimals into decimals of at least their
-/// scale, which Arrow converts exactly, or fails (see
-/// `cast_decimal_to_decimal`).
-fn without_exact_casts<'a>(
-    expr: &'a Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-) -> &'a dyn PhysicalExpr {
-    let mut expr = expr;
-    while let Some(cast) = expr.downcast_ref::<CastExpr>()
-        && let Ok(from) = cast.expr().data_type(schema)
-    {
-        let to = cast.cast_type();
-        let exact = match (decimal_parts(&from), decimal_parts(to)) {
-            (Some((_, _, from_scale)), Some((_, _, to_scale))) => from_scale <= to_scale,
-            (None, _) => from.is_integer() && (to.is_integer() || to.is_decimal()),
-            _ => false,
-        };
-        if !exact {
-            break;
-        }
-        expr = cast.expr();
-    }
-    expr.as_ref()
-}
-
-/// The number of the parts of `expr` that may fail (on some rows or on all of
-/// them), see [`failures`], whatever their errors: more than one may fail
-/// with different errors, which DataFusion raises in an order that depends
-/// on its batches, unless they can all only fail with arithmetic overflows
-/// (see [`Failures::order_matters`]), which this does not tell.
-pub fn failing_parts(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
-    failures(expr, schema).parts()
-}
-
-/// Whether `expr`, which may fail on some rows (and not whenever it is
-/// evaluated, see [`Fallibility::Uniform`]), can only fail with arithmetic
-/// overflows (`ArrowError::ArithmeticOverflow`), on rows on which the
-/// expressions `non_zero` are not `0` (see [`failures_where`]): `+`, `-` and
-/// `*` of decimals of the same width, which Arrow computes with overflow
-/// checks whether DataFusion asks it to wrap on overflow or not (see
-/// `decimal_op`), and of integers of the same type that DataFusion asks to
-/// fail on overflow (with `add_checked`, `sub_checked` and `mul_checked`; it
-/// wraps by default, which is infallible), and the divisions of decimals of
-/// the same width by divisors that are not `0` (see `divides_by_non_zero`):
-/// Arrow rescales the dividend with overflow checks, and divides with
-/// `div_checked` (or `scaled_div`), which fails with
-/// `ArrowError::DivideByZero` on a divisor of `0`, and with overflows
-/// otherwise. If Arrow supports the types of their operands (see
-/// [`fails_on_operand_types`]: e.g. Arrow fails to multiply decimals whose
-/// scales add up to more than the largest scale, whenever it multiplies
-/// them). Arrow only applies them to the rows that are not null.
-fn fails_only_on_overflows(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    non_zero: &[&Arc<dyn PhysicalExpr>],
-) -> bool {
-    let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
-        return false;
-    };
-    let (Ok(left), Ok(right)) = (
-        binary.left().data_type(schema),
-        binary.right().data_type(schema),
-    ) else {
-        return false;
-    };
-    let same_numbers = match (decimal_parts(&left), decimal_parts(&right)) {
-        (Some((left_bytes, ..)), Some((right_bytes, ..))) => left_bytes == right_bytes,
-        (None, None) => left.is_integer() && left == right,
-        _ => false,
-    };
-    let overflows = match binary.op() {
-        Operator::Plus | Operator::Minus | Operator::Multiply => true,
-        Operator::Divide => {
-            left.is_decimal() && divides_by_non_zero(binary.right(), schema, non_zero)
-        }
-        _ => false,
-    };
-    overflows && same_numbers && !fails_on_operand_types(expr, schema)
-}
-
-/// Whether `expr`, which may fail on some rows (and not whenever it is
-/// evaluated, see [`Fallibility::Uniform`]), is a cast of numbers (integers,
-/// floating point numbers or decimals, not dictionaries of them) into a
-/// decimal, which can only fail on the values that overflow the decimal (see
-/// [`Failures`]): Arrow casts every value that is not null on its own (see
-/// `cast_integer_to_decimal`, `cast_floating_point_to_decimal` and
-/// `cast_decimal_to_decimal`), and fails on the values whose rescaled integers
-/// overflow the integer of the decimal (`Overflowing on`, also the floating
-/// point numbers that are not finite), or exceed its precision (`too large to
-/// store` or `too small to store`), whatever the other rows. If Arrow
-/// supports the types (see [`fails_on_operand_types`]: e.g. it fails to
-/// rescale decimals by more digits than their integers hold whenever it casts
-/// them).
-fn casts_only_on_overflows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    let Some(cast) = expr.downcast_ref::<CastExpr>() else {
-        return false;
-    };
-    let Ok(from) = cast.expr().data_type(schema) else {
-        return false;
-    };
-    (from.is_integer() || from.is_floating() || from.is_decimal())
-        && cast.cast_type().is_decimal()
-        && !fails_on_operand_types(expr, schema)
-}
-
-/// Whether `expr` itself, which may fail on some rows (see
-/// [`Fallibility::PerRow`]), fails with the same kind of error on all the
-/// rows that it fails on (see [`Failures`]): a pipeline evaluates the chunks
-/// of a partition on several threads, and raises the error of the chunk that
-/// fails first, whose kind must not depend on which chunk that is. So do:
-///
-/// * the parts that can only fail with arithmetic overflows (see
-///   `fails_only_on_overflows`), negations (which Arrow computes wrapping, but
-///   for scalars, with overflow checks), `TRY_CAST`s (on types that Arrow does
-///   not cast), matches of patterns of each row (that do not compile),
-///   concatenations of strings (whose offsets overflow), and additions and
-///   subtractions of dates, times, timestamps, intervals and durations (each
-///   of which Arrow computes with one kind of check, e.g. `Date arithmetic
-///   overflow` compute errors for a date and an interval, see `date_op`);
-/// * divisions and remainders, see `divides_with_one_kind`;
-/// * the casts that only fail with cast errors, see `casts_with_one_kind`;
-/// * the built-in functions that the classification knows, but for
-///   `to_timestamp` without formats (see `BuiltinFunction::fails_with_one_kind`).
-///
-/// Not the others (e.g. arithmetic on dates or intervals): conservatively,
-/// they may fail with different kinds of errors.
-fn fails_with_one_kind(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    use Operator::*;
-    if fails_only_on_overflows(expr, schema, &[])
-        || expr.is::<NegativeExpr>()
-        || expr.is::<TryCastExpr>()
-        || expr.is::<LikeExpr>()
-    {
-        return true;
-    }
-    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
-        let is_temporal = |operand: &Arc<dyn PhysicalExpr>| {
-            operand.data_type(schema).is_ok_and(|data_type| {
-                data_type.is_temporal() || is_interval_or_duration(&data_type)
-            })
-        };
-        return match binary.op() {
-            LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch | RegexMatch
-            | RegexIMatch | RegexNotMatch | RegexNotIMatch | StringConcat => true,
-            Plus | Minus => is_temporal(binary.left()) || is_temporal(binary.right()),
-            Divide | Modulo => divides_with_one_kind(binary, schema),
-            _ => false,
-        };
-    }
-    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
-        return cast
-            .expr()
-            .data_type(schema)
-            .is_ok_and(|from| casts_with_one_kind(&from, cast.cast_type()));
-    }
-    if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        return BuiltinFunction::of(function)
-            .is_some_and(|builtin| builtin.fails_with_one_kind(function.args()));
-    }
-    false
-}
-
-/// Whether the division or the remainder `binary` fails, if at all, with the
-/// same kind of error on all rows (see `fails_with_one_kind`). Arrow divides
-/// integers with checks, which fail with `ArrowError::DivideByZero` on a
-/// divisor of `0`, but with `ArrowError::ArithmeticOverflow` on the smallest
-/// integer divided by `-1`: only on one of them if the divisor is a
-/// constant, or the dividend a constant that is not negative, or unsigned. It
-/// computes
-/// the remainders of integers wrapping, but for divisors of `0`. And it
-/// rescales decimals before it divides them, which overflows, so only a
-/// constant divisor that is not `0` divides them with one kind of error (the
-/// divisions of decimals by divisors that are not `0` only overflow, see
-/// `fails_only_on_overflows`).
-fn divides_with_one_kind(binary: &BinaryExpr, schema: &Schema) -> bool {
-    let (Ok(left), Ok(right)) = (
-        binary.left().data_type(schema),
-        binary.right().data_type(schema),
-    ) else {
-        return false;
-    };
-    let constant = constant_value;
-    if left.is_integer() && right.is_integer() {
-        return binary.op() == &Operator::Modulo
-            || left.is_unsigned_integer()
-            || constant(binary.right()).is_some()
-            || constant(binary.left()).is_some_and(|dividend| {
-                ScalarValue::new_zero(&left).is_ok_and(|zero| {
-                    dividend
-                        .partial_cmp(&zero)
-                        .is_some_and(|order| order.is_ge())
-                })
-            });
-    }
-    left.is_decimal()
-        && right.is_decimal()
-        && constant(binary.right()).is_some_and(|divisor| {
-            !divisor.is_null()
-                && ScalarValue::new_zero(&right).is_ok_and(|zero| divisor != zero)
-        })
-}
-
-/// Whether Arrow fails to cast values of `from` into `to`, if at all, with
-/// cast errors only (`ArrowError::CastError`): numbers into numbers (see
-/// `cast_numeric_arrays`), strings into numbers, booleans, dates and times
-/// (see `parse_string`), and unions whose children it so casts (it casts the
-/// child of the type of `to`, or of another, see `union_extract_by_type`).
-/// And numbers into strings, which can only fail if their offsets overflow.
-/// Conservatively, not the other casts, e.g. of strings into decimals or
-/// timestamps, nor of decimals.
-fn casts_with_one_kind(from: &DataType, to: &DataType) -> bool {
-    let is_number =
-        |data_type: &DataType| data_type.is_integer() || data_type.is_floating();
-    if let DataType::Union(fields, _) = from {
-        return fields.iter().all(|(_, field)| {
-            field.data_type() == to || casts_with_one_kind(field.data_type(), to)
-        });
-    }
-    (is_number(from) && (is_number(to) || is_string(to)))
-        || (is_string(from)
-            && (is_number(to)
-                || matches!(
-                    to,
-                    DataType::Boolean
-                        | DataType::Date32
-                        | DataType::Date64
-                        | DataType::Time32(_)
-                        | DataType::Time64(_)
-                )))
-}
-
-/// The fallibility of `expr` (see [`fallibility`]), and whether its errors
-/// depend on the batches it is evaluated on, but for failures on empty
-/// batches (see [`depends_on_batches`]). Each node is classified once.
-fn analyze(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    bytes: usize,
-) -> (Fallibility, bool) {
-    let node = node_fallibility(expr, schema, bytes);
-    let children = expr.children();
-    let analyzed = children
-        .iter()
-        .map(|child| analyze(child, schema, bytes))
-        .collect::<Vec<_>>();
-    let fallibility = analyzed
-        .iter()
-        .map(|&(fallibility, _)| fallibility)
-        .fold(node, Ord::max);
-    let conditional = conditional_operands(expr);
-    let depends_on_batches = analyzed.iter().any(|&(_, depends)| depends)
-        // It fails whenever DataFusion evaluates it.
-        || node == Fallibility::Uniform
-        // A case-insensitive `LIKE` that only fails on strings that are not
-        // all ASCII: what Arrow considers ASCII depends on the representation
-        // of the strings (e.g. the bytes beneath nulls, which `filter` keeps
-        // and `take` drops).
-        || (node == Fallibility::PerRow && is_case_insensitive_constant_like(expr))
-        // DataFusion evaluates an operand that may fail on some rows on rows
-        // that depend on the batch.
-        || children.iter().zip(&analyzed).any(|(child, &(fallibility, _))| {
-            fallibility == Fallibility::PerRow
-                && conditional.iter().any(|operand| Arc::ptr_eq(operand, child))
-        })
-        // It builds lists with 32-bit offsets or narrow run ends (a column
-        // only passes its own on), which overflow beyond as many values in a
-        // batch as they can count, so whether it fails depends on the number
-        // of rows of the batches.
-        || (!expr.is::<Column>()
-            && expr
-                .data_type(schema)
-                .is_ok_and(|data_type| contains_narrow_lengths(&data_type)))
-        // It copies values that its operands share between rows, or a
-        // constant, into arrays whose 32-bit offsets overflow beyond 2 GiB of
-        // bytes, or builds such arrays from more bytes than an operand has.
-        || expands_values(expr, schema, bytes)
-        || builds_byte_offsets(expr, schema, bytes)
-        // It is opaque (e.g. a function): whatever it returns, its
-        // implementation may fail depending on the rows it is evaluated on
-        // together (e.g. on the size of the values it builds, which
-        // DataFusion may limit per batch, or which overflow their offsets).
-        || is_opaque(expr, schema, bytes)
-        // `-` negates a scalar with overflow checks, but an array wrapping
-        // (see `NegativeExpr`): of an operand that may be a scalar on some
-        // batches and an array on others, whether it fails depends on them.
-        || expr
-            .downcast_ref::<NegativeExpr>()
-            .is_some_and(|negative| may_change_shape(negative.arg()))
-        // Arrow matches a scalar pattern and an array of patterns differently
-        // (it compiles case-insensitive patterns of an array, but may match a
-        // scalar one with ASCII strings without compiling it, and compiles a
-        // scalar pattern even without rows): of operands that may be a scalar
-        // on some batches and an array on others, whether it fails depends on
-        // them.
-        || (matches_patterns(expr) && expr.children().into_iter().any(may_change_shape))
-        // `CASE` merges the values of its branches with nulls for the rows
-        // that none takes, which Arrow cannot do with unions without nullable
-        // fields (a union has no nulls of its own): whether it merges any
-        // depends on the batch (all rows of a chunk may take a branch, or
-        // none).
-        || (expr.is::<CaseExpr>()
-            && expr
-                .data_type(schema)
-                .is_ok_and(|data_type| contains_unions(&data_type)))
-        // It may fail and evaluates or produces dictionaries.
-        || (node != Fallibility::Infallible
-            && children.iter().copied().chain([expr]).any(|expr| {
-                expr.data_type(schema)
-                    .is_ok_and(|data_type| contains_dictionaries(&data_type))
-            }));
-    (fallibility, depends_on_batches)
-}
-
-/// Whether `expr` is opaque to the classification: not one of the
-/// expressions of DataFusion whose evaluation it knows (columns, literals,
-/// the results of scalar subqueries, `BinaryExpr`, `LIKE`, casts, `NOT`,
-/// negations, `IS [NOT] NULL`, `IN` lists, `CASE`, and the calls of built-in
-/// functions that it knows, see [`function_fallibility`]), which apply
-/// Arrow's kernels to their operands, e.g. another function, whose
-/// implementation it cannot know (e.g. a function that returns integers may
-/// build strings to compute them).
-fn is_opaque(expr: &Arc<dyn PhysicalExpr>, schema: &Schema, bytes: usize) -> bool {
-    if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>() {
-        return function_fallibility(function, schema, bytes).is_none();
-    }
-    !(expr.is::<Column>()
-        || expr.is::<Literal>()
-        || expr.is::<ScalarSubqueryExpr>()
-        || expr.is::<BinaryExpr>()
-        || expr.is::<LikeExpr>()
-        || expr.is::<CastExpr>()
-        || expr.is::<TryCastExpr>()
-        || expr.is::<NotExpr>()
-        || expr.is::<NegativeExpr>()
-        || expr.is::<IsNullExpr>()
-        || expr.is::<IsNotNullExpr>()
-        || expr.is::<InListExpr>()
-        || expr.is::<CaseExpr>())
 }
 
 /// Whether `expr` may evaluate to a scalar on some batches and to an array
@@ -2358,61 +1453,6 @@ fn may_change_shape(expr: &Arc<dyn PhysicalExpr>) -> bool {
                 && expr.children().into_iter().all(is_constant_tree)))
     })
     .unwrap_or(true)
-}
-
-/// Whether arrays of `data_type` contain unions, at any depth.
-fn contains_unions(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Union(..) => true,
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => contains_unions(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| contains_unions(field.data_type())),
-        DataType::Dictionary(_, values) => contains_unions(values),
-        DataType::RunEndEncoded(_, values) => contains_unions(values.data_type()),
-        _ => false,
-    }
-}
-
-/// Whether `expr` matches strings with patterns: `LIKE` and the regular
-/// expression operators.
-fn matches_patterns(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    use Operator::*;
-    expr.is::<LikeExpr>()
-        || expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
-            matches!(
-                binary.op(),
-                LikeMatch
-                    | ILikeMatch
-                    | NotLikeMatch
-                    | NotILikeMatch
-                    | RegexMatch
-                    | RegexIMatch
-                    | RegexNotMatch
-                    | RegexNotIMatch
-            )
-        })
-}
-
-/// The operands of `expr` that DataFusion evaluates on rows that depend on
-/// the batch: the right side of an `AND` or an `OR`, and the values after
-/// the first one of an `IN` list.
-fn conditional_operands(expr: &Arc<dyn PhysicalExpr>) -> &[Arc<dyn PhysicalExpr>] {
-    if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
-        match binary.op() {
-            Operator::And | Operator::Or => std::slice::from_ref(binary.right()),
-            _ => &[],
-        }
-    } else if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
-        in_list.list().get(1..).unwrap_or_default()
-    } else {
-        &[]
-    }
 }
 
 /// Whether arrays of `data_type` contain, at any depth, lists with 32-bit
@@ -2617,28 +1657,13 @@ fn is_broadcast_constant(
 /// Copied for every row of a batch, a constant overflows the 32-bit offsets of
 /// strings (2 GiB) on batches of enough rows, e.g. a constant of 1 KiB on a
 /// batch of 2^21 rows (which a batch without columns has without memory), but
-/// not on the chunks of a pipeline. So the native operators only evaluate
-/// such constants (but null or empty ones) if the plan bounds the rows of the
-/// batches of DataFusion, and only as many bytes as these batches hold for
-/// each of their rows (see `constant_bytes` and
-/// [`depends_on_batches_with_rows`]).
+/// not on the chunks of a pipeline. [`fallibility`] judges that the
+/// expressions that copy such constants (but null or empty ones) may fail
+/// on some rows.
 pub const MAX_CONSTANT_BYTES: usize = 1024;
 
-/// The most bytes of a string or binary constant that an expression may copy
-/// for every row of batches of at most `max_rows` rows without depending on
-/// them (see [`depends_on_batches_with_rows`]): none if `max_rows` is not
-/// known, otherwise at most [`MAX_CONSTANT_BYTES`], and few enough for the
-/// 32-bit offsets of strings (`i32::MAX` bytes) of `max_rows` copies, and of
-/// the copies for the rows of a chunk (at most [`DEFAULT_VECTOR_SIZE`] rows).
-fn constant_bytes(max_rows: Option<usize>) -> usize {
-    max_rows.map_or(0, |rows| {
-        let rows = rows.max(DEFAULT_VECTOR_SIZE);
-        (i32::MAX as usize / rows).min(MAX_CONSTANT_BYTES)
-    })
-}
-
 /// Whether `expr` is a literal of bounded size: a null, or a string or binary
-/// of at most `bytes` bytes (see `constant_bytes`), which the batches it is
+/// of at most `bytes` bytes, which the batches it is
 /// evaluated on can hold for each of their rows, so that copying it for every
 /// row does not depend on the batches.
 fn has_bounded_bytes(expr: &Arc<dyn PhysicalExpr>, bytes: usize) -> bool {
@@ -2795,51 +1820,17 @@ fn contains_byte_offsets(data_type: &DataType) -> bool {
     }
 }
 
-/// Whether arrays of `data_type` contain dictionaries, at any depth.
-fn contains_dictionaries(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Dictionary(..) => true,
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => contains_dictionaries(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| contains_dictionaries(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| contains_dictionaries(field.data_type())),
-        DataType::RunEndEncoded(_, values) => contains_dictionaries(values.data_type()),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use arrow::datatypes::{DataType, Field, SchemaRef};
 
+    use datafusion_expr::ColumnarValue;
+
     use crate::operators::filter::test_support::{
-        dynamic_filter, physical_expr, physical_expr_in, trusting,
+        physical_expr, physical_expr_in, trusting,
     };
-
-    /// The most rows of the batches of DataFusion in the tests that know them
-    /// (DataFusion's default batch size), which hold a constant of
-    /// `MAX_CONSTANT_BYTES` bytes for each of their rows.
-    const ROWS: Option<usize> = Some(8192);
-
-    /// Whether the errors of `expr` depend on batches of at most `ROWS` rows.
-    fn depends(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        depends_on_batches_with_rows(expr, schema, ROWS)
-    }
-
-    /// How `expr` can fail on batches of at most `ROWS` rows.
-    fn fallibility_on_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Fallibility {
-        fallibility_with(expr, schema, constant_bytes(ROWS))
-    }
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2983,11 +1974,6 @@ mod tests {
         ] {
             let expr = physical_expr(predicate, &schema);
             assert_eq!(fallibility(&expr, &schema), expected, "{predicate}");
-            assert_eq!(
-                is_infallible(&expr, &schema),
-                expected == Infallible,
-                "{predicate}"
-            );
         }
         assert_eq!(
             fallible_conjuncts(
@@ -3026,17 +2012,6 @@ mod tests {
             let expr = physical_expr(&predicate, &schema);
             assert_eq!(fallibility(&expr, &schema), expected, "{expected:?}");
         }
-        assert!(depends_on_batches(
-            &physical_expr(&format!("a > 0 AND s ILIKE '{unicode}'"), &schema),
-            &schema
-        ));
-        // Whether Arrow compiles it depends on the representation of the
-        // strings, e.g. on bytes beneath nulls, which `filter` keeps and
-        // `take` drops: it depends on the batches anywhere.
-        assert!(depends_on_batches(
-            &physical_expr(&format!("s ILIKE '{unicode}' AND a > 0"), &schema),
-            &schema
-        ));
 
         // Arrow cannot compare some types, whatever the values.
         let nested = Arc::new(Schema::new(vec![
@@ -3092,9 +2067,7 @@ mod tests {
             Arc::new(CastExpr::new(physical_expr("s", &schema), dictionary, None))
         };
         assert_eq!(fallibility(&pack(DataType::Int8), &schema), PerRow);
-        assert!(depends_on_batches(&pack(DataType::Int8), &schema));
         assert_eq!(fallibility(&pack(DataType::Int32), &schema), Infallible);
-        assert!(!depends_on_batches(&pack(DataType::Int32), &schema));
         // Casting a dictionary into another casts its keys, which may index
         // more values than the batch has rows (e.g. nulls, which take no
         // memory).
@@ -3151,7 +2124,6 @@ mod tests {
             None,
         ));
         assert_eq!(fallibility(&booleans, &schema), Uniform);
-        assert!(depends_on_batches(&booleans, &schema));
         // Nor apply `NOT`, `AND` or `OR` to integers.
         for expr in [
             Arc::new(NotExpr::new(physical_expr("a", &schema))) as Arc<dyn PhysicalExpr>,
@@ -3167,7 +2139,6 @@ mod tests {
             )),
         ] {
             assert_eq!(fallibility(&expr, &schema), Uniform, "{expr}");
-            assert!(depends_on_batches(&expr, &schema), "{expr}");
         }
         let not: Arc<dyn PhysicalExpr> =
             Arc::new(NotExpr::new(physical_expr("e", &schema)));
@@ -3179,169 +2150,6 @@ mod tests {
             physical_expr("b", &schema),
         ));
         assert_eq!(fallibility(&mixed, &schema), Uniform);
-    }
-
-    #[test]
-    fn finds_errors_that_depend_on_batches() {
-        let schema = schema();
-        for (predicate, expected) in [
-            // DataFusion decides per batch on which rows it evaluates the
-            // conjuncts after the first one, and the right side of `OR`.
-            ("a <> 0 AND 10 / a > 1", true),
-            ("a = 0 OR 10 / a > 1", true),
-            ("a > 0 AND upper(s) = 'X'", true),
-            ("(a > 0 AND 10 / a > 1) OR e", true),
-            ("e OR (a > 0 AND 10 / a > 1)", true),
-            ("CASE WHEN a > 0 AND 10 / a > 1 THEN 1 ELSE 0 END = 1", true),
-            ("a > 0 AND s LIKE s", true),
-            // DataFusion evaluates a value after the first one of an `IN`
-            // list on all rows of a batch, unless the values before it match
-            // all of them.
-            ("b IN (1, 10 / a)", true),
-            ("b NOT IN (1, 2, b / a)", true),
-            ("b IN (10 / a, 1)", false),
-            ("b IN (1, 2, a, b + 1)", false),
-            // A pattern that does not compile fails whenever DataFusion
-            // evaluates it, which depends on the batches: on the batches on
-            // which the left sides are not all true, and on empty batches.
-            ("s ~ 'a{1000000}'", true),
-            ("a = 0 OR s ~ 'a{1000000}'", true),
-            ("a = 0 OR (b = 0 OR s ~ 'a{1000000}')", true),
-            ("a <> 0 AND (b <> 0 OR s ~ 'a{1000000}')", true),
-            ("CASE WHEN a > 0 THEN s ~ 'a{1000000}' ELSE false END", true),
-            // DataFusion merges the dictionaries of the batches it coalesces,
-            // without the values that no row references, and a cast of a
-            // dictionary casts all of its values.
-            ("CAST(d AS INT) > 1", true),
-            ("upper(d) = 'X'", true),
-            ("CAST(d AS VARCHAR) = 'x' AND d <> 'y'", false),
-            // Functions may fail on empty batches.
-            ("regexp_like(s, 'a{1000000}')", true),
-            ("a = 0 OR regexp_count(s, 'a{1000000}') > 0", true),
-            // The first conjunct and the left side of `OR` are evaluated on all
-            // rows.
-            ("10 / a > 1 AND b = 1", false),
-            ("10 / a > 1 OR b = 1", false),
-            ("CAST(s AS INT) = 1 AND a > 0", false),
-            // `-` negates a scalar with overflow checks, but an array
-            // wrapping: an operand that may be either depends on the batches.
-            ("-a > 0", false),
-            ("-(a + 1) > 0", false),
-            ("-(CASE WHEN a > 0 THEN b ELSE 0 END) > 0", true),
-            ("-(CASE WHEN a > 0 THEN b END) IS NULL", true),
-            // So does Arrow match scalar patterns and arrays of patterns
-            // differently (also of strings).
-            ("s ILIKE s", false),
-            ("s LIKE CASE WHEN a > 0 THEN 'x%' ELSE s END", true),
-            ("s ILIKE CASE WHEN a > 0 THEN 'x%' ELSE s END", true),
-            ("CASE WHEN a > 0 THEN s ELSE 'x' END LIKE 'y%'", true),
-            ("s ~ CASE WHEN a > 0 THEN 'x' ELSE s END", true),
-            // But functions are opaque: whatever they return, they may fail
-            // depending on the rows they are evaluated on together (e.g.
-            // `repeat` limits the size of its strings).
-            ("regexp_count(s, 'a+') > 0 AND a > 0", true),
-            ("regexp_count(s, 'a{1000000}') > 0 AND a > 0", true),
-            ("repeat(s, b) IS NULL", true),
-            // Unless they are built-in functions whose implementations are
-            // known, which cannot fail on values, also after other conjuncts
-            // or in `OR`.
-            ("length(s) = 1 AND a > 0", false),
-            ("a > 0 AND length(s) = 1", false),
-            ("a > 0 AND strpos(u, 'x') > 1", false),
-            ("a > 0 OR character_length(u) = 2", false),
-            ("a > 0 AND substr(s, 1, 2) = 'ab'", false),
-            ("a > 0 AND regexp_like(s, 'a+')", false),
-            ("a > 0 AND abs(c) > 1.0", false),
-            // But for those that build strings with 32-bit offsets from more
-            // bytes than their arguments have (`upper` of a 'ΐ' is 3 times
-            // longer), and those that may fail on some rows after other
-            // conjuncts (`abs` of the smallest integer, a negative length).
-            ("upper(s) = 'X' AND a > 0", true),
-            ("upper(u) = 'X'", false),
-            ("a > 0 AND upper(u) = 'X'", true),
-            ("a > 0 AND abs(b) > 1", true),
-            ("abs(b) > 1 AND a > 0", false),
-            ("a > 0 AND substr(s, 1, -1) = 'x'", true),
-            ("a > 0 AND substr(s, 1, b) = 'x'", true),
-            ("substr(s, 1, b) = 'x' AND a > 0", false),
-            // A pattern that does not compile fails whenever it is evaluated.
-            ("a > 0 AND regexp_like(s, 'a{1000000}')", true),
-            ("regexp_like(s, 'a{1000000}')", true),
-            ("a > 0 AND regexp_like(s, s)", true),
-            // Patterns that compile cannot fail.
-            ("a > 0 AND s LIKE 'x%'", false),
-            ("a = 1 OR s LIKE 'x%'", false),
-            ("a = 0 OR (b = 0 OR s ~ 'a+')", false),
-            ("a > 0 AND u LIKE '%x%'", false),
-            ("a > 0 AND u ~ 'a{1000000}'", true),
-            ("a > 0 AND b % 3 = 0 AND b + 1 > 0", false),
-            // `CASE` evaluates its branches on the rows they are for.
-            ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
-            ("a > 0 AND b > 0", false),
-        ] {
-            let expr = physical_expr(predicate, &schema);
-            assert_eq!(depends(&expr, &schema), expected, "{predicate}");
-        }
-        // On batches of unknown sizes, `strpos` copies the substring it
-        // searches for every row of a batch, which may overflow (see
-        // `constants_need_batches_of_known_sizes`).
-        let expr = physical_expr("a > 0 AND strpos(u, 'x') > 1", &schema);
-        assert!(depends_on_batches(&expr, &schema));
-    }
-
-    #[test]
-    fn finds_several_failures() {
-        // Which of several parts that may fail fails first depends on the
-        // batches: DataFusion evaluates each part on all rows of a batch.
-        let schema = schema();
-        for (predicate, expected) in [
-            ("CAST(s AS INT) + 10 / a > 0", true),
-            ("CAST(10 / a AS SMALLINT) > 0", true),
-            ("upper(s) = lower(s)", true),
-            ("10 / a > 1", false),
-            ("CAST(s AS INT) = 1 AND a > 0", false),
-            // `CASE` itself does not fail.
-            ("CASE WHEN a <> 0 THEN 10 / a > 1 ELSE false END", false),
-        ] {
-            let expr = physical_expr(predicate, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), expected, "{predicate}");
-        }
-    }
-
-    #[test]
-    fn finds_lists_built_per_batch() {
-        // Lists with 32-bit offsets that an expression builds overflow beyond
-        // `i32::MAX` values in a batch: a column only passes its lists on.
-        let list = |data_type: DataType| {
-            DataType::List(Arc::new(Field::new_list_field(data_type, true)))
-        };
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Boolean, true),
-            Field::new("a", list(DataType::Null), true),
-            Field::new("b", list(DataType::Null), true),
-            Field::new(
-                "l",
-                DataType::LargeList(Arc::new(Field::new_list_field(
-                    DataType::Null,
-                    true,
-                ))),
-                true,
-            ),
-        ]));
-        for (expr, expected) in [
-            ("a", false),
-            ("a IS NOT NULL", false),
-            ("CASE WHEN x THEN a ELSE b END IS NOT NULL", true),
-            ("CASE WHEN x THEN l ELSE l END IS NOT NULL", false),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), expected, "{expr}");
-        }
-        let constant = crate::operators::filter::test_support::constant_list_of_nulls();
-        assert!(depends_on_batches(&constant, &schema));
-        // So do run-end encoded arrays with run ends of less than 64 bits.
-        let runs = crate::operators::filter::test_support::constant_list_of_short_runs();
-        assert!(depends_on_batches(&runs, &schema));
     }
 
     #[test]
@@ -3468,107 +2276,6 @@ mod tests {
     }
 
     #[test]
-    fn cases_of_unions_depend_on_batches() {
-        let union = DataType::Union(
-            arrow::datatypes::UnionFields::try_new(
-                [0],
-                [Field::new("i", DataType::Int32, false)],
-            )
-            .unwrap(),
-            UnionMode::Dense,
-        );
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("b", DataType::Boolean, true),
-            Field::new("u", union.clone(), false),
-            Field::new(
-                "t",
-                DataType::Struct(vec![Field::new("u", union, false)].into()),
-                true,
-            ),
-        ]));
-        let case = |then: &str| -> Arc<dyn PhysicalExpr> {
-            Arc::new(
-                CaseExpr::try_new(
-                    None,
-                    vec![(physical_expr("b", &schema), physical_expr(then, &schema))],
-                    None,
-                )
-                .unwrap(),
-            )
-        };
-        assert!(depends_on_batches(&case("u"), &schema));
-        assert!(depends_on_batches(&case("t"), &schema));
-        assert!(!depends_on_batches(&case("1"), &schema));
-        assert!(!depends_on_batches(
-            &physical_expr("u IS NULL", &schema),
-            &schema
-        ));
-    }
-
-    #[test]
-    fn dynamic_expressions_depend_on_batches() {
-        // Whatever they evaluate, also in other expressions.
-        let schema = schema();
-        let dynamic = dynamic_filter("a > 0", &schema);
-        assert!(!depends_on_batches(
-            &physical_expr("a > 0", &schema),
-            &schema
-        ));
-        assert!(depends_on_batches(&dynamic, &schema));
-        let nested: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            physical_expr("b > 0", &schema),
-            Operator::Or,
-            dynamic,
-        ));
-        assert!(depends_on_batches(&nested, &schema));
-    }
-
-    #[test]
-    fn finds_strings_built_from_more_bytes() {
-        // Strings with 32-bit offsets built from more bytes than an operand
-        // has overflow beyond 2 GiB of bytes in a batch, which a batch of more
-        // rows reaches without its columns overflowing.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("s", DataType::Utf8, true),
-            Field::new("t", DataType::Utf8, true),
-            Field::new("l", DataType::LargeUtf8, true),
-            Field::new("a", DataType::Int32, true),
-            Field::new("e", DataType::Boolean, true),
-        ]));
-        let cast = |name: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
-            Arc::new(CastExpr::new(physical_expr(name, &schema), to, None))
-        };
-        let case = |then: &str, otherwise: Option<&str>| -> Arc<dyn PhysicalExpr> {
-            Arc::new(
-                CaseExpr::try_new(
-                    None,
-                    vec![(physical_expr("e", &schema), physical_expr(then, &schema))],
-                    otherwise.map(|otherwise| physical_expr(otherwise, &schema)),
-                )
-                .unwrap(),
-            )
-        };
-        for (expr, depends) in [
-            (physical_expr("s || s", &schema), true),
-            (physical_expr("s || t", &schema), true),
-            (cast("a", DataType::Utf8), true),
-            (cast("l", DataType::Utf8), true),
-            (case("s", Some("t")), true),
-            (case("s", Some("'x'")), true),
-            // A cast into the type of its operand passes it on, and a `CASE`
-            // selects, for each row, a value of its only column with bytes.
-            (cast("s", DataType::Utf8), false),
-            (cast("s", DataType::LargeUtf8), false),
-            (case("s", None), false),
-            (case("s", Some("''")), false),
-            (case("NULL", Some("s")), false),
-            (physical_expr("s = t", &schema), false),
-        ] {
-            assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
-        }
-    }
-
-    #[test]
     fn finds_expansions_of_values() {
         use Fallibility::*;
         // A union of `Int32` and of `data_type`.
@@ -3662,82 +2369,7 @@ mod tests {
             (physical_expr("d", &schema), (Infallible, false)),
             (physical_expr("d IS NULL", &schema), (Infallible, false)),
         ] {
-            assert_eq!(
-                (
-                    fallibility(&expr, &schema),
-                    depends_on_batches(&expr, &schema)
-                ),
-                expected,
-                "{expr}"
-            );
-        }
-
-        // Constants of more than `MAX_CONSTANT_BYTES` bytes, which are copied
-        // for every row, on batches of at most `ROWS` rows, and constants of
-        // any bytes on batches of unknown sizes (see
-        // `constants_need_batches_of_known_sizes`).
-        let constant = |value: ScalarValue| -> Arc<dyn PhysicalExpr> {
-            Arc::new(Literal::new(value))
-        };
-        let case = |value: ScalarValue| -> Arc<dyn PhysicalExpr> {
-            Arc::new(
-                CaseExpr::try_new(
-                    None,
-                    vec![(physical_expr("e", &schema), constant(value))],
-                    None,
-                )
-                .unwrap(),
-            )
-        };
-        let string = |value: &str| ScalarValue::Utf8(Some(value.to_string()));
-        let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
-        let bounded = "x".repeat(MAX_CONSTANT_BYTES);
-        for (expr, expected) in [
-            (case(string(&large)), (true, true)),
-            (
-                case(ScalarValue::Binary(Some(vec![1; MAX_CONSTANT_BYTES + 1]))),
-                (true, true),
-            ),
-            (constant(string(&large)), (true, true)),
-            (
-                Arc::new(IsNullExpr::new(case(string(&large)))) as Arc<dyn PhysicalExpr>,
-                (true, true),
-            ),
-            // Unless they are of bounded sizes (which a batch of at most `ROWS`
-            // rows holds for each of its rows).
-            (case(string("abc")), (false, true)),
-            (case(string(&bounded)), (false, true)),
-            (case(ScalarValue::Binary(Some(vec![1]))), (false, true)),
-            (constant(string("abc")), (false, true)),
-            (constant(string(&bounded)), (false, true)),
-            (
-                Arc::new(IsNullExpr::new(case(string("abc")))) as Arc<dyn PhysicalExpr>,
-                (false, true),
-            ),
-            // Or null or empty, with 64-bit offsets or views, or compared.
-            (case(string("")), (false, false)),
-            (case(ScalarValue::Utf8(None)), (false, false)),
-            (constant(string("")), (false, false)),
-            (
-                case(ScalarValue::LargeUtf8(Some(large.clone()))),
-                (false, false),
-            ),
-            (
-                case(ScalarValue::Utf8View(Some(large.clone()))),
-                (false, false),
-            ),
-            (case(ScalarValue::Int64(Some(1))), (false, false)),
-            (physical_expr("s = 'abc'", &schema), (false, false)),
-            (
-                physical_expr(&format!("s = '{large}'"), &schema),
-                (false, false),
-            ),
-        ] {
-            assert_eq!(
-                (depends(&expr, &schema), depends_on_batches(&expr, &schema)),
-                expected,
-                "{expr}"
-            );
+            assert_eq!(fallibility(&expr, &schema), expected.0, "{expr}");
         }
     }
 
@@ -4005,336 +2637,6 @@ mod tests {
     }
 
     #[test]
-    fn decimal_arithmetic_fails_only_on_overflows() {
-        use Fallibility::*;
-        let schema = tpch_schema();
-        for (expr, only_overflows) in [
-            // The chains of TPC-H (Q1, Q7 to Q10, Q14): the integers are cast
-            // into decimals with enough digits for them, which cannot fail.
-            ("l_extendedprice * (1 - l_discount) * (1 + l_tax)", true),
-            (
-                "l_extendedprice * (1 - l_discount) - l_tax * l_quantity",
-                true,
-            ),
-            ("l_extendedprice * (1 - l_discount) + big", true),
-            ("ps_availqty * l_extendedprice + l_quantity", true),
-            // A cast of strings, or a division, may fail otherwise.
-            (
-                "l_extendedprice * (1 - l_discount) + CAST(s AS DECIMAL(15, 2))",
-                false,
-            ),
-            (
-                "l_extendedprice / l_discount + l_extendedprice * l_tax",
-                false,
-            ),
-            ("l_extendedprice * l_tax + 10 / n", false),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            let failures = failures(&expr, &schema);
-            assert!(failures.parts() > 1, "{expr}: {failures:?}");
-            assert_eq!(failing_parts(&expr, &schema), failures.parts(), "{expr}");
-            assert_eq!(failures.only_overflows(), only_overflows, "{expr}");
-            assert_eq!(failures.order_matters(), !only_overflows, "{expr}");
-            assert_eq!(
-                depends_on_batches(&expr, &schema),
-                !only_overflows,
-                "{expr}"
-            );
-            assert_eq!(fallibility(&expr, &schema), PerRow, "{expr}");
-        }
-        // Decimals that Arrow does not multiply (their scales add up to more
-        // than 38) fail whenever they are multiplied, not with overflows.
-        let scales = Arc::new(Schema::new(vec![
-            Field::new("p", DataType::Decimal128(38, 30), true),
-            Field::new("q", DataType::Decimal128(38, 20), true),
-        ]));
-        let product: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            physical_expr("p", &scales),
-            Operator::Multiply,
-            physical_expr("q", &scales),
-        ));
-        assert!(!failures(&product, &scales).only_overflows());
-        assert!(depends_on_batches(&product, &scales));
-        // Arithmetic on integers that fails on overflow only fails with
-        // overflows too, with decimal arithmetic or not.
-        let checked = |left: Arc<dyn PhysicalExpr>, op, right| -> Arc<dyn PhysicalExpr> {
-            Arc::new(BinaryExpr::new(left, op, right).with_fail_on_overflow(true))
-        };
-        let n = || physical_expr("n", &schema);
-        let integers =
-            checked(checked(n(), Operator::Multiply, n()), Operator::Minus, n());
-        assert_eq!(failures(&integers, &schema).parts(), 2);
-        assert!(failures(&integers, &schema).only_overflows());
-        assert!(!depends_on_batches(&integers, &schema));
-        let with_decimals: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            physical_expr("CAST(l_tax * l_quantity AS DOUBLE)", &schema),
-            Operator::Gt,
-            Arc::new(CastExpr::new(integers, DataType::Float64, None)),
-        ));
-        assert!(failures(&with_decimals, &schema).only_overflows());
-        assert!(!depends_on_batches(&with_decimals, &schema));
-        // Several parts that only fail on overflows, behind a guard, still
-        // depend on the batches: DataFusion decides per batch on which rows
-        // it evaluates them.
-        let guarded = physical_expr(
-            "l_tax > 0 AND l_extendedprice * (1 - l_discount) > 1",
-            &schema,
-        );
-        assert!(depends_on_batches(&guarded, &schema));
-        // Failures add up: arithmetic overflows and other errors are told
-        // apart.
-        let overflow = failures(&physical_expr("l_tax * l_quantity", &schema), &schema);
-        let other = failures(&physical_expr("10 / n", &schema), &schema);
-        assert!(overflow.only_overflows() && !overflow.order_matters());
-        assert!(!other.only_overflows() && !other.order_matters());
-        assert!(!overflow.and(overflow).order_matters());
-        assert!(overflow.and(other).order_matters());
-        assert!(other.and(other).order_matters());
-        assert!(!other.and(Failures::NONE).order_matters());
-        assert!(Failures::NONE.is_none() && Failures::NONE.only_overflows());
-    }
-
-    #[test]
-    fn decimal_divisions_by_divisors_that_are_not_zero_only_overflow() {
-        let schema = tpch_schema();
-        for (expr, only_overflows) in [
-            // Divisors that cannot be `0`: constants, `NULLIF`s of `0`, and
-            // the divisors that a `CASE` only divides on the rows on which
-            // they are not `0` (or null).
-            ("l_extendedprice / 7", true),
-            (
-                "l_extendedprice / 7 + l_extendedprice * (1 - l_discount)",
-                true,
-            ),
-            ("l_extendedprice / NULLIF(l_discount, 0)", true),
-            (
-                "CASE WHEN l_discount <> 0 THEN l_extendedprice / l_discount END",
-                true,
-            ),
-            (
-                "CASE WHEN l_tax > 0 AND l_discount > 0 \
-                 THEN l_extendedprice / l_discount * l_tax END",
-                true,
-            ),
-            (
-                "CASE WHEN l_discount = 0 THEN 0 ELSE l_extendedprice / l_discount END",
-                true,
-            ),
-            (
-                "CASE WHEN l_tax = 0 OR l_discount = 0 THEN 0 \
-                 WHEN l_tax > 1 THEN l_quantity / l_tax \
-                 ELSE l_extendedprice / l_discount END",
-                true,
-            ),
-            ("CASE WHEN n <> 0 THEN l_extendedprice / n END", true),
-            // Divisors that may be `0` where they divide.
-            ("l_extendedprice / l_discount", false),
-            ("l_extendedprice / 0", false),
-            ("l_extendedprice / NULLIF(l_discount, 1)", false),
-            ("l_extendedprice / NULLIF(l_discount, l_tax)", false),
-            (
-                "CASE WHEN l_tax <> 0 THEN l_extendedprice / l_discount END",
-                false,
-            ),
-            (
-                "CASE WHEN l_discount <> 0 THEN 0 ELSE l_extendedprice / l_discount END",
-                false,
-            ),
-            (
-                "CASE WHEN l_discount <> 0 OR l_tax > 0 \
-                 THEN l_extendedprice / l_discount END",
-                false,
-            ),
-            (
-                "CASE WHEN l_discount >= 0 THEN l_extendedprice / l_discount END",
-                false,
-            ),
-            (
-                "CASE WHEN l_discount = 0 AND l_tax = 0 THEN 0 \
-                 ELSE l_extendedprice / l_discount END",
-                false,
-            ),
-            (
-                "CASE l_discount WHEN 0 THEN 0 ELSE l_extendedprice / l_discount END",
-                false,
-            ),
-            // Rounding the divisor turns values that are not `0` into `0`.
-            (
-                "CASE WHEN l_discount <> 0 \
-                 THEN l_extendedprice / CAST(l_discount AS DECIMAL(15, 1)) END",
-                false,
-            ),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            let failures = failures(&expr, &schema);
-            assert!(!failures.is_none(), "{expr}");
-            assert_eq!(failures.only_overflows(), only_overflows, "{expr}");
-            if only_overflows {
-                assert!(!failures.order_matters(), "{expr}");
-                assert!(!depends(&expr, &schema), "{expr}");
-            }
-        }
-        // `NULLIF` is a built-in function, which sessions trust by default: a
-        // division by a `NULLIF` of `0` only overflows in the sessions that do
-        // not register the functions they trust too, but not in those that
-        // trust none, where `NULLIF` is opaque.
-        let untrusting = datafusion::prelude::SessionContext::new_with_config(
-            datafusion::prelude::SessionConfig::new()
-                .with_option_extension(TrustedFunctions::default()),
-        );
-        for (session, only_overflows) in [
-            (datafusion::prelude::SessionContext::new(), true),
-            (untrusting, false),
-        ] {
-            let expr = physical_expr_in(
-                &session,
-                "l_extendedprice / NULLIF(l_discount, 0)",
-                &schema,
-            );
-            let failures = failures(&expr, &schema);
-            assert_eq!(failures.only_overflows(), only_overflows, "{expr}");
-            assert_eq!(failures.order_matters(), !only_overflows, "{expr}");
-            assert_eq!(depends(&expr, &schema), !only_overflows, "{expr}");
-        }
-        // Arrow divides such divisors without failing on the rows of `0`,
-        // and fails with arithmetic overflows only.
-        let decimals = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Decimal128(38, 0), true),
-            Field::new("b", DataType::Decimal128(38, 0), true),
-        ]));
-        let batch = |a: i128, b: i128| {
-            let column = |value: i128| -> Arc<dyn arrow::array::Array> {
-                Arc::new(
-                    arrow::array::Decimal128Array::from(vec![Some(value), None])
-                        .with_precision_and_scale(38, 0)
-                        .unwrap(),
-                )
-            };
-            RecordBatch::try_new(Arc::clone(&decimals), vec![column(a), column(b)])
-                .unwrap()
-        };
-        for expr in [
-            "a / NULLIF(b, 0)",
-            "CASE WHEN b <> 0 THEN a / b END",
-            "CASE WHEN b = 0 THEN 0 ELSE a / b END",
-        ] {
-            let expr = physical_expr(expr, &decimals);
-            assert!(failures(&expr, &decimals).only_overflows(), "{expr}");
-            let result = expr.evaluate(&batch(10, 0)).and_then(|v| v.into_array(2));
-            assert!(result.is_ok(), "{expr}: {result:?}");
-            let error = expr
-                .evaluate(&batch(10_i128.pow(37), 3))
-                .and_then(|v| v.into_array(2))
-                .unwrap_err();
-            assert!(
-                matches!(
-                    error.find_root(),
-                    datafusion_common::DataFusionError::ArrowError(error, _)
-                        if matches!(**error, arrow::error::ArrowError::ArithmeticOverflow(_))
-                ),
-                "{expr}: {error:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn casts_of_numbers_into_decimals_only_overflow() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("sum", DataType::Decimal128(36, 2), true),
-            Field::new("x", DataType::Float64, true),
-            Field::new("n", DataType::Int64, true),
-            Field::new("u", DataType::UInt64, true),
-            Field::new("big", DataType::Decimal256(50, 2), true),
-            Field::new("p", DataType::Decimal128(15, 2), true),
-            Field::new("s", DataType::Utf8, true),
-        ]));
-        let cast = |column: &str, to: DataType| -> Arc<dyn PhysicalExpr> {
-            Arc::new(CastExpr::new(physical_expr(column, &schema), to, None))
-        };
-        // The casts of TPC-H Q11 (of the sums of its groups, and of a floating
-        // point number, into the type in which it compares them), and of
-        // integers and decimals into decimals that may not hold their values.
-        for expr in [
-            cast("sum", DataType::Decimal128(38, 15)),
-            cast("x", DataType::Decimal128(38, 15)),
-            cast("n", DataType::Decimal128(10, 2)),
-            cast("u", DataType::Decimal128(19, 0)),
-            cast("big", DataType::Decimal128(38, 2)),
-            cast("p", DataType::Decimal128(5, 2)),
-            cast("p", DataType::Decimal64(15, 4)),
-        ] {
-            assert_eq!(fallibility(&expr, &schema), Fallibility::PerRow, "{expr}");
-            assert_eq!(failures(&expr, &schema), Failures::CAST_OVERFLOW, "{expr}");
-            assert!(!depends_on_batches(&expr, &schema), "{expr}");
-        }
-        // Not the casts of strings, which may fail to parse them.
-        let parsed = cast("s", DataType::Decimal128(15, 2));
-        assert!(!failures(&parsed, &schema).only_overflows());
-        assert!(depends_on_batches(&parsed, &schema));
-        // Their overflows are not arithmetic overflows: with other parts that
-        // may fail (but such casts), which error comes first depends on the
-        // batches.
-        for (expr, order_matters) in [
-            (
-                "CAST(sum AS DECIMAL(38, 15)) > CAST(x AS DECIMAL(38, 15))",
-                false,
-            ),
-            ("CAST(p * p AS DECIMAL(10, 2))", true),
-            ("CAST(p AS DECIMAL(5, 2)) + p * p", true),
-            ("CAST(n AS DECIMAL(10, 2)) > 10 / n", true),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            let failures = failures(&expr, &schema);
-            assert!(failures.parts() > 1, "{expr}");
-            assert!(failures.only_overflows() || order_matters, "{expr}");
-            assert_eq!(failures.order_matters(), order_matters, "{expr}");
-            assert_eq!(depends_on_batches(&expr, &schema), order_matters, "{expr}");
-        }
-        let casts = Failures::CAST_OVERFLOW;
-        assert!(casts.only_overflows() && !casts.order_matters());
-        assert!(!casts.and(casts).order_matters());
-        assert!(casts.and(Failures::OVERFLOW).order_matters());
-        assert!(casts.and(Failures::ANY).order_matters());
-        // Arrow casts every value that is not null on its own, and fails on
-        // those that overflow the decimal: with a cast error if the rescaled
-        // value overflows the integer of the decimal, and with an invalid
-        // argument if it only exceeds its precision.
-        let sums = Arc::new(Schema::new(vec![schema.field(0).clone()]));
-        let q11: Arc<dyn PhysicalExpr> = Arc::new(CastExpr::new(
-            Arc::new(Column::new("sum", 0)),
-            DataType::Decimal128(38, 15),
-            None,
-        ));
-        let cast_sums = |values: Vec<Option<i128>>| {
-            let values = arrow::array::Decimal128Array::from(values)
-                .with_precision_and_scale(36, 2)
-                .unwrap();
-            let batch =
-                RecordBatch::try_new(Arc::clone(&sums), vec![Arc::new(values)]).unwrap();
-            q11.evaluate(&batch).and_then(|value| value.into_array(3))
-        };
-        let fitting = 10_i128.pow(24);
-        assert!(cast_sums(vec![Some(fitting), None, Some(-fitting)]).is_ok());
-        for (value, cast_error) in [(10_i128.pow(25), false), (10_i128.pow(30), true)] {
-            let error = cast_sums(vec![Some(1), Some(value), None]).unwrap_err();
-            let overflow = match error.find_root() {
-                datafusion_common::DataFusionError::ArrowError(error, _) => match **error
-                {
-                    arrow::error::ArrowError::CastError(ref message) => {
-                        cast_error && message.contains("Overflowing on")
-                    }
-                    arrow::error::ArrowError::InvalidArgumentError(ref message) => {
-                        !cast_error && message.contains("too large to store")
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            assert!(overflow, "{value}: {error:?}");
-        }
-    }
-
-    #[test]
     fn scalar_subquery_results_are_constants() {
         use datafusion_expr::physical_planning_context::{
             ScalarSubqueryResults, SubqueryIndex,
@@ -4354,8 +2656,6 @@ mod tests {
         // The result is known once the subquery ran, before any row is
         // evaluated: a constant, which cannot fail.
         assert_eq!(fallibility(&average, &schema), Fallibility::Infallible);
-        assert!(failures(&average, &schema).is_none());
-        assert!(!depends_on_batches(&average, &schema));
         // E.g. the filter of TPC-H Q22, with a widening cast.
         let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             physical_expr("CAST(l_quantity AS DECIMAL(19, 6))", &schema),
@@ -4363,25 +2663,6 @@ mod tests {
             Arc::clone(&average),
         ));
         assert_eq!(fallibility(&filter, &schema), Fallibility::Infallible);
-        assert!(!depends_on_batches(&filter, &schema));
-        // E.g. the filter of TPC-H Q11, which casts the sums of its groups
-        // into the type of the result to compare them: a cast that only fails
-        // on the sums that overflow the decimal, on their rows, and so on no
-        // empty batch.
-        let sums =
-            Schema::new(vec![Field::new("sum", DataType::Decimal128(36, 2), true)]);
-        let threshold = result(DataType::Decimal128(38, 15), 2);
-        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(CastExpr::new(
-                Arc::new(Column::new("sum", 0)),
-                DataType::Decimal128(38, 15),
-                None,
-            )),
-            Operator::Gt,
-            Arc::clone(&threshold),
-        ));
-        assert_eq!(failures(&filter, &sums), Failures::CAST_OVERFLOW);
-        assert!(!depends_on_batches(&filter, &sums));
         // Arithmetic with it only overflows. Evaluating it fails before the
         // subquery ran, but once it ran, Arrow subtracts the result from every
         // row of the batch, which computes nothing on the empty batches that
@@ -4391,8 +2672,6 @@ mod tests {
             Operator::Minus,
             Arc::clone(&average),
         ));
-        assert!(failures(&difference, &schema).only_overflows());
-        assert!(!depends_on_batches(&difference, &schema));
         assert!(
             average
                 .evaluate(&RecordBatch::new_empty(Arc::clone(&schema)))
@@ -4425,30 +2704,11 @@ mod tests {
                 Fallibility::Infallible,
                 "{computed}"
             );
-            assert!(depends_on_batches(&computed, &schema), "{computed}");
             assert!(!applies_to_rows(&computed, &schema), "{computed}");
         }
         // Unlike the difference, which has an operand that is an array on
         // every batch, to every row of which Arrow applies it.
         assert!(applies_to_rows(&difference, &schema));
-        // A string of any number of bytes, which an expression may copy for
-        // every row of a batch (but a comparison does not).
-        assert!(depends_on_batches(&name, &schema));
-        let compared: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            physical_expr("s", &schema),
-            Operator::Eq,
-            Arc::clone(&name),
-        ));
-        assert!(!depends_on_batches(&compared, &schema));
-        let copied: Arc<dyn PhysicalExpr> = Arc::new(
-            CaseExpr::try_new(
-                None,
-                vec![(physical_expr("n > 0", &schema), Arc::clone(&name))],
-                None,
-            )
-            .unwrap(),
-        );
-        assert!(depends_on_batches(&copied, &schema));
     }
 
     #[test]
@@ -4551,7 +2811,7 @@ mod tests {
             SessionContext::new_with_config(trusting(SessionConfig::new())),
             SessionContext::new(),
         ];
-        for (expr, expected, depends_on) in [
+        for (expr, expected, _) in [
             // Infallible built-in functions (but for the types and the
             // constant arguments they do not support).
             (
@@ -4574,8 +2834,6 @@ mod tests {
             ),
             ("trim(s)".to_owned(), Infallible, false),
             ("ltrim(c_phone, '1')".to_owned(), Infallible, false),
-            ("rtrim(s, 'x')".to_owned(), Infallible, false),
-            ("strpos(c_phone, '1')".to_owned(), Infallible, false),
             ("strpos(s, s)".to_owned(), Infallible, false),
             ("character_length(s)".to_owned(), Infallible, false),
             ("length(c_phone)".to_owned(), Infallible, false),
@@ -4661,12 +2919,14 @@ mod tests {
             ("concat(s, c_phone)".to_owned(), PerRow, true),
             ("md5(s)".to_owned(), PerRow, true),
             // Nor of dictionaries, nor of characters to trim that are not
-            // constants, nor of constants of more than `MAX_CONSTANT_BYTES`.
+            // constants, nor of string constants that they copy for every row
+            // into strings with 32-bit offsets, which overflow on enough rows.
             ("substr(d, 1, 2)".to_owned(), PerRow, true),
             ("character_length(d)".to_owned(), PerRow, true),
             ("btrim(s, s)".to_owned(), PerRow, true),
             (format!("strpos(s, '{large}')"), PerRow, true),
-            (format!("strpos(s, '{}')", &large[1..]), Infallible, false),
+            ("rtrim(s, 'x')".to_owned(), PerRow, true),
+            ("strpos(c_phone, '1')".to_owned(), PerRow, true),
             // Nor of arguments that may be scalars on some batches and arrays
             // on others, which they evaluate differently (`to_timestamp` of a
             // scalar fails with an array of formats).
@@ -4691,36 +2951,9 @@ mod tests {
         ] {
             for session in &sessions {
                 let expr = physical_expr_in(session, &expr, &schema);
-                assert_eq!(fallibility_on_rows(&expr, &schema), expected, "{expr}");
-                assert_eq!(depends(&expr, &schema), depends_on, "{expr}");
+                assert_eq!(fallibility(&expr, &schema), expected, "{expr}");
             }
         }
-        // After other conjuncts, those that may fail on some rows depend on
-        // the batches, the others do not.
-        for (expr, depends) in [
-            ("n > 0 AND extract(year from o_orderdate) = 1995", false),
-            (
-                "n > 0 AND substring(c_phone from 1 for 2) IN ('13', '31')",
-                false,
-            ),
-            ("n > 0 OR regexp_like(s, '^a')", false),
-            ("n > 0 AND sqrt(x) > 1", true),
-            ("n > 0 AND date_trunc('month', ts) > ts", true),
-        ] {
-            for session in &sessions {
-                let expr = physical_expr_in(session, expr, &schema);
-                assert_eq!(depends_on_batches(&expr, &schema), depends, "{expr}");
-            }
-        }
-        // A function whose arguments are all constants returns an array on a
-        // batch of one row, and a scalar on others: `-` negates them
-        // differently.
-        let negated = Arc::new(NegativeExpr::new(physical_expr("abs(-5)", &schema)))
-            as Arc<dyn PhysicalExpr>;
-        assert!(depends_on_batches(&negated, &schema));
-        let negated = Arc::new(NegativeExpr::new(physical_expr("abs(x)", &schema)))
-            as Arc<dyn PhysicalExpr>;
-        assert!(!depends_on_batches(&negated, &schema));
     }
 
     #[test]
@@ -4757,17 +2990,16 @@ mod tests {
             "to_timestamp_seconds(u)",
         ] {
             let expr = physical_expr(expr, &schema);
-            assert!(is_infallible(&expr, &schema), "{expr}");
-            assert!(!depends_on_batches(&expr, &schema), "{expr}");
+            assert_eq!(
+                fallibility(&expr, &schema),
+                Fallibility::Infallible,
+                "{expr}"
+            );
             let result = expr.evaluate(&batch).and_then(|value| value.into_array(3));
             assert!(result.is_ok(), "{expr}: {result:?}");
         }
-        // The key of `hits42` has a single part that may fail (`date_trunc`
-        // of the smallest timestamps), with one kind of error.
+        // `date_trunc` of the smallest timestamps fails.
         let key = physical_expr("date_trunc('minute', to_timestamp_seconds(n))", &schema);
-        let failures = failures(&key, &schema);
-        assert_eq!(failures.parts(), 1);
-        assert!(!failures.only_overflows() && !failures.order_matters());
         assert!(key.evaluate(&batch).is_err());
     }
 
@@ -4889,10 +3121,8 @@ mod tests {
         let schema = tpch_schema();
         let session = SessionContext::new_with_config(trusting(SessionConfig::new()));
         let builtin = physical_expr_in(&session, "abs(x)", &schema);
-        assert!(!depends(&builtin, &schema));
         assert_eq!(fallibility(&builtin, &schema), Fallibility::Infallible);
         let by_default = physical_expr_in(&SessionContext::new(), "abs(x)", &schema);
-        assert!(!depends(&by_default, &schema));
         assert_eq!(fallibility(&by_default, &schema), Fallibility::Infallible);
         let signature =
             datafusion_expr::Signature::any(1, datafusion_expr::Volatility::Immutable);
@@ -4908,7 +3138,6 @@ mod tests {
             assert_eq!(call.to_string(), builtin.to_string());
             let function = call.downcast_ref::<ScalarFunctionExpr>().unwrap();
             assert_eq!(BuiltinFunction::of(function), None);
-            assert!(depends(&call, &schema));
             assert_eq!(fallibility(&call, &schema), Fallibility::PerRow);
             // By default, a function is known by the name of its type, which
             // may also be that of a type of another crate: only the sessions
@@ -4922,7 +3151,6 @@ mod tests {
                 opaque_by_default,
                 "{function:?}"
             );
-            assert_eq!(depends(&call, &schema), opaque_by_default);
         }
         // The functions of the names of built-in ones whose types do not have
         // the names of theirs are not trusted.
@@ -4951,148 +3179,7 @@ mod tests {
             SessionConfig::new().with_option_extension(TrustedFunctions::default()),
         );
         let untrusted = physical_expr_in(&untrusting, "abs(x)", &schema);
-        assert!(depends(&untrusted, &schema));
         assert_eq!(fallibility(&untrusted, &schema), Fallibility::PerRow);
-    }
-
-    #[test]
-    fn parts_that_fail_with_several_kinds_of_errors_depend_on_batches() {
-        // A pipeline evaluates the chunks of a partition on several threads,
-        // and raises the error of the chunk that fails first: a part that may
-        // fail with different kinds of errors on different rows raises an
-        // error whose kind depends on the threads.
-        let schema = tpch_schema();
-        for (expr, expected) in [
-            // Parse errors, and execution errors beyond the nanoseconds.
-            ("to_timestamp(s)", true),
-            ("to_timestamp(s, '%Y-%m-%d')", false),
-            // Divisions by zero, and of the smallest integer by -1 (overflows).
-            ("n / n", true),
-            ("10 / n", false),
-            ("-10 / n", true),
-            ("n / 0", false),
-            ("n / -1", false),
-            ("n % n", false),
-            // Overflows when decimals are rescaled, and divisions by zero.
-            ("l_extendedprice / l_discount", true),
-            ("l_extendedprice % l_discount", true),
-            ("l_extendedprice / 7", false),
-            ("l_extendedprice / 0", true),
-            // Casts with cast errors only.
-            ("CAST(n AS INT)", false),
-            ("CAST(x AS BIGINT)", false),
-            ("CAST(s AS INT)", false),
-            ("CAST(s AS DATE)", false),
-            ("CAST(s AS BOOLEAN)", false),
-            ("CAST(n AS VARCHAR) = s", false),
-            // Casts of strings into decimals also fail on their precision.
-            ("CAST(s AS DECIMAL(5, 2))", true),
-            ("CAST(s AS TIMESTAMP)", true),
-            // Casts of numbers into decimals only fail on the values that
-            // overflow the decimal (see `casts_only_on_overflows`).
-            ("CAST(l_quantity AS DECIMAL(5, 2))", false),
-            ("CAST(x AS DECIMAL(10, 2))", false),
-            // Arithmetic on dates and intervals.
-            ("o_orderdate + INTERVAL '1 day'", false),
-            ("ts - INTERVAL '1 month'", false),
-            // Decimal arithmetic, which can only overflow, and its parts.
-            ("l_extendedprice * (1 - l_discount) * (1 + l_tax)", false),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            assert_eq!(depends(&expr, &schema), expected, "{expr}");
-            assert_eq!(failures(&expr, &schema).order_matters(), expected, "{expr}");
-        }
-    }
-
-    #[test]
-    fn bounded_constants_do_not_depend_on_batches() {
-        let schema = tpch_schema();
-        let large = "x".repeat(MAX_CONSTANT_BYTES + 1);
-        // Whether the errors depend on batches of at most `ROWS` rows, and on
-        // batches of unknown sizes.
-        for (expr, expected) in [
-            (
-                "CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' \
-                 THEN '1-URGENT' ELSE '2-HIGH' END"
-                    .to_owned(),
-                (false, true),
-            ),
-            (
-                "CASE WHEN n > 0 THEN 'HIGH' WHEN n < 0 THEN 'LOW' END".to_owned(),
-                (false, true),
-            ),
-            (
-                "CASE WHEN n > 0 THEN 'HIGH' END = 'HIGH'".to_owned(),
-                (false, true),
-            ),
-            ("'1-URGENT'".to_owned(), (false, true)),
-            (format!("'{}'", &large[1..]), (false, true)),
-            // Constants of more bytes may overflow the 32-bit offsets of a
-            // batch of DataFusion, but not of a chunk.
-            (
-                format!("CASE WHEN n > 0 THEN '{large}' ELSE 'LOW' END"),
-                (true, true),
-            ),
-            (format!("'{large}'"), (true, true)),
-            // A column and a constant build strings of more bytes than the
-            // column has.
-            (
-                "CASE WHEN n > 0 THEN s ELSE 'LOW' END".to_owned(),
-                (true, true),
-            ),
-            ("CASE WHEN n > 0 THEN s END".to_owned(), (false, false)),
-            // Constants without bytes, and compared ones, are not copied.
-            ("CASE WHEN n > 0 THEN '' END".to_owned(), (false, false)),
-            ("o_orderpriority = '1-URGENT'".to_owned(), (false, false)),
-        ] {
-            let expr = physical_expr(&expr, &schema);
-            assert_eq!(
-                (depends(&expr, &schema), depends_on_batches(&expr, &schema)),
-                expected,
-                "{expr}"
-            );
-        }
-    }
-
-    #[test]
-    fn constants_need_batches_of_known_sizes() {
-        // The bytes of the constants that batches of at most so many rows
-        // hold for each of their rows, and the chunks of the pipeline.
-        for (rows, bytes) in [
-            (None, 0),
-            (Some(0), MAX_CONSTANT_BYTES),
-            (ROWS, MAX_CONSTANT_BYTES),
-            (Some((1 << 21) - 1), MAX_CONSTANT_BYTES),
-            (Some(1 << 21), MAX_CONSTANT_BYTES - 1),
-            (Some(1 << 30), 1),
-            (Some(usize::MAX), 0),
-        ] {
-            assert_eq!(constant_bytes(rows), bytes, "{rows:?}");
-        }
-        // Built-in functions copy their constant arguments for every row of
-        // the batch (e.g. `strpos` pads them, see `make_scalar_function`),
-        // but for the parameters that they read as scalars.
-        let schema = tpch_schema();
-        for (expr, depends_on) in [
-            ("extract(year from o_orderdate)", false),
-            ("date_trunc('month', ts)", false),
-            ("to_timestamp(s, '%Y-%m-%d', '%d/%m/%Y')", false),
-            ("ltrim(c_phone, '1')", false),
-            ("nullif(c_phone, '10')", false),
-            ("starts_with(s, 'abc')", false),
-            ("ends_with('abc', s)", false),
-            ("regexp_like(s, '^a', 'i')", false),
-            ("strpos(c_phone, '1')", true),
-            ("nullif('10', s)", true),
-            // Of views, which have no offsets to overflow.
-            ("nullif('10', c_phone)", false),
-            ("substr('abc', n)", true),
-            ("regexp_like(s, c_phone, 'i')", true),
-            ("strpos(c_phone, '')", false),
-        ] {
-            let expr = physical_expr(expr, &schema);
-            assert_eq!(depends_on_batches(&expr, &schema), depends_on, "{expr}");
-        }
     }
 
     #[test]

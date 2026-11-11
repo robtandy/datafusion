@@ -3043,23 +3043,22 @@ mod tests {
             Ok(())
         };
         // The queries, their errors, and the numbers of target partitions on
-        // which the planner lowers their aggregations (it leaves them to
-        // DataFusion on the others: a cast of a string on several threads, and
-        // a division, which may fail with a division by zero or an overflow,
-        // on any number of threads).
+        // which the planner lowers their aggregations: all of them, whatever
+        // their arguments may fail with (a cast of a string, a division, which
+        // may fail with a division by zero or an overflow, or a cast of an
+        // integer into a decimal, which may overflow), see
+        // `docs/compatibility.md`.
         let queries: [(&str, &str, &[usize]); 3] = [
             (
                 "SELECT k, COUNT(*), SUM(CAST(s AS BIGINT)) FROM t GROUP BY k",
                 "Cannot cast string 'not an integer' to value of Int64 type",
-                &[1],
+                &[1, 4, 16],
             ),
             (
                 "SELECT k, MAX(v), SUM(v / d) FROM t GROUP BY k",
                 "Divide by zero error",
-                &[],
+                &[1, 4, 16],
             ),
-            // A cast of an integer into a decimal can only fail with an overflow:
-            // the planner lowers the aggregation on several threads too.
             (
                 "SELECT k, MAX(v), SUM(CAST(v AS DECIMAL(3, 0))) FROM t GROUP BY k",
                 "1000",

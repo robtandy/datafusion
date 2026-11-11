@@ -36,22 +36,15 @@
 //!   in order, on a single thread.
 //!
 //! The rows that the threshold discards are never sorted, so their sort keys
-//! are only evaluated by the threshold predicate.
-//! [`try_lower`](super::try_lower) therefore lowers to a TopK only if its sort
-//! keys cannot fail to evaluate (e.g. columns and literals): which rows' keys
-//! DataFusion evaluates differs, and a key that fails on a discarded row
-//! would fail in one engine but not in the other. Likewise, the dynamic filter
-//! prunes rows of the scans below the TopK at other times than DataFusion's
-//! TopK does: the TopK is lowered only if the work on the rows it prunes
-//! cannot fail.
+//! are only evaluated by the threshold predicate, and the rows that the
+//! dynamic filter prunes are not even read: which rows the TopK (and the
+//! scans below it) evaluate depends on when its threshold tightens.
 //!
-//! DataFusion's threshold compares floats with `-0.0 = 0.0`, so that its
-//! result can depend on the order of its batches, but only if the last row of
-//! the result has a zero in a float key: a TopK by float keys checks that row
-//! when it is finalized, and then executes DataFusion's TopK instead of
-//! emitting its own result, see [`FloatKeyFallback`].
+//! The TopK keeps the first `k` rows in the order of its sort keys, in which
+//! floats compare in their total order (`-0.0` before `0.0`, `NaN` last).
+//! Which of the rows that tie with its last row it keeps, and in which order
+//! it emits rows with equal keys, is its own.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -71,11 +64,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{
-    SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk,
-    sorted_local_source_state,
-};
-use crate::chunk::DEFAULT_VECTOR_SIZE;
+use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -125,104 +114,17 @@ impl TopKDynamicFilter {
     }
 }
 
-/// DataFusion's TopK, which a [`PhysicalTopK`] by float keys runs instead of
-/// emitting its own result if that may differ, and the float sort keys that
-/// the threshold of DataFusion's TopK compares.
+/// Formerly DataFusion's TopK, which a [`PhysicalTopK`] by float keys
+/// executed again instead of emitting its own result, if the last row of its
+/// result had a float zero (DataFusion's threshold may keep other rows among
+/// the zeros, which tie in SQL).
 ///
-/// DataFusion's TopK filters every batch with the predicate of its threshold
-/// (its `k`-th row so far), which compares floats with `-0.0 = 0.0`, while
-/// its heap and its sort order `-0.0` before `0.0` (in their total order).
-/// Once a threshold key is a zero, it therefore discards the rows of later
-/// batches with the zero of the other sign there, also those that come
-/// before the threshold row, and which rows it returns depends on the order
-/// of its batches (and, over several partitions, on the timing of their
-/// threads, which share the threshold).
-///
-/// That can only change its result if the last (`k`-th) row of the exact
-/// result has a zero in one of these keys: a threshold always comes at or
-/// after that row (the threshold is the last of `k` rows of the input), so a
-/// row of the result that the predicate discards comes before the threshold
-/// by a key that is a zero in the row and the other zero in the threshold,
-/// and equals both on the keys before it. So does the last row then, which
-/// lies between them. Otherwise, DataFusion's predicate discards no row of
-/// the exact result, and its heap keeps exactly these rows, which the native
-/// TopK returns too (rows with equal keys may come in any order in both).
-///
-/// The native TopK keeps the exact result (its own predicate selects both
-/// zeros), checks its last row and, if one of these keys is a zero there,
-/// executes `plan`, DataFusion's TopK, after all, and emits its output. The
-/// rows of the native TopK are then not used: that costs a second execution
-/// of the input of the TopK, but only if its `k`-th row has a float zero.
-///
-/// That execution comes after the native TopK read the input of `plan`: it
-/// returns what a single execution of DataFusion's TopK returns only if
-/// `plan` executes again as if it had not been executed before, i.e. it reads
-/// data that every execution reads again (e.g. in-memory batches, not a
-/// stream that can only be read once) and calls no volatile function (which
-/// may have state, e.g. count its calls). [`try_lower`](super::try_lower)
-/// only lowers TopKs by float keys over such inputs.
-#[derive(Debug, Clone)]
-pub struct FloatKeyFallback {
-    plan: Arc<dyn ExecutionPlan>,
-    keys: Vec<usize>,
-    executions: Arc<AtomicUsize>,
-}
-
-impl FloatKeyFallback {
-    /// Run `plan`, whose output must be the output of the TopK (the rows of
-    /// a TopK by the same keys, with the same fetch), if the last row of the
-    /// result has a zero in one of the sort keys at the positions `keys`.
-    /// `plan` must execute again, after the TopK read its input, as if it
-    /// had not been executed (see above).
-    pub fn new(plan: Arc<dyn ExecutionPlan>, keys: Vec<usize>) -> Self {
-        Self {
-            plan,
-            keys,
-            executions: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// DataFusion's TopK.
-    pub fn plan(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.plan
-    }
-
-    /// The positions of the float sort keys that DataFusion's threshold
-    /// compares.
-    pub fn keys(&self) -> &[usize] {
-        &self.keys
-    }
-
-    /// The number of executions of the TopK that executed [`Self::plan`].
-    pub fn executions(&self) -> usize {
-        self.executions.load(Ordering::Relaxed)
-    }
-
-    /// Whether the result of DataFusion's TopK by the sort keys `ordering`
-    /// may differ from the native result, whose last row is row `row` of
-    /// `batch`: if one of [`Self::keys`] is a zero in that row.
-    pub(crate) fn may_differ(
-        &self,
-        ordering: &LexOrdering,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> Result<bool> {
-        let row = batch.slice(row, 1);
-        for &key in &self.keys {
-            let Some(sort_expr) = ordering.get(key) else {
-                return internal_err!("The TopK has no sort key {key}");
-            };
-            let value = match sort_expr.expr.evaluate(&row)? {
-                ColumnarValue::Scalar(value) => value,
-                ColumnarValue::Array(array) => ScalarValue::try_from_array(&array, 0)?,
-            };
-            if is_float_zero(&value) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
+/// The native TopK no longer does: the rows that tie with its last row, also
+/// zeros of either sign, are its own to choose. The type has no values, and
+/// [`PhysicalTopK::float_key_fallback`] is always `None`; both remain only
+/// for the callers that still ask for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatKeyFallback {}
 
 /// Keeps the first `k` rows of its input in the order of its sort keys, see
 /// the [module documentation](self).
@@ -234,7 +136,6 @@ pub struct PhysicalTopK {
     keys: SortKeys,
     k: usize,
     dynamic_filter: Option<TopKDynamicFilter>,
-    float_key_fallback: Option<FloatKeyFallback>,
 }
 
 impl PhysicalTopK {
@@ -256,29 +157,7 @@ impl PhysicalTopK {
             keys,
             k,
             dynamic_filter: None,
-            float_key_fallback: None,
         })
-    }
-
-    /// Run DataFusion's TopK instead if its result may differ (see
-    /// [`FloatKeyFallback`]). Its plan must have the schema of the TopK, and
-    /// its keys must be keys of the TopK.
-    pub fn with_float_key_fallback(mut self, fallback: FloatKeyFallback) -> Result<Self> {
-        if fallback.plan.schema() != self.schema {
-            return internal_err!(
-                "The DataFusion plan of a PhysicalTopK has schema {:?}, expected {:?}",
-                fallback.plan.schema(),
-                self.schema
-            );
-        }
-        let num_keys = self.keys.ordering().len();
-        if let Some(key) = fallback.keys.iter().find(|&&key| key >= num_keys) {
-            return internal_err!(
-                "The float key {key} of a PhysicalTopK with {num_keys} sort keys"
-            );
-        }
-        self.float_key_fallback = Some(fallback);
-        Ok(self)
     }
 
     /// Update `dynamic_filter` with the threshold of the TopK as it gets
@@ -336,10 +215,10 @@ impl PhysicalTopK {
         self.dynamic_filter.as_ref()
     }
 
-    /// DataFusion's TopK, which the TopK runs if its result may differ, if
-    /// any (see [`FloatKeyFallback`]).
+    /// Always `None`: the TopK never executes DataFusion's TopK instead of
+    /// emitting its own result (see [`FloatKeyFallback`]).
     pub fn float_key_fallback(&self) -> Option<&FloatKeyFallback> {
-        self.float_key_fallback.as_ref()
+        None
     }
 
     /// The number of buffered rows at which a thread reduces its rows.
@@ -464,13 +343,12 @@ impl PhysicalTopK {
 /// equal the values, so that it never discards a row that comes before the
 /// threshold row. Returns `None` if it cannot discard any row.
 ///
-/// DataFusion compares floats with `-0.0 = 0.0`, but sorts `-0.0` before
-/// `0.0`. A float key whose value is a zero is therefore compared with `<=`
-/// (`>=`), which selects both zeros: `x < 0.0` would discard a `-0.0` that
-/// comes before the threshold row. (The predicate selects all rows that come
-/// before the threshold row, and some others. DataFusion's own TopK uses
-/// `x < 0.0`, so its result can depend on the order of its batches, see
-/// [`FloatKeyFallback`].)
+/// The sort orders floats in their total order, `-0.0` before `0.0`, while
+/// comparisons may consider both zeros equal. A float key whose value is a
+/// zero is therefore compared with `<=` (`>=`), which selects both zeros, so
+/// that the predicate never discards a `-0.0` that comes before a `0.0`
+/// threshold row. (The predicate selects all rows that come before the
+/// threshold row, and some others, which the TopK sorts out.)
 pub(crate) fn threshold_predicate(
     keys: &[(Arc<dyn PhysicalExpr>, SortOptions)],
     values: &[ScalarValue],
@@ -625,9 +503,6 @@ impl PhysicalOperator for PhysicalTopK {
         if self.dynamic_filter.is_some() {
             description.push_str(", dynamic_filter=true");
         }
-        if self.float_key_fallback.is_some() {
-            description.push_str(", float_key_fallback=true");
-        }
         description
     }
 
@@ -717,32 +592,12 @@ impl PhysicalOperator for PhysicalTopK {
     ) -> Result<SinkFinalize> {
         let global = downcast_state::<TopKSinkState>(gstate.as_any(), self.name())?;
         let runs = std::mem::take(&mut *global.runs.lock());
-        let mut merger = RunMerger::new(Arc::clone(&self.schema), runs, Some(self.k));
+        let merger = RunMerger::new(Arc::clone(&self.schema), runs, Some(self.k));
         if let Some(dynamic_filter) = &self.dynamic_filter {
             dynamic_filter.filter.mark_complete();
         }
         let rows = merger.remaining_rows();
-        match &self.float_key_fallback {
-            // DataFusion's TopK had a threshold only if it saw `k` rows.
-            Some(fallback) if rows == self.k => {
-                // Merge the result, to check its last row.
-                let mut batches = VecDeque::new();
-                while let Some(batch) = merger.next_batch(DEFAULT_VECTOR_SIZE)? {
-                    batches.push_back(batch);
-                }
-                let last = batches.back().filter(|batch| batch.num_rows() > 0);
-                let Some(last) = last else {
-                    return internal_err!("{} merged no rows of {rows}", self.name());
-                };
-                if fallback.may_differ(self.ordering(), last, last.num_rows() - 1)? {
-                    fallback.executions.fetch_add(1, Ordering::Relaxed);
-                    global.output.set_plan(Arc::clone(&fallback.plan));
-                } else {
-                    global.output.set_batches(batches);
-                }
-            }
-            _ => global.output.set(merger),
-        }
+        global.output.set(merger);
         Ok(if rows == 0 {
             SinkFinalize::NoOutputPossible
         } else {
@@ -774,24 +629,16 @@ impl PhysicalOperator for PhysicalTopK {
             );
         };
         let global = downcast_state::<TopKSinkState>(sink.as_any(), self.name())?;
-        global.output.take_source(ctx, self.name())
-    }
-
-    fn get_local_source_state(
-        &self,
-        ctx: &ExecutionContext,
-        gstate: &dyn GlobalSourceState,
-    ) -> Result<Box<dyn LocalSourceState>> {
-        sorted_local_source_state(ctx, gstate, self.name())
+        global.output.take_source(self.name())
     }
 
     fn get_data(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
-        lstate: &mut dyn LocalSourceState,
+        _lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
-        next_sorted_chunk(ctx, gstate, lstate, self.name())
+        next_sorted_chunk(gstate, self.name())
     }
 }
 
@@ -807,14 +654,13 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Float64Type, Int64Type, Schema};
     use arrow_row::{RowConverter, SortField};
-    use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::col;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
-    use crate::chunk::SelectionVector;
+    use crate::chunk::{DEFAULT_VECTOR_SIZE, SelectionVector};
     use crate::explain::format_pipelines;
     use crate::operators::union::test_support::{
         TestSource, run, values, values_chunk, values_chunks, values_schema,
@@ -1283,7 +1129,7 @@ mod tests {
         // (The context of the test has no registry with the sink state.)
         assert!(source.is_err());
         let global = global.downcast_ref::<TopKSinkState>().unwrap();
-        let source = global.output.take_source(&ctx, topk.name())?;
+        let source = global.output.take_source(topk.name())?;
         let mut output = vec![];
         let mut lstate = topk.get_local_source_state(&ctx, source.as_ref())?;
         while let SourceResult::Chunk(chunk) =
@@ -1337,12 +1183,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topk_keeps_negative_zeros_before_zeros() -> Result<()> {
-        // DataFusion compares `-0.0 = 0.0`, but sorts `-0.0` first: once the
-        // threshold is a zero, the zeros of the other sign must still pass, so
-        // that the TopK keeps the first rows of the sort (as DataFusion's merge
-        // with a fetch of a sort does; DataFusion's own TopK does not, which
-        // is why the TopKs of float keys check their last row, see
-        // `FloatKeyFallback`).
+        // The sort orders `-0.0` before `0.0`: once the threshold is a zero,
+        // the zeros of the other sign must still pass its predicate, so that
+        // the TopK keeps the first rows of its sort.
         let schema =
             Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
         let chunk = |values: Vec<f64>| {
@@ -1379,94 +1222,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topk_runs_datafusion_s_topk_if_its_last_row_has_a_float_zero() -> Result<()>
+    async fn topks_of_float_keys_keep_the_first_rows_of_their_total_order() -> Result<()>
     {
+        // Every `k`, also where the last row of the result is a zero of either
+        // sign: the TopK returns the first `k` rows of its sort, in which floats
+        // are in their total order, and never anything else (it used to execute
+        // DataFusion's TopK instead where the last row was a zero).
         let schema =
             Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
-        let batch = |values: Vec<f64>| {
-            RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Float64Array::from(values))],
-            )
-        };
-        let floats = |output: &[RecordBatch]| {
-            output
-                .iter()
-                .flat_map(|batch| {
-                    let values = batch.column(0).as_primitive::<Float64Type>();
-                    values.values().to_vec()
-                })
-                .map(f64::to_bits)
-                .collect::<Vec<_>>()
-        };
-        // Stands in for DataFusion's TopK: rows that the native TopK would not
-        // return.
-        let datafusion: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
-            &[vec![batch(vec![42.0, 43.0])?]],
-            Arc::clone(&schema),
-            None,
-        )?;
-        // In ascending order: -0.0, 0.0, 1.0, 2.0, 3.0, NaN.
-        let values = vec![3.0, -0.0, 1.0, f64::NAN, 0.0, 2.0];
-        for (descending, k, expected) in [
-            // The last row is a zero: DataFusion's TopK runs.
-            (false, 1, None),
-            (false, 2, None),
-            (true, 5, None),
-            (true, 6, None),
-            // It is not.
-            (false, 3, Some(vec![-0.0, 0.0, 1.0])),
-            (true, 2, Some(vec![f64::NAN, 3.0])),
-            (true, 4, Some(vec![f64::NAN, 3.0, 2.0, 1.0])),
-            // There are fewer rows than `k`.
-            (false, 7, Some(vec![-0.0, 0.0, 1.0, 2.0, 3.0, f64::NAN])),
-        ] {
-            let fallback = FloatKeyFallback::new(Arc::clone(&datafusion), vec![0]);
-            let chunks = vec![DataChunk::from_record_batch(batch(values.clone())?)];
-            let input = Arc::new(TestSource::with_schema(Arc::clone(&schema), chunks));
-            let root: Arc<dyn PhysicalOperator> = Arc::new(
-                PhysicalTopK::try_new(input, ordering(&schema, descending), k)?
-                    .with_float_key_fallback(fallback.clone())?,
-            );
-            assert!(root.description().ends_with(", float_key_fallback=true"));
-            // Twice: the plan runs (with a fresh state) in every execution that
-            // needs it.
-            for execution in 1..=2 {
-                let output = run(Arc::clone(&root), 4).await?;
-                let case = format!("descending: {descending}, k = {k}");
-                match &expected {
-                    Some(expected) => {
-                        let expected =
-                            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-                        assert_eq!(floats(&output), expected, "{case}");
-                        assert_eq!(fallback.executions(), 0, "{case}");
-                    }
-                    None => {
-                        assert_eq!(
-                            floats(&output),
-                            [42.0_f64.to_bits(), 43.0_f64.to_bits()]
-                        );
-                        assert_eq!(fallback.executions(), execution, "{case}");
-                    }
+        let values = vec![3.0, -0.0, 1.0, f64::NAN, 0.0, 2.0, -0.0, 0.0];
+        let mut sorted = values.clone();
+        sorted.sort_by(f64::total_cmp);
+        for descending in [false, true] {
+            let expected = match descending {
+                false => sorted.clone(),
+                true => sorted.iter().rev().copied().collect(),
+            };
+            for k in 1..=values.len() + 1 {
+                for threads in [1, 4] {
+                    // A chunk per value, so that the threshold tightens as they
+                    // come.
+                    let chunks = values
+                        .iter()
+                        .map(|&value| {
+                            let batch = RecordBatch::try_new(
+                                Arc::clone(&schema),
+                                vec![Arc::new(Float64Array::from(vec![value]))],
+                            )?;
+                            Ok(DataChunk::from_record_batch(batch))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let input =
+                        Arc::new(TestSource::with_schema(Arc::clone(&schema), chunks));
+                    let topk =
+                        PhysicalTopK::try_new(input, ordering(&schema, descending), k)?;
+                    assert!(topk.float_key_fallback().is_none());
+                    assert!(!topk.description().contains("fallback"));
+                    let output = run(Arc::new(topk), threads).await?;
+                    let bits = output
+                        .iter()
+                        .flat_map(|batch| {
+                            let values = batch.column(0).as_primitive::<Float64Type>();
+                            values.values().to_vec()
+                        })
+                        .map(f64::to_bits)
+                        .collect::<Vec<_>>();
+                    let expected = expected
+                        .iter()
+                        .take(k)
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        bits, expected,
+                        "descending: {descending}, k = {k}, {threads} threads"
+                    );
                 }
             }
         }
-
-        // The plan must have the schema of the TopK, the keys must be keys of
-        // the TopK.
-        let input: Arc<dyn PhysicalOperator> =
-            Arc::new(TestSource::with_schema(Arc::clone(&schema), vec![]));
-        let topk =
-            || PhysicalTopK::try_new(Arc::clone(&input), ordering(&schema, false), 3);
-        let other = MemorySourceConfig::try_new_exec(&[vec![]], values_schema(), None)?;
-        let err = topk()?
-            .with_float_key_fallback(FloatKeyFallback::new(other, vec![0]))
-            .unwrap_err();
-        assert!(err.to_string().contains("has schema"), "{err}");
-        let err = topk()?
-            .with_float_key_fallback(FloatKeyFallback::new(datafusion, vec![1]))
-            .unwrap_err();
-        assert!(err.to_string().contains("float key 1"), "{err}");
         Ok(())
     }
 

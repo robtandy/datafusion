@@ -40,10 +40,7 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{
-    SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk,
-    sorted_local_source_state,
-};
+use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -94,10 +91,9 @@ impl PhysicalSort {
 
     /// Lower a sort of a DataFusion plan that is not a TopK: see
     /// [`try_lower`](super::try_lower), which lowers a sort that keeps only
-    /// its first rows to a [`PhysicalTopK`](super::PhysicalTopK), unless it is
-    /// a merge with a fetch of a sort whose keys can fail to evaluate (a
-    /// `PhysicalSort` with a fetch). Returns `Ok(None)` for TopKs and any
-    /// other node, without calling `lower_input`.
+    /// its first rows to a [`PhysicalTopK`](super::PhysicalTopK), and a sort
+    /// of no rows to a `PhysicalSort` with a fetch of 0. Returns `Ok(None)` for
+    /// TopKs and any other node, without calling `lower_input`.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         options: &ConfigOptions,
@@ -298,24 +294,16 @@ impl PhysicalOperator for PhysicalSort {
             );
         };
         let global = downcast_state::<SortSinkState>(sink.as_any(), self.name())?;
-        global.output.take_source(ctx, self.name())
-    }
-
-    fn get_local_source_state(
-        &self,
-        ctx: &ExecutionContext,
-        gstate: &dyn GlobalSourceState,
-    ) -> Result<Box<dyn LocalSourceState>> {
-        sorted_local_source_state(ctx, gstate, self.name())
+        global.output.take_source(self.name())
     }
 
     fn get_data(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
-        lstate: &mut dyn LocalSourceState,
+        _lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
-        next_sorted_chunk(ctx, gstate, lstate, self.name())
+        next_sorted_chunk(gstate, self.name())
     }
 }
 
