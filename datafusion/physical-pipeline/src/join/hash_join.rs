@@ -50,7 +50,8 @@
 //!   DataFusion still creates the streams of its probe side, so a join
 //!   lowered from a `HashJoinExec` creates the DataFusion streams of that
 //!   probe input too, without polling them, to raise the same errors (e.g.
-//!   of a scan of an object store that is not registered), unless creating
+//!   of a scan of an object store that is not registered, or of an
+//!   aggregation whose accumulators fail to be created), unless creating
 //!   them cannot fail (e.g. of scans of memory, or of local files in a
 //!   runtime with the local file system, see
 //!   [`PhysicalHashJoin::create_probe_streams`]).
@@ -1866,15 +1867,16 @@ enum ProbeStreamFailures {
 ///   failing, but for failing to create the streams of their inputs:
 ///   projections, filters, repartitionings, coalescings of partitions, hash
 ///   joins (of valid partitionings, without a prepared build), nested loop and
-///   cross joins, aggregations, sorts, merges, unions, limits and cooperative
-///   nodes;
+///   cross joins, sorts, merges, unions, limits and cooperative nodes;
 /// * [only without the local file
 ///   system](ProbeStreamFailures::WithoutLocalFileSystem) if, in addition,
 ///   some of its leaves are Parquet (without virtual columns or decryption) or
 ///   CSV scans of the local file system, whose object store is registered by
 ///   default (unlike, e.g., the store of a scan of `s3://`, which may not be);
-/// * [possibly](ProbeStreamFailures::Possible) otherwise, e.g. for a window,
-///   which is not known to create its streams without failing.
+/// * [possibly](ProbeStreamFailures::Possible) otherwise, e.g. for an
+///   aggregation, which creates its accumulators, and reserves their memory,
+///   when its streams are created: e.g. the accumulator of
+///   `approx_percentile_cont` fails on a percentile outside of `[0, 1]`.
 ///
 /// Creating the streams of such inputs reads nothing, but creating the streams
 /// of a copy of a deep input (as the joins below a join, in a chain of joins)
@@ -1908,7 +1910,6 @@ fn probe_stream_failures(plan: &Arc<dyn ExecutionPlan>) -> ProbeStreamFailures {
         || plan.is::<FilterExec>()
         || plan.is::<RepartitionExec>()
         || plan.is::<CooperativeExec>()
-        || plan.is::<AggregateExec>()
         || plan.is::<SortExec>()
         || plan.is::<SortPreservingMergeExec>()
         || plan.is::<UnionExec>()
@@ -7439,8 +7440,15 @@ mod tests {
         for (sql, failures) in [
             ("SELECT k FROM b", Never),
             ("SELECT k, d FROM p WHERE s <> 's1'", WithoutLocalFileSystem),
+            // An aggregation, which creates its accumulators (which may fail)
+            // when its streams are created, also over memory.
             (
                 "SELECT p.k, COUNT(*) FROM p JOIN b ON p.k = b.k GROUP BY p.k ORDER BY p.k",
+                Possible,
+            ),
+            ("SELECT k, COUNT(*) FROM b GROUP BY k", Possible),
+            (
+                "SELECT b.k, p.d FROM b JOIN p ON p.k = b.k ORDER BY b.k",
                 WithoutLocalFileSystem,
             ),
             (
@@ -7626,6 +7634,74 @@ mod tests {
             let plan = make_plan()?;
             let exec = Arc::new(PipelineRootExec::try_new(lower(&plan)?, plan)?);
             assert_pending(collect(exec, task_ctx())).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_streams_of_aggregations_fail_like_datafusion() -> Result<()> {
+        // An empty build side (`t_empty`) joined to an aggregation whose
+        // accumulator fails to be created: `approx_percentile_cont` with a
+        // percentile outside of `[0, 1]`, of the strings `h` of `t1` cast into
+        // floats. DataFusion creates the streams of the probe side of the
+        // join, and so the accumulator, although it never reads the probe side
+        // (the build side is empty), and fails. So does the native join, which
+        // creates them too: an aggregation may fail to create its streams. On
+        // 4 threads, the aggregation (of strings that may fail to be cast) is
+        // left to DataFusion, in the probe pipeline of the join, which never
+        // runs; on 1 thread, it is native.
+        let setup = async |ctx: &SessionContext| register_test_tables(ctx);
+        let sql = "SELECT t_empty.a, x.p FROM t_empty JOIN \
+            (SELECT approx_percentile_cont(CAST(h AS DOUBLE), 2.0) AS p FROM t1) x \
+            ON t_empty.c = x.p";
+        let message = "Percentile value must be between 0.0 and 1.0 inclusive";
+        for target_partitions in [4, 1] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let error = with_timeout(run_sql(&ctx, sql))
+                .await
+                .expect_err("DataFusion fails");
+            assert!(error.to_string().contains(message), "{error}");
+
+            let ctx = pipeline_context(config);
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let root = plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator();
+            let tree = format_operator_tree(root);
+            let native = with_timeout(collect(Arc::clone(&plan), ctx.task_ctx()))
+                .await
+                .map(|batches| count_rows(&batches));
+            match native {
+                Err(e) => assert!(
+                    e.to_string().contains(message),
+                    "{target_partitions} threads: {e}\n{tree}"
+                ),
+                Ok(rows) => panic!(
+                    "{target_partitions} threads: the pipeline engine returns {rows} rows, \
+                     DataFusion fails: {error}\n{tree}"
+                ),
+            }
+            let join = root.downcast_ref::<PhysicalHashJoin>().unwrap_or_else(|| {
+                panic!("{target_partitions} threads: a native join: {tree}")
+            });
+            assert_eq!(
+                join.probe_stream_failures,
+                ProbeStreamFailures::Possible,
+                "{tree}"
+            );
+            let bridged_aggregations = bridged_plans(root)
+                .iter()
+                .filter(|plan| plan.is::<AggregateExec>())
+                .count();
+            assert_eq!(
+                bridged_aggregations,
+                usize::from(target_partitions > 1),
+                "{tree}"
+            );
         }
         Ok(())
     }
