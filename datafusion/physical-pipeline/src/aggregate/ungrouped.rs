@@ -25,16 +25,24 @@
 //!   output row, which the source role emits once. Without any input row,
 //!   the accumulators of the final stage are evaluated as they are created,
 //!   e.g. `COUNT` is `0` and `SUM` is `NULL`.
+//!
+//! An aggregation of `MIN` and `MAX` aggregates with a dynamic filter (see
+//! [`super::dynamic_filter`]) shares the bounds of the accumulators of all
+//! threads in its global state: after every chunk, a thread whose
+//! accumulators have better bounds than those it knows updates them, and the
+//! filter, as the partitions of DataFusion's `AggregateStream` do after every
+//! batch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::RecordBatch;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::Accumulator;
 use datafusion_physical_plan::filter::batch_filter;
 use parking_lot::Mutex;
 
+use super::dynamic_filter::SharedBounds;
 use super::hash_aggregate::{AggregateSpec, InputBuffer};
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -55,6 +63,9 @@ pub(crate) struct UngroupedAggregate;
 struct UngroupedSinkState {
     accumulators: Mutex<Option<Vec<Box<dyn Accumulator>>>>,
     output: Mutex<Option<RecordBatch>>,
+    /// The bounds of the `MIN` and `MAX` aggregates of all threads, if the
+    /// threads update the dynamic filter of the aggregation.
+    bounds: Option<SharedBounds>,
 }
 
 impl GlobalSinkState for UngroupedSinkState {}
@@ -65,6 +76,10 @@ struct UngroupedLocalState {
     accumulators: Vec<Box<dyn Accumulator>>,
     /// The input rows, if they must be sorted before they are aggregated.
     buffer: InputBuffer,
+    /// The bounds of all threads that the thread saw last, if the threads
+    /// update the dynamic filter of the aggregation (see
+    /// `AggregateFilter::update_bounds`).
+    known_bounds: Vec<ScalarValue>,
 }
 
 impl LocalSinkState for UngroupedLocalState {}
@@ -83,22 +98,43 @@ impl GlobalSourceState for UngroupedSourceState {
 }
 
 impl UngroupedAggregate {
-    pub(crate) fn global_sink_state() -> Result<Arc<dyn GlobalSinkState>> {
-        Ok(Arc::new(UngroupedSinkState::default()))
+    /// The global sink state of an execution of `spec`, whose threads update
+    /// its dynamic filter, if it has one, if `filters` (see
+    /// `filters_enabled`).
+    pub(crate) fn global_sink_state(
+        spec: &AggregateSpec,
+        filters: bool,
+    ) -> Result<Arc<dyn GlobalSinkState>> {
+        let bounds = match (&spec.dynamic_filter, filters) {
+            (Some(filter), true) => Some(filter.shared_bounds()),
+            _ => None,
+        };
+        Ok(Arc::new(UngroupedSinkState {
+            bounds,
+            ..UngroupedSinkState::default()
+        }))
     }
 
     pub(crate) fn local_sink_state(
         spec: &AggregateSpec,
+        gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
+        let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
         Ok(Box::new(UngroupedLocalState {
             accumulators: update_accumulators(spec)?,
             buffer: InputBuffer::default(),
+            known_bounds: global
+                .bounds
+                .as_ref()
+                .map(SharedBounds::unknown)
+                .unwrap_or_default(),
         }))
     }
 
     pub(crate) fn sink(
         spec: &AggregateSpec,
         batch: RecordBatch,
+        gstate: &dyn GlobalSinkState,
         lstate: &mut dyn LocalSinkState,
     ) -> Result<()> {
         let local =
@@ -107,7 +143,18 @@ impl UngroupedAggregate {
             local.buffer.push(batch);
             return Ok(());
         }
-        update(spec, &mut local.accumulators, &batch)
+        update(spec, &mut local.accumulators, &batch)?;
+        if let Some(filter) = &spec.dynamic_filter {
+            let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
+            if let Some(bounds) = &global.bounds {
+                filter.update_bounds(
+                    &mut local.accumulators,
+                    &mut local.known_bounds,
+                    bounds,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn combine(
