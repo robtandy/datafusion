@@ -608,8 +608,10 @@ of a table from its files, but a schema given when the table is registered may
 have other types, into which the scan casts the values of the files, and fails
 on those that it cannot cast, on rows that a dynamic filter prunes in only one
 of the engines: such scans, and scans of files whose metadata is not cached,
-may fail. So may the scans with custom readers of their files or custom
-providers of their schemas, and the scans of files with explicit schemas (in
+may fail. So may the scans with custom readers of their files (any other
+reader factory than DataFusion's own, which the planner recognizes by comparing
+it with the factories that `ParquetFormat` creates over the object store of the
+scan and the cache of the runtime) or custom providers of their schemas, and the scans of files with explicit schemas (in
 which the reader reads them) of other types than those the reader derives from
 the files themselves: such schemas may constrain their values (e.g. fixed-size
 lists for lists of any length), which the reader only checks as it decodes

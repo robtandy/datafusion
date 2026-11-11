@@ -6774,6 +6774,10 @@ mod tests {
         }
     }
 
+    /// Makes a reader factory of the factory of a scan.
+    type WrapFactory =
+        dyn Fn(Arc<dyn ParquetFileReaderFactory>) -> Arc<dyn ParquetFileReaderFactory>;
+
     /// A reader factory named like the built-in `CachedParquetFileReaderFactory`,
     /// whose readers fail to read the metadata of the files whose paths end with
     /// `faulty` (see [`CachedParquetFileReaderFactoryWithFaults`]).
@@ -6814,18 +6818,19 @@ mod tests {
         // the TopK, without reading its metadata: a TopK over a custom reader,
         // which may fail on any file, stays in DataFusion.
         // Also with a custom factory of the name of the built-in one.
-        let faults = |inner| CachedParquetFileReaderFactoryWithFaults {
-            inner,
-            faulty: "1.parquet",
-        };
-        let factories: [&dyn Fn(
-            Arc<dyn ParquetFileReaderFactory>,
-        ) -> Arc<dyn ParquetFileReaderFactory>; 2] =
-            [&|inner| Arc::new(faults(inner)), &|inner| {
-                Arc::new(impersonation::CachedParquetFileReaderFactory {
-                    inner: faults(inner),
-                })
-            }];
+        fn faults(
+            inner: Arc<dyn ParquetFileReaderFactory>,
+        ) -> CachedParquetFileReaderFactoryWithFaults {
+            CachedParquetFileReaderFactoryWithFaults {
+                inner,
+                faulty: "1.parquet",
+            }
+        }
+        let factories: [&WrapFactory; 2] = [&|inner| Arc::new(faults(inner)), &|inner| {
+            Arc::new(impersonation::CachedParquetFileReaderFactory {
+                inner: faults(inner),
+            })
+        }];
         for factory in factories {
             assert_topk_over_custom_reader_stays_in_datafusion(factory).await?;
         }
@@ -6838,9 +6843,7 @@ mod tests {
     /// of the second file, succeeds in DataFusion, produces the same rows
     /// through the pipeline engine, and stays in DataFusion there.
     async fn assert_topk_over_custom_reader_stays_in_datafusion(
-        factory: &dyn Fn(
-            Arc<dyn ParquetFileReaderFactory>,
-        ) -> Arc<dyn ParquetFileReaderFactory>,
+        factory: &WrapFactory,
     ) -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = two_parquet_files(dir.path(), (0, "foo", 100), (1, "foo", 10))?;
