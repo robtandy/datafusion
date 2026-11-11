@@ -2693,7 +2693,8 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) 
 /// of `coerce_int96` (see `Int96Coercer`), from which the scan casts them into
 /// the unit of the table, which may overflow. A file with an explicit schema
 /// (`PartitionedFile::arrow_schema`) is read in that schema, with these
-/// coercions. (Not its coercion of strings into
+/// coercions, if it fits the Parquet schema of the file (which the reader
+/// checks, as `ArrowReaderMetadata::try_new` does, and fails otherwise). (Not its coercion of strings into
 /// dictionaries: such files may fail.) The schema of a table that DataFusion
 /// inferred from its files has their types, but a schema given when the table
 /// was registered may have others, into which the scan casts the values of the
@@ -2754,28 +2755,44 @@ fn reads_files_of_the_types_of_their_table(
         else {
             return false;
         };
-        let file_metadata = metadata.file_metadata();
         // The reader reads a file in its explicit schema, if it has one, and
-        // otherwise in the schema of its metadata.
-        let file_schema = match &file.arrow_schema {
-            Some(schema) => schema.as_ref().clone(),
-            None => match parquet::arrow::parquet_to_arrow_schema(
-                file_metadata.schema_descr(),
-                file_metadata.key_value_metadata(),
-            ) {
-                Ok(schema) => schema,
-                Err(_) => return false,
-            },
+        // otherwise in the schema of its metadata, which arrow-rs derives (from
+        // the Arrow schema in the metadata, if any) and checks against the
+        // Parquet schema of the file: a file whose explicit schema does not fit
+        // its Parquet schema fails to be read.
+        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+        let mut options = ArrowReaderOptions::new();
+        if let Some(schema) = &file.arrow_schema {
+            options = options.with_schema(Arc::clone(schema));
+        }
+        let Ok(reader_metadata) =
+            ArrowReaderMetadata::try_new(Arc::clone(metadata), options.clone())
+        else {
+            return false;
         };
-        let mut file_schema =
-            apply_file_schema_type_coercions(table, &file_schema).unwrap_or(file_schema);
+        let file_schema = reader_metadata.schema().as_ref().clone();
+        let coerced = apply_file_schema_type_coercions(table, &file_schema);
+        let mut changed = coerced.is_some();
+        let mut file_schema = coerced.unwrap_or(file_schema);
         if let Some(unit) = &int96
             && let Some(coerced) =
-                Int96Coercer::new(file_metadata.schema_descr(), &file_schema, unit)
+                Int96Coercer::new(reader_metadata.parquet_schema(), &file_schema, unit)
                     .with_timezone(int96_timezone.clone())
                     .coerce()
         {
             file_schema = coerced;
+            changed = true;
+        }
+        // The reader reads the file in the coerced schema, which arrow-rs
+        // checks against its Parquet schema again.
+        if changed
+            && ArrowReaderMetadata::try_new(
+                Arc::clone(metadata),
+                options.with_schema(Arc::new(file_schema.clone())),
+            )
+            .is_err()
+        {
+            return false;
         }
         // Of the type of the table, and without nulls if the table has none.
         table.fields().iter().all(|field| {
@@ -6357,6 +6374,116 @@ mod tests {
                                 .map(|file| {
                                     file.clone()
                                         .with_arrow_schema(Arc::clone(&reader_schema))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let config = FileScanConfigBuilder::from(config.clone())
+                    .with_file_groups(file_groups)
+                    .build();
+                Ok(Transformed::yes(
+                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
+                ))
+            })?;
+            Ok(plan.data)
+        };
+        let plan = make_plan().await?;
+        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("DataFusion prunes the second file");
+        let root = create_pipeline_plan_with_runtime(
+            make_plan().await?,
+            config.options(),
+            &ctx.runtime_env(),
+        )?;
+        let tree = format_operator_tree(root.operator());
+        let topks = count::<PhysicalTopK>(root.operator());
+        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
+        let output = |batches| crate::test_utils::EngineOutput {
+            schema: plan.schema(),
+            plan: Arc::clone(&plan),
+            batches,
+            ordered: true,
+        };
+        compare_outputs(&output(expected), &output(actual))
+            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
+        assert_eq!(topks, 0, "{tree}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_files_whose_explicit_schemas_do_not_fit_stay_in_datafusion()
+    -> Result<()> {
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        // A table `k INT, v INT, s VARCHAR` of two Parquet files, whose
+        // explicit schemas (`PartitionedFile::arrow_schema`) are the schema of
+        // the table: 100 rows `(0, 100, 'foo')`, and 10 rows `(1, 'bad_integer',
+        // 'foo')`, whose file stores `v` as strings, which its explicit schema
+        // does not fit. The reader fails to read that file, which DataFusion's
+        // scan prunes with the filter of the TopK: the TopK stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![0; 100])),
+                Arc::new(Int32Array::from(vec![100; 100])),
+                Arc::new(arrow::array::StringViewArray::from(vec!["foo"; 100])),
+            ],
+        )?;
+        let strings = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8View, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let second = RecordBatch::try_new(
+            Arc::clone(&strings),
+            vec![
+                Arc::new(Int32Array::from(vec![1; 10])),
+                Arc::new(arrow::array::StringViewArray::from(vec!["bad_integer"; 10])),
+                Arc::new(arrow::array::StringViewArray::from(vec!["foo"; 10])),
+            ],
+        )?;
+        write_parquet(&path.join("0.parquet"), first.schema(), &[first], None)?;
+        write_parquet(&path.join("1.parquet"), second.schema(), &[second], None)?;
+        let path = path.to_str().unwrap();
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let ctx = datafusion_context(config.clone());
+        ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+            .await?;
+        let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
+        // The plan of DataFusion, with the explicit schema of every file (a new
+        // plan for every execution, whose TopK counts the partitions that
+        // complete its filter).
+        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let plan = plan.transform_up(|node| {
+                let Some(config) = node
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                let file_groups = config
+                    .file_groups
+                    .iter()
+                    .map(|group| {
+                        FileGroup::new(
+                            group
+                                .iter()
+                                .map(|file| {
+                                    file.clone().with_arrow_schema(Arc::clone(&schema))
                                 })
                                 .collect(),
                         )
