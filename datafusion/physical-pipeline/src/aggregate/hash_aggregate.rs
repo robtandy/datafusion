@@ -103,6 +103,13 @@ pub(crate) struct AggregateSpec {
     /// [`rows_can_bypass_tables`]), if the session trusts the accumulators of
     /// all aggregates (see [`Self::rows_bypass_tables`]).
     pub(crate) bypass: bool,
+    /// Whether all aggregates (of both stages) have the same values however
+    /// the rows of a group are split into partial states (see
+    /// [`splits_exactly`]).
+    pub(crate) splits_exactly: bool,
+    /// The number of partitions of the input of the stage that consumes the
+    /// input rows, which DataFusion aggregates on their own.
+    pub(crate) input_partitions: usize,
 }
 
 impl AggregateSpec {
@@ -116,7 +123,9 @@ impl AggregateSpec {
     /// its thread-local table in an execution with the configuration
     /// `options`: if they may (see [`Self::bypass`]), and the aggregation has
     /// no aggregates, or the session trusts the accumulators of all of them
-    /// (see [`TrustedAggregateFunctions`]).
+    /// (see [`TrustedAggregateFunctions`]). (But the single thread of an
+    /// aggregation with aggregates aggregates all of its rows in its table,
+    /// see `PhysicalHashAggregate::get_local_sink_state`.)
     pub(crate) fn rows_bypass_tables(&self, options: &ConfigOptions) -> bool {
         if !self.bypass {
             return false;
@@ -751,6 +760,12 @@ impl PhysicalHashAggregate {
         let bypass = top_k.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
+        let splits_exactly = update
+            .iter()
+            .map(|update| update.expr.as_ref())
+            .chain(merge.iter().map(Arc::as_ref))
+            .all(|aggregate| splits_exactly(aggregate, &input_schema));
+        let input_partitions = raw.input().output_partitioning().partition_count();
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),
@@ -765,6 +780,8 @@ impl PhysicalHashAggregate {
                 single_stage,
                 top_k,
                 bypass,
+                splits_exactly,
+                input_partitions,
             }),
         })
     }
@@ -778,7 +795,8 @@ impl PhysicalHashAggregate {
     /// they are implemented by DataFusion's types. In the sessions that trust
     /// the functions of all aggregates of an aggregation (that are neither
     /// `DISTINCT` nor ordered), the input rows of the threads whose groups
-    /// hardly repeat bypass their thread-local tables.
+    /// hardly repeat bypass their thread-local tables, when the aggregation
+    /// runs on several threads.
     ///
     /// ```
     /// use datafusion::prelude::{SessionConfig, SessionContext};
@@ -1130,17 +1148,59 @@ fn implementation_type(udaf: &AggregateUDF) -> TypeId {
     implementation.type_id()
 }
 
+/// Whether the value of `aggregate` (of arguments of the input `schema`) is
+/// the same however the rows of a group are split into partial states, which
+/// are merged in any order: whether it is DataFusion's built-in (see
+/// [`BUILTIN_AGGREGATES`], by its implementation type) `count`, `min`, `max`,
+/// `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`, `approx_distinct`
+/// or `median`, which count, compare (floating point values by their total
+/// order), combine the bits of, sketch or collect the values of their rows,
+/// or its `sum` or `avg` of integers or decimals, which add them up with
+/// (wrapping) integer arithmetic. The values of the other aggregates may
+/// depend on it: e.g. a sum of floating point values, whose rounding depends
+/// on how its additions are grouped (`(s + a) + b` is not always `s + (a +
+/// b)`), a first or last value, an array, or a user-defined aggregate.
+fn splits_exactly(aggregate: &AggregateFunctionExpr, schema: &SchemaRef) -> bool {
+    let function = aggregate.fun();
+    let Some(&(name, builtin)) = BUILTIN_AGGREGATES
+        .iter()
+        .find(|(name, _)| *name == function.name())
+    else {
+        return false;
+    };
+    if implementation_type(function) != implementation_type(&builtin()) {
+        return false;
+    }
+    match name {
+        "count" | "min" | "max" | "bit_and" | "bit_or" | "bit_xor" | "bool_and"
+        | "bool_or" | "approx_distinct" | "median" => true,
+        "sum" | "avg" => aggregate.expressions().iter().all(|argument| {
+            argument.data_type(schema).is_ok_and(|data_type| {
+                data_type.is_integer()
+                    || matches!(
+                        data_type,
+                        DataType::Decimal32(_, _)
+                            | DataType::Decimal64(_, _)
+                            | DataType::Decimal128(_, _)
+                            | DataType::Decimal256(_, _)
+                    )
+            })
+        }),
+        _ => false,
+    }
+}
+
 /// The built-in aggregate functions of DataFusion whose accumulators a
 /// session trusts the native aggregation not to fail (see
 /// [`BUILTIN_AGGREGATES`]): a configuration extension of the session, created
 /// with [`PhysicalHashAggregate::trusted_aggregate_functions`].
 ///
 /// In the sessions that trust the aggregate functions of all aggregates of an
-/// aggregation, the input rows of a thread whose groups hardly repeat bypass
-/// its thread-local table, like the rows of aggregations without aggregates
-/// (see `rows_can_bypass_tables`): they are aggregated once, by the final
-/// aggregation of their radix partition, rather than in the thread-local
-/// table first (DataFusion skips its partial aggregation then).
+/// aggregation, the input rows of a thread (of several threads) whose groups
+/// hardly repeat bypass its thread-local table, like the rows of aggregations
+/// without aggregates (see `rows_can_bypass_tables`): they are aggregated
+/// once, by the final aggregation of their radix partition, rather than in the
+/// thread-local table first (DataFusion skips its partial aggregation then).
 ///
 /// A function is trusted if it is implemented by the type of
 /// `datafusion-functions-aggregate` that implements the built-in function of
@@ -1431,6 +1491,25 @@ impl PhysicalOperator for PhysicalHashAggregate {
         if self.spec.is_ungrouped() {
             return UngroupedAggregate::local_sink_state(&self.spec);
         }
+        // A single thread of the aggregation of a single partition of
+        // DataFusion sees the rows in the order of that partition. If the
+        // values of its aggregates may depend on how the rows of a group are
+        // split into partial states (see `splits_exactly`), its table holds all
+        // of its groups, so that the accumulators aggregate all rows of a group
+        // into a single state, as DataFusion's do (see
+        // `TableCapacity::UNBOUNDED`). (DataFusion's results on several
+        // partitions depend on the order in which their partial states
+        // arrive.)
+        if ctx.num_threads == 1
+            && self.spec.input_partitions == 1
+            && !self.spec.splits_exactly
+        {
+            return RadixHashAggregate::local_sink_state(
+                &self.spec,
+                TableCapacity::UNBOUNDED,
+                false,
+            );
+        }
         let options = ctx.task_ctx.session_config().options();
         let bypass = self.spec.rows_bypass_tables(options);
         RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity, bypass)
@@ -1473,7 +1552,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
         if self.spec.is_ungrouped() {
             UngroupedAggregate::finalize(&self.spec, gstate)
         } else {
-            RadixHashAggregate::finalize(gstate)
+            RadixHashAggregate::finalize(&self.spec, gstate)
         }
     }
 
@@ -3148,6 +3227,73 @@ mod tests {
             .map(|lookalike| aggregate(Arc::clone(lookalike)))
         {
             assert!(!given.trusts(&aggregate?));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregates_split_exactly_if_their_values_do_not_depend_on_it() -> Result<()>
+    {
+        use super::super::test_support::{lookalike_count, lookalike_sum};
+        // Whether the values of the aggregates of an aggregation are the same
+        // however the rows of a group are split into partial states (see
+        // `splits_exactly`): `c` is a `DOUBLE`, `g` a decimal, `a`, `b` and `id`
+        // integers.
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        crate::test_utils::register_test_tables(&ctx)?;
+        let lookalikes = crate::test_utils::datafusion_context(test_session_config());
+        crate::test_utils::register_test_tables(&lookalikes)?;
+        lookalikes.register_udaf(lookalike_count());
+        lookalikes.register_udaf(lookalike_sum());
+        for (ctx, sql, exact) in [
+            // Counts, extremes (floating point values by their total order),
+            // bits, sketches, medians, and integer and decimal sums.
+            (
+                &ctx,
+                "SELECT d, COUNT(*), COUNT(DISTINCT b), MIN(c), MAX(c), MIN(h), \
+                 BIT_XOR(a), BOOL_AND(e), APPROX_DISTINCT(c), MEDIAN(c), SUM(a), \
+                 SUM(g), AVG(g), SUM(DISTINCT b), COUNT(c) FILTER (WHERE e) \
+                 FROM t1 GROUP BY d",
+                true,
+            ),
+            (&ctx, "SELECT DISTINCT a, d FROM t1", true),
+            // Sums of floating point values (also the averages of integers,
+            // which DataFusion adds up as floating point values), first and
+            // last values, arrays, and other functions.
+            (&ctx, "SELECT d, COUNT(*), SUM(c) FROM t1 GROUP BY d", false),
+            (&ctx, "SELECT d, AVG(c) FROM t1 GROUP BY d", false),
+            (&ctx, "SELECT d, MAX(a), AVG(b) FROM t1 GROUP BY d", false),
+            (&ctx, "SELECT d, FIRST_VALUE(a) FROM t1 GROUP BY d", false),
+            (
+                &ctx,
+                "SELECT d, LAST_VALUE(a ORDER BY id) FROM t1 GROUP BY d",
+                false,
+            ),
+            (&ctx, "SELECT d, ARRAY_AGG(a) FROM t1 GROUP BY d", false),
+            (&ctx, "SELECT d, STDDEV(b) FROM t1 GROUP BY d", false),
+            (
+                &ctx,
+                "SELECT d, STRING_AGG(h, ',') FROM t1 GROUP BY d",
+                false,
+            ),
+            // Lookalikes of DataFusion's `count` and `sum` (see
+            // `lookalike_count`), which DataFusion's types do not implement.
+            (&lookalikes, "SELECT d, count(a) FROM t1 GROUP BY d", false),
+            (&lookalikes, "SELECT d, sum(a) FROM t1 GROUP BY d", false),
+        ] {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let mut aggregate = None;
+            let mut node = Arc::clone(&plan);
+            while aggregate.is_none() {
+                aggregate = try_lower(&node)?;
+                let Some(child) = node.children().first().map(|&child| Arc::clone(child))
+                else {
+                    break;
+                };
+                node = child;
+            }
+            let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
+            assert_eq!(aggregate.spec.splits_exactly, exact, "{sql}");
         }
         Ok(())
     }
