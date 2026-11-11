@@ -69,12 +69,6 @@ impl BatchChunks {
         }
         Some(DataChunk::from_record_batch(chunk))
     }
-
-    /// Drop the batch that is emitted, if any, and free its memory.
-    pub(crate) fn clear(&mut self) {
-        self.batch = None;
-        self.reservation.free();
-    }
 }
 
 #[cfg(test)]
@@ -120,8 +114,11 @@ mod tests {
         chunks.set(batch(0))?;
         assert!(chunks.next_chunk().is_none());
         assert_eq!(pool.reserved(), 0);
+        // A new batch replaces the batch that is emitted.
+        chunks.set(batch(5000))?;
+        assert_eq!(chunks.next_chunk().unwrap().len(), 2048);
         chunks.set(batch(10))?;
-        chunks.clear();
+        assert_eq!(chunks.next_chunk().unwrap().len(), 10);
         assert!(chunks.next_chunk().is_none());
         assert_eq!(pool.reserved(), 0);
         Ok(())

@@ -215,7 +215,10 @@ use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
-use crate::sources::{EmptyScanSource, LazyMemorySource, try_create_scan_source};
+use crate::sources::{
+    EmptyScanSource, ExplainSource, FileScanSource, LazyMemorySource,
+    StreamingTableSource, try_create_scan_source,
+};
 use crate::window::PhysicalWindow;
 
 /// A [`QueryPlanner`] that executes queries with the pipeline engine.
@@ -601,7 +604,16 @@ impl Lowering<'_> {
         if let Some(scan) = try_create_scan_source(plan)? {
             return Ok(scan);
         }
+        if let Some(explain) = ExplainSource::try_lower(plan)? {
+            return Ok(Arc::new(explain));
+        }
+        if let Some(scan) = FileScanSource::try_lower(plan)? {
+            return Ok(Arc::new(scan));
+        }
         if let Some(source) = LazyMemorySource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        if let Some(source) = StreamingTableSource::try_lower(plan) {
             return Ok(Arc::new(source));
         }
         // The pipeline engine schedules its tasks cooperatively and pushes
@@ -4095,10 +4107,7 @@ mod tests {
             .operator
             .downcast_ref::<PhysicalProjection>()
             .expect("native");
-        let bridge = projection.children()[0]
-            .downcast_ref::<BridgeOperator>()
-            .expect("a bridge");
-        assert!(!is_coalesce_batches(bridge.plan()));
+        assert!(projection.children()[0].is::<StreamingTableSource>());
         // So it is without a part that may fail above it.
         let make_plan = || {
             let source = batch_plan(zeros.clone(), AfterBatch::Fail).unwrap();
@@ -4112,10 +4121,7 @@ mod tests {
         let root =
             assert_plan_outcome(make_plan, config.clone(), Some(INJECTED_FAILURE)).await;
         let projection = root.downcast_ref::<PhysicalProjection>().expect("native");
-        let bridge = projection.children()[0]
-            .downcast_ref::<BridgeOperator>()
-            .expect("a bridge");
-        assert!(!is_coalesce_batches(bridge.plan()));
+        assert!(projection.children()[0].is::<StreamingTableSource>());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4644,10 +4650,10 @@ mod tests {
                 .operator
                 .downcast_ref::<PhysicalProjection>()
                 .expect("native");
-            let bridge = projection.children()[0]
-                .downcast_ref::<BridgeOperator>()
-                .expect("a bridge");
-            assert!(!bridge.plan().is::<RepartitionExec>(), "{partitioning}");
+            assert!(
+                projection.children()[0].is::<StreamingTableSource>(),
+                "{partitioning}"
+            );
         }
     }
 
