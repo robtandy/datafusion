@@ -2412,11 +2412,9 @@ fn operator_names(operator: &Arc<dyn PhysicalOperator>) -> Vec<String> {
 
 /// The window functions and the loop joins of the stress corpus run on the
 /// native windows ([`PhysicalWindow`]), nested loop joins and cross joins,
-/// over both sources, without `BridgeOperator`s: all but the queries of
+/// over both sources, without `BridgeOperator`s: all of them, also the
 /// windows stacked on windows of other partitions or orders that DataFusion
-/// sorts or merges in between (2 and 5 of `WINDOW_FUNCTIONS`), which
-/// `PhysicalWindow::try_lower` leaves to DataFusion (it does not judge whether
-/// DataFusion's window below reads all of its input before it emits).
+/// sorts or merges in between (2 and 5 of `WINDOW_FUNCTIONS`).
 ///
 /// [`PhysicalWindow`]: datafusion_physical_pipeline::window::PhysicalWindow
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2425,11 +2423,7 @@ async fn windows_and_loop_joins_of_the_stress_corpus_are_native() -> Result<()> 
         let ctx = pipeline_context(test_session_config());
         source.register(&ctx).await?;
         for (queries, operators, bridged) in [
-            (
-                stress::WINDOW_FUNCTIONS,
-                &["PhysicalWindow"][..],
-                &[2, 5][..],
-            ),
+            (stress::WINDOW_FUNCTIONS, &["PhysicalWindow"][..], &[][..]),
             (
                 stress::LOOP_JOINS,
                 &["PhysicalNestedLoopJoin", "PhysicalCrossJoin"][..],
