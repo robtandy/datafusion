@@ -58,12 +58,21 @@ use datafusion_common::{Result, internal_err};
 
 /// Whether `error` says that rows do not fit into one array: its offsets
 /// (32-bit for `Utf8`, `Binary`, `List`, ..., also in nested and run-end
-/// encoded arrays) would overflow. The rows then fit into smaller arrays.
+/// encoded arrays) would overflow, the merged values of its dictionaries need
+/// more keys than their key type holds (e.g. more than 128 values for `Int8`
+/// keys), or its run ends more rows than their type holds (e.g. 32767 for
+/// `Int16` run ends). The rows then fit into smaller arrays.
 pub(crate) fn is_capacity_error(error: &ArrowError) -> bool {
     match error {
-        ArrowError::OffsetOverflowError(_) => true,
+        ArrowError::OffsetOverflowError(_)
+        | ArrowError::DictionaryKeyOverflowError
+        | ArrowError::RunEndIndexOverflowError => true,
         // `MutableArrayData`, which some kernels fall back to.
         ArrowError::InvalidArgumentError(message) => message.contains("offset overflow"),
+        // The interleaving of run-end encoded arrays.
+        ArrowError::ComputeError(message) => {
+            message.contains("does not fit run-end type")
+        }
         _ => false,
     }
 }
@@ -1006,6 +1015,104 @@ mod tests {
         assert!(!is_capacity_error(&ArrowError::InvalidArgumentError(
             "invalid".to_string()
         )));
+        // Narrow dictionary keys and run ends.
+        assert!(is_capacity_error(&ArrowError::DictionaryKeyOverflowError));
+        assert!(is_capacity_error(&ArrowError::RunEndIndexOverflowError));
+        let message = "interleave_run_end: output length 40000 does not fit run-end type";
+        assert!(is_capacity_error(&ArrowError::ComputeError(
+            message.to_string()
+        )));
+        assert!(!is_capacity_error(&ArrowError::ComputeError(
+            "other".to_string()
+        )));
+    }
+
+    #[test]
+    fn merges_rows_whose_narrow_encodings_do_not_fit_into_one_array() {
+        use arrow::array::{DictionaryArray, Int16Array, RunArray};
+        use arrow::datatypes::{Int8Type, Int16Type};
+        // Three runs of 64 rows with interleaving keys and 64 distinct
+        // `Int8`-keyed dictionary values each: a chunk of their merge with all
+        // 192 values needs more than the 128 values that `Int8` keys address,
+        // so the merger emits smaller chunks.
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", dictionary, false),
+        ]));
+        let runs = (0..3_i64)
+            .map(|run| {
+                let k = (0..64).map(|i| i * 3 + run).collect::<Vec<_>>();
+                let s = k.iter().map(|k| format!("value {k}")).collect::<Vec<_>>();
+                let s = s
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<DictionaryArray<Int8Type>>();
+                let keys = Int64Array::from(k);
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(keys.clone()), Arc::new(s)],
+                )
+                .unwrap();
+                let options = SortOptions::default();
+                let keys = KeyColumn::try_new(Arc::new(keys), options).unwrap();
+                SortedRun::try_new_with_keys(batch, RunKeys::Column(keys)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut merger = RunMerger::new(Arc::clone(&schema), runs, None);
+        let mut keys = vec![];
+        let mut chunks = 0;
+        while let Some(batch) = merger.next_batch(2048).unwrap() {
+            chunks += 1;
+            keys.extend_from_slice(batch.column(0).as_primitive::<Int64Type>().values());
+            let s = batch.column(1).as_dictionary::<Int8Type>();
+            let s = s.downcast_dict::<StringArray>().unwrap();
+            for (row, value) in s.into_iter().enumerate() {
+                let k = batch.column(0).as_primitive::<Int64Type>().value(row);
+                assert_eq!(value, Some(format!("value {k}").as_str()));
+            }
+        }
+        assert!(chunks > 1, "{chunks} chunks");
+        assert_eq!(keys, (0..192).collect::<Vec<_>>());
+
+        // Two runs of 20000 rows of `Int16` run ends: all 40000 rows do not
+        // fit into one array.
+        let run_end_encoded = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int16, false)),
+            Arc::new(Field::new("values", DataType::Int64, true)),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("r", run_end_encoded, false),
+        ]));
+        let runs = (0..2_i64)
+            .map(|run| {
+                let keys = Int64Array::from_iter_values((0..20_000).map(|i| i * 2 + run));
+                let values = RunArray::<Int16Type>::try_new(
+                    &Int16Array::from(vec![20_000]),
+                    &Int64Array::from(vec![run]),
+                )
+                .unwrap();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(keys.clone()), Arc::new(values)],
+                )
+                .unwrap();
+                let keys =
+                    KeyColumn::try_new(Arc::new(keys), SortOptions::default()).unwrap();
+                SortedRun::try_new_with_keys(batch, RunKeys::Column(keys)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut merger = RunMerger::new(Arc::clone(&schema), runs, None);
+        let mut sizes = vec![];
+        let mut keys = vec![];
+        while let Some(batch) = merger.next_batch(usize::MAX).unwrap() {
+            sizes.push(batch.num_rows());
+            keys.extend_from_slice(batch.column(0).as_primitive::<Int64Type>().values());
+        }
+        assert_eq!(sizes, [20_000, 20_000]);
+        assert_eq!(keys, (0..40_000).collect::<Vec<_>>());
     }
 
     #[test]
