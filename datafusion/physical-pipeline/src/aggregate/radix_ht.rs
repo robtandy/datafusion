@@ -662,22 +662,60 @@ impl GlobalSourceState for RadixSourceState {
 #[derive(Debug)]
 struct TopKGroups {
     top_k: TopK,
+    /// The top groups of the partitions that were finalized so far, sorted
+    /// (see [`TopK::sort_groups`]).
     groups: Mutex<Option<RecordBatch>>,
+    /// The cutoff of `groups` (see [`TopK::sorted_cutoff`]): the groups of
+    /// the other partitions whose values are worse are not among the top
+    /// groups.
+    cutoff: Mutex<Option<ArrayRef>>,
     /// The number of partitions that were not finalized yet.
     remaining: AtomicUsize,
 }
 
 impl TopKGroups {
+    fn new(top_k: TopK, partitions: usize) -> Self {
+        Self {
+            top_k,
+            groups: Mutex::new(None),
+            cutoff: Mutex::new(None),
+            remaining: AtomicUsize::new(partitions),
+        }
+    }
+
     /// Add `outputs`, the groups of a finalized partition. Returns the top
     /// groups of all partitions once all of them were added.
+    ///
+    /// The groups of a partition that may be among the top groups (not worse
+    /// than the cutoff of the groups added so far) are selected and sorted
+    /// first, by the thread that finalized the partition, so that merging
+    /// them with the groups added so far, one partition after the other,
+    /// gathers the top groups only.
     fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
+        let column = self.top_k.output_column();
         for output in outputs {
-            let output = self.top_k.select_groups(output)?;
-            let mut groups = self.groups.lock();
-            let merged = match groups.take() {
-                Some(groups) => self.top_k.merge_groups(&groups, &output)?,
+            let cutoff = self.cutoff.lock().clone();
+            let output = match &cutoff {
+                Some(cutoff) => {
+                    match self.top_k.candidates(output.column(column), cutoff)? {
+                        Some(selected) => filter_record_batch(&output, &selected)?,
+                        None => output,
+                    }
+                }
                 None => output,
             };
+            if output.num_rows() == 0 {
+                continue;
+            }
+            let output = self.top_k.select_sorted_groups(&output)?;
+            let mut groups = self.groups.lock();
+            let merged = match groups.take() {
+                Some(groups) => self.top_k.merge_sorted_groups(&groups, &output)?,
+                None => output,
+            };
+            if let Some(cutoff) = self.top_k.sorted_cutoff(&merged) {
+                *self.cutoff.lock() = Some(cutoff);
+            }
             *groups = Some(merged);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -820,11 +858,9 @@ impl RadixHashAggregate {
         let Some(partitions) = sink.non_empty.lock().clone() else {
             return internal_err!("{OPERATOR} is a source before it was finalized");
         };
-        let top_k = spec.top_k.map(|top_k| TopKGroups {
-            top_k,
-            groups: Mutex::new(None),
-            remaining: AtomicUsize::new(partitions.len()),
-        });
+        let top_k = spec
+            .top_k
+            .map(|top_k| TopKGroups::new(top_k, partitions.len()));
         Ok(Arc::new(RadixSourceState {
             sink,
             partitions,

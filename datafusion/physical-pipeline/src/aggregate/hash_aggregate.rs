@@ -271,69 +271,76 @@ impl TopK {
     }
 
     /// The groups of `batch`, the output of the aggregation for a set of
+    /// distinct groups, sorted by their values: the best first, those of
+    /// `NULL` values last.
+    pub(crate) fn sort_groups(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let values = batch.column(self.output_column());
+        let indices = sort_to_indices(values, Some(self.sort_options()), None)?;
+        Ok(take_record_batch(batch, &indices)?)
+    }
+
+    /// The groups of `batch`, the output of the aggregation for a set of
     /// distinct groups, that may be among the groups the sort keeps (see
-    /// [`Self::select`]).
-    pub(crate) fn select_groups(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    /// [`Self::select`]), sorted (see [`Self::sort_groups`]).
+    pub(crate) fn select_sorted_groups(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch> {
         match self.select(batch.column(self.output_column()).as_ref())? {
-            Some(indices) => Ok(take_record_batch(&batch, &indices)?),
-            None => Ok(batch),
+            // The best values first, then `NULL`s.
+            Some(indices) => Ok(take_record_batch(batch, &indices)?),
+            None => self.sort_groups(batch),
         }
     }
 
+    /// The cutoff (see [`Self::cutoff`]) of `groups`, a set of distinct
+    /// groups sorted by [`Self::sort_groups`]: its `limit`-th value, if it is
+    /// not `NULL`.
+    pub(crate) fn sorted_cutoff(&self, groups: &RecordBatch) -> Option<ArrayRef> {
+        let values = groups.column(self.output_column());
+        let valid = values.len() - values.null_count();
+        (self.limit > 0 && valid >= self.limit).then(|| values.slice(self.limit - 1, 1))
+    }
+
     /// The groups of `left` and `right`, outputs of the aggregation for two
-    /// sets of distinct groups (selected by [`Self::select_groups`]), that may
-    /// be among the groups the sort keeps: [`Self::select_groups`] of all of
-    /// them, without concatenating them. Only the selected groups are
+    /// sets of distinct groups selected and sorted by
+    /// [`Self::select_sorted_groups`], that may be among the groups the sort
+    /// keeps: [`Self::select_sorted_groups`] of all of them, without
+    /// concatenating them or sorting them again. Only the selected groups are
     /// gathered, so that their strings fit into an array (of 32-bit offsets)
     /// whenever the selected groups of either side and the groups of the
     /// result do.
-    pub(crate) fn merge_groups(
+    pub(crate) fn merge_sorted_groups(
         &self,
         left: &RecordBatch,
         right: &RecordBatch,
     ) -> Result<RecordBatch> {
         let column = self.output_column();
         let (left_values, right_values) = (left.column(column), right.column(column));
-        let options = self.sort_options();
-        // The non-null values of either side, the best first.
-        let sorted = |values: &ArrayRef| -> Result<Vec<u32>> {
-            let valid = values.len() - values.null_count();
-            if valid == 0 {
-                return Ok(vec![]);
-            }
-            Ok(sort_to_indices(values, Some(options), Some(valid))?
-                .values()
-                .to_vec())
-        };
-        let (left_sorted, right_sorted) = (sorted(left_values)?, sorted(right_values)?);
-        let compare =
-            make_comparator(left_values.as_ref(), right_values.as_ref(), options)?;
-        // A merge of the sorted sides, up to `limit` rows.
+        // The non-null values of either side come first, the best first, then
+        // its `NULL`s.
+        let valid = |values: &ArrayRef| values.len() - values.null_count();
+        let (left_valid, right_valid) = (valid(left_values), valid(right_values));
+        let compare = make_comparator(
+            left_values.as_ref(),
+            right_values.as_ref(),
+            self.sort_options(),
+        )?;
+        // A merge of the non-null values of both sides, up to `limit` rows.
         let mut rows = vec![];
         let (mut l, mut r) = (0, 0);
-        while rows.len() < self.limit && (l < left_sorted.len() || r < right_sorted.len())
-        {
-            let from_left = r == right_sorted.len()
-                || (l < left_sorted.len()
-                    && compare(left_sorted[l] as usize, right_sorted[r] as usize)
-                        .is_le());
-            if from_left {
-                rows.push((0, left_sorted[l] as usize));
+        while rows.len() < self.limit && (l < left_valid || r < right_valid) {
+            if r == right_valid || (l < left_valid && compare(l, r).is_le()) {
+                rows.push((0, l));
                 l += 1;
             } else {
-                rows.push((1, right_sorted[r] as usize));
+                rows.push((1, r));
                 r += 1;
             }
         }
-        let nulls = |side: usize, values: &ArrayRef| {
-            (0..values.len())
-                .filter(|&row| values.is_null(row))
-                .map(move |row| (side, row))
-                .collect::<Vec<_>>()
-        };
-        let nulls = nulls(0, left_values)
-            .into_iter()
-            .chain(nulls(1, right_values));
+        let nulls = (left_valid..left_values.len())
+            .map(|row| (0, row))
+            .chain((right_valid..right_values.len()).map(|row| (1, row)));
         match self.order {
             TopKOrder::Key => rows.extend(nulls),
             TopKOrder::Aggregate => {
@@ -2428,8 +2435,8 @@ mod tests {
     }
 
     #[test]
-    fn top_k_merges_the_best_groups_of_two_sets_without_concatenating_them() -> Result<()>
-    {
+    fn top_k_merges_the_best_groups_of_two_sorted_sets_without_concatenating_them()
+    -> Result<()> {
         use arrow::array::{AsArray, StringViewArray};
         use arrow::compute::concat_batches;
         let schema = Arc::new(Schema::new(vec![
@@ -2493,11 +2500,26 @@ mod tests {
                     order,
                 };
                 for (left, right) in [(&left, &right), (&right, &left), (&left, &empty)] {
-                    let merged = top_k.merge_groups(left, right)?;
-                    let expected =
-                        top_k.select_groups(concat_batches(&schema, [left, right])?)?;
+                    let (left, right) = (
+                        top_k.select_sorted_groups(left)?,
+                        top_k.select_sorted_groups(right)?,
+                    );
+                    assert_eq!(top_k.sort_groups(&left)?, left, "{top_k:?}");
+                    let merged = top_k.merge_sorted_groups(&left, &right)?;
+                    let expected = top_k.select_sorted_groups(&concat_batches(
+                        &schema,
+                        [&left, &right],
+                    )?)?;
                     assert_eq!(rows(&merged), rows(&expected), "{top_k:?}");
                     assert_eq!(merged.schema(), schema);
+                    // Sorted, with their `limit`-th value as their cutoff.
+                    assert_eq!(top_k.sort_groups(&merged)?, merged, "{top_k:?}");
+                    let values = merged.column(top_k.output_column());
+                    assert_eq!(
+                        top_k.sorted_cutoff(&merged),
+                        top_k.cutoff(values.as_ref())?,
+                        "{top_k:?}"
+                    );
                 }
             }
         }
