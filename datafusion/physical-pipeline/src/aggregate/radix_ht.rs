@@ -56,10 +56,11 @@
 //! * `get_data`: the threads of the pipeline that reads the aggregation claim
 //!   the partitions one by one. A thread merges the states of the groups of
 //!   its partition, and aggregates the rows of the partition that bypassed
-//!   the thread-local tables, into a new [`GroupedHashTable`] (DataFusion's
-//!   final aggregation) and evaluates it, and emits the result in chunks of
-//!   at most [`DEFAULT_VECTOR_SIZE`] rows. Partitions have disjoint groups, so
-//!   the threads finalize them in parallel, without sharing anything.
+//!   the thread-local tables, in the order in which the threads added them,
+//!   into a new [`GroupedHashTable`] (DataFusion's final aggregation) and
+//!   evaluates it, and emits the result in chunks of at most
+//!   [`DEFAULT_VECTOR_SIZE`] rows. Partitions have disjoint groups, so the
+//!   threads finalize them in parallel, without sharing anything.
 //!
 //! A top-k aggregation (see [`TopK`]) only needs the groups that the sort
 //! above it may keep: every flush of a thread-local table only scatters
