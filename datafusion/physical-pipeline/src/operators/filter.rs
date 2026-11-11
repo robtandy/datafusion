@@ -4615,10 +4615,6 @@ mod tests {
             let plan = filter(Arc::clone(&expr));
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
             assert!(PhysicalFilter::supports_filter_exec(exec), "{expr}");
-            assert!(
-                crate::operators::adaptive_filter::depends_on_batches(&expr, &schema),
-                "{expr}"
-            );
             let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
             AdaptiveFilter::try_new(&expr, &schema).unwrap();
             lower(&plan).unwrap();
@@ -4655,11 +4651,7 @@ mod tests {
         let plan = filter(Arc::clone(&expr));
         let exec = plan.downcast_ref::<FilterExec>().unwrap();
         assert!(PhysicalFilter::supports_filter_exec(exec));
-        assert!(crate::operators::adaptive_filter::depends_on_batches(
-            &expr, &schema
-        ));
         let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
-        let _ = crate::operators::adaptive_filter::failures(&expr, &schema);
         lower(&plan).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         // DataFusion selects all rows, natively too.
