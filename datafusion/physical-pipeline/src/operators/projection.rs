@@ -20,27 +20,18 @@
 //!   never divides by zero, exactly as in DataFusion where the filter output
 //!   is compacted. Input columns that are not referenced are never touched.
 //!
-//! So an expression fails exactly when it fails in `ProjectionExec` for the
-//! same rows. The projection evaluates its expressions on chunks, not on the
-//! batches `ProjectionExec` sees (e.g. the batches a `FilterExec` coalesces
-//! its output into, or empty batches, which pipelines skip), so
-//! [`PhysicalProjection::try_from_projection_exec`] only lowers expressions
-//! whose errors do not depend on the batches (see [`depends_on_batches`](super::adaptive_filter::depends_on_batches)):
-//! `x = 0 OR 10 / x > 1`, whose right side DataFusion evaluates on all rows of
-//! a batch unless at most 20% of them have `x <> 0`, or
-//! `x = 0 OR s ~ 'a{1000000}'`, whose right side does not compile and is
-//! evaluated on empty batches, must be evaluated by DataFusion, on the
-//! batches of its input plan. The analytical expressions of TPC-H are
-//! lowered: chains of decimal arithmetic, which can only fail with arithmetic
-//! overflows (e.g. `l_extendedprice * (1 - l_discount) * (1 + l_tax)`), the
-//! built-in functions whose implementations are known, which sessions trust
-//! by default (e.g. `extract(year from o_orderdate)` or
-//! `substring(c_phone from 1 for 2)`, see
-//! [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions)), and
-//! constant strings of bounded sizes, which are copied for every row, on
-//! batches whose rows the plan bounds (e.g.
-//! `CASE WHEN ... THEN '1-URGENT' ELSE '2-HIGH' END` above a scan of memory),
-//! see [`depends_on_batches_with_rows`].
+//! [`PhysicalProjection::try_from_projection_exec`] lowers every
+//! `ProjectionExec`, whatever its expressions may fail with: e.g. the decimal
+//! arithmetic of TPC-H (`l_extendedprice * (1 - l_discount) * (1 + l_tax)`),
+//! the decimal division of TPC-H Q8 by a sum that may be 0, built-in and
+//! user-defined functions, or `x = 0 OR 10 / x > 1`. The projection evaluates
+//! them on its chunks rather than on the batches of `ProjectionExec`, so which
+//! error it raises when several rows or expressions fail, or whether an
+//! expression whose errors in DataFusion depend on its batches fails at all,
+//! can differ from DataFusion: that is the engine's own (see
+//! `docs/compatibility.md`). Only inputs whose rows the native operators
+//! cannot gather are left to DataFusion (see
+//! [`PhysicalProjection::supports_projection_exec`]).
 //!
 //! The evaluation of expressions on some of the rows of a chunk (`BoundExprs`)
 //! is shared with [`PhysicalFilter`](super::filter::PhysicalFilter).
@@ -48,11 +39,9 @@
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::expressions::{
     Column, LambdaExpr, LambdaVariable, Literal,
 };
@@ -60,14 +49,9 @@ use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
-use super::adaptive_filter::{
-    Failures, depends_on_batches_with_rows, failures_with_rows, has_32_bit_offsets,
-};
 use crate::chunk::{DataChunk, Gather, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -110,72 +94,21 @@ impl PhysicalProjection {
         Self::try_new_with_schema(input, exprs, schema)
     }
 
-    /// Whether [`Self::try_from_projection_exec`] can lower `exec` with
-    /// exactly its semantics, including its errors: whether none of its
-    /// expressions has errors that depend on how DataFusion splits the rows
-    /// into batches, empty ones included (see [`depends_on_batches`](super::adaptive_filter::depends_on_batches)), at most
-    /// one part of all of its expressions may fail, unless all of them can
-    /// only fail with arithmetic overflows (which error `ProjectionExec`,
-    /// which evaluates each expression on a whole batch before the next one,
-    /// raises first depends on its batches otherwise, see [`Failures`]), and
-    /// its input has no lists of values that take less than a byte each (e.g.
-    /// fixed-size lists of `1 << 30` nulls, booleans, or empty lists or
-    /// binaries), which the native operators cannot gather with `take`, and no
-    /// run-end encoded arrays whose child fields are not Arrow's (see
-    /// `can_gather`).
+    /// Whether [`Self::try_from_projection_exec`] can lower `exec`: whether
+    /// the native operators can gather the rows of its input, which has no
+    /// lists of values that take less than a byte each (e.g. fixed-size lists
+    /// of `1 << 30` nulls, booleans, or empty lists or binaries), which the
+    /// native operators cannot gather with `take`, and no run-end encoded
+    /// arrays whose child fields are not Arrow's (see `can_gather`).
     ///
-    /// String constants are copied for every row of a batch, and so overflow
-    /// the 32-bit offsets of strings on batches of enough rows: only those
-    /// that the batches of the input of `exec` (whose rows its plan bounds, see
-    /// `max_batch_rows`) can hold for each of their rows are lowered (see
-    /// [`depends_on_batches_with_rows`]).
-    ///
-    /// So the projections of analytical queries are lowered, e.g. the decimal
-    /// arithmetic `l_extendedprice * (1 - l_discount) * (1 + l_tax)`, the
-    /// built-in functions `extract(year from o_orderdate)` and
-    /// `substring(c_phone from 1 for 2)` in the sessions that trust them, as
-    /// sessions do by default (see
-    /// [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions)), or
-    /// `CASE WHEN ... THEN '1-URGENT' ELSE '2-HIGH' END` on batches of known
-    /// sizes.
-    ///
-    /// Below a limit that stops the execution early (e.g. a
-    /// `GlobalLimitExec`), a planner must keep the whole plan in DataFusion,
-    /// and so it must a projection with a part that may fail above native
-    /// operators of the same pipeline with parts that may fail (unless all of
-    /// these parts can only fail with arithmetic overflows), and the filters
-    /// below a projection with a part that may fail whose plans have parts
-    /// that may fail (likewise, see
-    /// [`supports_filter_exec`](super::filter::PhysicalFilter::supports_filter_exec)):
-    /// the rows evaluated before the limit is reached, and which error comes
-    /// first, depend on DataFusion's batches.
+    /// Every expression is lowered, whatever it may fail with, see the
+    /// [module documentation](self).
     pub fn supports_projection_exec(exec: &ProjectionExec) -> bool {
-        let input_schema = exec.input().schema();
-        let max_rows = max_batch_rows(exec.input());
-        // First the expressions that must not be evaluated before the
-        // execution (volatile or dynamic ones), which `depends_on_batches`
-        // finds before it probes any.
-        if exec.expr().iter().any(|projection| {
-            depends_on_batches_with_rows(
-                &projection.expr,
-                input_schema.as_ref(),
-                max_rows,
-            )
-        }) {
-            return false;
-        }
-        let failures = exec
-            .expr()
+        exec.input()
+            .schema()
+            .fields()
             .iter()
-            .map(|projection| {
-                failures_with_rows(&projection.expr, input_schema.as_ref(), max_rows)
-            })
-            .fold(Failures::NONE, Failures::and);
-        !failures.order_matters()
-            && input_schema
-                .fields()
-                .iter()
-                .all(|field| can_gather(field.data_type()))
+            .all(|field| can_gather(field.data_type()))
     }
 
     /// Lower a DataFusion [`ProjectionExec`]: evaluate its expressions on the
@@ -190,7 +123,7 @@ impl PhysicalProjection {
     ) -> Result<Self> {
         if !Self::supports_projection_exec(exec) {
             return not_impl_err!(
-                "PhysicalProjection cannot lower this ProjectionExec: the errors of one of its expressions depend on DataFusion's batches"
+                "PhysicalProjection cannot lower this ProjectionExec: the native operators cannot gather the rows of its input"
             );
         }
         check_lowered_input(exec.input().schema().as_ref(), input.as_ref())?;
@@ -354,41 +287,6 @@ pub(crate) fn check_lowered_input(
         );
     }
     Ok(())
-}
-
-/// The most rows of the batches that `plan` produces in DataFusion, if its
-/// nodes bound them: the batches of a scan of memory (as many rows as the
-/// largest batch of memory), and of the nodes that pass the batches of their
-/// input on (projections, merges of partitions) or coalesce them (filters,
-/// into batches of their batch size, but for the batches of more than half of
-/// it, which they pass on, see `LimitedBatchCoalescer`). Other nodes (e.g.
-/// scans of files, repartitions, joins or aggregations) produce batches of the
-/// batch size of the session, which the plan does not tell, or of any number
-/// of rows: `None`.
-///
-/// The native operators only lower string constants that these batches hold
-/// for each of their rows (see [`depends_on_batches_with_rows`]).
-pub(crate) fn max_batch_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
-        let memory = scan.data_source().downcast_ref::<MemorySourceConfig>()?;
-        let largest = memory
-            .partitions()
-            .iter()
-            .flatten()
-            .map(RecordBatch::num_rows)
-            .max();
-        return Some(largest.unwrap_or(0));
-    }
-    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        return max_batch_rows(projection.input());
-    }
-    if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
-        return max_batch_rows(coalesce.input());
-    }
-    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        return Some(max_batch_rows(filter.input())?.max(filter.batch_size()));
-    }
-    None
 }
 
 /// The selection of the logical rows of `chunk` among its physical rows,
@@ -601,8 +499,7 @@ pub(crate) fn takes_little_memory(data_type: &DataType) -> bool {
 /// bits, which count at most 512 MiB of booleans), and whose cost is
 /// proportional to the number of values. DataFusion filters such arrays
 /// without copying their values. Nor run-end encoded arrays whose child fields
-/// are not Arrow's, which Arrow's `filter` renames, nor dense unions with
-/// children with 32-bit offsets, whose values rows may share.
+/// are not Arrow's, which Arrow's `filter` renames.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(field)
@@ -615,16 +512,6 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
         }
         DataType::Struct(fields) => {
             fields.iter().all(|field| can_gather(field.data_type()))
-        }
-        // Rows of a dense union may point to the same value of a child, which
-        // `take` (and DataFusion's `filter`) copy for every row, so the 32-bit
-        // offsets of the child may overflow on some batches and not others.
-        DataType::Union(fields, UnionMode::Dense)
-            if fields
-                .iter()
-                .any(|(_, field)| has_32_bit_offsets(field.data_type())) =>
-        {
-            false
         }
         DataType::Union(fields, _) => fields
             .iter()
@@ -650,13 +537,15 @@ mod tests {
     use arrow::array::{
         ArrayRef, AsArray, Int32Array, Int64Array, StringArray, StringViewArray,
     };
-    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, UnionMode};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::DataFusionError;
+    use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::BinaryExpr;
     use datafusion_physical_plan::Partitioning;
+    use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::repartition::RepartitionExec;
 
     use crate::operators::adaptive_filter::MAX_CONSTANT_BYTES;
@@ -1048,17 +937,16 @@ mod tests {
             "SELECT 1 AS one, 'x' AS s FROM t1 WHERE a > 0",
         ])
         .await;
-        // Several functions (whose failures are not known) or other parts that
-        // may fail: which error comes first depends on the batches. Or string
-        // constants of more than `MAX_CONSTANT_BYTES`, copied for every row of
-        // a batch, whose 32-bit offsets overflow on batches with enough rows.
-        // Or functions that build strings, whose sizes DataFusion may limit
-        // per batch, or that may overflow their 32-bit offsets.
+        // Also several functions (whose failures are not known) or other parts
+        // that may fail, string constants of more than `MAX_CONSTANT_BYTES`,
+        // copied for every row of a batch, whose 32-bit offsets overflow on
+        // batches with enough rows, and functions that build strings, whose
+        // sizes DataFusion may limit per batch.
         let large = format!(
             "SELECT 1 AS one, '{}' AS s FROM t1 WHERE a > 0",
             "x".repeat(MAX_CONSTANT_BYTES + 1)
         );
-        assert_all_projections_in_datafusion(&[
+        assert_all_native_byte_eq(&[
             "SELECT id, length(h) AS len, concat(d, h) AS cat FROM t1 WHERE h LIKE '%01%'",
             "SELECT id, a + b AS s, upper(d) AS u FROM t1 WHERE a > 10",
             "SELECT id, CAST(a AS SMALLINT) AS n, f + INTERVAL '1 day' AS next_day FROM t1",
@@ -1066,15 +954,6 @@ mod tests {
             &large,
         ])
         .await;
-    }
-
-    /// Assert that `queries` return the same results with the native operators
-    /// as with DataFusion, without native projections.
-    async fn assert_all_projections_in_datafusion(queries: &[&str]) {
-        for sql in queries {
-            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
-            assert_eq!(run.operators.projections, 0, "native projection: {sql}");
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1090,31 +969,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn differential_projection_errors_match_datafusion() {
-        // Whether a native projection is used, and whether the query fails
-        // (in both engines).
-        for (sql, native, fails) in [
+    async fn differential_errors_of_native_projections() {
+        // Whether DataFusion fails, and whether the native projection fails:
+        // all projections are native.
+        for (sql, datafusion_fails, native_fails) in [
             // No guard: `x = 0` on half of the rows.
             ("SELECT id, 10 / x AS q FROM dense", true, true),
             // Guarded by the filter, or by `CASE`.
             (
                 "SELECT id, 10 / x AS q FROM dense WHERE x <> 0",
-                true,
+                false,
                 false,
             ),
             (
                 "SELECT id, CASE WHEN x <> 0 THEN 10 / x END AS q FROM dense",
-                true,
+                false,
                 false,
             ),
             // `OR` divides all rows of a batch unless at most 20% have
-            // `x <> 0`: the errors depend on the batches, so these projections
-            // stay in DataFusion.
-            (
-                "SELECT id, x = 0 OR 10 / x > 1 AS b FROM dense",
-                false,
-                true,
-            ),
+            // `x <> 0`, on the batches of DataFusion and on the chunks of the
+            // native projection.
+            ("SELECT id, x = 0 OR 10 / x > 1 AS b FROM dense", true, true),
             (
                 "SELECT id, x = 0 OR 10 / x > 1 AS b FROM sparse",
                 false,
@@ -1128,19 +1003,29 @@ mod tests {
             ),
             (
                 "SELECT id, 10 / b AS q FROM nulls_ok WHERE a IS NULL",
-                true,
+                false,
                 false,
             ),
         ] {
-            let (error, operators) =
-                assert_native_parity_with_setup(sql, guard_tables).await;
-            assert_eq!(operators.projections > 0, native, "{sql}");
-            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
+            let outcome = assert_allowed_native_outcome_with_config(
+                sql,
+                crate::test_utils::test_session_config(),
+                guard_tables,
+                &["Divide by zero"],
+            )
+            .await;
+            assert!(outcome.operators.projections > 0, "{sql}");
+            assert_eq!(
+                outcome.datafusion.is_some(),
+                datafusion_fails,
+                "{sql}: {outcome:?}"
+            );
+            assert_eq!(outcome.native.is_some(), native_fails, "{sql}: {outcome:?}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn batch_dependent_projections_see_datafusion_batches() {
+    async fn batch_dependent_projections_are_native() {
         // Two batches of 2048 rows: 1848 zeros then 200 ones, and 2048 ones.
         // `FilterExec` coalesces them into one batch, in which 55% of the rows
         // have `x <> 0`: DataFusion divides all of them by `x` and fails. On
@@ -1161,10 +1046,17 @@ mod tests {
             register_partitions(ctx, "coalesced", vec![batches.clone()])
         };
         let sql = "SELECT x = 0 OR 10 / x > 1 AS b FROM coalesced WHERE x >= 0";
-        let (error, operators) = assert_native_parity_with_setup(sql, setup).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_outcome_with_setup(sql, setup, &["Divide by zero"])
+            .await;
         assert!(error.unwrap().contains("Divide by zero"));
-        // The projection stays in DataFusion, with the filter below it.
-        assert_eq!(operators.projections + operators.filters, 0);
+        // The projection and the filter below it are native: whether the
+        // native projection, on the chunks of the filter, divides by zero is
+        // the engine's own (behaviour that depends on the batches).
+        assert_eq!(operators.projections + operators.filters, 2);
 
         let exec = ProjectionExec::try_new(
             [ProjectionExpr::new(
@@ -1179,16 +1071,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(&exec));
-        let err = PhysicalProjection::try_from_projection_exec(
-            &exec,
-            source(Arc::clone(&schema), vec![]),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("depend on DataFusion's batches"),
-            "{err}"
-        );
+        assert!(PhysicalProjection::supports_projection_exec(&exec));
         // On the chunks, the projection does not fail.
         let projection = PhysicalProjection::try_new(
             source(Arc::clone(&schema), vec![]),
@@ -1204,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn projections_that_fail_on_some_batches_stay_in_datafusion() {
+    async fn projections_that_fail_on_some_batches_are_native() {
         let schema = xys(&[]).schema();
         let plan = |expr: &str, batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
             Arc::new(
@@ -1241,15 +1124,20 @@ mod tests {
         ] {
             let exec_plan = plan(expr, &batches);
             let exec = exec_plan.downcast_ref::<ProjectionExec>().unwrap();
-            assert!(
-                !PhysicalProjection::supports_projection_exec(exec),
-                "{expr}"
-            );
-            let (error, operators) =
-                assert_native_plan_parity(|| plan(expr, &batches), false).await;
+            assert!(PhysicalProjection::supports_projection_exec(exec), "{expr}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                || plan(expr, &batches),
+                false,
+                &["did not compile", "Divide by zero"],
+            )
+            .await;
             let input = format!("{expr} on {} batches", batches.len());
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
-            assert_eq!(operators.projections, 0, "{input}");
+            assert_eq!(operators.projections, 1, "{input}");
         }
         // On the chunks of the pipeline, the projection does not fail.
         let native = PhysicalProjection::try_new(
@@ -1271,9 +1159,14 @@ mod tests {
         assert!(project(&native, &DataChunk::from(mixed.slice(0, 2048))).is_ok());
         // A pattern that compiles cannot fail.
         for batches in [vec![mixed], vec![empty, zeros], vec![]] {
-            let (error, operators) = assert_native_plan_parity(
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || plan("x = 0 OR (y = 0 OR s ~ 'a+')", &batches),
                 false,
+                &["did not compile", "Divide by zero"],
             )
             .await;
             assert!(error.is_none());
@@ -1315,14 +1208,18 @@ mod tests {
                     .unwrap(),
                 )
             };
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, false, &[]).await;
             assert!(error.is_none(), "{error:?}");
-            assert_eq!(operators.projections, 0);
+            assert_eq!(operators.projections, 1);
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion() {
+    async fn case_insensitive_patterns_that_fail_on_unicode_are_native() {
         // One batch of 4096 rows, `(x, s) = (1, "a")` then `(0, "é")`:
         // DataFusion evaluates `s ILIKE 'sss…'` on all rows of the batch, and
         // compiles its pattern (too big) because some strings are not ASCII,
@@ -1342,10 +1239,15 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         assert!(error.unwrap().contains("Unable to build regex"));
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
         let native = PhysicalProjection::try_new(
             source(Arc::clone(&schema), vec![]),
             vec![(physical_expr(&expr, &schema), "m".to_owned())],
@@ -1375,17 +1277,21 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let projection_plan = plan(&calls);
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         lower(&projection_plan).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let (error, operators) =
-            assert_native_plan_parity(|| plan(&Arc::default()), false).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(|| plan(&Arc::default()), false, &[])
+            .await;
         assert!(error.is_none());
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn case_insensitive_patterns_on_bytes_beneath_nulls_stay_in_datafusion() {
+    async fn case_insensitive_patterns_on_bytes_beneath_nulls_are_native() {
         // `x = 0` selects every other row, the first one too, whose string is
         // null above bytes that are not ASCII: DataFusion's `filter` keeps
         // them, so Arrow compiles the pattern of the `ILIKE`, which is too
@@ -1410,10 +1316,15 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         assert!(error.unwrap().contains("Unable to build regex"));
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
         let native = PhysicalProjection::try_new(
             source(Arc::clone(&schema), vec![]),
             vec![(physical_expr(&expr, &schema), "m".to_owned())],
@@ -1424,7 +1335,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_that_arrow_cannot_evaluate_stay_in_datafusion() {
+    async fn casts_that_arrow_cannot_evaluate_are_native() {
         // Arrow cannot pack booleans into a dictionary: the cast fails whenever
         // it is evaluated, which depends on DataFusion's batches (see the
         // test of the same name for filters), empty ones included.
@@ -1446,24 +1357,32 @@ mod tests {
             };
             let projection_plan = plan();
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-            assert!(
-                !PhysicalProjection::supports_projection_exec(exec),
-                "{expr}"
-            );
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(PhysicalProjection::supports_projection_exec(exec), "{expr}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                plan,
+                false,
+                &["Unsupported output type for dictionary packing"],
+            )
+            .await;
             assert!(error.unwrap().contains("dictionary packing"), "{expr}");
-            assert_eq!(operators.projections, 0, "{expr}");
+            assert_eq!(operators.projections, 1, "{expr}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lists_built_per_batch_stay_in_datafusion() {
+    async fn lists_built_per_batch_are_native_if_their_rows_can_be_gathered() {
         // On the batch of 4096 rows, the 32-bit offsets of the lists overflow,
         // on each chunk of 2048 rows of a pipeline, they do not: when
         // `CASE WHEN x THEN a ELSE b END` merges the lists of `a` on the first
         // 2048 rows (`1 << 30` nulls) and of `b` on the others (`1 << 30` too),
         // and when a constant list of `1 << 19` nulls is broadcast to the
-        // rows.
+        // rows. But the native operators cannot gather the rows of the lists
+        // of nulls of the input (see `can_gather`): these projections stay in
+        // DataFusion.
         let batch = lists_to_merge();
         let schema = batch.schema();
         for expr in [
@@ -1491,7 +1410,9 @@ mod tests {
         }
         // So do 16-bit run ends: a constant fixed-size list of 8 values in one
         // run, broadcast to the rows, has 32768 values on the batch of 4096
-        // rows, and 16384 on a chunk of 2048.
+        // rows, and 16384 on a chunk of 2048. The rows of the input can be
+        // gathered: the projection is native, and whether it fails depends on
+        // the batches (which is the engine's own).
         let ints = xys(&[((0, 0), 4096)]);
         let ints_schema = ints.schema();
         let plan = || -> Arc<dyn ExecutionPlan> {
@@ -1505,10 +1426,10 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
         assert!(
-            assert_same_outcome_in_datafusion(plan(), task_ctx)
+            assert_allowed_native_outcome(plan(), task_ctx, &["Option::unwrap()"])
                 .await
                 .is_err()
         );
@@ -1533,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn projections_with_several_failures_stay_in_datafusion() {
+    async fn projections_with_several_failures_are_native() {
         // `ProjectionExec` evaluates `CAST(s AS INT)` on all rows of the batch
         // before `10 / x`, and fails to cast `"invalid"`; on the first chunk of
         // a pipeline, `"1"` casts, and `10 / x` divides by zero.
@@ -1556,15 +1477,28 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         // On one thread, a pipeline evaluates the first chunk first.
         let config = SessionConfig::new().with_target_partitions(1);
-        let (error, operators) =
-            assert_native_plan_parity_with_config(plan, false, config).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
+            plan,
+            false,
+            config,
+            &["Cannot cast string 'invalid'", "Divide by zero"],
+        )
+        .await;
         assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
         // A single expression that may fail is lowered.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || -> Arc<dyn ExecutionPlan> {
                 Arc::new(
                     ProjectionExec::try_new(
@@ -1578,6 +1512,7 @@ mod tests {
                 )
             },
             false,
+            &["Cannot cast string 'invalid'", "Divide by zero"],
         )
         .await;
         assert!(error.unwrap().contains("Divide by zero"));
@@ -1688,13 +1623,13 @@ mod tests {
                 false,
             ),
             (list(DataType::Struct(Vec::<Field>::new().into()), 4), false),
-            // Rows of dense unions may share the strings of a child, but not
-            // those of sparse unions, nor values without offsets.
-            (union(DataType::Utf8, UnionMode::Dense), false),
+            // Rows of dense unions may share the strings or lists of a child,
+            // which gathering them copies for every row, as DataFusion does.
+            (union(DataType::Utf8, UnionMode::Dense), true),
             (union(list(DataType::Int32, 2), UnionMode::Dense), true),
             (
                 union(DataType::new_list(DataType::Int8, true), UnionMode::Dense),
-                false,
+                true,
             ),
             (union(DataType::Utf8, UnionMode::Sparse), true),
             (union(DataType::Float64, UnionMode::Dense), true),
@@ -1720,7 +1655,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn operations_on_unsupported_types_stay_in_datafusion() {
+    async fn operations_on_unsupported_types_are_native() {
         // `NOT` of an integer fails whenever it is evaluated, on an empty batch
         // too, which a pipeline skips.
         let schema = xys(&[]).schema();
@@ -1739,14 +1674,23 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            plan,
+            false,
+            &["could not cast array of type Int32"],
+        )
+        .await;
         assert!(error.is_some());
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cases_of_unions_stay_in_datafusion() {
+    async fn cases_of_unions_are_native() {
         // `ProjectionExec` evaluates `CASE b WHEN true THEN u END` on the
         // batch, which merges unions without nullable fields with nulls, and
         // fails, but a pipeline on chunks whose rows all take the branch, or
@@ -1764,9 +1708,14 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            task_ctx,
+            &["Cannot extend a union with no nullable fields with nulls"],
+        )
+        .await;
         assert!(
             outcome.as_ref().is_err_and(|error| error
                 .contains("Cannot extend a union with no nullable fields with nulls")),
@@ -1775,7 +1724,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn projections_above_filters_between_failures_keep_their_errors() {
+    async fn projections_above_filters_between_failures_are_native() {
         // `FilterExec(x >= 0)` pulls both batches of its input, and the cast of
         // the second one fails, before the projection above it divides by zero
         // the rows of the first one; a native filter would pass them on at
@@ -1795,17 +1744,26 @@ mod tests {
             )
         };
         let config = || SessionConfig::new().with_target_partitions(1);
-        let (error, operators) =
-            assert_native_plan_parity_with_config(plan, false, config()).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
+            plan,
+            false,
+            config(),
+            &["Cannot cast string 'invalid'", "Divide by zero"],
+        )
+        .await;
         let error = error.unwrap();
         assert!(error.contains("Cannot cast string 'invalid'"), "{error}");
         // The filter stays in DataFusion, with its input; the projection
         // above it is lowered.
-        assert_eq!((operators.filters, operators.projections), (0, 1));
+        assert_eq!((operators.filters, operators.projections), (1, 2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn matches_of_patterns_that_may_be_scalars_stay_in_datafusion() {
+    async fn matches_of_patterns_that_may_be_scalars_are_native() {
         // `ProjectionExec` matches the strings with the array of patterns that
         // `CASE` returns on its batch, which Arrow compiles, and one is too
         // big, but a pipeline with the scalar that it returns on the first
@@ -1824,15 +1782,20 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn negations_of_values_that_may_be_scalars_stay_in_datafusion() {
+    async fn negations_of_values_that_may_be_scalars_are_native() {
         // `ProjectionExec` negates the array that `CASE` returns on its batch,
         // wrapping, but a pipeline the scalar that it returns on the first
         // chunk, all of whose rows take the `ELSE` branch, with overflow checks
@@ -1850,14 +1813,19 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Arithmetic overflow"])
+            .await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_stay_in_datafusion() {
+    async fn functions_are_native() {
         let _large = one_large_test_at_a_time().await;
         // `ProjectionExec` evaluates `concat_length(s)`, which builds `s || s`,
         // on the batch of 8192 rows, 2 GiB of strings, whose 32-bit offsets
@@ -1876,9 +1844,11 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan(), task_ctx, &["Offset overflow error"])
+                .await;
         assert!(
             outcome
                 .as_ref()
@@ -1888,7 +1858,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concatenations_of_strings_stay_in_datafusion() {
+    async fn concatenations_of_strings_are_native() {
         let _large = one_large_test_at_a_time().await;
         // `ProjectionExec` evaluates `s || s` on the batch of 8192 rows, 2 GiB
         // of strings, whose 32-bit offsets overflow, but a pipeline on chunks
@@ -1909,9 +1879,11 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan(), task_ctx, &["Offset overflow error"])
+                .await;
         assert!(
             outcome
                 .as_ref()
@@ -1921,7 +1893,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
+    async fn functions_building_values_of_variable_lengths_are_native() {
         // `ProjectionExec` evaluates `repeat(s, n)` on the batch of 8192 rows,
         // 4 GiB of strings, more than DataFusion allows, but a pipeline on
         // chunks of 2048 rows (see the test of the same name for filters).
@@ -1941,9 +1913,14 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            task_ctx,
+            &["string size overflow on repeat"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -1977,16 +1954,21 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let plan = projection(dynamic_first_call(&calls, &schema));
         let exec = plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         // The fallback returns `true` on all rows, as DataFusion does.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || projection(dynamic_first_call(&Arc::default(), &schema)),
             false,
+            &[],
         )
         .await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
         let batches = datafusion_physical_plan::collect(
             projection(dynamic_first_call(&Arc::default(), &schema)),
             Arc::new(TaskContext::default()),
@@ -1998,7 +1980,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dynamic_expressions_stay_in_datafusion() {
+    async fn dynamic_expressions_are_native() {
         // `ProjectionExec` evaluates `x <> 0 AND 10 / x > 1` on the batch of
         // 1848 zeros then 2248 ones, more than 20% of which pass `x <> 0`, so
         // it divides all rows, and fails, but a pipeline on chunks of 2048
@@ -2024,9 +2006,10 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan(), task_ctx, &["Divide by zero"]).await;
         assert!(
             outcome
                 .as_ref()
@@ -2036,7 +2019,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn projections_of_types_without_arrays_stay_in_datafusion() {
+    async fn projections_of_types_without_arrays_are_native() {
         // The classification probes `u IS NULL` on a null of the type of `u`,
         // which Arrow cannot build for types it has no arrays of (but a schema
         // can have, e.g. of a table without batches; see
@@ -2060,12 +2043,12 @@ mod tests {
             let projection_plan = plan();
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
             assert!(
-                !PhysicalProjection::supports_projection_exec(exec),
+                PhysicalProjection::supports_projection_exec(exec),
                 "{data_type}"
             );
             let task_ctx = Arc::new(TaskContext::default());
             assert_eq!(
-                assert_same_outcome_in_datafusion(plan(), task_ctx).await,
+                assert_allowed_native_outcome(plan(), task_ctx, &[]).await,
                 Ok(0),
                 "{data_type}"
             );
@@ -2073,16 +2056,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+    async fn casts_of_dense_unions_of_shared_strings_are_native() {
+        let _large = one_large_test_at_a_time().await;
         // Casting a dense union extracts its child of strings first, copying a
         // string of 2 MiB for each of the 1200 rows of the batch of
         // `ProjectionExec` that point to it, whose 32-bit offsets overflow,
         // whatever the type it casts into, but not for the 600 rows of a chunk
-        // (see `filters_of_dense_unions_of_shared_strings_stay_in_datafusion`).
+        // of the native projection (`docs/compatibility.md` allows the engines
+        // to have other capacity limits, and to raise other errors).
         let batch = dense_union_of_a_large_string();
         let schema = batch.schema();
+        let halves = [batch.slice(0, 2048), batch.slice(2048, 2048)];
         for to in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-            let plan = || -> Arc<dyn ExecutionPlan> {
+            let plan = |batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
                 let cast =
                     Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
                         physical_expr("u", &schema),
@@ -2092,27 +2078,53 @@ mod tests {
                 Arc::new(
                     ProjectionExec::try_new(
                         [ProjectionExpr::new(cast as Arc<dyn PhysicalExpr>, "c")],
-                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                        scan_batches(&schema, batches),
                     )
                     .unwrap(),
                 )
             };
-            let projection_plan = plan();
+            let projection_plan = plan(std::slice::from_ref(&batch));
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-            assert!(!PhysicalProjection::supports_projection_exec(exec), "{to}");
+            assert!(PhysicalProjection::supports_projection_exec(exec), "{to}");
             let task_ctx = Arc::new(TaskContext::default());
-            let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+            let datafusion =
+                outcome(Arc::clone(&projection_plan), Arc::clone(&task_ctx)).await;
             assert!(
-                outcome
+                datafusion
                     .as_ref()
                     .is_err_and(|error| error.to_lowercase().contains("overflow")),
-                "{to}: {outcome:?}"
+                "{to}: {datafusion:?}"
+            );
+            let operator = lower(&projection_plan).unwrap();
+            assert_eq!(NativeOperators::of(&operator).projections, 1, "{to}");
+            let native = executable(operator, projection_plan).unwrap();
+            let native = outcome(native, Arc::clone(&task_ctx)).await;
+            // The cast returns nulls for the integers of the union, in a column
+            // that the plan declares non-nullable: on each half of the batch,
+            // DataFusion does not overflow, and fails on these nulls, as the
+            // native projection does on the whole batch.
+            for half in &halves {
+                let expected =
+                    outcome(plan(std::slice::from_ref(half)), Arc::clone(&task_ctx))
+                        .await;
+                assert!(
+                    expected
+                        .as_ref()
+                        .is_err_and(|error| error.contains("non-nullable")),
+                    "{to}: {expected:?}"
+                );
+            }
+            assert!(
+                native
+                    .as_ref()
+                    .is_err_and(|error| error.contains("non-nullable")),
+                "{to}: {native:?}"
             );
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn broadcast_constants_stay_in_datafusion() {
+    async fn broadcast_constants_are_native() {
         // `ProjectionExec` evaluates `CASE WHEN x THEN '…' END` on the batch,
         // which copies a string of 2 MiB for each of its 2048 rows with `x`,
         // and panics, but a pipeline on chunks of 2048 rows, on which `CASE`
@@ -2134,9 +2146,10 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan(), task_ctx, &["offset overflow"]).await;
         assert!(
             outcome
                 .as_ref()
@@ -2157,15 +2170,15 @@ mod tests {
             PhysicalProjection::supports_projection_exec(&projection)
         };
         let max = MAX_CONSTANT_BYTES;
-        assert!(!constant(&"x".repeat(max + 1)));
-        assert!(!constant(&"x".repeat(2 << 20)));
+        assert!(constant(&"x".repeat(max + 1)));
+        assert!(constant(&"x".repeat(2 << 20)));
         assert!(constant(&"x".repeat(max)));
         assert!(constant("x"));
         assert!(constant(""));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unpacking_repeated_values_stays_in_datafusion() {
+    async fn unpacking_repeated_values_is_native() {
         // `ProjectionExec` unpacks the dictionary on all rows of the batch
         // (half of them pass `id < 2048`), and the 32-bit offsets of 2048
         // strings of 2 MiB overflow, but a pipeline evaluates it on chunks of
@@ -2185,9 +2198,11 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan(), task_ctx, &["Offset overflow error"])
+                .await;
         assert!(
             outcome
                 .as_ref()
@@ -2197,7 +2212,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_of_dictionary_keys_stay_in_datafusion() {
+    async fn casts_of_dictionary_keys_are_native() {
         // `ProjectionExec` evaluates the cast of the keys of `d` on all rows of
         // the batch (half of them pass `x = 0`), and fails on `1 << 31`, but a
         // pipeline evaluates it on chunks of 2048 rows, the second of which
@@ -2216,9 +2231,14 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
+        assert!(PhysicalProjection::supports_projection_exec(exec));
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            task_ctx,
+            &["Can't cast value 2147483648 to type Int32"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -2228,7 +2248,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn projections_of_dictionary_values_stay_in_datafusion() {
+    async fn projections_of_dictionary_values_are_native() {
         // `FilterExec` coalesces the rows `"1"` and `"2"` into one batch,
         // merging the dictionaries of the two batches without the values that
         // no row references, `"x"` and `"y"`: DataFusion casts `"1"` and `"2"`.
@@ -2255,10 +2275,15 @@ mod tests {
         };
         let projection_plan = plan();
         let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-        assert!(!PhysicalProjection::supports_projection_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalProjection::supports_projection_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Cannot cast string"])
+            .await;
         assert!(error.is_none());
-        assert_eq!(operators.projections, 0);
+        assert_eq!(operators.projections, 1);
         let native = PhysicalProjection::try_new(
             source(Arc::clone(&schema), vec![]),
             vec![(physical_expr("CAST(d AS INT)", &schema), "i".to_owned())],
@@ -2267,7 +2292,11 @@ mod tests {
         let chunk = selected_chunk(&batches[0], vec![0]);
         assert!(project(&native, &chunk).is_err());
         // Unpacking the dictionary cannot fail.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || -> Arc<dyn ExecutionPlan> {
                 let filter = FilterExec::try_new(
                     physical_expr("d <> 'x' AND d <> 'y'", &schema),
@@ -2286,6 +2315,7 @@ mod tests {
                 )
             },
             false,
+            &["Cannot cast string"],
         )
         .await;
         assert!(error.is_none());
@@ -2316,19 +2346,15 @@ mod tests {
         ])
         .await;
         // `strpos` copies the substring it searches for every row of a batch
-        // (see `make_scalar_function`): on batches whose rows the plan bounds.
+        // (see `make_scalar_function`), on batches of any size.
         let sql = "SELECT i, sv, strpos(sv, 'g') AS g FROM vd WHERE sv LIKE 'a string%' AND i % 7 = 0";
-        let run =
-            assert_native_byte_eq_with_config(sql, unrepartitioned(), all_tables).await;
-        assert!(run.operators.projections > 0, "no native projection: {sql}");
-        let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
-        assert_eq!(run.operators.projections, 0, "{sql}");
-        // Functions are opaque: whatever they return, they may fail depending
-        // on the rows they are evaluated on together. And so are the
-        // built-in ones of dictionaries (e.g. `upper` takes the dictionary
-        // itself, and may evaluate all of its values, which depend on
-        // DataFusion's batches).
-        assert_all_projections_in_datafusion(&[
+        for config in [unrepartitioned(), crate::test_utils::test_session_config()] {
+            let run = assert_native_byte_eq_with_config(sql, config, all_tables).await;
+            assert!(run.operators.projections > 0, "no native projection: {sql}");
+        }
+        // Functions of dictionaries (e.g. `upper` takes the dictionary itself,
+        // and may evaluate all of its values, which depend on the batches).
+        assert_all_native_byte_eq(&[
             "SELECT i, upper(d32) AS u FROM vd WHERE i % 5 = 0",
             "SELECT i, length(d8) AS u FROM vd WHERE i % 5 = 0",
             "SELECT i, concat(sv, d8) AS c FROM vd WHERE i % 5 = 0",
@@ -2448,7 +2474,7 @@ mod tests {
         // batches of the scans of the 3 partitions of the tables, which a
         // repartition into 4 partitions (before a filter) does not bound (see
         // `max_batch_rows`).
-        for (sql, repartitioned) in [
+        for (sql, _repartitioned) in [
             (
                 "SELECT o_orderkey, CASE WHEN o_orderpriority = '1-URGENT' \
                  OR o_orderpriority = '2-HIGH' THEN '1-URGENT' ELSE '2-HIGH' END AS priority \
@@ -2469,12 +2495,12 @@ mod tests {
             assert!(projections > 0, "no projection: {sql}");
             assert!(run.operators.projections > 0, "no native projection: {sql}");
             let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
-            assert_eq!(run.operators.projections == 0, repartitioned, "{sql}");
+            assert!(run.operators.projections > 0, "no native projection: {sql}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn builtin_functions_of_tpch_projections_are_native_by_default() {
+    async fn tpch_projections_are_native() {
         // The sessions of `test_session_config` (4 threads) do not register the
         // functions they trust (see `TrustedFunctions`): by default, they trust
         // the built-in functions of DataFusion, so that the
@@ -2545,7 +2571,8 @@ mod tests {
                 "{sql}"
             );
         }
-        // Unless the session trusts no function: then `substr` is opaque.
+        // Also in a session that trusts no function (whose calls are opaque to
+        // the classification of errors).
         let untrusting = config.clone().with_option_extension(
             crate::operators::adaptive_filter::TrustedFunctions::default(),
         );
@@ -2553,60 +2580,23 @@ mod tests {
                    FROM customer";
         let (plan, root) = assert_planned_byte_eq(sql, untrusting, tpch_tables).await;
         let projection = plan.downcast_ref::<ProjectionExec>().expect("a projection");
-        assert!(!PhysicalProjection::supports_projection_exec(projection));
-        assert_eq!(NativeOperators::of(&root).projections, 0, "{sql}");
-        // But the decimal division of Q8 by a sum that may be 0: it may fail
+        assert!(PhysicalProjection::supports_projection_exec(projection));
+        assert_eq!(NativeOperators::of(&root).projections, 1, "{sql}");
+        // And the decimal division of Q8 by a sum that may be 0, which may fail
         // with a division by zero (on a sum of 0) and with an overflow (on a
-        // quotient beyond the precision of its type), of which DataFusion
-        // raises the error of the first row of its partition that fails, but
-        // a pipeline the error of the chunk that fails first on any of its
-        // threads (see `parts_that_fail_with_several_kinds_of_errors_stay_in_datafusion`):
-        // DataFusion executes it, with its input.
+        // quotient beyond the precision of its type): which of them is raised
+        // is the engine's own (see `docs/compatibility.md`).
         let sql = "SELECT o_year, sum(CASE WHEN o_orderpriority = '1-URGENT' THEN volume ELSE 0 END) \
                    / sum(volume) AS mkt_share FROM (\
                    SELECT extract(year from o_orderdate) AS o_year, \
                    l_extendedprice * (1 - l_discount) AS volume, o_orderpriority \
                    FROM lineitem, orders WHERE l_orderkey = o_orderkey) \
                    GROUP BY o_year ORDER BY o_year";
-        let (plan, root) = assert_planned_byte_eq(sql, config, tpch_tables).await;
-        let mut divisions = vec![];
-        plan.apply(|node| {
-            if let Some(projection) = node.downcast_ref::<ProjectionExec>()
-                && projection
-                    .expr()
-                    .iter()
-                    .any(|expr| expr.expr.to_string().contains(" / "))
-            {
-                divisions.push(Arc::clone(node));
-            }
-            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
-        })
-        .unwrap();
-        let [division] = divisions.as_slice() else {
-            panic!("one projection of the division: {divisions:?}");
-        };
-        let projection = division.downcast_ref::<ProjectionExec>().unwrap();
-        let input_schema = projection.input().schema();
-        let failures = projection
-            .expr()
-            .iter()
-            .map(|expr| {
-                crate::operators::adaptive_filter::failures(&expr.expr, &input_schema)
-            })
-            .fold(Failures::NONE, Failures::and);
-        assert!(!failures.only_overflows() && failures.order_matters());
-        assert!(!PhysicalProjection::supports_projection_exec(projection));
-        let bridged = crate::bridge::bridged_plans(&root);
-        let tree = crate::explain::format_operator_tree(&root);
-        assert_eq!(bridged.len(), 1, "{tree}");
-        assert_eq!(
-            datafusion_physical_plan::displayable(bridged[0].as_ref())
-                .one_line()
-                .to_string(),
-            datafusion_physical_plan::displayable(division.as_ref())
-                .one_line()
-                .to_string(),
-            "{tree}"
+        let (_, root) = assert_planned_byte_eq(sql, config, tpch_tables).await;
+        assert!(
+            crate::bridge::bridged_plans(&root).is_empty(),
+            "{sql}\n{}",
+            crate::explain::format_operator_tree(&root)
         );
     }
 
@@ -2618,7 +2608,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn differential_decimal_overflows_match_datafusion() {
+    async fn differential_decimal_overflows_of_native_operators() {
         // `a * b * c` overflows `Decimal128` on some rows of every partition:
         // the first product on the rows of `x = 1`, the second one on the rows
         // of `x = 2`. Whatever the batches and the order of the rows, both
@@ -2679,8 +2669,10 @@ mod tests {
                 ],
             )
         };
-        for (sql, native, fails) in [
-            // Several products that may only overflow: native.
+        // Whether the native operators fail (DataFusion fails on the same
+        // queries, but for the guarded one).
+        for (sql, _, native_fails) in [
+            // Several products that may only overflow.
             ("SELECT a * b * c AS v FROM overflows", true, true),
             ("SELECT a * b AS ab, b * c AS bc FROM overflows", true, true),
             (
@@ -2694,45 +2686,45 @@ mod tests {
                 true,
             ),
             ("SELECT x FROM overflows WHERE a * b * c > 0", true, true),
-            // But after a guard: DataFusion decides per batch on which rows it
+            // After a guard: DataFusion decides per batch on which rows it
             // evaluates them (here on all of them: a third of the rows have
-            // `x = 0`).
+            // `x = 0`), the native filter only evaluates them on the rows
+            // with `x = 0`, which do not overflow.
             (
                 "SELECT x FROM overflows WHERE x = 0 AND a * b > c * a",
-                false,
                 true,
+                false,
             ),
             (
                 "SELECT a * b AS v FROM overflows WHERE b * c > 0",
                 true,
                 true,
             ),
-            // With a part that fails otherwise (a cast of strings), which error
-            // comes first depends on the batches: in DataFusion.
+            // With a part that fails otherwise (a cast of strings): which error
+            // comes first is the engine's own.
             (
                 "SELECT a * b + CAST(s AS DECIMAL(38, 0)) AS v FROM overflows",
-                false,
+                true,
                 true,
             ),
             (
                 "SELECT a * b + CAST(s AS DECIMAL(38, 0)) AS v FROM overflows WHERE x = 0",
-                false,
+                true,
                 false,
             ),
         ] {
-            let (error, operators) = assert_native_parity_with_setup(sql, &setup).await;
-            assert_eq!(
-                operators.projections + operators.filters > 0,
-                native,
+            let outcome = assert_allowed_native_outcome_with_config(
+                sql,
+                crate::test_utils::test_session_config(),
+                &setup,
+                &["Overflow", "Cannot cast"],
+            )
+            .await;
+            assert!(
+                outcome.operators.projections + outcome.operators.filters > 0,
                 "{sql}"
             );
-            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
-            if let Some(error) = error {
-                assert!(
-                    error.contains("Overflow") || error.contains("Cannot cast"),
-                    "{sql}: {error}"
-                );
-            }
+            assert_eq!(outcome.native.is_some(), native_fails, "{sql}: {outcome:?}");
         }
     }
 
@@ -2850,7 +2842,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_of_values_that_may_be_scalars_stay_in_datafusion() {
+    async fn functions_of_values_that_may_be_scalars_are_native() {
         // Functions may evaluate scalars and arrays differently: `to_timestamp`
         // of a string and an array of formats fails on a scalar string, which a
         // `CASE` returns on the first chunk of a pipeline, but not on the array
@@ -2876,13 +2868,19 @@ mod tests {
             };
             let projection_plan = plan();
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-            assert!(
-                !PhysicalProjection::supports_projection_exec(exec),
-                "{expr}"
-            );
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(PhysicalProjection::supports_projection_exec(exec), "{expr}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                plan,
+                false,
+                &["Unsupported data type", "did not compile"],
+            )
+            .await;
             assert!(error.is_none(), "{expr}: {error:?}");
-            assert_eq!(operators.projections, 0, "{expr}");
+            assert_eq!(operators.projections, 1, "{expr}");
             // On the first chunk of a pipeline, it fails.
             let native = PhysicalProjection::try_new(
                 source(Arc::clone(&schema), vec![]),
@@ -2923,7 +2921,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn regexp_like_with_flags_of_rows_stays_in_datafusion() {
+    async fn regexp_like_with_flags_of_rows_is_native() {
         // With flags of each row, `regexp_like` checks the flags of the whole
         // batch for `g` before it compiles any pattern: DataFusion fails to
         // plan the global option on the batch of 4096 rows, but a pipeline
@@ -2949,9 +2947,18 @@ mod tests {
         ])
         .unwrap();
         let (plan, supported, native) = project_batch("regexp_like(s, p, f)", &batch);
-        assert!(!supported);
+        assert!(supported);
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        let outcome = assert_allowed_native_outcome(
+            plan,
+            task_ctx,
+            &[
+                "Error during planning",
+                "did not compile",
+                "unclosed character class",
+            ],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -2967,7 +2974,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn regexp_like_with_large_flags_of_rows_stays_in_datafusion() {
+    async fn regexp_like_with_large_flags_of_rows_is_native() {
         let _large = one_large_test_at_a_time().await;
         // `regexp_like` copies flags of each row that are views into 32-bit
         // offsets for the whole batch: 4096 flags of 512 KiB overflow them
@@ -2989,9 +2996,10 @@ mod tests {
         ])
         .unwrap();
         let (plan, supported, _) = project_batch("regexp_like(s, 'a', f)", &batch);
-        assert!(!supported);
+        assert!(supported);
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        let outcome =
+            assert_allowed_native_outcome(plan, task_ctx, &["offset overflow"]).await;
         assert!(
             outcome
                 .as_ref()
@@ -3001,7 +3009,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn to_timestamp_of_numbers_stays_in_datafusion() {
+    async fn to_timestamp_of_numbers_is_native() {
         // `to_timestamp` casts decimals into `Decimal128(38, 9)` before it
         // converts them into timestamps, on the whole batch: DataFusion fails
         // to cast `10^60` on the batch of 4096 rows, but a pipeline would fail
@@ -3017,9 +3025,14 @@ mod tests {
         let batch =
             RecordBatch::try_from_iter([("d", Arc::new(values) as ArrayRef)]).unwrap();
         let (plan, supported, native) = project_batch("to_timestamp(d)", &batch);
-        assert!(!supported);
+        assert!(supported);
         let task_ctx = Arc::new(TaskContext::default());
-        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        let outcome = assert_allowed_native_outcome(
+            plan,
+            task_ctx,
+            &["Cast error", "Execution error", "Parser error"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -3044,7 +3057,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn parts_that_fail_with_several_kinds_of_errors_stay_in_datafusion() {
+    async fn parts_that_fail_with_several_kinds_of_errors_are_native() {
         // DataFusion evaluates the rows of a partition in order, and fails on
         // row 2047, but a pipeline evaluates the chunks of the partition on
         // several threads, and raises the error of the chunk that fails first,
@@ -3116,17 +3129,29 @@ mod tests {
             ),
         ] {
             let (plan, supported, native) = project_batch(expr, &batch);
-            assert!(!supported, "{expr}");
+            assert!(supported, "{expr}");
             for threads in 2..=4 {
                 for _ in 0..8 {
                     let config = SessionConfig::new().with_target_partitions(threads);
-                    let (error, operators) = assert_native_plan_parity_with_config(
+                    let NativeOutcome {
+                        datafusion: error,
+                        operators,
+                        ..
+                    } = assert_allowed_native_plan_outcome_with_config(
                         || Arc::clone(&plan),
                         false,
                         config,
+                        &[
+                            "Parser error",
+                            "Execution error",
+                            "Arithmetic overflow",
+                            "Divide by zero",
+                            "Cast error",
+                            "Invalid argument",
+                        ],
                     )
                     .await;
-                    assert_eq!(operators.projections, 0, "{expr}");
+                    assert_eq!(operators.projections, 1, "{expr}");
                     assert!(error.is_some(), "{expr}");
                 }
             }
@@ -3187,10 +3212,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_that_shadow_builtin_ones_stay_in_datafusion() {
+    async fn functions_that_shadow_builtin_ones_are_native() {
         // `abs` is a function of a type named `AbsFunc`, like the built-in one,
-        // but another type: DataFusion evaluates it on a batch of 4096 rows,
-        // which it returns, and a pipeline would on chunks of 2048 rows.
+        // but another type, which returns the number of rows it is called
+        // with: DataFusion evaluates it on a batch of 4096 rows, which it
+        // returns, and the native projection on chunks of 2048 rows. Its
+        // result depends on the batches, which is the engine's own: the
+        // projection is native.
         let setup = async |ctx: &SessionContext| {
             ctx.register_udf(datafusion_expr::ScalarUDF::new_from_impl(AbsFunc {
                 signature: datafusion_expr::Signature::any(
@@ -3203,16 +3231,30 @@ mod tests {
             register_partitions(ctx, "shadowed", vec![vec![batch]])
         };
         let sql = "SELECT x, abs(x) AS n FROM shadowed WHERE x >= 0";
-        let run = assert_native_byte_eq_with_setup(sql, &setup).await;
-        assert_eq!(run.operators.projections, 0);
-        let rows = run.expected.batches[0]
-            .column(1)
-            .as_primitive::<Int64Type>();
-        assert_eq!(rows.value(0), 4096);
+        let run = run_native(sql, crate::test_utils::test_session_config(), &setup)
+            .await
+            .unwrap();
+        assert_eq!(run.operators.projections, 1);
+        let rows = |batches: &[RecordBatch]| {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(1)
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&run.expected.batches), vec![4096; 4096]);
+        let native = rows(&run.actual.batches);
+        assert_eq!(native.len(), 4096);
+        assert!(native.iter().all(|&rows| rows <= 2048), "{native:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn constants_of_batches_of_unknown_sizes_stay_in_datafusion() {
+    async fn constants_of_batches_of_unknown_sizes_are_native() {
         let _large = one_large_test_at_a_time().await;
         // A constant of 1 KiB, copied for each of the 2^21 rows of a batch
         // without columns (which takes no memory), overflows the 32-bit
@@ -3247,12 +3289,12 @@ mod tests {
         };
         let large = "x".repeat(MAX_CONSTANT_BYTES);
         let plan = project(&large, scan_batches(&schema, &[batch(1 << 21)]));
-        assert!(!supported(&plan));
+        assert!(supported(&plan));
         // DataFusion splits the batches of its scans into batches of the
         // batch size of the session, which the plan does not tell.
         let config = SessionConfig::new().with_batch_size(1 << 21);
         let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
-        let outcome = assert_same_outcome_in_datafusion(plan, task_ctx).await;
+        let outcome = assert_allowed_native_outcome(plan, task_ctx, &["overflow"]).await;
         assert!(
             outcome
                 .as_ref()
@@ -3264,7 +3306,7 @@ mod tests {
             &large,
             scan_batches(&schema, &[batch((1 << 21) - 1)])
         )));
-        assert!(!supported(&project(
+        assert!(supported(&project(
             &format!("{large}x"),
             scan_batches(&schema, &[batch(1)])
         )));
@@ -3279,7 +3321,7 @@ mod tests {
         };
         let scan = scan_batches(&schema, &[batch(4096)]);
         assert!(supported(&project("1-URGENT", Arc::clone(&scan))));
-        assert!(!supported(&project(
+        assert!(supported(&project(
             "1-URGENT",
             repartition(Arc::clone(&scan))
         )));
