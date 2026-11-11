@@ -244,7 +244,6 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_csv::source::CsvSource;
-use datafusion_datasource_parquet::ParquetFileReaderFactory;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::LogicalPlan;
@@ -704,7 +703,7 @@ impl Lowering<'_> {
             // batches pull later batches of their input, whose errors they
             // raise, before the nodes above them see the rows of earlier ones.
             if coalesces_batches(plan)
-                && conflict(ctx.fallible_above, subtree_failures(input, self.runtime))
+                && conflict(ctx.fallible_above, subtree_failures(input))
             {
                 return Ok(bridge(plan));
             }
@@ -825,7 +824,7 @@ impl Lowering<'_> {
         }
         let fails_like_datafusion = |keys: &Judgement| {
             self.fails_like_datafusion_on_threads(keys.failures)
-                && !conflict(keys.failures, subtree_failures(sort.input(), self.runtime))
+                && !conflict(keys.failures, subtree_failures(sort.input()))
         };
         if !fails_like_datafusion(&keys) {
             return Ok(None);
@@ -853,9 +852,7 @@ impl Lowering<'_> {
             Some((_, id)) => {
                 let exact = match topk_filter_pruning(sort.input(), *id) {
                     TopKFilterPruning::Unread | TopKFilterPruning::Settled => true,
-                    TopKFilterPruning::Rows => {
-                        works_alike_on_any_rows(sort.input(), self.runtime)
-                    }
+                    TopKFilterPruning::Rows => works_alike_on_any_rows(sort.input()),
                     TopKFilterPruning::Other => false,
                 };
                 if !exact {
@@ -933,7 +930,7 @@ impl Lowering<'_> {
             return Ok(None);
         }
         if !raw.dynamic_expressions_produced().is_empty()
-            && !subtree_failures(raw.input(), self.runtime).is_none()
+            && !subtree_failures(raw.input()).is_none()
         {
             return Ok(None);
         }
@@ -1019,7 +1016,7 @@ impl Lowering<'_> {
         if concatenation_may_fail(&join.schema())
             || conflict(
                 ctx.fallible_above,
-                subtree_failures(join.right(), self.runtime).and(probe.failures),
+                subtree_failures(join.right()).and(probe.failures),
             )
         {
             return Ok(None);
@@ -1039,10 +1036,11 @@ impl Lowering<'_> {
         // side may fail on the rows that DataFusion skips is left to
         // DataFusion (see [`subtree_failures`]: e.g. a probe side with an
         // expression that may fail, or a source that may fail to read its
-        // rows, but for scans of well-formed Parquet files whose expressions
-        // cannot fail, as in TPC-H, see [`source_may_fail`]).
+        // rows, but for scans of Parquet files whose expressions cannot fail,
+        // as in TPC-H, whose reading and decoding is treated as unable to
+        // fail, see [`source_may_fail`]).
         if !plan.dynamic_expressions_produced().is_empty()
-            && !subtree_failures(join.right(), self.runtime).is_none()
+            && !subtree_failures(join.right()).is_none()
         {
             return Ok(None);
         }
@@ -1312,7 +1310,7 @@ impl Lowering<'_> {
         // `FilterExec` coalesces its output: it pulls later batches of its
         // input, whose errors it raises, before the nodes above it see the
         // rows of earlier ones, which the native filter passes on at once.
-        if conflict(ctx.fallible_above, subtree_failures(plan, self.runtime)) {
+        if conflict(ctx.fallible_above, subtree_failures(plan)) {
             return Ok(bridge(plan));
         }
         if PhysicalFilter::supports_filter_exec(filter) {
@@ -2095,14 +2093,11 @@ fn conflict(above: Failures, below: Failures) -> bool {
 /// The parts that may fail of all nodes of `plan` (see [`node_failures`]),
 /// in the pipelines of `plan`: the subqueries of a `ScalarSubqueryExec` run
 /// before its input, in both engines (see [`scalar_subquery_input`]).
-fn subtree_failures(
-    plan: &Arc<dyn ExecutionPlan>,
-    runtime: Option<&RuntimeEnv>,
-) -> Failures {
+fn subtree_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
     pipeline_children(plan)
         .into_iter()
-        .map(|child| subtree_failures(child, runtime))
-        .fold(node_failures(plan, runtime), Failures::and)
+        .map(subtree_failures)
+        .fold(node_failures(plan), Failures::and)
 }
 
 /// The parts of `plan` itself that may fail: the parts of its expressions
@@ -2112,13 +2107,10 @@ fn subtree_failures(
 /// rows (see [`source_may_fail`]), and the nodes that may fail to combine
 /// their batches (see [`may_fail_to_combine`]), which may fail with several
 /// kinds of errors.
-fn node_failures(
-    plan: &Arc<dyn ExecutionPlan>,
-    runtime: Option<&RuntimeEnv>,
-) -> Failures {
+fn node_failures(plan: &Arc<dyn ExecutionPlan>) -> Failures {
     let mut failures = file_scan_failures(plan)
         .unwrap_or_else(|| Judgement::of_plan(plan.as_ref()).failures);
-    if source_may_fail(plan, runtime) {
+    if source_may_fail(plan) {
         failures = failures.and(Failures::MIXED);
     }
     if may_fail_to_combine(plan) {
@@ -2551,24 +2543,21 @@ fn passes_rows_on(plan: &Arc<dyn ExecutionPlan>) -> bool {
 
 /// Whether the nodes of `plan` (in its pipelines, see [`pipeline_children`])
 /// have no part that may fail (see [`node_failures`]: also no source that may
-/// fail to read its rows, but for scans of well-formed Parquet files, see
-/// [`source_may_fail`]) and no expression whose errors or results depend on
-/// the rows that it is evaluated on together (see [`depends_on_batches`],
-/// e.g. a volatile function; the scans of files fold that into their
-/// failures, see [`file_scan_failures`]): whichever of their rows a dynamic
-/// filter prunes, the work of these nodes on the others is the same, and
-/// cannot fail.
-fn works_alike_on_any_rows(
-    plan: &Arc<dyn ExecutionPlan>,
-    runtime: Option<&RuntimeEnv>,
-) -> bool {
+/// fail to read its rows, but for scans of Parquet files, whose reading and
+/// decoding is treated as unable to fail, see [`source_may_fail`]) and no
+/// expression whose errors or results depend on the rows that it is evaluated
+/// on together (see [`depends_on_batches`], e.g. a volatile function; the
+/// scans of files fold that into their failures, see [`file_scan_failures`]):
+/// whichever of their rows a dynamic filter prunes, the work of these nodes on
+/// the others is the same, and cannot fail.
+fn works_alike_on_any_rows(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let batch_dependent = file_scan_failures(plan).is_none()
         && Judgement::of_plan(plan.as_ref()).batch_dependent;
     !batch_dependent
-        && node_failures(plan, runtime).is_none()
+        && node_failures(plan).is_none()
         && pipeline_children(plan)
             .into_iter()
-            .all(|child| works_alike_on_any_rows(child, runtime))
+            .all(works_alike_on_any_rows)
 }
 
 /// `plan`, a sort whose `SortExec` (see [`sort_of_chain`]) is a TopK, with
@@ -2655,254 +2644,29 @@ fn may_fail_to_combine(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// leaf but a scan of memory, of an empty relation or of placeholder rows, and
 /// a scan of Parquet files whose expressions (its predicate and its
 /// projection) cannot fail (see [`file_scan_failures`]), e.g. those of TPC-H
-/// and ClickBench, and whose files have the types of its table (see
-/// [`reads_files_of_the_types_of_their_table`]): such files are read without
-/// failing, whichever of their files, row groups and rows the dynamic filters
-/// of the operators above skip. A Parquet file whose columns the scan casts into
-/// the types of its table (e.g. a file of strings for a table of integers,
-/// whose schema was given when it was registered) may fail to be read. Scans of
-/// CSV files may fail to parse any value of their rows (also of files whose
-/// schema DataFusion inferred, from their first rows), and other scans of
-/// files, which may fail to read or parse them, and streams may fail too.
-fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) -> bool {
-    let well_formed_parquet = file_scan_failures(plan).is_some_and(|failures| {
-        failures.is_none()
-            && plan
-                .downcast_ref::<DataSourceExec>()
-                .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                .is_some_and(|config| {
-                    reads_files_of_the_types_of_their_table(config, runtime)
-                })
-    });
+/// and ClickBench. Reading and decoding Parquet files is treated as unable to
+/// fail, whichever of their files, row groups and rows the dynamic filters of
+/// the operators above skip: the errors of reading or decoding the rows that
+/// the dynamic filter of one engine skips, but not that of the other (e.g. of
+/// a custom reader, of a corrupt file, or of a value that does not fit the type
+/// of the table), are out of the scope of error parity (see §6 of
+/// `docs/error-parity.md`). Scans of CSV files may fail to parse any value of
+/// their rows (also of files whose schema DataFusion inferred, from their first
+/// rows), and other scans of files, which may fail to read or parse them, and
+/// streams may fail too.
+fn source_may_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let parquet = plan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        .is_some_and(|config| config.file_source().is::<ParquetSource>());
     plan.children().is_empty()
         && !(plan.is::<EmptyExec>()
             || plan.is::<PlaceholderRowExec>()
             || plan
                 .downcast_ref::<DataSourceExec>()
                 .is_some_and(|scan| scan.data_source().is::<MemorySourceConfig>())
-            || well_formed_parquet)
-}
-
-/// Whether the files of `config`, a scan of Parquet files in a session with
-/// the runtime `runtime`, have the columns of the table of the scan, of its
-/// types, so that the scan reads them without casting any value: as their
-/// metadata (their footers, which DataFusion caches in the file metadata cache
-/// of the runtime when it collects their statistics, see
-/// `datafusion.execution.collect_statistics`) shows, with the coercions of
-/// DataFusion's Parquet reader: of strings into `Utf8View` (see
-/// `apply_file_schema_type_coercions`), and of INT96 timestamps into the unit
-/// of `coerce_int96` (see `Int96Coercer`), from which the scan casts them into
-/// the unit of the table, which may overflow. A file with an explicit schema
-/// (`PartitionedFile::arrow_schema`) is read in that schema, with these
-/// coercions, but it may constrain the values of the file otherwise than its
-/// own types (e.g. fixed-size lists for lists of any length), which the reader
-/// only checks as it decodes them: only files whose explicit schemas have
-/// their own types are judged to be read without failing. And the types of the
-/// table must be types that the reader decodes without failing, whatever the
-/// values (see [`decodes_without_failing`]): e.g. not dictionaries with narrow
-/// keys, which the values of a column chunk may overflow. (Not its coercion of strings into
-/// dictionaries: such files may fail.) The schema of a table that DataFusion
-/// inferred from its files has their types, but a schema given when the table
-/// was registered may have others, into which the scan casts the values of the
-/// files (and fails on those that it cannot cast), or no nulls where the files
-/// have nulls. `false` if the metadata of a file is not cached (or not for its
-/// current version), if the runtime is not known, and for scans with a custom
-/// adapter of their expressions to the schemas of their files, a custom
-/// provider of these schemas, or a custom reader of their files.
-fn reads_files_of_the_types_of_their_table(
-    config: &FileScanConfig,
-    runtime: Option<&RuntimeEnv>,
-) -> bool {
-    use datafusion_datasource_parquet::metadata::CachedParquetMetaData;
-    use datafusion_datasource_parquet::{Int96Coercer, apply_file_schema_type_coercions};
-    let Some(runtime) = runtime else {
-        return false;
-    };
-    let Some(source) = config.file_source().downcast_ref::<ParquetSource>() else {
-        return false;
-    };
-    // A custom adapter of the expressions of the scan to the schemas of its
-    // files may rewrite them otherwise than casting columns, a custom provider
-    // of the schemas of its files may read them in other types, and a custom
-    // reader may fail otherwise than the built-in readers, or read other
-    // metadata than DataFusion cached. Neither `ParquetFileReaderFactory` nor
-    // `ParquetSource` lets the factory or the provider be identified (there is
-    // no downcast): the planner compares the (derived) `Debug` output of the
-    // factory with that of the built-in factories over the object store of the
-    // scan and the cache of the runtime (as `ParquetFormat` creates them), and
-    // judges any other factory, and any provider, as possibly failing. (Only a
-    // factory whose `Debug` output impersonates these exactly is not told
-    // apart.)
-    let builtin_factory = |factory: &Arc<dyn ParquetFileReaderFactory>| {
-        use datafusion_datasource_parquet::{
-            CachedParquetFileReaderFactory, DefaultParquetFileReaderFactory,
-        };
-        let Ok(store) = runtime.object_store(&config.object_store_url) else {
-            return false;
-        };
-        let debug = format!("{factory:?}");
-        let cached = CachedParquetFileReaderFactory::new(
-            Arc::clone(&store),
-            runtime.cache_manager.get_file_metadata_cache(),
-        );
-        debug == format!("{cached:?}")
-            || debug == format!("{:?}", DefaultParquetFileReaderFactory::new(store))
-    };
-    if config.expr_adapter_factory.is_some()
-        || !format!("{source:?}").contains("schema_provider: None")
-        || source
-            .parquet_file_reader_factory()
-            .is_some_and(|factory| !builtin_factory(factory))
-    {
-        return false;
-    }
-    let options = &source.table_parquet_options().global;
-    let int96 = options.coerce_int96.map(arrow::datatypes::TimeUnit::from);
-    let int96_timezone = options
-        .coerce_int96_tz
-        .as_ref()
-        .map(|timezone| Arc::<str>::from(timezone.as_str()));
-    let cache = runtime.cache_manager.get_file_metadata_cache();
-    let table = config.file_schema();
-    let has_the_types_of_the_table = |file: &datafusion_datasource::PartitionedFile| {
-        let Some(entry) = cache.get(&file.object_meta.location) else {
-            return false;
-        };
-        if !entry.is_valid_for(&file.object_meta) {
-            return false;
-        }
-        let Some(metadata) = entry
-            .file_metadata
-            .as_any()
-            .downcast_ref::<CachedParquetMetaData>()
-            .map(CachedParquetMetaData::parquet_metadata)
-        else {
-            return false;
-        };
-        // The reader reads a file in its explicit schema, if it has one, and
-        // otherwise in the schema of its metadata, which arrow-rs derives (from
-        // the Arrow schema in the metadata, if any) and checks against the
-        // Parquet schema of the file: a file whose explicit schema does not fit
-        // its Parquet schema fails to be read.
-        use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-        let options = ArrowReaderOptions::new();
-        let Ok(reader_metadata) =
-            ArrowReaderMetadata::try_new(Arc::clone(metadata), options.clone())
-        else {
-            return false;
-        };
-        // An explicit schema of other types than those the reader derives from
-        // the file (or without nulls where the file may have some) may impose
-        // constraints on the values that the reader only checks as it decodes
-        // them, e.g. fixed-size lists for lists: only explicit schemas of the
-        // types of the file are judged not to fail.
-        if let Some(explicit) = &file.arrow_schema
-            && !has_the_types_of(explicit, reader_metadata.schema())
-        {
-            return false;
-        }
-        let file_schema = reader_metadata.schema().as_ref().clone();
-        let coerced = apply_file_schema_type_coercions(table, &file_schema);
-        let mut changed = coerced.is_some();
-        let mut file_schema = coerced.unwrap_or(file_schema);
-        if let Some(unit) = &int96
-            && let Some(coerced) =
-                Int96Coercer::new(reader_metadata.parquet_schema(), &file_schema, unit)
-                    .with_timezone(int96_timezone.clone())
-                    .coerce()
-        {
-            file_schema = coerced;
-            changed = true;
-        }
-        // The reader reads the file in the coerced schema, which arrow-rs
-        // checks against its Parquet schema again.
-        if changed
-            && ArrowReaderMetadata::try_new(
-                Arc::clone(metadata),
-                options.with_schema(Arc::new(file_schema.clone())),
-            )
-            .is_err()
-        {
-            return false;
-        }
-        // Of the type of the table, which the reader decodes without failing,
-        // and without nulls if the table has none.
-        table.fields().iter().all(|field| {
-            decodes_without_failing(field.data_type())
-                && file_schema
-                    .field_with_name(field.name())
-                    .is_ok_and(|file_field| {
-                        file_field.data_type() == field.data_type()
-                            && (field.is_nullable() || !file_field.is_nullable())
-                    })
-        })
-    };
-    config
-        .file_groups
-        .iter()
-        .flat_map(|group| group.iter())
-        .all(has_the_types_of_the_table)
-}
-
-/// Whether the Parquet reader decodes the values of a well-formed file into
-/// arrays of `data_type` without failing, whatever the values: primitive
-/// values, decimals, binaries of a fixed size, views of strings and binaries,
-/// strings and binaries with 64-bit offsets, and lists with 64-bit offsets and
-/// structs of such values. Not strings, binaries, lists and maps with 32-bit
-/// offsets, which the values of a batch may overflow, nor dictionaries, whose
-/// keys the values of a column chunk may overflow (e.g. more than 128 values for
-/// `Int8` keys), nor fixed-size lists, whose lists the reader checks the
-/// lengths of, nor unions and run-end encodings.
-fn decodes_without_failing(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Null
-        | DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Float16
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(_)
-        | DataType::Time64(_)
-        | DataType::Timestamp(..)
-        | DataType::Duration(_)
-        | DataType::Interval(_)
-        | DataType::Decimal32(..)
-        | DataType::Decimal64(..)
-        | DataType::Decimal128(..)
-        | DataType::Decimal256(..)
-        | DataType::FixedSizeBinary(_)
-        | DataType::Utf8View
-        | DataType::BinaryView
-        | DataType::LargeUtf8
-        | DataType::LargeBinary => true,
-        DataType::LargeList(field) | DataType::LargeListView(field) => {
-            decodes_without_failing(field.data_type())
-        }
-        DataType::Struct(fields) => fields
-            .iter()
-            .all(|field| decodes_without_failing(field.data_type())),
-        _ => false,
-    }
-}
-
-/// Whether the fields of `schema` are the fields of `of`, in the same order,
-/// of the same types, and without nulls only where `of` has none.
-fn has_the_types_of(schema: &Schema, of: &Schema) -> bool {
-    schema.fields().len() == of.fields().len()
-        && schema.fields().iter().zip(of.fields()).all(|(field, of)| {
-            field.name() == of.name()
-                && field.data_type() == of.data_type()
-                && (field.is_nullable() || !of.is_nullable())
-        })
+            || (parquet
+                && file_scan_failures(plan).is_some_and(|failures| failures.is_none())))
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
@@ -3341,6 +3105,7 @@ mod tests {
     };
     use datafusion_common::tree_node::TreeNode;
     use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_datasource_parquet::ParquetFileReaderFactory;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal, col};
@@ -6126,15 +5891,128 @@ mod tests {
         Ok(())
     }
 
+    /// Assert the accepted behaviour (see §6 of `docs/error-parity.md`) of the
+    /// plans that `make_plan` makes in `ctx` (a new one for every execution),
+    /// lowered with the options of `config`: an operator, which `native`
+    /// counts, has a dynamic filter that prunes the reads of a scan of Parquet
+    /// files, one of which fails to be read or decoded, and which DataFusion's
+    /// filter skips. DataFusion succeeds. The planner treats reading and
+    /// decoding Parquet files as unable to fail, and judges only the
+    /// expressions of the scan, so the operator is native. The pipeline engine
+    /// produces the same rows, or, if its own filter does not skip that file,
+    /// fails with an error that contains `error`: errors of reading or
+    /// decoding the rows that only one engine skips are out of the scope of
+    /// error parity.
+    async fn assert_read_errors_out_of_scope(
+        ctx: &SessionContext,
+        config: &SessionConfig,
+        make_plan: impl AsyncFn() -> Result<Arc<dyn ExecutionPlan>>,
+        native: fn(&Arc<dyn PhysicalOperator>) -> usize,
+        error: &str,
+    ) -> Result<()> {
+        let plan = make_plan().await?;
+        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("DataFusion skips the file that fails to be read");
+        let root = create_pipeline_plan_with_runtime(
+            make_plan().await?,
+            config.options(),
+            &ctx.runtime_env(),
+        )?;
+        let tree = format_operator_tree(root.operator());
+        assert_eq!(native(root.operator()), 1, "{tree}");
+        match collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx()).await {
+            Ok(actual) => {
+                let output = |batches| crate::test_utils::EngineOutput {
+                    schema: plan.schema(),
+                    plan: Arc::clone(&plan),
+                    batches,
+                    ordered: true,
+                };
+                compare_outputs(&output(expected), &output(actual)).unwrap_or_else(
+                    |message| panic!("Results differ: {message}\n{tree}"),
+                );
+            }
+            Err(e) => assert!(e.to_string().contains(error), "{e}\n{tree}"),
+        }
+        Ok(())
+    }
+
+    /// [`assert_read_errors_out_of_scope`] of the plans of `sql`, in a session
+    /// with `config` of the tables that `setup` registers, whose scans of files
+    /// `transform` changes (e.g. into scans with other reader factories).
+    async fn assert_read_errors_of_query_out_of_scope<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        transform: &dyn Fn(&FileScanConfig) -> FileScanConfig,
+        native: fn(&Arc<dyn PhysicalOperator>) -> usize,
+        error: &str,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let plan = plan.transform_up(|node| {
+                let Some(config) = node
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                Ok(Transformed::yes(
+                    DataSourceExec::from_data_source(transform(config))
+                        as Arc<dyn ExecutionPlan>,
+                ))
+            })?;
+            Ok(plan.data)
+        };
+        assert_read_errors_out_of_scope(&ctx, &config, make_plan, native, error).await
+    }
+
+    /// A scan of files as it is.
+    fn as_it_is(config: &FileScanConfig) -> FileScanConfig {
+        config.clone()
+    }
+
+    /// A scan of files with the explicit schema `schema` for every file
+    /// (`PartitionedFile::arrow_schema`), in which the reader reads them.
+    fn with_explicit_schemas(
+        config: &FileScanConfig,
+        schema: &SchemaRef,
+    ) -> FileScanConfig {
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        let file_groups = config
+            .file_groups
+            .iter()
+            .map(|group| {
+                FileGroup::new(
+                    group
+                        .iter()
+                        .map(|file| file.clone().with_arrow_schema(Arc::clone(schema)))
+                        .collect(),
+                )
+            })
+            .collect();
+        FileScanConfigBuilder::from(config.clone())
+            .with_file_groups(file_groups)
+            .build()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    async fn joins_whose_dynamic_filter_prunes_reads_that_may_fail_are_native()
     -> Result<()> {
         // A table `k INT, v INT` of two Parquet files: 100 rows `k = 1` of
         // integers, and rows `k = 0` of strings that fail to cast to `INT`
         // when they are read. DataFusion pushes the dynamic filter of the join
         // (`k = 1`, from its build side) into the scan, which prunes the
         // second file: it never reads it. A native join does not prune the same
-        // reads, so that it would fail to cast.
+        // reads, so that it may fail to cast them, which is out of the scope of
+        // error parity: the join is native.
         let dir = tempfile::tempdir()?;
         let good = RecordBatch::try_from_iter([
             (
@@ -6188,13 +6066,19 @@ mod tests {
             Ok(TreeNodeRecursion::Continue)
         })?;
         assert_eq!(produced, 1, "{}", displayable(plan.as_ref()).indent(false));
-        let root = assert_parity_with(sql, config, &setup).await;
-        assert_eq!(count::<PhysicalHashJoin>(&root), 0);
-        Ok(())
+        assert_read_errors_of_query_out_of_scope(
+            sql,
+            config,
+            setup,
+            &as_it_is,
+            count::<PhysicalHashJoin>,
+            "Cannot cast string 'bad_integer' to value of Int32 type",
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_stay_in_datafusion()
+    async fn topks_whose_dynamic_filter_prunes_reads_that_may_fail_are_native()
     -> Result<()> {
         // A table `k INT, v INT, s VARCHAR` (its schema given when it is
         // registered) of two Parquet files: 100 rows `k = 0, v = 100`, and 10
@@ -6202,8 +6086,11 @@ mod tests {
         // read. The TopK of `ORDER BY k LIMIT 1` reads the first file,
         // whose rows tighten its threshold to `k <= 0`, and DataFusion's scan
         // prunes the second file with its dynamic filter: it never reads it. A
-        // native TopK does not prune the same reads, so that it would fail to
-        // cast.
+        // native TopK does not prune the same reads, so that it may fail to
+        // cast them, which is out of the scope of error parity: the TopK is
+        // native, also below the filter `s LIKE '%foo%'` (on batches of 64
+        // rows, the first of which tightens the threshold of DataFusion's
+        // TopK).
         let dir = tempfile::tempdir()?;
         let first = RecordBatch::try_from_iter([
             (
@@ -6241,19 +6128,9 @@ mod tests {
             Field::new("s", DataType::Utf8View, true),
         ]);
         let setup = async |ctx: &SessionContext| {
-            register_view_tables(ctx)?;
-            ctx.register_parquet(
-                "p",
-                path,
-                ParquetReadOptions::default().schema(&schema),
-            )
-            .await?;
-            Ok(())
+            ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+                .await
         };
-        // The scan casts the strings of the second file into the integers of
-        // the table: its expressions cannot fail, but its reads can. So they
-        // can below the filter `s LIKE '%foo%'` (on batches of 64 rows, the
-        // first of which tightens the threshold of DataFusion's TopK).
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
@@ -6261,13 +6138,16 @@ mod tests {
             "SELECT k, v FROM p ORDER BY k LIMIT 1",
             "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
         ] {
-            let root = assert_parity_with(sql, config.clone(), &setup).await;
-            assert_eq!(count::<PhysicalTopK>(&root), 0, "{sql}");
+            assert_read_errors_of_query_out_of_scope(
+                sql,
+                config.clone(),
+                &setup,
+                &as_it_is,
+                count::<PhysicalTopK>,
+                "Cannot cast string 'bad_integer' to value of Int32 type",
+            )
+            .await?;
         }
-        // Over a scan of memory, which cannot fail, the TopK is native.
-        let sql = "SELECT id, a FROM t1 ORDER BY a, id LIMIT 3";
-        let root = assert_parity_with(sql, config, &setup).await;
-        assert_eq!(count::<PhysicalTopK>(&root), 1);
         Ok(())
     }
 
@@ -6346,8 +6226,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_int96_files_that_the_scan_casts_stay_in_datafusion() -> Result<()>
-    {
+    async fn topks_over_int96_files_that_the_scan_casts_are_native() -> Result<()> {
         // A table `k INT, v TIMESTAMP (ns), s VARCHAR` (its schema given when it
         // is registered) of two Parquet files of INT96 timestamps: 100 rows `k =
         // 0` at the epoch, and 10 rows `k = 1` on the Julian day 3,000,000 (in
@@ -6356,9 +6235,8 @@ mod tests {
         // nanoseconds of the table: the timestamps of the second file overflow.
         // The TopK of `ORDER BY k LIMIT 1` reads the first file, whose first
         // batch of 64 rows tightens its threshold to `k < 0`, and DataFusion's
-        // scan prunes the second file. Its reads may fail (the files do not have
-        // the types of the table, once read as the session reads them), so the
-        // TopK stays in DataFusion.
+        // scan prunes the second file. A native TopK may decode it, which is
+        // out of the scope of error parity: the TopK is native.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p");
         write_int96_parquet(&path.join("0.parquet"), (0, 2_440_588, "foo"), 100)?;
@@ -6387,106 +6265,21 @@ mod tests {
             "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
             "SELECT k, v FROM p ORDER BY k LIMIT 1",
         ] {
-            let root = assert_parity_with(sql, config.clone(), &setup).await;
-            assert_eq!(
-                count::<PhysicalTopK>(&root),
-                0,
-                "{sql}\n{}",
-                format_operator_tree(&root)
-            );
+            assert_read_errors_of_query_out_of_scope(
+                sql,
+                config.clone(),
+                &setup,
+                &as_it_is,
+                count::<PhysicalTopK>,
+                "converted value exceeds the representable i64 range",
+            )
+            .await?;
         }
-        // Without `coerce_int96`, the reader reads the timestamps in the
-        // nanoseconds of the table (the second file, whose timestamps do not
-        // fit, is then read as DataFusion reads it), and the TopK is native.
-        let config = test_session_config()
-            .with_target_partitions(1)
-            .with_batch_size(64);
-        let sql = "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        let root = assert_parity_with(sql, config, &setup).await;
-        assert_eq!(
-            count::<PhysicalTopK>(&root),
-            1,
-            "{}",
-            format_operator_tree(&root)
-        );
-        Ok(())
-    }
-
-    /// Assert that `sql`, a TopK over a scan of Parquet files in `ctx`
-    /// (configured with `config`), with the explicit schema `schema` for every
-    /// file of the scans of the plan of DataFusion
-    /// (`PartitionedFile::arrow_schema`), succeeds in DataFusion, produces the
-    /// same rows through the pipeline engine, and stays in DataFusion there.
-    async fn assert_topk_over_explicit_file_schemas_stays_in_datafusion(
-        ctx: &SessionContext,
-        config: &SessionConfig,
-        sql: &str,
-        schema: &SchemaRef,
-    ) -> Result<()> {
-        use datafusion_datasource::file_groups::FileGroup;
-        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-        // A new plan for every execution, whose TopK counts the partitions that
-        // complete its filter.
-        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let plan = plan.transform_up(|node| {
-                let Some(config) = node
-                    .downcast_ref::<DataSourceExec>()
-                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let file_groups = config
-                    .file_groups
-                    .iter()
-                    .map(|group| {
-                        FileGroup::new(
-                            group
-                                .iter()
-                                .map(|file| {
-                                    file.clone().with_arrow_schema(Arc::clone(schema))
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect();
-                let config = FileScanConfigBuilder::from(config.clone())
-                    .with_file_groups(file_groups)
-                    .build();
-                Ok(Transformed::yes(
-                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
-                ))
-            })?;
-            Ok(plan.data)
-        };
-        let plan = make_plan().await?;
-        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| panic!("DataFusion fails: {e}\n{sql}"));
-        let root = create_pipeline_plan_with_runtime(
-            make_plan().await?,
-            config.options(),
-            &ctx.runtime_env(),
-        )?;
-        let tree = format_operator_tree(root.operator());
-        let topks = count::<PhysicalTopK>(root.operator());
-        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
-        let output = |batches| crate::test_utils::EngineOutput {
-            schema: plan.schema(),
-            plan: Arc::clone(&plan),
-            batches,
-            ordered: true,
-        };
-        compare_outputs(&output(expected), &output(actual))
-            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
-        assert_eq!(topks, 0, "{tree}");
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_files_whose_explicit_schemas_constrain_their_values_stay_in_datafusion()
+    async fn topks_over_files_whose_explicit_schemas_constrain_their_values_are_native()
     -> Result<()> {
         // A table `k INT, v INT[2], s VARCHAR` of two Parquet files of lists of
         // integers, whose explicit schemas (`PartitionedFile::arrow_schema`) are
@@ -6494,7 +6287,8 @@ mod tests {
         // 10 rows `k = 1` of lists of 3. The reader reads the lists as lists of
         // exactly 2 integers, which it checks only as it decodes them: it fails
         // to read the second file, which DataFusion's scan prunes with the
-        // filter of the TopK, so the TopK stays in DataFusion.
+        // filter of the TopK. A native TopK may read it, which is out of the
+        // scope of error parity: the TopK is native.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p");
         let lists = |k: i32, length: usize, rows: usize| -> Result<RecordBatch> {
@@ -6534,30 +6328,36 @@ mod tests {
             Field::new("v", DataType::FixedSizeList(item, 2), false),
             Field::new("s", DataType::Utf8View, false),
         ]));
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+                .await
+        };
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
-        let ctx = datafusion_context(config.clone());
-        ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
-            .await?;
-        let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
-            &ctx, &config, sql, &schema,
+        assert_read_errors_of_query_out_of_scope(
+            "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+            config,
+            setup,
+            &|config| with_explicit_schemas(config, &schema),
+            count::<PhysicalTopK>,
+            "Encountered misaligned row with length 3 (expected length 2)",
         )
         .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_files_with_explicit_schemas_that_the_scan_casts_stay_in_datafusion()
+    async fn topks_over_files_with_explicit_schemas_that_the_scan_casts_are_native()
     -> Result<()> {
-        // The files of `topks_over_int96_files_that_the_scan_casts_stay_in_datafusion`
+        // The files of `topks_over_int96_files_that_the_scan_casts_are_native`
         // (INT96 timestamps at the epoch, and on the Julian day 3,000,000), of
         // a table of timestamps in nanoseconds, without `coerce_int96`, but
         // with an explicit schema for every file (`PartitionedFile::arrow_schema`)
         // of timestamps in microseconds: the reader reads the files in that
         // schema, and the scan casts their timestamps into nanoseconds, which
         // overflow for the second file. DataFusion's scan prunes it with the
-        // filter of the TopK, so the TopK stays in DataFusion.
+        // filter of the TopK. A native TopK may read it, which is out of the
+        // scope of error parity: the TopK is native.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p");
         write_int96_parquet(&path.join("0.parquet"), (0, 2_440_588, "foo"), 100)?;
@@ -6572,31 +6372,34 @@ mod tests {
         };
         let schema = timestamps(arrow::datatypes::TimeUnit::Nanosecond);
         let reader_schema = Arc::new(timestamps(arrow::datatypes::TimeUnit::Microsecond));
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+                .await
+        };
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
-        let ctx = datafusion_context(config.clone());
-        ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
-            .await?;
-        let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
-            &ctx,
-            &config,
-            sql,
-            &reader_schema,
+        assert_read_errors_of_query_out_of_scope(
+            "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+            config,
+            setup,
+            &|config| with_explicit_schemas(config, &reader_schema),
+            count::<PhysicalTopK>,
+            "converted value exceeds the representable i64 range",
         )
         .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_files_whose_explicit_schemas_do_not_fit_stay_in_datafusion()
-    -> Result<()> {
+    async fn topks_over_files_whose_explicit_schemas_do_not_fit_are_native() -> Result<()>
+    {
         // A table `k INT, v INT, s VARCHAR` of two Parquet files, whose
         // explicit schemas (`PartitionedFile::arrow_schema`) are the schema of
         // the table: 100 rows `(0, 100, 'foo')`, and 10 rows `(1, 'bad_integer',
         // 'foo')`, whose file stores `v` as strings, which its explicit schema
         // does not fit. The reader fails to read that file, which DataFusion's
-        // scan prunes with the filter of the TopK: the TopK stays in DataFusion.
+        // scan prunes with the filter of the TopK. A native TopK may read it,
+        // which is out of the scope of error parity: the TopK is native.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p");
         let schema = Arc::new(Schema::new(vec![
@@ -6628,28 +6431,34 @@ mod tests {
         write_parquet(&path.join("0.parquet"), first.schema(), &[first], None)?;
         write_parquet(&path.join("1.parquet"), second.schema(), &[second], None)?;
         let path = path.to_str().unwrap();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+                .await
+        };
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
-        let ctx = datafusion_context(config.clone());
-        ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
-            .await?;
-        let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
-            &ctx, &config, sql, &schema,
+        assert_read_errors_of_query_out_of_scope(
+            "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+            config,
+            setup,
+            &|config| with_explicit_schemas(config, &schema),
+            count::<PhysicalTopK>,
+            "Incompatible supplied Arrow schema",
         )
         .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_files_of_narrow_dictionaries_stay_in_datafusion() -> Result<()> {
+    async fn topks_over_files_of_narrow_dictionaries_are_native() -> Result<()> {
         // A table `k INT, v Dictionary(Int8, VARCHAR), s VARCHAR` of two Parquet
         // files (of the types of the table): 100 rows `k = 0`, and 200 rows `k =
         // 1` written as two batches of 100 different values each, in one row
         // group, whose dictionary of 200 values does not fit `Int8` keys. The
         // reader fails to read the second file (only `v IS NOT NULL` reads `v`),
-        // which DataFusion's scan prunes with the filter of the TopK, so the TopK
-        // stays in DataFusion.
+        // which DataFusion's scan prunes with the filter of the TopK. A native
+        // TopK may read it, which is out of the scope of error parity: the TopK
+        // is native.
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p");
         let schema = Arc::new(Schema::new(vec![
@@ -6698,29 +6507,27 @@ mod tests {
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
-        let sql =
-            "SELECT k FROM p WHERE v IS NOT NULL AND s LIKE '%foo%' ORDER BY k LIMIT 1";
-        let root = assert_parity_with(sql, config, &setup).await;
-        assert_eq!(
-            count::<PhysicalTopK>(&root),
-            0,
-            "{}",
-            format_operator_tree(&root)
-        );
-        Ok(())
+        assert_read_errors_of_query_out_of_scope(
+            "SELECT k FROM p WHERE v IS NOT NULL AND s LIKE '%foo%' ORDER BY k LIMIT 1",
+            config,
+            setup,
+            &as_it_is,
+            count::<PhysicalTopK>,
+            "dictionary too large for index type",
+        )
+        .await
     }
 
     /// A reader factory whose readers fail to read the metadata of the files
-    /// whose paths end with `faulty`, and otherwise read files like
-    /// `CachedParquetFileReaderFactory`, whose name its name starts with.
+    /// whose paths end with `faulty`, and otherwise read files like `inner`.
     #[derive(Debug)]
-    struct CachedParquetFileReaderFactoryWithFaults {
+    struct ReaderFactoryWithFaults {
         inner: Arc<dyn ParquetFileReaderFactory>,
         faulty: &'static str,
     }
 
     /// A reader of a file whose metadata it fails to read, see
-    /// [`CachedParquetFileReaderFactoryWithFaults`].
+    /// [`ReaderFactoryWithFaults`].
     struct FaultyReader(Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>);
 
     impl parquet::arrow::async_reader::AsyncFileReader for FaultyReader {
@@ -6747,7 +6554,7 @@ mod tests {
         }
     }
 
-    impl ParquetFileReaderFactory for CachedParquetFileReaderFactoryWithFaults {
+    impl ParquetFileReaderFactory for ReaderFactoryWithFaults {
         fn create_reader(
             &self,
             partition_index: usize,
@@ -6774,143 +6581,56 @@ mod tests {
         }
     }
 
-    /// Makes a reader factory of the factory of a scan.
-    type WrapFactory =
-        dyn Fn(Arc<dyn ParquetFileReaderFactory>) -> Arc<dyn ParquetFileReaderFactory>;
-
-    /// A reader factory named like the built-in `CachedParquetFileReaderFactory`,
-    /// whose readers fail to read the metadata of the files whose paths end with
-    /// `faulty` (see [`CachedParquetFileReaderFactoryWithFaults`]).
-    mod impersonation {
-        use super::*;
-
-        #[derive(Debug)]
-        pub(super) struct CachedParquetFileReaderFactory {
-            pub(super) inner: CachedParquetFileReaderFactoryWithFaults,
-        }
-
-        impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
-            fn create_reader(
-                &self,
-                partition_index: usize,
-                partitioned_file: datafusion_datasource::PartitionedFile,
-                metadata_size_hint: Option<usize>,
-                metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
-            ) -> Result<Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>>
-            {
-                self.inner.create_reader(
-                    partition_index,
-                    partitioned_file,
-                    metadata_size_hint,
-                    metrics,
-                )
-            }
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_over_files_of_custom_readers_stay_in_datafusion() -> Result<()> {
+    async fn topks_over_files_of_custom_readers_are_native() -> Result<()> {
         // Two well-formed Parquet files of the types of their table, of 100 rows
-        // `(0, 100, 'foo')` and 10 rows `(1, 100, 'foo')`, which the scan reads
-        // with a custom reader factory, whose readers fail to read the metadata
-        // of the second file (and whose name starts with the name of a built-in
-        // factory). DataFusion's scan prunes the second file with the filter of
-        // the TopK, without reading its metadata: a TopK over a custom reader,
-        // which may fail on any file, stays in DataFusion.
-        // Also with a custom factory of the name of the built-in one.
-        fn faults(
-            inner: Arc<dyn ParquetFileReaderFactory>,
-        ) -> CachedParquetFileReaderFactoryWithFaults {
-            CachedParquetFileReaderFactoryWithFaults {
-                inner,
-                faulty: "1.parquet",
-            }
-        }
-        let factories: [&WrapFactory; 2] = [&|inner| Arc::new(faults(inner)), &|inner| {
-            Arc::new(impersonation::CachedParquetFileReaderFactory {
-                inner: faults(inner),
-            })
-        }];
-        for factory in factories {
-            assert_topk_over_custom_reader_stays_in_datafusion(factory).await?;
-        }
-        Ok(())
-    }
-
-    /// Assert that a TopK over the scan of two Parquet files (100 rows `(0,
-    /// 'foo')` and 10 rows `(1, 'foo')`) with the reader factory that `factory`
-    /// makes of the factory of the scan, whose readers fail to read the metadata
-    /// of the second file, succeeds in DataFusion, produces the same rows
-    /// through the pipeline engine, and stays in DataFusion there.
-    async fn assert_topk_over_custom_reader_stays_in_datafusion(
-        factory: &WrapFactory,
-    ) -> Result<()> {
+        // `(0, 'foo')` and 10 rows `(1, 'foo')`, which the scan reads with a
+        // custom reader factory, whose readers fail to read the metadata of the
+        // second file. DataFusion's scan prunes the second file with the filter
+        // of the TopK, without reading its metadata. A native TopK may read it,
+        // which is out of the scope of error parity: the planner does not tell
+        // custom readers from DataFusion's (it has no way to), and the TopK is
+        // native.
         let dir = tempfile::tempdir()?;
         let path = two_parquet_files(dir.path(), (0, "foo", 100), (1, "foo", 10))?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", &path, ParquetReadOptions::default())
+                .await
+        };
+        let with_faults = |config: &FileScanConfig| {
+            let source = config
+                .file_source()
+                .downcast_ref::<ParquetSource>()
+                .expect("a scan of Parquet files");
+            let inner = Arc::clone(
+                source
+                    .parquet_file_reader_factory()
+                    .expect("the reader factory of the scan"),
+            );
+            let source = source.clone().with_parquet_file_reader_factory(Arc::new(
+                ReaderFactoryWithFaults {
+                    inner,
+                    faulty: "1.parquet",
+                },
+            ));
+            datafusion_datasource::file_scan_config::FileScanConfigBuilder::from(
+                config.clone(),
+            )
+            .with_source(Arc::new(source))
+            .build()
+        };
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
-        let ctx = datafusion_context(config.clone());
-        ctx.register_parquet("p", &path, ParquetReadOptions::default())
-            .await?;
-        let sql = "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let plan = plan.transform_up(|node| {
-                let Some(config) = node
-                    .downcast_ref::<DataSourceExec>()
-                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let Some(source) = config.file_source().downcast_ref::<ParquetSource>()
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let inner = Arc::clone(
-                    source
-                        .parquet_file_reader_factory()
-                        .expect("the reader factory of the scan"),
-                );
-                let source = source
-                    .clone()
-                    .with_parquet_file_reader_factory(factory(inner));
-                let config =
-                    datafusion_datasource::file_scan_config::FileScanConfigBuilder::from(
-                        config.clone(),
-                    )
-                    .with_source(Arc::new(source))
-                    .build();
-                Ok(Transformed::yes(
-                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
-                ))
-            })?;
-            Ok(plan.data)
-        };
-        let plan = make_plan().await?;
-        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .expect("DataFusion prunes the second file");
-        let root = create_pipeline_plan_with_runtime(
-            make_plan().await?,
-            config.options(),
-            &ctx.runtime_env(),
-        )?;
-        let tree = format_operator_tree(root.operator());
-        let topks = count::<PhysicalTopK>(root.operator());
-        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
-        let output = |batches| crate::test_utils::EngineOutput {
-            schema: plan.schema(),
-            plan: Arc::clone(&plan),
-            batches,
-            ordered: true,
-        };
-        compare_outputs(&output(expected), &output(actual))
-            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
-        assert_eq!(topks, 0, "{tree}");
-        Ok(())
+        assert_read_errors_of_query_out_of_scope(
+            "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
+            config,
+            setup,
+            &with_faults,
+            count::<PhysicalTopK>,
+            "the metadata of the file cannot be read",
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
