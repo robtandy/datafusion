@@ -3676,6 +3676,114 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn competing_failures_of_aggregates_are_left_to_datafusion() -> Result<()> {
+        use super::super::test_support::{
+            assert_aggregate_fails_like_datafusion_with_setup,
+            assert_aggregate_parity_with_setup,
+            assert_lowered_fails_like_datafusion_with_setup,
+        };
+        // The review's case: one batch of 8,192 rows, `k = 1`, `x = y = 1` but
+        // `x[8191] = 1000` and `y[0] = i64::MAX`. DataFusion evaluates the
+        // argument of every aggregate on all rows of a batch before the next
+        // one: `CAST(x AS DECIMAL(3, 0))` fails first, with the invalid argument
+        // of `1000` (too large for the precision). The native operator
+        // evaluates them on its chunks: `CAST(y AS DECIMAL(38, 25))` failed
+        // first, with the arithmetic overflow of rescaling `i64::MAX`. Such
+        // aggregations, with several parts that may fail not only with
+        // arithmetic overflows, are left to DataFusion (see
+        // `fail_in_the_order_of_the_batches`), on any number of threads; with
+        // a single cast, or with decimal arithmetic only (as in TPC-H), they
+        // stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+            Field::new("p", DataType::Decimal128(15, 2), false),
+            Field::new("q", DataType::Decimal128(15, 2), false),
+        ]));
+        let mut x = vec![1; 8_192];
+        x[8_191] = 1_000;
+        let mut y = vec![1; 8_192];
+        y[0] = i64::MAX;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from(x)),
+                Arc::new(Int64Array::from(y)),
+                Arc::new(
+                    Decimal128Array::from(vec![10_000; 8_192])
+                        .with_precision_and_scale(15, 2)?,
+                ),
+                Arc::new(
+                    Decimal128Array::from(vec![5; 8_192])
+                        .with_precision_and_scale(15, 2)?,
+                ),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        let x_fails = "Failed to cast field 'x' from Int64 to Decimal128(3, 0)";
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                for (sql, message) in [
+                    (
+                        "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), \
+                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t GROUP BY k",
+                        x_fails,
+                    ),
+                    (
+                        "SELECT SUM(CAST(x AS DECIMAL(3, 0))), \
+                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t",
+                        x_fails,
+                    ),
+                    (
+                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) \
+                         FILTER (WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1) FROM t \
+                         GROUP BY k",
+                        "Failed to cast field",
+                    ),
+                ] {
+                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        message,
+                    )
+                    .await;
+                    assert_eq!(lowered, 0, "{sql}");
+                    assert_eq!(
+                        planned_aggregations(sql, &config, &setup).await?,
+                        0,
+                        "{sql}"
+                    );
+                }
+                let sql =
+                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), COUNT(*) FROM t GROUP BY k";
+                assert_aggregate_fails_like_datafusion_with_setup(
+                    sql,
+                    config.clone(),
+                    &setup,
+                    "1000 is too large to store in a Decimal128 of precision 3",
+                )
+                .await;
+                let sql = "SELECT k, SUM(p * (1 - q)), SUM(p * (1 - q) * (1 + q)) FROM t \
+                           GROUP BY k";
+                assert!(
+                    planned_aggregations(sql, &config, &setup).await? > 0,
+                    "{sql}"
+                );
+                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations of the plan of `sql` that the planner
     /// lowers in a session of configuration `config` set up by `setup`.
     async fn planned_aggregations<F>(

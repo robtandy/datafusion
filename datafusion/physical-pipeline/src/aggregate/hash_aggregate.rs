@@ -56,7 +56,7 @@ use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
 };
-use crate::operators::adaptive_filter::is_infallible;
+use crate::operators::adaptive_filter::{Failures, failures, is_infallible};
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
@@ -611,6 +611,10 @@ impl PhysicalHashAggregate {
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
     ///   input only, or fails;
+    /// * aggregations with several parts that may fail (group keys, arguments
+    ///   and filters of aggregates), not all of them only with arithmetic
+    ///   overflows, whose first error depends on DataFusion's batches (see
+    ///   `fail_in_the_order_of_the_batches`);
     /// * aggregations with an aggregate whose accumulators may get other
     ///   values from the chunks of the native operator than from DataFusion's
     ///   batches, or fail with other errors (see `updates_like_datafusion`):
@@ -697,6 +701,9 @@ impl PhysicalHashAggregate {
         if let Some(last) = last
             && (!is_final_of(last, raw) || !advertises_its_input_partitions(last))
         {
+            return Ok(None);
+        }
+        if fail_in_the_order_of_the_batches(raw) {
             return Ok(None);
         }
         let single_partition = raw.input().output_partitioning().partition_count() == 1;
@@ -1362,6 +1369,41 @@ fn sums_exactly_as_floats(
     };
     cast.cast_type() == &DataType::Float64
         && max_rows().is_some_and(|rows| (rows as u128) * magnitude <= 1 << 53)
+}
+
+/// Whether the first error of `raw`, the `AggregateExec` that consumes the input
+/// rows, may depend on the batches of its input: if several of the parts that
+/// it evaluates on every batch may fail, and not all of them only with
+/// arithmetic overflows (see [`failures`]). DataFusion evaluates its group
+/// keys, then the arguments of its aggregates, then their filters, each on
+/// all rows of a batch before the next one, the native operator on its
+/// chunks: e.g. of `SUM(CAST(x AS DECIMAL(3, 0)))` and `SUM(CAST(y AS
+/// DECIMAL(38, 25)))` of a batch in which `x` overflows on its last row, and
+/// `y` on its first, DataFusion raises the invalid argument of `x` (a value
+/// too large for the precision), the native operator the arithmetic overflow
+/// of `y` (of its rescaled value). (The planner accepts several casts into
+/// decimals, see `Failures::order_matters`, whose errors are of these two
+/// kinds, depending on the values; and several arithmetic overflows, e.g. of
+/// the decimal arithmetic of TPC-H, whichever of them comes first.)
+fn fail_in_the_order_of_the_batches(raw: &AggregateExec) -> bool {
+    let schema = raw.input().schema();
+    let parts = raw
+        .group_expr()
+        .expr()
+        .iter()
+        .map(|(expr, _)| Arc::clone(expr))
+        .chain(
+            raw.aggr_expr()
+                .iter()
+                .flat_map(|aggregate| aggregate.expressions()),
+        )
+        .chain(raw.filter_expr().iter().flatten().cloned())
+        .map(|expr| failures(&expr, &schema))
+        .fold(Failures::NONE, Failures::and);
+    let overflows = (0..parts.parts()).fold(Failures::NONE, |overflows, _| {
+        overflows.and(Failures::OVERFLOW)
+    });
+    parts.parts() > 1 && parts != overflows
 }
 
 /// An upper bound of the number of rows of `plan`, from DataFusion's
