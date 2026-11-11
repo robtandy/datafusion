@@ -4250,14 +4250,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_over_projections_of_sorts_that_may_fail_to_combine_stay_in_datafusion()
+    async fn windows_over_projections_of_sorts_that_may_fail_to_combine_are_native()
     -> Result<()> {
         // DataFusion plans a projection of columns between a window and the sort
-        // below it, which the planner moves below the sort to lower the window.
-        // But DataFusion's sort sorts all columns of its input, also those that
-        // the projection drops: two rows of lists of `1 << 30` nulls, which the
-        // sort concatenates, fail. A native window, which would sort the
-        // projected rows only, returns them.
+        // below it. DataFusion's sort sorts all columns of its input, also those
+        // that the projection drops: two rows of lists of `1 << 30` nulls, which
+        // the sort concatenates, fail. The native window lowers the projection
+        // below the sort that it replaces, sorts the projected rows only, and
+        // returns them: the rows of the plan with other values in the column
+        // that the projection drops.
         let config = test_session_config();
         let make_plan = |many_nulls: bool, bounded: bool| {
             let rows = vec![
@@ -4285,25 +4286,32 @@ mod tests {
         };
         for bounded in [true, false] {
             let task_ctx =
-                Arc::new(TaskContext::default().with_session_config(config.clone()));
-            let error = collect(make_plan(true, bounded)(), task_ctx)
+                || Arc::new(TaskContext::default().with_session_config(config.clone()));
+            collect(make_plan(true, bounded)(), task_ctx())
                 .await
-                .expect_err("DataFusion fails")
-                .to_string();
-            let root = assert_plan_outcome(
-                make_plan(true, bounded),
-                config.clone(),
-                Some(&error),
-            )
-            .await;
-            assert_eq!(count::<PhysicalWindow>(&root), 0);
-            // With other values in the column that the projection drops, the
-            // window is native, with the projection below its sort.
+                .expect_err("DataFusion fails");
+            // With other values in the column that the projection drops, both
+            // engines return the same rows.
             let root =
                 assert_plan_outcome(make_plan(false, bounded), config.clone(), None)
                     .await;
             assert_eq!(count::<PhysicalWindow>(&root), 1);
             assert_eq!(count::<PhysicalProjection>(&root), 1);
+            // So does the native window with the lists of nulls.
+            let lowered = lower_for_default_runtime(make_plan(true, bounded)(), &config)?;
+            let tree = format_operator_tree(lowered.operator());
+            assert_eq!(count::<PhysicalWindow>(lowered.operator()), 1, "{tree}");
+            let actual = collect(lowered as Arc<dyn ExecutionPlan>, task_ctx()).await?;
+            let expected = collect(make_plan(false, bounded)(), task_ctx()).await?;
+            let output = |batches| crate::test_utils::EngineOutput {
+                plan: make_plan(false, bounded)(),
+                schema: make_plan(false, bounded)().schema(),
+                batches,
+                ordered: false,
+            };
+            if let Err(message) = compare_outputs(&output(expected), &output(actual)) {
+                panic!("Results differ: {message}\nlowered: {tree}");
+            }
         }
         Ok(())
     }

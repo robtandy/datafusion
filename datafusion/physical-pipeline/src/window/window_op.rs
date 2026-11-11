@@ -123,7 +123,10 @@ use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    ReplaceChildrenOptions,
+};
 use parking_lot::Mutex;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
@@ -683,12 +686,13 @@ impl PhysicalWindow {
     /// merges, windows below, sorted scans), and it is stacked on the native
     /// window of a window below, as a stage, as a re-sorting stage, or as a
     /// window of its own (where DataFusion sorts or merges in between). The
-    /// nodes below the window that
-    /// only distribute and sort its input are replaced too (the native window
-    /// partitions and sorts its input itself): `SortExec`s,
-    /// `SortPreservingMergeExec`s, `CoalescePartitionsExec`s and
+    /// nodes below the window that only distribute and sort its input are
+    /// replaced too (the native window partitions and sorts its input itself):
+    /// `SortExec`s, `SortPreservingMergeExec`s, `CoalescePartitionsExec`s and
     /// `RepartitionExec`s (round robin or hash) without a fetch that read all
-    /// partitions of their input.
+    /// partitions of their input, also below the projections (of columns or
+    /// of computed values) between them and the window, which are lowered
+    /// with the input, below these nodes (see `rows_below`).
     ///
     /// Returns `Ok(None)` for any other node, without calling `lower_input`,
     /// and for the windows that are left to DataFusion:
@@ -713,11 +717,6 @@ impl PhysicalWindow {
     ///   union by their type first, also for descending keys, and its nulls
     ///   among the values of their type, so that such keys would not be in the
     ///   order of the window.
-    ///
-    /// A window whose input projects the rows of the sorts or redistributions
-    /// below it (a `ProjectionExec` between them) is not lowered either: the
-    /// planner lowers it with the projection moved below the sorts (see
-    /// `with_projection_below_sort` in the planner).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         runtime: &RuntimeEnv,
@@ -741,7 +740,7 @@ impl PhysicalWindow {
             );
         }
         let input_schema = Arc::clone(&spec.stages[0].input_schema);
-        let lowered = lower_input(rows)?;
+        let lowered = lower_input(&rows)?;
         if lowered.schema() != input_schema {
             return internal_err!(
                 "The lowered input {} of a {} has schema {:?}, expected {:?}",
@@ -896,7 +895,7 @@ impl PhysicalWindow {
 /// that it reads, or `None` if it is left to DataFusion.
 fn analyze(
     plan: &Arc<dyn ExecutionPlan>,
-) -> Result<Option<(WindowSpec, &Arc<dyn ExecutionPlan>)>> {
+) -> Result<Option<(WindowSpec, Arc<dyn ExecutionPlan>)>> {
     let Some(WindowNode {
         window_exprs,
         input,
@@ -976,15 +975,7 @@ fn analyze(
     // window above another one with other partitions or orders, which
     // DataFusion sorts or merges in between, is a native window over the
     // native window of the window below.
-    let rows = without_distribution(input);
-    // A projection between the window and the sorts or redistributions below
-    // it is not looked through: the planner lowers such a window with the
-    // projection moved below the sorts (see `with_projection_below_sort` in
-    // the planner), which only changes on which rows the projection is
-    // evaluated.
-    if projects_distributed_rows(rows) {
-        return Ok(None);
-    }
+    let rows = rows_below(input)?;
     let ordering = input.output_ordering().cloned();
     if ordering.as_ref().is_some_and(|ordering| {
         ordering.iter().any(|sort_expr| {
@@ -1093,12 +1084,12 @@ fn window_below(input: &Arc<dyn ExecutionPlan>) -> Option<WindowBelow<'_>> {
 
 /// The window node below `input`, the input of a window node, through
 /// projections of columns and the nodes that only distribute and sort rows
-/// (see [`without_distribution`]), which a re-sorting stage replaces.
+/// (see [`strip_distribution`]), which a re-sorting stage replaces.
 fn window_below_any_sort(input: &Arc<dyn ExecutionPlan>) -> Option<WindowBelow<'_>> {
     let mut projection: Option<Vec<usize>> = None;
     let mut node = input;
     loop {
-        let stripped = without_distribution(node);
+        let stripped = strip_distribution(node);
         if window_node(stripped).is_some() {
             return Some(WindowBelow {
                 projection,
@@ -1138,11 +1129,33 @@ fn same_keys(previous: &[ArrayRef], keys: &[ArrayRef]) -> Result<bool> {
     Ok(true)
 }
 
-/// `plan`, the input of a window, without the nodes that only distribute and
-/// sort its rows (see [`PhysicalWindow::try_lower`]): sorts, merges of sorted
-/// partitions, merges of partitions and repartitionings, without a fetch, that
-/// read all partitions of their input.
-fn without_distribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
+/// The rows that a window reads, of `input`, the input of the window node:
+/// `input` without the nodes that only distribute and sort its rows (see
+/// [`strip_distribution`]), which the native window replaces, also below the
+/// projections above them, which are moved below these nodes. A projection
+/// computes every row on its own (columns, or any expression), so it computes
+/// the same rows below the sorts, merges and repartitionings as above them,
+/// and the native window partitions and sorts the projected rows itself.
+fn rows_below(input: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    let stripped = strip_distribution(input);
+    let Some(projection) = stripped.downcast_ref::<ProjectionExec>() else {
+        return Ok(Arc::clone(stripped));
+    };
+    let rows = rows_below(projection.input())?;
+    if Arc::ptr_eq(&rows, projection.input()) {
+        return Ok(Arc::clone(stripped));
+    }
+    Arc::clone(stripped).replace_children(
+        vec![rows],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+}
+
+/// `plan` without the nodes that only distribute and sort its rows (see
+/// [`PhysicalWindow::try_lower`]): sorts, merges of sorted partitions, merges
+/// of partitions and repartitionings, without a fetch, that read all
+/// partitions of their input.
+fn strip_distribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     let mut plan = plan;
     loop {
         let next = if let Some(sort) = plan.downcast_ref::<SortExec>() {
@@ -1170,16 +1183,6 @@ fn without_distribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan
             None => return plan,
         }
     }
-}
-
-/// Whether `plan` projects (through one or more `ProjectionExec`s) the rows
-/// of nodes that only distribute or sort them (see [`without_distribution`]).
-fn projects_distributed_rows(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let mut node = plan;
-    while let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-        node = projection.input();
-    }
-    !Arc::ptr_eq(node, plan) && !Arc::ptr_eq(without_distribution(node), node)
 }
 
 /// Whether `repartition` distributes the rows of its input over its
@@ -3020,6 +3023,141 @@ mod tests {
         };
         let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), true).await;
         assert_eq!(count::<PhysicalWindow>(&root), 1);
+        Ok(())
+    }
+
+    /// A projection of `id`, `d` and the computed `b + 1 AS x` of the rows of
+    /// `input` (of the schema of `t1`).
+    fn project_x(input: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let x = datafusion_physical_expr::expressions::BinaryExpr::new(
+            col("b", &schema)?,
+            datafusion_expr::Operator::Plus,
+            datafusion_physical_expr::expressions::lit(1_i64),
+        );
+        let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+            (col("id", &schema)?, "id".to_string()),
+            (col("d", &schema)?, "d".to_string()),
+            (Arc::new(x), "x".to_string()),
+        ];
+        Ok(Arc::new(ProjectionExec::try_new(exprs, input)?))
+    }
+
+    /// `SUM(x) OVER (PARTITION BY d ORDER BY id)` (if `partitioned`, `OVER
+    /// (ORDER BY id)` otherwise) of the rows of `input`, which have the columns
+    /// `id`, `d` and `x` (see [`project_x`]), in the window node of `mode` (a
+    /// `WindowAggExec` if `None`).
+    fn sum_of_x_plan(
+        input: Arc<dyn ExecutionPlan>,
+        partitioned: bool,
+        mode: Option<datafusion_physical_plan::InputOrderMode>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let schema = input.schema();
+        let partition_by = match partitioned {
+            true => vec![col("d", &schema)?],
+            false => vec![],
+        };
+        let id = PhysicalSortExpr::new_default(col("id", &schema)?);
+        let window_expr = datafusion_physical_plan::windows::create_window_expr(
+            &datafusion_expr::WindowFunctionDefinition::AggregateUDF(
+                datafusion::functions_aggregate::sum::sum_udaf(),
+            ),
+            "s".to_string(),
+            &[col("x", &schema)?],
+            &partition_by,
+            std::slice::from_ref(&id),
+            Arc::new(datafusion_expr::WindowFrame::new(Some(true))),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        Ok(match mode {
+            Some(mode) => Arc::new(BoundedWindowAggExec::try_new(
+                vec![window_expr],
+                input,
+                mode,
+                partitioned,
+            )?),
+            None => Arc::new(WindowAggExec::try_new(
+                vec![window_expr],
+                input,
+                partitioned,
+            )?),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_over_projections_of_sorts_are_native() -> Result<()> {
+        use crate::bridge::bridged_plans;
+        use datafusion_physical_plan::InputOrderMode;
+        // `Window -> ProjectionExec[id, d, b + 1 AS x] -> SortExec`, of a single
+        // partition or of the hash partitions of `d`: the projection, which
+        // computes a value, is lowered with the input of the native window,
+        // below the sort that the native window replaces (a projection
+        // computes every row on its own).
+        let task_ctx = || {
+            Arc::new(TaskContext::default().with_session_config(test_session_config()))
+        };
+        for partitioned in [false, true] {
+            for mode in [None, Some(InputOrderMode::Sorted)] {
+                let make = || {
+                    let sorted = match partitioned {
+                        true => {
+                            sort_exec(hash_repartition(t1_scan()?)?, &["d", "id"], true)?
+                        }
+                        false => {
+                            let coalesced =
+                                Arc::new(CoalescePartitionsExec::new(t1_scan()?));
+                            sort_exec(coalesced, &["id"], false)?
+                        }
+                    };
+                    sum_of_x_plan(project_x(sorted)?, partitioned, mode.clone())
+                };
+                let case = format!("partitioned: {partitioned}, {mode:?}");
+                let plan = make()?;
+                let window =
+                    PhysicalWindow::try_lower(&plan, &RuntimeEnv::default(), lower)?;
+                let window = window.unwrap_or_else(|| panic!("{case}: not lowered"));
+                assert_eq!(window.input().name(), "TestProjection", "{case}");
+                let root =
+                    assert_lowered_plan_byte_eq(make, lower, task_ctx(), !partitioned)
+                        .await;
+                let tree = format_operator_tree(&root);
+                assert_eq!(count::<PhysicalWindow>(&root), 1, "{case}\n{tree}");
+                assert!(bridged_plans(&root).is_empty(), "{case}\n{tree}");
+            }
+        }
+        // Also below a merge of the sorted partitions, and through two
+        // projections (the second one of columns).
+        let make = || {
+            let sorted = sort_exec(t1_scan()?, &["id"], true)?;
+            let projected = project_x(sorted)?;
+            let schema = projected.schema();
+            let columns: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+                (col("x", &schema)?, "x".to_string()),
+                (col("d", &schema)?, "d".to_string()),
+                (col("id", &schema)?, "id".to_string()),
+            ];
+            let reordered: Arc<dyn ExecutionPlan> =
+                Arc::new(ProjectionExec::try_new(columns, projected)?);
+            let ordering = LexOrdering::new([PhysicalSortExpr::new_default(col(
+                "id",
+                &reordered.schema(),
+            )?)])
+            .expect("an ordering");
+            let merged = Arc::new(SortPreservingMergeExec::new(ordering, reordered));
+            sum_of_x_plan(merged, false, Some(InputOrderMode::Sorted))
+        };
+        let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), true).await;
+        let tree = format_operator_tree(&root);
+        assert_eq!(count::<PhysicalWindow>(&root), 1, "{tree}");
+        assert!(bridged_plans(&root).is_empty(), "{tree}");
+        // And in SQL, over an aggregation whose projection computes a value.
+        assert_windows(
+            "SELECT d, m, RANK() OVER (ORDER BY m DESC, d) AS r FROM (SELECT d, COUNT(*) + 1 AS m FROM t1 GROUP BY d)",
+        )
+        .await;
         Ok(())
     }
 
