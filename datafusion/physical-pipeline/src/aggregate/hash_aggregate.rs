@@ -594,7 +594,7 @@ impl PhysicalHashAggregate {
     ///   input only, or fails;
     /// * aggregations with an aggregate whose accumulators may get other
     ///   values from the chunks of the native operator than from DataFusion's
-    ///   batches (see [`updates_like_datafusion`]): user-defined aggregates,
+    ///   batches (see `updates_like_datafusion`): user-defined aggregates,
     ///   and some built-in aggregates of a single partition;
     /// * aggregations with a soft limit on their groups (`lim=[n]` without
     ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
@@ -1565,7 +1565,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
     }
 
     /// Not if the aggregation aggregates its input in order (see
-    /// [`AggregateSpec::aggregates_in_order`]): the pipelines that end in it
+    /// `AggregateSpec::aggregates_in_order`): the pipelines that end in it
     /// then run on a single thread.
     fn parallel_sink(&self) -> bool {
         !self.spec.aggregates_in_order()
