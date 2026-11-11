@@ -56,8 +56,9 @@
 //!   runtime with the local file system, see
 //!   [`PhysicalHashJoin::create_probe_streams`]). Like
 //!   `HashJoinExec::execute`, it creates the streams of its build input
-//!   before (if that may fail too), and before its build side is read, so
-//!   that the same error comes first.
+//!   before (if that may fail too), and before its build side is read (in a
+//!   meta pipeline that all the pipelines of the build side wait for, see
+//!   `ProbeStreamsInit`), so that the same error comes first.
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
 //!   table concurrently: neither side is shuffled
@@ -1011,13 +1012,11 @@ impl PhysicalHashJoin {
     /// dropped once all are created, as the consumers of the partitions of the
     /// join hold them (and the memory they reserve) meanwhile.
     ///
-    /// Copying an input resets the dynamic filters that its joins produce (see
-    /// `HashJoinExec::reset_state`). The joins of the probe side publish theirs
-    /// only once the build side of this join is collected, after the copies
-    /// are made; a native join of the build side may publish its filter before
-    /// (its build pipelines do not wait for the copies), which then only
-    /// prunes fewer rows, which its probe side, of expressions that cannot
-    /// fail, reads and drops.
+    /// Copying an input resets the dynamic filters that its nodes produce (see
+    /// `HashJoinExec::reset_state`), which they publish once their own input
+    /// is collected: after the copies are made, as all the pipelines of the
+    /// build side wait for them (see [`ProbeStreamsInit`]), and those of the
+    /// probe side for the build side.
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
@@ -2592,10 +2591,6 @@ struct JoinState {
     /// saw: rows, and a NULL key.
     probe_has_rows: AtomicBool,
     probe_has_null_key: AtomicBool,
-    /// Whether the streams of the DataFusion probe input were created (see
-    /// [`PhysicalHashJoin::create_probe_streams`]), or the error of creating
-    /// them.
-    probe_streams: OnceLock<std::result::Result<(), Arc<DataFusionError>>>,
     /// The first error of evaluating the build keys, if DataFusion raises it
     /// only once the whole build side is collected (see
     /// `JoinSpec::defers_build_key_errors`): in `finalize`.
@@ -2976,7 +2971,6 @@ impl PhysicalOperator for PhysicalHashJoin {
             build_null_key_rows: AtomicUsize::new(0),
             probe_has_rows: AtomicBool::new(false),
             probe_has_null_key: AtomicBool::new(false),
-            probe_streams: OnceLock::new(),
             deferred_build_error: Mutex::new(None),
             key_stats: Mutex::new(BuildKeyStats::new(&self.spec)),
             reservation,
@@ -2985,21 +2979,12 @@ impl PhysicalOperator for PhysicalHashJoin {
 
     fn get_local_sink_state(
         &self,
-        ctx: &ExecutionContext,
-        gstate: &dyn GlobalSinkState,
+        _ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
-        let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
-        // `HashJoinExec::execute` creates the streams of its probe side right
-        // away, after the stream of its build side and before reading either:
-        // the first thread of a build pipeline creates them once its source
-        // is created, while the other threads wait, before any of them reads
-        // anything, so that the join raises the same errors, also if its build
-        // side never completes.
-        state
-            .probe_streams
-            .get_or_init(|| self.create_probe_streams(ctx).map_err(Arc::new))
-            .as_ref()
-            .map_err(|e| DataFusionError::Shared(Arc::clone(e)))?;
+        // The streams that `HashJoinExec::execute` creates right away were
+        // created before (see `ProbeStreamsInit`, which the build pipelines
+        // wait for).
         Ok(Box::new(BuildLocalState {
             key_stats: BuildKeyStats::new(&self.spec),
             ..Default::default()
@@ -3250,41 +3235,44 @@ impl PhysicalOperator for PhysicalHashJoin {
                 &finalize_pipeline,
                 Arc::new(JoinHashTableBuild::new(Arc::clone(&this))),
             )?;
-            // The probe streams of a join lowered from a `HashJoinExec` are
-            // created as soon as the execution starts, in a pipeline that
-            // depends on nothing (unless creating them cannot fail). Whether
-            // the runtime has the local file system, which scans of local
-            // files need, is only known then.
-            let init_pipeline = if self.probe_plan.is_some()
+            // The streams that `HashJoinExec::execute` creates before it reads
+            // either input are created as soon as the execution starts (unless
+            // creating them cannot fail), in a child meta pipeline that depends
+            // on nothing, which all the pipelines of the build side wait for,
+            // in all meta pipelines (e.g. the input of an aggregation of the
+            // build side): the errors of creating them come before the errors
+            // of reading the build side. Whether the runtime has the local file
+            // system, which scans of local files need, is only known then.
+            let init_meta = if self.probe_plan.is_some()
                 && self.probe_stream_failures != StreamFailures::Never
             {
-                let init_pipeline =
-                    build.create_union_pipeline(&build_pipeline, false)?;
-                build.set_source(
+                let sink = Arc::new(ProbeStreamsInit {
+                    join: Arc::clone(&this),
+                    schema: Arc::new(Schema::empty()),
+                });
+                let (mut init, init_pipeline) =
+                    build.create_child_meta_pipeline(&build_pipeline, sink)?;
+                init.set_source(
                     &init_pipeline,
-                    Arc::new(ProbeStreamsInit {
+                    Arc::new(ProbeStreamsStart {
                         schema: Arc::new(Schema::empty()),
                     }),
                 )?;
-                Some(init_pipeline)
+                Some(init.id())
             } else {
                 None
             };
-            build.build(&mut build_pipeline, self.build_side())?;
+            match init_meta {
+                Some(init_meta) => build.build_with_dependency(
+                    &mut build_pipeline,
+                    self.build_side(),
+                    init_meta,
+                )?,
+                None => build.build(&mut build_pipeline, self.build_side())?,
+            }
             for pipeline in build.pipelines() {
                 if pipeline != finalize_pipeline {
                     build.add_dependency(&finalize_pipeline, &pipeline)?;
-                }
-                // `HashJoinExec::execute` creates the streams of both inputs
-                // before any of them is read: the pipelines that read the
-                // build side wait for the streams to be created, so that
-                // their errors come before the errors of reading the build
-                // side (e.g. of a bridged plan that fails on its first batch).
-                if let Some(init_pipeline) = &init_pipeline
-                    && pipeline != finalize_pipeline
-                    && pipeline != *init_pipeline
-                {
-                    build.add_dependency(&pipeline, init_pipeline)?;
                 }
             }
             build_meta
@@ -3391,29 +3379,72 @@ impl PhysicalOperator for JoinHashTableBuild {
     }
 }
 
-/// The source of a pipeline of the build meta pipeline of a
+/// The sink of a child meta pipeline of the build meta pipeline of a
 /// [`PhysicalHashJoin`] lowered from a `HashJoinExec` whose probe streams may
-/// fail to be created (see [`stream_failures`]), which depends on
-/// nothing, so that it runs as soon as the execution starts. It produces no
-/// rows: its sink, the join, creates the streams of its DataFusion probe
-/// input when it creates the local sink state of the pipeline (see
-/// [`PhysicalHashJoin::create_probe_streams`]), as `HashJoinExec::execute`
-/// does right away, also when the build pipelines wait for pipeline breakers
-/// of the build side. (A join whose probe streams can only fail without the
-/// local file system in the runtime checks the runtime then, and creates them
-/// only if it has none.) Like `HashJoinExec::execute`, it creates the streams
-/// of the build input before them, if creating them may fail, and the other
-/// pipelines of the meta pipeline, which read the build side, wait for it: the
-/// errors of creating the streams come first, those of the build streams
-/// before those of the probe streams.
+/// fail to be created (see [`stream_failures`]): when it is finalized, it
+/// creates the streams that `HashJoinExec::execute` creates before it reads
+/// either input, those of the build input (if that may fail too) and then
+/// those of the probe input (see [`PhysicalHashJoin::create_probe_streams`]),
+/// so that the join raises the same errors. (A join whose probe streams can
+/// only fail without the local file system in the runtime checks the runtime
+/// then, and creates them only if it has none.)
+///
+/// Its meta pipeline depends on nothing, so that it runs as soon as the
+/// execution starts, also when the build side waits for pipeline breakers that
+/// never complete, and all the pipelines of the build side, of all the meta
+/// pipelines that it creates (e.g. the input of an aggregation of the build
+/// side), wait for it to be finalized (see
+/// [`MetaPipelineBuilder::build_with_dependency`]): like in DataFusion, the
+/// errors of creating the streams come before the errors of reading the build
+/// side. Its pipeline reads no rows, from a [`ProbeStreamsStart`].
 #[derive(Debug)]
 struct ProbeStreamsInit {
+    /// The join (a [`PhysicalHashJoin`]).
+    join: Arc<dyn PhysicalOperator>,
     schema: SchemaRef,
 }
 
 impl PhysicalOperator for ProbeStreamsInit {
     fn name(&self) -> &str {
         "ProbeStreamsInit"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &[]
+    }
+
+    fn is_sink(&self) -> bool {
+        true
+    }
+
+    fn finalize(
+        &self,
+        ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSinkState,
+    ) -> Result<SinkFinalize> {
+        let Some(join) = self.join.downcast_ref::<PhysicalHashJoin>() else {
+            return internal_err!(
+                "ProbeStreamsInit creates the streams of the inputs of a PhysicalHashJoin"
+            );
+        };
+        join.create_probe_streams(ctx)?;
+        Ok(SinkFinalize::Ready)
+    }
+}
+
+/// The source of the pipeline of a [`ProbeStreamsInit`]: it produces no rows.
+#[derive(Debug)]
+struct ProbeStreamsStart {
+    schema: SchemaRef,
+}
+
+impl PhysicalOperator for ProbeStreamsStart {
+    fn name(&self) -> &str {
+        "ProbeStreamsStart"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -3486,6 +3517,7 @@ mod tests {
     use futures::StreamExt;
 
     use crate::PipelineQueryPlanner;
+    use crate::aggregate::PhysicalHashAggregate;
     use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
@@ -7532,12 +7564,20 @@ mod tests {
         .await;
         let join = root.downcast_ref::<PhysicalHashJoin>().unwrap();
         assert!(join.build_side().is::<PhysicalHashJoin>());
-        // The pipeline that creates the probe streams depends on nothing.
+        // The pipeline that creates the probe streams (of meta pipeline 2)
+        // depends on nothing, and all the pipelines of the build side wait for
+        // it: those of the build meta pipeline of the join (1), and those of
+        // the build side of the nested join (3).
         let pipelines = format_pipelines(&root)?;
-        assert!(
-            pipelines.contains("Pipeline 3: ProbeStreamsInit -> PhysicalHashJoin\n"),
-            "{pipelines}"
-        );
+        for expected in [
+            "MetaPipeline 2 (sink: ProbeStreamsInit)\n  \
+             Pipeline 3: ProbeStreamsStart -> ProbeStreamsInit\n",
+            "Pipeline 1: MemoryScanSource -> PhysicalHashJoin -> PhysicalHashJoin \
+             depends on meta pipelines [2, 3]\n",
+            "Pipeline 4: BridgeOperator -> PhysicalHashJoin depends on meta pipelines [2]\n",
+        ] {
+            assert!(pipelines.contains(expected), "{pipelines}");
+        }
         Ok(())
     }
 
@@ -7772,7 +7812,7 @@ mod tests {
             assert!(
                 pipelines
                     .lines()
-                    .any(|line| line.ends_with(": ProbeStreamsInit -> PhysicalHashJoin")),
+                    .any(|line| line.ends_with(": ProbeStreamsStart -> ProbeStreamsInit")),
                 "{name}: {pipelines}"
             );
 
@@ -7963,6 +8003,107 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Assert that a join of `CAST(COUNT(argument) AS DOUBLE)` of the table `s`
+    /// of `table` (the build side) with
+    /// `approx_percentile_cont(CAST(v AS DOUBLE), 2.0)` of `s` (the probe side),
+    /// whose accumulator fails to be created (the percentile is not in
+    /// `[0, 1]`), fails with the invalid percentile, like in DataFusion, also
+    /// where the `COUNT` fails when it reads its rows: `HashJoinExec::execute`
+    /// creates the streams of both sides before it reads either. On 1 and 4
+    /// threads, the `COUNT` being native on `native_threads` (where it reads its
+    /// rows in the pipeline of a meta pipeline of the build side, which waits
+    /// for the streams to be created), as many times as it takes to see a race.
+    async fn assert_probe_stream_errors_come_first(
+        table: fn() -> Result<RecordBatch>,
+        argument: &str,
+        native_threads: &[usize],
+    ) -> Result<()> {
+        let sql = format!(
+            "SELECT b.n, x.p FROM (SELECT CAST(COUNT({argument}) AS DOUBLE) AS n FROM s) b \
+             JOIN (SELECT approx_percentile_cont(CAST(v AS DOUBLE), 2.0) AS p, 1 AS one \
+             FROM s) x ON b.n = x.p"
+        );
+        let message = "Percentile value must be between 0.0 and 1.0 inclusive";
+        let setup = |ctx: &SessionContext| ctx.register_batch("s", table()?);
+        for threads in [1, 4] {
+            let config = test_session_config().with_target_partitions(threads);
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx)?;
+            let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+            let join = find_hash_join(&plan).expect("a hash join");
+            let build_side = displayable(join.children()[0].as_ref()).indent(true);
+            assert!(build_side.to_string().contains("count"), "{build_side}");
+            let expected = with_timeout(collect(plan, ctx.task_ctx()))
+                .await
+                .expect_err("DataFusion fails");
+            assert!(expected.to_string().contains(message), "{expected}");
+
+            let ctx = pipeline_context(config);
+            setup(&ctx)?;
+            for _ in 0..10 {
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                let root = plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .expect("a pipeline plan")
+                    .operator();
+                let tree = format_operator_tree(root);
+                let join = root
+                    .downcast_ref::<PhysicalHashJoin>()
+                    .unwrap_or_else(|| panic!("a native join: {tree}"));
+                assert_eq!(
+                    count::<PhysicalHashAggregate>(join.build_side()),
+                    usize::from(native_threads.contains(&threads)),
+                    "{tree}"
+                );
+                let actual = with_timeout(collect(plan, ctx.task_ctx()))
+                    .await
+                    .map(|batches| count_rows(&batches));
+                match actual {
+                    Err(e) => assert!(
+                        e.to_string().contains(message),
+                        "{threads} threads, COUNT({argument}): the pipeline engine fails \
+                         with {e}, DataFusion with {expected}\n{tree}"
+                    ),
+                    Ok(rows) => panic!("{threads} threads: {rows} rows\n{tree}"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_stream_errors_come_before_cast_errors_of_the_build_side() -> Result<()>
+    {
+        // The strings `v`, with `'bad_integer'`, which `COUNT(CAST(v AS INT))`
+        // fails to cast when it reads them: natively on 1 thread (on 4, the
+        // aggregation of a cast that may fail stays in DataFusion).
+        let strings = || {
+            let values = ["bad_integer", "1", "2", "3"];
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8View, true)])),
+                vec![Arc::new(StringViewArray::from_iter_values(values))],
+            )?)
+        };
+        assert_probe_stream_errors_come_first(strings, "CAST(v AS INT)", &[1]).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_stream_errors_come_before_overflows_of_the_build_side() -> Result<()> {
+        // The decimals `v` of 10^37, whose products with 1000 overflow when
+        // `COUNT(v * 1000)` reads them: natively on 1 and 4 threads (decimal
+        // products can only overflow).
+        let decimals = || {
+            let values = Decimal128Array::from(vec![10_i128.pow(37); 4])
+                .with_precision_and_scale(38, 0)?;
+            let field = Field::new("v", DataType::Decimal128(38, 0), true);
+            Ok(RecordBatch::try_new(
+                Arc::new(Schema::new(vec![field])),
+                vec![Arc::new(values)],
+            )?)
+        };
+        assert_probe_stream_errors_come_first(decimals, "v * 1000", &[1, 4]).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
