@@ -87,6 +87,18 @@
 //! ([`JoinHashTable::mark_matched`]), in an atomic bitset shared by all
 //! probe threads, for the joins that emit build rows once the probe side is
 //! exhausted (e.g. the unmatched rows of a `LEFT` join).
+//!
+//! # Membership
+//!
+//! Every chain is a distinct key, of which the build counts
+//! ([`JoinHashTable::num_distinct_keys`]) and the table gathers
+//! ([`JoinHashTable::distinct_keys`], from the first rows of the chains).
+//! [`JoinHashTable::may_contain_keys`] checks, without comparing any key,
+//! whether a build row may have the keys of a row (like DataFusion's
+//! `HashTableLookupExpr`): it is exact for a dense index, and otherwise
+//! accepts the rows whose probe sequence reaches an entry with their salt,
+//! which the rows with a match do. Joins filter the rows of their probe side
+//! with them before they probe (see their dynamic filters).
 
 use std::fmt;
 use std::ops::Range;
@@ -95,7 +107,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{Array, ArrayRef, ArrowPrimitiveType, AsArray};
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::datatypes::{
     DataType, Date32Type, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
     UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -629,6 +641,9 @@ struct PartitionTable {
     first_row: usize,
     /// The number of rows in the chains of the table.
     num_entries: usize,
+    /// The number of chains of the table: of the distinct keys of its rows
+    /// that can match.
+    num_chains: usize,
     /// The buckets of the key filter in which the keys of the rows fall (see
     /// [`KeyIndexPlan::buckets`]), until the filter is built.
     buckets: Vec<u32>,
@@ -647,6 +662,7 @@ impl fmt::Debug for PartitionTable {
             .field("capacity", &self.entries.len())
             .field("rows", &self.next.len())
             .field("num_entries", &self.num_entries)
+            .field("num_chains", &self.num_chains)
             .finish()
     }
 }
@@ -740,6 +756,7 @@ fn build_partition(
     let mask = capacity - 1;
     let key_columns = (0..num_keys).collect::<Vec<_>>();
     let mut num_entries = 0;
+    let mut num_chains = 0;
     // The rows of the current batch, their hashes, and the rows of the
     // batch to insert in the current round, with the slot at which they
     // continue.
@@ -800,6 +817,7 @@ fn build_partition(
                         if current == 0 {
                             // The first row of a new chain.
                             entries[slot] = entry(salt, locations[i]);
+                            num_chains += 1;
                             break;
                         }
                         if entry_salt(current) == salt {
@@ -852,6 +870,7 @@ fn build_partition(
         next,
         first_row: range.rows.start,
         num_entries,
+        num_chains,
         buckets,
     })
 }
@@ -1003,7 +1022,8 @@ impl Drop for PartitionKeys<'_> {
 
 /// Build the chains of the rows of the partition `range` of `collection` into
 /// the [`DenseIndex`] `dense` of the keys of `plan` (compared with
-/// `null_equality`), and return the number of rows in the chains.
+/// `null_equality`), and return the number of rows in the chains and the
+/// number of chains (of distinct keys).
 ///
 /// Like [`build_partition`], the rows are inserted in reverse order and
 /// prepended to their chain, so that the rows of a chain are in the order of
@@ -1020,14 +1040,15 @@ fn build_dense_partition(
     dense: &DenseBuild,
     null_equality: NullEquality,
     reservation: &MemoryReservation,
-) -> Result<usize> {
+) -> Result<(usize, usize)> {
     if range.rows.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let mut keys = PartitionKeys::new(&dense.entries, reservation);
     let null_equals_null = null_equality == NullEquality::NullEqualsNull;
     let mut null_chain = 0;
     let mut num_entries = 0;
+    let mut num_chains = 0;
     let mut locations = Vec::with_capacity(DEFAULT_VECTOR_SIZE);
     for block in range.blocks.clone().rev() {
         let first_row = collection.row_index(RowLocation::new(block, 0));
@@ -1048,6 +1069,9 @@ fn build_dense_partition(
                 };
                 dense.next[first_row + location.row()].store(next, Ordering::Relaxed);
                 num_entries += 1;
+                // The first row of a key (all rows of a key are in this
+                // partition), or the first row with a NULL key.
+                num_chains += usize::from(next == 0);
             }
             end = start;
         }
@@ -1056,7 +1080,7 @@ fn build_dense_partition(
     if null_chain != 0 {
         dense.null_chain.store(null_chain, Ordering::Relaxed);
     }
-    Ok(num_entries)
+    Ok((num_entries, num_chains))
 }
 
 /// Builds a [`JoinHashTable`] from the combined build rows of all threads.
@@ -1326,7 +1350,7 @@ impl JoinHashTableBuilder {
                     dense: Some(dense), ..
                 },
             ) => {
-                let num_entries = build_dense_partition(
+                let (num_entries, num_chains) = build_dense_partition(
                     &self.collection,
                     range,
                     plan,
@@ -1337,6 +1361,7 @@ impl JoinHashTableBuilder {
                 Ok(PartitionTable {
                     first_row: range.rows.start,
                     num_entries,
+                    num_chains,
                     ..Default::default()
                 })
             }
@@ -1384,6 +1409,7 @@ impl JoinHashTableBuilder {
             })
             .collect::<Result<Vec<_>>>()?;
         let num_entries = tables.iter().map(|table| table.num_entries).sum();
+        let num_chains = tables.iter().map(|table| table.num_chains).sum();
         let (dense, key_filter, tables) = match key_index {
             Some(KeyIndexPlan {
                 range,
@@ -1408,6 +1434,7 @@ impl JoinHashTableBuilder {
             dense,
             key_filter,
             num_entries,
+            num_chains,
             matched,
             reservation,
         })
@@ -1533,6 +1560,8 @@ pub struct JoinHashTable {
     key_filter: Option<KeyFilter>,
     /// The number of rows in the chains (the rows that can match).
     num_entries: usize,
+    /// The number of chains: of the distinct keys of the rows that can match.
+    num_chains: usize,
     /// The rows that found a match, if tracked.
     matched: Option<MatchedRows>,
     /// The memory of the pointer tables, the chains and the matched rows.
@@ -1552,6 +1581,7 @@ impl fmt::Debug for JoinHashTable {
         f.debug_struct("JoinHashTable")
             .field("rows", &self.collection.len())
             .field("entries", &self.num_entries)
+            .field("distinct_keys", &self.num_chains)
             .field("radix_bits", &self.radix_bits)
             .field("index", &index)
             .field("tracks_matches", &self.matched.is_some())
@@ -1607,6 +1637,14 @@ impl JoinHashTable {
     /// Returns `true` if no probe row can match any build row.
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
+    }
+
+    /// The number of distinct keys of the build rows that can match (one per
+    /// chain): with [`NullEquality::NullEqualsNull`], keys with NULLs count
+    /// too (all NULLs of a single key are one key), otherwise they are not in
+    /// the table.
+    pub fn num_distinct_keys(&self) -> usize {
+        self.num_chains
     }
 
     /// The number of radix bits of the partitions.
@@ -1868,6 +1906,155 @@ impl JoinHashTable {
         self.matched
             .as_ref()
             .is_some_and(|matched| matched.get(row))
+    }
+
+    /// The distinct keys of the build rows that can match (see
+    /// [`Self::num_distinct_keys`]), in no particular order: one array per key
+    /// column, with the keys of the first row of every chain.
+    ///
+    /// It reads every entry of the index, of which a hashed table has at least
+    /// twice as many as rows (and a dense index one per key of its
+    /// [`KeyRange`]): it is meant for tables of few distinct keys, e.g. for the
+    /// `IN` lists of the dynamic filters of a join.
+    pub fn distinct_keys(&self) -> Result<Vec<ArrayRef>> {
+        let mut locations = Vec::new();
+        locations.try_reserve_exact(self.num_chains).map_err(|e| {
+            resources_datafusion_err!(
+                "Failed to allocate the distinct keys of a JoinHashTable: {e}"
+            )
+        })?;
+        match &self.dense {
+            Some(dense) => locations.extend(
+                dense
+                    .entries
+                    .iter()
+                    .chain([&dense.null_chain])
+                    .filter(|&&chain| chain != 0)
+                    .map(|&chain| unpack(chain)),
+            ),
+            None => {
+                for table in &self.partitions {
+                    locations.extend(
+                        table
+                            .entries
+                            .iter()
+                            .filter(|&&entry| entry != 0)
+                            .map(|&entry| entry_location(entry)),
+                    );
+                }
+            }
+        }
+        if locations.len() != self.num_chains {
+            return internal_err!(
+                "A JoinHashTable of {} distinct keys has {} chains",
+                self.num_chains,
+                locations.len()
+            );
+        }
+        let key_columns = (0..self.num_keys()).collect::<Vec<_>>();
+        self.collection.gather_columns(&locations, &key_columns)
+    }
+
+    /// Whether a build row that can match may have the keys of each row of
+    /// `keys` (one array per key column, of the types of the keys of the
+    /// table): `true` for every row whose keys are equal to the keys of such a
+    /// build row, `false` for almost all others. Like DataFusion's
+    /// `HashTableLookupExpr`, which checks whether its hash table has the
+    /// hashes of the keys, it does not compare the keys with the keys of the
+    /// build rows:
+    ///
+    /// * a dense index reads the entry of the key of every row (exact);
+    /// * a hashed table rejects the keys that its key filter rejects, and
+    ///   accepts a row if its probe sequence reaches an entry with its salt
+    ///   before an empty entry. The entry of the chain of equal keys is on that
+    ///   sequence, before any empty entry; the entries of other keys with the
+    ///   same salt (a collision of the bits of their hashes that select the
+    ///   slot and of those of the salt) make it accept rows that have no match.
+    ///
+    /// Rows with a NULL key are only accepted under
+    /// [`NullEquality::NullEqualsNull`], if a build row with a NULL key may
+    /// have their keys.
+    pub fn may_contain_keys(&self, keys: &[ArrayRef]) -> Result<BooleanBuffer> {
+        let num_rows = keys.first().map_or(0, |key| key.len());
+        if keys.len() != self.num_keys() || keys.iter().any(|key| key.len() != num_rows) {
+            return internal_err!(
+                "Cannot look up {} key columns of {:?} rows in a JoinHashTable on {} keys",
+                keys.len(),
+                keys.iter().map(|key| key.len()).collect::<Vec<_>>(),
+                self.num_keys()
+            );
+        }
+        if self.is_empty() {
+            return Ok(BooleanBuffer::new_unset(num_rows));
+        }
+        let key_nulls = keys
+            .iter()
+            .map(|key| key.logical_nulls())
+            .collect::<Vec<_>>();
+        // Under `NullEqualsNothing`, a row with a NULL key matches nothing.
+        let valid = match self.null_equality() {
+            NullEquality::NullEqualsNothing => {
+                NullBuffer::union_many(key_nulls.iter().map(Option::as_ref))
+            }
+            NullEquality::NullEqualsNull => None,
+        };
+        // The key bits of the single integer key of a dense index or a key
+        // filter.
+        let mut bits = Vec::new();
+        if (self.dense.is_some() || self.key_filter.is_some())
+            && (keys[0].data_type() != self.layout().column(0).data_type()
+                || !key_bits(keys[0].as_ref(), &mut bits))
+        {
+            return internal_err!(
+                "Keys of type {} cannot be looked up in a JoinHashTable on {}",
+                keys[0].data_type(),
+                self.layout().column(0).data_type()
+            );
+        }
+        let key_nulls = key_nulls[0].as_ref();
+        let is_null = |row: usize| key_nulls.is_some_and(|nulls| nulls.is_null(row));
+        if let Some(dense) = &self.dense {
+            // The NULL chain of a NULL key is empty but under `NullEqualsNull`.
+            return Ok(BooleanBuffer::collect_bool(num_rows, |row| {
+                if is_null(row) {
+                    dense.null_chain != 0
+                } else {
+                    dense.chain(bits[row]) != 0
+                }
+            }));
+        }
+        let mut hashes = Vec::new();
+        hash_join_keys(keys, num_rows, &mut hashes)?;
+        Ok(BooleanBuffer::collect_bool(num_rows, |row| {
+            if valid.as_ref().is_some_and(|valid| valid.is_null(row)) {
+                return false;
+            }
+            // The key filter does not reject NULL keys, which a NULL key of a
+            // build row may match.
+            if let Some(filter) = &self.key_filter
+                && !is_null(row)
+                && !filter.accepts(bits[row])
+            {
+                return false;
+            }
+            let hash = hashes[row];
+            let table = self.partition(hash);
+            if table.entries.is_empty() {
+                return false;
+            }
+            let salt = salt(hash);
+            let mut slot = hash as usize & table.mask;
+            loop {
+                let current = table.entries[slot];
+                if current == 0 {
+                    return false;
+                }
+                if entry_salt(current) == salt {
+                    return true;
+                }
+                slot = (slot + 1) & table.mask;
+            }
+        }))
     }
 }
 
@@ -3459,7 +3646,276 @@ mod tests {
                     expected,
                     "{radix_bits}, {limit}"
                 );
+                // Every key is counted once, wherever its first row was kept.
+                assert_eq!(table.num_distinct_keys(), 250, "{radix_bits}, {limit}");
+                assert_eq!(
+                    sorted_keys(&table.distinct_keys().unwrap()[0]),
+                    (0..250).map(Some).collect::<Vec<_>>()
+                );
             }
+        }
+    }
+
+    /// The keys `keys` (of an integer type or `Date32`), sorted.
+    fn sorted_keys(keys: &ArrayRef) -> Vec<Option<i128>> {
+        let keys = match keys.data_type() {
+            DataType::Date32 => arrow::compute::cast(keys, &DataType::Int32).unwrap(),
+            _ => Arc::clone(keys),
+        };
+        let keys = arrow::compute::cast(&keys, &DataType::Decimal128(38, 0)).unwrap();
+        let keys = keys.as_primitive::<arrow::datatypes::Decimal128Type>();
+        let mut keys = keys.iter().collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The rows of `contained` (by [`JoinHashTable::may_contain_keys`]) whose
+    /// keys no build row has.
+    fn false_positives(contained: &BooleanBuffer, matches: &[bool]) -> usize {
+        contained
+            .iter()
+            .zip(matches)
+            .filter(|&(contained, &matches)| contained && !matches)
+            .count()
+    }
+
+    #[test]
+    fn distinct_keys_and_membership_of_every_index() {
+        // The keys -3 to 13 (with duplicates and NULLs) of `build_and_probe`,
+        // looked up with the probe keys -5 to 17 (and NULLs), as keys of
+        // integer types in hashed tables, dense indexes and hashed tables with
+        // key filters.
+        let (build, probe_batch) = build_and_probe();
+        let build_keys = (-3..=13).map(Some).collect::<Vec<_>>();
+        let mut cases: Vec<(DataType, KeyMap, &str)> = vec![
+            (DataType::Int32, |key| i128::from(key), "hashed"),
+            (DataType::UInt64, |key| i128::from(key + 5) << 58, "hashed"),
+        ];
+        cases.extend(
+            integer_key_types()
+                .into_iter()
+                .map(|(data_type, map)| (data_type, map, "dense")),
+        );
+        cases.extend([
+            (
+                DataType::Int64,
+                (|key| i128::from(key) << 50) as KeyMap,
+                "buckets",
+            ),
+            (DataType::Int32, |key| i128::from(key) * 100_000, "buckets"),
+        ]);
+        for (data_type, map, index) in cases {
+            let typed_build = build
+                .iter()
+                .map(|batch| with_keys(batch, &data_type, map))
+                .collect::<Vec<_>>();
+            let typed_probe = with_keys(&probe_batch, &data_type, map);
+            let range = key_range(&typed_build);
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                let null_keys_match = null_equality == NullEquality::NullEqualsNull;
+                // Whether a build row has the key of every probe row.
+                let probe_keys = probe_batch.column(0).as_primitive::<Int32Type>();
+                let matches = probe_keys
+                    .iter()
+                    .map(|key| {
+                        key.map_or(null_keys_match, |key| (-3..=13).contains(&key))
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected_keys = build_keys
+                    .iter()
+                    .map(|key| key.map(map))
+                    .collect::<Vec<_>>();
+                if null_keys_match {
+                    expected_keys.insert(0, None);
+                }
+                for (radix_bits, threads) in [(0, 1), (2, 3), (5, 2)] {
+                    let table = configured_table(
+                        &typed_build,
+                        1,
+                        null_equality,
+                        radix_bits,
+                        threads,
+                        |b| hashes(b, 1),
+                        |builder| match index {
+                            "hashed" => Ok(builder),
+                            _ => builder.with_key_range(range),
+                        },
+                    )
+                    .unwrap();
+                    let case = format!(
+                        "{data_type}, {index}, {null_equality:?}, {radix_bits} bits, {threads} threads"
+                    );
+                    assert_eq!(table.has_dense_index(), index == "dense", "{case}");
+                    assert_eq!(table.filters_keys(true), index == "buckets", "{case}");
+                    // One key of every chain: the distinct valid keys, and
+                    // NULL if NULLs are equal.
+                    assert_eq!(table.num_distinct_keys(), expected_keys.len(), "{case}");
+                    let keys = table.distinct_keys().unwrap();
+                    assert_eq!(keys.len(), 1, "{case}");
+                    assert_eq!(keys[0].data_type(), &data_type, "{case}");
+                    assert_eq!(sorted_keys(&keys[0]), expected_keys, "{case}");
+                    // Every probe row with a match is contained; the others
+                    // are not, but rarely in a hashed table (always, if all
+                    // hashes collide).
+                    let contained = table
+                        .may_contain_keys(&[Arc::clone(typed_probe.column(0))])
+                        .unwrap();
+                    assert_eq!(contained.len(), probe_batch.num_rows(), "{case}");
+                    for (row, &matches) in matches.iter().enumerate() {
+                        assert!(!matches || contained.value(row), "{case}, row {row}");
+                    }
+                    let false_positives = false_positives(&contained, &matches);
+                    if index == "dense" {
+                        assert_eq!(false_positives, 0, "{case}");
+                    } else if !hashes_are_forced_to_collide() {
+                        assert!(false_positives <= 1, "{case}: {false_positives}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_keys_and_membership_of_several_keys() {
+        // The keys `(f, s)` of `multi_column_keys_and_matched_rows`, of which
+        // `(0.0, s)` and `(-0.0, s)` are equal, looked up with keys of rows
+        // with matches and keys that differ by one value.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, true),
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let long = "a fairly long string value";
+        let build = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(vec![
+                    Some(0.0),
+                    Some(-0.0),
+                    Some(f64::NAN),
+                    None,
+                    Some(1.5),
+                ])),
+                Arc::new(StringViewArray::from(vec![
+                    Some(long),
+                    Some(long),
+                    Some("n"),
+                    Some("x"),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![10, 11, 12, 13, 14])),
+            ],
+        )
+        .unwrap();
+        let probe_keys: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from(vec![
+                Some(-0.0),
+                Some(f64::NAN),
+                None,
+                Some(1.5),
+                Some(0.0),
+                Some(f64::NAN),
+                None,
+            ])),
+            Arc::new(StringViewArray::from(vec![
+                Some(long),
+                Some("n"),
+                Some("x"),
+                None,
+                Some("a fairly long string valuE"),
+                Some("x"),
+                None,
+            ])),
+        ];
+        for (null_equality, distinct_keys, matches) in [
+            (
+                NullEquality::NullEqualsNothing,
+                2,
+                [true, true, false, false, false, false, false],
+            ),
+            (
+                NullEquality::NullEqualsNull,
+                4,
+                [true, true, true, true, false, false, false],
+            ),
+        ] {
+            for (radix_bits, threads) in [(0, 1), (3, 2)] {
+                let table = table(
+                    std::slice::from_ref(&build),
+                    2,
+                    null_equality,
+                    radix_bits,
+                    threads,
+                    |b| hashes(b, 2),
+                );
+                let case = format!("{null_equality:?}, {radix_bits} bits");
+                assert_eq!(table.num_distinct_keys(), distinct_keys, "{case}");
+                let keys = table.distinct_keys().unwrap();
+                assert_eq!(keys.len(), 2, "{case}");
+                let mut strings = keys[1]
+                    .as_string_view()
+                    .iter()
+                    .map(|s| s.map(str::to_string))
+                    .collect::<Vec<_>>();
+                strings.sort_unstable();
+                let mut expected = vec![Some(long.to_string()), Some("n".to_string())];
+                if null_equality == NullEquality::NullEqualsNull {
+                    expected.extend([None, Some("x".to_string())]);
+                    expected.sort_unstable();
+                }
+                assert_eq!(strings, expected, "{case}");
+                let contained = table.may_contain_keys(&probe_keys).unwrap();
+                for (row, &matches) in matches.iter().enumerate() {
+                    assert!(!matches || contained.value(row), "{case}, row {row}");
+                }
+                if !hashes_are_forced_to_collide() {
+                    assert!(false_positives(&contained, &matches) <= 1, "{case}");
+                }
+            }
+        }
+
+        // Keys of another number of columns, or rows, cannot be looked up.
+        let table = table(
+            std::slice::from_ref(&build),
+            2,
+            NullEquality::NullEqualsNothing,
+            0,
+            1,
+            |b| hashes(b, 2),
+        );
+        assert!(table.may_contain_keys(&probe_keys[..1]).is_err());
+        let short = vec![Arc::clone(&probe_keys[0]), probe_keys[1].slice(0, 3)];
+        assert!(table.may_contain_keys(&short).is_err());
+    }
+
+    #[test]
+    fn empty_tables_contain_no_keys() {
+        // Only rows with NULL keys, which match nothing.
+        let nulls = batch(vec![None, None, None]);
+        for index in ["hashed", "dense"] {
+            let table = configured_table(
+                std::slice::from_ref(&nulls),
+                1,
+                NullEquality::NullEqualsNothing,
+                2,
+                1,
+                |b| hashes(b, 1),
+                |builder| match index {
+                    "dense" => builder.with_key_range(KeyRange::new(0, 10).unwrap()),
+                    _ => Ok(builder),
+                },
+            )
+            .unwrap();
+            assert!(table.is_empty(), "{index}");
+            assert_eq!(table.num_distinct_keys(), 0, "{index}");
+            assert_eq!(table.distinct_keys().unwrap()[0].len(), 0, "{index}");
+            let probe_keys: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), None]));
+            let contained = table.may_contain_keys(&[probe_keys]).unwrap();
+            assert_eq!(contained.count_set_bits(), 0, "{index}");
+            assert_eq!(contained.len(), 2, "{index}");
         }
     }
 }
