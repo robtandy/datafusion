@@ -1199,7 +1199,7 @@ impl JoinHashTableBuilder {
     /// * with a [`DenseIndex`] if the range spans at most [`MAX_DENSE_SPAN`]
     ///   keys, and at most 65,536 keys or 8 keys per build row (and if the
     ///   memory pool has room for its entries and its chains, all the memory
-    ///   that building it needs, see [`PartitionKeys`]);
+    ///   that building it needs, see `PartitionKeys`);
     /// * otherwise with the hashed tables of the partitions and a
     ///   [`KeyFilter`] of the range, and of the buckets of keys in which build
     ///   keys fall (of at most 2^19 buckets, which the partitions record as
