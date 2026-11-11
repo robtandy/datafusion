@@ -1347,6 +1347,11 @@ struct ShapeClasses {
 /// the `OFFSET` skips (the first sorted rows that `result` does not have)
 /// must not be ordered after rows of `result` that they do not tie with, nor
 /// the rows that the `LIMIT` cuts before them.
+// The rows of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a
+// `Mutex` for memory accounting with the `arrow-buffer/pool` feature (enabled
+// by `--all-features`): it affects neither their equality nor their hashing.
+// Not `expect`: the lint only fires with that feature.
+#[allow(clippy::allow_attributes, clippy::mutable_key_type)]
 fn compare_sorted(
     (reference_name, result_name): (&str, &str),
     result: &[Row],
@@ -1932,6 +1937,11 @@ fn list_rows(
 /// Rows that are equal within the tolerance have the same [`Shape`]: the rows
 /// are grouped by their shapes, and the floating-point values of the rows of
 /// each group are matched.
+// The rows of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a
+// `Mutex` for memory accounting with the `arrow-buffer/pool` feature (enabled
+// by `--all-features`): it affects neither their equality nor their hashing.
+// Not `expect`: the lint only fires with that feature.
+#[allow(clippy::allow_attributes, clippy::mutable_key_type)]
 fn multiset_difference(expected: &[Row], actual: &[Row], tolerance: f64) -> Difference {
     if let ([e], [a]) = (expected, actual) {
         return if rows_equal(e, a, tolerance) {
