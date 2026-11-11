@@ -97,6 +97,7 @@ use crate::operator::{
     downcast_state_mut,
 };
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::sort::memory_size;
 
 /// Lower a DataFusion `SymmetricHashJoinExec` natively, see the [module
 /// documentation](self): to a [`PhysicalHashJoin`] that builds its table on
@@ -541,29 +542,33 @@ impl PhysicalSymmetricHashJoin {
             }
         }
 
-        // The rows join the table of their input.
-        let previous_size = own.rows.memory_size();
+        // The rows join the table of their input. (Only the keys that are new
+        // to the table are copied into it.)
         let first = own.rows.len();
+        let mut key_bytes = 0;
         for row in 0..num_rows {
             let position = first + row;
             let previous = match is_matchable(row) {
-                true => own
-                    .heads
-                    .insert(encoded.row(row).as_ref().into(), position)
-                    .unwrap_or(usize::MAX),
+                true => {
+                    let key = encoded.row(row);
+                    match own.heads.get_mut(key.as_ref()) {
+                        Some(head) => std::mem::replace(head, position),
+                        None => {
+                            key_bytes += key.as_ref().len();
+                            own.heads.insert(key.as_ref().into(), position);
+                            usize::MAX
+                        }
+                    }
+                }
                 false => usize::MAX,
             };
             own.previous.push(previous);
         }
         own.matched.extend_from_slice(&own_matched);
-        let key_bytes = (0..num_rows)
-            .filter(|&row| is_matchable(row))
-            .map(|row| encoded.row(row).as_ref().len())
-            .sum::<usize>();
-        own.rows.push(batch.clone());
-        let grown = own.rows.memory_size().saturating_sub(previous_size)
+        let grown = memory_size(&batch)
             + key_bytes
             + num_rows * (size_of::<usize>() * 3 + size_of::<bool>());
+        own.rows.push(batch.clone());
         state.join.reservation.try_grow(grown)?;
 
         // The output.
@@ -911,6 +916,7 @@ mod tests {
     use std::ops::Range;
 
     use arrow::array::{Array, Int64Array};
+    use arrow::compute::SortOptions;
     use arrow::datatypes::DataType;
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -920,12 +926,17 @@ mod tests {
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::collect;
+    use datafusion_physical_plan::joins::SortMergeJoinExec;
     use datafusion_physical_plan::joins::{
         HashJoinExec, PartitionMode, StreamJoinPartitionMode,
     };
     use datafusion_physical_plan::limit::GlobalLimitExec;
+    use datafusion_physical_plan::repartition::RepartitionExec;
+    use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
     use futures::StreamExt;
@@ -1422,6 +1433,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sort_merge_joins_of_unbounded_inputs_are_native() -> Result<()> {
+        // A sort-merge join (of several partitions, whose order no node above
+        // relies on) of two inputs that never end is a symmetric hash join; of
+        // one that ends, a hash join that builds on it.
+        for (left_unbounded, right_unbounded) in
+            [(true, true), (true, false), (false, true)]
+        {
+            for join_type in ALL_JOIN_TYPES {
+                let context = format!("{join_type} {left_unbounded} {right_unbounded}");
+                let make_plan = || -> Result<Arc<dyn ExecutionPlan>> {
+                    let input = |side: &str, rows, skew, unbounded| -> Result<_> {
+                        let scan = match unbounded {
+                            true => stream_scan(side, rows, skew, false),
+                            false => bounded_scan(side, rows, skew),
+                        };
+                        let key = col(&format!("{side}k"), &scan.schema())?;
+                        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(
+                            Arc::clone(&key),
+                        )])
+                        .unwrap();
+                        let partitioning = Partitioning::Hash(vec![Arc::clone(&key)], 4);
+                        let repartition = RepartitionExec::try_new(scan, partitioning)?;
+                        let sort = SortExec::new(ordering, Arc::new(repartition))
+                            .with_preserve_partitioning(true);
+                        Ok((Arc::new(sort) as Arc<dyn ExecutionPlan>, key))
+                    };
+                    let (left, left_key) = input("l", 300, 0, left_unbounded)?;
+                    let (right, right_key) = input("r", 500, 3, right_unbounded)?;
+                    Ok(Arc::new(SortMergeJoinExec::try_new(
+                        left,
+                        right,
+                        vec![(left_key, right_key)],
+                        Some(join_filter("id", Operator::Gt, "id")),
+                        join_type,
+                        vec![SortOptions::default()],
+                        NullEquality::NullEqualsNothing,
+                    )?))
+                };
+                let plan = make_plan()?;
+                let expected = with_timeout(collect(make_plan()?, task_ctx())).await?;
+                let expected = EngineOutput {
+                    schema: plan.schema(),
+                    plan: Arc::clone(&plan),
+                    batches: expected,
+                    ordered: false,
+                };
+                let root =
+                    crate::join::merge_join::try_lower(&plan, false, |input, _| {
+                        crate::planner::lower_execution_plan(input)
+                    })?
+                    .expect("a native join");
+                let tree = format_operator_tree(&root);
+                match left_unbounded && right_unbounded {
+                    true => assert!(root.is::<PhysicalSymmetricHashJoin>(), "{context}"),
+                    false => assert!(root.is::<PhysicalHashJoin>(), "{context}"),
+                }
+                let actual = run_native(&root, plan, task_ctx()).await?;
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\n{context}\n{tree}");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

@@ -944,11 +944,6 @@ impl StoredRows {
             .collect::<Vec<_>>();
         Ok(interleave(&arrays, &located)?)
     }
-
-    /// The bytes of the rows.
-    pub(crate) fn memory_size(&self) -> usize {
-        self.batches.iter().map(memory_size).sum()
-    }
 }
 
 /// Whether the residual filter `filter` holds for the `num_rows` pairs of
