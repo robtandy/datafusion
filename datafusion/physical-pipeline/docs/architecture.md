@@ -32,7 +32,11 @@ To make this achievable, the engine never re-plans a query: it starts from
 the `ExecutionPlan` produced by DataFusion's `DefaultPhysicalPlanner`, reuses
 its schemas and its `PhysicalExpr`s (with all coercions applied), and keeps
 all scan pushdowns. Native operators must reproduce the semantics of the
-DataFusion operator they replace, including error behavior.
+DataFusion operator they replace, including error behavior. See
+[Error parity](error-parity.md) for how the planner decides which parts of a
+plan stay in DataFusion so that their errors match, and for the errors that
+are out of the scope of parity: those of reading or decoding the rows of
+Parquet files that the dynamic filters of the two engines skip differently.
 
 ## Overview
 
@@ -528,8 +532,10 @@ the rules of the planner itself. In short, DataFusion executes:
   pull ahead of their consumers (`FilterExec`, coalescing repartitions, hash
   and nested loop joins, which coalesce their output);
 - joins and TopKs whose dynamic filters prune the reads of inputs that may
-  fail (e.g. Parquet scans), and windows above TopKs that may end some of
-  their partitions early.
+  fail (e.g. CSV scans, or work that may fail above Parquet scans, whose
+  reading and decoding is treated as unable to fail, see
+  [Error parity](error-parity.md)), and windows above TopKs that may end
+  some of their partitions early.
 
 Windows, nested loop joins and cross joins keep all of their rows in memory
 without reserving it in the memory pool, while the DataFusion nodes that they
@@ -597,30 +603,17 @@ built-in functions by default, see `TrustedFunctions`):
   `hits23`: the native TopK updates the filter, so that the scans of Parquet
   files skip the reads that its threshold rules out.
 
-A scan of Parquet files is judged to read its rows without failing only if
-its expressions cannot fail and its files have the types of its table: the
-planner checks the schemas of the files in their metadata, which DataFusion
-caches when it collects their statistics (`collect_statistics`, on by
-default), with the coercions of DataFusion's Parquet reader (of strings into
-`Utf8View`, and of INT96 timestamps into the unit of `coerce_int96`), and no
-nulls in the columns of the table that have none. DataFusion infers the schema
-of a table from its files, but a schema given when the table is registered may
-have other types, into which the scan casts the values of the files, and fails
-on those that it cannot cast, on rows that a dynamic filter prunes in only one
-of the engines: such scans, and scans of files whose metadata is not cached,
-may fail. So may the scans with custom readers of their files (any other
-reader factory than DataFusion's own, which the planner recognizes by comparing
-it with the factories that `ParquetFormat` creates over the object store of the
-scan and the cache of the runtime) or custom providers of their schemas, and the scans of files with explicit schemas (in
-which the reader reads them) of other types than those the reader derives from
-the files themselves: such schemas may constrain their values (e.g. fixed-size
-lists for lists of any length), which the reader only checks as it decodes
-them. And so may the scans of columns of types that the reader may fail to
-decode, whatever the files: dictionaries (whose keys the values of a column
-chunk may overflow, e.g. more than 128 values for `Int8` keys), strings,
-binaries, lists and maps with 32-bit offsets (which the values of a batch may
-overflow) and fixed-size lists (whose lengths the reader checks). The scans of
-CSV files may fail to parse any of their values.
+When it decides whether a TopK or a hash join with a dynamic filter runs
+natively, the planner treats reading and decoding a scan of Parquet files as
+unable to fail, and judges only the expressions of the scan: its pushed-down
+predicate and its projection (see `source_may_fail`). The errors of reading or
+decoding the rows that the dynamic filter of only one of the engines skips
+(e.g. of a custom `ParquetFileReaderFactory`, of a corrupt file, of INT96
+timestamps that overflow the unit of the table, or of dictionary keys that
+overflow their type) are out of the scope of error parity: see §6 of
+[Error parity](error-parity.md). The planner never identifies reader factories
+or schema providers by their `Debug` text. The scans of CSV files may fail to
+parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
