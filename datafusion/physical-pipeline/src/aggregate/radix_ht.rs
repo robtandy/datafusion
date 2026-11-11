@@ -4256,6 +4256,314 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn minima_and_maxima_of_values_without_a_total_order_are_aggregated_in_order()
+    -> Result<()> {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+
+        use crate::operator::PhysicalOperator;
+        // The review of 786024a6a: DataFusion's `min` and `max` of structs
+        // compare them field by field, skipping NULLs, so that `{a: NULL}` is
+        // equal to `{a: 1}`, and the first of them stays the minimum and the
+        // maximum (see `compares_totally`). One partition of 8,192 rows of a
+        // single group, `a = NULL` in the first 2,048 rows and `a = 1` after:
+        // DataFusion's minimum and maximum are `{a: NULL}`, the native ones on
+        // 4 and 16 threads were `{a: 1}` (of a thread of the last rows), 20 of
+        // 20 times. Such aggregates do not split exactly: a single partition is
+        // aggregated in order, in a single state per group.
+        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Struct(fields.clone()), true),
+        ]));
+        let a = Int64Array::from_iter((0..8_192).map(|i| (i >= 2_048).then_some(1)));
+        let v = StructArray::new(fields, vec![Arc::new(a) as ArrayRef], None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1; 8_192])), Arc::new(v)],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false);
+                if trusted {
+                    config = trusting(config);
+                }
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                for (sql, in_order) in [
+                    ("SELECT k, MIN(v) FROM t GROUP BY k", true),
+                    ("SELECT k, MAX(v) FROM t GROUP BY k", true),
+                    ("SELECT MIN(v), MAX(v) FROM t", true),
+                    // Of values that DataFusion compares by a total order.
+                    ("SELECT k, MIN(k), MAX(k) FROM t GROUP BY k", false),
+                ] {
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let plan = aggregation(&plan).expect("an aggregation");
+                    let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
+                        .unwrap_or_else(|| panic!("not lowered: {sql}"));
+                    assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
+                    for _ in 0..5 {
+                        assert_aggregate_parity_with_setup(sql, config.clone(), &setup)
+                            .await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn values_that_may_not_fit_32_bit_offsets_are_aggregated_like_datafusion()
+    -> Result<()> {
+        use std::fmt::Write;
+
+        use datafusion::prelude::CsvReadOptions;
+        use datafusion_physical_plan::ExecutionPlanProperties;
+
+        use crate::operator::PhysicalOperator;
+        // The review of 786024a6a: DataFusion materializes the values (and the
+        // states) of all groups of a stage at once, into arrays whose 32-bit
+        // offsets may overflow, the native operator those of every radix
+        // partition on their own (see `materializes_safely`, and
+        // `huge_values_of_groups_fail_to_be_materialized_like_datafusion`).
+        // Aggregations whose values may not fit are aggregated like those of
+        // aggregates that do not split exactly: in order, a single state per
+        // group, over a single partition (which DataFusion's accumulators
+        // materialize at once), and by DataFusion otherwise. The values that
+        // are bounded by the bytes of columns of a `MemTable` (also through
+        // `upper` and structs of them) or by its rows stay as they are.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = |offset: i64| -> Result<RecordBatch> {
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..1_000).map(|i| offset + i % 100),
+                    )),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..1_000).map(|i| format!("s{}", (offset + i) % 37)),
+                    )),
+                ],
+            )?)
+        };
+        for partitions in [1, 4] {
+            let table = (0..partitions)
+                .map(|p| Ok(vec![batch(p * 1_000)?]))
+                .collect::<Result<Vec<_>>>()?;
+            let setup = mem_table_setup(Arc::clone(&schema), table);
+            // (In a single stage over one partition, which DataFusion's
+            // partial aggregation of two would skip, see `try_lower`.)
+            let config = test_session_config()
+                .with_target_partitions(4)
+                .with_repartition_aggregations(false);
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            // Whether the native operator aggregates them over one partition
+            // (`Some`, in order if `Some(true)`), and over four.
+            const NATIVE: (Option<bool>, bool) = (Some(false), true);
+            const UNBOUNDED: (Option<bool>, bool) = (Some(true), false);
+            for (sql, (one, four)) in [
+                ("SELECT k, MIN(s), MAX(s) FROM t GROUP BY k", NATIVE),
+                (
+                    "SELECT k, ARRAY_AGG(s ORDER BY s) FROM t GROUP BY k",
+                    NATIVE,
+                ),
+                ("SELECT k, COUNT(DISTINCT s) FROM t GROUP BY k", NATIVE),
+                ("SELECT k, APPROX_DISTINCT(s) FROM t GROUP BY k", NATIVE),
+                (
+                    "SELECT k, STRING_AGG(s, ',' ORDER BY s) FROM t GROUP BY k",
+                    NATIVE,
+                ),
+                ("SELECT s, COUNT(*) FROM t GROUP BY s", NATIVE),
+                ("SELECT upper(s), COUNT(*) FROM t GROUP BY upper(s)", NATIVE),
+                (
+                    "SELECT named_struct('s', s), COUNT(*) FROM t \
+                     GROUP BY named_struct('s', s)",
+                    NATIVE,
+                ),
+                ("SELECT [k, k], COUNT(*) FROM t GROUP BY [k, k]", NATIVE),
+                // Values that are not bounded: in order, or by DataFusion (as
+                // aggregates that do not split exactly, also of sorted rows).
+                ("SELECT k, MIN(repeat(s, 3)) FROM t GROUP BY k", UNBOUNDED),
+                (
+                    "SELECT repeat(s, 3), COUNT(*) FROM t GROUP BY repeat(s, 3)",
+                    UNBOUNDED,
+                ),
+                (
+                    "SELECT k, STRING_AGG(s || s, ',' ORDER BY s) FROM t GROUP BY k",
+                    (None, false),
+                ),
+            ] {
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let plan = aggregation(&plan).expect("an aggregation");
+                let lowered = PhysicalHashAggregate::try_lower(&plan, lower)?;
+                if partitions == 1 {
+                    // (Its sink may be serial for other reasons too: e.g. its
+                    // keys may fail, see `AggregateSpec::evaluates_in_order`.)
+                    assert_eq!(lowered.is_some(), one.is_some(), "{sql}");
+                    if let (Some(lowered), Some(true)) = (&lowered, one) {
+                        assert!(!lowered.parallel_sink(), "{sql}");
+                    }
+                } else {
+                    assert_eq!(lowered.is_some(), four, "{sql}");
+                }
+                if lowered.is_some() {
+                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+                }
+            }
+        }
+        // The strings of uncompressed CSV files, of at most their bytes (see
+        // `max_column_bytes`), of two files (partitions).
+        let dir = tempfile::tempdir()?;
+        for file in 0..2 {
+            let mut rows = String::from("k,s\n");
+            for i in 0..1_000 {
+                writeln!(rows, "{i},s{}", (file * 1_000 + i) % 37).expect("a string");
+            }
+            std::fs::write(dir.path().join(format!("part-{file}.csv")), rows)?;
+        }
+        let path = dir.path().to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_csv("c", &path, CsvReadOptions::new()).await
+        };
+        let config = test_session_config().with_target_partitions(4);
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let sql = "SELECT s, COUNT(*), MIN(s), MAX(s) FROM c GROUP BY s";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let plan = aggregation(&plan).expect("an aggregation");
+        assert!(plan.children()[0].output_partitioning().partition_count() > 1);
+        assert!(
+            PhysicalHashAggregate::try_lower(&plan, lower)?.is_some(),
+            "{sql}"
+        );
+        assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "allocates more than 8 GiB"]
+    async fn huge_values_of_groups_fail_to_be_materialized_like_datafusion() -> Result<()>
+    {
+        use std::panic::AssertUnwindSafe;
+
+        use arrow::array::{StringArray, StructArray};
+        use arrow::datatypes::Fields;
+        use futures::FutureExt;
+
+        use super::super::test_support::{
+            assert_aggregate_fails_like_datafusion_with_setup,
+            assert_lowered_fails_like_datafusion_with_setup,
+        };
+        // The review of 786024a6a: 40,960 groups (of distinct keys) of a string
+        // of 55,000 bytes, in one partition: 2,252,800,000 bytes, more than an
+        // array of `Utf8` (of 32-bit offsets) holds. DataFusion materializes the
+        // values of all groups of a stage at once, and fails, the native
+        // operator materialized those of every radix partition on their own,
+        // and succeeded. Its aggregations of a single partition now aggregate
+        // them in a single table, which they materialize at once, by
+        // DataFusion's accumulators (see `materializes_safely`).
+        let fields = Fields::from(vec![Field::new("s", DataType::Utf8, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+            Field::new("v", DataType::Struct(fields.clone()), true),
+        ]));
+        let value = "x".repeat(55_000);
+        let batches = (0..20)
+            .map(|b| {
+                let s: ArrayRef =
+                    Arc::new(StringArray::from(vec![value.as_str(); 2_048]));
+                let v = StructArray::new(fields.clone(), vec![Arc::clone(&s)], None);
+                let k = Int64Array::from_iter_values((0..2_048).map(|i| b * 2_048 + i));
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(k), s, Arc::new(v)],
+                )?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
+        let session = |target_partitions, trusted| {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            if trusted { trusting(config) } else { config }
+        };
+        // The review's aggregation, also of several partitions (left to
+        // DataFusion, whose final aggregation of a single partition fails),
+        // and aggregates that split exactly.
+        let struct_min = "SELECT k, MIN(v) FROM t GROUP BY k";
+        let overflow =
+            "struct column 0 (\"s\") failed: Invalid argument error: offset overflow";
+        for config in [session(1, false), session(1, true)] {
+            assert_aggregate_fails_like_datafusion_with_setup(
+                struct_min, config, &setup, overflow,
+            )
+            .await;
+        }
+        let several = session(4, false).with_repartition_aggregations(false);
+        let lowered = assert_lowered_fails_like_datafusion_with_setup(
+            struct_min,
+            several.clone(),
+            &setup,
+            overflow,
+        )
+        .await;
+        assert_eq!(lowered, 0);
+        assert_eq!(planned_aggregations(struct_min, &several, &setup).await?, 0);
+        let config = session(1, false);
+        // (Which DataFusion aggregates by `k` and `s` first.)
+        assert_aggregate_fails_like_datafusion_with_setup(
+            "SELECT k, COUNT(DISTINCT s) FROM t GROUP BY k",
+            config.clone(),
+            &setup,
+            "offset overflow, buffer size > 2147483647",
+        )
+        .await;
+        // (Ordered, of sorted rows: left to DataFusion, as inexact aggregates.)
+        let array_agg = "SELECT k, ARRAY_AGG(s ORDER BY s) FROM t GROUP BY k";
+        let lowered = assert_lowered_fails_like_datafusion_with_setup(
+            array_agg,
+            config.clone(),
+            &setup,
+            "Offset overflow error: 2147530000",
+        )
+        .await;
+        assert_eq!(lowered, 0);
+        assert_eq!(planned_aggregations(array_agg, &config, &setup).await?, 0);
+        // DataFusion's `StringBuilder`s panic, and so do the native operator's,
+        // of DataFusion's accumulators.
+        for sql in [
+            "SELECT k, MIN(s) FROM t GROUP BY k",
+            "SELECT k, FIRST_VALUE(s ORDER BY s) FROM t GROUP BY k",
+        ] {
+            for ctx in [
+                datafusion_context(config.clone()),
+                crate::test_utils::pipeline_context(config.clone()),
+            ] {
+                setup(&ctx).await?;
+                let result =
+                    AssertUnwindSafe(async { ctx.sql(sql).await?.collect().await })
+                        .catch_unwind()
+                        .await;
+                let Err(panic) = result else {
+                    panic!("{sql} did not panic");
+                };
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied());
+                assert_eq!(message, Some("byte array offset overflow"), "{sql}");
+            }
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations that the planner plans for `sql`, and
     /// of those of them that read their input through a bridge.
     async fn planned_aggregations_over_bridges<F>(

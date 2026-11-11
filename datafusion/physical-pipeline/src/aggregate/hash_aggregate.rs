@@ -6,6 +6,7 @@
 //! `AggregateExec`s, see the [module documentation](super).
 
 use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
@@ -33,7 +34,9 @@ use datafusion_functions_aggregate::{
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
 use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr::{
+    LexOrdering, PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
+};
 use datafusion_physical_expr_common::utils::scatter;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy,
@@ -743,11 +746,19 @@ impl PhysicalHashAggregate {
         // before it aggregates any row, natively as in DataFusion, as one of its
         // accumulators cannot be created when the streams are (see
         // `fails_when_created`, e.g. of a percentile out of range).
-        let exact = aggregates().all(|aggregate| {
-            splits_exactly(aggregate, raw.input(), &max_rows)
-                || !aggregate.order_bys().is_empty()
-        }) || aggregates()
-            .any(|aggregate| fails_when_created(aggregate, grouped));
+        //
+        // So that the native operator fails where DataFusion fails to
+        // materialize their values (see `materializes_safely`), it aggregates
+        // the values that may not fit into arrays with 32-bit offsets as
+        // DataFusion does, as those of aggregates that do not split exactly.
+        let sets = raw.group_expr().groups().len();
+        let exact = keys_materialize_safely(raw)
+            && aggregates().all(|aggregate| {
+                (splits_exactly(aggregate, raw.input(), &max_rows)
+                    || !aggregate.order_bys().is_empty())
+                    && materializes_safely(aggregate, sets, raw.input(), &max_rows)
+            })
+            || aggregates().any(|aggregate| fails_when_created(aggregate, grouped));
         if !exact && !single_partition {
             return Ok(None);
         }
@@ -915,11 +926,16 @@ impl PhysicalHashAggregate {
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
         let bound = std::cell::OnceCell::new();
         let max_rows = || *bound.get_or_init(|| max_rows(raw.input()));
-        let splits_exactly = update
-            .iter()
-            .map(|update| update.expr.as_ref())
-            .chain(merge.iter().map(Arc::as_ref))
-            .all(|aggregate| splits_exactly(aggregate, raw.input(), &max_rows));
+        let sets = raw.group_expr().groups().len();
+        let splits_exactly = keys_materialize_safely(raw)
+            && update
+                .iter()
+                .map(|update| update.expr.as_ref())
+                .chain(merge.iter().map(Arc::as_ref))
+                .all(|aggregate| {
+                    splits_exactly(aggregate, raw.input(), &max_rows)
+                        && materializes_safely(aggregate, sets, raw.input(), &max_rows)
+                });
         let input_partitions = raw.input().output_partitioning().partition_count();
         let evaluates_in_order =
             input_partitions == 1 && own_parts(raw) + pipeline_parts(&input) > 0;
@@ -1689,15 +1705,29 @@ fn test_operator_parts(_operator: &Arc<dyn PhysicalOperator>) -> usize {
 
 /// An upper bound of the number of rows of `plan`, from DataFusion's
 /// statistics: its number of rows if it is exact (e.g. of a `MemTable`, or of
-/// the metadata of Parquet files), or that of the input of a node that
-/// produces at most the rows of its input (a filter, a projection, a sort, a
-/// limit, or a node that coalesces or repartitions its partitions).
+/// the metadata of Parquet files), that of the input of a node that produces
+/// at most the rows of its input (a filter, a projection, a sort, a limit, or
+/// a node that coalesces or repartitions its partitions), or, of a join, a row
+/// for every pair of rows of its inputs and every row of either.
 fn max_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+    use datafusion_physical_plan::joins::{
+        CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
+        SymmetricHashJoinExec,
+    };
     if let Ok(statistics) =
         StatisticsContext::new().compute_arc(plan, &StatisticsArgs::new())
         && let Precision::Exact(rows) = statistics.num_rows
     {
         return Some(rows);
+    }
+    let join = plan.is::<HashJoinExec>()
+        || plan.is::<CrossJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
+        || plan.is::<SortMergeJoinExec>()
+        || plan.is::<SymmetricHashJoinExec>();
+    if join && let [left, right] = plan.children().as_slice() {
+        let pairs = |rows: usize| rows.checked_add(1);
+        return pairs(max_rows(left)?)?.checked_mul(pairs(max_rows(right)?)?);
     }
     let at_most_its_input = plan.is::<FilterExec>()
         || plan.is::<ProjectionExec>()
@@ -1802,7 +1832,8 @@ fn implementation_type(udaf: &AggregateUDF) -> TypeId {
 /// Whether the value of `aggregate` (of the rows of `input`) is the same
 /// however the rows of a group are split into partial states, which
 /// are merged in any order: whether it is DataFusion's built-in (see
-/// [`BUILTIN_AGGREGATES`], by its implementation type) `count`, `min`, `max`,
+/// [`BUILTIN_AGGREGATES`], by its implementation type) `count`, `min`, `max`
+/// (of values that it compares by a total order, see [`compares_totally`]),
 /// `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`, `approx_distinct`
 /// or `median`, which count, compare (floating point values by their total
 /// order), combine the bits of, sketch or collect the values of their rows,
@@ -1826,13 +1857,318 @@ fn splits_exactly(
         return false;
     };
     match name {
-        "count" | "min" | "max" | "bit_and" | "bit_or" | "bit_xor" | "bool_and"
-        | "bool_or" | "approx_distinct" | "median" => true,
+        "min" | "max" => aggregate.expressions().iter().all(|argument| {
+            match argument.data_type(&input.schema()) {
+                Ok(data_type) => compares_totally(&data_type),
+                Err(_) => false,
+            }
+        }),
+        "count" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
+        | "approx_distinct" | "median" => true,
         "sum" | "avg" => adds_up_exactly(aggregate, input, max_rows),
         "array_agg" | "first_value" | "last_value" | "nth_value" => {
             orders_its_arguments(aggregate)
         }
         _ => false,
+    }
+}
+
+/// Whether DataFusion cannot fail to materialize the values of `aggregate`, or
+/// its states, for all groups of a stage at once (of `sets` grouping sets, of
+/// the rows of `input`, of at most `max_rows()` rows, if known), as it does
+/// when its stage ends: into arrays whose 32-bit offsets cannot overflow (see
+/// [`may_overflow_offsets`]). The native operator materializes the groups of
+/// every radix partition on their own. E.g. 40,960 groups of a string of
+/// 55,000 bytes do not fit into an array of `Utf8`: DataFusion's `min` of
+/// structs of them fails with an invalid argument (its `min` of the strings
+/// panics), its ordered `array_agg` with an offset overflow.
+fn materializes_safely(
+    aggregate: &AggregateFunctionExpr,
+    sets: usize,
+    input: &Arc<dyn ExecutionPlan>,
+    max_rows: &dyn Fn() -> Option<usize>,
+) -> bool {
+    let fits = |bound: Option<usize>| {
+        bound
+            .is_some_and(|bound| i32::try_from(bound.saturating_mul(sets.max(1))).is_ok())
+    };
+    // The built-in aggregates collect at most a value of every input row of a
+    // group into their lists (e.g. `array_agg`, or the states of `median` and
+    // of a `count` of distinct values).
+    let elements_fit = |_: &DataType| fits(max_rows());
+    let max_bytes = || -> Option<usize> {
+        match builtin_name(aggregate.fun())? {
+            // Values of their arguments (and of their order), of at most
+            // the bytes of their columns.
+            "min" | "max" | "first_value" | "last_value" | "nth_value" | "array_agg"
+            | "count" => max_values_bytes(aggregate, input, max_rows),
+            // A sketch of a group, of at most `NUM_REGISTERS` (16,384) bytes,
+            // for every row at most.
+            "approx_distinct" => max_rows()?.checked_mul(16_384),
+            // The values of its input, and a separator after every value.
+            "string_agg" => {
+                let arguments = aggregate.expressions();
+                let separator = arguments.get(1)?.downcast_ref::<Literal>()?;
+                let separator = match separator.value() {
+                    ScalarValue::Utf8(separator)
+                    | ScalarValue::LargeUtf8(separator)
+                    | ScalarValue::Utf8View(separator) => {
+                        separator.as_ref().map_or(0, String::len)
+                    }
+                    _ => return None,
+                };
+                max_values_bytes(aggregate, input, max_rows)?
+                    .checked_add(max_rows()?.checked_mul(separator)?)
+            }
+            _ => None,
+        }
+    };
+    let bytes = std::cell::OnceCell::new();
+    let bytes_fit = || *bytes.get_or_init(|| fits(max_bytes()));
+    let Ok(states) = aggregate.state_fields() else {
+        return false;
+    };
+    std::iter::once(aggregate.field())
+        .chain(states)
+        .all(|field| !may_overflow_offsets(field.data_type(), &elements_fit, &bytes_fit))
+}
+
+/// Whether DataFusion cannot fail to store or materialize the group keys of
+/// `raw` for all groups of a stage at once (see [`materializes_safely`]): its
+/// group values keep the bytes of the keys with 32-bit offsets in a buffer
+/// that fails to grow beyond them (e.g. the groups of a `count` of distinct
+/// strings, which it aggregates by their strings first). The keys keep at
+/// most the bytes of their values (see [`max_expr_bytes`]), for every grouping
+/// set, and at most an element of lists for every byte (but of booleans and
+/// nulls), or of an array of the values of a row (`make_array`), one for
+/// every value.
+fn keys_materialize_safely(raw: &AggregateExec) -> bool {
+    let schema = raw.input().schema();
+    let sets = raw.group_expr().groups().len().max(1);
+    raw.group_expr().expr().iter().all(|(expr, _)| {
+        let Ok(data_type) = expr.data_type(&schema) else {
+            return false;
+        };
+        if !may_overflow_offsets(&data_type, &|_| false, &|| false) {
+            return true;
+        }
+        let fits = |bound: Option<usize>| {
+            bound.is_some_and(|bound| i32::try_from(bound.saturating_mul(sets)).is_ok())
+        };
+        // An array of the values of a row (e.g. `[a, b]`), without offsets:
+        // as many elements for every row.
+        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
+            && function.name() == "make_array"
+            && function.args().iter().all(|argument| {
+                argument.data_type(&schema).is_ok_and(|data_type| {
+                    !may_overflow_offsets(&data_type, &|_| false, &|| false)
+                })
+            })
+        {
+            return fits(
+                max_rows(raw.input())
+                    .and_then(|rows| rows.checked_mul(function.args().len())),
+            );
+        }
+        let bytes_fit =
+            fits(max_expr_bytes(expr, raw.input(), &|| max_rows(raw.input())));
+        let elements_fit = |element: &DataType| {
+            !matches!(element, DataType::Boolean | DataType::Null) && bytes_fit
+        };
+        !may_overflow_offsets(&data_type, &elements_fit, &|| bytes_fit)
+    })
+}
+
+/// An upper bound of the bytes of the values of the arguments of `aggregate`
+/// and of its order (over the rows of `input`), of those with 32-bit offsets
+/// (see [`max_expr_bytes`]).
+fn max_values_bytes(
+    aggregate: &AggregateFunctionExpr,
+    input: &Arc<dyn ExecutionPlan>,
+    max_rows: &dyn Fn() -> Option<usize>,
+) -> Option<usize> {
+    let schema = input.schema();
+    let order = aggregate.order_bys().iter().map(|sort| &sort.expr);
+    let mut bytes = 0_usize;
+    for expr in aggregate.expressions().iter().chain(order) {
+        if !may_overflow_offsets(&expr.data_type(&schema).ok()?, &|_| false, &|| false) {
+            continue;
+        }
+        bytes = bytes.checked_add(max_expr_bytes(expr, input, max_rows)?)?;
+    }
+    Some(bytes)
+}
+
+/// An upper bound of the bytes of the values of `expr` over the rows of
+/// `plan` (of at most `max_rows()` rows, if known): of those of the column of
+/// `plan` that it is (see [`max_column_bytes`]), of a literal for every row,
+/// three times those of the argument of `upper` or `lower` (whose case
+/// mapping turns a character into at most three, e.g. the two bytes of `ΐ`
+/// into the six of `Ϊ́`), or those of the values of the fields of a struct.
+/// The values of other expressions are not bounded (e.g. `repeat(s, 1000)`).
+fn max_expr_bytes(
+    expr: &Arc<dyn PhysicalExpr>,
+    plan: &Arc<dyn ExecutionPlan>,
+    max_rows: &dyn Fn() -> Option<usize>,
+) -> Option<usize> {
+    if let Some(column) = expr.downcast_ref::<Column>() {
+        return max_column_bytes(plan, column.index());
+    }
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
+        let bytes = match literal.value() {
+            ScalarValue::Utf8(value)
+            | ScalarValue::LargeUtf8(value)
+            | ScalarValue::Utf8View(value) => value.as_ref().map_or(0, String::len),
+            ScalarValue::Binary(value)
+            | ScalarValue::LargeBinary(value)
+            | ScalarValue::BinaryView(value) => value.as_ref().map_or(0, Vec::len),
+            _ => return None,
+        };
+        return max_rows()?.checked_mul(bytes);
+    }
+    let function = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    // The values of the fields of a struct, of those with 32-bit offsets.
+    let fields = |values: Vec<&Arc<dyn PhysicalExpr>>| {
+        let schema = plan.schema();
+        values.into_iter().try_fold(0_usize, |bytes, value| {
+            let data_type = value.data_type(&schema).ok()?;
+            if !may_overflow_offsets(&data_type, &|_| false, &|| false) {
+                return Some(bytes);
+            }
+            bytes.checked_add(max_expr_bytes(value, plan, max_rows)?)
+        })
+    };
+    match (function.name(), function.args()) {
+        ("upper" | "lower", [argument]) => {
+            max_expr_bytes(argument, plan, max_rows)?.checked_mul(3)
+        }
+        ("named_struct", arguments) => {
+            fields(arguments.iter().skip(1).step_by(2).collect())
+        }
+        ("struct", arguments) => fields(arguments.iter().collect()),
+        _ => None,
+    }
+}
+
+/// Whether the 32-bit offsets of an array of `data_type` (of the values of all
+/// groups of a stage) may overflow: those of strings and binaries, which
+/// count the bytes of their values, unless `bytes_fit()`, and those of lists
+/// and maps, which count their elements, unless `elements_fit(element type)`
+/// (at the top: the elements of nested lists, or of large lists, are not
+/// bounded).
+fn may_overflow_offsets(
+    data_type: &DataType,
+    elements_fit: &dyn Fn(&DataType) -> bool,
+    bytes_fit: &dyn Fn() -> bool,
+) -> bool {
+    let nested =
+        |data_type: &DataType| may_overflow_offsets(data_type, &|_| false, bytes_fit);
+    match data_type {
+        DataType::Utf8 | DataType::Binary => !bytes_fit(),
+        DataType::List(field) | DataType::ListView(field) | DataType::Map(field, _) => {
+            nested(field.data_type()) || !elements_fit(field.data_type())
+        }
+        DataType::LargeList(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _) => nested(field.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|field| {
+            may_overflow_offsets(field.data_type(), elements_fit, bytes_fit)
+        }),
+        DataType::Union(fields, _) => fields.iter().any(|(_, field)| {
+            may_overflow_offsets(field.data_type(), elements_fit, bytes_fit)
+        }),
+        DataType::Dictionary(_, values) => nested(values),
+        DataType::RunEndEncoded(_, values) => nested(values.data_type()),
+        _ => false,
+    }
+}
+
+/// An upper bound of the bytes of the column `index` of `plan`, from
+/// DataFusion's statistics: the size of all its columns if it is exact (e.g.
+/// the memory of the arrays of a `MemTable`, at least their bytes), the size
+/// of the files of an uncompressed CSV scan, or that of
+/// the column of the input that the column is of a node that passes the
+/// values of its input on (a filter, a projection, a sort, a limit, a node
+/// that coalesces or repartitions its partitions, or the group keys of an
+/// aggregation).
+fn max_column_bytes(plan: &Arc<dyn ExecutionPlan>, index: usize) -> Option<usize> {
+    use datafusion_datasource::file_groups::FileGroup;
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::source::DataSourceExec;
+    use datafusion_datasource_csv::source::CsvSource;
+    if let Ok(statistics) =
+        StatisticsContext::new().compute_arc(plan, &StatisticsArgs::new())
+        && let Precision::Exact(bytes) = statistics.total_byte_size
+    {
+        return Some(bytes);
+    }
+    // The values of uncompressed CSV files, which are at most their bytes (of
+    // every file once: a range of a file reads on to the end of its line).
+    if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+        && config.file_source().is::<CsvSource>()
+        && !config.file_compression_type.is_compressed()
+    {
+        let files = config
+            .file_groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| (&file.object_meta.location, file.object_meta.size))
+            .collect::<HashMap<_, _>>();
+        let bytes = files
+            .values()
+            .try_fold(0_u64, |bytes, size| bytes.checked_add(*size))?;
+        return usize::try_from(bytes).ok();
+    }
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let column = projection
+            .expr()
+            .get(index)?
+            .expr
+            .downcast_ref::<Column>()?;
+        return max_column_bytes(projection.input(), column.index());
+    }
+    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+        let index = match filter.projection() {
+            Some(projection) => *projection.get(index)?,
+            None => index,
+        };
+        return max_column_bytes(filter.input(), index);
+    }
+    // The distinct keys of a single grouping set, of a column (e.g. of the
+    // groups of a `count` of distinct values, which DataFusion aggregates by
+    // its values first).
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && aggregate.group_expr().is_single()
+    {
+        let (key, _) = aggregate.group_expr().expr().get(index)?;
+        let column = key.downcast_ref::<Column>()?;
+        return max_column_bytes(aggregate.input(), column.index());
+    }
+    let passes_its_input_on = plan.is::<RepartitionExec>()
+        || plan.is::<CoalescePartitionsExec>()
+        || plan.is::<SortExec>()
+        || plan.is::<SortPreservingMergeExec>()
+        || plan.is::<GlobalLimitExec>()
+        || plan.is::<LocalLimitExec>();
+    match plan.children().as_slice() {
+        [input] if passes_its_input_on => max_column_bytes(input, index),
+        _ => None,
+    }
+}
+
+/// Whether DataFusion's `min` and `max` compare the values of `data_type` by a
+/// total order, so that they keep the same value whatever the order of the
+/// rows: values that are not nested (floating point values by their total
+/// order), and dictionaries of them. Nested values are compared field by
+/// field, or element by element, skipping NULLs: e.g. `{a: NULL}` compares
+/// equal to `{a: 1}` and to `{a: 2}`, so that the first of them in the order
+/// of the rows (or of the partial states) stays the minimum.
+fn compares_totally(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, values) => compares_totally(values),
+        DataType::RunEndEncoded(_, _) => false,
+        data_type => !data_type.is_nested(),
     }
 }
 
@@ -3014,7 +3350,12 @@ mod tests {
                 "SELECT a + 1 AS x FROM t1 WHERE b > 0 ORDER BY x",
                 Some(5_000),
             ),
-            ("SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.k", None),
+            // At most a row for every pair of rows of `t1` (5,000) and `t2`
+            // (150), and every row of either.
+            (
+                "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.k",
+                Some(5_001 * 151),
+            ),
             ("SELECT a FROM t1 GROUP BY a", None),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;

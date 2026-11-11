@@ -1169,7 +1169,9 @@ mod tests {
                 config = config.set_str(key, value);
             }
             for sql in [
-                "SELECT t1.a, COUNT(*), SUM(t2.w), MIN(t1.d) FROM t1 JOIN t2 ON t1.a = t2.k \
+                // (Of strings of views: those of `Utf8`, `d`, may not fit an
+                // array once a join repeats them, see `materializes_safely`.)
+                "SELECT t1.a, COUNT(*), SUM(t2.w), MIN(t1.h) FROM t1 JOIN t2 ON t1.a = t2.k \
                  GROUP BY t1.a",
                 "SELECT d, e, COUNT(*), SUM(a), AVG(g) FROM t1 GROUP BY d, e",
                 "SELECT id % 100 AS k, COUNT(*), MEDIAN(a) FROM t1 GROUP BY id % 100",
