@@ -6,6 +6,24 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 
 # Agent Guidelines for Apache DataFusion
 
+## Work on `datafusion/physical-pipeline` (branch `datafusion/new_ex`)
+
+For changes to the `datafusion-physical-pipeline` crate, this section replaces "Before Committing" and "Testing" below. Nothing else in the workspace depends on that crate.
+
+- **Run package-level checks only:**
+
+  ```bash
+  export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+  cargo fmt --all -- --check
+  timeout 900 cargo clippy -p datafusion-physical-pipeline --all-targets -- -D warnings
+  timeout 900 cargo test -p datafusion-physical-pipeline
+  ```
+
+- **While iterating,** filter the tests (for example `cargo test -p datafusion-physical-pipeline --lib join::`) and only `tail` their output.
+- **If a change also touches another crate,** also run that crate's clippy and tests (`-p <crate>`).
+- **Doc-only changes** need only `cargo fmt --all -- --check` and, for Markdown, `./ci/scripts/doc_prettier_check.sh`.
+- **Don't run** workspace-wide clippy, `./dev/rust_lint.sh` or the extended workspace test suite for these changes. A separate job runs the full checks on `datafusion/new_ex` after merges, and files an issue if anything breaks.
+
 ## Developer Documentation
 
 - [Quick Start Setup](docs/source/contributor-guide/development_environment.md#quick-start)
