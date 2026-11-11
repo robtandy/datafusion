@@ -20,9 +20,7 @@ use arrow::compute::{
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::config::{
-    ConfigEntry, ConfigExtension, ConfigOptions, ExtensionOptions,
-};
+use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::{Result, ScalarValue, config_err, internal_err};
 use datafusion_expr::AggregateUDF;
 use datafusion_functions_aggregate::{
@@ -47,14 +45,13 @@ use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
 };
-use crate::operators::adaptive_filter::is_infallible;
 
 /// A hash aggregation: a pipeline breaker that consumes the rows of its input
 /// in parallel and produces one row per group (DuckDB's
 /// `PhysicalHashAggregate`).
 ///
-/// It computes exactly what DataFusion computes with a single
-/// `AggregateExec` (`Single` / `SinglePartitioned`) or with the two-stage
+/// It computes what DataFusion computes with a single `AggregateExec`
+/// (`Single` / `SinglePartitioned`) or with the two-stage
 /// `AggregateExec(Partial) -> RepartitionExec(Hash) / CoalescePartitionsExec
 /// -> AggregateExec(Final / FinalPartitioned)` chain, using the expressions,
 /// accumulators and schema of these nodes, without shuffling the partial
@@ -97,11 +94,14 @@ pub(crate) struct AggregateSpec {
     /// The limit of a top-k aggregation: only the groups that the sort above
     /// it may keep are produced.
     pub(crate) top_k: Option<TopK>,
-    /// Whether the input rows of a thread whose groups hardly repeat may
-    /// bypass its thread-local table, and be aggregated by the final
-    /// aggregation of their radix partitions directly (see
-    /// [`rows_can_bypass_tables`]), if the session trusts the accumulators of
-    /// all aggregates (see [`Self::rows_bypass_tables`]).
+    /// The soft limit of an aggregation without aggregates (DataFusion's
+    /// `lim=[n]` without an order, of `SELECT DISTINCT ... LIMIT n`): the
+    /// limit above it returns any `n` of its groups, so a thread stops
+    /// consuming its input once its table holds `n` groups.
+    pub(crate) soft_limit: Option<usize>,
+    /// Whether the input rows of a thread whose groups hardly repeat bypass
+    /// its thread-local table, and are aggregated by the final aggregation of
+    /// their radix partitions directly (see [`rows_can_bypass_tables`]).
     pub(crate) bypass: bool,
 }
 
@@ -111,101 +111,123 @@ impl AggregateSpec {
     pub(crate) fn is_ungrouped(&self) -> bool {
         self.group_by.is_true_no_grouping()
     }
-
-    /// Whether the input rows of a thread whose groups hardly repeat bypass
-    /// its thread-local table in an execution with the configuration
-    /// `options`: if they may (see [`Self::bypass`]), and the aggregation has
-    /// no aggregates, or the session trusts the accumulators of all of them
-    /// (see [`TrustedAggregateFunctions`]).
-    pub(crate) fn rows_bypass_tables(&self, options: &ConfigOptions) -> bool {
-        if !self.bypass {
-            return false;
-        }
-        if self.update.is_empty() && self.merge.is_empty() {
-            return true;
-        }
-        options
-            .extensions
-            .get::<TrustedAggregateFunctions>()
-            .is_some_and(|trusted| {
-                self.update
-                    .iter()
-                    .all(|update| trusted.trusts(&update.expr))
-                    && self.merge.iter().all(|merge| trusted.trusts(merge))
-            })
-    }
 }
 
-/// The limit of a top-k aggregation by its group key, which DataFusion's
-/// `TopKAggregation` rule sets on the stages of an aggregation without
-/// aggregates (`lim=[n]`, DataFusion's `TopKDistinct`, e.g. `SELECT DISTINCT
-/// k FROM t ORDER BY k LIMIT 10`) below a sort with a fetch of `limit` rows
-/// whose only sort key is its only group key.
+/// The limit of a *top-k aggregation*, which DataFusion's `TopKAggregation`
+/// rule sets on the stages of an aggregation of a single group key below a
+/// sort with a fetch of `limit` rows (`lim=[n]` with an order), by its only
+/// sort key:
 ///
-/// The sort keeps the first `limit` groups by their key, so the aggregation
-/// only produces the groups that can be among them, exactly like DataFusion's
-/// `GroupedTopKAggregateStream` of a single partition: the `limit` groups of
-/// the best non-null keys, and the group of the `NULL` key, which DataFusion
-/// keeps whatever the order of the `NULL`s. Distinct groups have distinct
-/// keys, so these groups do not depend on the order of the rows. The keys are
-/// compared as the sort compares them, as DataFusion's top-k aggregation does
-/// for the types of [`orders_like_datafusion`]. So the operators between the
-/// aggregation and the sort above it see exactly the groups they see in
-/// DataFusion, also the operators that see all of them (e.g. a window
-/// `COUNT(*) OVER ()`: DataFusion's `TopKAggregation` rule passes the limit
-/// through the operators that keep the number of rows, windows included).
+/// * the group key of an aggregation without aggregates (DataFusion's
+///   `TopKDistinct`, e.g. `SELECT DISTINCT k FROM t ORDER BY k LIMIT 10`), see
+///   [`TopKOrder::Key`];
+/// * its only aggregate, a `MIN` ascending or a `MAX` descending (DataFusion's
+///   `TopKMinMax`, e.g. `SELECT k, MAX(v) FROM t GROUP BY k ORDER BY MAX(v)
+///   DESC LIMIT 10`), see [`TopKOrder::Aggregate`].
 ///
-/// DataFusion's top-k aggregations by a `MIN` or `MAX` (`TopKMinMax`) are
-/// left to it: the values of distinct groups may tie, and of the groups that
-/// tie with the worst of its top groups, its heap keeps the one whose row came
-/// last (a new group that ties with its worst group replaces it), which
-/// depends on the order of the rows (and decides, e.g., the groups that a
-/// projection `1000 / (a - 1)` above it is evaluated for).
+/// The sort keeps the `limit` best groups by their *value* (their key, or
+/// their aggregate), so the aggregation only needs to produce groups among
+/// which are those, with their exact values. The value of a group only gets
+/// better as more of its rows come: a key does not change, and the `MIN`
+/// (`MAX`) of more rows is smaller (greater). So:
+///
+/// * of a set of partial states of distinct groups (e.g. the groups of a
+///   flush of a thread-local table), only the states of the `limit` best
+///   values are needed (see [`Self::select`]): every other group is beaten by
+///   `limit` groups, whose final values are at least as good, so that it is
+///   not among the best groups (unless it ties with them);
+/// * once such a set has `limit` values, the rows whose value is worse than
+///   the worst of them, its *cutoff*, cannot make their groups among the best
+///   ones (see [`Self::cutoff`] and [`Self::candidates`]).
+///
+/// The partial state of the best value of a group among the best groups is
+/// never dropped, so its final value is exact. Which of the groups that tie
+/// with the last of them the aggregation produces is its own.
+///
+/// The values are compared as the sort compares them: by Arrow's kernels, in
+/// the order of `descending`, floating point values by their total order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TopK {
     /// The number of groups the sort keeps.
     pub(crate) limit: usize,
-    /// Whether the groups with the greatest keys come first.
+    /// Whether the groups with the greatest values come first.
     pub(crate) descending: bool,
+    /// The value that orders the groups.
+    pub(crate) order: TopKOrder,
+}
+
+/// The value that orders the groups of a top-k aggregation (see [`TopK`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopKOrder {
+    /// The group key. The group of the `NULL` key is always produced: the
+    /// limit does not tell whether the sort puts it first or last.
+    Key,
+    /// The only aggregate, a `MIN` (ascending) or `MAX` (descending) of an
+    /// argument of the type of the aggregate. A group without values (`NULL`)
+    /// comes last: DataFusion's `TopKAggregation` sets such limits with an
+    /// order that puts `NULL` first only for arguments that cannot be `NULL`,
+    /// whose groups always have a value.
+    Aggregate,
 }
 
 impl TopK {
-    /// The rows of `keys`, the keys of a set of distinct groups (one per
+    /// The column of the output of the aggregation that holds the values of
+    /// its groups: its only group column, or the aggregate after it.
+    pub(crate) fn output_column(&self) -> usize {
+        match self.order {
+            TopKOrder::Key => 0,
+            TopKOrder::Aggregate => 1,
+        }
+    }
+
+    /// The options of the sort of the values: the best first, the `NULL`s
+    /// last.
+    fn sort_options(&self) -> SortOptions {
+        SortOptions::new(self.descending, false)
+    }
+
+    /// The rows of `values`, the values of a set of distinct groups (one per
     /// group), whose groups may be among the groups the sort keeps (see
-    /// [`TopK`]): the `limit` best non-null keys, followed by the `NULL` key.
-    /// Returns `None` if these are all rows. A group that is not selected
-    /// (`limit` other groups beat it) is not among the groups the sort keeps.
-    pub(crate) fn select(&self, keys: &dyn Array) -> Result<Option<UInt32Array>> {
-        if keys.len() - keys.null_count() <= self.limit {
+    /// [`TopK`]): the `limit` best non-null values (and, for
+    /// [`TopKOrder::Key`], the group of the `NULL` key, or, for
+    /// [`TopKOrder::Aggregate`], as many groups without values as the best
+    /// values are fewer than `limit`). Returns `None` if these are all rows.
+    pub(crate) fn select(&self, values: &dyn Array) -> Result<Option<UInt32Array>> {
+        let selected = match self.order {
+            TopKOrder::Key => values.len() - values.null_count(),
+            TopKOrder::Aggregate => values.len(),
+        };
+        if selected <= self.limit {
             return Ok(None);
         }
-        // With the nulls last, the first `limit` rows are non-null.
-        let options = SortOptions::new(self.descending, false);
-        let mut indices = sort_to_indices(keys, Some(options), Some(self.limit))?
-            .values()
-            .to_vec();
+        // With the nulls last, the first `limit` rows are the best values,
+        // followed by `NULL`s if there are fewer of them.
+        let best = sort_to_indices(values, Some(self.sort_options()), Some(self.limit))?;
+        if self.order == TopKOrder::Aggregate {
+            return Ok(Some(best));
+        }
+        let mut indices = best.values().to_vec();
         indices.extend(
-            (0..keys.len())
-                .filter(|&row| keys.is_null(row))
+            (0..values.len())
+                .filter(|&row| values.is_null(row))
                 .map(|row| row as u32),
         );
         Ok(Some(UInt32Array::from(indices)))
     }
 
-    /// The *cutoff* of `keys`, the keys of a set of distinct groups (one per
-    /// group): the `limit`-th best of them, if `limit` of them are not
-    /// `NULL`. From then on, at least `limit` groups have a key at least as
-    /// good as the cutoff, so a row whose key is worse cannot be of one of the
-    /// groups the sort keeps (see [`Self::candidates`]).
-    pub(crate) fn cutoff(&self, keys: &dyn Array) -> Result<Option<ArrayRef>> {
-        let valid = keys.len() - keys.null_count();
+    /// The *cutoff* of `values`, the values of a set of distinct groups (one
+    /// per group): the `limit`-th best of them, if `limit` of them are not
+    /// `NULL`. From then on, at least `limit` groups have a value at least as
+    /// good as the cutoff, so a row whose value is worse cannot make its group
+    /// one of the groups the sort keeps (see [`Self::candidates`]).
+    pub(crate) fn cutoff(&self, values: &dyn Array) -> Result<Option<ArrayRef>> {
+        let valid = values.len() - values.null_count();
         if self.limit == 0 || valid < self.limit {
             return Ok(None);
         }
         // With the nulls last, the first `limit` rows are non-null.
-        let options = SortOptions::new(self.descending, false);
-        let best = sort_to_indices(keys, Some(options), Some(self.limit))?;
-        Ok(Some(take(keys, &best.slice(self.limit - 1, 1), None)?))
+        let best = sort_to_indices(values, Some(self.sort_options()), Some(self.limit))?;
+        Ok(Some(take(values, &best.slice(self.limit - 1, 1), None)?))
     }
 
     /// Whether `cutoff` is a better cutoff than `other` (see [`Self::cutoff`]),
@@ -216,28 +238,34 @@ impl TopK {
         cutoff: &dyn Array,
         other: &dyn Array,
     ) -> Result<bool> {
-        let options = SortOptions::new(self.descending, false);
-        Ok(make_comparator(cutoff, other, options)?(0, 0).is_lt())
+        Ok(make_comparator(cutoff, other, self.sort_options())?(0, 0).is_lt())
     }
 
-    /// The rows of `keys`, the group keys of input rows, whose groups may be
-    /// among the groups the sort keeps given the cutoff `cutoff` (see
-    /// [`Self::cutoff`]): the rows whose key is not worse than the cutoff, and
-    /// those whose key is `NULL` (whose group is always kept). Returns `None`
-    /// if these are all rows.
+    /// The rows of `values`, the values of input rows (their group keys, or
+    /// the arguments of the aggregate), that may make their groups among the
+    /// groups the sort keeps given the cutoff `cutoff` (see [`Self::cutoff`]):
+    /// the rows whose value is not worse than the cutoff, and, for
+    /// [`TopKOrder::Key`], the rows of the `NULL` key (whose group is always
+    /// kept). (The `NULL` argument of an aggregate changes no value.) Returns
+    /// `None` if these are all rows.
     pub(crate) fn candidates(
         &self,
-        keys: &ArrayRef,
+        values: &ArrayRef,
         cutoff: &ArrayRef,
     ) -> Result<Option<BooleanArray>> {
         let cutoff = Scalar::new(Arc::clone(cutoff));
         let selected = match self.descending {
-            true => gt_eq(keys, &cutoff)?,
-            false => lt_eq(keys, &cutoff)?,
+            true => gt_eq(values, &cutoff)?,
+            false => lt_eq(values, &cutoff)?,
         };
-        let selected = match selected.nulls() {
-            Some(nulls) => BooleanArray::new(selected.values() | &!nulls.inner(), None),
-            None => selected,
+        let selected = match (self.order, selected.nulls()) {
+            (TopKOrder::Key, Some(nulls)) => {
+                BooleanArray::new(selected.values() | &!nulls.inner(), None)
+            }
+            (TopKOrder::Aggregate, Some(nulls)) => {
+                BooleanArray::new(selected.values() & nulls.inner(), None)
+            }
+            (_, None) => selected,
         };
         Ok((selected.true_count() < selected.len()).then_some(selected))
     }
@@ -246,38 +274,27 @@ impl TopK {
     /// distinct groups, that may be among the groups the sort keeps (see
     /// [`Self::select`]).
     pub(crate) fn select_groups(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        match self.select(batch.column(0).as_ref())? {
+        match self.select(batch.column(self.output_column()).as_ref())? {
             Some(indices) => Ok(take_record_batch(&batch, &indices)?),
             None => Ok(batch),
         }
-    }
-
-    /// The groups of `batch`, the top groups of the aggregation, in the order
-    /// in which DataFusion's top-k aggregation produces them: it drains its
-    /// heap from the best group to the worst, and the group of the `NULL` key
-    /// comes last. The operators between the aggregation and the sort above
-    /// it see the groups in that order, e.g. a projection that fails on
-    /// several of them fails on the first one, whose value its error shows.
-    pub(crate) fn sort_groups(&self, batch: &RecordBatch) -> Result<RecordBatch> {
-        let options = SortOptions::new(self.descending, false);
-        let indices = sort_to_indices(batch.column(0), Some(options), None)?;
-        Ok(take_record_batch(batch, &indices)?)
     }
 
     /// The groups of `left` and `right`, outputs of the aggregation for two
     /// sets of distinct groups (selected by [`Self::select_groups`]), that may
     /// be among the groups the sort keeps: [`Self::select_groups`] of all of
     /// them, without concatenating them. Only the selected groups are
-    /// gathered, which DataFusion's top-k aggregation outputs as well, so
-    /// that their strings fit into an array (of 32-bit offsets) whenever its
-    /// do.
+    /// gathered, so that their strings fit into an array (of 32-bit offsets)
+    /// whenever the selected groups of either side and the groups of the
+    /// result do.
     pub(crate) fn merge_groups(
         &self,
         left: &RecordBatch,
         right: &RecordBatch,
     ) -> Result<RecordBatch> {
-        let (left_values, right_values) = (left.column(0), right.column(0));
-        let options = SortOptions::new(self.descending, false);
+        let column = self.output_column();
+        let (left_values, right_values) = (left.column(column), right.column(column));
+        let options = self.sort_options();
         // The non-null values of either side, the best first.
         let sorted = |values: &ArrayRef| -> Result<Vec<u32>> {
             let valid = values.len() - values.null_count();
@@ -314,11 +331,16 @@ impl TopK {
                 .map(move |row| (side, row))
                 .collect::<Vec<_>>()
         };
-        rows.extend(
-            nulls(0, left_values)
-                .into_iter()
-                .chain(nulls(1, right_values)),
-        );
+        let nulls = nulls(0, left_values)
+            .into_iter()
+            .chain(nulls(1, right_values));
+        match self.order {
+            TopKOrder::Key => rows.extend(nulls),
+            TopKOrder::Aggregate => {
+                let room = self.limit.saturating_sub(rows.len());
+                rows.extend(nulls.take(room));
+            }
+        }
         let columns = left
             .columns()
             .iter()
@@ -550,53 +572,41 @@ impl PhysicalHashAggregate {
     ///   single operator.
     ///
     /// `lower_input` lowers the input of the stage that consumes the input
-    /// rows. Returns `Ok(None)` for any other node, and for the aggregations
-    /// whose result the native operator cannot reproduce exactly, so that
-    /// DataFusion executes them:
+    /// rows. Every such aggregation is lowered, whatever its aggregates
+    /// (user-defined ones included), its expressions (also those that may
+    /// fail) and its limits, but for those whose result the native operator
+    /// does not compute, which are left to DataFusion (`Ok(None)`, as for any
+    /// other node):
     ///
     /// * aggregations of input that is clustered by the group keys
-    ///   (`GroupClusteringMode` other than `None`): they keep the order of
-    ///   their input, which the plan above them may rely on;
-    /// * aggregations of input without partitions, which DataFusion
-    ///   aggregates differently from an empty input (e.g. it produces no
-    ///   grand total for a `ROLLUP`, and fails to coalesce the partial
-    ///   states of an ungrouped aggregation);
+    ///   (`GroupClusteringMode` other than `None`): they produce their groups
+    ///   in the order of their input, which the plan above them may rely on
+    ///   (e.g. instead of a sort), the native operator in no particular order;
     /// * aggregations whose groups may span several partitions of the input
     ///   of the final (or single) `AggregateExec`, which aggregates every
     ///   partition on its own (the native operator aggregates all rows
     ///   together, which is the same if every partition has its own groups:
-    ///   if there is a single partition, or the partitions are partitioned
+    ///   if there is at most one partition, or the partitions are partitioned
     ///   by the group keys);
-    /// * aggregations that advertise another number of partitions than their
-    ///   input has (after their input was replaced without recomputing their
-    ///   properties): DataFusion then aggregates some partitions of their
-    ///   input only, or fails;
-    /// * aggregations with a soft limit on their groups (`lim=[n]` without
-    ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
-    ///   LIMIT n`: each stage stops reading its input once it has `n` groups,
-    ///   so DataFusion neither evaluates the rest of its input (which may
-    ///   fail, e.g. with a division by zero) nor returns its groups, and the
-    ///   limit above returns groups of the rows read first, while the native
-    ///   operator reads all of its input, on several threads;
-    /// * top-k aggregations (`lim=[n]` with an order, of an `ORDER BY ...
-    ///   LIMIT n` by the group key or a `MIN` / `MAX` aggregate): DataFusion
-    ///   keeps only the top `n` groups in every stage, so the operators
-    ///   between the aggregation and the sort above it (e.g. a projection,
-    ///   which may fail on the other groups, or a window, which sees all of
-    ///   them) only see these, and so does the native operator, if it
-    ///   reproduces them exactly (see [`TopK`]). It does for the top-k
-    ///   aggregations by their group key, without aggregates, whose stages
-    ///   have the same limit (of at most [`MAX_TOP_K_LIMIT`] groups), of a
-    ///   single key of a type that DataFusion's top-k aggregation orders like
-    ///   its sorts (see [`orders_like_datafusion`]) but strings with 32-bit
-    ///   offsets (see [`holds_like_datafusion`]), which cannot fail
-    ///   (conservatively), and whose final stage has a single partition.
-    ///   DataFusion's top-k aggregation of several partitions keeps the top
-    ///   groups of every partition, which depend on how its rows are
-    ///   partitioned (e.g. the number of groups that a window `COUNT(*) OVER
-    ///   ()` above it counts); and the groups of its top-k aggregations by a
-    ///   `MIN` or `MAX` depend on the order of its rows when their values tie
-    ///   (see [`TopK`]).
+    /// * aggregations with an aggregate ordered by values that its
+    ///   accumulators do not order like the sorts (nested values, see
+    ///   `compares_totally`): they would keep other rows than the first ones
+    ///   of their order.
+    ///
+    /// The limits of DataFusion's aggregations only allow them to drop groups
+    /// that the limit or the sort above them drops anyway:
+    ///
+    /// * with a soft limit on its groups (`lim=[n]` without an order, from
+    ///   `SELECT DISTINCT ... LIMIT n`), the limit above returns any `n`
+    ///   groups: the threads stop consuming their input once one of them has
+    ///   `n` groups;
+    /// * with a top-k limit (`lim=[n]` with an order, from `ORDER BY ...
+    ///   LIMIT n` by the group key, or by a `MIN` / `MAX` aggregate), the
+    ///   aggregation produces the top `n` groups of all of its groups, on any
+    ///   number of partitions, and the groups that tie with them as it
+    ///   chooses (see `TopK`), or all of its groups, among which the sort
+    ///   above selects them (e.g. for limits of more than `MAX_TOP_K_LIMIT`
+    ///   groups).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -622,17 +632,11 @@ impl PhysicalHashAggregate {
         }) {
             return Ok(None);
         }
-        if matches!(group_limit(raw, last), GroupLimit::Unsupported) {
-            return Ok(None);
-        }
-        if raw.input().output_partitioning().partition_count() == 0
-            || !advertises_its_input_partitions(raw)
-            || !groups_are_partition_local(last.unwrap_or(raw))
-        {
+        if !groups_are_partition_local(last.unwrap_or(raw)) {
             return Ok(None);
         }
         if let Some(last) = last
-            && (!is_final_of(last, raw) || !advertises_its_input_partitions(last))
+            && !is_final_of(last, raw)
         {
             return Ok(None);
         }
@@ -643,8 +647,9 @@ impl PhysicalHashAggregate {
         // which compare nested values by another order, and not by a total one
         // (see `compares_totally`, e.g. `{a: NULL}` is equal to `{a: 1}`, and
         // `[NULL]` is after `[1]` whatever the order of the NULLs), so that they
-        // may keep a row that is not the first in the order of the aggregate.
-        // Aggregates ordered by such values are left to DataFusion.
+        // would keep a row that is not the first in the order of the aggregate
+        // (a wrong result, on any number of threads). Aggregates ordered by such
+        // values are left to DataFusion.
         let input_schema = raw.input().schema();
         if raw.aggr_expr().iter().any(|aggregate| {
             aggregate.order_bys().iter().any(|sort| {
@@ -762,13 +767,15 @@ impl PhysicalHashAggregate {
                 schema.fields().len()
             );
         }
-        // The constructors compute all groups of the limits that `try_lower`
-        // leaves to DataFusion, which is all that the sort above needs.
-        let top_k = match group_limit(raw, last) {
-            GroupLimit::TopK(top_k) => Some(top_k),
-            GroupLimit::None | GroupLimit::Unsupported => None,
+        let (top_k, soft_limit) = match group_limit(raw, last) {
+            GroupLimit::None => (None, None),
+            GroupLimit::Soft(limit) => (None, Some(limit)),
+            GroupLimit::TopK(top_k) => (Some(top_k), None),
         };
+        // The tables of limited aggregations hold their groups (the groups
+        // that a soft limit counts, the best groups of a top-k aggregation).
         let bypass = top_k.is_none()
+            && soft_limit.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
         Ok(Self {
@@ -784,6 +791,7 @@ impl PhysicalHashAggregate {
                 input_order,
                 single_stage,
                 top_k,
+                soft_limit,
                 bypass,
             }),
         })
@@ -791,14 +799,17 @@ impl PhysicalHashAggregate {
 
     /// The configuration extension of a session that trusts `functions`, the
     /// built-in aggregate functions of DataFusion (e.g.
-    /// `datafusion::functions_aggregate::all_default_aggregate_functions()`),
-    /// whose accumulators cannot fail: `count`, `sum`, `min`, `max`, `avg`,
-    /// `first_value`, `last_value`, `bool_and`, `bool_or`, `bit_and`,
-    /// `bit_or`, `bit_xor`, `approx_distinct`, `median` and `array_agg`, if
-    /// they are implemented by DataFusion's types. In the sessions that trust
-    /// the functions of all aggregates of an aggregation (that are neither
-    /// `DISTINCT` nor ordered), the input rows of the threads whose groups
-    /// hardly repeat bypass their thread-local tables.
+    /// `datafusion::functions_aggregate::all_default_aggregate_functions()`):
+    /// `count`, `sum`, `min`, `max`, `avg`, `first_value`, `last_value`,
+    /// `bool_and`, `bool_or`, `bit_and`, `bit_or`, `bit_xor`,
+    /// `approx_distinct`, `median` and `array_agg`, if they are implemented by
+    /// DataFusion's types.
+    ///
+    /// The extension no longer changes how aggregations are executed: the
+    /// input rows of the threads whose groups hardly repeat bypass their
+    /// thread-local tables whatever the aggregate functions (user-defined ones
+    /// included), in every session. It is kept so that the sessions that
+    /// register it keep working.
     ///
     /// ```
     /// use datafusion::prelude::{SessionConfig, SessionContext};
@@ -848,6 +859,16 @@ impl PhysicalHashAggregate {
         self
     }
 
+    /// Never let the input rows of the threads bypass their thread-local
+    /// tables, e.g. to compare the results of both paths.
+    #[cfg(test)]
+    pub(crate) fn without_bypass(mut self) -> Self {
+        Arc::get_mut(&mut self.spec)
+            .expect("the spec of a new aggregation")
+            .bypass = false;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn spec(&self) -> Arc<AggregateSpec> {
         Arc::clone(&self.spec)
@@ -874,28 +895,17 @@ fn partial_aggregate(plan: &Arc<dyn ExecutionPlan>) -> Option<&AggregateExec> {
     None
 }
 
-/// Whether `aggregate` advertises the partitions of its input: DataFusion
-/// aggregates the input partitions of the partitions an aggregation
-/// advertises.
-fn advertises_its_input_partitions(aggregate: &AggregateExec) -> bool {
-    aggregate
-        .properties()
-        .output_partitioning()
-        .partition_count()
-        == aggregate.input().output_partitioning().partition_count()
-}
-
 /// Whether no group of `aggregate`, the `AggregateExec` that produces the
 /// final values, spans several partitions of its input. DataFusion
 /// aggregates every partition on its own, which is the same as aggregating
-/// all rows together exactly then: if there is a single partition, or the
-/// partitions are partitioned by (a subset of) the group keys. (With grouping
-/// sets, a single stage aggregation makes groups of the rows of all
+/// all rows together exactly then: if there is at most a single partition, or
+/// the partitions are partitioned by (a subset of) the group keys. (With
+/// grouping sets, a single stage aggregation makes groups of the rows of all
 /// partitions, e.g. the grand total of a `ROLLUP`.)
 fn groups_are_partition_local(aggregate: &AggregateExec) -> bool {
     let input = aggregate.input();
     let partitioning = input.output_partitioning();
-    if partitioning.partition_count() == 1 {
+    if partitioning.partition_count() <= 1 {
         return true;
     }
     let group_by = aggregate.group_expr();
@@ -934,116 +944,150 @@ fn is_final_of(last: &AggregateExec, partial: &AggregateExec) -> bool {
 enum GroupLimit {
     /// All groups are produced.
     None,
-    /// A top-k aggregation that the native operator reproduces.
+    /// Any `n` groups will do, see [`AggregateSpec::soft_limit`].
+    Soft(usize),
+    /// A top-k aggregation, see [`TopK`].
     TopK(TopK),
-    /// A limit that the native operator does not reproduce.
-    Unsupported,
 }
 
-/// The largest limit of a top-k aggregation that the native operator
-/// reproduces: it merges the top groups of all partitions into a single
-/// batch, which must stay small.
+/// The largest limit of a top-k aggregation that the native operator keeps
+/// the top groups of: it merges the top groups of all partitions into a
+/// single batch, which must stay small. The aggregations of larger limits
+/// produce all of their groups, among which the sort above selects the top
+/// groups.
 const MAX_TOP_K_LIMIT: usize = 1 << 16;
 
 /// The limit on the groups of the aggregation whose stage that consumes the
 /// input rows is `raw`, and whose final stage is `last` (if it has two
-/// stages), see [`PhysicalHashAggregate::try_lower`] and [`TopK`].
+/// stages), see [`PhysicalHashAggregate::try_lower`].
+///
+/// A stage with a limit drops the groups that the limit (or the sort) above
+/// the aggregation drops anyway, so may the native operator, which fuses the
+/// stages, if their limits agree (the greatest of them, then): its other
+/// limits are dropped, and the aggregation produces all of its groups, which
+/// is always correct.
 fn group_limit(raw: &AggregateExec, last: Option<&AggregateExec>) -> GroupLimit {
-    let options = raw.limit_options();
-    if last.is_some_and(|last| last.limit_options() != options) {
-        return GroupLimit::Unsupported;
-    }
-    let Some(options) = options else {
+    let stages = || [Some(raw), last].into_iter().flatten();
+    let mut limits = stages().filter_map(AggregateExec::limit_options);
+    let Some(first) = limits.next() else {
         return GroupLimit::None;
     };
-    // A soft limit has no order.
-    let Some(descending) = options.descending() else {
-        return GroupLimit::Unsupported;
-    };
-    let limit = options.limit();
+    let mut limit = first.limit();
+    for other in limits {
+        if other.descending() != first.descending() {
+            return GroupLimit::None;
+        }
+        limit = limit.max(other.limit());
+    }
+    match first.descending() {
+        // A soft limit has no order. Only aggregations without aggregates
+        // (whose groups are complete with their first row) may stop early.
+        None => {
+            let distinct = !raw.group_expr().is_true_no_grouping()
+                && stages().all(|stage| stage.aggr_expr().is_empty());
+            if distinct && limit > 0 {
+                GroupLimit::Soft(limit)
+            } else {
+                GroupLimit::None
+            }
+        }
+        Some(descending) => {
+            top_k(raw, last, limit, descending).map_or(GroupLimit::None, GroupLimit::TopK)
+        }
+    }
+}
+
+/// The top-k aggregation of `limit` groups in the order of `descending` of
+/// the aggregation whose stages are `raw` and `last` (see [`group_limit`]),
+/// if the native operator keeps only its top groups: an aggregation of a
+/// single group key (without grouping sets or filters), by that key if it
+/// has no aggregates, or by its only aggregate if it is a `MIN` ascending or
+/// a `MAX` descending (see [`is_min_max`]), of values whose order is
+/// supported (see [`is_top_k_type`]).
+fn top_k(
+    raw: &AggregateExec,
+    last: Option<&AggregateExec>,
+    limit: usize,
+    descending: bool,
+) -> Option<TopK> {
     let group_by = raw.group_expr();
-    let schema = raw.input().schema();
-    let orders = |expr: &Arc<dyn PhysicalExpr>| {
-        is_infallible(expr, &schema)
-            && expr.data_type(&schema).is_ok_and(|data_type| {
-                orders_like_datafusion(&data_type) && holds_like_datafusion(&data_type)
-            })
-    };
     let [(key, _)] = group_by.expr() else {
-        return GroupLimit::Unsupported;
+        return None;
     };
-    // The top groups of every partition depend on the partitioning.
-    let partitions = last
-        .unwrap_or(raw)
-        .properties()
-        .output_partitioning()
-        .partition_count();
     if group_by.has_grouping_set()
-        || partitions != 1
         || !(1..=MAX_TOP_K_LIMIT).contains(&limit)
-        || !orders(key)
         || raw.filter_expr().iter().any(Option::is_some)
     {
-        return GroupLimit::Unsupported;
+        return None;
     }
-    // The groups of a top-k aggregation by a `MIN` or `MAX` depend on the
-    // order of its rows when their values tie (see `TopK`).
-    if !raw.aggr_expr().is_empty() {
-        return GroupLimit::Unsupported;
-    }
-    GroupLimit::TopK(TopK { limit, descending })
+    let schema = raw.input().schema();
+    let (order, value_type) = match raw.aggr_expr() {
+        [] => (TopKOrder::Key, key.data_type(&schema).ok()?),
+        [aggregate] => {
+            let min_max = [Some(raw), last].into_iter().flatten().all(|stage| {
+                matches!(stage.aggr_expr(), [aggregate] if is_min_max(aggregate, descending, &schema))
+            });
+            if !min_max {
+                return None;
+            }
+            (TopKOrder::Aggregate, aggregate.field().data_type().clone())
+        }
+        _ => return None,
+    };
+    is_top_k_type(&value_type).then_some(TopK {
+        limit,
+        descending,
+        order,
+    })
 }
 
-/// Whether the native operator holds the values of `data_type` of the groups
-/// of a top-k aggregation wherever DataFusion's top-k aggregation does. The
-/// native operator holds all groups of a thread-local table (and the top
-/// groups of every flush of a partition) before it keeps their top groups,
-/// DataFusion's top-k aggregation its top groups only: strings with 32-bit
-/// offsets (`Utf8`) of more groups than DataFusion holds may overflow the
-/// offsets of the arrays of the native tables (e.g. two distinct keys of 1.1
-/// GB), so their aggregations are left to DataFusion. Fixed-width values,
-/// `LargeUtf8` (64-bit offsets) and `Utf8View` (views of several buffers) do
-/// not overflow.
-fn holds_like_datafusion(data_type: &DataType) -> bool {
-    data_type != &DataType::Utf8
+/// Whether `aggregate` (of input rows of schema `schema`) is DataFusion's
+/// built-in `MAX` (if `descending`) or `MIN` (identified by the type that
+/// implements it), neither `DISTINCT` nor ordered, of a single argument of
+/// its own type, whose partial state is its value: an aggregate whose value
+/// only gets better in the order `descending` as more rows come, which a
+/// top-k aggregation may order its groups by (see [`TopK`]).
+fn is_min_max(
+    aggregate: &AggregateFunctionExpr,
+    descending: bool,
+    schema: &SchemaRef,
+) -> bool {
+    let function = match descending {
+        true => TypeId::of::<min_max::Max>(),
+        false => TypeId::of::<min_max::Min>(),
+    };
+    let output = aggregate.field();
+    let value_type = output.data_type();
+    let arguments = aggregate.expressions();
+    let [argument] = arguments.as_slice() else {
+        return false;
+    };
+    implementation_type(aggregate.fun()) == function
+        && !aggregate.is_distinct()
+        && aggregate.order_bys().is_empty()
+        && argument
+            .data_type(schema)
+            .is_ok_and(|data_type| &data_type == value_type)
+        && aggregate.state_fields().is_ok_and(|fields| {
+            matches!(fields.as_slice(), [state] if state.data_type() == value_type)
+        })
 }
 
-/// Whether DataFusion's top-k aggregation compares the values of
-/// `data_type` as its sorts do, so that it keeps the groups that the sort
-/// above it keeps: integers, decimals, temporal values (but intervals) and
-/// strings. Its heap compares floating point values both by the IEEE
-/// comparisons and by their total order, which disagree on `-0.0`, `0.0` and
-/// `NaN`s, so that it may drop a group that the sort would keep.
-fn orders_like_datafusion(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Duration(_)
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-    )
+/// Whether the native top-k aggregation orders values of `data_type`, by the
+/// Arrow kernels that the sort above it orders them by: the types of
+/// DataFusion's top-k aggregations, primitive values (floating point values
+/// by their total order) and strings.
+fn is_top_k_type(data_type: &DataType) -> bool {
+    data_type.is_primitive()
+        || matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
 }
 
 /// Whether the input rows of an aggregation without an input order or a
-/// limit may bypass the thread-local tables of a thread whose groups hardly
-/// repeat (see `RadixLocalState::aggregate`), and be aggregated by the final
+/// limit bypass the thread-local tables of a thread whose groups hardly
+/// repeat (see `RadixLocalState::aggregate`), and are aggregated by the final
 /// aggregation of their radix partitions directly:
 ///
 /// * the aggregation has group keys and no grouping sets;
@@ -1054,23 +1098,15 @@ fn orders_like_datafusion(data_type: &DataType) -> bool {
 ///   partitioning gathers from several chunks) are of flat types, which are
 ///   gathered without merging dictionaries or nested offsets.
 ///
-/// The rows of an aggregation with aggregates bypass the tables only in the
-/// sessions that trust the accumulators of all of its aggregates (see
-/// [`AggregateSpec::rows_bypass_tables`]). The accumulators of aggregates
-/// aggregate every row in the tables, when it is consumed, with the rows of
-/// its group that the table aggregated so far, like DataFusion's: an
-/// accumulator may fail depending on the rows that it aggregates together
-/// (e.g. a user-defined sum that rejects negative running totals), so that
-/// deferring its rows to the final aggregation fails later than DataFusion
-/// (after the rows that follow them), and converting them to partial states
-/// one by one (like DataFusion's partial stage when it skips its
-/// aggregation, which it decides by its own counts) fails where DataFusion
-/// does not. The accumulators of the built-in aggregate functions of
-/// [`TrustedAggregateFunctions`] cannot fail on the rows they aggregate, nor
-/// on the partial states they merge: the final aggregation of a partition
-/// aggregates the bypassed rows into exactly the states that the tables
-/// would have merged, so that the rows of their aggregations bypass the
-/// tables where the session trusts them.
+/// Whatever the aggregates, user-defined, `DISTINCT` and ordered ones
+/// included: the final aggregation of a partition updates the accumulators
+/// of its groups with the bypassed rows, as the tables would have, and merges
+/// them with the partial states of the tables. A bypassed row is aggregated
+/// once, rather than in a table first, and its group interned once (as
+/// DataFusion skips its partial aggregation). That an accumulator gets its
+/// rows in other batches, or fails on other rows first (e.g. a user-defined
+/// sum that rejects negative running totals), than in DataFusion depends on
+/// the batches and the threads, which are the engine's own.
 fn rows_can_bypass_tables(
     group_by: &PhysicalGroupBy,
     update: &[AggregateUpdate],
@@ -1101,27 +1137,9 @@ fn rows_can_bypass_tables(
             .all(|update| update.arguments.iter().all(is_flat))
 }
 
-/// The built-in aggregate functions of DataFusion whose accumulators cannot
-/// fail on the rows that they aggregate, nor on the partial states that they
-/// merge (see [`TrustedAggregateFunctions`]): their name, and the function of
+/// The built-in aggregate functions of DataFusion that
+/// [`TrustedAggregateFunctions`] names: their name, and the function of
 /// `datafusion-functions-aggregate` that returns them.
-///
-/// * `count`, `sum`, `avg`, `bit_and`, `bit_or` and `bit_xor` add up (with
-///   wrapping arithmetic) or combine fixed-width values, `min`, `max`,
-///   `bool_and` and `bool_or` compare them, `first_value` and `last_value`
-///   keep one of them, `approx_distinct` adds their hashes to a
-///   HyperLogLog sketch, and `median` and `array_agg` collect them. None of
-///   them fails on the values of its rows, or on how its rows are grouped
-///   into batches and partial states.
-/// * Evaluating the final value of a group may fail (e.g. the average of
-///   decimals that does not fit the output precision), but on the final state
-///   of the group only, which is the same whether its rows were aggregated
-///   in the thread-local tables or bypassed them: the states are sums,
-///   counts, extremes or collections of the same values.
-///
-/// `DISTINCT` aggregates and aggregates with an `ORDER BY` are not trusted
-/// (see [`TrustedAggregateFunctions::trusts`]): their accumulators keep sets
-/// or ordered lists of values, of other states.
 const BUILTIN_AGGREGATES: [(&str, BuiltinAggregate); 15] = [
     ("count", count::count_udaf),
     ("sum", sum::sum_udaf),
@@ -1150,17 +1168,14 @@ fn implementation_type(udaf: &AggregateUDF) -> TypeId {
     implementation.type_id()
 }
 
-/// The built-in aggregate functions of DataFusion whose accumulators a
-/// session trusts the native aggregation not to fail (see
+/// The built-in aggregate functions of DataFusion that a session trusts (see
 /// [`BUILTIN_AGGREGATES`]): a configuration extension of the session, created
 /// with [`PhysicalHashAggregate::trusted_aggregate_functions`].
 ///
-/// In the sessions that trust the aggregate functions of all aggregates of an
-/// aggregation, the input rows of a thread whose groups hardly repeat bypass
-/// its thread-local table, like the rows of aggregations without aggregates
-/// (see `rows_can_bypass_tables`): they are aggregated once, by the final
-/// aggregation of their radix partition, rather than in the thread-local
-/// table first (DataFusion skips its partial aggregation then).
+/// The native aggregation no longer reads it: the input rows of a thread
+/// whose groups hardly repeat bypass its thread-local table whatever the
+/// aggregate functions (see `rows_can_bypass_tables`). The extension is kept
+/// so that the sessions that register it keep working; it has no effect.
 ///
 /// A function is trusted if it is implemented by the type of
 /// `datafusion-functions-aggregate` that implements the built-in function of
@@ -1177,8 +1192,8 @@ pub struct TrustedAggregateFunctions {
 impl TrustedAggregateFunctions {
     /// Trust `functions`, the built-in aggregate functions of DataFusion
     /// (e.g. `datafusion::functions_aggregate::all_default_aggregate_functions()`):
-    /// those whose accumulators cannot fail (see [`BUILTIN_AGGREGATES`]), if
-    /// they are implemented by DataFusion's types.
+    /// those of [`BUILTIN_AGGREGATES`], if they are implemented by DataFusion's
+    /// types.
     fn new(functions: &[Arc<AggregateUDF>]) -> Self {
         let mut implementations: Vec<(&'static str, TypeId)> = vec![];
         for function in functions {
@@ -1201,18 +1216,6 @@ impl TrustedAggregateFunctions {
     /// The names of the trusted functions.
     pub fn names(&self) -> Vec<&'static str> {
         self.implementations.iter().map(|(name, _)| *name).collect()
-    }
-
-    /// Whether the accumulators of `aggregate` cannot fail: whether it is
-    /// neither `DISTINCT` nor ordered (`ORDER BY`), and its function is a
-    /// trusted one.
-    pub(crate) fn trusts(&self, aggregate: &AggregateFunctionExpr) -> bool {
-        let function = aggregate.fun();
-        !aggregate.is_distinct()
-            && aggregate.order_bys().is_empty()
-            && self
-                .implementations
-                .contains(&(function.name(), implementation_type(function)))
     }
 }
 
@@ -1240,7 +1243,7 @@ impl ExtensionOptions for TrustedAggregateFunctions {
         vec![ConfigEntry {
             key: format!("{}.functions", Self::PREFIX),
             value: Some(self.names().join(",")),
-            description: "The built-in aggregate functions whose accumulators the native aggregation of the pipeline engine trusts not to fail",
+            description: "The built-in aggregate functions that the session trusts (no longer read by the native aggregation of the pipeline engine)",
         }]
     }
 }
@@ -1413,6 +1416,9 @@ impl fmt::Display for AggregateSpec {
             let order = if top_k.descending { "DESC" } else { "ASC" };
             write!(f, ", lim=[{}], order={order}", top_k.limit)?;
         }
+        if let Some(limit) = self.soft_limit {
+            write!(f, ", lim=[{limit}]")?;
+        }
         Ok(())
     }
 }
@@ -1459,15 +1465,17 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
     fn get_local_sink_state(
         &self,
-        ctx: &ExecutionContext,
+        _ctx: &ExecutionContext,
         _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
             return UngroupedAggregate::local_sink_state(&self.spec);
         }
-        let options = ctx.task_ctx.session_config().options();
-        let bypass = self.spec.rows_bypass_tables(options);
-        RadixHashAggregate::local_sink_state(&self.spec, self.table_capacity, bypass)
+        RadixHashAggregate::local_sink_state(
+            &self.spec,
+            self.table_capacity,
+            self.spec.bypass,
+        )
     }
 
     fn sink(
@@ -1480,10 +1488,9 @@ impl PhysicalOperator for PhysicalHashAggregate {
         let batch = input.compact()?;
         if self.spec.is_ungrouped() {
             UngroupedAggregate::sink(&self.spec, batch, lstate)?;
-        } else {
-            RadixHashAggregate::sink(&self.spec, batch, gstate, lstate)?;
+            return Ok(SinkResult::NeedMoreInput);
         }
-        Ok(SinkResult::NeedMoreInput)
+        RadixHashAggregate::sink(&self.spec, batch, gstate, lstate)
     }
 
     fn combine(
@@ -1584,7 +1591,7 @@ mod tests {
         ChildrenPropertiesMode, Partitioning, ReplaceChildrenOptions,
     };
 
-    use super::super::test_support::lower;
+    use super::super::test_support::{lower, rows_of};
     use crate::bridge::BridgeOperator;
     use crate::executor::Executor;
     use crate::operators::union::test_support::assert_lowered_plan_byte_eq;
@@ -1805,18 +1812,6 @@ mod tests {
                 single(AggregateMode::Single, true, input(1, true)?)?,
             ),
             (
-                "input without partitions",
-                single(AggregateMode::Single, false, input(0, false)?)?,
-            ),
-            (
-                "partial input without partitions",
-                last(
-                    AggregateMode::Final,
-                    false,
-                    coalesce(partial(false, input(0, false)?)?),
-                )?,
-            ),
-            (
                 "single stage of several partitions",
                 single(AggregateMode::Single, true, input(2, false)?)?,
             ),
@@ -1850,13 +1845,6 @@ mod tests {
                     hash_repartition(input(2, false)?)?,
                     input_schema(),
                 )?),
-            ),
-            (
-                "stale partitions",
-                lowered_plans()[0].1()?.replace_children(
-                    vec![input(3, false)?],
-                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
-                )?,
             ),
             (
                 "limited partial states",
@@ -1898,6 +1886,122 @@ mod tests {
             partial_aggregate(other.input()).unwrap()
         ));
         assert!(try_lower(&(other as Plan))?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_of_inputs_without_partitions_are_lowered() -> Result<()> {
+        // An input without partitions has no rows: an ungrouped aggregation
+        // produces its row, a grouping set without group columns its group,
+        // as for an empty input. (DataFusion produces no row, or fails to
+        // coalesce the partial states of no partition.)
+        let rollup = || -> Result<PhysicalGroupBy> {
+            Ok(PhysicalGroupBy::new(
+                vec![(col("k", &input_schema())?, "k".into())],
+                vec![(lit(ScalarValue::Utf8(None)), "k".into())],
+                vec![vec![false], vec![true]],
+                true,
+            ))
+        };
+        let rolled_up = |mode: AggregateMode, input: Plan| -> Result<Plan> {
+            Ok(Arc::new(AggregateExec::try_new(
+                mode,
+                rollup()?,
+                aggregates(&input_schema())?,
+                vec![None, None],
+                input,
+                input_schema(),
+            )?))
+        };
+        let nothing = || vec![ScalarValue::Int64(Some(0)), ScalarValue::Int64(None)];
+        let total = || {
+            let mut row = vec![ScalarValue::Utf8(None), ScalarValue::UInt8(Some(1))];
+            row.extend(nothing());
+            row
+        };
+        let plans: [(&str, Plan, Vec<Vec<ScalarValue>>); 5] = [
+            (
+                "ungrouped",
+                single(AggregateMode::Single, false, input(0, false)?)?,
+                vec![nothing()],
+            ),
+            (
+                "ungrouped of two stages",
+                last(
+                    AggregateMode::Final,
+                    false,
+                    coalesce(partial(false, input(0, false)?)?),
+                )?,
+                vec![nothing()],
+            ),
+            (
+                "grouped",
+                single(AggregateMode::Single, true, input(0, false)?)?,
+                vec![],
+            ),
+            (
+                "grouping sets",
+                rolled_up(AggregateMode::Single, input(0, false)?)?,
+                vec![total()],
+            ),
+            (
+                "grouping sets of two stages",
+                Arc::new(AggregateExec::try_new(
+                    AggregateMode::Final,
+                    rollup()?.as_final(),
+                    aggregates(&input_schema())?,
+                    vec![None, None],
+                    coalesce(rolled_up(AggregateMode::Partial, input(0, false)?)?),
+                    input_schema(),
+                )?),
+                vec![total()],
+            ),
+        ];
+        for (name, plan, expected) in plans {
+            let root = lower(&plan)?;
+            assert!(root.is::<PhysicalHashAggregate>(), "{name}");
+            assert_eq!(root.schema(), plan.schema(), "{name}");
+            for threads in [1, 4] {
+                let output = Executor::collect(
+                    Arc::clone(&root),
+                    Arc::new(TaskContext::default()),
+                    threads,
+                )
+                .await?;
+                assert_eq!(rows_of(&output), expected, "{name} on {threads} threads");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_with_stale_partitions_aggregate_their_input() -> Result<()> {
+        // An aggregation whose input was replaced without recomputing its
+        // properties advertises 3 partitions of an input of 1: DataFusion would
+        // execute input partitions that do not exist. The native operator
+        // aggregates its input.
+        let stale = lowered_plans()[2].1()?.replace_children(
+            vec![input(1, false)?],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )?;
+        assert_eq!(
+            stale.properties().output_partitioning().partition_count(),
+            3
+        );
+        let root = lower(&stale)?;
+        assert!(root.is::<PhysicalHashAggregate>());
+        let task_ctx = Arc::new(TaskContext::default());
+        let actual = Executor::collect(root, Arc::clone(&task_ctx), 4).await?;
+        let expected = datafusion_physical_plan::collect(
+            single(AggregateMode::Single, true, input(1, false)?)?,
+            task_ctx,
+        )
+        .await?;
+        let schema = stale.schema();
+        assert_eq!(
+            canonical_batch(&schema, &actual, false)?,
+            canonical_batch(&schema, &expected, false)?
+        );
         Ok(())
     }
 
@@ -1965,11 +2069,17 @@ mod tests {
     }
 
     #[test]
-    fn soft_limited_aggregations_are_not_lowered_and_top_k_ones_are() -> Result<()> {
+    fn limited_aggregations_are_lowered() -> Result<()> {
         let plan = |aggregate: AggregateExec| Arc::new(aggregate) as Plan;
-        // The top-k limit of the lowered aggregation, if it is lowered.
-        let lowered_limit = |plan: &Plan| -> Result<Option<Option<TopK>>> {
-            Ok(try_lower(plan)?.map(|aggregate| aggregate.spec.top_k))
+        // The top-k and soft limits of the lowered aggregation.
+        let lowered_limits = |plan: &Plan| -> Result<(Option<TopK>, Option<usize>)> {
+            let aggregate = try_lower(plan)?.expect("a lowered aggregation");
+            Ok((aggregate.spec.top_k, aggregate.spec.soft_limit))
+        };
+        let top_k = |order: TopKOrder| TopK {
+            limit: 3,
+            descending: true,
+            order,
         };
         for limit in [
             Limit::None,
@@ -1977,22 +2087,21 @@ mod tests {
             Limit::TopKDistinct,
             Limit::TopKMax,
         ] {
-            // The key `k` is a `Utf8` string (see `holds_like_datafusion`), the
-            // argument `v` of `MAX(v)` nullable: only the aggregations without
-            // a limit are lowered.
-            let expected = |limited: bool| {
-                if limited && limit != Limit::None {
-                    None
-                } else {
-                    Some(None)
-                }
+            // The key `k` is a `Utf8` string, the argument `v` of `MAX(v)`
+            // nullable.
+            let expected = |limited: bool| match (limited, limit) {
+                (false, _) | (true, Limit::None) => (None, None),
+                (true, Limit::Soft) => (None, Some(3)),
+                (true, Limit::TopKDistinct) => (Some(top_k(TopKOrder::Key)), None),
+                (true, Limit::TopKMax) => (Some(top_k(TopKOrder::Aggregate)), None),
             };
             for apply in [false, true] {
                 let single =
                     limited(AggregateMode::Single, limit, apply, input(1, false)?)?;
-                assert_eq!(lowered_limit(&plan(single))?, expected(apply), "{limit:?}");
+                assert_eq!(lowered_limits(&plan(single))?, expected(apply), "{limit:?}");
             }
-            // A limit of the partial or of the final stage, or of both.
+            // A limit of the partial or of the final stage, or of both, of a
+            // final stage of several partitions or of one.
             for (mode, single_partition) in [
                 (AggregateMode::FinalPartitioned, false),
                 (AggregateMode::Final, true),
@@ -2013,18 +2122,17 @@ mod tests {
                     };
                     let last = limited(mode, limit, limit_final, states)?;
                     assert_eq!(
-                        lowered_limit(&plan(last))?,
+                        lowered_limits(&plan(last))?,
                         expected(limit_partial || limit_final),
                         "{limit:?} {mode:?}"
                     );
                 }
             }
         }
-        // A top-k aggregation by the integer key `v` is lowered: of a single
-        // stage, or of two stages with the same limit and a single final
-        // partition.
-        let schema = input_schema();
-        let by_v = |mode: AggregateMode, input: Plan, top_k: bool| -> Result<Plan> {
+        // Stages of different limits produce all groups: of other orders, and
+        // a soft and a top-k limit. Stages of the same order the greatest
+        // limit.
+        let by_v = |mode: AggregateMode, input: Plan, limit: Option<(usize, bool)>| {
             let key = col("v", &input.schema())?;
             let aggregate = AggregateExec::try_new(
                 mode,
@@ -2032,36 +2140,108 @@ mod tests {
                 vec![],
                 vec![],
                 input,
-                Arc::clone(&schema),
+                input_schema(),
             )?;
-            if !top_k {
-                return Ok(Arc::new(aggregate));
-            }
+            let Some((limit, descending)) = limit else {
+                return Ok(Arc::new(aggregate) as Plan);
+            };
             let limited = aggregate
-                .try_optimize_topk(3, "v", SortOptions::new(false, false))
+                .try_optimize_topk(limit, "v", SortOptions::new(descending, false))
                 .expect("a top-k aggregation")
                 .data;
-            Ok(Arc::new(limited))
+            Ok::<_, datafusion_common::DataFusionError>(Arc::new(limited))
         };
-        let top_k = Some(Some(TopK {
-            limit: 3,
+        let two_stages = |partial: Option<(usize, bool)>, last: Option<(usize, bool)>| {
+            let states = by_v(AggregateMode::Partial, input(4, false)?, partial)?;
+            let states = Arc::new(RepartitionExec::try_new(
+                Arc::clone(&states),
+                Partitioning::Hash(vec![col("v", &states.schema())?], 3),
+            )?);
+            let plan = by_v(AggregateMode::FinalPartitioned, states, last)?;
+            Ok::<_, datafusion_common::DataFusionError>(lowered_limits(&plan)?.0)
+        };
+        let ascending = |limit: usize| TopK {
+            limit,
             descending: false,
-        }));
-        let single = by_v(AggregateMode::Single, input(1, false)?, true)?;
-        assert_eq!(lowered_limit(&single)?, top_k);
-        let partial = || by_v(AggregateMode::Partial, input(4, false)?, true);
-        let last = by_v(AggregateMode::Final, coalesce(partial()?), true)?;
-        assert_eq!(lowered_limit(&last)?, top_k);
-        let last = by_v(AggregateMode::Final, coalesce(partial()?), false)?;
-        assert_eq!(lowered_limit(&last)?, None);
-        let states = partial()?;
-        let key = col("v", &states.schema())?;
-        let states = Arc::new(RepartitionExec::try_new(
-            states,
-            Partitioning::Hash(vec![key], 3),
-        )?);
-        let last = by_v(AggregateMode::FinalPartitioned, states, true)?;
-        assert_eq!(lowered_limit(&last)?, None);
+            order: TopKOrder::Key,
+        };
+        assert_eq!(
+            two_stages(Some((3, false)), Some((3, false)))?,
+            Some(ascending(3))
+        );
+        assert_eq!(
+            two_stages(Some((3, false)), Some((5, false)))?,
+            Some(ascending(5))
+        );
+        assert_eq!(two_stages(Some((3, false)), None)?, Some(ascending(3)));
+        assert_eq!(two_stages(Some((3, false)), Some((3, true)))?, None);
+        let soft = limited(AggregateMode::Partial, Limit::Soft, true, input(4, false)?)?;
+        let topk = limited(
+            AggregateMode::Final,
+            Limit::TopKDistinct,
+            true,
+            coalesce(plan(soft)),
+        )?;
+        assert_eq!(lowered_limits(&plan(topk))?, (None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn top_k_aggregations_of_large_limits_or_other_aggregates_produce_all_groups()
+    -> Result<()> {
+        // DataFusion's top-k aggregations of more groups than the native
+        // operator keeps the top groups of (`MAX_TOP_K_LIMIT`), or by an
+        // aggregate that is not DataFusion's `MIN` / `MAX` (see `is_min_max`),
+        // are lowered without their limit: they produce all of their groups.
+        let schema = input_schema();
+        let by_k = |aggregates: Vec<Arc<AggregateFunctionExpr>>,
+                    limit: usize,
+                    order_by: &str|
+         -> Result<Plan> {
+            let filters = vec![None; aggregates.len()];
+            let aggregate = AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by(true)?,
+                aggregates,
+                filters,
+                input(1, false)?,
+                Arc::clone(&schema),
+            )?
+            .try_optimize_topk(limit, order_by, SortOptions::new(true, false))
+            .expect("a top-k aggregation")
+            .data;
+            assert!(aggregate.limit_options().is_some());
+            Ok(Arc::new(aggregate))
+        };
+        let max = |function: Arc<AggregateUDF>| -> Result<Arc<AggregateFunctionExpr>> {
+            Ok(Arc::new(
+                AggregateExprBuilder::new(function, vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("max(v)")
+                    .build()?,
+            ))
+        };
+        let top_k = |plan: &Plan| -> Result<Option<TopK>> {
+            Ok(try_lower(plan)?.expect("a lowered aggregation").spec.top_k)
+        };
+        assert_eq!(
+            top_k(&by_k(vec![max(max_udaf())?], 3, "max(v)")?)?,
+            Some(TopK {
+                limit: 3,
+                descending: true,
+                order: TopKOrder::Aggregate,
+            })
+        );
+        // More groups than a top-k aggregation keeps.
+        let large = MAX_TOP_K_LIMIT + 1;
+        assert_eq!(top_k(&by_k(vec![], large, "k")?)?, None);
+        assert_eq!(
+            top_k(&by_k(vec![max(max_udaf())?], large, "max(v)")?)?,
+            None
+        );
+        // A user-defined `max` of DataFusion's name, type name and order.
+        let lookalike = Arc::new(super::super::test_support::lookalike_max());
+        assert_eq!(top_k(&by_k(vec![max(lookalike)?], 3, "max(v)")?)?, None);
         Ok(())
     }
 
@@ -2150,28 +2330,100 @@ mod tests {
             Some(3),
             None,
         ]);
-        let select = |limit, descending| -> Result<Option<Vec<u32>>> {
-            let top_k = TopK { limit, descending };
+        let top_k = |limit, descending, order| TopK {
+            limit,
+            descending,
+            order,
+        };
+        let select = |top_k: TopK| -> Result<Option<Vec<u32>>> {
             Ok(top_k.select(&values)?.map(|indices| {
                 let mut indices = indices.values().to_vec();
                 indices.sort_unstable();
                 indices
             }))
         };
-        // The 2 greatest keys (9, 7), the 2 least (1, 3), and the `NULL` keys.
-        assert_eq!(select(2, true)?, Some(vec![1, 2, 4, 5, 7]));
-        assert_eq!(select(2, false)?, Some(vec![1, 3, 4, 6, 7]));
-        assert_eq!(select(1, false)?, Some(vec![1, 3, 4, 7]));
+        // By key: the 2 greatest keys (9, 7), the 2 least (1, 3), and the
+        // `NULL` keys.
+        let key = |limit, descending| top_k(limit, descending, TopKOrder::Key);
+        assert_eq!(select(key(2, true))?, Some(vec![1, 2, 4, 5, 7]));
+        assert_eq!(select(key(2, false))?, Some(vec![1, 3, 4, 6, 7]));
+        assert_eq!(select(key(1, false))?, Some(vec![1, 3, 4, 7]));
         // All rows, if there are not more of them.
-        assert_eq!(select(5, true)?, None);
+        assert_eq!(select(key(5, true))?, None);
+        // By aggregate: the best values, followed by groups without values
+        // (`NULL`) if there are fewer of them.
+        let aggregate =
+            |limit, descending| top_k(limit, descending, TopKOrder::Aggregate);
+        assert_eq!(select(aggregate(2, true))?, Some(vec![2, 5]));
+        assert_eq!(select(aggregate(3, false))?, Some(vec![0, 3, 6]));
+        assert_eq!(select(aggregate(5, true))?, Some(vec![0, 2, 3, 5, 6]));
+        let selected = select(aggregate(6, true))?.expect("a selection");
+        assert_eq!(selected.len(), 6);
+        assert!([0, 2, 3, 5, 6].iter().all(|row| selected.contains(row)));
+        assert_eq!(select(aggregate(8, true))?, None);
         // Strings, by their bytes.
         let strings = StringArray::from(vec![Some("b"), Some("ab"), None, Some("B")]);
-        let top_k = TopK {
-            limit: 1,
-            descending: false,
-        };
-        let indices = top_k.select(&strings)?.expect("a selection");
+        let indices = key(1, false).select(&strings)?.expect("a selection");
         assert_eq!(indices.values().as_ref(), &[3, 2]);
+        let indices = aggregate(1, true).select(&strings)?.expect("a selection");
+        assert_eq!(indices.values().as_ref(), &[0]);
+        // Floating point values by their total order: `NaN` is the greatest,
+        // `-0.0` less than `0.0`.
+        let floats = arrow::array::Float64Array::from(vec![
+            Some(0.0),
+            Some(f64::NAN),
+            None,
+            Some(-0.0),
+            Some(1.5),
+        ]);
+        let indices = aggregate(2, true).select(&floats)?.expect("a selection");
+        assert_eq!(indices.values().as_ref(), &[1, 4]);
+        let indices = aggregate(2, false).select(&floats)?.expect("a selection");
+        assert_eq!(indices.values().as_ref(), &[3, 0]);
+        Ok(())
+    }
+
+    #[test]
+    fn top_k_candidates_are_the_rows_not_worse_than_the_cutoff() -> Result<()> {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(5),
+            None,
+            Some(9),
+            Some(1),
+            Some(7),
+        ]));
+        let candidates = |descending, order| -> Result<Option<Vec<bool>>> {
+            let top_k = TopK {
+                limit: 2,
+                descending,
+                order,
+            };
+            let cutoff = top_k.cutoff(values.as_ref())?.expect("a cutoff");
+            Ok(top_k
+                .candidates(&values, &cutoff)?
+                .map(|selected| selected.iter().map(|row| row == Some(true)).collect()))
+        };
+        // The cutoff of the 2 greatest values is 7, of the 2 least 5. The rows of
+        // the `NULL` key are always candidates, those of `NULL` arguments never.
+        assert_eq!(
+            candidates(true, TopKOrder::Key)?,
+            Some(vec![false, true, true, false, true])
+        );
+        assert_eq!(
+            candidates(true, TopKOrder::Aggregate)?,
+            Some(vec![false, false, true, false, true])
+        );
+        assert_eq!(
+            candidates(false, TopKOrder::Aggregate)?,
+            Some(vec![true, false, false, true, false])
+        );
+        // Fewer values than the limit have no cutoff.
+        let top_k = TopK {
+            limit: 5,
+            descending: true,
+            order: TopKOrder::Aggregate,
+        };
+        assert!(top_k.cutoff(values.as_ref())?.is_none());
         Ok(())
     }
 
@@ -2228,9 +2480,18 @@ mod tests {
             rows
         };
         let empty = RecordBatch::new_empty(Arc::clone(&schema));
-        for descending in [false, true] {
+        // By the keys `k`, and by the values `m` (as if they were the values of
+        // an aggregate).
+        let orders = [TopKOrder::Key, TopKOrder::Aggregate];
+        for (descending, order) in [false, true].into_iter().flat_map(|descending| {
+            orders.into_iter().map(move |order| (descending, order))
+        }) {
             for limit in [1, 2, 3, 10] {
-                let top_k = TopK { limit, descending };
+                let top_k = TopK {
+                    limit,
+                    descending,
+                    order,
+                };
                 for (left, right) in [(&left, &right), (&right, &left), (&left, &empty)] {
                     let merged = top_k.merge_groups(left, right)?;
                     let expected =
@@ -2384,288 +2645,323 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_produce_the_results_of_datafusion() -> Result<()> {
-        use super::super::test_support::assert_lowered_parity_with_setup;
+    async fn top_k_aggregations_produce_the_results_of_their_queries() -> Result<()> {
+        use super::super::test_support::{
+            assert_lowered_results_with_setup, without_limited_aggregations,
+        };
         let setup = async |ctx: &datafusion::prelude::SessionContext| register_tk(ctx);
-        // The queries, and whether their top-k aggregation is native when its
-        // final stage has a single partition (on a single thread).
+        // The queries, and what their native top-k aggregation orders its
+        // groups by (their results are unambiguous: there are no ties).
+        let (key, aggregate) = (TopKOrder::Key, TopKOrder::Aggregate);
         let queries = [
             // By the group key, of every supported type, in both directions,
             // with the `NULL` key first or last.
-            ("SELECT DISTINCT g FROM tk ORDER BY g LIMIT 5", true),
-            ("SELECT DISTINCT g FROM tk ORDER BY g DESC LIMIT 5", true),
+            ("SELECT DISTINCT g FROM tk ORDER BY g LIMIT 5", key),
+            ("SELECT DISTINCT g FROM tk ORDER BY g DESC LIMIT 5", key),
             (
                 "SELECT DISTINCT g FROM tk ORDER BY g NULLS FIRST LIMIT 3",
-                true,
+                key,
             ),
             (
                 "SELECT DISTINCT g FROM tk ORDER BY g DESC NULLS LAST LIMIT 7",
-                true,
+                key,
             ),
-            ("SELECT g FROM tk GROUP BY g ORDER BY g LIMIT 1", true),
-            ("SELECT DISTINCT u FROM tk ORDER BY u DESC LIMIT 4", true),
-            ("SELECT DISTINCT dt FROM tk ORDER BY dt LIMIT 6", true),
-            // Strings with 32-bit offsets are left to DataFusion.
+            ("SELECT g FROM tk GROUP BY g ORDER BY g LIMIT 1", key),
+            ("SELECT DISTINCT u FROM tk ORDER BY u DESC LIMIT 4", key),
+            ("SELECT DISTINCT dt FROM tk ORDER BY dt LIMIT 6", key),
             (
                 "SELECT DISTINCT s FROM tk ORDER BY s DESC NULLS LAST LIMIT 3",
-                false,
+                key,
             ),
-            ("SELECT DISTINCT sv FROM tk ORDER BY sv LIMIT 8", true),
-            ("SELECT DISTINCT ls FROM tk ORDER BY ls DESC LIMIT 2", true),
-            ("SELECT DISTINCT dec FROM tk ORDER BY dec LIMIT 5", true),
+            ("SELECT DISTINCT sv FROM tk ORDER BY sv LIMIT 8", key),
+            ("SELECT DISTINCT ls FROM tk ORDER BY ls DESC LIMIT 2", key),
+            ("SELECT DISTINCT dec FROM tk ORDER BY dec LIMIT 5", key),
             (
                 "SELECT DISTINCT t FROM tk ORDER BY t DESC NULLS LAST LIMIT 5",
-                true,
+                key,
             ),
             // More groups than there are.
-            ("SELECT DISTINCT g FROM tk ORDER BY g DESC LIMIT 1000", true),
+            ("SELECT DISTINCT g FROM tk ORDER BY g DESC LIMIT 1000", key),
             (
                 "SELECT DISTINCT g FROM tk WHERE g > 1000 ORDER BY g LIMIT 3",
-                true,
+                key,
             ),
-            // By a `MAX` descending or a `MIN` ascending: left to DataFusion,
-            // whose groups depend on the order of the rows when values tie.
+            // By a `MAX` descending or a `MIN` ascending, of values of every
+            // supported type.
             (
                 "SELECT g, MAX(id) FROM tk GROUP BY g ORDER BY MAX(id) DESC LIMIT 4",
-                false,
+                aggregate,
             ),
             (
                 "SELECT g, MIN(id) FROM tk GROUP BY g ORDER BY MIN(id) LIMIT 5",
-                false,
+                aggregate,
             ),
             (
                 "SELECT u, MIN(ndec) FROM tk GROUP BY u ORDER BY MIN(ndec) LIMIT 3",
-                false,
+                aggregate,
             ),
             (
                 "SELECT s, MAX(nt) FROM tk GROUP BY s ORDER BY MAX(nt) DESC NULLS LAST \
                  LIMIT 6",
-                false,
+                aggregate,
             ),
             (
                 "SELECT ls, MAX(nt) FROM tk GROUP BY ls ORDER BY MAX(nt) DESC LIMIT 6",
-                false,
+                aggregate,
             ),
             (
                 "SELECT dt, MIN(nsv) FROM tk GROUP BY dt ORDER BY MIN(nsv) LIMIT 4",
-                false,
+                aggregate,
+            ),
+            (
+                "SELECT g, MAX(ns) FROM tk GROUP BY g ORDER BY MAX(ns) DESC LIMIT 3",
+                aggregate,
             ),
             (
                 "SELECT g, MAX(nsv) FROM tk GROUP BY g ORDER BY MAX(nsv) DESC LIMIT 1000",
-                false,
+                aggregate,
             ),
-            // DataFusion keeps groups whose aggregate is `NULL` depending on
-            // the order of its rows: left to it (in no particular order).
+            // Of a nullable argument, its groups without values last.
+            (
+                "SELECT g, MAX(v) FROM tk GROUP BY g ORDER BY MAX(v) DESC NULLS LAST LIMIT 5",
+                aggregate,
+            ),
+            (
+                "SELECT g, MIN(dec) FROM tk GROUP BY g ORDER BY MIN(dec) LIMIT 5",
+                aggregate,
+            ),
             (
                 "SELECT g, MAX(m) FROM (SELECT g, MAX(v) AS m FROM tk GROUP BY g \
                  ORDER BY m DESC NULLS LAST LIMIT 1000) GROUP BY g",
-                false,
+                aggregate,
             ),
-            (
-                "SELECT g, MAX(v) FROM tk GROUP BY g ORDER BY MAX(v) DESC NULLS LAST LIMIT 5",
-                false,
-            ),
-            // With projections, aggregated again, and a window, which sees all
-            // groups of the aggregation.
+            // With projections, and aggregated again.
             (
                 "SELECT g + 1 AS g1, MAX(id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 5",
-                false,
+                aggregate,
             ),
             (
                 "SELECT COUNT(*), SUM(m), MIN(g) FROM \
                  (SELECT g, MAX(id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 5)",
-                false,
+                aggregate,
             ),
             (
                 "SELECT COUNT(*), MIN(s), MAX(s) FROM \
                  (SELECT DISTINCT s FROM tk ORDER BY s LIMIT 10)",
-                false,
+                key,
             ),
             (
                 "SELECT COUNT(*), MIN(sv), MAX(sv) FROM \
                  (SELECT DISTINCT sv FROM tk ORDER BY sv LIMIT 10)",
-                true,
-            ),
-            (
-                "SELECT g, MAX(id) AS m, COUNT(*) OVER () AS c FROM tk GROUP BY g \
-                 ORDER BY m DESC LIMIT 3",
-                false,
-            ),
-            (
-                "SELECT g, COUNT(*) OVER () AS c FROM tk GROUP BY g ORDER BY g DESC LIMIT 3",
-                true,
+                key,
             ),
         ];
         for target_partitions in [1, 4, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
+            let reference = without_limited_aggregations(config.clone());
             let ctx = crate::test_utils::datafusion_context(config.clone());
             register_tk(&ctx)?;
             let pipeline = crate::test_utils::pipeline_context(config.clone());
             register_tk(&pipeline)?;
-            for (sql, native) in queries {
+            for (sql, order) in queries {
                 // DataFusion plans a top-k aggregation.
                 let plan = ctx.sql(sql).await?.create_physical_plan().await?;
                 assert!(top_k_aggregation(&plan).is_some(), "{sql}");
-                // On several threads, its final stage has several partitions.
-                let native = native && target_partitions == 1;
-                // The lowering of the tests leaves windows (with their input)
-                // to DataFusion.
-                let window = sql.contains(" OVER ");
-                let root =
-                    assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
+                let root = assert_lowered_results_with_setup(
+                    sql,
+                    config.clone(),
+                    reference.clone(),
+                    &setup,
+                )
+                .await;
                 let top_k = native_top_k_aggregations(&root);
-                assert_eq!(top_k.len(), usize::from(native && !window), "{sql}");
-                // The planner lowers it natively too (but the windows here).
+                let orders = top_k.iter().map(|top_k| top_k.order).collect::<Vec<_>>();
+                assert_eq!(orders, [order], "{sql} on {target_partitions} partitions");
+                // So does the planner, but where it leaves the aggregation to
+                // DataFusion for reasons of its own (e.g. the coalescing of
+                // partial states of strings with 32-bit offsets).
                 let plan = pipeline.sql(sql).await?.create_physical_plan().await?;
                 let root = plan
                     .downcast_ref::<crate::bridge::PipelineRootExec>()
                     .expect("a pipeline plan")
                     .operator();
                 let planned = native_top_k_aggregations(root);
-                if !window {
-                    assert_eq!(planned, top_k, "{sql}");
-                }
-                assert!(planned.is_empty() || planned == top_k || window, "{sql}");
+                assert!(
+                    planned == top_k || planned.is_empty(),
+                    "{sql} on {target_partitions} partitions: {planned:?}"
+                );
             }
         }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_produce_their_groups_in_the_order_of_datafusion()
-    -> Result<()> {
-        use super::super::test_support::{
-            assert_aggregate_fails_like_datafusion_with_setup, lower,
-        };
-        use arrow::array::StringViewArray;
-        // DataFusion's top-k aggregation produces its groups from the best one
-        // to the worst (and the `NULL` key last): a projection above it that
-        // fails on several of them fails on the first one, whose value its
-        // error shows. So does the native one, also when it keeps all of its
-        // groups (without selecting or merging them).
+    async fn top_k_aggregations_produce_only_their_top_groups() -> Result<()> {
+        use super::super::test_support::test_lowering_outputs;
+        // The operators above a native top-k aggregation only see its top
+        // groups (of all partitions): the keys that do not cast to integers
+        // are never among them, on 1 and 4 threads, of a single stage and of
+        // two. (Which rows an error is raised for is the engine's own: on
+        // several partitions, those of DataFusion's top groups of every
+        // partition may not cast.)
         let schema =
             Arc::new(Schema::new(vec![Field::new("k", DataType::Utf8View, true)]));
-        let cases = [
+        let keys = (0..10_000)
+            .map(|i| Some(format!("{}{i:05}", if i < 10 { "" } else { "invalid" })))
+            .chain([None])
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::StringViewArray::from(keys))],
+        )?;
+        let setup = async |ctx: &datafusion::prelude::SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch.clone()]],
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        };
+        let row = |i: Option<i64>| {
+            vec![
+                ScalarValue::Int64(i),
+                ScalarValue::Utf8View(i.map(|i| format!("{i:05}"))),
+            ]
+        };
+        let queries = [
             (
-                vec!["invalid0021", "invalid0011"],
-                "LIMIT 2",
-                "'invalid0011'",
+                "SELECT CAST(k AS BIGINT) AS i, k FROM t GROUP BY k ORDER BY k LIMIT 3",
+                vec![row(Some(0)), row(Some(1)), row(Some(2))],
             ),
             (
-                vec!["invalid0011", "invalid0021"],
-                "DESC LIMIT 2",
-                "'invalid0021'",
+                "SELECT CAST(k AS BIGINT) AS i, k FROM t GROUP BY k \
+                 ORDER BY k NULLS FIRST LIMIT 3",
+                vec![row(None), row(Some(0)), row(Some(1))],
             ),
             (
-                vec![
-                    "invalid0050",
-                    "invalid0030",
-                    "invalid0010",
-                    "invalid0040",
-                    "invalid0020",
-                ],
-                "LIMIT 10",
-                "'invalid0010'",
-            ),
-            (
-                vec![
-                    "invalid0010",
-                    "invalid0030",
-                    "invalid0050",
-                    "invalid0020",
-                    "invalid0040",
-                ],
-                "DESC LIMIT 3",
-                "'invalid0050'",
+                "SELECT CAST(MIN(k) AS BIGINT) AS i, k FROM t GROUP BY k \
+                 ORDER BY MIN(k) LIMIT 3",
+                vec![row(Some(0)), row(Some(1)), row(Some(2))],
             ),
         ];
-        for (keys, order, message) in cases {
-            let sql = format!(
-                "SELECT CAST(k AS BIGINT) AS i, k FROM t GROUP BY k ORDER BY k {order}"
-            );
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(StringViewArray::from(keys.clone()))],
-            )?;
-            let setup = async |ctx: &datafusion::prelude::SessionContext| -> Result<()> {
-                let table = datafusion::datasource::MemTable::try_new(
-                    Arc::clone(&schema),
-                    vec![vec![batch.clone()]],
-                )?;
-                ctx.register_table("t", Arc::new(table))?;
-                Ok(())
-            };
-            let config = test_session_config().with_target_partitions(1);
-            // The top-k aggregation is native.
-            let ctx = crate::test_utils::datafusion_context(config.clone());
-            setup(&ctx).await?;
-            let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
-            assert_eq!(native_top_k_aggregations(&lower(&plan)?).len(), 1, "{sql}");
-            assert_aggregate_fails_like_datafusion_with_setup(
-                &sql,
-                config.clone(),
-                &setup,
-                message,
-            )
-            .await;
-            // And through the planner.
-            let pipeline = crate::test_utils::pipeline_context(config);
-            setup(&pipeline).await?;
-            let error = pipeline
-                .sql(&sql)
-                .await?
-                .collect()
-                .await
-                .expect_err("a cast error");
-            assert!(error.to_string().contains(message), "{sql}: {error}");
+        for threads in [1, 4] {
+            let config = test_session_config().with_target_partitions(threads);
+            for (sql, expected) in &queries {
+                // Through the lowering of the tests, whose native projection
+                // evaluates the cast of the output of the native aggregation.
+                for (engine, output, root) in
+                    test_lowering_outputs(sql, config.clone(), &setup).await
+                {
+                    assert_eq!(native_top_k_aggregations(&root).len(), 1, "{sql}");
+                    assert_eq!(
+                        &rows_of(&output.batches),
+                        expected,
+                        "{engine} on {threads} threads: {sql}"
+                    );
+                }
+            }
         }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_of_tied_values_are_left_to_datafusion() -> Result<()> {
-        use super::super::test_support::assert_lowered_parity_with_setup;
-        // Of the groups that tie with the worst of its top groups, the heap of
-        // DataFusion's top-k aggregation by a `MIN` / `MAX` keeps the one whose
-        // row came last, which decides the groups that the projection above it
-        // evaluates `1000 / ...` for (and the groups the sort returns).
-        let setup = async |_: &datafusion::prelude::SessionContext| Ok(());
+    async fn top_k_aggregations_break_ties_as_they_choose() -> Result<()> {
+        use super::super::test_support::{assert_top_rows, lowered_outputs};
+        // Of the groups that tie with the last of the top groups, a top-k
+        // aggregation by a `MIN` / `MAX` keeps any: its query returns the best
+        // values, of groups of its rows.
+        let setup = async |ctx: &datafusion::prelude::SessionContext| register_tkn(ctx);
         let queries = [
-            // DataFusion keeps `a = 3`, not `a = 1`.
-            "SELECT 1000 / (a - 1) AS q, a, MAX(b) AS m \
-             FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
-             GROUP BY a ORDER BY m DESC LIMIT 1",
-            "SELECT 1000 / (a - 1) AS q, a, MIN(b) AS m \
-             FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
-             GROUP BY a ORDER BY m LIMIT 1",
+            // The query, the query of all of its rows, the column of its value,
+            // whether its order is descending, and its limit.
+            (
+                "SELECT a, MAX(b) AS m FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
+                 GROUP BY a ORDER BY m DESC LIMIT 1",
+                "SELECT a, MAX(b) AS m FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
+                 GROUP BY a",
+                true,
+                1,
+            ),
+            (
+                "SELECT a, MIN(b) AS m FROM (VALUES (3, 1), (1, 1), (2, 1)) AS t(a, b) \
+                 GROUP BY a ORDER BY m LIMIT 1",
+                "SELECT a, MIN(b) AS m FROM (VALUES (3, 1), (1, 1), (2, 1)) AS t(a, b) \
+                 GROUP BY a",
+                false,
+                1,
+            ),
             // Ties behind a better group.
-            "SELECT 1000 / (a - 3) AS q, a, MAX(b) AS m \
-             FROM (VALUES (1, 5), (2, 3), (3, 3), (4, 3), (5, 1)) AS t(a, b) \
-             GROUP BY a ORDER BY m DESC LIMIT 2",
+            (
+                "SELECT a, MAX(b) AS m \
+                 FROM (VALUES (1, 5), (2, 3), (3, 3), (4, 3), (5, 1)) AS t(a, b) \
+                 GROUP BY a ORDER BY m DESC LIMIT 2",
+                "SELECT a, MAX(b) AS m \
+                 FROM (VALUES (1, 5), (2, 3), (3, 3), (4, 3), (5, 1)) AS t(a, b) \
+                 GROUP BY a",
+                true,
+                2,
+            ),
             // Groups that drop out and come back with a value that ties.
-            "SELECT 1000 / (a - 2) AS q, a, MAX(b) AS m \
-             FROM (VALUES (1, 1), (2, 2), (3, 1), (2, 1), (1, 2), (3, 2)) AS t(a, b) \
-             GROUP BY a ORDER BY m DESC LIMIT 1",
-            // Without a projection, the sort returns the group it keeps (`a = 3`,
-            // and `a = 2`). (The order in which the sort of the pipeline engine
-            // returns several rows that tie differs from DataFusion's, on the
-            // base too: such queries are not used here.)
-            "SELECT a, MAX(b) AS m FROM (VALUES (1, 1), (2, 1), (3, 1)) AS t(a, b) \
-             GROUP BY a ORDER BY m DESC LIMIT 1",
-            "SELECT a, MIN(b) AS m FROM (VALUES (3, 1), (1, 1), (2, 1)) AS t(a, b) \
-             GROUP BY a ORDER BY m LIMIT 1",
+            (
+                "SELECT a, MAX(b) AS m \
+                 FROM (VALUES (1, 1), (2, 2), (3, 1), (2, 1), (1, 2), (3, 2)) AS t(a, b) \
+                 GROUP BY a ORDER BY m DESC LIMIT 1",
+                "SELECT a, MAX(b) AS m \
+                 FROM (VALUES (1, 1), (2, 2), (3, 1), (2, 1), (1, 2), (3, 2)) AS t(a, b) \
+                 GROUP BY a",
+                true,
+                1,
+            ),
+            // 40,000 groups of 1 or 2 rows, and 13 values: most groups tie.
+            (
+                "SELECT g, MAX(v % 7) AS m FROM tkn GROUP BY g ORDER BY m DESC LIMIT 10",
+                "SELECT g, MAX(v % 7) AS m FROM tkn GROUP BY g",
+                true,
+                10,
+            ),
+            (
+                "SELECT g, MIN(v % 7) AS m FROM tkn GROUP BY g ORDER BY m LIMIT 1000",
+                "SELECT g, MIN(v % 7) AS m FROM tkn GROUP BY g",
+                false,
+                1000,
+            ),
+            // Groups without values, which tie as the last ones: there are only
+            // 4 groups of `g < 5` with values.
+            (
+                "SELECT g, MAX(k) AS m FROM tkn WHERE g < 5 OR k IS NULL GROUP BY g \
+                 ORDER BY m DESC NULLS LAST LIMIT 8",
+                "SELECT g, MAX(k) AS m FROM tkn WHERE g < 5 OR k IS NULL GROUP BY g",
+                true,
+                8,
+            ),
         ];
         for target_partitions in [1, 4, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
             let ctx = crate::test_utils::datafusion_context(config.clone());
-            for sql in queries {
-                if target_partitions == 1 {
-                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                    assert!(top_k_aggregation(&plan).is_some(), "{sql}");
+            register_tkn(&ctx)?;
+            for (sql, all, descending, limit) in queries {
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                assert!(top_k_aggregation(&plan).is_some(), "{sql}");
+                let all = ctx.sql(all).await?.collect().await?;
+                for (engine, output, root) in
+                    lowered_outputs(sql, config.clone(), &setup).await
+                {
+                    let context =
+                        format!("{engine} on {target_partitions} partitions: {sql}");
+                    if engine != "planner" {
+                        let top_k = native_top_k_aggregations(&root);
+                        assert_eq!(top_k.len(), 1, "{context}");
+                        assert_eq!(top_k[0].order, TopKOrder::Aggregate, "{context}");
+                    }
+                    assert_top_rows(
+                        &output.batches,
+                        &all,
+                        1,
+                        descending,
+                        limit,
+                        &context,
+                    );
                 }
-                let root =
-                    assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
-                assert!(native_top_k_aggregations(&root).is_empty(), "{sql}");
             }
         }
         Ok(())
@@ -2723,9 +3019,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_of_many_groups_produce_the_results_of_datafusion()
+    async fn top_k_aggregations_of_many_groups_produce_the_results_of_their_queries()
     -> Result<()> {
-        use super::super::test_support::assert_lowered_parity_with_setup;
+        use super::super::test_support::{
+            assert_lowered_results_with_setup, without_limited_aggregations,
+        };
         let setup = async |ctx: &datafusion::prelude::SessionContext| register_tkn(ctx);
         let queries = [
             // Shuffled keys, with the `NULL` key first or last.
@@ -2737,16 +3035,15 @@ mod tests {
             "SELECT DISTINCT asc FROM tkn ORDER BY asc LIMIT 7",
             "SELECT DISTINCT asc FROM tkn ORDER BY asc DESC LIMIT 7",
             "SELECT DISTINCT desc FROM tkn ORDER BY desc LIMIT 7",
-            // By a `MAX` or a `MIN` (left to DataFusion), of groups of 1 or 2
-            // rows, whose values are shuffled, or come best (or worst) first.
+            // By a `MAX` or a `MIN`, of groups of 1 or 2 rows, whose values are
+            // shuffled, or come best (or worst) first.
             "SELECT g, MAX(v) FROM tkn GROUP BY g ORDER BY MAX(v) DESC LIMIT 10",
             "SELECT g, MIN(v) FROM tkn GROUP BY g ORDER BY MIN(v) LIMIT 10",
             "SELECT k, MIN(asc) FROM tkn GROUP BY k ORDER BY MIN(asc) LIMIT 5",
             "SELECT k, MAX(asc) FROM tkn GROUP BY k ORDER BY MAX(asc) DESC LIMIT 5",
             "SELECT sv, MIN(v) FROM tkn GROUP BY sv ORDER BY MIN(v) LIMIT 4",
             "SELECT g, MAX(sv) FROM tkn GROUP BY g ORDER BY MAX(sv) DESC LIMIT 3",
-            // Fewer groups than a table holds (by a `MIN` or `MAX`, left to
-            // DataFusion, too).
+            // Fewer groups than a table holds.
             "SELECT few, MAX(v) FROM tkn GROUP BY few ORDER BY MAX(v) DESC LIMIT 10",
             "SELECT few, MIN(asc) FROM tkn GROUP BY few ORDER BY MIN(asc) LIMIT 3",
             "SELECT few, MAX(asc) FROM tkn GROUP BY few ORDER BY MAX(asc) DESC LIMIT 3",
@@ -2757,6 +3054,7 @@ mod tests {
             "SELECT DISTINCT asc FROM tkn ORDER BY asc DESC LIMIT 20000",
             "SELECT DISTINCT k FROM tkn ORDER BY k DESC LIMIT 32768",
             "SELECT DISTINCT k FROM tkn ORDER BY k LIMIT 32769",
+            "SELECT k, MIN(v) FROM tkn GROUP BY k ORDER BY MIN(v) LIMIT 30000",
         ];
         for target_partitions in [1, 4, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
@@ -2765,15 +3063,22 @@ mod tests {
             for sql in queries {
                 let plan = ctx.sql(sql).await?.create_physical_plan().await?;
                 assert!(top_k_aggregation(&plan).is_some(), "{sql}");
-                let root =
-                    assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
-                let native = native_top_k_aggregations(&root).len();
+                let root = assert_lowered_results_with_setup(
+                    sql,
+                    config.clone(),
+                    without_limited_aggregations(config.clone()),
+                    &setup,
+                )
+                .await;
+                let top_k = native_top_k_aggregations(&root);
                 let by_key = !sql.contains("MIN(") && !sql.contains("MAX(");
-                assert_eq!(
-                    native,
-                    usize::from(target_partitions == 1 && by_key),
-                    "{sql}"
-                );
+                let order = if by_key {
+                    TopKOrder::Key
+                } else {
+                    TopKOrder::Aggregate
+                };
+                let orders = top_k.iter().map(|top_k| top_k.order).collect::<Vec<_>>();
+                assert_eq!(orders, [order], "{sql} on {target_partitions} partitions");
             }
         }
         Ok(())
@@ -2781,37 +3086,32 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "allocates more than 8 GiB"]
-    async fn top_k_aggregations_of_huge_strings_produce_the_results_of_datafusion()
+    async fn top_k_aggregations_of_huge_strings_produce_the_results_of_their_queries()
     -> Result<()> {
-        use arrow::array::{LargeStringArray, StringArray};
+        use arrow::array::LargeStringArray;
         use arrow::buffer::{Buffer, OffsetBuffer};
 
         use super::super::test_support::assert_lowered_parity_with_setup;
         // Two distinct keys of 1,100,000,000 bytes, in batches of their own of
         // a single partition: together, more than an array of strings with
-        // 32-bit offsets can hold. DataFusion's top-k aggregation holds the
-        // best of them only.
+        // 32-bit offsets can hold, which the table of a thread holds of the
+        // keys of `LargeUtf8` (64-bit offsets) and `Utf8View` (views of several
+        // buffers). (Those of `Utf8` do not fit into the `GroupValues` of a
+        // table, whatever its limit, nor into DataFusion's: a capacity limit of
+        // the tables of both engines, which DataFusion's top-k aggregation, of
+        // the best group only, avoids.)
         let len = 1_100_000_000;
-        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+        for data_type in [DataType::LargeUtf8, DataType::Utf8View] {
             let schema =
                 Arc::new(Schema::new(vec![Field::new("k", data_type.clone(), false)]));
             let key = |byte: u8| -> Result<RecordBatch> {
                 let bytes = Buffer::from_vec(vec![byte; len]);
-                let key: ArrayRef = match data_type {
-                    DataType::Utf8 => Arc::new(StringArray::new(
-                        OffsetBuffer::new(vec![0, len as i32].into()),
-                        bytes,
-                        None,
-                    )),
-                    _ => {
-                        let key = LargeStringArray::new(
-                            OffsetBuffer::new(vec![0, len as i64].into()),
-                            bytes,
-                            None,
-                        );
-                        arrow::compute::cast(&key, &data_type)?
-                    }
-                };
+                let key = LargeStringArray::new(
+                    OffsetBuffer::new(vec![0, len as i64].into()),
+                    bytes,
+                    None,
+                );
+                let key = arrow::compute::cast(&key, &data_type)?;
                 Ok(RecordBatch::try_new(Arc::clone(&schema), vec![key])?)
             };
             let partitions = vec![vec![key(b'b')?, key(b'a')?]];
@@ -2832,82 +3132,134 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn top_k_aggregations_of_other_values_are_left_to_datafusion() -> Result<()> {
-        // On a single thread, the final stages have a single partition.
-        let config = test_session_config().with_target_partitions(1);
-        let ctx = crate::test_utils::datafusion_context(config);
-        crate::test_utils::register_test_tables(&ctx)?;
-        register_tk(&ctx)?;
-        let lowered = async |ctx: &datafusion::prelude::SessionContext, sql: &str| {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let aggregate = top_k_aggregation(&plan).expect("a limited aggregation");
-            Ok::<_, datafusion_common::DataFusionError>(try_lower(&aggregate)?.is_some())
+    async fn limited_aggregations_of_any_values_are_native() -> Result<()> {
+        use super::super::test_support::{
+            assert_aggregate_fails_with_setup, assert_any_rows,
+            assert_lowered_results_with_setup, assert_top_rows, lowered_outputs,
+            without_limited_aggregations,
         };
-        assert!(lowered(&ctx, "SELECT DISTINCT g FROM tk ORDER BY g LIMIT 3").await?);
-        for sql in [
-            // Floating point values, which DataFusion's top-k aggregation
-            // does not compare like its sorts.
-            "SELECT DISTINCT c FROM t1 ORDER BY c LIMIT 3",
-            "SELECT a, MAX(c) FROM t1 GROUP BY a ORDER BY MAX(c) DESC NULLS LAST LIMIT 3",
-            // Expressions that may fail (of a key that DataFusion computes in
-            // the aggregation, not in a projection below it).
-            "SELECT 100 / a AS q FROM t1 GROUP BY 100 / a ORDER BY q LIMIT 3",
-            "SELECT g, MAX(1000 / id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
-            // A nullable argument of a `MIN` / `MAX`.
-            "SELECT g, MAX(v) AS m FROM tk GROUP BY g ORDER BY m DESC NULLS LAST LIMIT 3",
-            // Strings with 32-bit offsets, as keys and as values.
-            "SELECT DISTINCT s FROM tk ORDER BY s LIMIT 3",
-            "SELECT g, MAX(ns) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
-            // A soft limit.
-            "SELECT DISTINCT d FROM t1 LIMIT 3",
-        ] {
-            assert!(!lowered(&ctx, sql).await?, "{sql}");
+        let setup = async |ctx: &datafusion::prelude::SessionContext| {
+            crate::test_utils::register_test_tables(ctx)?;
+            register_tk(ctx)
+        };
+        let (key, aggregate) = (TopKOrder::Key, TopKOrder::Aggregate);
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            let ctx = crate::test_utils::datafusion_context(config.clone());
+            setup(&ctx).await?;
+            // The limits of the native aggregation of `sql`.
+            let lowered =
+                async |sql: &str| -> Result<(Option<TopKOrder>, Option<usize>)> {
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let plan = top_k_aggregation(&plan).expect("a limited aggregation");
+                    let aggregate = try_lower(&plan)?.expect("a lowered aggregation");
+                    let spec = &aggregate.spec;
+                    Ok((spec.top_k.map(|top_k| top_k.order), spec.soft_limit))
+                };
+            // Floating point values, by their total order, as the sort orders
+            // them (DataFusion's top-k aggregation compares them otherwise), of
+            // nullable arguments, strings with 32-bit offsets, and final stages
+            // of several partitions.
+            for (sql, order) in [
+                ("SELECT DISTINCT c FROM t1 ORDER BY c LIMIT 3", key),
+                ("SELECT DISTINCT c FROM t1 ORDER BY c DESC LIMIT 3", key),
+                (
+                    "SELECT g, MAX(v) AS m FROM tk GROUP BY g ORDER BY m DESC NULLS LAST \
+                     LIMIT 3",
+                    aggregate,
+                ),
+                ("SELECT DISTINCT s FROM tk ORDER BY s LIMIT 3", key),
+                (
+                    "SELECT g, MAX(ns) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
+                    aggregate,
+                ),
+                ("SELECT DISTINCT g FROM tk ORDER BY g LIMIT 3", key),
+            ] {
+                assert_eq!(lowered(sql).await?, (Some(order), None), "{sql}");
+                assert_lowered_results_with_setup(
+                    sql,
+                    config.clone(),
+                    without_limited_aggregations(config.clone()),
+                    &setup,
+                )
+                .await;
+            }
+            // Minima and maxima of floating point values, of which many groups
+            // tie (`NaN`s are the greatest values).
+            for (sql, descending) in [
+                (
+                    "SELECT a, MAX(c) AS m FROM t1 GROUP BY a ORDER BY m DESC NULLS LAST \
+                     LIMIT 3",
+                    true,
+                ),
+                (
+                    "SELECT a, MIN(c) AS m FROM t1 GROUP BY a ORDER BY m LIMIT 3",
+                    false,
+                ),
+            ] {
+                assert_eq!(lowered(sql).await?, (Some(aggregate), None), "{sql}");
+                let function = if descending { "MAX" } else { "MIN" };
+                let all = format!("SELECT a, {function}(c) AS m FROM t1 GROUP BY a");
+                let all = ctx.sql(&all).await?.collect().await?;
+                for (engine, output, _) in
+                    lowered_outputs(sql, config.clone(), &setup).await
+                {
+                    assert_top_rows(&output.batches, &all, 1, descending, 3, engine);
+                }
+            }
+            // Keys and arguments that may fail, which both engines evaluate for
+            // all rows.
+            for (sql, order) in [
+                (
+                    "SELECT 100 / a AS q FROM t1 GROUP BY 100 / a ORDER BY q LIMIT 3",
+                    key,
+                ),
+                (
+                    "SELECT g, MAX(1000 / id) AS m FROM tk GROUP BY g ORDER BY m DESC LIMIT 3",
+                    aggregate,
+                ),
+            ] {
+                assert_eq!(lowered(sql).await?, (Some(order), None), "{sql}");
+                assert_aggregate_fails_with_setup(
+                    sql,
+                    config.clone(),
+                    &setup,
+                    &["Divide by zero"],
+                )
+                .await;
+            }
+            // A soft limit: any 3 groups.
+            let sql = "SELECT DISTINCT d FROM t1 LIMIT 3";
+            assert_eq!(lowered(sql).await?, (None, Some(3)), "{sql}");
+            let all = ctx
+                .sql("SELECT DISTINCT d FROM t1")
+                .await?
+                .collect()
+                .await?;
+            for (engine, output, _) in lowered_outputs(sql, config.clone(), &setup).await
+            {
+                assert_any_rows(&output.batches, &all, 3, engine);
+            }
         }
-        // A final stage of several partitions.
-        let ctx = crate::test_utils::datafusion_context(test_session_config());
-        register_tk(&ctx)?;
-        assert!(!lowered(&ctx, "SELECT DISTINCT g FROM tk ORDER BY g LIMIT 3").await?);
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rows_of_simple_aggregations_may_bypass_the_tables() -> Result<()> {
+    async fn rows_of_aggregations_of_any_aggregates_may_bypass_the_tables() -> Result<()>
+    {
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
-        let untrusting = ConfigOptions::default();
-        let with_extension = |trusted: TrustedAggregateFunctions| {
-            let mut options = ConfigOptions::default();
-            options.extensions.insert(trusted);
-            options
-        };
-        let functions =
-            datafusion::functions_aggregate::all_default_aggregate_functions();
-        let trusting = with_extension(
-            PhysicalHashAggregate::trusted_aggregate_functions(&functions),
-        );
-        // Sessions whose extension trusts no function behave like the sessions
-        // without it.
-        let untrusting_sessions = [
-            untrusting,
-            with_extension(TrustedAggregateFunctions::default()),
-            with_extension(PhysicalHashAggregate::trusted_aggregate_functions(&[
-                Arc::new(super::super::test_support::lookalike_count()),
-                datafusion::functions_aggregate::stddev::stddev_udaf(),
-            ])),
-        ];
-        // The queries, and whether their rows bypass the tables in a session
-        // that does not trust DataFusion's built-in aggregate functions, and
-        // in a session that does.
+        ctx.register_udaf(super::super::test_support::lookalike_count());
+        ctx.register_udaf(super::super::test_support::lookalike_sum());
+        // The queries, and whether their rows may bypass the tables, whatever
+        // their aggregate functions (built-in or user-defined, `DISTINCT` and
+        // ordered ones included).
         let queries = [
             // Without aggregates.
-            ("SELECT DISTINCT id, c, f, ts FROM t1", true, true),
-            ("SELECT a, d FROM t1 GROUP BY a, d", true, true),
-            // The accumulators of aggregates aggregate every row in the tables,
-            // but in the sessions that trust their functions (see
-            // `rows_can_bypass_tables`).
+            ("SELECT DISTINCT id, c, f, ts FROM t1", true),
+            ("SELECT a, d FROM t1 GROUP BY a, d", true),
             (
                 "SELECT a, COUNT(*), SUM(b), MIN(d), AVG(g) FROM t1 GROUP BY a",
-                false,
                 true,
             ),
             (
@@ -2915,89 +3267,74 @@ mod tests {
                  BIT_XOR(b), APPROX_DISTINCT(d), MEDIAN(b) FILTER (WHERE e), \
                  ARRAY_AGG(a), FIRST_VALUE(d), LAST_VALUE(f), COUNT(a, b) \
                  FROM t1 GROUP BY h",
-                false,
                 true,
             ),
-            // `DISTINCT` and ordered aggregates, whose accumulators are not
-            // trusted.
+            // `DISTINCT` aggregates. (DataFusion plans a single `DISTINCT`
+            // aggregate, or several of the same argument with `SUM`, `MIN` or
+            // `MAX`, as an aggregation of the aggregation by the group keys and
+            // the argument, without `DISTINCT`: these queries keep their
+            // `DISTINCT` aggregates.)
             (
                 "SELECT d, h, COUNT(DISTINCT a), MEDIAN(b) FILTER (WHERE e) FROM t1 \
                  GROUP BY d, h",
-                false,
-                false,
+                true,
             ),
-            (
-                "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
-                false,
-                false,
-            ),
-            (
-                "SELECT d, FIRST_VALUE(a ORDER BY id) FROM t1 GROUP BY d",
-                false,
-                false,
-            ),
-            // (DataFusion plans a single `DISTINCT` aggregate, or several of the
-            // same argument with `SUM`, `MIN` or `MAX`, as an aggregation of
-            // the aggregation by the group keys and the argument, without
-            // `DISTINCT`: these queries keep their `DISTINCT` aggregates.)
             (
                 "SELECT d, SUM(DISTINCT b), COUNT(*) FROM t1 GROUP BY d",
-                false,
-                false,
-            ),
-            (
-                "SELECT d, COUNT(DISTINCT a), COUNT(DISTINCT b) FROM t1 GROUP BY d",
-                false,
-                false,
+                true,
             ),
             (
                 "SELECT h, ARRAY_AGG(DISTINCT a), COUNT(*) FROM t1 GROUP BY h",
-                false,
-                false,
+                true,
             ),
             (
                 "SELECT h, AVG(DISTINCT a), MEDIAN(DISTINCT b), MAX(c) FROM t1 GROUP BY h",
-                false,
-                false,
+                true,
+            ),
+            // Ordered aggregates, whose accumulators order their values.
+            (
+                "SELECT d, ARRAY_AGG(id ORDER BY id) FROM t1 GROUP BY d",
+                true,
             ),
             (
                 "SELECT d, LAST_VALUE(a ORDER BY id), COUNT(*) FROM t1 GROUP BY d",
-                false,
-                false,
+                true,
             ),
             (
                 "SELECT d, ARRAY_AGG(a ORDER BY b DESC) FILTER (WHERE e), MAX(a) FROM t1 \
                  GROUP BY d",
-                false,
-                false,
+                true,
             ),
-            (
-                "SELECT d, FIRST_VALUE(a ORDER BY id DESC), SUM(b) FROM t1 GROUP BY d",
-                false,
-                false,
-            ),
-            // Functions that are not trusted.
-            ("SELECT d, STDDEV(b) FROM t1 GROUP BY d", false, false),
+            // Other built-in functions, and user-defined functions that look like
+            // DataFusion's `count` and `sum` (see `lookalike_count`).
+            ("SELECT d, STDDEV(b) FROM t1 GROUP BY d", true),
             (
                 "SELECT d, COUNT(*), STRING_AGG(h, ',') FROM t1 GROUP BY d",
-                false,
+                true,
+            ),
+            ("SELECT a, count(b), sum(b) FROM t1 GROUP BY a", true),
+            // Aggregates that require their rows in an order, which every
+            // thread sorts before it aggregates them.
+            (
+                "SELECT d, NTH_VALUE(a, 2 ORDER BY id) FROM t1 GROUP BY d",
                 false,
             ),
             // Grouping sets.
-            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false, false),
+            ("SELECT d, e FROM t1 GROUP BY ROLLUP (d, e)", false),
             (
                 "SELECT d, e, COUNT(*) FROM t1 GROUP BY ROLLUP (d, e)",
                 false,
-                false,
             ),
             // Keys and arguments of nested types and dictionaries.
-            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false, false),
+            ("SELECT [a, b] AS ab FROM t1 GROUP BY [a, b]", false),
             (
                 "SELECT arrow_cast(d, 'Dictionary(Int32, Utf8)') AS dd FROM t1 GROUP BY dd",
                 false,
-                false,
             ),
-            ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false, false),
+            ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false),
+            // Limited aggregations, whose tables hold the groups of their limit.
+            ("SELECT DISTINCT d FROM t1 LIMIT 3", false),
+            ("SELECT DISTINCT a FROM t1 ORDER BY a LIMIT 3", false),
         ];
         /// The first aggregation of the plan of `sql` that is lowered, from the
         /// top.
@@ -3018,34 +3355,9 @@ mod tests {
             }
             Ok(aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}")))
         }
-        for (sql, untrusted, trusted) in queries {
+        for (sql, bypass) in queries {
             let aggregate = lowered_aggregation(&ctx, sql).await?;
-            let spec = &aggregate.spec;
-            for options in &untrusting_sessions {
-                assert_eq!(spec.rows_bypass_tables(options), untrusted, "{sql}");
-                // As on the base: the rows of the aggregations without aggregates
-                // (of the aggregations that may bypass the tables) only.
-                assert_eq!(untrusted, spec.bypass && spec.update.is_empty(), "{sql}");
-            }
-            assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
-        }
-        // The aggregates of user-defined functions that look like DataFusion's
-        // `count` and `sum` (see `lookalike_count`), and replace them, are not
-        // trusted.
-        let ctx = crate::test_utils::datafusion_context(test_session_config());
-        crate::test_utils::register_test_tables(&ctx)?;
-        ctx.register_udaf(super::super::test_support::lookalike_count());
-        ctx.register_udaf(super::super::test_support::lookalike_sum());
-        for sql in [
-            "SELECT a, count(b) FROM t1 GROUP BY a",
-            "SELECT a, count(*) FROM t1 GROUP BY a",
-            "SELECT a, MAX(b), sum(b) FROM t1 GROUP BY a",
-        ] {
-            let aggregate = lowered_aggregation(&ctx, sql).await?;
-            assert!(aggregate.spec.bypass, "{sql}");
-            for options in untrusting_sessions.iter().chain([&trusting]) {
-                assert!(!aggregate.spec.rows_bypass_tables(options), "{sql}");
-            }
+            assert_eq!(aggregate.spec.bypass, bypass, "{sql}");
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
@@ -3053,22 +3365,11 @@ mod tests {
             MAX_FIXED_SIZE_BINARY
         )));
         assert!(!is_flat_type(&DataType::FixedSizeBinary(1_100_000)));
-        // Nor do the rows of a top-k aggregation (of a single partition).
-        let ctx = crate::test_utils::datafusion_context(
-            test_session_config().with_target_partitions(1),
-        );
-        crate::test_utils::register_test_tables(&ctx)?;
-        let sql = "SELECT DISTINCT a FROM t1 ORDER BY a LIMIT 3";
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let aggregate =
-            try_lower(&top_k_aggregation(&plan).expect("a top-k aggregation"))?
-                .expect("a lowered aggregation");
-        assert!(aggregate.spec.top_k.is_some() && !aggregate.spec.bypass);
         Ok(())
     }
 
     #[test]
-    fn trusted_aggregate_functions_are_identified_by_their_implementation_types()
+    fn built_in_aggregate_functions_are_identified_by_their_implementation_types()
     -> Result<()> {
         use datafusion::functions_aggregate::{
             approx_distinct::ApproxDistinct, array_agg::ArrayAgg, average::Avg,
@@ -3077,9 +3378,10 @@ mod tests {
             min_max::Min, sum::Sum,
         };
 
-        use super::super::test_support::{lookalike_count, lookalike_sum};
+        use super::super::test_support::{lookalike_count, lookalike_max, lookalike_sum};
         // Of the built-in aggregate functions that a session registers by
-        // default, exactly those of `BUILTIN_AGGREGATES` are trusted.
+        // default, exactly those of `BUILTIN_AGGREGATES` are trusted (by the
+        // extension, which the native aggregation no longer reads).
         let functions =
             datafusion::functions_aggregate::all_default_aggregate_functions();
         let trusted = PhysicalHashAggregate::trusted_aggregate_functions(&functions);
@@ -3135,9 +3437,9 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(types.len(), BUILTIN_AGGREGATES.len() - 2);
 
-        // Functions that look like DataFusion's `count` and `sum` in every way
-        // but their types: of the same names, implemented by types of the same
-        // names, whose `Debug` output is the built-in functions'.
+        // Functions that look like DataFusion's `count`, `sum` and `max` in
+        // every way but their types: of the same names, implemented by types of
+        // the same names, whose `Debug` output is the built-in functions'.
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
         let aggregate = |function: Arc<AggregateUDF>| {
             AggregateExprBuilder::new(function, vec![col("v", &schema)?])
@@ -3145,8 +3447,13 @@ mod tests {
                 .alias("aggregate")
                 .build()
         };
-        let lookalikes = [lookalike_count(), lookalike_sum()].map(Arc::new);
-        for (lookalike, builtin) in lookalikes.iter().zip([count_udaf(), sum_udaf()]) {
+        let lookalikes =
+            [lookalike_count(), lookalike_sum(), lookalike_max()].map(Arc::new);
+        for (lookalike, builtin) in
+            lookalikes
+                .iter()
+                .zip([count_udaf(), sum_udaf(), max_udaf()])
+        {
             assert_eq!(lookalike.name(), builtin.name());
             assert_eq!(
                 format!("{:?}", lookalike.inner()),
@@ -3156,77 +3463,31 @@ mod tests {
                 implementation_type(lookalike),
                 implementation_type(&builtin)
             );
-            // In a session that trusts the built-in functions, the aggregates of
-            // the built-in function are trusted, those of the lookalike are not.
-            assert!(trusted.trusts(&aggregate(Arc::clone(&builtin))?));
-            assert!(!trusted.trusts(&aggregate(Arc::clone(lookalike))?));
         }
-        // Nor are they trusted if they are given as built-in functions, on
-        // their own or with the built-in functions.
+        // They are not trusted, on their own or with the built-in functions.
         let given = PhysicalHashAggregate::trusted_aggregate_functions(&lookalikes);
         assert!(given.names().is_empty());
-        for aggregate in lookalikes
-            .iter()
-            .map(|lookalike| aggregate(Arc::clone(lookalike)))
-        {
-            assert!(!given.trusts(&aggregate?));
-        }
         let mut all = lookalikes.to_vec();
         all.extend(functions.iter().cloned());
         let given = PhysicalHashAggregate::trusted_aggregate_functions(&all);
         let mut names = given.names();
         names.sort_unstable();
         assert_eq!(names, builtins);
-        for aggregate in lookalikes
-            .iter()
-            .map(|lookalike| aggregate(Arc::clone(lookalike)))
-        {
-            assert!(!given.trusts(&aggregate?));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn distinct_and_ordered_aggregates_are_not_trusted() -> Result<()> {
-        // Every built-in function that a session may trust, plain (trusted),
-        // `DISTINCT` and ordered (not trusted). DataFusion drops the `ORDER BY`
-        // of the aggregates of the functions whose values do not depend on the
-        // order of their rows: their ordered aggregates are not ordered (and
-        // are trusted), those of `FIRST_VALUE`, `LAST_VALUE` and `ARRAY_AGG`
-        // are.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("v", DataType::Int64, true),
-            Field::new("b", DataType::Boolean, true),
-        ]));
-        let functions =
-            datafusion::functions_aggregate::all_default_aggregate_functions();
-        let trusted = PhysicalHashAggregate::trusted_aggregate_functions(&functions);
-        for (name, _) in BUILTIN_AGGREGATES {
-            let function = functions
-                .iter()
-                .find(|function| function.name() == name)
-                .expect("a built-in function");
-            let argument = if name.starts_with("bool_") { "b" } else { "v" };
-            let aggregate = |distinct: bool, order_by: Vec<PhysicalSortExpr>| {
-                AggregateExprBuilder::new(
-                    Arc::clone(function),
-                    vec![col(argument, &schema)?],
-                )
-                .schema(Arc::clone(&schema))
-                .alias(name)
-                .with_distinct(distinct)
-                .order_by(order_by)
-                .build()
-            };
-            let by_v = || vec![PhysicalSortExpr::new_default(col("v", &schema).unwrap())];
-            assert!(trusted.trusts(&aggregate(false, vec![])?), "{name}");
-            assert!(!trusted.trusts(&aggregate(true, vec![])?), "{name}");
-            assert!(!trusted.trusts(&aggregate(true, by_v())?), "{name}");
-            let ordered = aggregate(false, by_v())?;
-            let sensitive = ["first_value", "last_value", "array_agg"].contains(&name);
-            assert_eq!(ordered.order_bys().is_empty(), !sensitive, "{name}");
-            assert_eq!(trusted.trusts(&ordered), !sensitive, "{name}");
-        }
+        // Only DataFusion's `max`, descending, and `min`, ascending, order the
+        // groups of top-k aggregations (of the same order, see `is_min_max`).
+        let (max, lookalike) = (
+            aggregate(max_udaf())?,
+            aggregate(Arc::clone(&lookalikes[2]))?,
+        );
+        assert_eq!(max.fun().inner().is_descending(), Some(true));
+        assert_eq!(lookalike.fun().inner().is_descending(), Some(true));
+        assert!(is_min_max(&max, true, &schema));
+        assert!(!is_min_max(&max, false, &schema));
+        assert!(!is_min_max(&lookalike, true, &schema));
+        let min = aggregate(min_max::min_udaf())?;
+        assert!(is_min_max(&min, false, &schema));
+        assert!(!is_min_max(&min, true, &schema));
+        assert!(!is_min_max(&aggregate(sum_udaf())?, true, &schema));
         Ok(())
     }
 
@@ -3251,7 +3512,6 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
         use datafusion::datasource::MemTable;
         use datafusion_common::instant::Instant;
-        use datafusion_physical_plan::displayable;
         use std::sync::Arc;
         use std::time::Duration;
         let env = |name: &str, default: usize| {
@@ -3364,9 +3624,11 @@ mod tests {
         for (table, query) in queries {
             let sql = query.replace("{t}", table);
             let plan = engines[0].1.sql(&sql).await?.create_physical_plan().await?;
-            let native = displayable(plan.as_ref()).indent(true).to_string();
-            // DataFusion's top-k aggregations show their limit too.
-            let native = native.contains("], order=");
+            let native = plan
+                .downcast_ref::<crate::bridge::PipelineRootExec>()
+                .is_some_and(|root| {
+                    !native_top_k_aggregations(root.operator()).is_empty()
+                });
             let mut times = vec![vec![]; engines.len()];
             let mut outputs = vec![];
             for round in 0..rounds {
