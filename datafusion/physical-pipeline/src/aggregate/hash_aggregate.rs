@@ -626,11 +626,12 @@ impl PhysicalHashAggregate {
     ///   aggregate every partition on its own), or of a single partition whose
     ///   lowered input produces its rows in another order than DataFusion's
     ///   (see `keeps_datafusion_order`), e.g. an aggregation of the distinct
-    ///   values of a `SUM(DISTINCT x)`, or that DataFusion sorts for ordered
-    ///   aggregates (e.g. `ARRAY_AGG(x ORDER BY y)`) that the native operator
-    ///   does not sort it for. (Ordered aggregates order their values
-    ///   themselves: but for rows that tie in their order, their values do not
-    ///   depend on the order of their input.);
+    ///   values of a `SUM(DISTINCT x)`, or whose rows are sorted for ordered
+    ///   aggregates (e.g. `ARRAY_AGG(x ORDER BY y)`), by DataFusion or by the
+    ///   native operator, which order the rows that tie in the sort otherwise.
+    ///   (Ordered aggregates order their values themselves: but for rows that
+    ///   tie in their order, their values do not depend on the order of their
+    ///   input.);
     /// * aggregations with a soft limit on their groups (`lim=[n]` without
     ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
     ///   LIMIT n`: each stage stops reading its input once it has `n` groups,
@@ -735,15 +736,17 @@ impl PhysicalHashAggregate {
         // DataFusion aggregates the rows in the order of its input: sorted, if
         // it sorts it for ordered aggregates (a sort that the planner removes,
         // see `without_ordering_sort`). The native operator sorts the rows of
-        // its thread by the same order if an aggregate requires it (see
-        // `hard_input_order`), and aggregates them in the order of its input
-        // otherwise, which must then be DataFusion's.
-        let in_input_order = !exact && hard_input_order(raw)?.is_none();
-        if in_input_order && raw.input().is::<SortExec>() {
+        // its thread if an aggregate requires them in an order (see
+        // `hard_input_order`), by the same order, but not the rows that tie in
+        // it as DataFusion does (which sorts every batch, by an unstable sort,
+        // and merges them), so that the other aggregates may see another
+        // sequence. It aggregates the rows in the order of its input otherwise,
+        // which must then be DataFusion's.
+        if !exact && (raw.input().is::<SortExec>() || hard_input_order(raw)?.is_some()) {
             return Ok(None);
         }
         let input = lower_input(raw.input())?;
-        if in_input_order && !keeps_datafusion_order(&input) {
+        if !exact && !keeps_datafusion_order(&input) {
             return Ok(None);
         }
         let aggregate = match last {

@@ -2750,7 +2750,10 @@ mod tests {
         // them), and the two stages of an aggregation of a single partition
         // (whose final stage merges the single states of the groups rather than
         // evaluating them, as DataFusion's merges the partial states of its
-        // partition).
+        // partition). The aggregations with other aggregates that may not split
+        // their rows exactly next to aggregates that require their rows in an
+        // order are left to DataFusion (see
+        // `inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion`).
         let batches = seven_passes_over(2_048)?
             .into_iter()
             .map(|batch| {
@@ -2798,11 +2801,11 @@ mod tests {
                 false,
             ),
             (
-                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), SUM(f) FROM t GROUP BY a",
+                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), COUNT(*) FROM t GROUP BY a",
                 true,
             ),
             (
-                "SELECT k, NTH_VALUE(v, 6 ORDER BY v), SUM(f) FROM t GROUP BY k",
+                "SELECT k, NTH_VALUE(f, 6 ORDER BY v), MIN(f) FROM t GROUP BY k",
                 true,
             ),
             (
@@ -2828,6 +2831,12 @@ mod tests {
                 assert_eq!(thread.evaluated, thread.single_stage, "{sql}");
                 assert_eq!(thread.output, datafusion_aggregation(&ctx, sql).await?);
                 assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+            for sql in [
+                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), SUM(f) FROM t GROUP BY a",
+                "SELECT k, NTH_VALUE(v, 6 ORDER BY v), SUM(f) FROM t GROUP BY k",
+            ] {
+                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
             }
             // `SUM(f)` (and `LAST_VALUE(v)`) of two stages over a single
             // partition: DataFusion's final stage merges the partial states of the
@@ -3240,9 +3249,10 @@ mod tests {
         //   0)`, DataFusion adds up `0 + 1 - 1e16 + 0 + 0 + 1e16`, to `0.0`, the
         //   native operator `1e16 + 0 + 0 - 1e16 + 1 + 0`, to `1.0`. Next to an
         //   aggregate that requires its rows in order (`NTH_VALUE`), both sort
-        //   them (by the same order: but for rows that tie in it, see
-        //   `PhysicalHashAggregate::try_lower`), and without DataFusion's sort
-        //   (of `FIRST_VALUE`), neither does: native.
+        //   them, but order the rows that tie otherwise (see
+        //   `inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion`):
+        //   left to DataFusion too. Without DataFusion's sort (of
+        //   `FIRST_VALUE`), neither sorts them: native.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("f", DataType::Float64, false),
@@ -3294,6 +3304,8 @@ mod tests {
             let floats = datafusion_floats(sql, &config, &sorted, 1).await?;
             assert_eq!(floats, [0.0], "{sql}");
             assert_left_to_datafusion(sql, config.clone(), &sorted).await?;
+            let sql = "SELECT k, SUM(f), NTH_VALUE(v, 2 ORDER BY s) FROM t GROUP BY k";
+            assert_left_to_datafusion(sql, config.clone(), &sorted).await?;
             // The aggregates that split their rows exactly do not depend on
             // their order, and the others get the rows in DataFusion's order:
             // native.
@@ -3304,10 +3316,6 @@ mod tests {
                 ),
                 (
                     "SELECT k, SUM(f), FIRST_VALUE(v ORDER BY s) FROM t GROUP BY k",
-                    &sorted,
-                ),
-                (
-                    "SELECT k, SUM(f), NTH_VALUE(v, 2 ORDER BY s) FROM t GROUP BY k",
                     &sorted,
                 ),
             ] {
@@ -3472,6 +3480,70 @@ mod tests {
             let sql = "SELECT k, percentile_cont(f, 0.25), COUNT(*) FROM t GROUP BY k";
             assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
             assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // The review's case: a single partition of eight batches of 8,192 rows,
+        // `i = 0..65536`, `k = 1`, `s = i % 3` and `f = [1e16, 0, 0, 0, 1,
+        // -1e16, 1][i % 7]`. `NTH_VALUE(s, 5 ORDER BY s)` requires its rows in
+        // the order of `s`: DataFusion sorts its input (every batch, by an
+        // unstable sort, then merges them), the native operator sorts all rows
+        // of its thread at once, which orders the rows that tie in `s`
+        // otherwise. The `NTH_VALUE` of its own order is the same (see
+        // `orders_its_arguments`), but the aggregates that may not split their
+        // rows exactly see another sequence: the native `SUM(f)` was `1e16 +
+        // 1660`, DataFusion's `1e16 + 2856`, and the averages and standard
+        // deviations differed too. Such aggregations are left to DataFusion (see
+        // `PhysicalHashAggregate::try_lower`); the exact aggregates next to the
+        // ordered one stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let values = [1e16, 0.0, 0.0, 0.0, 1.0, -1e16, 1.0];
+        let batches = (0..8i64)
+            .map(|batch| {
+                let rows = batch * 8_192..(batch + 1) * 8_192;
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1; 8_192])),
+                        Arc::new(Int64Array::from_iter_values(
+                            rows.clone().map(|i| i % 3),
+                        )),
+                        Arc::new(arrow::array::Float64Array::from_iter_values(
+                            rows.map(|i| values[(i % 7) as usize]),
+                        )),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            for sql in [
+                "SELECT k, SUM(f), AVG(f), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k",
+                "SELECT k, STDDEV(f), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k",
+                "SELECT SUM(f), NTH_VALUE(s, 5 ORDER BY s) FROM t",
+            ] {
+                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+            }
+            let sql = "SELECT k, COUNT(*), MAX(f), SUM(s), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k";
+            assert_eq!(
+                planned_aggregations(sql, &config, &setup).await?,
+                1,
+                "{sql}"
+            );
+            assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
         }
         Ok(())
     }
