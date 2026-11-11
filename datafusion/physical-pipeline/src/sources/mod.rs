@@ -77,13 +77,16 @@ use crate::operator::{
     SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
 
+mod batches;
 pub mod csv;
 pub mod empty;
+pub mod lazy_memory;
 pub mod memory;
 pub mod parquet;
 
 pub use csv::CsvScanSource;
 pub use empty::EmptyScanSource;
+pub use lazy_memory::LazyMemorySource;
 pub use memory::MemoryScanSource;
 pub use parquet::ParquetScanSource;
 

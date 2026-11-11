@@ -177,7 +177,9 @@ use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::analyze::AnalyzeExec;
+use datafusion_physical_plan::buffer::BufferExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
@@ -213,7 +215,7 @@ use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
-use crate::sources::{EmptyScanSource, try_create_scan_source};
+use crate::sources::{EmptyScanSource, LazyMemorySource, try_create_scan_source};
 use crate::window::PhysicalWindow;
 
 /// A [`QueryPlanner`] that executes queries with the pipeline engine.
@@ -598,6 +600,14 @@ impl Lowering<'_> {
         }
         if let Some(scan) = try_create_scan_source(plan)? {
             return Ok(scan);
+        }
+        if let Some(source) = LazyMemorySource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        // The pipeline engine schedules its tasks cooperatively and pushes
+        // the chunks of its sources itself.
+        if let Some(input) = scheduled_input(plan) {
+            return self.lower(input);
         }
         if let Some(input) = redistributed_input(plan) {
             let lowered = self.lower(input)?;
@@ -1018,6 +1028,17 @@ fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
         return plan.fetch().is_none().then_some(input);
     }
     None
+}
+
+/// The input of `plan`, if `plan` only changes how its input is scheduled,
+/// without changing its rows: a `CooperativeExec`, which makes the tasks of
+/// its input yield, or a `BufferExec`, which polls its input ahead of its
+/// consumer.
+fn scheduled_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    if let Some(cooperative) = plan.downcast_ref::<CooperativeExec>() {
+        return Some(cooperative.input());
+    }
+    plan.downcast_ref::<BufferExec>().map(BufferExec::input)
 }
 
 /// Whether `repartition` only distributes the rows of its input over its

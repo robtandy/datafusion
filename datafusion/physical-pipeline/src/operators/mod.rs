@@ -8,6 +8,8 @@ pub mod adaptive_filter;
 pub mod caching;
 pub mod filter;
 pub mod limit;
+#[cfg(test)]
+pub(crate) mod lowering_tests;
 pub mod placeholder_row;
 pub mod projection;
 pub mod union;
