@@ -503,21 +503,9 @@ pub(crate) mod test_support {
     /// DataFusion and on the pipeline engine, with the same error (see
     /// [`assert_same_error`]): through the `PipelineQueryPlanner` and with the
     /// plan lowered by [`lower`], in which at least one aggregation is a
-    /// [`PhysicalHashAggregate`]. The query can use the tables of
-    /// [`register_test_tables`].
-    pub(crate) async fn assert_aggregate_fails_like_datafusion(sql: &str, message: &str) {
-        assert_aggregate_fails_like_datafusion_with_setup(
-            sql,
-            test_session_config(),
-            async |ctx: &SessionContext| register_test_tables(ctx),
-            message,
-        )
-        .await
-    }
-
-    /// [`assert_aggregate_fails_like_datafusion`] with a custom session
-    /// configuration, and `setup` registering the tables of the query. The
-    /// lowered plan runs with the default and with tiny thread-local tables.
+    /// [`PhysicalHashAggregate`], with the default and with tiny thread-local
+    /// tables. Both sessions have the configuration `config`, and `setup`
+    /// registers the tables of the query.
     pub(crate) async fn assert_aggregate_fails_like_datafusion_with_setup<F>(
         sql: &str,
         config: SessionConfig,
