@@ -528,12 +528,10 @@ native.
 - A native TopK whose dynamic filter a scan below it reads updates that
   filter with its threshold, so that the scan skips the files, row groups and
   rows that it rules out, as DataFusion's TopK does.
-- A native hash join sets its dynamic filter to the bounds of its build keys.
-  `PhysicalHashJoin::try_lower` still leaves the joins with a dynamic filter
-  whose probe side evaluates expressions that may fail to DataFusion: the
-  planner lowers them without their dynamic filter (the scans below them then
-  read all rows, and the join drops the rows that cannot match), e.g. the
-  joins of TPC-H Q15 and Q17 over Parquet.
+- A native hash join sets its dynamic filter to the bounds of its build keys,
+  whatever its probe side evaluates, so that the scans below it skip the
+  files, row groups and rows that cannot match, e.g. the joins of TPC-H Q15
+  and Q17 over Parquet.
 - The nodes that only distribute or coalesce rows are removed whatever the
   types of their rows (DataFusion may fail to concatenate dictionaries or
   strings with 32-bit offsets that the native operators never concatenate).
@@ -553,8 +551,8 @@ DataFusion still executes:
   symmetric hash joins, recursive queries, `StreamingTableExec`s) and
   user-defined `ExecutionPlan`s, with their subtrees;
 - the nodes that the native operators refuse themselves in their `try_lower`
-  functions (the parity-only refusals of the sorts, windows, joins and
-  aggregations are removed by their own issues);
+  functions (the parity-only refusals of the sorts, windows and aggregations
+  are removed by their own issues);
 - windows, nested loop joins and cross joins in sessions whose memory pool
   has a limit: they keep all of their rows in memory without reserving it in
   the memory pool, while the DataFusion nodes that they replace reserve their
@@ -612,10 +610,7 @@ are lowered to exactly the listed numbers of operators.
   be 0) are native, on any number of threads.
 - Over Parquet, the hash joins of Q15 and Q17 have dynamic filters that the
   Parquet scans of their probe sides read, below decimal arithmetic that may
-  overflow. `PhysicalHashJoin::try_lower` leaves such joins to DataFusion
-  (until it lowers them itself, see [`PipelineQueryPlanner`](#pipelinequeryplanner)),
-  so the planner lowers them without their dynamic filters: the scans read all
-  of their rows, which the joins probe, and the results are the same.
+  overflow: the native joins set them to the bounds of their build keys.
 - The TopK of Q18 has a dynamic filter that the scan of `orders` reads, below
   hash joins and an aggregation; the native TopK updates it, as do the TopKs of
   ClickBench's `hits23` and `hits25`, so that the scans of Parquet files skip
@@ -653,8 +648,11 @@ aggregate functions the rows of the threads whose groups hardly repeat bypass
 their tables and are aggregated once, by the final aggregation of their radix
 partitions (the _After_ columns, see `rows_can_bypass_tables`).
 
-The measurements below were taken on a 16-core Neoverse-N1 machine with 16
-threads, with the same build for both runs: the median of 5 executions, in ms
+The measurements below predate the [correctness policy](compatibility.md) of
+2026-11-11, which removed the planner's rules that left nodes to DataFusion to
+reproduce its errors: their native coverage is that of the time. They were
+taken on a 16-core Neoverse-N1 machine with 16 threads, with the same build
+for both runs: the median of 5 executions, in ms
 (without planning), and the native operators / all operators of the lowered
 plan (a plan of one operator runs entirely in DataFusion, in a
 `BridgeOperator`; the queries whose plans are partly native leave the
