@@ -54,6 +54,10 @@
 //! stacked below it) a single [`PhysicalWindow`], which partitions and sorts
 //! its input itself.
 //!
+//! The filters of the pipelines that may stop before their inputs end (below
+//! limits, and in the subqueries of scalar subqueries) are not cached: see
+//! `Lowering::lower_in`.
+//!
 //! Windows, nested loop joins and cross joins keep all of their rows in
 //! memory without reserving it in the memory pool, while the DataFusion nodes
 //! they replace reserve their memory (and fail or spill once the pool is
@@ -151,6 +155,7 @@
 //!
 //! [`PhysicalTopK`]: crate::sort::PhysicalTopK
 
+use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -464,11 +469,19 @@ struct Lowering<'a> {
     /// and loop joins are only lowered for runtimes whose memory pool has no
     /// limit.
     runtime: Option<&'a RuntimeEnv>,
+    /// Whether the node being lowered is in a pipeline that may stop before
+    /// its input ends (see [`Self::lower_in`]): below a limit, or in the
+    /// subquery of a scalar subquery, which fails at its second row.
+    early_stop: Cell<bool>,
 }
 
 impl<'a> Lowering<'a> {
     fn new(options: &'a ConfigOptions, runtime: Option<&'a RuntimeEnv>) -> Self {
-        Self { options, runtime }
+        Self {
+            options,
+            runtime,
+            early_stop: Cell::new(false),
+        }
     }
 }
 
@@ -484,6 +497,45 @@ impl Lowering<'_> {
             );
             Ok(bridge(plan))
         })
+    }
+
+    /// Lower `plan` (see [`Self::lower`]) in a pipeline that may stop before
+    /// its input ends if `early_stop` (e.g. below a limit), or that runs until
+    /// its input ends otherwise (e.g. below a pipeline breaker, such as a
+    /// sort, an aggregation or the build side of a join, which reads all of
+    /// its input).
+    ///
+    /// The filters of a pipeline that may stop early are not cached (see
+    /// [`CachingOperator`]): a cache holds back the rows of small chunks until
+    /// it is full or its input ends, which may never happen, e.g. if a limit
+    /// waits for these rows above a stream that stays pending once it has
+    /// produced them (DuckDB does not cache in such pipelines either). The
+    /// nodes that pass the rows of their inputs on in their pipelines (filters,
+    /// projections, unions, limits, the probe sides of joins and the input of
+    /// a scalar subquery) keep `early_stop` for their inputs.
+    fn lower_in(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        early_stop: bool,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let outer = self.early_stop.replace(early_stop);
+        let lowered = self.lower(plan);
+        self.early_stop.set(outer);
+        lowered
+    }
+
+    /// Lower `input`, an input of the join `join`, in the pipeline of the
+    /// join if it is its probe side (its second input, see [`is_within`]),
+    /// and in a pipeline that runs until its input ends if it is its build
+    /// side (see [`Self::lower_in`]).
+    fn lower_join_input(
+        &self,
+        join: &Arc<dyn ExecutionPlan>,
+        input: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let probe =
+            matches!(join.children().as_slice(), [_, probe] if is_within(probe, input));
+        self.lower_in(input, probe && self.early_stop.get())
     }
 
     fn lower_natively(
@@ -518,7 +570,11 @@ impl Lowering<'_> {
         if let Some(subquery) = self.try_lower_scalar_subquery(plan)? {
             return Ok(subquery);
         }
-        if let Some(limit) = PhysicalLimit::try_lower(plan, |input| self.lower(input))? {
+        // A limit with a fetch stops its pipeline once it has its rows.
+        let early_stop = self.early_stop.get() || plan.fetch().is_some();
+        if let Some(limit) =
+            PhysicalLimit::try_lower(plan, |input| self.lower_in(input, early_stop))?
+        {
             return Ok(Arc::new(limit));
         }
         if let Some(union) = PhysicalUnion::try_lower(plan, |input| self.lower(input))? {
@@ -578,7 +634,7 @@ impl Lowering<'_> {
             .iter()
             .map(|link| {
                 Ok(Arc::new(ScalarSubqueryResult::try_new(
-                    self.lower(&link.plan)?,
+                    self.lower_in(&link.plan, true)?,
                     input.schema(),
                     link.index,
                     exec.results().clone(),
@@ -619,8 +675,9 @@ impl Lowering<'_> {
             None => Arc::clone(plan),
             Some(_) => with_unread_topk_filter(plan)?,
         };
-        let Some(lowered) =
-            crate::sort::try_lower(&to_lower, self.options, |plan| self.lower(plan))?
+        let Some(lowered) = crate::sort::try_lower(&to_lower, self.options, |plan| {
+            self.lower_in(plan, false)
+        })?
         else {
             return Ok(None);
         };
@@ -649,7 +706,7 @@ impl Lowering<'_> {
             return Ok(None);
         };
         let aggregate = PhysicalHashAggregate::try_lower(&plan, |input| {
-            self.lower(without_ordering_sort(raw, input))
+            self.lower_in(without_ordering_sort(raw, input), false)
         })?;
         Ok(aggregate.map(|aggregate| Arc::new(aggregate) as Arc<dyn PhysicalOperator>))
     }
@@ -662,7 +719,8 @@ impl Lowering<'_> {
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
-        let lower_input = |input: &Arc<dyn ExecutionPlan>| self.lower(input);
+        let lower_input =
+            |input: &Arc<dyn ExecutionPlan>| self.lower_join_input(plan, input);
         Ok(PhysicalHashJoin::try_lower(plan, lower_input)?
             .map(|lowered| Arc::new(lowered) as Arc<dyn PhysicalOperator>))
     }
@@ -696,9 +754,9 @@ impl Lowering<'_> {
         };
         let rewritten = with_projection_below_sort(plan)?;
         for plan in std::iter::once(plan).chain(rewritten.as_ref()) {
-            if let Some(window) =
-                PhysicalWindow::try_lower(plan, runtime, |rows| self.lower(rows))?
-            {
+            if let Some(window) = PhysicalWindow::try_lower(plan, runtime, |rows| {
+                self.lower_in(rows, false)
+            })? {
                 return Ok(Some(Arc::new(window)));
             }
         }
@@ -752,7 +810,7 @@ impl Lowering<'_> {
         {
             return Ok(None);
         }
-        let input = self.lower(merge.input())?;
+        let input = self.lower_in(merge.input(), false)?;
         let mut operator = &input;
         while let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
             operator = &projection.children()[0];
@@ -779,7 +837,8 @@ impl Lowering<'_> {
         let Some(runtime) = self.runtime else {
             return Ok(None);
         };
-        let lower_input = |input: &Arc<dyn ExecutionPlan>| self.lower(input);
+        let lower_input =
+            |input: &Arc<dyn ExecutionPlan>| self.lower_join_input(plan, input);
         let join: Option<Arc<dyn PhysicalOperator>> = if nested_loop {
             PhysicalNestedLoopJoin::try_lower(plan, runtime, lower_input)?
                 .map(|join| Arc::new(join) as _)
@@ -791,7 +850,8 @@ impl Lowering<'_> {
     }
 
     /// Lower a `FilterExec` to a [`PhysicalFilter`] wrapped in a
-    /// [`CachingOperator`], unless the native filter does not implement it
+    /// [`CachingOperator`] (but in a pipeline that may stop early, see
+    /// [`Self::lower_in`]), unless the native filter does not implement it
     /// (see [`PhysicalFilter::supports_filter_exec`]).
     fn lower_filter(
         &self,
@@ -802,8 +862,11 @@ impl Lowering<'_> {
             return Ok(bridge(plan));
         }
         let input = self.lower(filter.input())?;
-        let filter = PhysicalFilter::try_from_filter_exec(filter, input)?;
-        Ok(Arc::new(CachingOperator::new(Arc::new(filter))))
+        let filter = Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
+        if self.early_stop.get() {
+            return Ok(filter);
+        }
+        Ok(Arc::new(CachingOperator::new(filter)))
     }
 
     /// Lower a `ProjectionExec` to a [`PhysicalProjection`], unless the native
@@ -1240,6 +1303,14 @@ fn passes_states_on(stage: &Arc<dyn ExecutionPlan>, partial: &AggregateExec) -> 
             && reduce.input().schema() == partial.schema()
             && reduce.schema() == partial.schema()
     })
+}
+
+/// Whether `input` is `side`, or a node below it through nodes of a single
+/// child (e.g. the input of a join without the nodes that distribute its
+/// rows), see [`Lowering::lower_join_input`].
+fn is_within(side: &Arc<dyn ExecutionPlan>, input: &Arc<dyn ExecutionPlan>) -> bool {
+    Arc::ptr_eq(side, input)
+        || matches!(side.children().as_slice(), [child] if is_within(child, input))
 }
 
 /// Whether a node of `plan` consumes the dynamic filter with id `filter`: e.g.
@@ -6441,6 +6512,196 @@ mod tests {
     // ---------------------------------------------------------------------
     // Scalar subqueries
     // ---------------------------------------------------------------------
+
+    /// A source of one partition that produces `batches`, and then stays
+    /// pending forever, as a stream that waits for rows that never come.
+    #[derive(Debug)]
+    struct PendsAfterRows {
+        batches: Vec<RecordBatch>,
+        properties: Arc<datafusion_physical_plan::PlanProperties>,
+    }
+
+    impl PendsAfterRows {
+        fn new(batches: Vec<RecordBatch>) -> Self {
+            use datafusion_physical_expr::EquivalenceProperties;
+            use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
+            let properties = datafusion_physical_plan::PlanProperties::new(
+                EquivalenceProperties::new(batches[0].schema()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Unbounded {
+                    requires_infinite_memory: false,
+                },
+            );
+            Self {
+                batches,
+                properties: Arc::new(properties),
+            }
+        }
+    }
+
+    impl datafusion_physical_plan::DisplayAs for PendsAfterRows {
+        fn fmt_as(
+            &self,
+            _t: datafusion_physical_plan::DisplayFormatType,
+            f: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(f, "PendsAfterRows")
+        }
+    }
+
+    impl ExecutionPlan for PendsAfterRows {
+        fn name(&self) -> &str {
+            "PendsAfterRows"
+        }
+
+        fn properties(&self) -> &Arc<datafusion_physical_plan::PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<datafusion_execution::SendableRecordBatchStream> {
+            use futures::StreamExt;
+            let batches = self.batches.clone().into_iter().map(Ok);
+            let stream = futures::stream::iter(batches).chain(futures::stream::pending());
+            Ok(Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    self.batches[0].schema(),
+                    stream,
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_end_with_the_rows_of_inputs_that_then_stay_pending() -> Result<()> {
+        // 128 positive rows, and then nothing more: DataFusion's limits end
+        // as soon as they have their row, and so do the native ones, whose
+        // pipelines do not cache the rows of their filters (a cache would hold
+        // them back until it is full or its input ends, see
+        // `Lowering::lower_in`).
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(1..=128))],
+        )?;
+        // A filter whose batches have at most `batch_size` rows.
+        let filter = |batch_size: usize| -> FilterExec {
+            let source = Arc::new(PendsAfterRows::new(vec![rows.clone()]));
+            let positive = Arc::new(BinaryExpr::new(
+                col("x", &schema).unwrap(),
+                datafusion_expr::Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
+            ));
+            FilterExec::try_new(positive, source)
+                .unwrap()
+                .with_batch_size(batch_size)
+                .unwrap()
+        };
+        // The plan of `WHERE x > 0 LIMIT 1` over several partitions: a merge
+        // with a fetch above a filter with the same fetch (which the native
+        // limit makes redundant), with the default batch size.
+        let merged = || -> Arc<dyn ExecutionPlan> {
+            let filter = filter(8192).with_fetch(Some(1)).unwrap();
+            Arc::new(CoalescePartitionsExec::new(filter).with_fetch(Some(1)))
+        };
+        // A global limit above a filter without a fetch, with batches of 32
+        // rows, which DataFusion's filter emits once it has 32 rows.
+        let limited = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(GlobalLimitExec::new(Arc::new(filter(32)), 0, Some(1)))
+        };
+        let shapes: [&dyn Fn() -> Arc<dyn ExecutionPlan>; 2] = [&merged, &limited];
+        for plan in shapes {
+            let config = test_session_config();
+            let root = create_pipeline_plan(plan())?;
+            let limit = root.operator();
+            assert!(limit.is::<PhysicalLimit>(), "{}", limit.name());
+            assert!(limit.children()[0].is::<PhysicalFilter>());
+            let name = plan().name().to_owned();
+            for (engine, plan) in [("DataFusion", plan()), ("pipeline", root as _)] {
+                let task_ctx =
+                    Arc::new(TaskContext::default().with_session_config(config.clone()));
+                let batches = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    collect(plan, task_ctx),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{engine} does not end {name}"))?;
+                let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(rows, 1, "{engine}: {name}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_of_pipelines_that_stop_early_are_not_cached() -> Result<()> {
+        // The pipelines of the filters below limits (but below pipeline
+        // breakers, which read all of their input, and on the build sides of
+        // joins) and those of the subqueries of scalar subqueries, which fail
+        // at their second row, may stop before their input ends: their
+        // filters are not cached.
+        for (sql, filters, cached) in [
+            ("SELECT id FROM t1 WHERE a > 0", 1, 1),
+            ("SELECT id FROM t1 WHERE a > 0 LIMIT 3", 1, 0),
+            ("SELECT id FROM t1 WHERE a > 0 LIMIT 3 OFFSET 2", 1, 0),
+            (
+                "SELECT a, COUNT(*) FROM t1 WHERE b > 0 GROUP BY a LIMIT 3",
+                1,
+                1,
+            ),
+            (
+                "SELECT t1.id FROM t1 JOIN (SELECT k FROM t2 WHERE w > 0) ON a = k \
+                 WHERE b > 0 LIMIT 3",
+                2,
+                1,
+            ),
+            (
+                "SELECT id, (SELECT k FROM t2 WHERE w > 0) AS m FROM t1 WHERE id < 10",
+                2,
+                1,
+            ),
+        ] {
+            let plan = datafusion_plan(sql, test_session_config()).await;
+            let root = lower_execution_plan(&plan)?;
+            assert_native(sql, &root);
+            let count = |operator| match operator {
+                "filters" => {
+                    crate::operators::union::test_support::count::<PhysicalFilter>(&root)
+                }
+                _ => {
+                    crate::operators::union::test_support::count::<CachingOperator>(&root)
+                }
+            };
+            assert_eq!(
+                (count("filters"), count("caches")),
+                (filters, cached),
+                "{sql}"
+            );
+        }
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn scalar_subqueries_are_native() -> Result<()> {
