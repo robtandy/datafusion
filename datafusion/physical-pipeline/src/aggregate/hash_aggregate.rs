@@ -739,6 +739,26 @@ impl PhysicalHashAggregate {
         }) {
             return Ok(None);
         }
+        // DataFusion sorts the rows of ordered aggregates by Arrow's order (the
+        // input of a `FIRST_VALUE`, which takes the first row then), the native
+        // operator lets their accumulators compare them as `ScalarValue`s (see
+        // `without_input_order`), as they do when they merge their states:
+        // which compare nested values by another order, and not by a total one
+        // (see `compares_totally`, e.g. `{a: NULL}` is equal to `{a: 1}`, and
+        // `[NULL]` is after `[1]` whatever the order of the NULLs), so that they
+        // may keep other rows. Aggregates ordered by such values are left to
+        // DataFusion.
+        let input_schema = raw.input().schema();
+        if raw.aggr_expr().iter().any(|aggregate| {
+            aggregate.order_bys().iter().any(|sort| {
+                !sort
+                    .expr
+                    .data_type(&input_schema)
+                    .is_ok_and(|data_type| compares_totally(&data_type))
+            })
+        }) {
+            return Ok(None);
+        }
         // Whether the values of the aggregates do not depend on the order of
         // the rows, and on how they are split into partial states: they split
         // exactly, or they are ordered (whose values the native operator
@@ -2157,13 +2177,15 @@ fn max_column_bytes(plan: &Arc<dyn ExecutionPlan>, index: usize) -> Option<usize
     }
 }
 
-/// Whether DataFusion's `min` and `max` compare the values of `data_type` by a
-/// total order, so that they keep the same value whatever the order of the
-/// rows: values that are not nested (floating point values by their total
-/// order), and dictionaries of them. Nested values are compared field by
-/// field, or element by element, skipping NULLs: e.g. `{a: NULL}` compares
-/// equal to `{a: 1}` and to `{a: 2}`, so that the first of them in the order
-/// of the rows (or of the partial states) stays the minimum.
+/// Whether DataFusion compares the values of `data_type` by a total order
+/// (Arrow's, by which it sorts them too): its `min` and `max`, which then keep
+/// the same value whatever the order of the rows, and the `ScalarValue`s of
+/// ordered aggregates. These are values that are not nested (floating point
+/// values by their total order), and dictionaries of them. Nested values are
+/// compared field by field, skipping NULLs, or element by element, NULLs last:
+/// e.g. `{a: NULL}` compares equal to `{a: 1}` and to `{a: 2}`, so that the
+/// first of them in the order of the rows (or of the partial states) stays
+/// the minimum.
 fn compares_totally(data_type: &DataType) -> bool {
     match data_type {
         DataType::Dictionary(_, values) => compares_totally(values),

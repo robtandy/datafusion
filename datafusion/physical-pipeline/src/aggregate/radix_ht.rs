@@ -4317,6 +4317,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregates_ordered_by_values_without_a_total_order_are_left_to_datafusion()
+    -> Result<()> {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+        // DataFusion sorts the rows of `FIRST_VALUE(v ORDER BY v)` by Arrow's
+        // order, which puts the NULLs of a field last, and takes the first; the
+        // native accumulator (see `without_input_order`) compared their
+        // `ScalarValue`s, which do not order structs totally (see
+        // `compares_totally`): of the rows of
+        // `minima_and_maxima_of_values_without_a_total_order_are_aggregated_in_order`,
+        // `{a: NULL}` before `{a: 1}`, DataFusion's first value was `{a: 1}`,
+        // the native one `{a: NULL}`, also on one thread. Aggregates ordered by
+        // such values are left to DataFusion; those ordered by other values
+        // stay native.
+        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+            Field::new("v", DataType::Struct(fields.clone()), true),
+        ]));
+        let a = Int64Array::from_iter((0..8_192).map(|i| (i >= 2_048).then_some(1)));
+        let v = StructArray::new(fields, vec![Arc::new(a) as ArrayRef], None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from_iter_values((0..8_192).rev())),
+                Arc::new(v),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false);
+                if trusted {
+                    config = trusting(config);
+                }
+                for sql in [
+                    "SELECT k, FIRST_VALUE(v ORDER BY v) FROM t GROUP BY k",
+                    "SELECT k, LAST_VALUE(v ORDER BY v DESC) FROM t GROUP BY k",
+                    "SELECT FIRST_VALUE(v ORDER BY v), LAST_VALUE(v ORDER BY v) FROM t",
+                    "SELECT k, NTH_VALUE(v, 2 ORDER BY v) FROM t GROUP BY k",
+                    "SELECT k, ARRAY_AGG(v ORDER BY v) FROM t GROUP BY k",
+                ] {
+                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                }
+                // Ordered by a column without ties.
+                let sql = "SELECT k, FIRST_VALUE(v ORDER BY i), MAX(i) FROM t GROUP BY k";
+                assert!(
+                    planned_aggregations(sql, &config, &setup).await? > 0,
+                    "{sql}"
+                );
+                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn values_that_may_not_fit_32_bit_offsets_are_aggregated_like_datafusion()
     -> Result<()> {
         use std::fmt::Write;
