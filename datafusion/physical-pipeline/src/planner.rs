@@ -244,6 +244,7 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_csv::source::CsvSource;
+use datafusion_datasource_parquet::ParquetFileReaderFactory;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::LogicalPlan;
@@ -2723,17 +2724,26 @@ fn reads_files_of_the_types_of_their_table(
     // A custom adapter of the expressions of the scan to the schemas of its
     // files may rewrite them otherwise than casting columns, a custom provider
     // of the schemas of its files may read them in other types, and a custom
-    // reader may read other metadata than DataFusion cached. (Neither
-    // `ParquetFileReaderFactory` nor `ParquetSource` lets the provider and the
-    // factory be inspected otherwise than by their `Debug` output: other than
-    // the built-in factories, and other than no provider, they may fail.)
+    // reader may fail otherwise than the built-in readers, or read other
+    // metadata than DataFusion cached. Neither `ParquetFileReaderFactory` nor
+    // `ParquetSource` lets the factory or the provider be identified otherwise
+    // than by their (derived) `Debug` output: only the built-in factories,
+    // whose `Debug` output is that of their structs, and no provider, are
+    // judged not to fail.
+    let builtin_factory = |factory: &Arc<dyn ParquetFileReaderFactory>| {
+        let debug = format!("{factory:?}");
+        [
+            "CachedParquetFileReaderFactory {",
+            "DefaultParquetFileReaderFactory {",
+        ]
+        .iter()
+        .any(|prefix| debug.starts_with(prefix))
+    };
     if config.expr_adapter_factory.is_some()
         || !format!("{source:?}").contains("schema_provider: None")
-        || source.parquet_file_reader_factory().is_some_and(|factory| {
-            let name = format!("{factory:?}");
-            !(name.starts_with("CachedParquetFileReaderFactory")
-                || name.starts_with("DefaultParquetFileReaderFactory"))
-        })
+        || source
+            .parquet_file_reader_factory()
+            .is_some_and(|factory| !builtin_factory(factory))
     {
         return false;
     }
@@ -6688,6 +6698,151 @@ mod tests {
             "{}",
             format_operator_tree(&root)
         );
+        Ok(())
+    }
+
+    /// A reader factory whose readers fail to read the metadata of the files
+    /// whose paths end with `faulty`, and otherwise read files like
+    /// `CachedParquetFileReaderFactory`, whose name its name starts with.
+    #[derive(Debug)]
+    struct CachedParquetFileReaderFactoryWithFaults {
+        inner: Arc<dyn ParquetFileReaderFactory>,
+        faulty: &'static str,
+    }
+
+    /// A reader of a file whose metadata it fails to read, see
+    /// [`CachedParquetFileReaderFactoryWithFaults`].
+    struct FaultyReader(Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>);
+
+    impl parquet::arrow::async_reader::AsyncFileReader for FaultyReader {
+        fn get_bytes(
+            &mut self,
+            range: std::ops::Range<u64>,
+        ) -> futures::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>>
+        {
+            self.0.get_bytes(range)
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a parquet::arrow::arrow_reader::ArrowReaderOptions>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            parquet::errors::Result<Arc<parquet::file::metadata::ParquetMetaData>>,
+        > {
+            Box::pin(async {
+                Err(parquet::errors::ParquetError::General(
+                    "the metadata of the file cannot be read".to_string(),
+                ))
+            })
+        }
+    }
+
+    impl ParquetFileReaderFactory for CachedParquetFileReaderFactoryWithFaults {
+        fn create_reader(
+            &self,
+            partition_index: usize,
+            partitioned_file: datafusion_datasource::PartitionedFile,
+            metadata_size_hint: Option<usize>,
+            metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
+        ) -> Result<Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>>
+        {
+            let faulty = partitioned_file
+                .object_meta
+                .location
+                .as_ref()
+                .ends_with(self.faulty);
+            let reader = self.inner.create_reader(
+                partition_index,
+                partitioned_file,
+                metadata_size_hint,
+                metrics,
+            )?;
+            Ok(match faulty {
+                true => Box::new(FaultyReader(reader)),
+                false => reader,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_files_of_custom_readers_stay_in_datafusion() -> Result<()> {
+        // Two well-formed Parquet files of the types of their table, of 100 rows
+        // `(0, 100, 'foo')` and 10 rows `(1, 100, 'foo')`, which the scan reads
+        // with a custom reader factory, whose readers fail to read the metadata
+        // of the second file (and whose name starts with the name of a built-in
+        // factory). DataFusion's scan prunes the second file with the filter of
+        // the TopK, without reading its metadata: a TopK over a custom reader,
+        // which may fail on any file, stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = two_parquet_files(dir.path(), (0, "foo", 100), (1, "foo", 10))?;
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let ctx = datafusion_context(config.clone());
+        ctx.register_parquet("p", &path, ParquetReadOptions::default())
+            .await?;
+        let sql = "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
+        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let plan = plan.transform_up(|node| {
+                let Some(config) = node
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                let Some(source) = config.file_source().downcast_ref::<ParquetSource>()
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                let inner = Arc::clone(
+                    source
+                        .parquet_file_reader_factory()
+                        .expect("the reader factory of the scan"),
+                );
+                let faults = CachedParquetFileReaderFactoryWithFaults {
+                    inner,
+                    faulty: "1.parquet",
+                };
+                let source = source
+                    .clone()
+                    .with_parquet_file_reader_factory(Arc::new(faults));
+                let config =
+                    datafusion_datasource::file_scan_config::FileScanConfigBuilder::from(
+                        config.clone(),
+                    )
+                    .with_source(Arc::new(source))
+                    .build();
+                Ok(Transformed::yes(
+                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
+                ))
+            })?;
+            Ok(plan.data)
+        };
+        let plan = make_plan().await?;
+        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .expect("DataFusion prunes the second file");
+        let root = create_pipeline_plan_with_runtime(
+            make_plan().await?,
+            config.options(),
+            &ctx.runtime_env(),
+        )?;
+        let tree = format_operator_tree(root.operator());
+        let topks = count::<PhysicalTopK>(root.operator());
+        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
+        let output = |batches| crate::test_utils::EngineOutput {
+            schema: plan.schema(),
+            plan: Arc::clone(&plan),
+            batches,
+            ordered: true,
+        };
+        compare_outputs(&output(expected), &output(actual))
+            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
+        assert_eq!(topks, 0, "{tree}");
         Ok(())
     }
 
