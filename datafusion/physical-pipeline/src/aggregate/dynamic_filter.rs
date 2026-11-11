@@ -22,6 +22,30 @@
 //! [`AggregateFilter::update_bounds`]), and marks it complete once it
 //! aggregated its input.
 //!
+//! # Published filters
+//!
+//! The native aggregation also publishes filters of its own, for the
+//! aggregations whose state can prune their input but for which DataFusion
+//! produces no filter:
+//!
+//! * the single stage aggregations without `GROUP BY` of `MIN` and `MAX`
+//!   aggregates (DataFusion plans a single stage, without a filter, for an
+//!   input of a single partition): their bounds, as above;
+//! * the top-k aggregations (see [`TopK`]), which drop the rows whose value is
+//!   worse than their *cutoff* (see [`TopK::candidates`]): `key <= cutoff OR
+//!   key IS NULL` for a top-k aggregation by its group key (`>=` for a
+//!   descending one), `x <= cutoff` for a top-k aggregation by a `MIN(x)`
+//!   (`x >= cutoff` for a `MAX(x)`), with the best cutoff of all threads (see
+//!   [`SharedCutoff`]).
+//!
+//! It creates the filter when it is lowered, and pushes it into its input
+//! like DataFusion's `FilterPushdown` rule pushes the dynamic filters of the
+//! nodes that produce them (see [`AggregateFilter::try_publish`]): through
+//! the nodes that let the filters of their parents through (projections,
+//! filters, repartitionings, coalesces, unions, joins on the side of the
+//! column, ...), into the nodes that accept them (scans of Parquet files).
+//! The filter is published only if a node of the input then reads it.
+//!
 //! # Which values are bounded
 //!
 //! A filter compares the values of a column with a value of the aggregation,
@@ -50,20 +74,29 @@
 use std::any::TypeId;
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::{self, AtomicUsize};
 
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, SchemaRef};
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{Accumulator, Operator};
 use datafusion_functions_aggregate::min_max;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, lit,
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, is_null, lit,
 };
 use datafusion_physical_plan::ExecutionPlan;
-use datafusion_physical_plan::aggregates::AggregateExec;
+use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
+use datafusion_physical_plan::execution_plan::{
+    plan_contains_expression_id, replace_children_if_necessary,
+};
+use datafusion_physical_plan::filter_pushdown::{
+    ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
+};
 use parking_lot::Mutex;
 
-use super::hash_aggregate::implementation_type;
+use super::hash_aggregate::{TopK, TopKOrder, implementation_type};
 use crate::operator::ExecutionContext;
 
 /// A dynamic filter that an aggregation updates while it aggregates its
@@ -71,16 +104,31 @@ use crate::operator::ExecutionContext;
 #[derive(Debug)]
 pub(crate) struct AggregateFilter {
     /// The filters, which nodes of the input read: those that DataFusion's
-    /// `AggregateExec` produces. All of them are set to the same predicate.
+    /// `AggregateExec` produces, or the one that the aggregation published.
+    /// All of them are set to the same predicate.
     filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
-    /// The aggregates of the aggregation, all of them: the filters select the
-    /// rows that may change their bounds, `a < min(a) OR b > max(b) OR ...`
-    /// (see [`AggregateFilter::update_bounds`]).
-    bounded: Vec<BoundedAggregate>,
+    kind: FilterKind,
 }
 
-/// A `MIN` or `MAX` aggregate whose bound an [`AggregateFilter`] compares
-/// its argument with.
+/// The rows that an [`AggregateFilter`] selects.
+#[derive(Debug)]
+pub(crate) enum FilterKind {
+    /// The rows that may change the bounds of the `MIN` and `MAX` aggregates
+    /// of an aggregation without `GROUP BY`, all of its aggregates: `a <
+    /// min(a) OR b > max(b) OR ...` (see [`AggregateFilter::update_bounds`]).
+    Bounds(Vec<BoundedAggregate>),
+    /// The rows that may make their groups among the top groups of a top-k
+    /// aggregation: those whose `value` (a column, the group key or the
+    /// argument of the aggregate) is not worse than the best cutoff, see
+    /// [`AggregateFilter::update_cutoff`].
+    Cutoff {
+        top_k: TopK,
+        value: Arc<dyn PhysicalExpr>,
+    },
+}
+
+/// A `MIN` or `MAX` aggregate whose bound a [`FilterKind::Bounds`] filter
+/// compares its argument with.
 #[derive(Debug)]
 pub(crate) struct BoundedAggregate {
     /// The index of the aggregate among the aggregates of the aggregation.
@@ -126,8 +174,97 @@ impl AggregateFilter {
         }
         Some(Self {
             filters,
-            bounded: bounded_aggregates(raw)?,
+            kind: FilterKind::Bounds(bounded_aggregates(raw)?),
         })
+    }
+
+    /// The filter that the aggregation whose stage that consumes the input
+    /// rows is `raw` (and whose final stage is `last`, if it has two), a
+    /// top-k aggregation if `top_k` is set, publishes into its input, if it
+    /// publishes one (see the [module documentation](self)), and the input
+    /// of `raw` with the nodes that read it. `None` if DataFusion's
+    /// `AggregateExec`s produce dynamic filters, or if no node of the input
+    /// would read the filter.
+    ///
+    /// The filter is pushed into the input with the default options of the
+    /// session (the lowering does not know the session; the session decides
+    /// whether the filter is updated, see [`filters_enabled`]).
+    pub(crate) fn try_publish(
+        raw: &AggregateExec,
+        last: Option<&AggregateExec>,
+        top_k: Option<TopK>,
+    ) -> Result<Option<(Self, Arc<dyn ExecutionPlan>)>> {
+        // DataFusion's filters (or their absence: DataFusion keeps them only
+        // if a node of the input reads them) take precedence.
+        if [Some(raw), last]
+            .into_iter()
+            .flatten()
+            .any(|stage| !stage.dynamic_expressions_produced().is_empty())
+        {
+            return Ok(None);
+        }
+        let input = raw.input();
+        let schema = input.schema();
+        let (kind, children) = match top_k {
+            Some(top_k) => {
+                // The group key, or the argument of the aggregate.
+                let value = match top_k.order {
+                    TopKOrder::Key => raw
+                        .group_expr()
+                        .expr()
+                        .first()
+                        .map(|(key, _)| Arc::clone(key)),
+                    TopKOrder::Aggregate => raw
+                        .aggr_expr()
+                        .first()
+                        .and_then(|aggregate| aggregate.expressions().first().cloned()),
+                };
+                let Some(value) = value.filter(|value| is_bounded_column(value, &schema))
+                else {
+                    return Ok(None);
+                };
+                let children = vec![Arc::clone(&value)];
+                (FilterKind::Cutoff { top_k, value }, children)
+            }
+            // DataFusion produces the filters of the bounds of partial
+            // aggregations (unless it does not push dynamic filters of
+            // aggregations down, or no node of the input would read them),
+            // but not of single stage ones.
+            None if matches!(
+                raw.mode(),
+                AggregateMode::Single | AggregateMode::SinglePartitioned
+            ) =>
+            {
+                let Some(bounded) = bounded_aggregates(raw) else {
+                    return Ok(None);
+                };
+                let children = bounded
+                    .iter()
+                    .map(|bounded| Arc::clone(&bounded.argument))
+                    .collect();
+                (FilterKind::Bounds(bounded), children)
+            }
+            None => return Ok(None),
+        };
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(children, lit(true)));
+        let config = ConfigOptions::default();
+        let Some(input) = push_down(input, vec![Arc::clone(&filter) as _], &config)?
+        else {
+            return Ok(None);
+        };
+        let Some(id) = filter.expression_id() else {
+            return internal_err!("A dynamic filter has no expression id");
+        };
+        if !plan_contains_expression_id(&input, id)? {
+            return Ok(None);
+        }
+        Ok(Some((
+            Self {
+                filters: vec![filter],
+                kind,
+            },
+            input,
+        )))
     }
 
     /// The filters that the aggregation updates.
@@ -136,11 +273,14 @@ impl AggregateFilter {
         &self.filters
     }
 
-    /// The bounds of all threads of an execution of the aggregation: `NULL`
-    /// (no bound yet).
-    pub(crate) fn shared_bounds(&self) -> SharedBounds {
-        SharedBounds {
-            bounds: Mutex::new(vec![ScalarValue::Null; self.bounded.len()]),
+    /// The bounds of all threads of an execution of the aggregation, if the
+    /// filter is a [`FilterKind::Bounds`] filter: `NULL` (no bound yet).
+    pub(crate) fn shared_bounds(&self) -> Option<SharedBounds> {
+        match &self.kind {
+            FilterKind::Bounds(bounded) => Some(SharedBounds {
+                bounds: Mutex::new(vec![ScalarValue::Null; bounded.len()]),
+            }),
+            FilterKind::Cutoff { .. } => None,
         }
     }
 
@@ -162,7 +302,9 @@ impl AggregateFilter {
         known: &mut [ScalarValue],
         shared: &SharedBounds,
     ) -> Result<()> {
-        let bounded = &self.bounded;
+        let FilterKind::Bounds(bounded) = &self.kind else {
+            return Ok(());
+        };
         let mut values = Vec::with_capacity(bounded.len());
         let mut improves = false;
         for (aggregate, known) in bounded.iter().zip(known.iter()) {
@@ -197,6 +339,40 @@ impl AggregateFilter {
             for filter in &self.filters {
                 filter.update(Arc::clone(&predicate))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Set the filter of a top-k aggregation to the rows that may make their
+    /// groups among its top groups given the cutoff `cutoff` (see
+    /// [`TopK::candidates`]): those whose value is not worse than the cutoff,
+    /// and, for a top-k aggregation by its group key, those of the `NULL` key,
+    /// whose group is always produced.
+    pub(crate) fn update_cutoff(&self, cutoff: &ArrayRef) -> Result<()> {
+        let FilterKind::Cutoff { top_k, value } = &self.kind else {
+            return Ok(());
+        };
+        if cutoff.len() != 1 || cutoff.is_null(0) {
+            return internal_err!(
+                "A cutoff of a top-k aggregation must be a single value"
+            );
+        }
+        let op = match top_k.descending {
+            true => Operator::GtEq,
+            false => Operator::LtEq,
+        };
+        let cutoff = ScalarValue::try_from_array(cutoff.as_ref(), 0)?;
+        let mut predicate: Arc<dyn PhysicalExpr> =
+            Arc::new(BinaryExpr::new(Arc::clone(value), op, lit(cutoff)));
+        if top_k.order == TopKOrder::Key {
+            predicate = Arc::new(BinaryExpr::new(
+                predicate,
+                Operator::Or,
+                is_null(Arc::clone(value))?,
+            ));
+        }
+        for filter in &self.filters {
+            filter.update(Arc::clone(&predicate))?;
         }
         Ok(())
     }
@@ -251,6 +427,55 @@ impl SharedBounds {
     /// No bounds, as a thread knows them before it aggregated a row.
     pub(crate) fn unknown(&self) -> Vec<ScalarValue> {
         vec![ScalarValue::Null; self.bounds.lock().len()]
+    }
+}
+
+/// The best cutoff (see [`TopK::cutoff`]) that the threads of an execution of
+/// a top-k aggregation found so far: every thread drops the rows that it
+/// rules out (see [`TopK::candidates`]), and it sets the dynamic filter of
+/// the aggregation, if it has one.
+#[derive(Debug, Default)]
+pub(crate) struct SharedCutoff {
+    cutoff: Mutex<Option<ArrayRef>>,
+    /// Incremented whenever `cutoff` gets better, so that the threads notice
+    /// a better cutoff with an atomic load.
+    generation: AtomicUsize,
+}
+
+impl SharedCutoff {
+    /// Make `cutoff`, a cutoff of the top-k aggregation `top_k` that a thread
+    /// found, the best cutoff if it is better, and then set `filter` to it.
+    pub(crate) fn offer(
+        &self,
+        top_k: &TopK,
+        cutoff: &ArrayRef,
+        filter: Option<&AggregateFilter>,
+    ) -> Result<()> {
+        let mut best = self.cutoff.lock();
+        if let Some(best) = best.as_ref()
+            && !top_k.is_better(cutoff.as_ref(), best.as_ref())?
+        {
+            return Ok(());
+        }
+        // Set under the lock, so that the filter is set to the best cutoff
+        // last.
+        if let Some(filter) = filter {
+            filter.update_cutoff(cutoff)?;
+        }
+        *best = Some(Arc::clone(cutoff));
+        self.generation.fetch_add(1, atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The best cutoff, if it got better since the thread that saw the
+    /// generation `seen` last looked (`seen` is then updated).
+    pub(crate) fn changed_since(&self, seen: &mut usize) -> Option<ArrayRef> {
+        let generation = self.generation.load(atomic::Ordering::Acquire);
+        if generation == *seen {
+            return None;
+        }
+        *seen = generation;
+        self.cutoff.lock().clone()
     }
 }
 
@@ -354,6 +579,75 @@ pub(crate) fn has_exact_bounds(data_type: &DataType) -> bool {
         )
 }
 
+/// Push `filters`, predicates of the output rows of `plan`, down into `plan`,
+/// like DataFusion's `FilterPushdown` rule pushes the filters of the parents
+/// of a node in its post-optimization phase, in which it pushes the dynamic
+/// filters of the nodes that produce them: every node tells which of the
+/// filters can be pushed into which of its children (rewritten for the
+/// columns of the child, see `ExecutionPlan::gather_filters_for_pushdown`),
+/// and the leaves take those that they can use (see
+/// `ExecutionPlan::handle_child_pushdown_result`, e.g. a scan of Parquet
+/// files adds them to its predicate). Returns `plan` with the nodes that
+/// took filters, `None` if no node did.
+///
+/// Unlike the rule, only `filters` are pushed down, not the filters of the
+/// nodes themselves, which are already where the rule pushed them, and the
+/// nodes above the leaves only get their new children: they drop the filters
+/// that their children do not take (DataFusion's nodes handle the filters of
+/// their parents in the post-optimization phase only by pushing them into
+/// their children), which is correct for a dynamic filter, which only prunes
+/// rows that are not needed.
+fn push_down(
+    plan: &Arc<dyn ExecutionPlan>,
+    filters: Vec<Arc<dyn PhysicalExpr>>,
+    config: &ConfigOptions,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let children = plan.children();
+    if children.is_empty() {
+        let result = ChildPushdownResult {
+            parent_filters: filters
+                .into_iter()
+                .map(|filter| ChildFilterPushdownResult {
+                    filter,
+                    child_results: vec![],
+                })
+                .collect(),
+            self_filters: vec![],
+        };
+        return Ok(plan
+            .handle_child_pushdown_result(FilterPushdownPhase::Post, result, config)?
+            .updated_node);
+    }
+    let description =
+        plan.gather_filters_for_pushdown(FilterPushdownPhase::Post, filters, config)?;
+    let parent_filters = description.parent_filters();
+    if parent_filters.len() != children.len() {
+        return Ok(None);
+    }
+    let mut pushed = false;
+    let mut new_children = Vec::with_capacity(children.len());
+    for (child, filters) in children.into_iter().zip(parent_filters) {
+        let filters = filters
+            .into_iter()
+            .filter(|filter| matches!(filter.discriminant, PushedDown::Yes))
+            .map(|filter| filter.predicate)
+            .collect::<Vec<_>>();
+        let new_child = match filters.is_empty() {
+            true => None,
+            false => push_down(child, filters, config)?,
+        };
+        pushed |= new_child.is_some();
+        new_children.push(new_child.unwrap_or_else(|| Arc::clone(child)));
+    }
+    if !pushed {
+        return Ok(None);
+    }
+    Ok(Some(replace_children_if_necessary(
+        Arc::clone(plan),
+        new_children,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -373,7 +667,7 @@ mod tests {
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{
         assert_aggregate_parity_with_setup, assert_lowered_results_with_setup,
-        lookalike_max,
+        lookalike_max, lower_with_tiny_tables, without_limited_aggregations,
     };
     use super::*;
     use crate::bridge::{PipelineRootExec, bridged_plans};
@@ -381,7 +675,7 @@ mod tests {
     use crate::operator::PhysicalOperator;
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::write_parquet;
-    use crate::test_utils::{pipeline_context, test_session_config};
+    use crate::test_utils::{datafusion_context, pipeline_context, test_session_config};
 
     /// The number of files of the Parquet table `m`, and of rows of every file.
     const M_FILES: i64 = 16;
@@ -465,9 +759,45 @@ mod tests {
         Ok(())
     }
 
-    /// Register the Parquet tables of `dir` (see [`write_table_m`]).
+    /// The number of files of the Parquet table `t`, and of rows of every file.
+    const T_FILES: i64 = 8;
+    const T_ROWS: i64 = 40_000;
+
+    /// Write the Parquet table `t` into `dir`: [`T_FILES`] files of
+    /// [`T_ROWS`] rows (more than the thread-local tables of a top-k
+    /// aggregation hold before they are flushed, which sets their cutoff),
+    /// with keys `k` that are unique and ascending, `hi = -k`, and groups `g`
+    /// of 1,000 values in every file.
+    fn write_table_t(dir: &Path) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("hi", DataType::Int64, false),
+            Field::new("g", DataType::Int64, false),
+        ]));
+        for file in 0..T_FILES {
+            let k = (0..T_ROWS).map(|row| file * T_ROWS + row);
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter_values(k.clone())),
+                Arc::new(Int64Array::from_iter_values(k.map(|k| -k))),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..T_ROWS).map(|row| row % 1_000),
+                )),
+            ];
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns)?;
+            write_parquet(
+                &dir.join(format!("t/{file:02}.parquet")),
+                Arc::clone(&schema),
+                &[batch],
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Register the Parquet tables `m` and `t` of `dir` (see
+    /// [`write_table_m`] and [`write_table_t`]).
     async fn register_tables(ctx: &SessionContext, dir: &Path) -> Result<()> {
-        for table in ["m"] {
+        for table in ["m", "t"] {
             let path = dir.join(table);
             let path = path.to_str().expect("a UTF-8 path");
             ctx.register_parquet(table, path, ParquetReadOptions::default())
@@ -476,10 +806,11 @@ mod tests {
         Ok(())
     }
 
-    /// A directory with the Parquet tables of the tests.
+    /// A directory with the Parquet tables `m` and `t`.
     fn write_tables() -> Result<tempfile::TempDir> {
         let dir = tempfile::tempdir()?;
         write_table_m(dir.path())?;
+        write_table_t(dir.path())?;
         Ok(dir)
     }
 
@@ -683,6 +1014,157 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_stage_aggregations_publish_filters_of_their_bounds() -> Result<()> {
+        // On a single partition, DataFusion plans a single stage aggregation,
+        // which produces no dynamic filter. The native aggregation publishes
+        // one into the scan, with which the scan prunes every file after the
+        // first one.
+        let dir = write_tables()?;
+        let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
+        for pushdown_filters in [false, true] {
+            let config = with_pushdown_filters(
+                test_session_config().with_target_partitions(1),
+                pushdown_filters,
+            );
+            for (sql, predicate) in BOUNDED_QUERIES {
+                let context = format!("{sql} (pushdown_filters: {pushdown_filters})");
+                let execution = execute(sql, config.clone(), dir.path()).await?;
+                assert!(execution.datafusion_filters.is_empty(), "{context}");
+                let [filter] = execution.native_filters.as_slice() else {
+                    panic!("No filter is published: {context}\n{}", execution.tree);
+                };
+                assert!(filter.is_complete(), "{context}");
+                assert_eq!(filter.current()?.to_string(), predicate, "{context}");
+                let pruned = pruned_by_statistics(&execution.scan);
+                assert!(
+                    pruned >= (M_FILES - 1) as usize,
+                    "{context}: {pruned} pruned"
+                );
+                // At most the first file is read (the scan prunes the row
+                // groups of a file that it did not read yet too).
+                assert!(
+                    execution.scanned_rows <= M_ROWS as usize,
+                    "{context}: {} rows scanned",
+                    execution.scanned_rows
+                );
+                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_k_aggregations_publish_filters_of_their_cutoffs() -> Result<()> {
+        // The top-k aggregations by the group key or by a `MIN` / `MAX` of
+        // `t` publish a dynamic filter into the scan, which the best cutoff of
+        // their threads sets: once a thread flushed its table (after 32,768
+        // rows of its first file), the scan prunes the files whose values are
+        // all worse, every file after the first one of every thread (of 4).
+        let dir = write_tables()?;
+        let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
+        let queries = [
+            (
+                "SELECT DISTINCT k FROM t ORDER BY k LIMIT 3",
+                "k@0 <= 2 OR k@0 IS NULL",
+            ),
+            (
+                "SELECT k FROM t GROUP BY k ORDER BY k NULLS FIRST LIMIT 10",
+                "k@0 <= 9 OR k@0 IS NULL",
+            ),
+            (
+                "SELECT g, MAX(hi) FROM t GROUP BY g ORDER BY MAX(hi) DESC LIMIT 3",
+                "hi@0 >= -2",
+            ),
+            (
+                "SELECT g, MIN(k) AS m FROM t GROUP BY g ORDER BY m LIMIT 5",
+                "k@0 <= 4",
+            ),
+        ];
+        for pushdown_filters in [false, true] {
+            let config = with_pushdown_filters(test_session_config(), pushdown_filters);
+            let reference = without_limited_aggregations(config.clone());
+            for (sql, predicate) in queries {
+                let context = format!("{sql} (pushdown_filters: {pushdown_filters})");
+                let execution = execute(sql, config.clone(), dir.path()).await?;
+                let [filter] = execution.native_filters.as_slice() else {
+                    panic!("No filter is published: {context}\n{}", execution.tree);
+                };
+                assert!(filter.is_complete(), "{context}");
+                assert_eq!(filter.current()?.to_string(), predicate, "{context}");
+                let pruned = pruned_by_statistics(&execution.scan);
+                assert!(
+                    pruned >= (T_FILES - 4) as usize,
+                    "{context}: {pruned} pruned"
+                );
+                assert!(
+                    execution.scanned_rows <= 4 * T_ROWS as usize,
+                    "{context}: {} rows scanned",
+                    execution.scanned_rows
+                );
+                assert_lowered_results_with_setup(
+                    sql,
+                    config.clone(),
+                    reference.clone(),
+                    &setup,
+                )
+                .await;
+            }
+        }
+        // Descending, the best keys come last, so the cutoffs of the first
+        // files prune hardly anything.
+        let sql = "SELECT DISTINCT k FROM t ORDER BY k DESC LIMIT 3";
+        let config = test_session_config();
+        let execution = execute(sql, config.clone(), dir.path()).await?;
+        assert_eq!(execution.native_filters.len(), 1, "{sql}");
+        let reference = without_limited_aggregations(config.clone());
+        assert_lowered_results_with_setup(sql, config, reference, &setup).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn top_k_aggregations_of_small_tables_prune_with_their_cutoffs() -> Result<()> {
+        // With tiny thread-local tables, which are flushed after a few rows,
+        // the cutoffs of the top-k aggregations of `m` prune all files but
+        // the first one of every thread on any number of threads.
+        let dir = write_tables()?;
+        let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
+        let queries = [
+            (
+                "SELECT DISTINCT id FROM m ORDER BY id LIMIT 4",
+                "id@0 <= 3 OR id@0 IS NULL",
+            ),
+            (
+                "SELECT g, MIN(id) FROM m GROUP BY g ORDER BY MIN(id) LIMIT 2",
+                "id@0 <= 1",
+            ),
+        ];
+        for threads in [1, 4] {
+            let config = test_session_config().with_target_partitions(threads);
+            let ctx = datafusion_context(config.clone());
+            register_tables(&ctx, dir.path()).await?;
+            for (sql, predicate) in queries {
+                let context = format!("{sql} on {threads} threads");
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let root = lower_with_tiny_tables(&plan)?;
+                let execution = execute_lowered(&ctx, plan, root).await?;
+                let [filter] = execution.native_filters.as_slice() else {
+                    panic!("No filter is published: {context}\n{}", execution.tree);
+                };
+                assert_eq!(filter.current()?.to_string(), predicate, "{context}");
+                assert!(
+                    execution.scanned_rows <= threads * M_ROWS as usize,
+                    "{context}: {} rows scanned",
+                    execution.scanned_rows
+                );
+                let reference = without_limited_aggregations(config.clone());
+                assert_lowered_results_with_setup(sql, config.clone(), reference, &setup)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn filters_of_other_aggregations_stay_true() -> Result<()> {
         // The native aggregations do not set the filters of `MIN` and `MAX`
         // of floating point values, whose `NaN`s the statistics of Parquet
@@ -752,6 +1234,43 @@ mod tests {
         assert_eq!(filter.current()?.to_string(), "true", "{sql}");
         assert_eq!(execution.scanned_rows, all_rows, "{sql}");
         assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_are_not_updated_if_the_session_does_not_push_them_down() -> Result<()>
+    {
+        // Without dynamic filters of aggregations, DataFusion produces none,
+        // and the filters that the native aggregations publish (which the
+        // lowering, unaware of the session, pushes into the scans) stay
+        // `true`: the scans read every row.
+        let dir = write_tables()?;
+        let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
+        for threads in [1, 4] {
+            let mut config = test_session_config().with_target_partitions(threads);
+            config
+                .options_mut()
+                .optimizer
+                .enable_aggregate_dynamic_filter_pushdown = false;
+            for (sql, rows) in [
+                ("SELECT MIN(x), MAX(x) FROM m WHERE e", M_FILES * M_ROWS),
+                (
+                    "SELECT DISTINCT k FROM t ORDER BY k LIMIT 3",
+                    T_FILES * T_ROWS,
+                ),
+            ] {
+                let context = format!("{sql} on {threads} threads");
+                let execution = execute(sql, config.clone(), dir.path()).await?;
+                assert!(execution.datafusion_filters.is_empty(), "{context}");
+                for filter in &execution.native_filters {
+                    assert_eq!(filter.current()?.to_string(), "true", "{context}");
+                }
+                assert_eq!(execution.scanned_rows, rows as usize, "{context}");
+                let reference = without_limited_aggregations(config.clone());
+                assert_lowered_results_with_setup(sql, config.clone(), reference, &setup)
+                    .await;
+            }
+        }
         Ok(())
     }
 }

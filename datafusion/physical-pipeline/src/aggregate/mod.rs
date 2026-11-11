@@ -79,8 +79,11 @@
 //! rows that cannot change its result (see `dynamic_filter`): the filter of
 //! the bounds of the `MIN` and `MAX` aggregates of an aggregation without
 //! `GROUP BY` that DataFusion's partial `AggregateExec` produces, which the
-//! threads set to their bounds as DataFusion's partitions do. Which rows the
-//! scans skip depends on the threads too, and is the engine's own.
+//! threads set to their bounds as DataFusion's partitions do, and the filters
+//! that the operator publishes itself into its input, of the bounds of a
+//! single stage aggregation of `MIN` and `MAX` aggregates and of the cutoffs
+//! of the top-k aggregations, for which DataFusion produces none. Which rows
+//! the scans skip depends on the threads too, and is the engine's own.
 //!
 //! [`Accumulator`]: datafusion_expr::Accumulator
 //! [`GroupsAccumulator`]: datafusion_expr::GroupsAccumulator

@@ -106,7 +106,7 @@ impl UngroupedAggregate {
         filters: bool,
     ) -> Result<Arc<dyn GlobalSinkState>> {
         let bounds = match (&spec.dynamic_filter, filters) {
-            (Some(filter), true) => Some(filter.shared_bounds()),
+            (Some(filter), true) => filter.shared_bounds(),
             _ => None,
         };
         Ok(Arc::new(UngroupedSinkState {
