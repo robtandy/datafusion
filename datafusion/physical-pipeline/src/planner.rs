@@ -169,12 +169,9 @@ use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, HashJoinExecBuilder, NestedLoopJoinExec,
-};
+use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
@@ -658,33 +655,15 @@ impl Lowering<'_> {
     }
 
     /// Lower a hash join with [`PhysicalHashJoin::try_lower`], which lowers
-    /// its inputs without the nodes that only distribute their rows.
-    ///
-    /// [`PhysicalHashJoin::try_lower`] leaves a join with a dynamic filter
-    /// whose probe side evaluates expressions that may fail to DataFusion
-    /// (e.g. the decimal arithmetic of TPC-H Q15 and Q17 above their scans of
-    /// Parquet files, which read the filter), so that its probe side
-    /// evaluates them on the rows that DataFusion's filter prunes. Which of
-    /// these rows the engine evaluates is its own: such a join is lowered
-    /// without its dynamic filter (see [`without_dynamic_filter`]). The
-    /// scans of its probe side keep the filter, which no node updates then,
-    /// so that they prune nothing: the join drops the probe rows that cannot
-    /// match itself, and its result is the same.
+    /// its inputs without the nodes that only distribute their rows, and sets
+    /// the dynamic filters of the join (that the scans of its probe side read)
+    /// to the bounds of its build keys.
     fn try_lower_hash_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
-        let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
-            return Ok(None);
-        };
         let lower_input = |input: &Arc<dyn ExecutionPlan>| self.lower(input);
-        if let Some(lowered) = PhysicalHashJoin::try_lower(plan, lower_input)? {
-            return Ok(Some(Arc::new(lowered)));
-        }
-        let Some(unfiltered) = without_dynamic_filter(plan, join)? else {
-            return Ok(None);
-        };
-        Ok(PhysicalHashJoin::try_lower(&unfiltered, lower_input)?
+        Ok(PhysicalHashJoin::try_lower(plan, lower_input)?
             .map(|lowered| Arc::new(lowered) as Arc<dyn PhysicalOperator>))
     }
 
@@ -1263,48 +1242,6 @@ fn passes_states_on(stage: &Arc<dyn ExecutionPlan>, partial: &AggregateExec) -> 
     })
 }
 
-/// `plan`, a hash join `join` with a dynamic filter, without the dynamic
-/// filter, `None` if it has none (see `Lowering::try_lower_hash_join`). The
-/// join is rebuilt with its inputs, keys, filter, type, projection, partition
-/// mode, null handling and fetch, but without its dynamic filter: the nodes of
-/// its probe side keep reading the filter, which nothing updates any more.
-///
-/// A join with a prepared build side (see
-/// `HashJoinExecBuilder::with_prepared_build`), whose build input is an
-/// `EmptyExec` that stands for the prepared rows, is not rebuilt: its rows are
-/// not those of its build input. Nor is any other join whose build input is
-/// an `EmptyExec`.
-fn without_dynamic_filter(
-    plan: &Arc<dyn ExecutionPlan>,
-    join: &HashJoinExec,
-) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    if plan.dynamic_expressions_produced().is_empty() || join.left().is::<EmptyExec>() {
-        return Ok(None);
-    }
-    let unfiltered = HashJoinExecBuilder::new(
-        Arc::clone(join.left()),
-        Arc::clone(join.right()),
-        join.on().to_vec(),
-        *join.join_type(),
-    )
-    .with_filter(join.filter().cloned())
-    .with_projection_ref(join.projection.clone())
-    .with_partition_mode(*join.partition_mode())
-    .with_null_equality(join.null_equality())
-    .with_null_aware(join.null_aware)
-    .with_null_aware_value_keys(join.null_aware_value_keys)
-    .with_fetch(plan.fetch())
-    .build_exec()?;
-    if unfiltered.schema() != plan.schema() {
-        return internal_err!(
-            "The hash join without its dynamic filter has schema {:?}, the join {:?}",
-            unfiltered.schema(),
-            plan.schema()
-        );
-    }
-    Ok(Some(unfiltered))
-}
-
 /// Whether a node of `plan` consumes the dynamic filter with id `filter`: e.g.
 /// a scan, which skips the rows that the filter rejects.
 fn consumes_dynamic_filter(plan: &Arc<dyn ExecutionPlan>, filter: u64) -> bool {
@@ -1752,7 +1689,7 @@ mod tests {
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal, col};
     use datafusion_physical_plan::aggregates::PhysicalGroupBy;
-    use datafusion_physical_plan::joins::PartitionMode;
+    use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion_physical_plan::limit::GlobalLimitExec;
     use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
     use datafusion_physical_plan::{PhysicalExpr, collect, displayable};
