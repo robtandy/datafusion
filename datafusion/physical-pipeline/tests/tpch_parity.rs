@@ -2206,7 +2206,9 @@ type Coverage = (usize, usize, usize, usize, &'static [(&'static str, Why)]);
 
 /// How the pipeline engine lowers every TPC-H query, for every source (with
 /// the configuration of the suite, on 4 threads): see
-/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly.
+/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly. Q8 (over
+/// both sources), Q15 and Q17 (over Parquet) still leave parts of their plans
+/// to DataFusion; lowering them natively too is tracked in #53.
 #[rustfmt::skip]
 const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
     ("MemTable", [
