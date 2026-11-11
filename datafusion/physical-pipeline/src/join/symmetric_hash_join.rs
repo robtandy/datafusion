@@ -123,12 +123,12 @@ where
     let Some(join) = plan.downcast_ref::<SymmetricHashJoinExec>() else {
         return Ok(None);
     };
-    let left = without_reordering(join.left());
-    let right = without_reordering(join.right());
+    let left = without_reordering(join.left())?;
+    let right = without_reordering(join.right())?;
     let equi_join = EquiJoin {
         plan,
-        left,
-        right,
+        left: &left,
+        right: &right,
         on: join.on(),
         filter: join.filter(),
         join_type: *join.join_type(),
@@ -143,10 +143,10 @@ where
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
-    let build_right = unbounded[0] || (!unbounded[1] && is_smaller(right, left));
+    let build_right = unbounded[0] || (!unbounded[1] && is_smaller(&right, &left));
     let (build, probe) = match build_right {
-        true => (right, left),
-        false => (left, right),
+        true => (&right, &left),
+        false => (&left, &right),
     };
     let build = lower_input(build, false)?;
     let probe = lower_input(probe, true)?;

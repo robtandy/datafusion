@@ -133,7 +133,10 @@ use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
+    ReplaceChildrenOptions,
+};
 use parking_lot::Mutex;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
@@ -197,12 +200,12 @@ where
         let join = lower_merge_join(join, spec, &mut lower_input)?;
         return Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>));
     }
-    let left = without_reordering(join.left());
-    let right = without_reordering(join.right());
+    let left = without_reordering(join.left())?;
+    let right = without_reordering(join.right())?;
     let equi_join = EquiJoin {
         plan,
-        left,
-        right,
+        left: &left,
+        right: &right,
         on: join.on(),
         filter: join.filter().as_ref(),
         join_type: join.join_type(),
@@ -219,10 +222,10 @@ where
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
-    let build_right = unbounded[0] || (!unbounded[1] && is_smaller(right, left));
+    let build_right = unbounded[0] || (!unbounded[1] && is_smaller(&right, &left));
     let (build, probe) = match build_right {
-        true => (right, left),
-        false => (left, right),
+        true => (&right, &left),
+        false => (&left, &right),
     };
     let build = lower_input(build, false)?;
     let probe = lower_input(probe, true)?;
@@ -328,17 +331,44 @@ pub fn emits_merge_join_order(operator: &Arc<dyn PhysicalOperator>) -> bool {
     }
 }
 
-/// `plan`, an input of a join, without the nodes directly above it that only
-/// sort its rows or distribute them over partitions: `SortExec`s and
-/// `SortPreservingMergeExec`s without a fetch, `CoalescePartitionsExec`s
-/// without a fetch, `RepartitionExec`s and `CoalesceBatchesExec`s. The native
-/// joins read all rows of both inputs, on all threads (which partitions the
-/// rows are distributed over, or what a repartitioning evaluates to distribute
-/// them, does not change the result of a join), and a merge join sorts its
-/// inputs itself.
+/// `plan`, an input of a join, without the nodes that only sort its rows or
+/// distribute them over partitions: `SortExec`s and `SortPreservingMergeExec`s
+/// without a fetch, `CoalescePartitionsExec`s without a fetch,
+/// `RepartitionExec`s and `CoalesceBatchesExec`s, directly above it or below
+/// the `ProjectionExec`s and `FilterExec`s (without a fetch) above it, which
+/// are rebuilt over their inputs without them (e.g. of the sort that
+/// DataFusion pushes below the projection of a sort-merge join of an
+/// aggregation). The native joins read all rows of both inputs, on all
+/// threads (which partitions the rows are distributed over, or what a
+/// repartitioning evaluates to distribute them, does not change the result of
+/// a join, nor of the projections and filters of their rows), and a merge
+/// join sorts its inputs itself.
 pub(crate) fn without_reordering(
     plan: &Arc<dyn ExecutionPlan>,
-) -> &Arc<dyn ExecutionPlan> {
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let plan = without_reordering_nodes(plan);
+    let streams_rows = plan.is::<ProjectionExec>()
+        || (plan.is::<FilterExec>() && plan.fetch().is_none());
+    let children = plan.children();
+    let [input] = children.as_slice() else {
+        return Ok(Arc::clone(plan));
+    };
+    if !streams_rows {
+        return Ok(Arc::clone(plan));
+    }
+    let stripped = without_reordering(input)?;
+    if Arc::ptr_eq(&stripped, input) {
+        return Ok(Arc::clone(plan));
+    }
+    Arc::clone(plan).replace_children(
+        vec![stripped],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+}
+
+/// `plan` without the nodes directly above it that only sort its rows or
+/// distribute them over partitions, see [`without_reordering`].
+fn without_reordering_nodes(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     let mut plan = plan;
     loop {
         plan = if let Some(sort) = plan.downcast_ref::<SortExec>()
@@ -526,8 +556,8 @@ where
     F: FnMut(&Arc<dyn ExecutionPlan>, bool) -> Result<Arc<dyn PhysicalOperator>>,
 {
     // The sorts read all of their input.
-    let left = lower_input(without_reordering(join.left()), false)?;
-    let right = lower_input(without_reordering(join.right()), false)?;
+    let left = lower_input(&without_reordering(join.left())?, false)?;
+    let right = lower_input(&without_reordering(join.right())?, false)?;
     merge_join_of_inputs(join, spec, left, right)
 }
 
@@ -2935,6 +2965,10 @@ pub(crate) mod tests {
             "SELECT a.id, b.id FROM t1 a JOIN t1 b ON a.h = b.h AND a.id < b.id AND a.id < 300",
             "SELECT a.id, c.name FROM t1 a JOIN t1 b ON a.id = b.id + 1 JOIN t2 c ON b.a = c.k",
             "SELECT t1.id, t2.name FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.a, t1.id, t2.name",
+            // DataFusion sorts the aggregation below the projection of its
+            // columns, which the join reads (as in TPC-H Q15).
+            "SELECT t2.name, s.total FROM t2 JOIN (SELECT a AS k, sum(b) AS total FROM t1 GROUP BY a) s ON t2.k = s.k",
+            "SELECT t2.name, s.total FROM t2 LEFT JOIN (SELECT a AS k, sum(b) AS total FROM t1 WHERE c > 0 GROUP BY a) s ON t2.k = s.k WHERE s.total > 0 OR s.total IS NULL",
         ] {
             for partitions in [4, 3] {
                 let (root, _) =
@@ -2982,6 +3016,10 @@ pub(crate) mod tests {
             ),
             (
                 "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.k ORDER BY t1.a NULLS FIRST LIMIT 30",
+                1,
+            ),
+            (
+                "SELECT t2.k, s.total, t2.name FROM t2 JOIN (SELECT a AS k, sum(b) AS total FROM t1 GROUP BY a) s ON t2.k = s.k ORDER BY t2.k NULLS FIRST",
                 1,
             ),
         ] {

@@ -789,10 +789,10 @@ impl Lowering<'_> {
     /// a sort-merge join (through projections and filters, see
     /// [`merge_join::ordered_join_below`]) to its input, in which the join is
     /// a [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin), whose rows the
-    /// native operators above it emit
-    /// in order, on a single thread (and to a limit of its input, in its order,
-    /// for a merge with a fetch). Merging the sorted partitions of the join is
-    /// emitting the rows of the merge join in order.
+    /// native operators above it emit in order, on a single thread (and to a
+    /// limit of its input, in its order, for a merge with a fetch). Merging the
+    /// sorted partitions of the join is emitting the rows of the merge join in
+    /// order.
     ///
     /// Only if the input of the merge is lowered to the rows of a merge join
     /// in its order (see [`merge_join::emits_merge_join_order`]).
@@ -824,8 +824,8 @@ impl Lowering<'_> {
     /// Lower a symmetric hash join with [`symmetric_hash_join::try_lower`]: to
     /// a [`PhysicalHashJoin`] that builds on an input that ends, or to a
     /// [`PhysicalSymmetricHashJoin`](crate::join::PhysicalSymmetricHashJoin) of
-    /// two inputs that never end, which
-    /// streams both of them in its pipelines (see [`Self::lower_in`]).
+    /// two inputs that never end, which streams both of them in its pipelines
+    /// (see [`Self::lower_in`]).
     fn try_lower_symmetric_hash_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
