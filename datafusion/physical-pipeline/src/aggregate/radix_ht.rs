@@ -1369,7 +1369,10 @@ mod tests {
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{assert_aggregate_parity_with_setup, lower};
     use crate::executor::Executor;
-    use crate::test_utils::{canonical_batch, datafusion_context, test_session_config};
+    use crate::test_utils::{
+        assert_byte_eq_with_datafusion_with_config, canonical_batch, datafusion_context,
+        test_session_config,
+    };
 
     /// The partition of the group of the keys of `row`.
     fn partition_of_row(keys: &[ArrayRef], row: usize) -> usize {
@@ -2261,7 +2264,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn literal_arguments_of_filtered_aggregates_are_built_for_their_rows()
     -> Result<()> {
-        // No row passes the filter, and a few do; on 1 thread and on 4; in a
+        // No row passes the filter, and a few do; on 1, 4 and 16 threads; in a
         // session that does not trust `count`, whose rows do not bypass the
         // tables (the regular path evaluates the arguments for the rows that
         // pass the filter only, like DataFusion), and in a session that does,
@@ -2269,8 +2272,10 @@ mod tests {
         // `evaluate_row_aligned`).
         let selections: [fn(i64) -> bool; 2] = [|_| false, |row| row % 1_000 == 7];
         let runs = selections.into_iter().flat_map(|selected| {
-            [(1, false), (4, false), (1, true), (4, true)]
-                .map(|(threads, trusted)| (selected, threads, trusted))
+            [1, 4, 16]
+                .into_iter()
+                .flat_map(|threads| [(threads, false), (threads, true)])
+                .map(move |(threads, trusted)| (selected, threads, trusted))
         });
         for (selected, threads, trusted) in runs {
             let plan = count_of_long_literal(selected)?;
@@ -2318,34 +2323,39 @@ mod tests {
             .downcast_ref::<PhysicalHashAggregate>()
             .expect("a native aggregation");
         // Checked before the execution, which would fail to allocate otherwise
-        // (see `is_flat_type`, and `AggregateSpec::bypass`).
+        // (see `is_flat_type`, and `AggregateSpec::bypass`), also in the
+        // sessions that trust `count`.
         assert!(!aggregate.spec().bypass);
-        // Like DataFusion: 32,769 groups that count no row.
-        let task_ctx = Arc::new(TaskContext::default());
-        let actual = Executor::collect(root, Arc::clone(&task_ctx), 1).await?;
-        let expected = datafusion_physical_plan::collect(
-            count_of_literal(literal, |_| false)?,
-            task_ctx,
-        )
-        .await?;
-        let schema = plan.schema();
-        assert_eq!(
-            canonical_batch(&schema, &actual, false)?,
-            canonical_batch(&schema, &expected, false)?
-        );
-        let counts = actual
-            .iter()
-            .map(|batch| {
-                batch
-                    .column(1)
-                    .as_primitive::<Int64Type>()
-                    .values()
-                    .to_vec()
-            })
-            .collect::<Vec<_>>()
-            .concat();
-        assert_eq!(counts.len(), 32_769);
-        assert!(counts.iter().all(|&count| count == 0));
+        for config in [SessionConfig::new(), trusting(SessionConfig::new())] {
+            assert!(!aggregate.spec().rows_bypass_tables(config.options()));
+            // Like DataFusion: 32,769 groups that count no row.
+            let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+            let actual =
+                Executor::collect(Arc::clone(&root), Arc::clone(&task_ctx), 1).await?;
+            let expected = datafusion_physical_plan::collect(
+                count_of_literal(literal.clone(), |_| false)?,
+                task_ctx,
+            )
+            .await?;
+            let schema = plan.schema();
+            assert_eq!(
+                canonical_batch(&schema, &actual, false)?,
+                canonical_batch(&schema, &expected, false)?
+            );
+            let counts = actual
+                .iter()
+                .map(|batch| {
+                    batch
+                        .column(1)
+                        .as_primitive::<Int64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            assert_eq!(counts.len(), 32_769);
+            assert!(counts.iter().all(|&count| count == 0));
+        }
         Ok(())
     }
 
@@ -2474,7 +2484,487 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregates_ordered_by_values_without_a_total_order_are_left_to_datafusion()
+    -> Result<()> {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+        // DataFusion sorts the rows of `FIRST_VALUE(v ORDER BY v)` by Arrow's
+        // order, which puts the NULLs of a field last, and takes the first; the
+        // native accumulator (see `without_input_order`) compared their
+        // `ScalarValue`s, which do not order structs totally (see
+        // `compares_totally`): of one partition of 8,192 rows of a single
+        // group, `{a: NULL}` in the first 2,048 rows and `{a: 1}` after,
+        // DataFusion's first value was `{a: 1}`, the native one `{a: NULL}`,
+        // also on one thread. Aggregates ordered by such values are left to
+        // DataFusion; those ordered by other values stay native.
+        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("i", DataType::Int64, false),
+            Field::new("v", DataType::Struct(fields.clone()), true),
+        ]));
+        let a = Int64Array::from_iter((0..8_192).map(|i| (i >= 2_048).then_some(1)));
+        let v = StructArray::new(fields, vec![Arc::new(a) as ArrayRef], None);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from_iter_values((0..8_192).rev())),
+                Arc::new(v),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false);
+                if trusted {
+                    config = trusting(config);
+                }
+                for sql in [
+                    "SELECT k, FIRST_VALUE(v ORDER BY v) FROM t GROUP BY k",
+                    "SELECT k, LAST_VALUE(v ORDER BY v DESC) FROM t GROUP BY k",
+                    "SELECT FIRST_VALUE(v ORDER BY v), LAST_VALUE(v ORDER BY v) FROM t",
+                    "SELECT k, NTH_VALUE(v, 2 ORDER BY v) FROM t GROUP BY k",
+                    "SELECT k, ARRAY_AGG(v ORDER BY v) FROM t GROUP BY k",
+                ] {
+                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                }
+                // Ordered by a column without ties.
+                let sql = "SELECT k, FIRST_VALUE(v ORDER BY i), MAX(i) FROM t GROUP BY k";
+                assert!(
+                    planned_aggregations(sql, &config, &setup).await? > 0,
+                    "{sql}"
+                );
+                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// A `MemTable` `t` of the partitions `partitions` (of the schema of their
+    /// first batch, or of `schema`).
+    fn mem_table_setup(
+        schema: SchemaRef,
+        partitions: Vec<Vec<RecordBatch>>,
+    ) -> impl AsyncFn(&SessionContext) -> Result<()> {
+        async move |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                partitions.clone(),
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        }
+    }
+
+    /// Assert that the aggregation of `sql` (see [`aggregation`]) in a session
+    /// of configuration `config`, set up by `setup`, is left to DataFusion, by
+    /// [`PhysicalHashAggregate::try_lower`] and by the planner, and that the
+    /// pipeline engine returns DataFusion's results.
+    async fn assert_left_to_datafusion<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        use super::super::test_support::assert_lowered_parity_with_setup;
+        assert_not_lowered(sql, &config, &setup).await?;
+        assert_lowered_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    /// Assert that neither [`PhysicalHashAggregate::try_lower`] nor the
+    /// planner lowers the aggregation of `sql`, in a session of configuration
+    /// `config` set up by `setup`.
+    async fn assert_not_lowered<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let plan = aggregation(&plan).expect("an aggregation");
+        assert!(
+            PhysicalHashAggregate::try_lower(&plan, lower)?.is_none(),
+            "{sql}"
+        );
+        assert_eq!(planned_aggregations(sql, config, &setup).await?, 0, "{sql}");
+        Ok(())
+    }
+
+    /// The number of native aggregations of the plan of `sql` that the planner
+    /// lowers in a session of configuration `config` set up by `setup`.
+    async fn planned_aggregations<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<usize>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = crate::test_utils::pipeline_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
+            return internal_err!("The pipeline engine did not plan {sql}");
+        };
+        Ok(crate::operators::union::test_support::count::<
+            PhysicalHashAggregate,
+        >(root.operator()))
+    }
+
+    /// Table `hc`: 34,816 distinct keys `k`, values `v`, strings `s` (views)
+    /// and booleans `b` (with nulls), in a single partition of batches of
+    /// 2,048 rows: a thread that aggregates them fills its table (of 32,768
+    /// groups) with the first 16 batches, and the rows of the last one then
+    /// bypass it, if they may.
+    fn hc_batches() -> Result<Vec<RecordBatch>> {
+        const ROWS: i64 = 17 * DEFAULT_VECTOR_SIZE as i64;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        (0..ROWS)
+            .step_by(DEFAULT_VECTOR_SIZE)
+            .map(|start| {
+                let rows = start..start + DEFAULT_VECTOR_SIZE as i64;
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.clone().map(|i| (i * 7_919) % 1_000_003),
+                    )),
+                    Arc::new(Int64Array::from_iter(
+                        rows.clone()
+                            .map(|i| (i % 13 != 4).then_some(i % 1_000 - 500)),
+                    )),
+                    Arc::new(StringViewArray::from_iter(rows.clone().map(|i| {
+                        (i % 17 != 3).then(|| format!("a string that is not inlined {i}"))
+                    }))),
+                    Arc::new(BooleanArray::from_iter(
+                        rows.map(|i| (i % 11 != 5).then_some(i % 3 == 0)),
+                    )),
+                ];
+                Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+            })
+            .collect()
+    }
+
+    /// Whether the rows of `batches` (of a table of the query) bypass the
+    /// table of a thread of the native aggregation that consumes them, the
+    /// deepest of the plan of `sql` that the planner lowers in the session of
+    /// `ctx`, when its sink consumes them on a thread of an execution in that
+    /// session, as the executor runs it (see
+    /// `PhysicalHashAggregate::get_local_sink_state`).
+    async fn planned_aggregation_bypasses(
+        ctx: &SessionContext,
+        sql: &str,
+        batches: &[RecordBatch],
+    ) -> Result<bool> {
+        use crate::operator::{ExecutionContext, PhysicalOperator};
+        fn deepest(
+            operator: &Arc<dyn PhysicalOperator>,
+        ) -> Option<Arc<dyn PhysicalOperator>> {
+            operator.children().iter().find_map(deepest).or_else(|| {
+                operator
+                    .is::<PhysicalHashAggregate>()
+                    .then(|| Arc::clone(operator))
+            })
+        }
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
+            return internal_err!("The pipeline engine did not plan {sql}");
+        };
+        let Some(aggregate) = deepest(root.operator()) else {
+            return internal_err!("No native aggregation in the plan of {sql}");
+        };
+        let schema = aggregate.children()[0].schema();
+        let execution = ExecutionContext::new(ctx.task_ctx(), 0, 1);
+        let global = aggregate.get_global_sink_state(&execution)?;
+        let mut local = aggregate.get_local_sink_state(&execution, global.as_ref())?;
+        let mut bypassed = false;
+        for batch in batches {
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    Arc::clone(batch.column_by_name(field.name()).expect("a column"))
+                })
+                .collect();
+            let chunk = DataChunk::from_record_batch(RecordBatch::try_new(
+                Arc::clone(&schema),
+                columns,
+            )?);
+            aggregate.sink(&execution, &chunk, global.as_ref(), local.as_mut())?;
+            let Some(state) = local.downcast_ref::<RadixLocalState>() else {
+                return internal_err!("The aggregation of {sql} has no radix sink state");
+            };
+            bypassed |= state.bypass.is_some();
+        }
+        Ok(bypassed)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rows_of_planned_aggregations_bypass_the_tables_in_trusting_sessions_only()
+    -> Result<()> {
+        use super::super::test_support::{lookalike_count, lookalike_sum};
+        // The native aggregations that the planner lowers, their sinks consuming
+        // 34,816 distinct keys on a thread of an execution of the session, as
+        // the executor runs them: once the table of the thread is full, its
+        // rows bypass it in the sessions that trust the functions of all
+        // aggregates (DataFusion's built-in aggregate functions, neither
+        // `DISTINCT` nor ordered), and in all sessions if there are no
+        // aggregates, as before sessions could trust aggregate functions. The
+        // rows of the other aggregations never bypass the tables. Nothing
+        // forces `AggregateSpec::bypass` here. (On a single target partition,
+        // on which the planner lowers all of these aggregations: on several,
+        // it leaves those whose partial states are lists or binaries to
+        // DataFusion, see the module documentation of `planner`.)
+        let batches = hc_batches()?;
+        let queries = [
+            // The query, whether its rows bypass the tables in a session that
+            // does not trust DataFusion's built-in aggregate functions, and in
+            // a session that does.
+            (
+                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM hc GROUP BY k",
+                false,
+                true,
+            ),
+            (
+                "SELECT k, BOOL_AND(b), BOOL_OR(b), BIT_AND(v), BIT_OR(v), BIT_XOR(v), \
+                 APPROX_DISTINCT(s), MEDIAN(v), ARRAY_AGG(v), FIRST_VALUE(v), \
+                 LAST_VALUE(s), COUNT(v) FILTER (WHERE b) FROM hc GROUP BY k",
+                false,
+                true,
+            ),
+            ("SELECT k, s FROM hc GROUP BY k, s", true, true),
+            ("SELECT DISTINCT k, v FROM hc", true, true),
+            // `DISTINCT` and ordered aggregates.
+            (
+                "SELECT k, COUNT(DISTINCT v), COUNT(DISTINCT s) FROM hc GROUP BY k",
+                false,
+                false,
+            ),
+            (
+                "SELECT k, SUM(DISTINCT v), COUNT(*) FROM hc GROUP BY k",
+                false,
+                false,
+            ),
+            (
+                "SELECT k, ARRAY_AGG(v ORDER BY s), COUNT(*) FROM hc GROUP BY k",
+                false,
+                false,
+            ),
+            (
+                "SELECT k, LAST_VALUE(v ORDER BY s DESC), MAX(v) FROM hc GROUP BY k",
+                false,
+                false,
+            ),
+            // Built-in functions that are not trusted.
+            (
+                "SELECT k, STDDEV(v), COUNT(*) FROM hc GROUP BY k",
+                false,
+                false,
+            ),
+        ];
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            let setup = async |ctx: &SessionContext| -> Result<()> {
+                let table = datafusion::datasource::MemTable::try_new(
+                    batches[0].schema(),
+                    vec![batches.clone()],
+                )?;
+                ctx.register_table("hc", Arc::new(table))?;
+                Ok(())
+            };
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            setup(&ctx).await?;
+            for (sql, untrusted, with_trust) in queries {
+                let bypass = if trusted { with_trust } else { untrusted };
+                assert_eq!(
+                    planned_aggregation_bypasses(&ctx, sql, &batches).await?,
+                    bypass,
+                    "{sql} (trusted: {trusted})"
+                );
+                // The results of the rows that bypass the table of the thread
+                // (those of the other sessions are checked by the other tests).
+                if bypass {
+                    assert_byte_eq_with_datafusion_with_config(
+                        sql,
+                        config.clone(),
+                        &setup,
+                    )
+                    .await;
+                }
+            }
+            // User-defined functions that look like DataFusion's `count` and
+            // `sum`, and replace them (see `lookalike_count`): their rows never
+            // bypass the tables.
+            let setup_lookalikes = async |ctx: &SessionContext| -> Result<()> {
+                setup(ctx).await?;
+                ctx.register_udaf(lookalike_count());
+                ctx.register_udaf(lookalike_sum());
+                Ok(())
+            };
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            setup_lookalikes(&ctx).await?;
+            for sql in [
+                "SELECT k, count(v), sum(v) FROM hc GROUP BY k",
+                "SELECT k, count(*), MAX(v) FROM hc GROUP BY k",
+            ] {
+                assert!(!planned_aggregation_bypasses(&ctx, sql, &batches).await?);
+                assert_byte_eq_with_datafusion_with_config(
+                    sql,
+                    config.clone(),
+                    &setup_lookalikes,
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn arguments_of_bypassed_rows_fail_like_datafusion() -> Result<()> {
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // 40,000 distinct keys (the rows of a thread bypass its table once it is
+        // full, in the sessions that trust the aggregate functions), and a last
+        // row on which an argument of an aggregate fails: DataFusion and the
+        // native aggregation fail on it with the same error, on 1, 4 and 16
+        // threads, with the default and with tiny tables, through the planner
+        // and the lowering of the tests. The bypassed rows evaluate the
+        // arguments of the aggregates when they are consumed, like the tables.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("d", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batches = (0..40_000)
+            .step_by(DEFAULT_VECTOR_SIZE)
+            .map(|start| {
+                let rows = start..(start + DEFAULT_VECTOR_SIZE as i64).min(40_000);
+                let last = |i: i64| i == 39_999;
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.clone().map(|i| (i * 7_919) % 40_009),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.clone().map(|i| if last(i) { 1_000 } else { i % 100 }),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        rows.clone().map(|i| i64::from(!last(i))),
+                    )),
+                    Arc::new(StringArray::from_iter_values(rows.map(|i| {
+                        if last(i) {
+                            "not an integer".to_string()
+                        } else {
+                            format!("{i}")
+                        }
+                    }))),
+                ];
+                Ok(RecordBatch::try_new(Arc::clone(&schema), columns)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![batches.clone()],
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        };
+        // The queries, their errors, and the numbers of target partitions on
+        // which the planner lowers their aggregations (it leaves them to
+        // DataFusion on the others: a cast of a string on several threads, and
+        // a division, which may fail with a division by zero or an overflow,
+        // on any number of threads).
+        let queries: [(&str, &str, &[usize]); 3] = [
+            (
+                "SELECT k, COUNT(*), SUM(CAST(s AS BIGINT)) FROM t GROUP BY k",
+                "Cannot cast string 'not an integer' to value of Int64 type",
+                &[1],
+            ),
+            (
+                "SELECT k, MAX(v), SUM(v / d) FROM t GROUP BY k",
+                "Divide by zero error",
+                &[],
+            ),
+            // A cast of an integer into a decimal can only fail with an overflow:
+            // the planner lowers the aggregation on several threads too.
+            (
+                "SELECT k, MAX(v), SUM(CAST(v AS DECIMAL(3, 0))) FROM t GROUP BY k",
+                "1000",
+                &[1, 4, 16],
+            ),
+        ];
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                for (sql, message, planned) in queries {
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let aggregate = PhysicalHashAggregate::try_lower(
+                        &aggregation(&plan).expect("an aggregation"),
+                        lower,
+                    )?
+                    .expect("a lowered aggregation");
+                    assert_eq!(
+                        aggregate.spec().rows_bypass_tables(config.options()),
+                        trusted
+                    );
+                    assert_eq!(
+                        planned_aggregations(sql, &config, &setup).await?,
+                        usize::from(planned.contains(&target_partitions)),
+                        "{sql} on {target_partitions} target partitions"
+                    );
+                    assert_aggregate_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        message,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bypassed_rows_are_aggregated_like_datafusion() -> Result<()> {
+        assert_bypassed_rows_are_aggregated_like_datafusion(&[1, 4], &[1, 4]).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bypassed_rows_are_aggregated_like_datafusion_on_16_threads() -> Result<()> {
+        assert_bypassed_rows_are_aggregated_like_datafusion(&[16], &[16]).await
+    }
+
+    /// Assert that the queries over table `u` (see [`register_u`]) produce
+    /// DataFusion's results, with `target_partitions` of `partitions`, on
+    /// `threads` native threads (and through the planner), with tables small
+    /// enough for their rows to bypass them.
+    async fn assert_bypassed_rows_are_aggregated_like_datafusion(
+        partitions: &[usize],
+        threads: &[usize],
+    ) -> Result<()> {
         // The queries, and whether their rows bypass the tables in the
         // sessions that trust DataFusion's built-in aggregate functions: those
         // whose aggregates are neither `DISTINCT` nor ordered (see
@@ -2548,8 +3038,10 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)]
-        {
+        let configs = [false, true]
+            .into_iter()
+            .flat_map(|trusted| partitions.iter().map(move |&p| (p, trusted)));
+        for (target_partitions, trusted) in configs {
             let mut config =
                 test_session_config().with_target_partitions(target_partitions);
             if trusted {
@@ -2562,7 +3054,7 @@ mod tests {
                 let aggregates = sql.contains('(');
                 let bypass = if trusted { trusted_bypass } else { !aggregates };
                 for capacity in tables {
-                    for threads in [1, 4] {
+                    for &threads in threads {
                         assert_bypassed_parity(&ctx, sql, capacity, threads, bypass)
                             .await?;
                     }
@@ -2692,22 +3184,31 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(counts.len(), 40_000);
         assert!(counts.iter().all(|&count| count == 1));
-        for threads in [1, 4] {
-            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads, false)
-                .await?;
-        }
-        assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
         // Also in a session that trusts DataFusion's `count`, which [`Count`]
         // replaces: its type is not DataFusion's (see
-        // `TrustedAggregateFunctions`).
-        let config = trusting(config);
-        let ctx = datafusion_context(config.clone());
-        setup(&ctx).await?;
-        for threads in [1, 4] {
-            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), threads, false)
-                .await?;
+        // `TrustedAggregateFunctions`). On 1, 4 and 16 threads.
+        for target_partitions in [4, 16] {
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                for threads in [1, 4, 16] {
+                    assert_bypassed_parity(
+                        &ctx,
+                        sql,
+                        TableCapacity::default(),
+                        threads,
+                        false,
+                    )
+                    .await?;
+                }
+                assert_aggregate_parity_with_setup(sql, config, &setup).await;
+            }
         }
-        assert_aggregate_parity_with_setup(sql, config, setup).await;
         Ok(())
     }
 
@@ -2915,16 +3416,77 @@ mod tests {
         }
     }
 
+    /// A function `sum` of a type named `Sum` too, which replaces DataFusion's
+    /// `SUM`: its accumulator rejects the rows that make its running total
+    /// negative, like the one of [`RunningSum`].
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct Sum {
+        signature: datafusion_expr::Signature,
+    }
+
+    impl datafusion_expr::AggregateUDFImpl for Sum {
+        fn name(&self) -> &str {
+            "sum"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn accumulator(
+            &self,
+            _: datafusion_expr::function::AccumulatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::Accumulator>> {
+            Ok(Box::new(RunningSumAccumulator(0)))
+        }
+    }
+
+    /// Register table `t` of `partitions`, and the function of a running total
+    /// named `function`: [`RunningSum`] (`running_sum`) or [`Sum`] (`sum`, which
+    /// replaces DataFusion's).
+    fn register_running_totals(
+        ctx: &SessionContext,
+        partitions: &[Vec<RecordBatch>],
+        function: &str,
+    ) -> Result<()> {
+        let schema = partitions
+            .iter()
+            .flatten()
+            .next()
+            .map(RecordBatch::schema)
+            .expect("rows");
+        let table =
+            datafusion::datasource::MemTable::try_new(schema, partitions.to_vec())?;
+        ctx.register_table("t", Arc::new(table))?;
+        let signature = datafusion_expr::Signature::exact(
+            vec![DataType::Int64],
+            datafusion_expr::Volatility::Immutable,
+        );
+        ctx.register_udaf(match function {
+            "sum" => datafusion_expr::AggregateUDF::from(Sum { signature }),
+            _ => datafusion_expr::AggregateUDF::from(RunningSum { signature }),
+        });
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn running_totals_of_user_defined_aggregates_are_aggregated_like_datafusion()
     -> Result<()> {
         use super::super::test_support::assert_aggregate_parity_with_setup;
         // 32,768 distinct keys of value 1, which fill the table of a thread,
         // then the rows `(50000, 1)` and `(50000, -1)` of a group, in a batch or
-        // in two: `running_sum` aggregates them together (its running total
-        // gets to 1, then 0), as DataFusion does, and never alone (-1, which it
-        // rejects). The rows of aggregations with aggregates do not bypass the
-        // tables (see `AggregateSpec::bypass`).
+        // in two: the running total of the group gets to 1, then 0, as in
+        // DataFusion, and never to -1 (which it rejects). The rows of the
+        // aggregations of user-defined functions do not bypass the tables, also
+        // in the sessions that trust DataFusion's built-in aggregate functions,
+        // also if the user-defined function is named `sum`, of a type named
+        // `Sum` (see `TrustedAggregateFunctions`): the accumulators aggregate
+        // every row when it is consumed, with the rows of its group that the
+        // table aggregated so far.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -2939,48 +3501,158 @@ mod tests {
             )
         };
         let distinct = batch((0..32_768).collect(), vec![1; 32_768])?;
-        for last in [
-            vec![batch(vec![50_000, 50_000], vec![1, -1])?],
-            vec![
-                batch(vec![50_000], vec![1])?,
-                batch(vec![50_000], vec![-1])?,
-            ],
+        for (last, thread_counts) in [
+            (
+                vec![batch(vec![50_000, 50_000], vec![1, -1])?],
+                &[1, 4, 16][..],
+            ),
+            // On several threads, DataFusion's partial aggregations of the
+            // partitions of its round-robin repartitioning aggregate the two
+            // batches apart (and reject -1), the native threads the chunks of
+            // their morsels: on one thread only.
+            (
+                vec![
+                    batch(vec![50_000], vec![1])?,
+                    batch(vec![50_000], vec![-1])?,
+                ],
+                &[1],
+            ),
         ] {
             let mut rows = vec![distinct.clone()];
             rows.extend(last);
-            // One target partition, two partitions (the second empty): the
-            // aggregation has two stages.
+            // Two partitions (the second empty): the aggregation has two
+            // stages, also on one target partition.
             let partitions = vec![rows, vec![]];
-            let setup = async |ctx: &SessionContext| -> Result<()> {
-                let table = datafusion::datasource::MemTable::try_new(
-                    Arc::clone(&schema),
-                    partitions.clone(),
-                )?;
-                ctx.register_table("t", Arc::new(table))?;
-                let signature = datafusion_expr::Signature::exact(
-                    vec![DataType::Int64],
-                    datafusion_expr::Volatility::Immutable,
-                );
-                ctx.register_udaf(datafusion_expr::AggregateUDF::from(RunningSum {
-                    signature,
-                }));
-                Ok(())
+            for function in ["running_sum", "sum"] {
+                let setup = async |ctx: &SessionContext| {
+                    register_running_totals(ctx, &partitions, function)
+                };
+                let sql = format!("SELECT k, {function}(v) AS s FROM t GROUP BY k");
+                for &threads in thread_counts {
+                    for trusted in [false, true] {
+                        let mut config =
+                            test_session_config().with_target_partitions(threads);
+                        if trusted {
+                            config = trusting(config);
+                        }
+                        let ctx = datafusion_context(config.clone());
+                        setup(&ctx).await?;
+                        let groups = ctx.sql(&sql).await?.collect().await?;
+                        assert_eq!(
+                            groups.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                            32_769
+                        );
+                        assert_bypassed_parity(
+                            &ctx,
+                            &sql,
+                            TableCapacity::default(),
+                            threads,
+                            false,
+                        )
+                        .await?;
+                        assert_aggregate_parity_with_setup(&sql, config, &setup).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn user_defined_sums_fail_on_the_rows_after_full_tables_like_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which fill the table of a thread, then a row
+        // whose value makes the running total of its group negative, which
+        // [`Sum`] (a function `sum` of a type named `Sum`, which replaces
+        // DataFusion's) rejects, then a string that is not an integer, whose
+        // cast fails: DataFusion fails on the negative running total. So does
+        // the native aggregation, of one stage and of two, also in a session
+        // that trusts DataFusion's built-in aggregate functions: [`Sum`] is not
+        // trusted, so the rows of its aggregation do not bypass the tables.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = |keys: Vec<i64>, value: i64, string: &str| {
+            let rows = keys.len();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(Int64Array::from(vec![value; rows])),
+                    Arc::new(StringArray::from(vec![string; rows])),
+                ],
+            )
+        };
+        let batches = vec![
+            batch((0..32_768).collect(), 1, "1")?,
+            batch(vec![50_000], -5, "2")?,
+            batch(vec![50_001], 3, "not an integer")?,
+        ];
+        let sql = "SELECT k, sum(v), MAX(CAST(s AS BIGINT)) FROM t GROUP BY k";
+        let message = "negative running total: -5";
+        for partitions in [vec![batches.clone()], vec![batches.clone(), vec![]]] {
+            let setup = async |ctx: &SessionContext| {
+                register_running_totals(ctx, &partitions, "sum")
             };
-            let sql = "SELECT k, running_sum(v) AS s FROM t GROUP BY k";
-            let config = test_session_config().with_target_partitions(1);
-            let ctx = datafusion_context(config.clone());
-            setup(&ctx).await?;
-            let groups = ctx.sql(sql).await?.collect().await?;
-            assert_eq!(
-                groups.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                32_769
-            );
-            // On one thread, like the single partition of DataFusion's rows:
-            // the thread-local tables of several threads aggregate the rows of
-            // a group apart, each with the running total of its own rows (as
-            // on the base).
-            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1, false).await?;
-            assert_aggregate_parity_with_setup(sql, config, setup).await;
+            for trusted in [false, true] {
+                let mut config = test_session_config().with_target_partitions(1);
+                if trusted {
+                    config = trusting(config);
+                }
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let aggregate = PhysicalHashAggregate::try_lower(
+                    &aggregation(&plan).expect("an aggregation"),
+                    lower,
+                )?
+                .expect("a lowered aggregation");
+                let spec = aggregate.spec();
+                assert!(spec.bypass && !spec.rows_bypass_tables(config.options()));
+                assert_aggregate_fails_like_datafusion_with_setup(
+                    sql,
+                    config.clone(),
+                    &setup,
+                    message,
+                )
+                .await;
+                // Had the rows of the aggregation bypassed the table (had `sum`
+                // been trusted, by its name or the name of its type), the
+                // negative value would have been aggregated later, by the
+                // final aggregation, after the cast failed.
+                let local = RadixHashAggregate::local_sink_state(
+                    &spec,
+                    TableCapacity::default(),
+                    true,
+                )?;
+                let mut sink = (spec, local, RadixHashAggregate::global_sink_state()?);
+                let (spec, local, global) = &mut sink;
+                let error = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).step_by(DEFAULT_VECTOR_SIZE).map(
+                            move |offset| {
+                                batch.slice(
+                                    offset,
+                                    DEFAULT_VECTOR_SIZE.min(batch.num_rows() - offset),
+                                )
+                            },
+                        )
+                    })
+                    .try_for_each(|chunk| {
+                        RadixHashAggregate::sink(
+                            spec,
+                            chunk,
+                            global.as_ref(),
+                            local.as_mut(),
+                        )
+                    })
+                    .expect_err("a cast error");
+                assert!(error.to_string().contains("not an integer"), "{error}");
+            }
         }
         Ok(())
     }
@@ -3030,6 +3702,27 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn bypassed_rows_of_long_values_are_aggregated_like_datafusion() -> Result<()> {
+        assert_bypassed_rows_of_long_values_are_aggregated_like_datafusion(
+            &[1, 4],
+            &[1, 4],
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bypassed_rows_of_long_values_are_aggregated_like_datafusion_on_16_threads()
+    -> Result<()> {
+        assert_bypassed_rows_of_long_values_are_aggregated_like_datafusion(&[16], &[16])
+            .await
+    }
+
+    /// Assert that the queries over table `long` (see [`register_long`])
+    /// produce DataFusion's results, like
+    /// [`assert_bypassed_rows_are_aggregated_like_datafusion`].
+    async fn assert_bypassed_rows_of_long_values_are_aggregated_like_datafusion(
+        partitions: &[usize],
+        threads: &[usize],
+    ) -> Result<()> {
         // The queries, and whether they have aggregates, whose rows bypass the
         // tables in the sessions that trust them only.
         let queries = [
@@ -3057,8 +3750,10 @@ mod tests {
                 maximum: 256,
             },
         ];
-        for (target_partitions, trusted) in [(1, false), (4, false), (1, true), (4, true)]
-        {
+        let configs = [false, true]
+            .into_iter()
+            .flat_map(|trusted| partitions.iter().map(move |&p| (p, trusted)));
+        for (target_partitions, trusted) in configs {
             let mut config =
                 test_session_config().with_target_partitions(target_partitions);
             if trusted {
@@ -3069,7 +3764,7 @@ mod tests {
             for (sql, aggregates) in queries {
                 let bypass = trusted || !aggregates;
                 for capacity in tables {
-                    for threads in [1, 4] {
+                    for &threads in threads {
                         assert_bypassed_parity(&ctx, sql, capacity, threads, bypass)
                             .await?;
                     }
@@ -3134,9 +3829,27 @@ mod tests {
             ctx.register_table("wide", Arc::new(table))?;
             Ok(())
         };
-        let config = test_session_config().with_target_partitions(1);
         let sql = "SELECT k, COUNT(b) FROM wide GROUP BY k";
-        assert_aggregate_parity_with_setup(sql, config, setup).await;
+        // In a session that trusts `count`, the rows of the binaries bypass the
+        // table of the thread (the reviewer's case), in the others they do not.
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            setup(&ctx).await?;
+            let batches = partitions.concat();
+            assert_eq!(
+                planned_aggregation_bypasses(&ctx, sql, &batches).await?,
+                trusted
+            );
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1, trusted)
+                .await?;
+            assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        }
         Ok(())
     }
 

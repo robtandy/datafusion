@@ -636,6 +636,26 @@ impl PhysicalHashAggregate {
         {
             return Ok(None);
         }
+        // DataFusion sorts the rows of ordered aggregates by Arrow's order (the
+        // input of a `FIRST_VALUE`, which takes the first row then), the native
+        // operator lets their accumulators compare them as `ScalarValue`s (see
+        // `without_input_order`), as they do when they merge their states:
+        // which compare nested values by another order, and not by a total one
+        // (see `compares_totally`, e.g. `{a: NULL}` is equal to `{a: 1}`, and
+        // `[NULL]` is after `[1]` whatever the order of the NULLs), so that they
+        // may keep a row that is not the first in the order of the aggregate.
+        // Aggregates ordered by such values are left to DataFusion.
+        let input_schema = raw.input().schema();
+        if raw.aggr_expr().iter().any(|aggregate| {
+            aggregate.order_bys().iter().any(|sort| {
+                !sort
+                    .expr
+                    .data_type(&input_schema)
+                    .is_ok_and(|data_type| compares_totally(&data_type))
+            })
+        }) {
+            return Ok(None);
+        }
         let input = lower_input(raw.input())?;
         let aggregate = match last {
             Some(last) => Self::try_new_two_stage(raw, last, input)?,
@@ -1278,6 +1298,20 @@ fn is_flat_type(data_type: &DataType) -> bool {
             | DataType::LargeUtf8
             | DataType::Utf8View
     )
+}
+
+/// Whether DataFusion compares the `ScalarValue`s of `data_type` by a total
+/// order consistent with Arrow's, by which it sorts them: values that are
+/// not nested (floating point values by their total order), and dictionaries
+/// of them. Nested values are compared field by field, skipping NULLs, or
+/// element by element, NULLs last: e.g. `{a: NULL}` compares equal to
+/// `{a: 1}` and to `{a: 2}`, which Arrow sorts after both.
+fn compares_totally(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, values) => compares_totally(values),
+        DataType::RunEndEncoded(_, _) => false,
+        data_type => !data_type.is_nested(),
+    }
 }
 
 /// The aggregates `exprs`, with the aggregates whose accumulators may rely
@@ -2621,7 +2655,7 @@ mod tests {
             "SELECT a, MIN(b) AS m FROM (VALUES (3, 1), (1, 1), (2, 1)) AS t(a, b) \
              GROUP BY a ORDER BY m LIMIT 1",
         ];
-        for target_partitions in [1, 4] {
+        for target_partitions in [1, 4, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
             let ctx = crate::test_utils::datafusion_context(config.clone());
             for sql in queries {
@@ -2724,7 +2758,7 @@ mod tests {
             "SELECT DISTINCT k FROM tkn ORDER BY k DESC LIMIT 32768",
             "SELECT DISTINCT k FROM tkn ORDER BY k LIMIT 32769",
         ];
-        for target_partitions in [1, 4] {
+        for target_partitions in [1, 4, 16] {
             let config = test_session_config().with_target_partitions(target_partitions);
             let ctx = crate::test_utils::datafusion_context(config.clone());
             register_tkn(&ctx)?;
@@ -2841,16 +2875,30 @@ mod tests {
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
         let untrusting = ConfigOptions::default();
-        let mut trusting = ConfigOptions::default();
-        trusting
-            .extensions
-            .insert(PhysicalHashAggregate::trusted_aggregate_functions(
-                &datafusion::functions_aggregate::all_default_aggregate_functions(),
-            ));
+        let with_extension = |trusted: TrustedAggregateFunctions| {
+            let mut options = ConfigOptions::default();
+            options.extensions.insert(trusted);
+            options
+        };
+        let functions =
+            datafusion::functions_aggregate::all_default_aggregate_functions();
+        let trusting = with_extension(
+            PhysicalHashAggregate::trusted_aggregate_functions(&functions),
+        );
+        // Sessions whose extension trusts no function behave like the sessions
+        // without it.
+        let untrusting_sessions = [
+            untrusting,
+            with_extension(TrustedAggregateFunctions::default()),
+            with_extension(PhysicalHashAggregate::trusted_aggregate_functions(&[
+                Arc::new(super::super::test_support::lookalike_count()),
+                datafusion::functions_aggregate::stddev::stddev_udaf(),
+            ])),
+        ];
         // The queries, and whether their rows bypass the tables in a session
         // that does not trust DataFusion's built-in aggregate functions, and
         // in a session that does.
-        for (sql, untrusted, trusted) in [
+        let queries = [
             // Without aggregates.
             ("SELECT DISTINCT id, c, f, ts FROM t1", true, true),
             ("SELECT a, d FROM t1 GROUP BY a, d", true, true),
@@ -2888,6 +2936,46 @@ mod tests {
                 false,
                 false,
             ),
+            // (DataFusion plans a single `DISTINCT` aggregate, or several of the
+            // same argument with `SUM`, `MIN` or `MAX`, as an aggregation of
+            // the aggregation by the group keys and the argument, without
+            // `DISTINCT`: these queries keep their `DISTINCT` aggregates.)
+            (
+                "SELECT d, SUM(DISTINCT b), COUNT(*) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
+            (
+                "SELECT d, COUNT(DISTINCT a), COUNT(DISTINCT b) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
+            (
+                "SELECT h, ARRAY_AGG(DISTINCT a), COUNT(*) FROM t1 GROUP BY h",
+                false,
+                false,
+            ),
+            (
+                "SELECT h, AVG(DISTINCT a), MEDIAN(DISTINCT b), MAX(c) FROM t1 GROUP BY h",
+                false,
+                false,
+            ),
+            (
+                "SELECT d, LAST_VALUE(a ORDER BY id), COUNT(*) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
+            (
+                "SELECT d, ARRAY_AGG(a ORDER BY b DESC) FILTER (WHERE e), MAX(a) FROM t1 \
+                 GROUP BY d",
+                false,
+                false,
+            ),
+            (
+                "SELECT d, FIRST_VALUE(a ORDER BY id DESC), SUM(b) FROM t1 GROUP BY d",
+                false,
+                false,
+            ),
             // Functions that are not trusted.
             ("SELECT d, STDDEV(b) FROM t1 GROUP BY d", false, false),
             (
@@ -2910,7 +2998,13 @@ mod tests {
                 false,
             ),
             ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false, false),
-        ] {
+        ];
+        /// The first aggregation of the plan of `sql` that is lowered, from the
+        /// top.
+        async fn lowered_aggregation(
+            ctx: &datafusion::prelude::SessionContext,
+            sql: &str,
+        ) -> Result<PhysicalHashAggregate> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let mut aggregate = None;
             let mut node = Arc::clone(&plan);
@@ -2922,10 +3016,36 @@ mod tests {
                 };
                 node = child;
             }
-            let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
+            Ok(aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}")))
+        }
+        for (sql, untrusted, trusted) in queries {
+            let aggregate = lowered_aggregation(&ctx, sql).await?;
             let spec = &aggregate.spec;
-            assert_eq!(spec.rows_bypass_tables(&untrusting), untrusted, "{sql}");
+            for options in &untrusting_sessions {
+                assert_eq!(spec.rows_bypass_tables(options), untrusted, "{sql}");
+                // As on the base: the rows of the aggregations without aggregates
+                // (of the aggregations that may bypass the tables) only.
+                assert_eq!(untrusted, spec.bypass && spec.update.is_empty(), "{sql}");
+            }
             assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
+        }
+        // The aggregates of user-defined functions that look like DataFusion's
+        // `count` and `sum` (see `lookalike_count`), and replace them, are not
+        // trusted.
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        crate::test_utils::register_test_tables(&ctx)?;
+        ctx.register_udaf(super::super::test_support::lookalike_count());
+        ctx.register_udaf(super::super::test_support::lookalike_sum());
+        for sql in [
+            "SELECT a, count(b) FROM t1 GROUP BY a",
+            "SELECT a, count(*) FROM t1 GROUP BY a",
+            "SELECT a, MAX(b), sum(b) FROM t1 GROUP BY a",
+        ] {
+            let aggregate = lowered_aggregation(&ctx, sql).await?;
+            assert!(aggregate.spec.bypass, "{sql}");
+            for options in untrusting_sessions.iter().chain([&trusting]) {
+                assert!(!aggregate.spec.rows_bypass_tables(options), "{sql}");
+            }
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
@@ -2944,6 +3064,169 @@ mod tests {
             try_lower(&top_k_aggregation(&plan).expect("a top-k aggregation"))?
                 .expect("a lowered aggregation");
         assert!(aggregate.spec.top_k.is_some() && !aggregate.spec.bypass);
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_aggregate_functions_are_identified_by_their_implementation_types()
+    -> Result<()> {
+        use datafusion::functions_aggregate::{
+            approx_distinct::ApproxDistinct, array_agg::ArrayAgg, average::Avg,
+            bool_and_or::BoolAnd, bool_and_or::BoolOr, count::Count,
+            first_last::FirstValue, first_last::LastValue, median::Median, min_max::Max,
+            min_max::Min, sum::Sum,
+        };
+
+        use super::super::test_support::{lookalike_count, lookalike_sum};
+        // Of the built-in aggregate functions that a session registers by
+        // default, exactly those of `BUILTIN_AGGREGATES` are trusted.
+        let functions =
+            datafusion::functions_aggregate::all_default_aggregate_functions();
+        let trusted = PhysicalHashAggregate::trusted_aggregate_functions(&functions);
+        let mut names = trusted.names();
+        names.sort_unstable();
+        let mut builtins = BUILTIN_AGGREGATES.map(|(name, _)| name);
+        builtins.sort_unstable();
+        assert_eq!(names, builtins);
+        // By the types of `datafusion-functions-aggregate` that implement them.
+        let function = |name: &str| {
+            functions
+                .iter()
+                .find(|function| function.name() == name)
+                .unwrap_or_else(|| panic!("no function {name}"))
+        };
+        for (name, implementation) in [
+            ("count", TypeId::of::<Count>()),
+            ("sum", TypeId::of::<Sum>()),
+            ("min", TypeId::of::<Min>()),
+            ("max", TypeId::of::<Max>()),
+            ("avg", TypeId::of::<Avg>()),
+            ("first_value", TypeId::of::<FirstValue>()),
+            ("last_value", TypeId::of::<LastValue>()),
+            ("bool_and", TypeId::of::<BoolAnd>()),
+            ("bool_or", TypeId::of::<BoolOr>()),
+            ("approx_distinct", TypeId::of::<ApproxDistinct>()),
+            ("median", TypeId::of::<Median>()),
+            ("array_agg", TypeId::of::<ArrayAgg>()),
+        ] {
+            assert_eq!(
+                implementation_type(function(name)),
+                implementation,
+                "{name}"
+            );
+            assert!(trusted.implementations.contains(&(name, implementation)));
+        }
+        // `bit_and`, `bit_or` and `bit_xor` share a type (private to the crate),
+        // which no other function has: their names tell them apart.
+        let bitwise = ["bit_and", "bit_or", "bit_xor"].map(|name| {
+            let implementation = implementation_type(function(name));
+            assert!(trusted.implementations.contains(&(name, implementation)));
+            implementation
+        });
+        assert!(
+            bitwise
+                .iter()
+                .all(|&implementation| implementation == bitwise[0])
+        );
+        let types = trusted
+            .implementations
+            .iter()
+            .map(|&(_, implementation)| implementation)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(types.len(), BUILTIN_AGGREGATES.len() - 2);
+
+        // Functions that look like DataFusion's `count` and `sum` in every way
+        // but their types: of the same names, implemented by types of the same
+        // names, whose `Debug` output is the built-in functions'.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        let aggregate = |function: Arc<AggregateUDF>| {
+            AggregateExprBuilder::new(function, vec![col("v", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("aggregate")
+                .build()
+        };
+        let lookalikes = [lookalike_count(), lookalike_sum()].map(Arc::new);
+        for (lookalike, builtin) in lookalikes.iter().zip([count_udaf(), sum_udaf()]) {
+            assert_eq!(lookalike.name(), builtin.name());
+            assert_eq!(
+                format!("{:?}", lookalike.inner()),
+                format!("{:?}", builtin.inner())
+            );
+            assert_ne!(
+                implementation_type(lookalike),
+                implementation_type(&builtin)
+            );
+            // In a session that trusts the built-in functions, the aggregates of
+            // the built-in function are trusted, those of the lookalike are not.
+            assert!(trusted.trusts(&aggregate(Arc::clone(&builtin))?));
+            assert!(!trusted.trusts(&aggregate(Arc::clone(lookalike))?));
+        }
+        // Nor are they trusted if they are given as built-in functions, on
+        // their own or with the built-in functions.
+        let given = PhysicalHashAggregate::trusted_aggregate_functions(&lookalikes);
+        assert!(given.names().is_empty());
+        for aggregate in lookalikes
+            .iter()
+            .map(|lookalike| aggregate(Arc::clone(lookalike)))
+        {
+            assert!(!given.trusts(&aggregate?));
+        }
+        let mut all = lookalikes.to_vec();
+        all.extend(functions.iter().cloned());
+        let given = PhysicalHashAggregate::trusted_aggregate_functions(&all);
+        let mut names = given.names();
+        names.sort_unstable();
+        assert_eq!(names, builtins);
+        for aggregate in lookalikes
+            .iter()
+            .map(|lookalike| aggregate(Arc::clone(lookalike)))
+        {
+            assert!(!given.trusts(&aggregate?));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_and_ordered_aggregates_are_not_trusted() -> Result<()> {
+        // Every built-in function that a session may trust, plain (trusted),
+        // `DISTINCT` and ordered (not trusted). DataFusion drops the `ORDER BY`
+        // of the aggregates of the functions whose values do not depend on the
+        // order of their rows: their ordered aggregates are not ordered (and
+        // are trusted), those of `FIRST_VALUE`, `LAST_VALUE` and `ARRAY_AGG`
+        // are.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("b", DataType::Boolean, true),
+        ]));
+        let functions =
+            datafusion::functions_aggregate::all_default_aggregate_functions();
+        let trusted = PhysicalHashAggregate::trusted_aggregate_functions(&functions);
+        for (name, _) in BUILTIN_AGGREGATES {
+            let function = functions
+                .iter()
+                .find(|function| function.name() == name)
+                .expect("a built-in function");
+            let argument = if name.starts_with("bool_") { "b" } else { "v" };
+            let aggregate = |distinct: bool, order_by: Vec<PhysicalSortExpr>| {
+                AggregateExprBuilder::new(
+                    Arc::clone(function),
+                    vec![col(argument, &schema)?],
+                )
+                .schema(Arc::clone(&schema))
+                .alias(name)
+                .with_distinct(distinct)
+                .order_by(order_by)
+                .build()
+            };
+            let by_v = || vec![PhysicalSortExpr::new_default(col("v", &schema).unwrap())];
+            assert!(trusted.trusts(&aggregate(false, vec![])?), "{name}");
+            assert!(!trusted.trusts(&aggregate(true, vec![])?), "{name}");
+            assert!(!trusted.trusts(&aggregate(true, by_v())?), "{name}");
+            let ordered = aggregate(false, by_v())?;
+            let sensitive = ["first_value", "last_value", "array_agg"].contains(&name);
+            assert_eq!(ordered.order_bys().is_empty(), !sensitive, "{name}");
+            assert_eq!(trusted.trusts(&ordered), !sensitive, "{name}");
+        }
         Ok(())
     }
 

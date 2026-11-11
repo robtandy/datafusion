@@ -94,7 +94,8 @@ pub(crate) mod test_support {
     };
     use arrow::datatypes::SchemaRef;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{Result, internal_err};
+    use datafusion_common::{DataFusionError, Result, internal_err};
+    use datafusion_expr::AggregateUDF;
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
@@ -121,7 +122,8 @@ pub(crate) mod test_support {
     use crate::operators::union::test_support::count;
     use crate::test_utils::{
         EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
-        datafusion_context, register_test_tables, run_sql, test_session_config,
+        datafusion_context, pipeline_context, register_test_tables, run_sql,
+        test_session_config,
     };
 
     /// Lower `plan` with the native operators, standing in for the planner:
@@ -469,23 +471,41 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Assert that `sql` fails with an error that contains `message`, both on
-    /// DataFusion and with the plan lowered by [`lower`], in which at least
-    /// one aggregation is a [`PhysicalHashAggregate`]. The query can use the
-    /// tables of [`register_test_tables`].
-    pub(crate) async fn assert_aggregate_fails_like_datafusion(sql: &str, message: &str) {
-        assert_aggregate_fails_like_datafusion_with_setup(
-            sql,
-            test_session_config(),
-            async |ctx: &SessionContext| register_test_tables(ctx),
-            message,
-        )
-        .await
+    /// Assert that `actual`, an error of the pipeline engine, is `expected`,
+    /// the error of DataFusion: an error of the same kind (the variant of its
+    /// root error, and of the Arrow error that it is), with the same message.
+    pub(crate) fn assert_same_error(
+        expected: &DataFusionError,
+        actual: &DataFusionError,
+        context: &str,
+    ) {
+        let kind = |error: &DataFusionError| {
+            let debug = match error.find_root() {
+                DataFusionError::ArrowError(error, _) => format!("ArrowError::{error:?}"),
+                error => format!("{error:?}"),
+            };
+            debug.split('(').next().unwrap_or_default().to_owned()
+        };
+        assert_eq!(
+            kind(expected),
+            kind(actual),
+            "Errors of different kinds: DataFusion: {expected}\npipeline engine: \
+             {actual}\n{context}"
+        );
+        assert_eq!(
+            expected.find_root().strip_backtrace(),
+            actual.find_root().strip_backtrace(),
+            "Different errors\n{context}"
+        );
     }
 
-    /// [`assert_aggregate_fails_like_datafusion`] with a custom session
-    /// configuration, and `setup` registering the tables of the query. The
-    /// lowered plan runs with the default and with tiny thread-local tables.
+    /// Assert that `sql` fails with an error that contains `message`, both on
+    /// DataFusion and on the pipeline engine, with the same error (see
+    /// [`assert_same_error`]): through the `PipelineQueryPlanner` and with the
+    /// plan lowered by [`lower`], in which at least one aggregation is a
+    /// [`PhysicalHashAggregate`], with the default and with tiny thread-local
+    /// tables. Both sessions have the configuration `config`, and `setup`
+    /// registers the tables of the query.
     pub(crate) async fn assert_aggregate_fails_like_datafusion_with_setup<F>(
         sql: &str,
         config: SessionConfig,
@@ -494,11 +514,22 @@ pub(crate) mod test_support {
     ) where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        let ctx = datafusion_context(config);
+        let ctx = datafusion_context(config.clone());
         setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
         assert!(error.to_string().contains(message), "DataFusion: {error}");
-        for lower in [lower as fn(&_) -> _, lower_with_tiny_tables] {
+        let pipeline = pipeline_context(config);
+        setup(&pipeline).await.expect("setup");
+        match run_sql(&pipeline, sql).await {
+            Ok(_) => panic!(
+                "The pipeline engine succeeds, DataFusion fails: {error}\nquery: {sql}"
+            ),
+            Err(e) => assert_same_error(&error, &e, &format!("planner, query: {sql}")),
+        }
+        for (lower, tables) in [
+            (lower as fn(&_) -> _, "default"),
+            (lower_with_tiny_tables, "tiny"),
+        ] {
             let plan = ctx
                 .sql(sql)
                 .await
@@ -514,11 +545,133 @@ pub(crate) mod test_support {
                 Ok(_) => panic!(
                     "The pipeline engine succeeds, DataFusion fails: {error}\nquery: {sql}"
                 ),
-                Err(e) => {
-                    assert!(e.to_string().contains(message), "pipeline engine: {e}")
-                }
+                Err(e) => assert_same_error(
+                    &error,
+                    &e,
+                    &format!("{tables} tables, query: {sql}"),
+                ),
             }
         }
+    }
+
+    /// A function `count` that looks like DataFusion's built-in `count`: of
+    /// the same name, implemented by a type of the same name (`Count`) with
+    /// DataFusion's signature, so that its `Debug` output is DataFusion's, and
+    /// with DataFusion's accumulators. Only the type that implements it is
+    /// not DataFusion's (see `TrustedAggregateFunctions`).
+    pub(crate) fn lookalike_count() -> AggregateUDF {
+        AggregateUDF::from(lookalikes::Count::new())
+    }
+
+    /// A function `sum` that looks like DataFusion's built-in `sum`, like
+    /// [`lookalike_count`].
+    pub(crate) fn lookalike_sum() -> AggregateUDF {
+        AggregateUDF::from(lookalikes::Sum::new())
+    }
+
+    /// The types of [`lookalike_count`] and [`lookalike_sum`].
+    mod lookalikes {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, FieldRef};
+        use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::functions_aggregate::sum::sum_udaf;
+        use datafusion_common::{Result, ScalarValue};
+        use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
+        use datafusion_expr::utils::AggregateOrderSensitivity;
+        use datafusion_expr::{
+            Accumulator, AggregateUDF, AggregateUDFImpl, GroupsAccumulator, ReversedUDAF,
+            SetMonotonicity, Signature,
+        };
+
+        /// A type named like the type of the built-in function `$builtin`
+        /// (`$name`), with its fields (its signature), which implements the
+        /// function `$function` with the accumulators of the built-in.
+        macro_rules! lookalike {
+            ($name:ident, $function:literal, $builtin:ident) => {
+                #[derive(Debug, PartialEq, Eq, Hash)]
+                pub(crate) struct $name {
+                    signature: Signature,
+                }
+
+                impl $name {
+                    pub(crate) fn new() -> Self {
+                        Self {
+                            signature: $builtin().signature().clone(),
+                        }
+                    }
+
+                    fn builtin() -> Arc<AggregateUDF> {
+                        $builtin()
+                    }
+                }
+
+                impl AggregateUDFImpl for $name {
+                    fn name(&self) -> &str {
+                        $function
+                    }
+
+                    fn signature(&self) -> &Signature {
+                        &self.signature
+                    }
+
+                    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+                        Self::builtin().inner().return_type(arg_types)
+                    }
+
+                    fn return_field(&self, arg_fields: &[FieldRef]) -> Result<FieldRef> {
+                        Self::builtin().inner().return_field(arg_fields)
+                    }
+
+                    fn accumulator(
+                        &self,
+                        args: AccumulatorArgs,
+                    ) -> Result<Box<dyn Accumulator>> {
+                        Self::builtin().inner().accumulator(args)
+                    }
+
+                    fn state_fields(
+                        &self,
+                        args: StateFieldsArgs,
+                    ) -> Result<Vec<FieldRef>> {
+                        Self::builtin().inner().state_fields(args)
+                    }
+
+                    fn groups_accumulator_supported(
+                        &self,
+                        args: AccumulatorArgs,
+                    ) -> bool {
+                        Self::builtin().inner().groups_accumulator_supported(args)
+                    }
+
+                    fn create_groups_accumulator(
+                        &self,
+                        args: AccumulatorArgs,
+                    ) -> Result<Box<dyn GroupsAccumulator>> {
+                        Self::builtin().inner().create_groups_accumulator(args)
+                    }
+
+                    fn reverse_expr(&self) -> ReversedUDAF {
+                        ReversedUDAF::Identical
+                    }
+
+                    fn order_sensitivity(&self) -> AggregateOrderSensitivity {
+                        Self::builtin().inner().order_sensitivity()
+                    }
+
+                    fn default_value(&self, data_type: &DataType) -> Result<ScalarValue> {
+                        Self::builtin().inner().default_value(data_type)
+                    }
+
+                    fn set_monotonicity(&self, data_type: &DataType) -> SetMonotonicity {
+                        Self::builtin().inner().set_monotonicity(data_type)
+                    }
+                }
+            };
+        }
+
+        lookalike!(Count, "count", count_udaf);
+        lookalike!(Sum, "sum", sum_udaf);
     }
 
     /// Assert that `sql` produces byte-identical results on DataFusion and on
@@ -1234,7 +1387,18 @@ mod tests {
                 "Divide by zero",
             ),
         ] {
-            assert_aggregate_fails_like_datafusion(sql, message).await;
+            // On 1, 4 and 16 threads: on several, the planner leaves the
+            // aggregations of divisions to DataFusion (they fail with several
+            // kinds of errors), the lowering of the tests does not.
+            for target_partitions in [1, 4, 16] {
+                assert_aggregate_fails_like_datafusion_with_setup(
+                    sql,
+                    test_session_config().with_target_partitions(target_partitions),
+                    async |ctx: &SessionContext| register_test_tables(ctx),
+                    message,
+                )
+                .await;
+            }
         }
     }
 
