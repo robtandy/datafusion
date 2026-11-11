@@ -29,11 +29,7 @@
 //!   synchronization. The table has a bounded capacity, so that it stays
 //!   cache resident: when it is full, it is *flushed*, as DuckDB abandons its
 //!   thread-local tables (or it grows, if the groups of the thread keep
-//!   coming back, see `RadixLocalState::aggregate`). But an aggregation of a
-//!   single partition of DataFusion whose aggregates may not split their rows
-//!   exactly aggregates it on a single thread, in order, whose table holds all
-//!   of its groups (see `AggregateSpec::aggregates_in_order` and
-//!   [`TableCapacity::UNBOUNDED`]).
+//!   coming back, see `RadixLocalState::aggregate`).
 //! * A thread whose full table has almost as many groups as it aggregated
 //!   rows (e.g. for a `GROUP BY` of an id) gains nothing from aggregating
 //!   them, it only builds a hash table for them in vain: it stops, like
@@ -187,13 +183,6 @@ impl Partition {
 #[derive(Debug)]
 struct RadixSinkState {
     partitions: Vec<Mutex<Partition>>,
-    /// The tables of the threads that aggregate all rows of a group into a
-    /// single state (see [`TableCapacity::UNBOUNDED`]): `finalize` scatters
-    /// their partial states to the partitions, but the table of a single
-    /// thread that aggregated all rows of a single-stage aggregation, which
-    /// holds the final states of all groups, and which the source evaluates
-    /// (as DataFusion's single stage evaluates its accumulators).
-    whole: Mutex<Vec<GroupedHashTable>>,
     /// The partitions that have groups, set by `finalize`.
     non_empty: Mutex<Option<Vec<usize>>>,
 }
@@ -206,7 +195,6 @@ impl RadixSinkState {
             partitions: (0..NUM_PARTITIONS)
                 .map(|_| Mutex::new(Partition::default()))
                 .collect(),
-            whole: Mutex::new(vec![]),
             non_empty: Mutex::new(None),
         }
     }
@@ -239,9 +227,6 @@ impl RadixSinkState {
 #[derive(Debug)]
 struct RadixLocalState {
     table: GroupedHashTable,
-    /// Whether the table holds all groups of the thread, every group in a
-    /// single state (see [`TableCapacity::UNBOUNDED`]).
-    whole: bool,
     /// The number of groups at which the table is flushed or grown.
     capacity: usize,
     /// The capacity the table can grow to.
@@ -619,39 +604,12 @@ impl Default for TableCapacity {
     }
 }
 
-impl TableCapacity {
-    /// The capacity of a table that holds all groups of its thread: it is
-    /// never flushed (nor grown) before the thread finished, so its rows
-    /// never bypass it either, and its accumulators aggregate all rows of
-    /// every group of the thread, in their order, into a single partial state,
-    /// as the accumulators of DataFusion's aggregation of a single partition
-    /// do. This is the table of the single thread of an aggregation of a
-    /// single partition of DataFusion whose aggregates may not split their
-    /// rows exactly (see `AggregateSpec::aggregates_in_order`): the
-    /// partial states of the flushes of a table (and the rows that bypass it)
-    /// split the rows of a group into several states, which changes the values
-    /// of the accumulators that depend on how their rows are grouped, e.g. the
-    /// rounding of a sum of floating point values (`(s + a) + b` is not always
-    /// `s + (a + b)`), the last value of a group, and the failures of a
-    /// user-defined sum that rejects negative running totals. The final
-    /// aggregation evaluates such a table (or merges its states, for an
-    /// aggregation of two stages) without merging it with other states of its
-    /// groups (see [`RadixHashAggregate::finalize`]).
-    pub(crate) const UNBOUNDED: Self = Self {
-        initial: usize::MAX,
-        maximum: usize::MAX,
-    };
-}
-
 /// The global source state: the partitions to finalize.
 #[derive(Debug)]
 struct RadixSourceState {
     sink: Arc<RadixSinkState>,
     /// The partitions that have groups.
     partitions: Vec<usize>,
-    /// The table of the single thread that aggregated all rows, if `finalize`
-    /// kept it, which the first thread to claim it evaluates.
-    whole: Mutex<Option<GroupedHashTable>>,
     /// The next entry of `partitions` to claim.
     next: AtomicUsize,
     /// The top groups of a top-k aggregation.
@@ -720,8 +678,7 @@ impl RadixHashAggregate {
 
     /// The local sink state of a thread, with a table of capacity `capacity`,
     /// whose rows may bypass the table if `may_bypass` (see
-    /// [`AggregateSpec::rows_bypass_tables`]). A table of
-    /// [`TableCapacity::UNBOUNDED`] holds all groups of the thread.
+    /// [`AggregateSpec::rows_bypass_tables`]).
     ///
     /// The table of a top-k aggregation holds twice its limit at least (up
     /// to the maximum capacity), so that every flush keeps the best half of
@@ -740,7 +697,6 @@ impl RadixHashAggregate {
         }
         Ok(Box::new(RadixLocalState {
             table: GroupedHashTable::try_new_update(spec)?,
-            whole: capacity == TableCapacity::UNBOUNDED,
             capacity: initial,
             maximum_capacity: capacity.maximum,
             table_rows: 0,
@@ -795,48 +751,11 @@ impl RadixHashAggregate {
         if local.flushed == 0 {
             local.table.add_empty_grouping_sets(spec)?;
         }
-        if local.whole {
-            let table = GroupedHashTable::try_new_update(spec)?;
-            global
-                .whole
-                .lock()
-                .push(std::mem::replace(&mut local.table, table));
-            return Ok(());
-        }
         local.flush(spec, global)
     }
 
-    /// Finalize the sink: record the partitions that have groups. The table of
-    /// a single thread that aggregated all rows of a single-stage aggregation,
-    /// every group in a single state (see [`TableCapacity::UNBOUNDED`]), holds
-    /// the final states of all groups: it is kept for the source, which
-    /// evaluates it, as DataFusion's single stage evaluates its accumulators.
-    /// The partial states of the other tables of single states are scattered
-    /// to the partitions, whose final aggregation merges them, as DataFusion's
-    /// final stage merges the partial states of its partitions.
-    pub(crate) fn finalize(
-        spec: &AggregateSpec,
-        gstate: &dyn GlobalSinkState,
-    ) -> Result<SinkFinalize> {
+    pub(crate) fn finalize(gstate: &dyn GlobalSinkState) -> Result<SinkFinalize> {
         let global = downcast_state::<RadixSinkState>(gstate.as_any(), OPERATOR)?;
-        let mut whole = global.whole.lock();
-        let evaluated = spec.single_stage
-            && whole.len() == 1
-            && global
-                .partitions
-                .iter()
-                .all(|partition| partition.lock().is_empty());
-        if !evaluated {
-            let (mut hashes, mut partitions) = (vec![], vec![]);
-            for mut table in whole.drain(..) {
-                if let Some(states) = table.emit_states()? {
-                    hash_keys(&states.keys, &mut hashes, &mut partitions)?;
-                    global.add_states(states, &partitions)?;
-                }
-            }
-        }
-        let has_groups = whole.iter().any(|table| !table.is_empty());
-        drop(whole);
         let non_empty = global
             .partitions
             .iter()
@@ -844,7 +763,7 @@ impl RadixHashAggregate {
             .filter(|(_, partition)| !partition.lock().is_empty())
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
-        let result = if non_empty.is_empty() && !has_groups {
+        let result = if non_empty.is_empty() {
             SinkFinalize::NoOutputPossible
         } else {
             SinkFinalize::Ready
@@ -870,11 +789,9 @@ impl RadixHashAggregate {
             groups: Mutex::new(None),
             remaining: AtomicUsize::new(partitions.len()),
         });
-        let whole = Mutex::new(sink.whole.lock().pop());
         Ok(Arc::new(RadixSourceState {
             sink,
             partitions,
-            whole,
             next: AtomicUsize::new(0),
             top_k,
         }))
@@ -903,13 +820,6 @@ impl RadixHashAggregate {
                 }
                 local.outputs.pop();
                 local.offset = 0;
-                continue;
-            }
-            if let Some(mut table) = state.whole.lock().take() {
-                if let Some(columns) = table.evaluate()? {
-                    let output = RecordBatch::try_new(Arc::clone(&spec.schema), columns)?;
-                    local.outputs = vec![output];
-                }
                 continue;
             }
             let next = state.next.fetch_add(1, Ordering::Relaxed);
@@ -1459,7 +1369,10 @@ mod tests {
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{assert_aggregate_parity_with_setup, lower};
     use crate::executor::Executor;
-    use crate::test_utils::{canonical_batch, datafusion_context, test_session_config};
+    use crate::test_utils::{
+        assert_byte_eq_with_datafusion_with_config, canonical_batch, datafusion_context,
+        test_session_config,
+    };
 
     /// The partition of the group of the keys of `row`.
     fn partition_of_row(keys: &[ArrayRef], row: usize) -> usize {
@@ -1829,7 +1742,7 @@ mod tests {
         let (spec, mut local, global) = sink;
         RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut())?;
         let mut counts = BTreeMap::new();
-        if RadixHashAggregate::finalize(&spec, global.as_ref())?
+        if RadixHashAggregate::finalize(global.as_ref())?
             == SinkFinalize::NoOutputPossible
         {
             return Ok(counts);
@@ -2303,11 +2216,14 @@ mod tests {
         count_of_literal(literal, selected)
     }
 
-    /// The rows of [`count_of_literal`]: 32,768 distinct keys `k` (which fill
-    /// the thread-local table of a thread, whose rows then bypass it, if they
-    /// may), followed by 2,048 rows of a new key; `p` is true for the rows of
-    /// `selected`.
-    fn literal_rows(selected: fn(i64) -> bool) -> Result<Vec<RecordBatch>> {
+    /// `COUNT(<literal>) FILTER (WHERE p) GROUP BY k` over a single partition:
+    /// 32,768 distinct keys (which fill the thread-local table of a thread,
+    /// whose rows then bypass it, if they may), followed by 2,048 rows of a new
+    /// key; `p` is true for the rows of `selected`.
+    fn count_of_literal(
+        literal: datafusion_common::ScalarValue,
+        selected: fn(i64) -> bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("p", DataType::Boolean, false),
@@ -2323,20 +2239,10 @@ mod tests {
                 ],
             )
         };
-        Ok(vec![
+        let partitions = vec![vec![
             batch((0..32_768).collect(), 0..32_768)?,
             batch(vec![100_000; 2_048], 32_768..34_816)?,
-        ])
-    }
-
-    /// `COUNT(<literal>) FILTER (WHERE p) GROUP BY k` over a single partition
-    /// of the rows of [`literal_rows`].
-    fn count_of_literal(
-        literal: datafusion_common::ScalarValue,
-        selected: fn(i64) -> bool,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let partitions = vec![literal_rows(selected)?];
-        let schema = partitions[0][0].schema();
+        ]];
         let input =
             MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None)?;
         let count = AggregateExprBuilder::new(count_udaf(), vec![lit(literal)])
@@ -2358,57 +2264,48 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn literal_arguments_of_filtered_aggregates_are_built_for_their_rows()
     -> Result<()> {
-        use super::super::test_support::lower_with_tiny_tables;
-        // No row passes the filter, and a few do; in a session that does not
-        // trust `count`, whose rows do not bypass the tables (the regular path
-        // evaluates the arguments for the rows that pass the filter only, like
-        // DataFusion), and in a session that does, whose rows bypass them (see
-        // `AggregateSpec::rows_bypass_tables`, and `evaluate_row_aligned`): on
-        // 1, 4 and 16 threads, with default and tiny tables (whose rows bypass
-        // them on several threads), and as a thread of several threads that
-        // consumes all rows, the reviewer's case (a single thread aggregates the
-        // rows of a group into a single state, see `TableCapacity::UNBOUNDED`).
+        // No row passes the filter, and a few do; on 1, 4 and 16 threads; in a
+        // session that does not trust `count`, whose rows do not bypass the
+        // tables (the regular path evaluates the arguments for the rows that
+        // pass the filter only, like DataFusion), and in a session that does,
+        // whose rows bypass them (see `AggregateSpec::rows_bypass_tables`, and
+        // `evaluate_row_aligned`).
         let selections: [fn(i64) -> bool; 2] = [|_| false, |row| row % 1_000 == 7];
-        for (selected, trusted) in selections
-            .into_iter()
-            .flat_map(|selected| [(selected, false), (selected, true)])
-        {
+        let runs = selections.into_iter().flat_map(|selected| {
+            [1, 4, 16]
+                .into_iter()
+                .flat_map(|threads| [(threads, false), (threads, true)])
+                .map(move |(threads, trusted)| (selected, threads, trusted))
+        });
+        for (selected, threads, trusted) in runs {
+            let plan = count_of_long_literal(selected)?;
+            let root = lower(&plan)?;
+            let aggregate = root
+                .downcast_ref::<PhysicalHashAggregate>()
+                .expect("a native aggregation");
             let config = if trusted {
                 trusting(SessionConfig::new())
             } else {
                 SessionConfig::new()
             };
             let options = Arc::clone(config.options());
+            assert_eq!(aggregate.spec().rows_bypass_tables(&options), trusted);
             let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
-            let plan = count_of_long_literal(selected)?;
-            let schema = plan.schema();
+            let actual = Executor::collect(root, Arc::clone(&task_ctx), threads).await?;
             let expected = datafusion_physical_plan::collect(
                 count_of_long_literal(selected)?,
-                Arc::clone(&task_ctx),
+                task_ctx,
             )
             .await?;
-            let expected = canonical_batch(&schema, &expected, false)?;
-            assert_eq!(expected.num_rows(), 32_769);
-            for (lower, threads) in [
-                (lower as fn(&_) -> _, &[1, 4, 16][..]),
-                (lower_with_tiny_tables, &[4, 16]),
-            ] {
-                for &threads in threads {
-                    let root = lower(&plan)?;
-                    let aggregate = root
-                        .downcast_ref::<PhysicalHashAggregate>()
-                        .expect("a native aggregation");
-                    assert_eq!(aggregate.spec().rows_bypass_tables(&options), trusted);
-                    let actual =
-                        Executor::collect(root, Arc::clone(&task_ctx), threads).await?;
-                    assert_eq!(canonical_batch(&schema, &actual, false)?, expected);
-                }
-            }
-            let root = lower(&plan)?;
-            let thread =
-                aggregation_thread(&root, task_ctx, &literal_rows(selected)?, 2)?;
-            assert_eq!(thread.bypassed, trusted);
-            assert_eq!(thread.output, expected);
+            let schema = plan.schema();
+            assert_eq!(
+                canonical_batch(&schema, &actual, false)?,
+                canonical_batch(&schema, &expected, false)?
+            );
+            assert_eq!(
+                actual.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                32_769
+            );
         }
         Ok(())
     }
@@ -2586,1929 +2483,6 @@ mod tests {
         Ok(())
     }
 
-    /// Table `t`, of a single partition of batches of 2,048 rows: seven passes
-    /// over the keys `0..32768` (a thread that aggregates them fills a table
-    /// of 32,768 groups with every pass), with the row numbers `v` and a
-    /// floating point value `f` per pass, `1e16, 0, 0, 0, 1, -1e16, 1`, whose
-    /// sum depends on the order in which it is added up: DataFusion adds the
-    /// values of a group up one after the other, to `1.0`, while sums of
-    /// partial sums of several of them are `0.0`, e.g. `1e16 + (0 + 0 + 0 + 1 +
-    /// -1e16 + 1)` (`1 + -1e16` rounds to `-1e16`) and `(1e16 + 0 + 0 + 0 + 1) +
-    /// (-1e16 + 1)`.
-    fn seven_passes() -> Result<Vec<RecordBatch>> {
-        seven_passes_over(32_768)
-    }
-
-    /// The rows of [`seven_passes`], over the keys `0..keys` (a multiple of
-    /// 2,048).
-    fn seven_passes_over(keys: i64) -> Result<Vec<RecordBatch>> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let passes = [1e16, 0.0, 0.0, 0.0, 1.0, -1e16, 1.0];
-        let mut batches = vec![];
-        let num_keys = keys;
-        for (pass, value) in passes.into_iter().enumerate() {
-            for start in (0..num_keys).step_by(DEFAULT_VECTOR_SIZE) {
-                let keys = start..start + DEFAULT_VECTOR_SIZE as i64;
-                let first = pass as i64 * num_keys;
-                let columns: Vec<ArrayRef> = vec![
-                    Arc::new(Int64Array::from_iter_values(keys.clone())),
-                    Arc::new(Int64Array::from_iter_values(keys.map(|k| first + k))),
-                    Arc::new(arrow::array::Float64Array::from(vec![
-                        value;
-                        DEFAULT_VECTOR_SIZE
-                    ])),
-                ];
-                batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
-            }
-        }
-        Ok(batches)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn groups_of_a_single_thread_are_aggregated_into_a_single_state() -> Result<()>
-    {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // The rows of [`seven_passes`] on one thread, as DataFusion aggregates
-        // its single partition: the accumulators of every group aggregate all
-        // of its rows into a single state, in their order (see
-        // `TableCapacity::UNBOUNDED`), so that the sums of floating point
-        // values are those of DataFusion, and the last values and the values
-        // of `ARRAY_AGG` too. Before, a thread flushed its table whenever it
-        // was full, until it grew, so that the final aggregation merged the
-        // partial sums of several rows of a group: `0.0`. In the sessions that
-        // trust the aggregate functions, the rows of the second to the fifth
-        // passes bypassed the table instead, and the final aggregation
-        // aggregated them after the partial states of the last two passes: the
-        // last values were those of the fifth pass, and the arrays in another
-        // order.
-        let batches = seven_passes()?;
-        let setup = async |ctx: &SessionContext| -> Result<()> {
-            let table = datafusion::datasource::MemTable::try_new(
-                batches[0].schema(),
-                vec![batches.clone()],
-            )?;
-            ctx.register_table("t", Arc::new(table))?;
-            Ok(())
-        };
-        // The queries, and whether their aggregates split their rows exactly
-        // (see `AggregateSpec::splits_exactly`): the single thread of those
-        // aggregates flushes (and bypasses) its table as before.
-        let queries = [
-            ("SELECT k, SUM(f), AVG(f) FROM t GROUP BY k", false),
-            (
-                "SELECT k, LAST_VALUE(v), FIRST_VALUE(v), COUNT(*) FROM t GROUP BY k",
-                false,
-            ),
-            (
-                "SELECT k, ARRAY_AGG(v), SUM(f) FILTER (WHERE v > 0) FROM t GROUP BY k",
-                false,
-            ),
-            (
-                "SELECT k, COUNT(*), SUM(v), MIN(f), MAX(f), AVG(v * 0) FROM t \
-                 GROUP BY k",
-                false,
-            ),
-            (
-                "SELECT k, COUNT(*), SUM(v), MIN(f), MAX(f) FROM t GROUP BY k",
-                true,
-            ),
-        ];
-        for trusted in [false, true] {
-            let mut config = test_session_config().with_target_partitions(1);
-            if trusted {
-                config = trusting(config);
-            }
-            // DataFusion's sums: 1.0, and 1/7 on average.
-            let ctx = datafusion_context(config.clone());
-            setup(&ctx).await?;
-            let sums = ctx.sql(queries[0].0).await?.collect().await?;
-            assert_eq!(
-                sums.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                32_768
-            );
-            for batch in &sums {
-                let float = |column: usize| {
-                    batch
-                        .column(column)
-                        .as_primitive::<arrow::datatypes::Float64Type>()
-                };
-                assert!(float(1).values().iter().all(|&sum| sum == 1.0));
-                assert!(float(2).values().iter().all(|&avg| avg == 1.0 / 7.0));
-            }
-            // The single thread of aggregates that may not split their rows
-            // exactly never flushes the table (nor bypasses it): one partial
-            // state per group, which the final aggregation evaluates. (The
-            // executor runs their pipelines on a single thread on any number of
-            // threads, see `AggregateSpec::aggregates_in_order`.) The threads
-            // of the other aggregates flush their tables, and bypass them in a
-            // trusting session.
-            let pipeline = crate::test_utils::pipeline_context(config.clone());
-            setup(&pipeline).await?;
-            for (sql, exact) in queries {
-                for threads in [1, 4] {
-                    let thread =
-                        planned_aggregation_thread(&pipeline, sql, &batches, threads)
-                            .await?;
-                    let whole = !exact;
-                    assert_eq!(thread.splits_exactly, exact, "{sql}");
-                    assert_eq!(thread.whole, whole, "{sql} on {threads} threads");
-                    assert_eq!(thread.evaluated, whole, "{sql} on {threads} threads");
-                    assert_eq!(thread.flushed == 0, whole, "{sql} on {threads} threads");
-                    assert_eq!(thread.bypassed, trusted && !whole, "{sql}");
-                    if whole {
-                        assert_eq!(thread.groups, 32_768);
-                    }
-                    let expected = datafusion_aggregation(&ctx, sql).await?;
-                    assert_eq!(thread.output, expected, "{sql} on {threads} threads");
-                }
-            }
-            for (sql, _) in queries {
-                assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-                // Through the planner, and lowered with default and tiny tables.
-                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-                for capacity in [TableCapacity::default(), SMALL_TABLES] {
-                    assert_bypassed_parity(&ctx, sql, capacity, 1, trusted).await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn single_states_of_other_aggregations_are_aggregated_like_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // The rows of [`seven_passes`] over 2,048 keys with a few more group
-        // columns, on one thread (whose aggregates do not split their rows
-        // exactly, see `TableCapacity::UNBOUNDED`): grouping sets (and the grand
-        // total of an aggregation without input rows), aggregates that require
-        // their rows in an order (which the thread sorts once it saw all of
-        // them), and the two stages of an aggregation of a single partition
-        // (whose final stage merges the single states of the groups rather than
-        // evaluating them, as DataFusion's merges the partial states of its
-        // partition). The aggregations with other aggregates that may not split
-        // their rows exactly next to aggregates that require their rows in an
-        // order are left to DataFusion (see
-        // `inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion`).
-        let batches = seven_passes_over(2_048)?
-            .into_iter()
-            .map(|batch| {
-                let k = batch.column(0).as_primitive::<Int64Type>();
-                let a: ArrayRef = Arc::new(Int64Array::from_iter_values(
-                    k.values().iter().map(|k| k % 3),
-                ));
-                let b: ArrayRef = Arc::new(StringArray::from_iter_values(
-                    k.values().iter().map(|k| format!("b{}", k % 5)),
-                ));
-                let schema = Arc::new(Schema::new(vec![
-                    Field::new("k", DataType::Int64, false),
-                    Field::new("v", DataType::Int64, false),
-                    Field::new("f", DataType::Float64, false),
-                    Field::new("a", DataType::Int64, false),
-                    Field::new("b", DataType::Utf8, false),
-                ]));
-                let mut columns = batch.columns().to_vec();
-                columns.extend([a, b]);
-                Ok(RecordBatch::try_new(schema, columns)?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let setup = async |ctx: &SessionContext| -> Result<()> {
-            let table = datafusion::datasource::MemTable::try_new(
-                batches[0].schema(),
-                vec![batches.clone()],
-            )?;
-            ctx.register_table("t", Arc::new(table))?;
-            Ok(())
-        };
-        // The queries, and whether rows pass their filter (which the sink of
-        // the aggregation that `planned_aggregation_thread` drives does not
-        // evaluate: it consumes the rows that pass it).
-        let queries = [
-            (
-                "SELECT a, b, SUM(f), AVG(f), COUNT(*) FROM t GROUP BY ROLLUP (a, b)",
-                true,
-            ),
-            (
-                "SELECT k, a, SUM(f) FROM t GROUP BY GROUPING SETS ((k), (a), ())",
-                true,
-            ),
-            (
-                "SELECT a, SUM(f), LAST_VALUE(v) FROM t WHERE v < 0 GROUP BY ROLLUP (a)",
-                false,
-            ),
-            (
-                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), COUNT(*) FROM t GROUP BY a",
-                true,
-            ),
-            (
-                "SELECT k, NTH_VALUE(f, 6 ORDER BY v), MIN(f) FROM t GROUP BY k",
-                true,
-            ),
-            (
-                "SELECT k, ARRAY_AGG(f ORDER BY v DESC), FIRST_VALUE(v ORDER BY f, v) \
-                 FROM t GROUP BY k",
-                true,
-            ),
-        ];
-        for trusted in [false, true] {
-            let mut config = test_session_config().with_target_partitions(1);
-            if trusted {
-                config = trusting(config);
-            }
-            let ctx = datafusion_context(config.clone());
-            setup(&ctx).await?;
-            let pipeline = crate::test_utils::pipeline_context(config.clone());
-            setup(&pipeline).await?;
-            for (sql, rows) in queries {
-                let rows = if rows { &batches[..] } else { &[] };
-                let thread = planned_aggregation_thread(&pipeline, sql, rows, 1).await?;
-                // (DataFusion aggregates grouping sets in two stages.)
-                assert!(thread.whole && thread.flushed == 0, "{sql}: {thread:?}");
-                assert_eq!(thread.evaluated, thread.single_stage, "{sql}");
-                assert_eq!(thread.output, datafusion_aggregation(&ctx, sql).await?);
-                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-            }
-            for sql in [
-                "SELECT a, NTH_VALUE(f, 2 ORDER BY v DESC), SUM(f) FROM t GROUP BY a",
-                "SELECT k, NTH_VALUE(v, 6 ORDER BY v), SUM(f) FROM t GROUP BY k",
-            ] {
-                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
-            }
-            // `SUM(f)` (and `LAST_VALUE(v)`) of two stages over a single
-            // partition: DataFusion's final stage merges the partial states of the
-            // groups, `1.0` (and the values of the last pass).
-            let schema = batches[0].schema();
-            let aggregates = [
-                (
-                    "sum(f)",
-                    datafusion::functions_aggregate::sum::sum_udaf(),
-                    "f",
-                ),
-                (
-                    "last_value(v)",
-                    datafusion::functions_aggregate::first_last::last_value_udaf(),
-                    "v",
-                ),
-            ]
-            .into_iter()
-            .map(|(alias, function, argument)| {
-                Ok(Arc::new(
-                    AggregateExprBuilder::new(function, vec![col(argument, &schema)?])
-                        .schema(Arc::clone(&schema))
-                        .alias(alias)
-                        .build()?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-            let single = AggregateExec::try_new(
-                AggregateMode::Single,
-                PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
-                aggregates,
-                vec![None, None],
-                MemorySourceConfig::try_new_exec(
-                    std::slice::from_ref(&batches),
-                    Arc::clone(&schema),
-                    None,
-                )?,
-                Arc::clone(&schema),
-            )?;
-            let last: Arc<dyn ExecutionPlan> = Arc::new(two_stages(&single)?.1);
-            let expected =
-                datafusion_physical_plan::collect(Arc::clone(&last), ctx.task_ctx())
-                    .await?;
-            let sums = canonical_batch(&last.schema(), &expected, false)?;
-            assert!(
-                sums.column(1)
-                    .as_primitive::<arrow::datatypes::Float64Type>()
-                    .values()
-                    .iter()
-                    .all(|&sum| sum == 1.0)
-            );
-            // `try_lower` leaves the two stages of a single grouping set to
-            // DataFusion, whose partial stage may skip (see
-            // `aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion`):
-            // not that of these 14,336 rows, below its 100,000 rows. The
-            // operator of the constructor merges the single states.
-            assert!(PhysicalHashAggregate::try_lower(&last, lower)?.is_none());
-            let final_stage = last.downcast_ref::<AggregateExec>().expect("Final");
-            let partial = final_stage
-                .input()
-                .downcast_ref::<AggregateExec>()
-                .expect("Partial");
-            let input = lower(partial.input())?;
-            let operator: Arc<dyn crate::PhysicalOperator> = Arc::new(
-                PhysicalHashAggregate::try_new_two_stage(partial, final_stage, input)?,
-            );
-            let thread = aggregation_thread(&operator, ctx.task_ctx(), &batches, 1)?;
-            assert!(thread.whole && !thread.evaluated && thread.flushed == 0);
-            assert_eq!(thread.output, sums);
-            let actual =
-                Executor::collect(Arc::clone(&operator), ctx.task_ctx(), 1).await?;
-            assert_eq!(canonical_batch(&last.schema(), &actual, false)?, sums);
-        }
-        Ok(())
-    }
-
-    /// A function `batch_sum` that adds up the values of every batch first.
-    #[derive(Debug, PartialEq, Eq, Hash)]
-    struct BatchSum {
-        signature: datafusion_expr::Signature,
-    }
-
-    impl datafusion_expr::AggregateUDFImpl for BatchSum {
-        fn name(&self) -> &str {
-            "batch_sum"
-        }
-
-        fn signature(&self) -> &datafusion_expr::Signature {
-            &self.signature
-        }
-
-        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-            Ok(DataType::Float64)
-        }
-
-        fn accumulator(
-            &self,
-            _: datafusion_expr::function::AccumulatorArgs,
-        ) -> Result<Box<dyn datafusion_expr::Accumulator>> {
-            Ok(Box::new(BatchSumAccumulator(0.0)))
-        }
-    }
-
-    #[derive(Debug)]
-    struct BatchSumAccumulator(f64);
-
-    impl datafusion_expr::Accumulator for BatchSumAccumulator {
-        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
-            let values = values[0].as_primitive::<arrow::datatypes::Float64Type>();
-            self.0 += values.values().iter().sum::<f64>();
-            Ok(())
-        }
-
-        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-            let sums = states[0].as_primitive::<arrow::datatypes::Float64Type>();
-            self.0 += sums.values().iter().sum::<f64>();
-            Ok(())
-        }
-
-        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
-            Ok(vec![datafusion_common::ScalarValue::Float64(Some(self.0))])
-        }
-
-        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
-            Ok(datafusion_common::ScalarValue::Float64(Some(self.0)))
-        }
-
-        fn size(&self) -> usize {
-            size_of::<Self>()
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn accumulators_that_depend_on_their_batches_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // A single partition of one batch of 8,192 rows, `k = 1`, and `f = 0` but
-        // `f[0] = 1e16`, `f[2048] = -1e16` and `f[2049] = 1`. The accumulators
-        // that add up the values of a batch first get `1.0` from DataFusion's
-        // batch, but `0.0` from the chunks of 2,048 rows of the native operator
-        // (`1e16 + (-1e16 + 1)`): [`BatchSum`], a user-defined aggregate (whose
-        // accumulators may compute anything from their batches), and
-        // DataFusion's `SUM` and `AVG` of floating point values without `GROUP
-        // BY`. The t-digests of `approx_median` and `approx_percentile_cont`
-        // merge every batch, so that their quantiles of the 8,192 distinct
-        // values `g` differ too (e.g. 5615.31 and 5615.61). So their
-        // aggregations are left to DataFusion (see `updates_like_datafusion`),
-        // in both sessions: those of user-defined aggregates always, those of
-        // the built-in ones of a single partition, whose results are
-        // deterministic. The grouped `SUM` and `AVG` add up their rows one by
-        // one, and stay native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-            Field::new("g", DataType::Float64, false),
-        ]));
-        let mut f = vec![0.0; 8_192];
-        f[0] = 1e16;
-        f[2_048] = -1e16;
-        f[2_049] = 1.0;
-        let g =
-            (0..8_192i64).map(|i| ((i * 7_919) % 8_191) as f64 * 1.37 + (i % 13) as f64);
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(arrow::array::Float64Array::from(f)),
-                Arc::new(arrow::array::Float64Array::from_iter_values(g)),
-            ],
-        )?;
-        let setup = async |ctx: &SessionContext| -> Result<()> {
-            let table = datafusion::datasource::MemTable::try_new(
-                Arc::clone(&schema),
-                vec![vec![batch.clone()]],
-            )?;
-            ctx.register_table("t", Arc::new(table))?;
-            ctx.register_udaf(datafusion_expr::AggregateUDF::from(BatchSum {
-                signature: datafusion_expr::Signature::exact(
-                    vec![DataType::Float64],
-                    datafusion_expr::Volatility::Immutable,
-                ),
-            }));
-            Ok(())
-        };
-        // The queries, the target partitions on which they run, and whether
-        // their aggregations are native.
-        let queries: [(&str, &[usize], bool); 7] = [
-            (
-                "SELECT k, batch_sum(f) FROM t GROUP BY k",
-                &[1, 4, 16],
-                false,
-            ),
-            ("SELECT batch_sum(f) FROM t", &[1, 4, 16], false),
-            ("SELECT SUM(f), AVG(f) FROM t", &[1], false),
-            (
-                "SELECT k, approx_median(g), approx_percentile_cont(g, 0.9) FROM t \
-                 GROUP BY k",
-                &[1],
-                false,
-            ),
-            ("SELECT approx_percentile_cont(g, 0.13) FROM t", &[1], false),
-            (
-                "SELECT k, SUM(f), AVG(f), STDDEV(g) FROM t GROUP BY k",
-                &[1],
-                true,
-            ),
-            ("SELECT COUNT(*), MIN(f), MAX(g), SUM(k) FROM t", &[1], true),
-        ];
-        for (sql, partitions, native) in queries {
-            for &target_partitions in partitions {
-                for trusted in [false, true] {
-                    let mut config =
-                        test_session_config().with_target_partitions(target_partitions);
-                    if trusted {
-                        config = trusting(config);
-                    }
-                    let ctx = datafusion_context(config.clone());
-                    setup(&ctx).await?;
-                    // DataFusion's sums: 1.0.
-                    if sql.contains("SUM(f)") || sql.contains("batch_sum(f)") {
-                        let column = usize::from(sql.starts_with("SELECT k"));
-                        let output = ctx.sql(sql).await?.collect().await?;
-                        let sums = output[0]
-                            .column(column)
-                            .as_primitive::<arrow::datatypes::Float64Type>();
-                        assert_eq!(sums.values().as_ref(), &[1.0], "{sql}");
-                    }
-                    if native {
-                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-                        assert_aggregate_parity_with_setup(sql, config, &setup).await;
-                    } else {
-                        assert_left_to_datafusion(sql, config, &setup).await?;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn single_partitions_are_aggregated_in_order_on_several_threads() -> Result<()>
-    {
-        use crate::operator::PhysicalOperator;
-        /// The number of partitions of the input of the first stage of the
-        /// aggregation of `plan`.
-        fn input_partitions(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-            use datafusion_physical_plan::ExecutionPlanProperties;
-            if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
-                && matches!(
-                    aggregate.mode(),
-                    AggregateMode::Partial
-                        | AggregateMode::Single
-                        | AggregateMode::SinglePartitioned
-                )
-            {
-                return Some(aggregate.input().output_partitioning().partition_count());
-            }
-            plan.children().into_iter().find_map(input_partitions)
-        }
-        // DataFusion aggregates the rows of a single partition one after the
-        // other, on any number of target partitions: the review's single batch
-        // of 8,192 rows (`k = 1`, and `f = 0` but `f[0] = 1e16`, `f[2048] =
-        // -1e16` and `f[2049] = 1`), which it does not repartition, and the 112
-        // batches of `seven_passes` if it repartitions neither scans nor
-        // batches. Its sums of `f` are `1.0`. The threads of a pipeline
-        // evaluate the chunks of a partition in parallel: on 4 and 16 threads,
-        // the native sums of the partial states of a group were `0.0`. So the
-        // aggregations of a single partition whose aggregates do not split
-        // exactly (see `splits_exactly`) aggregate it in order, on a single
-        // thread (see `AggregateSpec::aggregates_in_order`), and stay native,
-        // but for those grouped by a single grouping set, which DataFusion
-        // aggregates in two stages on several target partitions, and whose
-        // partial stage it may skip (see
-        // `aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion`):
-        // they are left to DataFusion. The others stay parallel.
-        let mut f = vec![0.0; 8_192];
-        f[0] = 1e16;
-        f[2_048] = -1e16;
-        f[2_049] = 1.0;
-        let one = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("k", DataType::Int64, false),
-                Field::new("v", DataType::Int64, false),
-                Field::new("f", DataType::Float64, false),
-            ])),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(Int64Array::from_iter_values(0..8_192)),
-                Arc::new(arrow::array::Float64Array::from(f)),
-            ],
-        )?;
-        let unpartitioned = |config: SessionConfig| {
-            config
-                .set_bool("datafusion.optimizer.repartition_file_scans", false)
-                .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
-        };
-        // The queries, and whether they aggregate in order, if they are native.
-        let queries = [
-            ("SELECT k, SUM(f), AVG(f) FROM t GROUP BY k", None),
-            (
-                "SELECT k, STDDEV(f), VAR_POP(f), MIN(f) FROM t GROUP BY k",
-                None,
-            ),
-            ("SELECT STDDEV(f), CORR(f, v), COUNT(*) FROM t", Some(true)),
-            (
-                "SELECT k, COUNT(*), SUM(v), MAX(f) FROM t GROUP BY k",
-                Some(false),
-            ),
-            ("SELECT COUNT(f), SUM(v), MIN(f) FROM t", Some(false)),
-        ];
-        for (batches, configure) in [
-            (
-                vec![one],
-                (|config| config) as fn(SessionConfig) -> SessionConfig,
-            ),
-            (seven_passes()?, unpartitioned),
-        ] {
-            let schema = batches[0].schema();
-            let setup = async |ctx: &SessionContext| -> Result<()> {
-                let table = datafusion::datasource::MemTable::try_new(
-                    Arc::clone(&schema),
-                    vec![batches.clone()],
-                )?;
-                ctx.register_table("t", Arc::new(table))?;
-                Ok(())
-            };
-            for (sql, in_order) in queries {
-                for target_partitions in [4, 16] {
-                    for trusted in [false, true] {
-                        let mut config = configure(
-                            test_session_config()
-                                .with_target_partitions(target_partitions),
-                        );
-                        if trusted {
-                            config = trusting(config);
-                        }
-                        let ctx = datafusion_context(config.clone());
-                        setup(&ctx).await?;
-                        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                        assert_eq!(input_partitions(&plan), Some(1), "{sql}");
-                        let Some(in_order) = in_order else {
-                            assert_left_to_datafusion(sql, config, &setup).await?;
-                            continue;
-                        };
-                        let plan = aggregation(&plan).expect("an aggregation");
-                        let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
-                            .unwrap_or_else(|| panic!("not lowered: {sql}"));
-                        assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
-                        if sql.contains("SUM(f)") {
-                            let output = ctx.sql(sql).await?.collect().await?;
-                            let sums = output.iter().flat_map(|batch| {
-                                batch
-                                    .column(1)
-                                    .as_primitive::<arrow::datatypes::Float64Type>()
-                                    .values()
-                                    .to_vec()
-                            });
-                            assert!(sums.into_iter().all(|sum| sum == 1.0), "{sql}");
-                        }
-                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-                        assert_aggregate_parity_with_setup(sql, config, &setup).await;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A `MemTable` `t` of the partitions `partitions` (of the schema of their
-    /// first batch, or of `schema`).
-    fn mem_table_setup(
-        schema: SchemaRef,
-        partitions: Vec<Vec<RecordBatch>>,
-    ) -> impl AsyncFn(&SessionContext) -> Result<()> {
-        async move |ctx: &SessionContext| -> Result<()> {
-            let table = datafusion::datasource::MemTable::try_new(
-                Arc::clone(&schema),
-                partitions.clone(),
-            )?;
-            ctx.register_table("t", Arc::new(table))?;
-            Ok(())
-        }
-    }
-
-    /// The `Float64` values of `column` of the result of `sql`, in DataFusion.
-    async fn datafusion_floats(
-        sql: &str,
-        config: &SessionConfig,
-        setup: impl AsyncFn(&SessionContext) -> Result<()>,
-        column: usize,
-    ) -> Result<Vec<f64>> {
-        let ctx = datafusion_context(config.clone());
-        setup(&ctx).await?;
-        let output = ctx.sql(sql).await?.collect().await?;
-        Ok(output
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(column)
-                    .as_primitive::<arrow::datatypes::Float64Type>()
-                    .values()
-                    .to_vec()
-            })
-            .collect())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregations_whose_rows_come_in_another_order_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // The values of aggregates that may not split their rows exactly (see
-        // `splits_exactly`) depend on the order of their rows too: DataFusion
-        // aggregates its single partition in the order of its input, and so
-        // must the native operator (see `AggregateSpec::aggregates_in_order`).
-        // But it cannot if it gets the rows in another order, so that such
-        // aggregations are left to DataFusion, with their input.
-        // * `SUM(DISTINCT f)` and `AVG(DISTINCT f)` of the rows `(1, 1e16), (1,
-        //   -1e16), (1, 1)` (the review's case): DataFusion aggregates the
-        //   distinct values of the inner aggregation (of its rewrite into
-        //   `GROUP BY k, f`) in the order of their first rows, `1e16 - 1e16 +
-        //   1`, to `1.0` (and `1/3`), while the native inner aggregation
-        //   produced them in the order of its radix partitions: `0.0`. (Without
-        //   `GROUP BY`, DataFusion's sum of the batch of distinct values is
-        //   `0.0`.)
-        // * A `SUM(f)` next to an ordered aggregate that DataFusion sorts its
-        //   input for, but that orders its values itself (`ARRAY_AGG`, whose
-        //   order is not required), so that the native operator does not sort
-        //   it: of the
-        //   rows `(s, f) = (5, 1e16), (4, 0), (3, 0), (2, -1e16), (1, 1), (0,
-        //   0)`, DataFusion adds up `0 + 1 - 1e16 + 0 + 0 + 1e16`, to `0.0`, the
-        //   native operator `1e16 + 0 + 0 - 1e16 + 1 + 0`, to `1.0`. Next to an
-        //   aggregate that requires its rows in order (`NTH_VALUE`), both sort
-        //   them, but order the rows that tie otherwise (see
-        //   `inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion`):
-        //   left to DataFusion too. Without DataFusion's sort (of
-        //   `FIRST_VALUE`), neither sorts them: native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let rows = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 1, 1])),
-                Arc::new(arrow::array::Float64Array::from(vec![1e16, -1e16, 1.0])),
-            ],
-        )?;
-        let distinct = mem_table_setup(Arc::clone(&schema), vec![vec![rows]]);
-        let sorted_schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("s", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let sorted = RecordBatch::try_new(
-            Arc::clone(&sorted_schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 6])),
-                Arc::new(Int64Array::from(vec![5, 4, 3, 2, 1, 0])),
-                Arc::new(Int64Array::from_iter_values(0..6)),
-                Arc::new(arrow::array::Float64Array::from(vec![
-                    1e16, 0.0, 0.0, -1e16, 1.0, 0.0,
-                ])),
-            ],
-        )?;
-        let sorted = mem_table_setup(Arc::clone(&sorted_schema), vec![vec![sorted]]);
-        for trusted in [false, true] {
-            let mut config = test_session_config().with_target_partitions(1);
-            if trusted {
-                config = trusting(config);
-            }
-            // The query, and DataFusion's values of its last column.
-            for (sql, values) in [
-                ("SELECT k, SUM(DISTINCT f) FROM t GROUP BY k", 1.0),
-                ("SELECT k, AVG(DISTINCT f) FROM t GROUP BY k", 1.0 / 3.0),
-                ("SELECT SUM(DISTINCT f) FROM t", 0.0),
-                ("SELECT AVG(DISTINCT f) FROM t", 0.0),
-            ] {
-                let column = usize::from(sql.starts_with("SELECT k"));
-                let floats = datafusion_floats(sql, &config, &distinct, column).await?;
-                assert_eq!(floats, [values], "{sql}");
-                assert_left_to_datafusion(sql, config.clone(), &distinct).await?;
-            }
-            let sql = "SELECT k, SUM(f), ARRAY_AGG(v ORDER BY s) FROM t GROUP BY k";
-            let floats = datafusion_floats(sql, &config, &sorted, 1).await?;
-            assert_eq!(floats, [0.0], "{sql}");
-            assert_left_to_datafusion(sql, config.clone(), &sorted).await?;
-            let sql = "SELECT k, SUM(f), NTH_VALUE(v, 2 ORDER BY s) FROM t GROUP BY k";
-            assert_left_to_datafusion(sql, config.clone(), &sorted).await?;
-            // The aggregates that split their rows exactly do not depend on
-            // their order, and the others get the rows in DataFusion's order:
-            // native.
-            for (sql, setup) in [
-                (
-                    "SELECT k, COUNT(DISTINCT f), MAX(f) FROM t GROUP BY k",
-                    &distinct,
-                ),
-                (
-                    "SELECT k, SUM(f), FIRST_VALUE(v ORDER BY s) FROM t GROUP BY k",
-                    &sorted,
-                ),
-            ] {
-                assert!(
-                    planned_aggregations(sql, &config, setup).await? > 0,
-                    "{sql}"
-                );
-                assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregations_of_several_partitions_that_split_inexactly_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // DataFusion aggregates every partition on its own first, in order,
-        // and merges the partial states of a group: its results are
-        // deterministic if they do not depend on the order in which the states
-        // arrive, e.g. if every group has a single one. The native sources
-        // read all partitions as a single queue of chunks, so that the native
-        // operator cannot aggregate every partition on its own: the
-        // aggregations of several partitions whose aggregates may not split
-        // their rows exactly (see `splits_exactly`) are left to DataFusion.
-        // The review's case: `seven_passes` in the first partition, and an
-        // empty second one, on one target partition: DataFusion's `SUM(f)` is
-        // `1.0` and its `AVG(f)` `1/7`, the native ones were `0.0` (also in a
-        // session without the trust extension). (On 4 target partitions,
-        // DataFusion's results depend on the order in which the states arrive:
-        // the results of its executions differ.) The aggregates that split
-        // exactly stay native, and so does the `AVG` of a `SMALLINT` (`w`),
-        // whose sums are exact (see `sums_exactly_as_floats`).
-        let batches = seven_passes()?
-            .into_iter()
-            .map(|batch| {
-                let k = batch.column(0).as_primitive::<Int64Type>();
-                let w: ArrayRef = Arc::new(arrow::array::Int16Array::from_iter_values(
-                    k.values().iter().map(|k| (k % 1_000) as i16),
-                ));
-                let mut columns = batch.columns().to_vec();
-                columns.push(w);
-                let mut fields = batch.schema().fields().to_vec();
-                fields.push(Arc::new(Field::new("w", DataType::Int16, false)));
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let schema = batches[0].schema();
-        for (partitions, target_partitions) in [(2, 1), (2, 4), (1, 4)] {
-            let mut table = vec![batches.clone()];
-            table.resize(partitions, vec![]);
-            let setup = mem_table_setup(Arc::clone(&schema), table);
-            for trusted in [false, true] {
-                let mut config =
-                    test_session_config().with_target_partitions(target_partitions);
-                if trusted {
-                    config = trusting(config);
-                }
-                let sql = "SELECT k, SUM(f), AVG(f) FROM t GROUP BY k";
-                let sums = datafusion_floats(sql, &config, &setup, 1).await?;
-                assert_eq!(sums.len(), 32_768);
-                if target_partitions == 1 {
-                    assert!(sums.iter().all(|&sum| sum == 1.0));
-                    let averages = datafusion_floats(sql, &config, &setup, 2).await?;
-                    assert!(averages.iter().all(|&average| average == 1.0 / 7.0));
-                }
-                for sql in [
-                    sql,
-                    "SELECT k, STDDEV(f), COUNT(*) FROM t GROUP BY k",
-                    "SELECT k, AVG(v), COUNT(*) FROM t GROUP BY k",
-                    "SELECT SUM(f) FROM t",
-                ] {
-                    if target_partitions == 1 {
-                        assert_left_to_datafusion(sql, config.clone(), &setup).await?;
-                    } else {
-                        assert_not_lowered(sql, &config, &setup).await?;
-                    }
-                }
-                for sql in [
-                    "SELECT k, COUNT(*), SUM(v), MIN(f), MAX(f) FROM t GROUP BY k",
-                    "SELECT k, COUNT(*), AVG(w), SUM(w) FROM t GROUP BY k",
-                ] {
-                    assert!(planned_aggregations(sql, &config, &setup).await? > 0);
-                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn percentiles_of_columns_are_left_to_datafusion() -> Result<()> {
-        use super::super::test_support::{
-            assert_aggregate_parity_with_setup,
-            assert_lowered_fails_like_datafusion_with_setup,
-        };
-        // DataFusion's accumulators of `percentile_cont` of a percentile of a
-        // column validate it on every call: its range, and that it is constant
-        // (on every batch without `GROUP BY`, on every row of a group
-        // otherwise). DataFusion updates every aggregate with a whole batch
-        // before the next aggregate, the native operator with its chunks, so
-        // that another error could come first. The review's case: one batch of
-        // 8,192 rows, `k = 1`, `f = 1`, `q1 = 0.5` but its last value `1.5`,
-        // and `q2 = -0.5`. DataFusion fails on the differing values of `q1`,
-        // the native operator failed on the range of `q2` (its first chunk).
-        // Such aggregations are left to DataFusion; literal percentiles, which
-        // DataFusion validates when it creates the accumulators, stay native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-            Field::new("q1", DataType::Float64, false),
-            Field::new("q2", DataType::Float64, false),
-        ]));
-        let mut q1 = vec![0.5; 8_192];
-        q1[8_191] = 1.5;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(arrow::array::Float64Array::from(vec![1.0; 8_192])),
-                Arc::new(arrow::array::Float64Array::from(q1)),
-                Arc::new(arrow::array::Float64Array::from(vec![-0.5; 8_192])),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        for target_partitions in [1, 4] {
-            for trusted in [false, true] {
-                let mut config =
-                    test_session_config().with_target_partitions(target_partitions);
-                if trusted {
-                    config = trusting(config);
-                }
-                for sql in [
-                    "SELECT k, percentile_cont(f, q1), percentile_cont(f, q2) FROM t \
-                     GROUP BY k",
-                    "SELECT percentile_cont(f, q1), percentile_cont(f, q2) FROM t",
-                ] {
-                    let ctx = datafusion_context(config.clone());
-                    setup(&ctx).await?;
-                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                    let plan = aggregation(&plan).expect("an aggregation");
-                    assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
-                    assert_eq!(planned_aggregations(sql, &config, &setup).await?, 0);
-                    let message = "must be constant across the aggregation, found \
-                                   differing values 0.5 and 1.5";
-                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        &setup,
-                        message,
-                    )
-                    .await;
-                    assert_eq!(lowered, 0, "{sql}");
-                }
-            }
-        }
-        for trusted in [false, true] {
-            let mut config = test_session_config().with_target_partitions(1);
-            if trusted {
-                config = trusting(config);
-            }
-            let sql = "SELECT k, percentile_cont(f, 0.25), COUNT(*) FROM t GROUP BY k";
-            assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-            assert_aggregate_parity_with_setup(sql, config, &setup).await;
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn inexact_aggregates_of_rows_sorted_for_ordered_aggregates_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // The review's case: a single partition of eight batches of 8,192 rows,
-        // `i = 0..65536`, `k = 1`, `s = i % 3` and `f = [1e16, 0, 0, 0, 1,
-        // -1e16, 1][i % 7]`. `NTH_VALUE(s, 5 ORDER BY s)` requires its rows in
-        // the order of `s`: DataFusion sorts its input (every batch, by an
-        // unstable sort, then merges them), the native operator sorts all rows
-        // of its thread at once, which orders the rows that tie in `s`
-        // otherwise. The `NTH_VALUE` of its own order is the same (see
-        // `orders_its_arguments`), but the aggregates that may not split their
-        // rows exactly see another sequence: the native `SUM(f)` was `1e16 +
-        // 1660`, DataFusion's `1e16 + 2856`, and the averages and standard
-        // deviations differed too. Such aggregations are left to DataFusion (see
-        // `PhysicalHashAggregate::try_lower`); the exact aggregates next to the
-        // ordered one stay native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("s", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let values = [1e16, 0.0, 0.0, 0.0, 1.0, -1e16, 1.0];
-        let batches = (0..8i64)
-            .map(|batch| {
-                let rows = batch * 8_192..(batch + 1) * 8_192;
-                RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(Int64Array::from(vec![1; 8_192])),
-                        Arc::new(Int64Array::from_iter_values(
-                            rows.clone().map(|i| i % 3),
-                        )),
-                        Arc::new(arrow::array::Float64Array::from_iter_values(
-                            rows.map(|i| values[(i % 7) as usize]),
-                        )),
-                    ],
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
-        for trusted in [false, true] {
-            let mut config = test_session_config().with_target_partitions(1);
-            if trusted {
-                config = trusting(config);
-            }
-            for sql in [
-                "SELECT k, SUM(f), AVG(f), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k",
-                "SELECT k, STDDEV(f), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k",
-                "SELECT SUM(f), NTH_VALUE(s, 5 ORDER BY s) FROM t",
-            ] {
-                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
-            }
-            let sql = "SELECT k, COUNT(*), MAX(f), SUM(s), NTH_VALUE(s, 5 ORDER BY s) FROM t GROUP BY k";
-            assert_eq!(
-                planned_aggregations(sql, &config, &setup).await?,
-                1,
-                "{sql}"
-            );
-            assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion()
-    -> Result<()> {
-        use crate::test_utils::assert_byte_eq_with_datafusion_with_config;
-        use datafusion_physical_plan::ExecutionPlanProperties;
-        // The review's case: a single partition of batches of 8,192 rows, seven
-        // passes over the keys `0..131072`, `v = 1e16 + 2 * pass` and `w = 3 *
-        // pass + 1`, on 4 and 16 target partitions (repartitioning neither the
-        // batches nor the scan, so that the partial aggregation has a single
-        // input partition). DataFusion's partial aggregation of a single
-        // grouping set skips aggregating its rows once most of them make new
-        // groups (by default, if more than 80% of the first 100,000 rows do),
-        // and passes every further row on as a state of its own, which its
-        // final aggregation merges with the state of the rows before: the
-        // native `STDDEV(v)` of every group of all rows was `4.47213595499958`,
-        // DataFusion's `4.515229959514974`, and `VAR_POP` and `CORR` differed
-        // too. Such aggregations are left to DataFusion (see
-        // `PhysicalHashAggregate::try_lower`), also if the session disables
-        // skipping (a ratio of 1.0, on which the native results matched), which
-        // `try_lower` does not see. Without groups (whose partial aggregation
-        // DataFusion never skips), and with aggregates that split exactly, they
-        // stay native. (The results are compared through the planner only:
-        // `try_lower` lowers none of these aggregations.)
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Float64, false),
-            Field::new("w", DataType::Float64, false),
-        ]));
-        let mut batches = vec![];
-        for pass in 0..7 {
-            for start in (0..131_072).step_by(8_192) {
-                batches.push(RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(Int64Array::from_iter_values(start..start + 8_192)),
-                        Arc::new(arrow::array::Float64Array::from(vec![
-                            1e16 + 2.0
-                                * pass as f64;
-                            8_192
-                        ])),
-                        Arc::new(arrow::array::Float64Array::from(vec![
-                            3.0 * pass as f64
-                                + 1.0;
-                            8_192
-                        ])),
-                    ],
-                )?);
-            }
-        }
-        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
-        let sql = "SELECT k, STDDEV(v), VAR_POP(v), CORR(v, w) FROM t GROUP BY k";
-        // The target partitions, and whether DataFusion may skip.
-        for (target_partitions, skip) in [(4, true), (16, true), (4, false)] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .set_bool(
-                        "datafusion.optimizer.enable_round_robin_repartition",
-                        false,
-                    )
-                    .set_bool("datafusion.optimizer.repartition_file_scans", false);
-                if !skip {
-                    config = config.set_str(
-                        "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
-                        "1.0",
-                    );
-                }
-                if trusted {
-                    config = trusting(config);
-                }
-                // Two stages, of a single input partition.
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                let last = aggregation(&plan).expect("an aggregation");
-                let mut node = Arc::clone(
-                    last.downcast_ref::<AggregateExec>()
-                        .expect("an AggregateExec")
-                        .input(),
-                );
-                while node.downcast_ref::<AggregateExec>().is_none() {
-                    node = Arc::clone(node.children()[0]);
-                }
-                let partial = node.downcast_ref::<AggregateExec>().expect("two stages");
-                assert_eq!(partial.mode(), &AggregateMode::Partial);
-                assert_eq!(partial.input().output_partitioning().partition_count(), 1);
-                assert_not_lowered(sql, &config, &setup).await?;
-                assert_byte_eq_with_datafusion_with_config(sql, config.clone(), &setup)
-                    .await;
-                if target_partitions == 4 && skip {
-                    for sql in [
-                        "SELECT STDDEV(v), VAR_POP(v), CORR(v, w) FROM t",
-                        "SELECT k, COUNT(*), MIN(v), MAX(w) FROM t GROUP BY k",
-                    ] {
-                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-                        assert_byte_eq_with_datafusion_with_config(
-                            sql,
-                            config.clone(),
-                            &setup,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn distinct_aggregates_that_depend_on_the_order_of_their_values_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // The review of abaaba6a6: one batch of 8,192 rows, `k = 1`, and `f =
-        // 0` but `f[0] = 1e16`, `f[2048] = -1e16` and `f[2049] = 1`. A `DISTINCT`
-        // aggregate collects its distinct values in a hash set, which reserves
-        // room for every batch it extends it with, so that the order of its
-        // values depends on the batches: DataFusion's `SUM(DISTINCT f)` of its
-        // batch is `1.0` (and `AVG(DISTINCT f)` `0.25`), the native one of the
-        // chunks of 2,048 rows was `0.0`, although a single thread aggregated
-        // all rows into a single state (next to `COUNT(*)`, which keeps
-        // DataFusion from rewriting the `DISTINCT` aggregates into an
-        // aggregation of an aggregation). The `DISTINCT` aggregates that may not
-        // split their rows exactly (see `splits_exactly`) are left to DataFusion
-        // (see `updates_like_datafusion`); those that do stay native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let mut f = vec![0.0; 8_192];
-        f[0] = 1e16;
-        f[2_048] = -1e16;
-        f[2_049] = 1.0;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(arrow::array::Float64Array::from(f)),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        for target_partitions in [1, 4] {
-            for trusted in [false, true] {
-                let mut config =
-                    test_session_config().with_target_partitions(target_partitions);
-                if trusted {
-                    config = trusting(config);
-                }
-                let sql = "SELECT k, SUM(DISTINCT f), AVG(DISTINCT f), COUNT(*) FROM t \
-                           GROUP BY k";
-                // (DataFusion's values in a single stage, of a single target
-                // partition.)
-                if target_partitions == 1 {
-                    assert_eq!(datafusion_floats(sql, &config, &setup, 1).await?, [1.0]);
-                    assert_eq!(datafusion_floats(sql, &config, &setup, 2).await?, [0.25]);
-                }
-                for sql in [
-                    sql,
-                    "SELECT k, ARRAY_AGG(DISTINCT f), COUNT(*) FROM t GROUP BY k",
-                    "SELECT SUM(DISTINCT f), COUNT(*) FROM t",
-                ] {
-                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
-                }
-                // (On several partitions, the planner leaves the aggregations of
-                // `DISTINCT` aggregates to DataFusion anyway, see the module
-                // documentation of `planner`.)
-                if target_partitions == 1 {
-                    let sql = "SELECT k, COUNT(DISTINCT f), MEDIAN(DISTINCT f), \
-                               SUM(DISTINCT k), COUNT(*) FROM t GROUP BY k";
-                    assert!(
-                        planned_aggregations(sql, &config, &setup).await? > 0,
-                        "{sql}"
-                    );
-                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn accumulators_that_fail_to_be_created_for_their_groups_are_left_to_datafusion()
-    -> Result<()> {
-        use super::super::test_support::{
-            assert_aggregate_fails_like_datafusion_with_setup,
-            assert_lowered_fails_like_datafusion_with_setup,
-        };
-        // The review of 4bfef9fea: one batch of 8,192 rows, `k = 1`, `f = 1.0`
-        // and `x = 1` but `x[8191] = 1000`. `NTH_VALUE`, whose function does not
-        // support groups accumulators, of the invalid index `0` fails to create
-        // its accumulator, which DataFusion and the native operator create for
-        // every group as its first row comes (see `fails_for_each_group`):
-        // DataFusion after it evaluated `CAST(x AS DECIMAL(3, 0))` on the whole
-        // batch, raising its invalid argument; the native operator after it
-        // evaluated it on the first chunk, raising the internal error of the
-        // index. Such aggregations are left to DataFusion (see
-        // `fail_in_the_order_of_the_batches`). Alone, the `NTH_VALUE` fails
-        // natively like in DataFusion; and without `GROUP BY`, both create the
-        // accumulator when they create their streams (see
-        // `fails_when_created`), and fail with its error first.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-            Field::new("x", DataType::Int64, false),
-        ]));
-        let mut x = vec![1; 8_192];
-        x[8_191] = 1_000;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(arrow::array::Float64Array::from(vec![1.0; 8_192])),
-                Arc::new(Int64Array::from(x)),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        let index_fails = "Nth value indices are 1 based. 0 is invalid index";
-        for target_partitions in [1, 4, 16] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(false);
-                if trusted {
-                    config = trusting(config);
-                }
-                let sql = "SELECT k, NTH_VALUE(f, 0), SUM(CAST(x AS DECIMAL(3, 0))) FROM t \
-                           GROUP BY k";
-                let lowered = assert_lowered_fails_like_datafusion_with_setup(
-                    sql,
-                    config.clone(),
-                    &setup,
-                    "1000 is too large to store in a Decimal128 of precision 3",
-                )
-                .await;
-                assert_eq!(lowered, 0, "{sql}");
-                assert_eq!(
-                    planned_aggregations(sql, &config, &setup).await?,
-                    0,
-                    "{sql}"
-                );
-                for sql in [
-                    "SELECT k, NTH_VALUE(f, 0) FROM t GROUP BY k",
-                    "SELECT NTH_VALUE(f, 0), SUM(CAST(x AS DECIMAL(3, 0))) FROM t",
-                ] {
-                    assert_aggregate_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        &setup,
-                        index_fails,
-                    )
-                    .await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregations_that_may_fail_evaluate_their_rows_in_order() -> Result<()> {
-        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
-        use crate::operator::PhysicalOperator;
-        // The review of d0a259437: one batch of 8,192 rows, `x = 1` but
-        // `x[2047] = 10^13` and `x[2048] = i64::MAX`. `CAST(x AS DECIMAL(38,
-        // 25))` fails on both, with the invalid argument of a value too large for
-        // the precision, and with the arithmetic overflow of rescaling
-        // `i64::MAX`: DataFusion on the first, the native operators on 4 and 16
-        // threads on the second (whose chunk a thread failed on first). An
-        // aggregation that may fail, or whose pipeline may (see `own_parts`
-        // and `pipeline_parts`), evaluates its rows in order, on a single
-        // thread (see `AggregateSpec::evaluates_in_order`), so that it fails on
-        // the first of them that fails in DataFusion; the others stay
-        // parallel.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("x", DataType::Int64, false),
-        ]));
-        let mut x = vec![1; 8_192];
-        x[2_047] = 10_000_000_000_000;
-        x[2_048] = i64::MAX;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(Int64Array::from(x)),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        let message = "10000000000000.0000000000000000000000000 is too large to store in a \
-                       Decimal128 of precision 38";
-        for target_partitions in [1, 4, 16] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(false);
-                if trusted {
-                    config = trusting(config);
-                }
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                for (sql, in_order) in [
-                    (
-                        "SELECT k, SUM(CAST(x AS DECIMAL(38, 25))) FROM t GROUP BY k",
-                        true,
-                    ),
-                    ("SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM t", true),
-                    ("SELECT k, SUM(x), COUNT(*) FROM t GROUP BY k", false),
-                ] {
-                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                    let plan = aggregation(&plan).expect("an aggregation");
-                    let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
-                        .unwrap_or_else(|| panic!("not lowered: {sql}"));
-                    assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
-                    if in_order {
-                        // (The threads of a parallel sink failed on the second
-                        // value every time.)
-                        for _ in 0..5 {
-                            assert_aggregate_fails_like_datafusion_with_setup(
-                                sql,
-                                config.clone(),
-                                &setup,
-                                message,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn competing_failures_of_aggregates_are_left_to_datafusion() -> Result<()> {
-        use super::super::test_support::{
-            assert_aggregate_fails_like_datafusion_with_setup,
-            assert_aggregate_parity_with_setup,
-            assert_lowered_fails_like_datafusion_with_setup,
-        };
-        // The review's case: one batch of 8,192 rows, `k = 1`, `x = y = 1` but
-        // `x[8191] = 1000` and `y[0] = i64::MAX`. DataFusion evaluates the
-        // argument of every aggregate on all rows of a batch before the next
-        // one: `CAST(x AS DECIMAL(3, 0))` fails first, with the invalid argument
-        // of `1000` (too large for the precision). The native operator
-        // evaluates them on its chunks: `CAST(y AS DECIMAL(38, 25))` failed
-        // first, with the arithmetic overflow of rescaling `i64::MAX`. Likewise
-        // if one of the casts is evaluated by a native filter or projection
-        // below the aggregation, in its pipeline: DataFusion evaluates it on
-        // the whole batch before the aggregation sees it. And arithmetic
-        // overflows of the same kind name other values (the review of
-        // abaaba6a6): of `SUM(p * 10)` and `SUM(q * 10)` of `DECIMAL(38, 0)`s,
-        // `p = q = 1` but `p[8191] = 9 * 10^37` and `q[0] = 8 * 10^37`, the
-        // overflow of `p` in DataFusion, of `q` natively. Such aggregations,
-        // with several parts that may fail, are left to DataFusion (see
-        // `fail_in_the_order_of_the_batches`), on any number of threads; with
-        // a single cast, or with decimal arithmetic that cannot overflow but
-        // once (as in TPC-H, see `cannot_overflow`), they stay native.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("x", DataType::Int64, false),
-            Field::new("y", DataType::Int64, false),
-            Field::new("p", DataType::Decimal128(15, 2), false),
-            Field::new("q", DataType::Decimal128(15, 2), false),
-            Field::new("p38", DataType::Decimal128(38, 0), false),
-            Field::new("q38", DataType::Decimal128(38, 0), false),
-            Field::new("a20", DataType::Decimal128(20, 0), false),
-            Field::new("b20", DataType::Decimal128(20, 0), false),
-            Field::new("c37", DataType::Decimal128(37, 0), false),
-            Field::new("d37", DataType::Decimal128(37, 0), false),
-        ]));
-        let mut x = vec![1; 8_192];
-        x[8_191] = 1_000;
-        let mut y = vec![1; 8_192];
-        y[0] = i64::MAX;
-        let mut p38 = vec![1; 8_192];
-        p38[8_191] = 9 * 10i128.pow(37);
-        let mut q38 = vec![1; 8_192];
-        q38[0] = 8 * 10i128.pow(37);
-        // Products of 40 digits, and sums rescaled to 47 digits, which may
-        // overflow (see `cannot_overflow`).
-        let mut a20 = vec![1; 8_192];
-        a20[8_191] = 10i128.pow(20) - 1;
-        let mut b20 = vec![1; 8_192];
-        b20[0] = 10i128.pow(20) - 2;
-        let mut c37 = vec![1; 8_192];
-        c37[8_191] = 10i128.pow(37) - 1;
-        let mut d37 = vec![1; 8_192];
-        d37[0] = 10i128.pow(37) - 2;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(Int64Array::from(x)),
-                Arc::new(Int64Array::from(y)),
-                Arc::new(
-                    Decimal128Array::from(vec![10_000; 8_192])
-                        .with_precision_and_scale(15, 2)?,
-                ),
-                Arc::new(
-                    Decimal128Array::from(vec![5; 8_192])
-                        .with_precision_and_scale(15, 2)?,
-                ),
-                Arc::new(Decimal128Array::from(p38).with_precision_and_scale(38, 0)?),
-                Arc::new(Decimal128Array::from(q38).with_precision_and_scale(38, 0)?),
-                Arc::new(Decimal128Array::from(a20).with_precision_and_scale(20, 0)?),
-                Arc::new(Decimal128Array::from(b20).with_precision_and_scale(20, 0)?),
-                Arc::new(Decimal128Array::from(c37).with_precision_and_scale(37, 0)?),
-                Arc::new(Decimal128Array::from(d37).with_precision_and_scale(37, 0)?),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        let x_fails = "Failed to cast field 'x' from Int64 to Decimal128(3, 0)";
-        let configs = [1, 4, 16].into_iter().flat_map(|target_partitions| {
-            [false, true].into_iter().flat_map(move |trusted| {
-                [true, false]
-                    .into_iter()
-                    .map(move |repartition| (target_partitions, trusted, repartition))
-            })
-        });
-        for (target_partitions, trusted, repartition) in configs {
-            {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(repartition);
-                if trusted {
-                    config = trusting(config);
-                }
-                for (sql, message) in [
-                    (
-                        "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), \
-                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t GROUP BY k",
-                        x_fails,
-                    ),
-                    (
-                        "SELECT SUM(CAST(x AS DECIMAL(3, 0))), \
-                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t",
-                        x_fails,
-                    ),
-                    (
-                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) \
-                         FILTER (WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1) FROM t \
-                         GROUP BY k",
-                        "Failed to cast field",
-                    ),
-                    (
-                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))), SUM(d) FROM \
-                         (SELECT k, y, CAST(x AS DECIMAL(3, 0)) + 0.5 AS d FROM t) \
-                         GROUP BY k",
-                        x_fails,
-                    ),
-                    (
-                        "SELECT k, SUM(p38 * CAST(10 AS DECIMAL(2, 0))), \
-                         SUM(q38 * CAST(10 AS DECIMAL(2, 0))) FROM t GROUP BY k",
-                        "Overflow happened on: 90000000000000000000000000000000000000 * 10",
-                    ),
-                    (
-                        "SELECT k, SUM(a20 * a20), SUM(b20 * b20) FROM t GROUP BY k",
-                        "Overflow happened on: 99999999999999999999 * 99999999999999999999",
-                    ),
-                    // The `ORDER BY` of an aggregate, which DataFusion evaluates
-                    // with its arguments (the review of d0a259437).
-                    (
-                        "SELECT k, FIRST_VALUE(k ORDER BY CAST(x AS DECIMAL(3, 0))), \
-                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t GROUP BY k",
-                        x_fails,
-                    ),
-                    (
-                        "SELECT FIRST_VALUE(k ORDER BY CAST(x AS DECIMAL(3, 0))), \
-                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t",
-                        x_fails,
-                    ),
-                    (
-                        "SELECT k, SUM(c37 + CAST(1 AS DECIMAL(11, 10))), \
-                         SUM(d37 + CAST(1 AS DECIMAL(11, 10))) FROM t GROUP BY k",
-                        "Overflow happened on: 9999999999999999999999999999999999999 * 10000000000",
-                    ),
-                ] {
-                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        &setup,
-                        message,
-                    )
-                    .await;
-                    assert_eq!(lowered, 0, "{sql}");
-                    assert_eq!(
-                        planned_aggregations(sql, &config, &setup).await?,
-                        0,
-                        "{sql}"
-                    );
-                }
-                // A filter of the pipeline: over several partitions, the
-                // aggregation reads DataFusion's input, filtered by DataFusion,
-                // through a bridge (whose threads read every partition in
-                // order), and only evaluates its argument.
-                let sql = "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) FROM t \
-                     WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1 GROUP BY k";
-                assert_lowered_fails_like_datafusion_with_setup(
-                    sql,
-                    config.clone(),
-                    &setup,
-                    x_fails,
-                )
-                .await;
-                let (planned, bridged) =
-                    planned_aggregations_over_bridges(sql, &config, &setup).await?;
-                assert_eq!(planned, bridged, "{sql}");
-                // A single part that may fail, also next to TPC-H Q9's
-                // arithmetic, whose literal `1` (a `DECIMAL(20, 0)` once
-                // coerced) has a digit: it cannot overflow. (The planner leaves
-                // that one to DataFusion: its own analysis counts the
-                // overflows of the arithmetic too.)
-                for sql in [
-                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), COUNT(*) FROM t GROUP BY k",
-                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))) FROM t WHERE y > 0 GROUP BY k",
-                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), SUM(p * (1 - q) - q * p) \
-                     FROM t GROUP BY k",
-                ] {
-                    let message =
-                        "1000 is too large to store in a Decimal128 of precision 3";
-                    assert_aggregate_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        &setup,
-                        message,
-                    )
-                    .await;
-                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        &setup,
-                        message,
-                    )
-                    .await;
-                    assert!(lowered > 0, "{sql}");
-                }
-                let sql = "SELECT k, SUM(p * (1 - q)), SUM(p * (1 - q) * (1 + q)) FROM t \
-                           GROUP BY k";
-                assert!(
-                    planned_aggregations(sql, &config, &setup).await? > 0,
-                    "{sql}"
-                );
-                assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// The number of native aggregations of the plan of `sql` that the planner
-    /// lowers in a session of configuration `config` set up by `setup`.
-    async fn planned_aggregations<F>(
-        sql: &str,
-        config: &SessionConfig,
-        setup: F,
-    ) -> Result<usize>
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        let ctx = crate::test_utils::pipeline_context(config.clone());
-        setup(&ctx).await?;
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
-            return internal_err!("The pipeline engine did not plan {sql}");
-        };
-        Ok(crate::operators::union::test_support::count::<
-            PhysicalHashAggregate,
-        >(root.operator()))
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregations_that_may_fail_read_the_rows_of_datafusion_in_its_order()
-    -> Result<()> {
-        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
-        // The review of 4c99a7f4a. An aggregation that may fail fails on the
-        // row that fails first, which depends on the order of its rows: those
-        // that DataFusion evaluates partition by partition, in order (see
-        // `try_lower`). `CAST(x AS DECIMAL(38, 25))` fails on `10^13 + 2` and
-        // on `10^13` with the invalid argument of a value too large for the
-        // precision, and on `i64::MAX` with the arithmetic overflow of
-        // rescaling it. Such aggregations read DataFusion's input through a
-        // bridge (whose threads read every partition in order) if the native
-        // operators would read its rows otherwise:
-        let runs =
-            async |sql: &str, config: &SessionConfig, setup, message| -> Result<()> {
-                for _ in 0..5 {
-                    assert_aggregate_fails_like_datafusion_with_setup(
-                        sql,
-                        config.clone(),
-                        setup,
-                        message,
-                    )
-                    .await;
-                }
-                let (planned, bridged) =
-                    planned_aggregations_over_bridges(sql, config, setup).await?;
-                assert!(
-                    planned > 0 && bridged == planned,
-                    "{sql}: {planned} {bridged}"
-                );
-                Ok(())
-            };
-        // - An aggregation below, whose rows the native operator emits in
-        //   another order: with one partition `x = [10^13 + 2, i64::MAX]`,
-        //   the aggregation of the groups of `x` failed on `i64::MAX` natively.
-        //   (On several target partitions, DataFusion aggregates the groups in
-        //   several partitions, and fails on the first of either: with
-        //   aggregations of a single partition.)
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![
-                10_000_000_000_002,
-                i64::MAX,
-            ]))],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        for target_partitions in [1, 4, 16] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(target_partitions == 1);
-                if trusted {
-                    config = trusting(config);
-                }
-                for sql in [
-                    "SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM (SELECT x FROM t GROUP BY x)",
-                    "SELECT x > 0, SUM(CAST(x AS DECIMAL(38, 25))) FROM \
-                     (SELECT x FROM t GROUP BY x) GROUP BY x > 0",
-                ] {
-                    runs(
-                        sql,
-                        &config,
-                        &setup,
-                        "10000000000002.0000000000000000000000000 is too large to store \
-                         in a Decimal128 of precision 38",
-                    )
-                    .await?;
-                }
-            }
-        }
-        // - Several partitions, of which the native sources read the chunks as
-        //   a single queue: one batch of 8,192 rows, `x = 1` but
-        //   `x[2047] = 10^13` and `x[2048] = i64::MAX`, and an empty partition.
-        //   The threads failed on the chunk of `i64::MAX` first.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("x", DataType::Int64, false),
-        ]));
-        let mut x = vec![1; 8_192];
-        x[2_047] = 10_000_000_000_000;
-        x[2_048] = i64::MAX;
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1; 8_192])),
-                Arc::new(Int64Array::from(x)),
-            ],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch], vec![]]);
-        for target_partitions in [4, 16] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(false)
-                    .set_bool("datafusion.optimizer.repartition_file_scans", false)
-                    .set_bool(
-                        "datafusion.optimizer.enable_round_robin_repartition",
-                        false,
-                    );
-                if trusted {
-                    config = trusting(config);
-                }
-                for sql in [
-                    "SELECT k, SUM(CAST(x AS DECIMAL(38, 25))) FROM t GROUP BY k",
-                    "SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM t",
-                ] {
-                    runs(
-                        sql,
-                        &config,
-                        &setup,
-                        "10000000000000.0000000000000000000000000 is too large to store in a \
-                         Decimal128 of precision 38",
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn minima_and_maxima_of_values_without_a_total_order_are_aggregated_in_order()
-    -> Result<()> {
-        use arrow::array::StructArray;
-        use arrow::datatypes::Fields;
-
-        use crate::operator::PhysicalOperator;
-        // The review of 786024a6a: DataFusion's `min` and `max` of structs
-        // compare them field by field, skipping NULLs, so that `{a: NULL}` is
-        // equal to `{a: 1}`, and the first of them stays the minimum and the
-        // maximum (see `compares_totally`). One partition of 8,192 rows of a
-        // single group, `a = NULL` in the first 2,048 rows and `a = 1` after:
-        // DataFusion's minimum and maximum are `{a: NULL}`, the native ones on
-        // 4 and 16 threads were `{a: 1}` (of a thread of the last rows), 20 of
-        // 20 times. Such aggregates do not split exactly: a single partition is
-        // aggregated in order, in a single state per group.
-        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Struct(fields.clone()), true),
-        ]));
-        let a = Int64Array::from_iter((0..8_192).map(|i| (i >= 2_048).then_some(1)));
-        let v = StructArray::new(fields, vec![Arc::new(a) as ArrayRef], None);
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1; 8_192])), Arc::new(v)],
-        )?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-        for target_partitions in [1, 4, 16] {
-            for trusted in [false, true] {
-                let mut config = test_session_config()
-                    .with_target_partitions(target_partitions)
-                    .with_repartition_aggregations(false);
-                if trusted {
-                    config = trusting(config);
-                }
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                for (sql, in_order) in [
-                    ("SELECT k, MIN(v) FROM t GROUP BY k", true),
-                    ("SELECT k, MAX(v) FROM t GROUP BY k", true),
-                    // (Without groups, see
-                    // `ungrouped_minima_and_maxima_of_values_without_a_total_order_are_left_to_datafusion`.)
-                    // Of values that DataFusion compares by a total order.
-                    ("SELECT k, MIN(k), MAX(k) FROM t GROUP BY k", false),
-                ] {
-                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                    let plan = aggregation(&plan).expect("an aggregation");
-                    let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
-                        .unwrap_or_else(|| panic!("not lowered: {sql}"));
-                    assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
-                    for _ in 0..5 {
-                        assert_aggregate_parity_with_setup(sql, config.clone(), &setup)
-                            .await;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn ungrouped_minima_and_maxima_of_values_without_a_total_order_are_left_to_datafusion()
-    -> Result<()> {
-        use arrow::array::StructArray;
-        use arrow::datatypes::Fields;
-        // The review of e5834101a: DataFusion's accumulators of `min` and `max`
-        // without groups compare the extreme of a batch with their state (see
-        // `updates_like_datafusion`), so that their values of structs, which
-        // they do not compare by a total order, depend on the batches. One
-        // batch of 8,192 rows, `a = 2` in the first 2,048 rows, `a = 1` in row
-        // 2,049, and NULL in the others: DataFusion's minimum is `{a: 1}`
-        // (`{a: NULL}` is equal to both), that of the native chunks of 2,048
-        // rows was `{a: 2}`, also on one thread; and the maximum of the rows
-        // with 1 and 2 swapped. They are left to DataFusion; with groups, whose
-        // accumulator of structs compares the rows one by one, they are
-        // aggregated in order.
-        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Struct(fields.clone()), true),
-        ]));
-        for (first, then) in [(2, 1), (1, 2)] {
-            let a = Int64Array::from_iter((0..8_192).map(|i| {
-                if i < 2_048 {
-                    Some(first)
-                } else if i == 2_049 {
-                    Some(then)
-                } else {
-                    None
-                }
-            }));
-            let v = StructArray::new(fields.clone(), vec![Arc::new(a) as ArrayRef], None);
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(vec![1; 8_192])), Arc::new(v)],
-            )?;
-            let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
-            for target_partitions in [1, 4, 16] {
-                for trusted in [false, true] {
-                    let mut config = test_session_config()
-                        .with_target_partitions(target_partitions)
-                        .with_repartition_aggregations(false);
-                    if trusted {
-                        config = trusting(config);
-                    }
-                    let sql = "SELECT MIN(v), MAX(v) FROM t";
-                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
-                    let sql = "SELECT k, MIN(v), MAX(v) FROM t GROUP BY k";
-                    assert!(
-                        planned_aggregations(sql, &config, &setup).await? > 0,
-                        "{sql}"
-                    );
-                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A table of two rows, of keys 1 and 2, of lists `v` of `len` values of
-    /// `data_type` (NULLs, or integers), of `partitions` partitions.
-    fn lists_of_two_rows(
-        data_type: &DataType,
-        len: usize,
-        partitions: usize,
-    ) -> Result<(SchemaRef, Vec<Vec<RecordBatch>>)> {
-        use arrow::array::{ListArray, NullArray};
-        use arrow::buffer::OffsetBuffer;
-        let field = Arc::new(Field::new_list_field(data_type.clone(), true));
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::List(Arc::clone(&field)), true),
-        ]));
-        let row = |k: i64| -> Result<RecordBatch> {
-            let values: ArrayRef = match data_type {
-                DataType::Null => Arc::new(NullArray::new(len)),
-                _ => Arc::new(Int64Array::from_iter_values(0..len as i64)),
-            };
-            let list = ListArray::new(
-                Arc::clone(&field),
-                OffsetBuffer::from_lengths([len]),
-                values,
-                None,
-            );
-            Ok(RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(vec![k])), Arc::new(list)],
-            )?)
-        };
-        let (one, two) = (row(1)?, row(2)?);
-        let table = match partitions {
-            1 => vec![vec![one, two]],
-            _ => vec![vec![one], vec![two]],
-        };
-        Ok((schema, table))
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn lists_of_values_that_may_not_fit_32_bit_offsets_are_aggregated_like_datafusion()
-    -> Result<()> {
-        use crate::operator::PhysicalOperator;
-        // The review of e5834101a: the lists that an aggregate keeps of its
-        // input (e.g. the `first_value` of lists) are not bounded by its rows,
-        // but by the bytes of their elements, which nulls do not take (see
-        // `has_a_byte_per_value`, and
-        // `huge_lists_of_groups_fail_to_be_materialized_like_datafusion`): they
-        // are aggregated like DataFusion, in order over one partition, and by
-        // DataFusion over two. Lists of integers stay as they are.
-        let sql = "SELECT k, FIRST_VALUE(v ORDER BY k) FROM t GROUP BY k";
-        for (data_type, bounded) in [(DataType::Null, false), (DataType::Int64, true)] {
-            for partitions in [1, 2] {
-                let (schema, table) = lists_of_two_rows(&data_type, 3, partitions)?;
-                let setup = mem_table_setup(schema, table);
-                for target_partitions in [1, 4] {
-                    let config = test_session_config()
-                        .with_target_partitions(target_partitions)
-                        .with_repartition_aggregations(false);
-                    let ctx = datafusion_context(config.clone());
-                    setup(&ctx).await?;
-                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                    let plan = aggregation(&plan).expect("an aggregation");
-                    let lowered = PhysicalHashAggregate::try_lower(&plan, lower)?;
-                    let case = format!("{data_type} over {partitions} partitions");
-                    match (bounded, partitions) {
-                        (false, 2) => {
-                            assert!(lowered.is_none(), "{case}");
-                            assert_left_to_datafusion(sql, config.clone(), &setup)
-                                .await?;
-                            continue;
-                        }
-                        (false, _) => assert!(
-                            lowered.is_some_and(|lowered| !lowered.parallel_sink()),
-                            "{case}"
-                        ),
-                        (true, _) => assert!(lowered.is_some(), "{case}"),
-                    }
-                    assert_aggregate_parity_with_setup(sql, config, &setup).await;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "takes minutes"]
-    async fn huge_lists_of_groups_fail_to_be_materialized_like_datafusion() -> Result<()>
-    {
-        use std::panic::AssertUnwindSafe;
-
-        use futures::FutureExt;
-        // The review of e5834101a: two rows of lists of 2^30 NULLs, in two
-        // partitions on 4 threads without repartitioning (and in one): the
-        // first values of both groups make a list of 2^31 elements, which
-        // DataFusion fails to materialize, with a panic. The native operator
-        // materialized those of every radix partition on their own, and
-        // succeeded. Now DataFusion aggregates the two partitions, and the
-        // native operator the one in a single table, whose accumulators panic
-        // like DataFusion's.
-        let sql = "SELECT k, FIRST_VALUE(v ORDER BY k) FROM t GROUP BY k";
-        for (partitions, target_partitions) in [(2, 4), (1, 1)] {
-            let (schema, table) =
-                lists_of_two_rows(&DataType::Null, 1 << 30, partitions)?;
-            let setup = mem_table_setup(schema, table);
-            let config = test_session_config()
-                .with_target_partitions(target_partitions)
-                .with_repartition_aggregations(false);
-            for ctx in [
-                datafusion_context(config.clone()),
-                crate::test_utils::pipeline_context(config.clone()),
-            ] {
-                setup(&ctx).await?;
-                let result =
-                    AssertUnwindSafe(async { ctx.sql(sql).await?.collect().await })
-                        .catch_unwind()
-                        .await;
-                let Err(panic) = result else {
-                    panic!("{sql} did not panic");
-                };
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied());
-                assert_eq!(
-                    message,
-                    Some("offset overflow: 2147483648 does not fit in i32"),
-                    "{sql}"
-                );
-            }
-        }
-        Ok(())
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn aggregates_ordered_by_values_without_a_total_order_are_left_to_datafusion()
     -> Result<()> {
@@ -4518,12 +2492,11 @@ mod tests {
         // order, which puts the NULLs of a field last, and takes the first; the
         // native accumulator (see `without_input_order`) compared their
         // `ScalarValue`s, which do not order structs totally (see
-        // `compares_totally`): of the rows of
-        // `minima_and_maxima_of_values_without_a_total_order_are_aggregated_in_order`,
-        // `{a: NULL}` before `{a: 1}`, DataFusion's first value was `{a: 1}`,
-        // the native one `{a: NULL}`, also on one thread. Aggregates ordered by
-        // such values are left to DataFusion; those ordered by other values
-        // stay native.
+        // `compares_totally`): of one partition of 8,192 rows of a single
+        // group, `{a: NULL}` in the first 2,048 rows and `{a: 1}` after,
+        // DataFusion's first value was `{a: 1}`, the native one `{a: NULL}`,
+        // also on one thread. Aggregates ordered by such values are left to
+        // DataFusion; those ordered by other values stay native.
         let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
@@ -4570,286 +2543,82 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn values_that_may_not_fit_32_bit_offsets_are_aggregated_like_datafusion()
-    -> Result<()> {
-        use std::fmt::Write;
-
-        use datafusion::prelude::CsvReadOptions;
-        use datafusion_physical_plan::ExecutionPlanProperties;
-
-        use crate::operator::PhysicalOperator;
-        // The review of 786024a6a: DataFusion materializes the values (and the
-        // states) of all groups of a stage at once, into arrays whose 32-bit
-        // offsets may overflow, the native operator those of every radix
-        // partition on their own (see `materializes_safely`, and
-        // `huge_values_of_groups_fail_to_be_materialized_like_datafusion`).
-        // Aggregations whose values may not fit are aggregated like those of
-        // aggregates that do not split exactly: in order, a single state per
-        // group, over a single partition (which DataFusion's accumulators
-        // materialize at once), and by DataFusion otherwise. The values that
-        // are bounded by the bytes of columns of a `MemTable` (also through
-        // `upper` and structs of them) or by its rows stay as they are.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, true),
-        ]));
-        let batch = |offset: i64| -> Result<RecordBatch> {
-            Ok(RecordBatch::try_new(
+    /// A `MemTable` `t` of the partitions `partitions` (of the schema of their
+    /// first batch, or of `schema`).
+    fn mem_table_setup(
+        schema: SchemaRef,
+        partitions: Vec<Vec<RecordBatch>>,
+    ) -> impl AsyncFn(&SessionContext) -> Result<()> {
+        async move |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
                 Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from_iter_values(
-                        (0..1_000).map(|i| offset + i % 100),
-                    )),
-                    Arc::new(StringArray::from_iter_values(
-                        (0..1_000).map(|i| format!("s{}", (offset + i) % 37)),
-                    )),
-                ],
-            )?)
-        };
-        for partitions in [1, 4] {
-            let table = (0..partitions)
-                .map(|p| Ok(vec![batch(p * 1_000)?]))
-                .collect::<Result<Vec<_>>>()?;
-            let setup = mem_table_setup(Arc::clone(&schema), table);
-            // (In a single stage over one partition, which DataFusion's
-            // partial aggregation of two would skip, see `try_lower`.)
-            let config = test_session_config()
-                .with_target_partitions(4)
-                .with_repartition_aggregations(false);
-            let ctx = datafusion_context(config.clone());
-            setup(&ctx).await?;
-            // Whether the native operator aggregates them over one partition
-            // (`Some`, in order if `Some(true)`), and over four.
-            const NATIVE: (Option<bool>, bool) = (Some(false), true);
-            const UNBOUNDED: (Option<bool>, bool) = (Some(true), false);
-            for (sql, (one, four)) in [
-                ("SELECT k, MIN(s), MAX(s) FROM t GROUP BY k", NATIVE),
-                (
-                    "SELECT k, ARRAY_AGG(s ORDER BY s) FROM t GROUP BY k",
-                    NATIVE,
-                ),
-                ("SELECT k, COUNT(DISTINCT s) FROM t GROUP BY k", NATIVE),
-                ("SELECT k, APPROX_DISTINCT(s) FROM t GROUP BY k", NATIVE),
-                (
-                    "SELECT k, STRING_AGG(s, ',' ORDER BY s) FROM t GROUP BY k",
-                    NATIVE,
-                ),
-                ("SELECT s, COUNT(*) FROM t GROUP BY s", NATIVE),
-                ("SELECT upper(s), COUNT(*) FROM t GROUP BY upper(s)", NATIVE),
-                (
-                    "SELECT named_struct('s', s), COUNT(*) FROM t \
-                     GROUP BY named_struct('s', s)",
-                    NATIVE,
-                ),
-                ("SELECT [k, k], COUNT(*) FROM t GROUP BY [k, k]", NATIVE),
-                // Values that are not bounded: in order, or by DataFusion (as
-                // aggregates that do not split exactly, also of sorted rows).
-                ("SELECT k, MIN(repeat(s, 3)) FROM t GROUP BY k", UNBOUNDED),
-                (
-                    "SELECT repeat(s, 3), COUNT(*) FROM t GROUP BY repeat(s, 3)",
-                    UNBOUNDED,
-                ),
-                (
-                    "SELECT k, STRING_AGG(s || s, ',' ORDER BY s) FROM t GROUP BY k",
-                    (None, false),
-                ),
-            ] {
-                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                let plan = aggregation(&plan).expect("an aggregation");
-                let lowered = PhysicalHashAggregate::try_lower(&plan, lower)?;
-                if partitions == 1 {
-                    // (Its sink may be serial for other reasons too: e.g. its
-                    // keys may fail, see `AggregateSpec::evaluates_in_order`.)
-                    assert_eq!(lowered.is_some(), one.is_some(), "{sql}");
-                    if let (Some(lowered), Some(true)) = (&lowered, one) {
-                        assert!(!lowered.parallel_sink(), "{sql}");
-                    }
-                } else {
-                    assert_eq!(lowered.is_some(), four, "{sql}");
-                }
-                if lowered.is_some() {
-                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
-                }
-            }
+                partitions.clone(),
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
         }
-        // The strings of uncompressed CSV files, of at most their bytes (see
-        // `max_column_bytes`), of two files (partitions).
-        let dir = tempfile::tempdir()?;
-        for file in 0..2 {
-            let mut rows = String::from("k,s\n");
-            for i in 0..1_000 {
-                writeln!(rows, "{i},s{}", (file * 1_000 + i) % 37).expect("a string");
-            }
-            std::fs::write(dir.path().join(format!("part-{file}.csv")), rows)?;
-        }
-        let path = dir.path().to_str().expect("a UTF-8 path").to_string();
-        let setup = async |ctx: &SessionContext| {
-            ctx.register_csv("c", &path, CsvReadOptions::new()).await
-        };
-        let config = test_session_config().with_target_partitions(4);
-        let ctx = datafusion_context(config.clone());
-        setup(&ctx).await?;
-        let sql = "SELECT s, COUNT(*), MIN(s), MAX(s) FROM c GROUP BY s";
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let plan = aggregation(&plan).expect("an aggregation");
-        assert!(plan.children()[0].output_partitioning().partition_count() > 1);
-        assert!(
-            PhysicalHashAggregate::try_lower(&plan, lower)?.is_some(),
-            "{sql}"
-        );
-        assert_aggregate_parity_with_setup(sql, config, &setup).await;
-        Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "allocates more than 8 GiB"]
-    async fn huge_values_of_groups_fail_to_be_materialized_like_datafusion() -> Result<()>
-    {
-        use std::panic::AssertUnwindSafe;
-
-        use arrow::array::{StringArray, StructArray};
-        use arrow::datatypes::Fields;
-        use futures::FutureExt;
-
-        use super::super::test_support::{
-            assert_aggregate_fails_like_datafusion_with_setup,
-            assert_lowered_fails_like_datafusion_with_setup,
-        };
-        // The review of 786024a6a: 40,960 groups (of distinct keys) of a string
-        // of 55,000 bytes, in one partition: 2,252,800,000 bytes, more than an
-        // array of `Utf8` (of 32-bit offsets) holds. DataFusion materializes the
-        // values of all groups of a stage at once, and fails, the native
-        // operator materialized those of every radix partition on their own,
-        // and succeeded. Its aggregations of a single partition now aggregate
-        // them in a single table, which they materialize at once, by
-        // DataFusion's accumulators (see `materializes_safely`).
-        let fields = Fields::from(vec![Field::new("s", DataType::Utf8, true)]);
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, true),
-            Field::new("v", DataType::Struct(fields.clone()), true),
-        ]));
-        let value = "x".repeat(55_000);
-        let batches = (0..20)
-            .map(|b| {
-                let s: ArrayRef =
-                    Arc::new(StringArray::from(vec![value.as_str(); 2_048]));
-                let v = StructArray::new(fields.clone(), vec![Arc::clone(&s)], None);
-                let k = Int64Array::from_iter_values((0..2_048).map(|i| b * 2_048 + i));
-                Ok(RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![Arc::new(k), s, Arc::new(v)],
-                )?)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
-        let session = |target_partitions, trusted| {
-            let config = test_session_config().with_target_partitions(target_partitions);
-            if trusted { trusting(config) } else { config }
-        };
-        // The review's aggregation, also of several partitions (left to
-        // DataFusion, whose final aggregation of a single partition fails),
-        // and aggregates that split exactly.
-        let struct_min = "SELECT k, MIN(v) FROM t GROUP BY k";
-        let overflow =
-            "struct column 0 (\"s\") failed: Invalid argument error: offset overflow";
-        for config in [session(1, false), session(1, true)] {
-            assert_aggregate_fails_like_datafusion_with_setup(
-                struct_min, config, &setup, overflow,
-            )
-            .await;
-        }
-        let several = session(4, false).with_repartition_aggregations(false);
-        let lowered = assert_lowered_fails_like_datafusion_with_setup(
-            struct_min,
-            several.clone(),
-            &setup,
-            overflow,
-        )
-        .await;
-        assert_eq!(lowered, 0);
-        assert_eq!(planned_aggregations(struct_min, &several, &setup).await?, 0);
-        let config = session(1, false);
-        // (Which DataFusion aggregates by `k` and `s` first.)
-        assert_aggregate_fails_like_datafusion_with_setup(
-            "SELECT k, COUNT(DISTINCT s) FROM t GROUP BY k",
-            config.clone(),
-            &setup,
-            "offset overflow, buffer size > 2147483647",
-        )
-        .await;
-        // (Ordered, of sorted rows: left to DataFusion, as inexact aggregates.)
-        let array_agg = "SELECT k, ARRAY_AGG(s ORDER BY s) FROM t GROUP BY k";
-        let lowered = assert_lowered_fails_like_datafusion_with_setup(
-            array_agg,
-            config.clone(),
-            &setup,
-            "Offset overflow error: 2147530000",
-        )
-        .await;
-        assert_eq!(lowered, 0);
-        assert_eq!(planned_aggregations(array_agg, &config, &setup).await?, 0);
-        // DataFusion's `StringBuilder`s panic, and so do the native operator's,
-        // of DataFusion's accumulators.
-        for sql in [
-            "SELECT k, MIN(s) FROM t GROUP BY k",
-            "SELECT k, FIRST_VALUE(s ORDER BY s) FROM t GROUP BY k",
-        ] {
-            for ctx in [
-                datafusion_context(config.clone()),
-                crate::test_utils::pipeline_context(config.clone()),
-            ] {
-                setup(&ctx).await?;
-                let result =
-                    AssertUnwindSafe(async { ctx.sql(sql).await?.collect().await })
-                        .catch_unwind()
-                        .await;
-                let Err(panic) = result else {
-                    panic!("{sql} did not panic");
-                };
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied());
-                assert_eq!(message, Some("byte array offset overflow"), "{sql}");
-            }
-        }
-        Ok(())
-    }
-
-    /// The number of native aggregations that the planner plans for `sql`, and
-    /// of those of them that read their input through a bridge.
-    async fn planned_aggregations_over_bridges<F>(
+    /// Assert that the aggregation of `sql` (see [`aggregation`]) in a session
+    /// of configuration `config`, set up by `setup`, is left to DataFusion, by
+    /// [`PhysicalHashAggregate::try_lower`] and by the planner, and that the
+    /// pipeline engine returns DataFusion's results.
+    async fn assert_left_to_datafusion<F>(
         sql: &str,
-        config: &SessionConfig,
+        config: SessionConfig,
         setup: F,
-    ) -> Result<(usize, usize)>
+    ) -> Result<()>
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        use crate::bridge::BridgeOperator;
-        use crate::operator::PhysicalOperator;
-        fn walk(operator: &Arc<dyn PhysicalOperator>, counts: &mut (usize, usize)) {
-            if operator.is::<PhysicalHashAggregate>() {
-                counts.0 += 1;
-                if operator.children()[0].is::<BridgeOperator>() {
-                    counts.1 += 1;
-                }
-            }
-            for child in operator.children() {
-                walk(child, counts);
-            }
-        }
+        use super::super::test_support::assert_lowered_parity_with_setup;
+        assert_not_lowered(sql, &config, &setup).await?;
+        assert_lowered_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    /// Assert that neither [`PhysicalHashAggregate::try_lower`] nor the
+    /// planner lowers the aggregation of `sql`, in a session of configuration
+    /// `config` set up by `setup`.
+    async fn assert_not_lowered<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let plan = aggregation(&plan).expect("an aggregation");
+        assert!(
+            PhysicalHashAggregate::try_lower(&plan, lower)?.is_none(),
+            "{sql}"
+        );
+        assert_eq!(planned_aggregations(sql, config, &setup).await?, 0, "{sql}");
+        Ok(())
+    }
+
+    /// The number of native aggregations of the plan of `sql` that the planner
+    /// lowers in a session of configuration `config` set up by `setup`.
+    async fn planned_aggregations<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<usize>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
         let ctx = crate::test_utils::pipeline_context(config.clone());
         setup(&ctx).await?;
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
         let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
             return internal_err!("The pipeline engine did not plan {sql}");
         };
-        let mut counts = (0, 0);
-        walk(root.operator(), &mut counts);
-        Ok(counts)
+        Ok(crate::operators::union::test_support::count::<
+            PhysicalHashAggregate,
+        >(root.operator()))
     }
 
     /// Table `hc`: 34,816 distinct keys `k`, values `v`, strings `s` (views)
@@ -4889,45 +2658,21 @@ mod tests {
             .collect()
     }
 
-    /// A thread of the native aggregation that consumes the rows of `batches`
-    /// (of a table of the query), the deepest of the plan of `sql` that the
-    /// planner lowers in the session of `ctx`: the thread of a pipeline of
-    /// `threads` threads of an execution in that session, as the executor runs
-    /// it (see `PhysicalHashAggregate::get_local_sink_state`), which consumes
-    /// all of the rows, then finalizes the aggregation.
-    #[derive(Debug)]
-    struct PlannedThread {
-        /// Whether the aggregates of the aggregation split their rows exactly
-        /// (see `AggregateSpec::splits_exactly`).
-        splits_exactly: bool,
-        /// Whether its table holds all of its groups (see
-        /// [`TableCapacity::UNBOUNDED`]).
-        whole: bool,
-        /// Whether the final aggregation evaluates that table, rather than
-        /// merging partial states (see [`RadixHashAggregate::finalize`]).
-        evaluated: bool,
-        /// Whether the aggregation has a single stage.
-        single_stage: bool,
-        /// Whether its rows bypassed its table at some point.
-        bypassed: bool,
-        /// The groups its table flushed before it finished.
-        flushed: usize,
-        /// The groups in its table when it finished.
-        groups: usize,
-        /// The output of the aggregation.
-        output: RecordBatch,
-    }
-
-    /// See [`PlannedThread`].
-    async fn planned_aggregation_thread(
+    /// Whether the rows of `batches` (of a table of the query) bypass the
+    /// table of a thread of the native aggregation that consumes them, the
+    /// deepest of the plan of `sql` that the planner lowers in the session of
+    /// `ctx`, when its sink consumes them on a thread of an execution in that
+    /// session, as the executor runs it (see
+    /// `PhysicalHashAggregate::get_local_sink_state`).
+    async fn planned_aggregation_bypasses(
         ctx: &SessionContext,
         sql: &str,
         batches: &[RecordBatch],
-        threads: usize,
-    ) -> Result<PlannedThread> {
+    ) -> Result<bool> {
+        use crate::operator::{ExecutionContext, PhysicalOperator};
         fn deepest(
-            operator: &Arc<dyn crate::PhysicalOperator>,
-        ) -> Option<Arc<dyn crate::PhysicalOperator>> {
+            operator: &Arc<dyn PhysicalOperator>,
+        ) -> Option<Arc<dyn PhysicalOperator>> {
             operator.children().iter().find_map(deepest).or_else(|| {
                 operator
                     .is::<PhysicalHashAggregate>()
@@ -4938,29 +2683,13 @@ mod tests {
         let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() else {
             return internal_err!("The pipeline engine did not plan {sql}");
         };
-        let Some(operator) = deepest(root.operator()) else {
+        let Some(aggregate) = deepest(root.operator()) else {
             return internal_err!("No native aggregation in the plan of {sql}");
         };
-        aggregation_thread(&operator, ctx.task_ctx(), batches, threads)
-    }
-
-    /// A thread of `operator`, a grouped [`PhysicalHashAggregate`] of the rows
-    /// of `batches`, like [`planned_aggregation_thread`], in an execution of
-    /// the task `task_ctx`.
-    fn aggregation_thread(
-        operator: &Arc<dyn crate::PhysicalOperator>,
-        task_ctx: Arc<TaskContext>,
-        batches: &[RecordBatch],
-        threads: usize,
-    ) -> Result<PlannedThread> {
-        let spec = operator
-            .downcast_ref::<PhysicalHashAggregate>()
-            .expect("an aggregation")
-            .spec();
-        let schema = operator.children()[0].schema();
-        let execution = crate::operator::ExecutionContext::new(task_ctx, 0, threads);
-        let global = operator.get_global_sink_state(&execution)?;
-        let mut local = operator.get_local_sink_state(&execution, global.as_ref())?;
+        let schema = aggregate.children()[0].schema();
+        let execution = ExecutionContext::new(ctx.task_ctx(), 0, 1);
+        let global = aggregate.get_global_sink_state(&execution)?;
+        let mut local = aggregate.get_local_sink_state(&execution, global.as_ref())?;
         let mut bypassed = false;
         for batch in batches {
             let columns = schema
@@ -4974,59 +2703,13 @@ mod tests {
                 Arc::clone(&schema),
                 columns,
             )?);
-            operator.sink(&execution, &chunk, global.as_ref(), local.as_mut())?;
-            bypassed |= local_radix_state(local.as_ref())?.bypass.is_some();
+            aggregate.sink(&execution, &chunk, global.as_ref(), local.as_mut())?;
+            let Some(state) = local.downcast_ref::<RadixLocalState>() else {
+                return internal_err!("The aggregation of {sql} has no radix sink state");
+            };
+            bypassed |= state.bypass.is_some();
         }
-        let state = local_radix_state(local.as_ref())?;
-        let (whole, flushed, groups) =
-            (state.whole, state.flushed, state.table.num_groups());
-        operator.combine(&execution, global.as_ref(), local.as_mut())?;
-        let mut output = vec![];
-        let finalized = RadixHashAggregate::finalize(&spec, global.as_ref())?;
-        let evaluated = global
-            .downcast_ref::<RadixSinkState>()
-            .is_some_and(|global| global.whole.lock().len() == 1);
-        if finalized == SinkFinalize::Ready {
-            let source = RadixHashAggregate::global_source_state(&spec, global)?;
-            let mut local = RadixHashAggregate::local_source_state()?;
-            while let SourceResult::Chunk(chunk) =
-                RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
-            {
-                output.push(chunk.compact()?);
-            }
-        }
-        Ok(PlannedThread {
-            splits_exactly: spec.splits_exactly,
-            whole,
-            evaluated,
-            single_stage: spec.single_stage,
-            bypassed,
-            flushed,
-            groups,
-            output: canonical_batch(&spec.schema, &output, false)?,
-        })
-    }
-
-    /// The radix sink state of `local`.
-    fn local_radix_state(local: &dyn LocalSinkState) -> Result<&RadixLocalState> {
-        match local.downcast_ref::<RadixLocalState>() {
-            Some(state) => Ok(state),
-            None => internal_err!("A grouped aggregation has no radix sink state"),
-        }
-    }
-
-    /// The output of the aggregation of `sql` (see [`aggregation`]) in
-    /// DataFusion, in the session of `ctx`.
-    async fn datafusion_aggregation(
-        ctx: &SessionContext,
-        sql: &str,
-    ) -> Result<RecordBatch> {
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let aggregation = aggregation(&plan).expect("an aggregation");
-        let output =
-            datafusion_physical_plan::collect(Arc::clone(&aggregation), ctx.task_ctx())
-                .await?;
-        canonical_batch(&aggregation.schema(), &output, false)
+        Ok(bypassed)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5035,47 +2718,33 @@ mod tests {
         use super::super::test_support::{lookalike_count, lookalike_sum};
         // The native aggregations that the planner lowers, their sinks consuming
         // 34,816 distinct keys on a thread of an execution of the session, as
-        // the executor runs them: once the table of a thread of several threads
-        // is full, its rows bypass it in the sessions that trust the functions
-        // of all aggregates (DataFusion's built-in aggregate functions, neither
+        // the executor runs them: once the table of the thread is full, its
+        // rows bypass it in the sessions that trust the functions of all
+        // aggregates (DataFusion's built-in aggregate functions, neither
         // `DISTINCT` nor ordered), and in all sessions if there are no
         // aggregates, as before sessions could trust aggregate functions. The
-        // rows of the other aggregations never bypass the tables, nor do those
-        // of the aggregations that aggregate their single partition in order
-        // (with aggregates that may not split their rows exactly, see
-        // `AggregateSpec::aggregates_in_order` and `TableCapacity::UNBOUNDED`),
-        // whose aggregations of several partitions are left to DataFusion. The
-        // results are DataFusion's. Nothing forces
-        // `AggregateSpec::bypass` here. (Planned on a single target partition,
-        // on which the planner lowers all of these aggregations: on several, it
-        // leaves those whose partial states are lists or binaries to
+        // rows of the other aggregations never bypass the tables. Nothing
+        // forces `AggregateSpec::bypass` here. (On a single target partition,
+        // on which the planner lowers all of these aggregations: on several,
+        // it leaves those whose partial states are lists or binaries to
         // DataFusion, see the module documentation of `planner`.)
         let batches = hc_batches()?;
-        const IN_ORDER: [&str; 2] = [
-            "SELECT k, COUNT(*), SUM(v), MAX(v), AVG(v) FROM hc GROUP BY k",
-            "SELECT k, ARRAY_AGG(v), FIRST_VALUE(v), LAST_VALUE(s), MIN(s) FROM hc \
-             GROUP BY k",
-        ];
         let queries = [
             // The query, whether its rows bypass the tables in a session that
             // does not trust DataFusion's built-in aggregate functions, and in
             // a session that does.
             (
-                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v) FROM hc GROUP BY k",
+                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM hc GROUP BY k",
                 false,
                 true,
             ),
             (
                 "SELECT k, BOOL_AND(b), BOOL_OR(b), BIT_AND(v), BIT_OR(v), BIT_XOR(v), \
-                 APPROX_DISTINCT(s), MEDIAN(v), COUNT(v) FILTER (WHERE b) FROM hc \
-                 GROUP BY k",
+                 APPROX_DISTINCT(s), MEDIAN(v), ARRAY_AGG(v), FIRST_VALUE(v), \
+                 LAST_VALUE(s), COUNT(v) FILTER (WHERE b) FROM hc GROUP BY k",
                 false,
                 true,
             ),
-            // Aggregates that may not split their rows exactly, of a single
-            // partition: aggregated in order.
-            (IN_ORDER[0], false, false),
-            (IN_ORDER[1], false, false),
             ("SELECT k, s FROM hc GROUP BY k, s", true, true),
             ("SELECT DISTINCT k, v FROM hc", true, true),
             // `DISTINCT` and ordered aggregates.
@@ -5090,12 +2759,12 @@ mod tests {
                 false,
             ),
             (
-                "SELECT k, ARRAY_AGG(v ORDER BY v), COUNT(*) FROM hc GROUP BY k",
+                "SELECT k, ARRAY_AGG(v ORDER BY s), COUNT(*) FROM hc GROUP BY k",
                 false,
                 false,
             ),
             (
-                "SELECT k, LAST_VALUE(v ORDER BY v DESC), MAX(v) FROM hc GROUP BY k",
+                "SELECT k, LAST_VALUE(v ORDER BY s DESC), MAX(v) FROM hc GROUP BY k",
                 false,
                 false,
             ),
@@ -5119,55 +2788,48 @@ mod tests {
                 ctx.register_table("hc", Arc::new(table))?;
                 Ok(())
             };
-            let datafusion = datafusion_context(config.clone());
-            setup(&datafusion).await?;
             let ctx = crate::test_utils::pipeline_context(config.clone());
             setup(&ctx).await?;
             for (sql, untrusted, with_trust) in queries {
                 let bypass = if trusted { with_trust } else { untrusted };
-                let expected = datafusion_aggregation(&datafusion, sql).await?;
-                // A thread of several bypasses the table as the session lets it,
-                // and gets DataFusion's results (of a single thread, that
-                // aggregates all rows of a group into a single state, if the
-                // aggregation aggregates in order).
-                let thread = planned_aggregation_thread(&ctx, sql, &batches, 4).await?;
-                assert_eq!(thread.whole, !thread.splits_exactly, "{sql}");
-                assert!(thread.whole || !IN_ORDER.contains(&sql), "{sql}");
-                assert_eq!(thread.bypassed, bypass, "{sql} (trusted: {trusted})");
-                assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
-                // A single thread aggregates all rows of a group into a single
-                // state if its aggregates may not split their rows exactly (see
-                // `TableCapacity::UNBOUNDED`), and its final aggregation
-                // evaluates that state; it bypasses its table as the session
-                // lets it otherwise.
-                let thread = planned_aggregation_thread(&ctx, sql, &batches, 1).await?;
-                assert_eq!(thread.whole, !thread.splits_exactly, "{sql}");
-                assert_eq!(thread.evaluated, thread.whole, "{sql}");
-                assert_eq!(thread.bypassed, bypass && !thread.whole, "{sql}");
-                assert_eq!(thread.flushed == 0, thread.whole, "{sql}");
-                assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
+                assert_eq!(
+                    planned_aggregation_bypasses(&ctx, sql, &batches).await?,
+                    bypass,
+                    "{sql} (trusted: {trusted})"
+                );
+                // The results of the rows that bypass the table of the thread
+                // (those of the other sessions are checked by the other tests).
+                if bypass {
+                    assert_byte_eq_with_datafusion_with_config(
+                        sql,
+                        config.clone(),
+                        &setup,
+                    )
+                    .await;
+                }
             }
             // User-defined functions that look like DataFusion's `count` and
-            // `sum`, and replace them (see `lookalike_count`): their
-            // aggregations are left to DataFusion (see `updates_like_datafusion`).
+            // `sum`, and replace them (see `lookalike_count`): their rows never
+            // bypass the tables.
             let setup_lookalikes = async |ctx: &SessionContext| -> Result<()> {
                 setup(ctx).await?;
                 ctx.register_udaf(lookalike_count());
                 ctx.register_udaf(lookalike_sum());
                 Ok(())
             };
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            setup_lookalikes(&ctx).await?;
             for sql in [
                 "SELECT k, count(v), sum(v) FROM hc GROUP BY k",
                 "SELECT k, count(*), MAX(v) FROM hc GROUP BY k",
             ] {
-                assert_left_to_datafusion(sql, config.clone(), &setup_lookalikes).await?;
-            }
-            // The aggregations that aggregate a single partition in order, of
-            // several partitions: left to DataFusion (see
-            // `PhysicalHashAggregate::try_lower`).
-            let config = config.with_target_partitions(4);
-            for sql in IN_ORDER {
-                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                assert!(!planned_aggregation_bypasses(&ctx, sql, &batches).await?);
+                assert_byte_eq_with_datafusion_with_config(
+                    sql,
+                    config.clone(),
+                    &setup_lookalikes,
+                )
+                .await;
             }
         }
         Ok(())
@@ -5176,15 +2838,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn arguments_of_bypassed_rows_fail_like_datafusion() -> Result<()> {
         use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
-        // 40,000 distinct keys (the rows of a thread of several threads bypass
-        // its table once it is full, in the sessions that trust the aggregate
-        // functions: with the tiny tables of the lowering of the tests, on 4 and
-        // 16 threads), and a last row on which an argument of an aggregate
-        // fails: DataFusion and the native aggregation fail on it with the same
-        // error, on 1, 4 and 16 threads, with the default and with tiny tables,
-        // through the planner and the lowering of the tests. The bypassed rows
-        // evaluate the arguments of the aggregates when they are consumed, like
-        // the tables.
+        // 40,000 distinct keys (the rows of a thread bypass its table once it is
+        // full, in the sessions that trust the aggregate functions), and a last
+        // row on which an argument of an aggregate fails: DataFusion and the
+        // native aggregation fail on it with the same error, on 1, 4 and 16
+        // threads, with the default and with tiny tables, through the planner
+        // and the lowering of the tests. The bypassed rows evaluate the
+        // arguments of the aggregates when they are consumed, like the tables.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -5309,10 +2969,7 @@ mod tests {
         // sessions that trust DataFusion's built-in aggregate functions: those
         // whose aggregates are neither `DISTINCT` nor ordered (see
         // `TrustedAggregateFunctions::trusts`). In the other sessions, only the
-        // rows of aggregations without aggregates bypass the tables. (The 3
-        // partitions of `u` are aggregated natively if the aggregates split
-        // their rows exactly, see `PhysicalHashAggregate::try_lower`: averages
-        // of decimals, ordered aggregates of their own order.)
+        // rows of aggregations without aggregates bypass the tables.
         let queries = [
             (
                 "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(sv), AVG(d), BOOL_OR(b) FROM u \
@@ -5343,11 +3000,11 @@ mod tests {
             ),
             (
                 "SELECT k % 97 AS m, MEDIAN(v), APPROX_DISTINCT(s), BOOL_AND(b), \
-                 BIT_AND(v), BIT_OR(v), SUM(d), AVG(d) FROM u GROUP BY k % 97",
+                 BIT_AND(v), BIT_OR(v), SUM(d), AVG(v) FROM u GROUP BY k % 97",
                 true,
             ),
             (
-                "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(v ORDER BY v, k) \
+                "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
                  FROM u GROUP BY k % 50",
                 false,
             ),
@@ -5408,48 +3065,6 @@ mod tests {
                 assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
             }
         }
-        Ok(())
-    }
-
-    /// Assert that the aggregation of `sql` (see [`aggregation`]) in a session
-    /// of configuration `config`, set up by `setup`, is left to DataFusion, by
-    /// [`PhysicalHashAggregate::try_lower`] and by the planner (see
-    /// `updates_like_datafusion`), and that the pipeline engine returns
-    /// DataFusion's results.
-    async fn assert_left_to_datafusion<F>(
-        sql: &str,
-        config: SessionConfig,
-        setup: F,
-    ) -> Result<()>
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        use super::super::test_support::assert_lowered_parity_with_setup;
-        assert_not_lowered(sql, &config, &setup).await?;
-        assert_lowered_parity_with_setup(sql, config, &setup).await;
-        Ok(())
-    }
-
-    /// Assert that neither [`PhysicalHashAggregate::try_lower`] nor the
-    /// planner lowers the aggregation of `sql`, in a session of configuration
-    /// `config` set up by `setup`.
-    async fn assert_not_lowered<F>(
-        sql: &str,
-        config: &SessionConfig,
-        setup: F,
-    ) -> Result<()>
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        let ctx = datafusion_context(config.clone());
-        setup(&ctx).await?;
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let plan = aggregation(&plan).expect("an aggregation");
-        assert!(
-            PhysicalHashAggregate::try_lower(&plan, lower)?.is_none(),
-            "{sql}"
-        );
-        assert_eq!(planned_aggregations(sql, config, &setup).await?, 0, "{sql}");
         Ok(())
     }
 
@@ -5514,12 +3129,9 @@ mod tests {
     async fn user_defined_counts_are_aggregated_like_datafusion() -> Result<()> {
         // `count` of [`Count`] over 40,000 distinct keys of a single
         // partition, in batches of 2,048 rows, whose arguments are all `true`:
-        // the rows after the first 32,768 would fill the table of a thread,
-        // whose rows would bypass it if `count` were trusted. The aggregations
-        // of user-defined aggregates are left to DataFusion (see
-        // `updates_like_datafusion`), also in the sessions that trust
-        // DataFusion's `count`, which [`Count`] replaces (its type is not
-        // DataFusion's, see `TrustedAggregateFunctions`).
+        // the rows after the first 32,768 fill the table of the thread, whose
+        // accumulators read the values of the arguments (the rows of an
+        // aggregation with aggregates do not bypass the tables).
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("b", DataType::Boolean, false),
@@ -5572,15 +3184,29 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(counts.len(), 40_000);
         assert!(counts.iter().all(|&count| count == 1));
-        // On 1, 4 and 16 threads.
-        for target_partitions in [1, 4, 16] {
+        // Also in a session that trusts DataFusion's `count`, which [`Count`]
+        // replaces: its type is not DataFusion's (see
+        // `TrustedAggregateFunctions`). On 1, 4 and 16 threads.
+        for target_partitions in [4, 16] {
             for trusted in [false, true] {
                 let mut config =
                     test_session_config().with_target_partitions(target_partitions);
                 if trusted {
                     config = trusting(config);
                 }
-                assert_left_to_datafusion(sql, config, &setup).await?;
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                for threads in [1, 4, 16] {
+                    assert_bypassed_parity(
+                        &ctx,
+                        sql,
+                        TableCapacity::default(),
+                        threads,
+                        false,
+                    )
+                    .await?;
+                }
+                assert_aggregate_parity_with_setup(sql, config, &setup).await;
             }
         }
         Ok(())
@@ -5653,15 +3279,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn accumulators_fail_on_the_rows_after_full_tables_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
-        // 32,768 distinct keys, which would fill the table of a thread, then a
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which fill the table of a thread, then a
         // negative value, which `non_negative_sum` rejects, then a string that
         // is not an integer, whose cast fails: DataFusion fails on the negative
-        // value. So does the pipeline engine, on a single thread, of a single
-        // stage (of a partition) and of two (of two partitions, one of them
-        // empty), in both sessions: the aggregations of user-defined aggregates
-        // are left to DataFusion (see `updates_like_datafusion`), whose
-        // accumulators aggregate every row when it is consumed.
+        // value. So does the native aggregation, on a single thread, of a
+        // single stage (of a partition) and of two (of two partitions, one of
+        // them empty), also in a session that trusts DataFusion's built-in
+        // aggregate functions: the rows of aggregations with aggregates whose
+        // functions the session does not trust do not bypass the tables (see
+        // `AggregateSpec::rows_bypass_tables`), whose accumulators aggregate
+        // every row when it is consumed.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -5700,23 +3328,25 @@ mod tests {
                 ctx.register_udaf(datafusion_expr::AggregateUDF::from(udaf));
                 Ok(())
             };
-            for trusted in [false, true] {
-                let mut config = test_session_config().with_target_partitions(1);
-                if trusted {
-                    config = trusting(config);
-                }
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                let plan = aggregation(&plan).expect("an aggregation");
-                assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
-                let message = "non_negative_sum rejects the negative value -5";
-                let lowered = assert_lowered_fails_like_datafusion_with_setup(
-                    sql, config, &setup, message,
-                )
-                .await;
-                assert_eq!(lowered, 0, "{} partitions", partitions.len());
-            }
+            let config = trusting(test_session_config().with_target_partitions(1));
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let aggregate = PhysicalHashAggregate::try_lower(
+                &aggregation(&plan).expect("an aggregation"),
+                lower,
+            )?
+            .expect("a lowered aggregation");
+            assert!(
+                !aggregate.spec().rows_bypass_tables(config.options()),
+                "{} partitions",
+                partitions.len()
+            );
+            let message = "non_negative_sum rejects the negative value -5";
+            assert_aggregate_fails_like_datafusion_with_setup(
+                sql, config, setup, message,
+            )
+            .await;
         }
         Ok(())
     }
@@ -5846,19 +3476,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn running_totals_of_user_defined_aggregates_are_aggregated_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
-        // 32,768 distinct keys of value 1, which would fill the table of a
-        // thread, then the rows `(50000, 1)` and `(50000, -1)` of a group, in a
-        // batch or in two. The aggregations of user-defined aggregates are left
-        // to DataFusion (see `updates_like_datafusion`), also in the sessions
-        // that trust DataFusion's built-in aggregate functions, also if the
-        // user-defined function is named `sum`, of a type named `Sum` (see
-        // `TrustedAggregateFunctions`), so that their accumulators get
-        // DataFusion's batches, and their running totals are DataFusion's: 1,
-        // then 0, whatever the number of threads. Or -1, which they reject, in
-        // the two batches on several threads, whose partial aggregations of the
-        // partitions of DataFusion's round-robin repartitioning aggregate them
-        // apart.
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // 32,768 distinct keys of value 1, which fill the table of a thread,
+        // then the rows `(50000, 1)` and `(50000, -1)` of a group, in a batch or
+        // in two: the running total of the group gets to 1, then 0, as in
+        // DataFusion, and never to -1 (which it rejects). The rows of the
+        // aggregations of user-defined functions do not bypass the tables, also
+        // in the sessions that trust DataFusion's built-in aggregate functions,
+        // also if the user-defined function is named `sum`, of a type named
+        // `Sum` (see `TrustedAggregateFunctions`): the accumulators aggregate
+        // every row when it is consumed, with the rows of its group that the
+        // table aggregated so far.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -5873,14 +3501,21 @@ mod tests {
             )
         };
         let distinct = batch((0..32_768).collect(), vec![1; 32_768])?;
-        for (last, apart) in [
-            (vec![batch(vec![50_000, 50_000], vec![1, -1])?], false),
+        for (last, thread_counts) in [
+            (
+                vec![batch(vec![50_000, 50_000], vec![1, -1])?],
+                &[1, 4, 16][..],
+            ),
+            // On several threads, DataFusion's partial aggregations of the
+            // partitions of its round-robin repartitioning aggregate the two
+            // batches apart (and reject -1), the native threads the chunks of
+            // their morsels: on one thread only.
             (
                 vec![
                     batch(vec![50_000], vec![1])?,
                     batch(vec![50_000], vec![-1])?,
                 ],
-                true,
+                &[1],
             ),
         ] {
             let mut rows = vec![distinct.clone()];
@@ -5893,22 +3528,12 @@ mod tests {
                     register_running_totals(ctx, &partitions, function)
                 };
                 let sql = format!("SELECT k, {function}(v) AS s FROM t GROUP BY k");
-                for threads in [1, 4, 16] {
+                for &threads in thread_counts {
                     for trusted in [false, true] {
                         let mut config =
                             test_session_config().with_target_partitions(threads);
                         if trusted {
                             config = trusting(config);
-                        }
-                        if apart && threads > 1 {
-                            let message = "negative running total: -1";
-                            let lowered =
-                                assert_lowered_fails_like_datafusion_with_setup(
-                                    &sql, config, &setup, message,
-                                )
-                                .await;
-                            assert_eq!(lowered, 0, "{sql}");
-                            continue;
                         }
                         let ctx = datafusion_context(config.clone());
                         setup(&ctx).await?;
@@ -5917,7 +3542,15 @@ mod tests {
                             groups.iter().map(RecordBatch::num_rows).sum::<usize>(),
                             32_769
                         );
-                        assert_left_to_datafusion(&sql, config, &setup).await?;
+                        assert_bypassed_parity(
+                            &ctx,
+                            &sql,
+                            TableCapacity::default(),
+                            threads,
+                            false,
+                        )
+                        .await?;
+                        assert_aggregate_parity_with_setup(&sql, config, &setup).await;
                     }
                 }
             }
@@ -5928,16 +3561,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn user_defined_sums_fail_on_the_rows_after_full_tables_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
-        // 32,768 distinct keys, which would fill the table of a thread, then a
-        // row whose value makes the running total of its group negative, which
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which fill the table of a thread, then a row
+        // whose value makes the running total of its group negative, which
         // [`Sum`] (a function `sum` of a type named `Sum`, which replaces
         // DataFusion's) rejects, then a string that is not an integer, whose
         // cast fails: DataFusion fails on the negative running total. So does
-        // the pipeline engine, of one stage and of two, also in a session that
-        // trusts DataFusion's built-in aggregate functions: the aggregations of
-        // user-defined aggregates are left to DataFusion (see
-        // `updates_like_datafusion`).
+        // the native aggregation, of one stage and of two, also in a session
+        // that trusts DataFusion's built-in aggregate functions: [`Sum`] is not
+        // trusted, so the rows of its aggregation do not bypass the tables.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -5973,17 +3605,53 @@ mod tests {
                 let ctx = datafusion_context(config.clone());
                 setup(&ctx).await?;
                 let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                let plan = aggregation(&plan).expect("an aggregation");
-                assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
-                assert_eq!(planned_aggregations(sql, &config, &setup).await?, 0);
-                let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                let aggregate = PhysicalHashAggregate::try_lower(
+                    &aggregation(&plan).expect("an aggregation"),
+                    lower,
+                )?
+                .expect("a lowered aggregation");
+                let spec = aggregate.spec();
+                assert!(spec.bypass && !spec.rows_bypass_tables(config.options()));
+                assert_aggregate_fails_like_datafusion_with_setup(
                     sql,
                     config.clone(),
                     &setup,
                     message,
                 )
                 .await;
-                assert_eq!(lowered, 0);
+                // Had the rows of the aggregation bypassed the table (had `sum`
+                // been trusted, by its name or the name of its type), the
+                // negative value would have been aggregated later, by the
+                // final aggregation, after the cast failed.
+                let local = RadixHashAggregate::local_sink_state(
+                    &spec,
+                    TableCapacity::default(),
+                    true,
+                )?;
+                let mut sink = (spec, local, RadixHashAggregate::global_sink_state()?);
+                let (spec, local, global) = &mut sink;
+                let error = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).step_by(DEFAULT_VECTOR_SIZE).map(
+                            move |offset| {
+                                batch.slice(
+                                    offset,
+                                    DEFAULT_VECTOR_SIZE.min(batch.num_rows() - offset),
+                                )
+                            },
+                        )
+                    })
+                    .try_for_each(|chunk| {
+                        RadixHashAggregate::sink(
+                            spec,
+                            chunk,
+                            global.as_ref(),
+                            local.as_mut(),
+                        )
+                    })
+                    .expect_err("a cast error");
+                assert!(error.to_string().contains("not an integer"), "{error}");
             }
         }
         Ok(())
@@ -6162,28 +3830,24 @@ mod tests {
             Ok(())
         };
         let sql = "SELECT k, COUNT(b) FROM wide GROUP BY k";
+        // In a session that trusts `count`, the rows of the binaries bypass the
+        // table of the thread (the reviewer's case), in the others they do not.
         for trusted in [false, true] {
             let mut config = test_session_config().with_target_partitions(1);
             if trusted {
                 config = trusting(config);
             }
-            // A thread of several threads that consumes these rows in their
-            // order: in a session that trusts `count`, the rows of the binaries
-            // bypass the table of the thread (the reviewer's case), in the
-            // others they do not. (A single thread aggregates the rows of a
-            // group into a single state, see `TableCapacity::UNBOUNDED`.)
             let ctx = crate::test_utils::pipeline_context(config.clone());
             setup(&ctx).await?;
-            let thread =
-                planned_aggregation_thread(&ctx, sql, &partitions.concat(), 2).await?;
-            assert_eq!(thread.bypassed, trusted);
-            let datafusion = datafusion_context(config.clone());
-            setup(&datafusion).await?;
+            let batches = partitions.concat();
             assert_eq!(
-                thread.output,
-                datafusion_aggregation(&datafusion, sql).await?
+                planned_aggregation_bypasses(&ctx, sql, &batches).await?,
+                trusted
             );
-            // And on a single thread.
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1, trusted)
+                .await?;
             assert_aggregate_parity_with_setup(sql, config, &setup).await;
         }
         Ok(())
@@ -6248,7 +3912,7 @@ mod tests {
         // At most 3 groups per flush of a table, out of 300.
         assert!(groups <= 3 * 300 / 16 + 6, "{groups}");
         assert!(matches!(
-            RadixHashAggregate::finalize(&spec, global.as_ref())?,
+            RadixHashAggregate::finalize(global.as_ref())?,
             SinkFinalize::Ready
         ));
         // The threads that finalize the partitions emit the top 3 groups once.
@@ -6311,7 +3975,7 @@ mod tests {
         let (spec, mut local, global) = sink;
         RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut())?;
         let mut batches = vec![];
-        if RadixHashAggregate::finalize(&spec, global.as_ref())? == SinkFinalize::Ready {
+        if RadixHashAggregate::finalize(global.as_ref())? == SinkFinalize::Ready {
             let source = RadixHashAggregate::global_source_state(&spec, global)?;
             let mut local = RadixHashAggregate::local_source_state()?;
             while let SourceResult::Chunk(chunk) =

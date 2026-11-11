@@ -6,9 +6,8 @@
 //! `AggregateExec`s, see the [module documentation](super).
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, Scalar, UInt32Array,
@@ -19,59 +18,36 @@ use arrow::compute::{
     SortColumn, SortOptions, concat, filter_record_batch, interleave, lexsort_to_indices,
     sort_to_indices, take, take_record_batch,
 };
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::{
     ConfigEntry, ConfigExtension, ConfigOptions, ExtensionOptions,
 };
-use datafusion_common::stats::Precision;
 use datafusion_common::{Result, ScalarValue, config_err, internal_err};
-use datafusion_expr::{AggregateUDF, Operator};
+use datafusion_expr::AggregateUDF;
 use datafusion_functions_aggregate::{
     approx_distinct, array_agg, average, bit_and_or_xor, bool_and_or, count, first_last,
     median, min_max, sum,
 };
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
-use datafusion_physical_expr::expressions::{BinaryExpr, CastExpr, Column, Literal};
-use datafusion_physical_expr::utils::collect_columns;
-use datafusion_physical_expr::{
-    LexOrdering, PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
-};
+use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::utils::scatter;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, GroupClusteringMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
-use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
-use datafusion_physical_plan::sorts::sort::SortExec;
-use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use super::radix_ht::{RadixHashAggregate, TableCapacity};
 use super::ungrouped::UngroupedAggregate;
-use crate::bridge::BridgeOperator;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
-use crate::join::PhysicalHashJoin;
-use crate::join::nested_loop::{PhysicalCrossJoin, PhysicalNestedLoopJoin};
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
 };
-use crate::operators::adaptive_filter::{failures, is_infallible};
-use crate::operators::caching::CachingOperator;
-use crate::operators::filter::PhysicalFilter;
-use crate::operators::limit::PhysicalLimit;
-use crate::operators::placeholder_row::PhysicalPlaceholderRow;
-use crate::operators::projection::PhysicalProjection;
-use crate::planner::PhysicalScalarSubquery;
-use crate::sources::csv::CsvScanSource;
-use crate::sources::empty::EmptyScanSource;
-use crate::sources::memory::MemoryScanSource;
-use crate::sources::parquet::ParquetScanSource;
+use crate::operators::adaptive_filter::is_infallible;
 
 /// A hash aggregation: a pipeline breaker that consumes the rows of its input
 /// in parallel and produces one row per group (DuckDB's
@@ -127,37 +103,9 @@ pub(crate) struct AggregateSpec {
     /// [`rows_can_bypass_tables`]), if the session trusts the accumulators of
     /// all aggregates (see [`Self::rows_bypass_tables`]).
     pub(crate) bypass: bool,
-    /// Whether all aggregates (of both stages) have the same values however
-    /// the rows of a group are split into partial states (see
-    /// [`splits_exactly`]).
-    pub(crate) splits_exactly: bool,
-    /// The number of partitions of the input of the stage that consumes the
-    /// input rows, which DataFusion aggregates on their own.
-    pub(crate) input_partitions: usize,
-    /// Whether the aggregation of a single partition of DataFusion, or a
-    /// native operator of its pipeline, may fail (see `own_parts` and
-    /// `pipeline_parts`): its pipelines then run on a single thread, which
-    /// evaluates the rows in order, and so fails on the first of them that
-    /// fails in DataFusion (the threads of a pipeline evaluate the chunks of a
-    /// partition in parallel, and any of them may fail first). (Those of
-    /// several partitions read them through a bridge, see `try_lower`.)
-    pub(crate) evaluates_in_order: bool,
 }
 
 impl AggregateSpec {
-    /// Whether the aggregation must aggregate the rows of its input in order,
-    /// on a single thread, into a single state per group: if DataFusion
-    /// aggregates a single partition, in order, and the values of some
-    /// aggregate depend on how the rows of a group are split into partial
-    /// states (see [`splits_exactly`]). (The threads of a pipeline evaluate the
-    /// chunks of a partition of DataFusion in parallel. The aggregations of
-    /// such aggregates of several partitions, and those whose input comes in
-    /// another order than DataFusion's, are left to DataFusion, see
-    /// [`PhysicalHashAggregate::try_lower`].)
-    pub(crate) fn aggregates_in_order(&self) -> bool {
-        self.input_partitions == 1 && !self.splits_exactly
-    }
-
     /// Whether there is no `GROUP BY` (and no grouping sets): the
     /// aggregation produces exactly one row.
     pub(crate) fn is_ungrouped(&self) -> bool {
@@ -168,9 +116,7 @@ impl AggregateSpec {
     /// its thread-local table in an execution with the configuration
     /// `options`: if they may (see [`Self::bypass`]), and the aggregation has
     /// no aggregates, or the session trusts the accumulators of all of them
-    /// (see [`TrustedAggregateFunctions`]). (But the single thread of an
-    /// aggregation with aggregates aggregates all of its rows in its table,
-    /// see `PhysicalHashAggregate::get_local_sink_state`.)
+    /// (see [`TrustedAggregateFunctions`]).
     pub(crate) fn rows_bypass_tables(&self, options: &ConfigOptions) -> bool {
         if !self.bypass {
             return false;
@@ -625,33 +571,6 @@ impl PhysicalHashAggregate {
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
     ///   input only, or fails;
-    /// * aggregations that may fail with several parts that may fail (group
-    ///   keys, arguments and filters of aggregates, and the expressions of the
-    ///   native operators of their pipeline), whose first error depends on
-    ///   DataFusion's batches (see `fail_in_the_order_of_the_batches`);
-    /// * aggregations with an aggregate whose accumulators may get other
-    ///   values from the chunks of the native operator than from DataFusion's
-    ///   batches, or fail with other errors (see `updates_like_datafusion`):
-    ///   user-defined aggregates, the percentile functions of percentiles of
-    ///   columns, and some built-in aggregates of a single partition;
-    /// * aggregations with an aggregate whose value may depend on how the rows
-    ///   of a group are split into partial states (see `splits_exactly`), e.g.
-    ///   a sum of floating point values, unless the native operator aggregates
-    ///   the rows in DataFusion's order (see
-    ///   `AggregateSpec::aggregates_in_order`): of several partitions, which
-    ///   DataFusion aggregates on their own first (the native sources read
-    ///   them as a single queue of chunks, so that the native operator cannot
-    ///   aggregate every partition on its own), or of a single partition whose
-    ///   lowered input produces its rows in another order than DataFusion's
-    ///   (see `keeps_datafusion_order`), e.g. an aggregation of the distinct
-    ///   values of a `SUM(DISTINCT x)`, or whose rows are sorted for ordered
-    ///   aggregates (e.g. `ARRAY_AGG(x ORDER BY y)`), by DataFusion or by the
-    ///   native operator, which order the rows that tie in the sort otherwise,
-    ///   or of a single partition grouped by a single grouping set in two
-    ///   stages, whose partial aggregation DataFusion may skip, so that a group
-    ///   gets several states that depend on DataFusion's batches. (Ordered
-    ///   aggregates order their values themselves: but for rows that tie in
-    ///   their order, their values do not depend on the order of their input.);
     /// * aggregations with a soft limit on their groups (`lim=[n]` without
     ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
     ///   LIMIT n`: each stage stops reading its input once it has `n` groups,
@@ -717,28 +636,6 @@ impl PhysicalHashAggregate {
         {
             return Ok(None);
         }
-        let single_partition = raw.input().output_partitioning().partition_count() == 1;
-        let grouped = !raw.group_expr().is_true_no_grouping();
-        // (Computed from DataFusion's statistics if an aggregate needs it.)
-        let bound = std::cell::OnceCell::new();
-        let max_rows = || *bound.get_or_init(|| max_rows(raw.input()));
-        let aggregates = || {
-            [Some(raw), last]
-                .into_iter()
-                .flatten()
-                .flat_map(|aggregate| aggregate.aggr_expr())
-        };
-        if aggregates().any(|aggregate| {
-            !updates_like_datafusion(
-                aggregate,
-                grouped,
-                single_partition,
-                raw.input(),
-                &max_rows,
-            )
-        }) {
-            return Ok(None);
-        }
         // DataFusion sorts the rows of ordered aggregates by Arrow's order (the
         // input of a `FIRST_VALUE`, which takes the first row then), the native
         // operator lets their accumulators compare them as `ScalarValue`s (see
@@ -746,8 +643,8 @@ impl PhysicalHashAggregate {
         // which compare nested values by another order, and not by a total one
         // (see `compares_totally`, e.g. `{a: NULL}` is equal to `{a: 1}`, and
         // `[NULL]` is after `[1]` whatever the order of the NULLs), so that they
-        // may keep other rows. Aggregates ordered by such values are left to
-        // DataFusion.
+        // may keep a row that is not the first in the order of the aggregate.
+        // Aggregates ordered by such values are left to DataFusion.
         let input_schema = raw.input().schema();
         if raw.aggr_expr().iter().any(|aggregate| {
             aggregate.order_bys().iter().any(|sort| {
@@ -759,77 +656,7 @@ impl PhysicalHashAggregate {
         }) {
             return Ok(None);
         }
-        // Whether the values of the aggregates do not depend on the order of
-        // the rows, and on how they are split into partial states: they split
-        // exactly, or they are ordered (whose values the native operator
-        // orders itself, see `without_input_order`), or the aggregation fails
-        // before it aggregates any row, natively as in DataFusion, as one of its
-        // accumulators cannot be created when the streams are (see
-        // `fails_when_created`, e.g. of a percentile out of range).
-        //
-        // So that the native operator fails where DataFusion fails to
-        // materialize their values (see `materializes_safely`), it aggregates
-        // the values that may not fit into arrays with 32-bit offsets as
-        // DataFusion does, as those of aggregates that do not split exactly.
-        let sets = raw.group_expr().groups().len();
-        let exact = keys_materialize_safely(raw)
-            && aggregates().all(|aggregate| {
-                (splits_exactly(aggregate, raw.input(), &max_rows)
-                    || !aggregate.order_bys().is_empty())
-                    && materializes_safely(aggregate, sets, raw.input(), &max_rows)
-            })
-            || aggregates().any(|aggregate| fails_when_created(aggregate, grouped));
-        if !exact && !single_partition {
-            return Ok(None);
-        }
-        // DataFusion's partial aggregation of a single grouping set skips
-        // aggregating the rows of its partition once most of them make new
-        // groups (see the session's `skip_partial_aggregation_probe_rows_threshold`
-        // and `skip_partial_aggregation_probe_ratio_threshold`, which are not
-        // known here), and passes every further row on as a state of its own:
-        // its final aggregation merges the state of the rows of a group before
-        // with those of the rows after, which depend on DataFusion's batches.
-        if !exact && last.is_some() && grouped && raw.group_expr().is_single() {
-            return Ok(None);
-        }
-        // DataFusion aggregates the rows in the order of its input: sorted, if
-        // it sorts it for ordered aggregates (a sort that the planner removes,
-        // see `without_ordering_sort`). The native operator sorts the rows of
-        // its thread if an aggregate requires them in an order (see
-        // `hard_input_order`), by the same order, but not the rows that tie in
-        // it as DataFusion does (which sorts every batch, by an unstable sort,
-        // and merges them), so that the other aggregates may see another
-        // sequence. It aggregates the rows in the order of its input otherwise,
-        // which must then be DataFusion's.
-        //
-        // An aggregation that may fail itself (see `own_parts`) fails on the
-        // row that fails first, which depends on the order of the rows too:
-        // DataFusion evaluates every partition in order, all of them at once,
-        // and fails on a row of the partition that fails first (with a single
-        // partition that fails, on its first row that fails). The native
-        // sources read all partitions as a single queue of chunks, and other
-        // native operators (e.g. an aggregation below) may reorder the rows:
-        // such aggregations read the rows of DataFusion's input through a
-        // bridge instead, whose threads read every partition in order. (Those
-        // of a single partition evaluate it in order, on a single thread, see
-        // `AggregateSpec::evaluates_in_order`. The order in which the native
-        // operators of a pipeline fail, e.g. a projection below an aggregation
-        // that cannot fail, is the planner's.)
-        let own = own_parts(raw);
-        let sorted = raw.input().is::<SortExec>() || hard_input_order(raw)?.is_some();
-        if (!exact || own > 0) && sorted {
-            return Ok(None);
-        }
-        let mut input = lower_input(raw.input())?;
-        if own > 0 && (!single_partition || !keeps_datafusion_order(&input)) {
-            input = Arc::new(BridgeOperator::new(Arc::clone(raw.input())));
-        }
-        if !exact && !keeps_datafusion_order(&input) {
-            return Ok(None);
-        }
-        if fail_in_the_order_of_the_batches(raw, &input) {
-            return Ok(None);
-        }
+        let input = lower_input(raw.input())?;
         let aggregate = match last {
             Some(last) => Self::try_new_two_stage(raw, last, input)?,
             None => Self::try_new_single_stage(raw, input)?,
@@ -944,21 +771,6 @@ impl PhysicalHashAggregate {
         let bypass = top_k.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
-        let bound = std::cell::OnceCell::new();
-        let max_rows = || *bound.get_or_init(|| max_rows(raw.input()));
-        let sets = raw.group_expr().groups().len();
-        let splits_exactly = keys_materialize_safely(raw)
-            && update
-                .iter()
-                .map(|update| update.expr.as_ref())
-                .chain(merge.iter().map(Arc::as_ref))
-                .all(|aggregate| {
-                    splits_exactly(aggregate, raw.input(), &max_rows)
-                        && materializes_safely(aggregate, sets, raw.input(), &max_rows)
-                });
-        let input_partitions = raw.input().output_partitioning().partition_count();
-        let evaluates_in_order =
-            input_partitions == 1 && own_parts(raw) + pipeline_parts(&input) > 0;
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),
@@ -973,9 +785,6 @@ impl PhysicalHashAggregate {
                 single_stage,
                 top_k,
                 bypass,
-                splits_exactly,
-                input_partitions,
-                evaluates_in_order,
             }),
         })
     }
@@ -989,8 +798,7 @@ impl PhysicalHashAggregate {
     /// they are implemented by DataFusion's types. In the sessions that trust
     /// the functions of all aggregates of an aggregation (that are neither
     /// `DISTINCT` nor ordered), the input rows of the threads whose groups
-    /// hardly repeat bypass their thread-local tables, when the aggregation
-    /// runs on several threads.
+    /// hardly repeat bypass their thread-local tables.
     ///
     /// ```
     /// use datafusion::prelude::{SessionConfig, SessionContext};
@@ -1293,532 +1101,6 @@ fn rows_can_bypass_tables(
             .all(|update| update.arguments.iter().all(is_flat))
 }
 
-/// The built-in aggregate functions of DataFusion: their names, and the types
-/// that implement them (see [`implementation_type`]).
-static DATAFUSION_AGGREGATES: LazyLock<Vec<(String, TypeId)>> = LazyLock::new(|| {
-    datafusion_functions_aggregate::all_default_aggregate_functions()
-        .iter()
-        .map(|function| (function.name().to_string(), implementation_type(function)))
-        .collect()
-});
-
-/// The name of `function` if it is one of DataFusion's built-in aggregate
-/// functions: if it is implemented by the type that implements the built-in
-/// function of its name (as [`TrustedAggregateFunctions`] identifies them).
-fn builtin_name(function: &AggregateUDF) -> Option<&'static str> {
-    let implementation = implementation_type(function);
-    DATAFUSION_AGGREGATES
-        .iter()
-        .find(|(name, builtin)| name == function.name() && *builtin == implementation)
-        .map(|(name, _)| name.as_str())
-}
-
-/// Whether the accumulators of `aggregate`, of an aggregation (`grouped`, or
-/// without `GROUP BY`) of `input` (of at most `max_rows()` rows, if known), get
-/// the values and the errors of DataFusion's accumulators, which
-/// DataFusion updates with its batches, every aggregate on a whole batch
-/// before the next aggregate, and the native operator with its chunks of at
-/// most [`DEFAULT_VECTOR_SIZE`] rows.
-///
-/// * A user-defined aggregate may compute anything from the rows of a call of
-///   its accumulator (e.g. add up the values of a batch first, then add that
-///   sum to its total): its aggregations are left to DataFusion.
-/// * A `DISTINCT` aggregate collects its distinct values in a hash set, which
-///   reserves room for every batch it extends it with: the order of its
-///   values depends on the batches, and so does the value of an aggregate
-///   that does not split its rows exactly (see [`splits_exactly`]), e.g. a
-///   `SUM(DISTINCT f)` of floating point values (that DataFusion does not
-///   rewrite, next to a `COUNT(*)`), or an `ARRAY_AGG(DISTINCT x)`: their
-///   aggregations are left to DataFusion.
-/// * The accumulators of DataFusion's `percentile_cont`,
-///   `approx_percentile_cont` and `approx_percentile_cont_with_weight` of a
-///   percentile of a column validate it on every call, the range of its first
-///   value and that it is constant: on every batch (without `GROUP BY`), or on
-///   every row of a group. Which of the aggregates of an aggregation fails
-///   first, and with which values, depends on the calls: their aggregations
-///   are left to DataFusion. (Literal percentiles are validated when the
-///   accumulators are created.)
-/// * DataFusion's built-in accumulators update their states row by row, or
-///   collect or combine their values exactly, so that their values do not
-///   depend on the batches of their rows, but the t-digests of
-///   `approx_percentile_cont`, `approx_percentile_cont_with_weight` and
-///   `approx_median`, which merge every batch into a digest, and the sums
-///   (and averages) of floating point values without `GROUP BY`, whose
-///   accumulators add up every batch first (their grouped accumulators add up
-///   their rows one by one). Their aggregations of a single partition
-///   (`single_partition`), whose results are deterministic, are left to
-///   DataFusion. (DataFusion's results of several partitions depend on the
-///   order in which their partial states arrive.)
-fn updates_like_datafusion(
-    aggregate: &AggregateFunctionExpr,
-    grouped: bool,
-    single_partition: bool,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> bool {
-    let Some(name) = builtin_name(aggregate.fun()) else {
-        return false;
-    };
-    if aggregate.is_distinct() && !splits_exactly(aggregate, input, max_rows) {
-        return false;
-    }
-    if matches!(
-        name,
-        "percentile_cont"
-            | "approx_percentile_cont"
-            | "approx_percentile_cont_with_weight"
-    ) && aggregate
-        .expressions()
-        .iter()
-        .skip(1)
-        .any(|argument| !collect_columns(argument).is_empty())
-    {
-        return false;
-    }
-    // Its `min` and `max` of values that it does not compare by a total order
-    // (see `compares_totally`) keep values that depend on its batches: their
-    // accumulators compare the extreme of a batch (`min_batch`) with their
-    // state, as do those of every group (`GroupsAccumulatorAdapter`), but the
-    // groups accumulator of structs, which compares them row by row. The
-    // native operator's chunks are not DataFusion's batches: e.g. a batch of
-    // `{a: 2}` in 2,048 rows, `{a: NULL}`, `{a: 1}` and `{a: NULL}` after, of
-    // which DataFusion's minimum is `{a: 1}` (`{a: NULL}` is equal to both),
-    // and that of chunks of 2,048 rows `{a: 2}`.
-    if matches!(name, "min" | "max")
-        && aggregate.expressions().iter().any(|argument| {
-            !argument.data_type(&input.schema()).is_ok_and(|data_type| {
-                compares_totally(&data_type)
-                    || (grouped && matches!(data_type, DataType::Struct(_)))
-            })
-        })
-    {
-        return false;
-    }
-    if !single_partition {
-        return true;
-    }
-    match name {
-        "approx_percentile_cont"
-        | "approx_percentile_cont_with_weight"
-        | "approx_median" => false,
-        "sum" | "avg" if !grouped => adds_up_exactly(aggregate, input, max_rows),
-        _ => true,
-    }
-}
-
-/// Whether the arguments of `aggregate`, of the rows of `input` (at most
-/// `max_rows()`, if known), are values that a `sum` or an `avg` adds up in any
-/// order to the same values (see [`splits_exactly`]): integers or decimals,
-/// which they add up with (wrapping) integer arithmetic, or the casts into
-/// `Float64` of integers whose sums are exact (see [`sums_exactly_as_floats`]),
-/// e.g. the `avg` of a `SMALLINT`.
-fn adds_up_exactly(
-    aggregate: &AggregateFunctionExpr,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> bool {
-    let schema = input.schema();
-    aggregate.expressions().iter().all(|argument| {
-        sums_exactly_as_floats(argument, input, max_rows)
-            || argument.data_type(&schema).is_ok_and(|data_type| {
-                data_type.is_integer()
-                    || matches!(
-                        data_type,
-                        DataType::Decimal32(_, _)
-                            | DataType::Decimal64(_, _)
-                            | DataType::Decimal128(_, _)
-                            | DataType::Decimal256(_, _)
-                    )
-            })
-    })
-}
-
-/// Whether `argument`, of the rows of `input` (at most `max_rows()`, which is
-/// only computed for such casts), is a cast into `Float64` of integers whose
-/// sums are exact, in any order: of integers of at most `m` in magnitude,
-/// every sum of at most `n` of them is an integer of at most `n * m`, which
-/// `Float64` represents exactly if it is at most 2^53, so that every addition
-/// of partial sums is exact. E.g. DataFusion's `avg` of a `SMALLINT` (`m` =
-/// 2^15), which it adds up as `Float64` values, of up to 2^38 rows. The cast
-/// may be computed by a projection below the aggregation, into which
-/// DataFusion moves the expressions that several aggregates share
-/// (`__common_expr_1`).
-fn sums_exactly_as_floats(
-    argument: &Arc<dyn PhysicalExpr>,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> bool {
-    if let Some(column) = argument.downcast_ref::<Column>()
-        && let Some(projection) = input.downcast_ref::<ProjectionExec>()
-        && let Some(expr) = projection.expr().get(column.index())
-    {
-        return sums_exactly_as_floats(&expr.expr, projection.input(), max_rows);
-    }
-    let Some(cast) = argument.downcast_ref::<CastExpr>() else {
-        return false;
-    };
-    let magnitude: u128 = match cast.expr().data_type(&input.schema()) {
-        Ok(DataType::Int8) => 1 << 7,
-        Ok(DataType::Int16) => 1 << 15,
-        Ok(DataType::Int32) => 1 << 31,
-        Ok(DataType::UInt8) => u8::MAX.into(),
-        Ok(DataType::UInt16) => u16::MAX.into(),
-        Ok(DataType::UInt32) => u32::MAX.into(),
-        _ => return false,
-    };
-    cast.cast_type() == &DataType::Float64
-        && max_rows().is_some_and(|rows| (rows as u128) * magnitude <= 1 << 53)
-}
-
-/// Whether the first error of `raw`, the `AggregateExec` that consumes the input
-/// rows, which `input` (its lowered input) evaluates, may depend on the
-/// batches of its input: if `raw` may fail, and several of the parts that it
-/// and the native operators of its pipeline (see [`pipeline_parts`]) evaluate
-/// may fail (see [`refined_parts`]). DataFusion evaluates the parts of an
-/// operator (the group keys of an aggregation, then the arguments of its
-/// aggregates, then their filters), each on all rows of a batch before the
-/// next one, and an operator on a batch before the operator above it; the
-/// native operators evaluate them on their chunks, so that another of them
-/// may fail first, also with an error of the same kind (an accumulator that
-/// fails to be created for every group counts as a part that may fail, see
-/// [`fails_for_each_group`]): e.g. of `SUM(CAST(x
-/// AS DECIMAL(3, 0)))` and `SUM(CAST(y AS DECIMAL(38, 25)))` (or of a filter
-/// `CAST(x AS DECIMAL(3, 0)) + 0.5 > 1` below `SUM(CAST(y AS DECIMAL(38,
-/// 25)))`), of a batch in which `x` overflows on its last row, and `y` on its
-/// first, DataFusion raises the invalid argument of `x`, the native operators
-/// the arithmetic overflow of `y`; and of `SUM(p * 10)` and `SUM(q * 10)` of
-/// `DECIMAL(38, 0)`s, the arithmetic overflow of `p` and of `q`. (The planner
-/// accepts several casts into decimals and several arithmetic overflows, see
-/// `Failures::order_matters`, whichever of them comes first.)
-fn fail_in_the_order_of_the_batches(
-    raw: &AggregateExec,
-    input: &Arc<dyn PhysicalOperator>,
-) -> bool {
-    let own = own_parts(raw);
-    own > 0 && own + pipeline_parts(input) > 1
-}
-
-/// The number of the parts that `raw`, the `AggregateExec` that consumes the
-/// input rows, evaluates on every batch that may fail (see [`refined_parts`]):
-/// its group keys, the arguments and the `ORDER BY` expressions of its
-/// aggregates (which DataFusion evaluates with their arguments) and their
-/// filters, and the accumulators that fail to be created for every group (see
-/// [`fails_for_each_group`]).
-fn own_parts(raw: &AggregateExec) -> usize {
-    let schema = raw.input().schema();
-    let grouped = !raw.group_expr().is_true_no_grouping();
-    let expressions = raw
-        .group_expr()
-        .expr()
-        .iter()
-        .map(|(expr, _)| Arc::clone(expr))
-        .chain(raw.aggr_expr().iter().flat_map(|aggregate| {
-            aggregate.expressions().into_iter().chain(
-                aggregate
-                    .order_bys()
-                    .iter()
-                    .map(|sort| Arc::clone(&sort.expr))
-                    .collect::<Vec<_>>(),
-            )
-        }))
-        .chain(raw.filter_expr().iter().flatten().cloned())
-        .map(|expr| refined_parts(&expr, &schema))
-        .sum::<usize>();
-    let accumulators = raw
-        .aggr_expr()
-        .iter()
-        .filter(|aggregate| fails_for_each_group(aggregate, grouped))
-        .count();
-    expressions + accumulators
-}
-
-/// Whether the accumulator of `aggregate` (of an aggregation `grouped` or
-/// not) cannot be created, and DataFusion and the native operator fail when
-/// they create their streams and states, before they evaluate any row: its
-/// accumulator, without `GROUP BY`, or its groups accumulator, if its function
-/// supports them. (Otherwise, they create an accumulator for every group, as
-/// its first row comes, see [`fails_for_each_group`].)
-fn fails_when_created(aggregate: &AggregateFunctionExpr, grouped: bool) -> bool {
-    if grouped {
-        aggregate.groups_accumulator_supported()
-            && aggregate.create_groups_accumulator().is_err()
-    } else {
-        aggregate.create_accumulator().is_err()
-    }
-}
-
-/// Whether the accumulator of `aggregate`, of an aggregation with `GROUP BY`
-/// (`grouped`) whose function does not support groups accumulators, cannot be
-/// created: DataFusion and the native operator create it for every group, as
-/// its first row comes (see `GroupsAccumulatorAdapter`), and fail then, after
-/// DataFusion evaluated the arguments of all aggregates on all rows of the
-/// batch, the native operator on those of a chunk, e.g. of `NTH_VALUE(f, 0)`
-/// (of an invalid index). It is a part that may fail (see
-/// [`fail_in_the_order_of_the_batches`]).
-fn fails_for_each_group(aggregate: &AggregateFunctionExpr, grouped: bool) -> bool {
-    grouped
-        && !aggregate.groups_accumulator_supported()
-        && aggregate.create_accumulator().is_err()
-}
-
-/// The number of the parts of `expr` (over `schema`) that may fail (see
-/// [`failures`]), but the decimal additions, subtractions and
-/// multiplications that cannot overflow (see [`cannot_overflow`]), which
-/// [`failures`] counts as parts that may overflow: e.g. of TPC-H's
-/// `l_extendedprice * (1 - l_discount)`, of `DECIMAL(15, 2)`s.
-fn refined_parts(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
-    failures(expr, schema)
-        .parts()
-        .saturating_sub(overflows_ruled_out(expr, schema))
-}
-
-/// The number of the operations of `expr` that [`failures`] counts as parts
-/// that may fail, but that cannot overflow (see [`cannot_overflow`]).
-fn overflows_ruled_out(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> usize {
-    let children = expr.children();
-    let own = if cannot_overflow(expr, schema) {
-        let below = children
-            .iter()
-            .map(|child| failures(child, schema).parts())
-            .sum::<usize>();
-        failures(expr, schema).parts().saturating_sub(below).min(1)
-    } else {
-        0
-    };
-    children
-        .iter()
-        .map(|child| overflows_ruled_out(child, schema))
-        .fold(own, |ruled_out, child| ruled_out + child)
-}
-
-/// Whether `expr` (over `schema`) is an addition, a subtraction or a
-/// multiplication of `Decimal128`s that cannot overflow, whatever the values
-/// of its operands (within the precisions of their types, see
-/// [`decimal_digits`]). Arrow rescales the operands of an addition (and a
-/// subtraction) to their larger scale `s` and adds them up as `i128`s, which
-/// overflow only above `2^127`: the unscaled values of operands of at most
-/// `d1` and `d2` digits and of scales `s1` and `s2` add up to less than
-/// `2 * 10^e`, with `e = max(d1 - s1, d2 - s2) + s`, which fits for `e <= 37`.
-/// It multiplies them as `i128`s, to less than `10^(d1 + d2)`, which fits for
-/// `d1 + d2 <= 38` (if the scale `s1 + s2` of the product is valid). Arrow does
-/// not validate the precisions of the results.
-fn cannot_overflow(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
-        return false;
-    };
-    let (Some((d1, s1)), Some((d2, s2))) = (
-        decimal_digits(binary.left(), schema),
-        decimal_digits(binary.right(), schema),
-    ) else {
-        return false;
-    };
-    match binary.op() {
-        Operator::Plus | Operator::Minus => {
-            let scale = s1.max(s2);
-            (d1 - s1).max(d2 - s2) + scale <= 37
-        }
-        Operator::Multiply => d1 + d2 <= 38 && s1 + s2 <= 38,
-        _ => false,
-    }
-}
-
-/// An upper bound of the number of digits of the unscaled values of `expr`,
-/// of type `Decimal128` (over `schema`), and its scale, if known: the digits of
-/// the value of a literal; the precision of its type, for a column (of a
-/// precision below the maximum of 38, which the type of a result may only
-/// cap) or a cast into the decimal (which fails on the values of more
-/// digits); or that of the operands of an addition, a subtraction or a
-/// multiplication that cannot overflow (see [`cannot_overflow`]):
-/// `max(d1 - s1, d2 - s2) + max(s1, s2) + 1` and `d1 + d2` digits.
-fn decimal_digits(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<(i32, i32)> {
-    let DataType::Decimal128(precision, scale) = expr.data_type(schema).ok()? else {
-        return None;
-    };
-    let (precision, scale) = (i32::from(precision), i32::from(scale));
-    if let Some(literal) = expr.downcast_ref::<Literal>() {
-        // The digits of its value (e.g. of the `1` of `1 - l_discount`, of a
-        // `DECIMAL(20, 0)` once DataFusion coerced it).
-        let ScalarValue::Decimal128(value, _, _) = literal.value() else {
-            return None;
-        };
-        let digits = value.map_or(1, |value| {
-            value.unsigned_abs().checked_ilog10().unwrap_or(0) + 1
-        });
-        return Some((i32::try_from(digits).ok()?, scale));
-    }
-    if expr.is::<CastExpr>() || (expr.is::<Column>() && precision < 38) {
-        return Some((precision, scale));
-    }
-    let binary = expr.downcast_ref::<BinaryExpr>()?;
-    let (d1, s1) = decimal_digits(binary.left(), schema)?;
-    let (d2, s2) = decimal_digits(binary.right(), schema)?;
-    if !cannot_overflow(expr, schema) {
-        return None;
-    }
-    match binary.op() {
-        Operator::Plus | Operator::Minus => {
-            Some(((d1 - s1).max(d2 - s2) + s1.max(s2) + 1, s1.max(s2)))
-        }
-        Operator::Multiply => Some((d1 + d2, s1 + s2)),
-        _ => None,
-    }
-}
-
-/// The number of the parts that may fail (see [`refined_parts`]) of the
-/// native operators that evaluate the chunks of the pipeline of `operator`,
-/// from `operator` down to the source of the pipeline, as the planner's
-/// `native_failures` counts them: the filters, the projections and the probe
-/// keys and filters of hash joins, through the operators that pass on the
-/// chunks of their inputs, down to the sources and pipeline breakers, which
-/// belong to other pipelines (and bridged plans, which DataFusion evaluates on
-/// whole batches).
-fn pipeline_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
-    if let Some(join) = operator.downcast_ref::<PhysicalHashJoin>() {
-        let probe_schema = join.probe_side().schema();
-        let keys = join
-            .on()
-            .iter()
-            .map(|(_, key)| refined_parts(key, &probe_schema))
-            .sum::<usize>();
-        let filter = join.filter().map_or(0, |filter| {
-            refined_parts(filter.expression(), filter.schema())
-        });
-        return keys + filter + pipeline_parts(join.probe_side());
-    }
-    if let Some(join) = operator.downcast_ref::<PhysicalNestedLoopJoin>() {
-        return pipeline_parts(join.probe_side());
-    }
-    if let Some(join) = operator.downcast_ref::<PhysicalCrossJoin>() {
-        return pipeline_parts(join.probe_side());
-    }
-    if let Some(subquery) = operator.downcast_ref::<PhysicalScalarSubquery>() {
-        return pipeline_parts(subquery.input());
-    }
-    if operator.is_source() || operator.is_sink() {
-        return 0;
-    }
-    let input_schema = || operator.children()[0].schema();
-    let own = if let Some(filter) = operator.downcast_ref::<PhysicalFilter>() {
-        refined_parts(filter.predicate(), &input_schema())
-    } else if let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
-        let input_schema = input_schema();
-        projection
-            .exprs()
-            .iter()
-            .map(|(expr, _)| refined_parts(expr, &input_schema))
-            .sum()
-    } else {
-        test_operator_parts(operator)
-    };
-    operator
-        .children()
-        .iter()
-        .map(pipeline_parts)
-        .fold(own, |parts, child| parts + child)
-}
-
-/// The number of the parts that may fail of `operator`, a stand-in of the
-/// tests for the native filter or projection (see [`pipeline_parts`]).
-#[cfg(test)]
-fn test_operator_parts(operator: &Arc<dyn PhysicalOperator>) -> usize {
-    use super::test_support::{TestFilter, TestProjection};
-    let input_schema = || operator.children()[0].schema();
-    if let Some(filter) = operator.downcast_ref::<TestFilter>() {
-        return refined_parts(filter.predicate(), &input_schema());
-    }
-    if let Some(projection) = operator.downcast_ref::<TestProjection>() {
-        let input_schema = input_schema();
-        return projection
-            .exprs()
-            .iter()
-            .map(|expr| refined_parts(expr, &input_schema))
-            .sum();
-    }
-    0
-}
-
-#[cfg(not(test))]
-fn test_operator_parts(_operator: &Arc<dyn PhysicalOperator>) -> usize {
-    0
-}
-
-/// An upper bound of the number of rows of `plan`, from DataFusion's
-/// statistics: its number of rows if it is exact (e.g. of a `MemTable`, or of
-/// the metadata of Parquet files), that of the input of a node that produces
-/// at most the rows of its input (a filter, a projection, a sort, a limit, or
-/// a node that coalesces or repartitions its partitions), or, of a join, a row
-/// for every pair of rows of its inputs and every row of either.
-fn max_rows(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    use datafusion_physical_plan::joins::{
-        CrossJoinExec, HashJoinExec, NestedLoopJoinExec, SortMergeJoinExec,
-        SymmetricHashJoinExec,
-    };
-    if let Ok(statistics) =
-        StatisticsContext::new().compute_arc(plan, &StatisticsArgs::new())
-        && let Precision::Exact(rows) = statistics.num_rows
-    {
-        return Some(rows);
-    }
-    let join = plan.is::<HashJoinExec>()
-        || plan.is::<CrossJoinExec>()
-        || plan.is::<NestedLoopJoinExec>()
-        || plan.is::<SortMergeJoinExec>()
-        || plan.is::<SymmetricHashJoinExec>();
-    if join && let [left, right] = plan.children().as_slice() {
-        let pairs = |rows: usize| rows.checked_add(1);
-        return pairs(max_rows(left)?)?.checked_mul(pairs(max_rows(right)?)?);
-    }
-    let at_most_its_input = plan.is::<FilterExec>()
-        || plan.is::<ProjectionExec>()
-        || plan.is::<RepartitionExec>()
-        || plan.is::<CoalescePartitionsExec>()
-        || plan.is::<SortExec>()
-        || plan.is::<SortPreservingMergeExec>()
-        || plan.is::<GlobalLimitExec>()
-        || plan.is::<LocalLimitExec>();
-    match plan.children().as_slice() {
-        [input] if at_most_its_input => max_rows(input),
-        _ => None,
-    }
-}
-
-/// Whether `input`, the lowered input of an aggregation of a single partition
-/// of DataFusion, produces the rows of that partition in DataFusion's order,
-/// on a single thread (see `AggregateSpec::aggregates_in_order`): if it
-/// consists of the native sources and of DataFusion's plans (in
-/// [`BridgeOperator`]s), which read a partition in order, and of filters,
-/// projections, limits and caches of chunks, which keep the order of their
-/// rows. The other native operators produce their rows in other orders than
-/// DataFusion's (e.g. an aggregation, whose groups DataFusion produces in the
-/// order of their first rows, or a join or a sort, of rows that tie).
-fn keeps_datafusion_order(input: &Arc<dyn PhysicalOperator>) -> bool {
-    let keeps_order = input.is::<PhysicalFilter>()
-        || input.is::<PhysicalProjection>()
-        || input.is::<CachingOperator>()
-        || input.is::<PhysicalLimit>()
-        || input.is::<PhysicalPlaceholderRow>()
-        || input.is::<BridgeOperator>()
-        || input.is::<MemoryScanSource>()
-        || input.is::<ParquetScanSource>()
-        || input.is::<CsvScanSource>()
-        || input.is::<EmptyScanSource>()
-        || is_test_operator_that_keeps_order(input);
-    keeps_order && input.children().iter().all(keeps_datafusion_order)
-}
-
-/// Whether `input` is a stand-in of the tests for the native filter or
-/// projection, which keep the order of their rows too.
-#[cfg(test)]
-fn is_test_operator_that_keeps_order(input: &Arc<dyn PhysicalOperator>) -> bool {
-    input.is::<super::test_support::TestFilter>()
-        || input.is::<super::test_support::TestProjection>()
-}
-
-#[cfg(not(test))]
-fn is_test_operator_that_keeps_order(_input: &Arc<dyn PhysicalOperator>) -> bool {
-    false
-}
-
 /// The built-in aggregate functions of DataFusion whose accumulators cannot
 /// fail on the rows that they aggregate, nor on the partial states that they
 /// merge (see [`TrustedAggregateFunctions`]): their name, and the function of
@@ -1868,441 +1150,17 @@ fn implementation_type(udaf: &AggregateUDF) -> TypeId {
     implementation.type_id()
 }
 
-/// Whether the value of `aggregate` (of the rows of `input`) is the same
-/// however the rows of a group are split into partial states, which
-/// are merged in any order: whether it is DataFusion's built-in (see
-/// [`BUILTIN_AGGREGATES`], by its implementation type) `count`, `min`, `max`
-/// (of values that it compares by a total order, see [`compares_totally`]),
-/// `bit_and`, `bit_or`, `bit_xor`, `bool_and`, `bool_or`, `approx_distinct`
-/// or `median`, which count, compare (floating point values by their total
-/// order), combine the bits of, sketch or collect the values of their rows,
-/// or its `sum` or `avg` of values that they add up exactly (see
-/// [`adds_up_exactly`], of an input of at most `max_rows()` rows, if known):
-/// integers or decimals, which they add up with (wrapping) integer
-/// arithmetic, and the casts into `Float64` of small integers; or its
-/// `array_agg`, `first_value`, `last_value` or `nth_value` ordered by their
-/// own arguments (e.g. `ARRAY_AGG(x ORDER BY x)`, see
-/// [`orders_its_arguments`]), whose values do not depend on the order of the
-/// rows either. The values of the other aggregates may depend on it: e.g. a
-/// sum of floating point values, whose rounding depends on how its additions
-/// are grouped (`(s + a) + b` is not always `s + (a + b)`), a first or last
-/// value, an array, or a user-defined aggregate.
-fn splits_exactly(
-    aggregate: &AggregateFunctionExpr,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> bool {
-    let Some(name) = builtin_name(aggregate.fun()) else {
-        return false;
-    };
-    match name {
-        "min" | "max" => aggregate.expressions().iter().all(|argument| {
-            match argument.data_type(&input.schema()) {
-                Ok(data_type) => compares_totally(&data_type),
-                Err(_) => false,
-            }
-        }),
-        "count" | "bit_and" | "bit_or" | "bit_xor" | "bool_and" | "bool_or"
-        | "approx_distinct" | "median" => true,
-        "sum" | "avg" => adds_up_exactly(aggregate, input, max_rows),
-        "array_agg" | "first_value" | "last_value" | "nth_value" => {
-            orders_its_arguments(aggregate)
-        }
-        _ => false,
-    }
-}
-
-/// Whether DataFusion cannot fail to materialize the values of `aggregate`, or
-/// its states, for all groups of a stage at once (of `sets` grouping sets, of
-/// the rows of `input`, of at most `max_rows()` rows, if known), as it does
-/// when its stage ends: into arrays whose 32-bit offsets cannot overflow (see
-/// [`may_overflow_offsets`]). The native operator materializes the groups of
-/// every radix partition on their own. E.g. 40,960 groups of a string of
-/// 55,000 bytes do not fit into an array of `Utf8`: DataFusion's `min` of
-/// structs of them fails with an invalid argument (its `min` of the strings
-/// panics), its ordered `array_agg` with an offset overflow.
-fn materializes_safely(
-    aggregate: &AggregateFunctionExpr,
-    sets: usize,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> bool {
-    let fits = |bound: Option<usize>| {
-        bound
-            .is_some_and(|bound| i32::try_from(bound.saturating_mul(sets.max(1))).is_ok())
-    };
-    // The lists that the built-in aggregates make of the values of their rows
-    // hold at most a value of every input row of a group (e.g. `array_agg`,
-    // or the states of `median` and of a `count` of distinct values). The
-    // lists that they keep of their input (e.g. the `first_value` of lists,
-    // or the lists in an `array_agg` of them) hold at most an element for every
-    // byte of their input, if their elements take a byte each.
-    let made = |_: &DataType| fits(max_rows());
-    let values = std::cell::OnceCell::new();
-    let kept = |element: &DataType| {
-        has_a_byte_per_value(element)
-            && *values.get_or_init(|| fits(max_values_bytes(aggregate, input, max_rows)))
-    };
-    let max_bytes = || -> Option<usize> {
-        match builtin_name(aggregate.fun())? {
-            // Values of their arguments (and of their order), of at most
-            // the bytes of their columns.
-            "min" | "max" | "first_value" | "last_value" | "nth_value" | "array_agg"
-            | "count" => max_values_bytes(aggregate, input, max_rows),
-            // A sketch of a group, of at most `NUM_REGISTERS` (16,384) bytes,
-            // for every row at most.
-            "approx_distinct" => max_rows()?.checked_mul(16_384),
-            // The values of its input, and a separator after every value.
-            "string_agg" => {
-                let arguments = aggregate.expressions();
-                let separator = arguments.get(1)?.downcast_ref::<Literal>()?;
-                let separator = match separator.value() {
-                    ScalarValue::Utf8(separator)
-                    | ScalarValue::LargeUtf8(separator)
-                    | ScalarValue::Utf8View(separator) => {
-                        separator.as_ref().map_or(0, String::len)
-                    }
-                    _ => return None,
-                };
-                max_values_bytes(aggregate, input, max_rows)?
-                    .checked_add(max_rows()?.checked_mul(separator)?)
-            }
-            _ => None,
-        }
-    };
-    let bytes = std::cell::OnceCell::new();
-    let bytes_fit = || *bytes.get_or_init(|| fits(max_bytes()));
-    let Ok(states) = aggregate.state_fields() else {
-        return false;
-    };
-    // The values that it keeps: of the types of its arguments and its order.
-    let schema = input.schema();
-    let order = aggregate.order_bys().iter().map(|sort| &sort.expr);
-    let kept_types = aggregate
-        .expressions()
-        .iter()
-        .chain(order)
-        .filter_map(|expr| expr.data_type(&schema).ok())
-        .collect::<Vec<_>>();
-    std::iter::once(aggregate.field())
-        .chain(states)
-        .all(|field| {
-            let data_type = field.data_type();
-            let top: &dyn Fn(&DataType) -> bool = match kept_types.contains(data_type) {
-                true => &kept,
-                false => &made,
-            };
-            !may_overflow_offsets(data_type, top, &kept, &bytes_fit)
-        })
-}
-
-/// Whether every value of `data_type` takes at least a byte of the memory of
-/// its array (of its values, offsets, views or keys), so that the elements of
-/// lists of them are at most the bytes of the lists: not booleans (bits),
-/// nulls, runs, or values of no width.
-fn has_a_byte_per_value(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Null | DataType::Boolean | DataType::RunEndEncoded(_, _) => false,
-        DataType::FixedSizeBinary(width) => *width > 0,
-        DataType::FixedSizeList(field, size) => {
-            *size > 0 && has_a_byte_per_value(field.data_type())
-        }
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| has_a_byte_per_value(field.data_type())),
-        _ => true,
-    }
-}
-
-/// Whether DataFusion cannot fail to store or materialize the group keys of
-/// `raw` for all groups of a stage at once (see [`materializes_safely`]): its
-/// group values keep the bytes of the keys with 32-bit offsets in a buffer
-/// that fails to grow beyond them (e.g. the groups of a `count` of distinct
-/// strings, which it aggregates by their strings first). The keys keep at
-/// most the bytes of their values (see [`max_expr_bytes`]), for every grouping
-/// set, and at most an element of lists for every byte (see
-/// [`has_a_byte_per_value`]), or of an array of the values of a row
-/// (`make_array`), one for every value.
-fn keys_materialize_safely(raw: &AggregateExec) -> bool {
-    let schema = raw.input().schema();
-    let sets = raw.group_expr().groups().len().max(1);
-    raw.group_expr().expr().iter().all(|(expr, _)| {
-        let Ok(data_type) = expr.data_type(&schema) else {
-            return false;
-        };
-        if !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false) {
-            return true;
-        }
-        let fits = |bound: Option<usize>| {
-            bound.is_some_and(|bound| i32::try_from(bound.saturating_mul(sets)).is_ok())
-        };
-        // An array of the values of a row (e.g. `[a, b]`), without offsets:
-        // as many elements for every row.
-        if let Some(function) = expr.downcast_ref::<ScalarFunctionExpr>()
-            && function.name() == "make_array"
-            && function.args().iter().all(|argument| {
-                argument.data_type(&schema).is_ok_and(|data_type| {
-                    !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false)
-                })
-            })
-        {
-            return fits(
-                max_rows(raw.input())
-                    .and_then(|rows| rows.checked_mul(function.args().len())),
-            );
-        }
-        let bytes_fit =
-            fits(max_expr_bytes(expr, raw.input(), &|| max_rows(raw.input())));
-        let elements_fit =
-            |element: &DataType| has_a_byte_per_value(element) && bytes_fit;
-        !may_overflow_offsets(&data_type, &elements_fit, &elements_fit, &|| bytes_fit)
-    })
-}
-
-/// An upper bound of the bytes of the values of the arguments of `aggregate`
-/// and of its order (over the rows of `input`), of those with 32-bit offsets
-/// (see [`max_expr_bytes`]).
-fn max_values_bytes(
-    aggregate: &AggregateFunctionExpr,
-    input: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> Option<usize> {
-    let schema = input.schema();
-    let order = aggregate.order_bys().iter().map(|sort| &sort.expr);
-    let mut bytes = 0_usize;
-    for expr in aggregate.expressions().iter().chain(order) {
-        if !may_overflow_offsets(
-            &expr.data_type(&schema).ok()?,
-            &|_| false,
-            &|_| false,
-            &|| false,
-        ) {
-            continue;
-        }
-        bytes = bytes.checked_add(max_expr_bytes(expr, input, max_rows)?)?;
-    }
-    Some(bytes)
-}
-
-/// An upper bound of the bytes of the values of `expr` over the rows of
-/// `plan` (of at most `max_rows()` rows, if known): of those of the column of
-/// `plan` that it is (see [`max_column_bytes`]), of a literal for every row,
-/// three times those of the argument of `upper` or `lower` (whose case
-/// mapping turns a character into at most three, e.g. the two bytes of `ΐ`
-/// into the six of `Ϊ́`), or those of the values of the fields of a struct.
-/// The values of other expressions are not bounded (e.g. `repeat(s, 1000)`).
-fn max_expr_bytes(
-    expr: &Arc<dyn PhysicalExpr>,
-    plan: &Arc<dyn ExecutionPlan>,
-    max_rows: &dyn Fn() -> Option<usize>,
-) -> Option<usize> {
-    if let Some(column) = expr.downcast_ref::<Column>() {
-        return max_column_bytes(plan, column.index());
-    }
-    if let Some(literal) = expr.downcast_ref::<Literal>() {
-        let bytes = match literal.value() {
-            ScalarValue::Utf8(value)
-            | ScalarValue::LargeUtf8(value)
-            | ScalarValue::Utf8View(value) => value.as_ref().map_or(0, String::len),
-            ScalarValue::Binary(value)
-            | ScalarValue::LargeBinary(value)
-            | ScalarValue::BinaryView(value) => value.as_ref().map_or(0, Vec::len),
-            _ => return None,
-        };
-        return max_rows()?.checked_mul(bytes);
-    }
-    let function = expr.downcast_ref::<ScalarFunctionExpr>()?;
-    // The values of the fields of a struct, of those with 32-bit offsets.
-    let fields = |values: Vec<&Arc<dyn PhysicalExpr>>| {
-        let schema = plan.schema();
-        values.into_iter().try_fold(0_usize, |bytes, value| {
-            let data_type = value.data_type(&schema).ok()?;
-            if !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false) {
-                return Some(bytes);
-            }
-            bytes.checked_add(max_expr_bytes(value, plan, max_rows)?)
-        })
-    };
-    match (function.name(), function.args()) {
-        ("upper" | "lower", [argument]) => {
-            max_expr_bytes(argument, plan, max_rows)?.checked_mul(3)
-        }
-        ("named_struct", arguments) => {
-            fields(arguments.iter().skip(1).step_by(2).collect())
-        }
-        ("struct", arguments) => fields(arguments.iter().collect()),
-        _ => None,
-    }
-}
-
-/// Whether the 32-bit offsets of an array of `data_type` (of the values of all
-/// groups of a stage) may overflow: those of strings and binaries, which
-/// count the bytes of their values, unless `bytes_fit()`, and those of lists
-/// and maps, which count their elements, unless `elements_fit(element type)`
-/// (of the lists at the top) or `nested_elements_fit(element type)` (of the
-/// lists in values, or in large lists).
-fn may_overflow_offsets(
-    data_type: &DataType,
-    elements_fit: &dyn Fn(&DataType) -> bool,
-    nested_elements_fit: &dyn Fn(&DataType) -> bool,
-    bytes_fit: &dyn Fn() -> bool,
-) -> bool {
-    let nested = |data_type: &DataType| {
-        may_overflow_offsets(
-            data_type,
-            nested_elements_fit,
-            nested_elements_fit,
-            bytes_fit,
-        )
-    };
-    match data_type {
-        DataType::Utf8 | DataType::Binary => !bytes_fit(),
-        DataType::List(field) | DataType::ListView(field) | DataType::Map(field, _) => {
-            nested(field.data_type()) || !elements_fit(field.data_type())
-        }
-        DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _) => nested(field.data_type()),
-        DataType::Struct(fields) => fields.iter().any(|field| {
-            may_overflow_offsets(
-                field.data_type(),
-                elements_fit,
-                nested_elements_fit,
-                bytes_fit,
-            )
-        }),
-        DataType::Union(fields, _) => fields.iter().any(|(_, field)| {
-            may_overflow_offsets(
-                field.data_type(),
-                elements_fit,
-                nested_elements_fit,
-                bytes_fit,
-            )
-        }),
-        DataType::Dictionary(_, values) => nested(values),
-        DataType::RunEndEncoded(_, values) => nested(values.data_type()),
-        _ => false,
-    }
-}
-
-/// An upper bound of the bytes of the column `index` of `plan`, from
-/// DataFusion's statistics: the size of all its columns if it is exact (e.g.
-/// the memory of the arrays of a `MemTable`, at least their bytes), the size
-/// of the files of an uncompressed CSV scan, or that of
-/// the column of the input that the column is of a node that passes the
-/// values of its input on (a filter, a projection, a sort, a limit, a node
-/// that coalesces or repartitions its partitions, or the group keys of an
-/// aggregation).
-fn max_column_bytes(plan: &Arc<dyn ExecutionPlan>, index: usize) -> Option<usize> {
-    use datafusion_datasource::file_groups::FileGroup;
-    use datafusion_datasource::file_scan_config::FileScanConfig;
-    use datafusion_datasource::source::DataSourceExec;
-    use datafusion_datasource_csv::source::CsvSource;
-    if let Ok(statistics) =
-        StatisticsContext::new().compute_arc(plan, &StatisticsArgs::new())
-        && let Precision::Exact(bytes) = statistics.total_byte_size
-    {
-        return Some(bytes);
-    }
-    // The values of uncompressed CSV files, which are at most their bytes (of
-    // every file once: a range of a file reads on to the end of its line).
-    if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
-        && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
-        && config.file_source().is::<CsvSource>()
-        && !config.file_compression_type.is_compressed()
-    {
-        let files = config
-            .file_groups
-            .iter()
-            .flat_map(FileGroup::iter)
-            .map(|file| (&file.object_meta.location, file.object_meta.size))
-            .collect::<HashMap<_, _>>();
-        let bytes = files
-            .values()
-            .try_fold(0_u64, |bytes, size| bytes.checked_add(*size))?;
-        return usize::try_from(bytes).ok();
-    }
-    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        let column = projection
-            .expr()
-            .get(index)?
-            .expr
-            .downcast_ref::<Column>()?;
-        return max_column_bytes(projection.input(), column.index());
-    }
-    if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        let index = match filter.projection() {
-            Some(projection) => *projection.get(index)?,
-            None => index,
-        };
-        return max_column_bytes(filter.input(), index);
-    }
-    // The distinct keys of a single grouping set, of a column (e.g. of the
-    // groups of a `count` of distinct values, which DataFusion aggregates by
-    // its values first).
-    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
-        && aggregate.group_expr().is_single()
-    {
-        let (key, _) = aggregate.group_expr().expr().get(index)?;
-        let column = key.downcast_ref::<Column>()?;
-        return max_column_bytes(aggregate.input(), column.index());
-    }
-    let passes_its_input_on = plan.is::<RepartitionExec>()
-        || plan.is::<CoalescePartitionsExec>()
-        || plan.is::<SortExec>()
-        || plan.is::<SortPreservingMergeExec>()
-        || plan.is::<GlobalLimitExec>()
-        || plan.is::<LocalLimitExec>();
-    match plan.children().as_slice() {
-        [input] if passes_its_input_on => max_column_bytes(input, index),
-        _ => None,
-    }
-}
-
-/// Whether DataFusion compares the values of `data_type` by a total order
-/// (Arrow's, by which it sorts them too): its `min` and `max`, which then keep
-/// the same value whatever the order of the rows, and the `ScalarValue`s of
-/// ordered aggregates. These are values that are not nested (floating point
-/// values by their total order), and dictionaries of them. Nested values are
-/// compared field by field, skipping NULLs, or element by element, NULLs last:
-/// e.g. `{a: NULL}` compares equal to `{a: 1}` and to `{a: 2}`, so that the
-/// first of them in the order of the rows (or of the partial states) stays
-/// the minimum.
-fn compares_totally(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Dictionary(_, values) => compares_totally(values),
-        DataType::RunEndEncoded(_, _) => false,
-        data_type => !data_type.is_nested(),
-    }
-}
-
-/// Whether `aggregate` is ordered by all of its arguments but literals (e.g.
-/// `ARRAY_AGG(x ORDER BY x)` or `NTH_VALUE(x, 2 ORDER BY y, x)`): the rows
-/// that tie in its order have the same values of its arguments, so that its
-/// array, or its first, last or n-th value, is the same in whatever order its
-/// rows come, and however they are split into partial states.
-fn orders_its_arguments(aggregate: &AggregateFunctionExpr) -> bool {
-    let order = aggregate.order_bys();
-    !order.is_empty()
-        && aggregate.expressions().iter().all(|argument| {
-            argument.downcast_ref::<Literal>().is_some()
-                || order
-                    .iter()
-                    .any(|sort| sort.expr.as_ref() == argument.as_ref())
-        })
-}
-
 /// The built-in aggregate functions of DataFusion whose accumulators a
 /// session trusts the native aggregation not to fail (see
 /// [`BUILTIN_AGGREGATES`]): a configuration extension of the session, created
 /// with [`PhysicalHashAggregate::trusted_aggregate_functions`].
 ///
 /// In the sessions that trust the aggregate functions of all aggregates of an
-/// aggregation, the input rows of a thread (of several threads) whose groups
-/// hardly repeat bypass its thread-local table, like the rows of aggregations
-/// without aggregates (see `rows_can_bypass_tables`): they are aggregated
-/// once, by the final aggregation of their radix partition, rather than in the
-/// thread-local table first (DataFusion skips its partial aggregation then).
+/// aggregation, the input rows of a thread whose groups hardly repeat bypass
+/// its thread-local table, like the rows of aggregations without aggregates
+/// (see `rows_can_bypass_tables`): they are aggregated once, by the final
+/// aggregation of their radix partition, rather than in the thread-local
+/// table first (DataFusion skips its partial aggregation then).
 ///
 /// A function is trusted if it is implemented by the type of
 /// `datafusion-functions-aggregate` that implements the built-in function of
@@ -2442,6 +1300,20 @@ fn is_flat_type(data_type: &DataType) -> bool {
     )
 }
 
+/// Whether DataFusion compares the `ScalarValue`s of `data_type` by a total
+/// order consistent with Arrow's, by which it sorts them: values that are
+/// not nested (floating point values by their total order), and dictionaries
+/// of them. Nested values are compared field by field, skipping NULLs, or
+/// element by element, NULLs last: e.g. `{a: NULL}` compares equal to
+/// `{a: 1}` and to `{a: 2}`, which Arrow sorts after both.
+fn compares_totally(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, values) => compares_totally(values),
+        DataType::RunEndEncoded(_, _) => false,
+        data_type => !data_type.is_nested(),
+    }
+}
+
 /// The aggregates `exprs`, with the aggregates whose accumulators may rely
 /// on the order of their input (`with_beneficial_ordering(true)`, set by
 /// DataFusion when the input of an aggregation is sorted as an ordered
@@ -2570,12 +1442,8 @@ impl PhysicalOperator for PhysicalHashAggregate {
         true
     }
 
-    /// Not if the aggregation aggregates its input in order (see
-    /// `AggregateSpec::aggregates_in_order`), or if it or its pipeline may fail
-    /// (see `AggregateSpec::evaluates_in_order`): the pipelines that end in it
-    /// then run on a single thread.
     fn parallel_sink(&self) -> bool {
-        !self.spec.aggregates_in_order() && !self.spec.evaluates_in_order
+        true
     }
 
     fn get_global_sink_state(
@@ -2596,19 +1464,6 @@ impl PhysicalOperator for PhysicalHashAggregate {
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
             return UngroupedAggregate::local_sink_state(&self.spec);
-        }
-        // The single thread of an aggregation that aggregates its input in
-        // order (see `AggregateSpec::aggregates_in_order` and
-        // `parallel_sink`) sees the rows in the order of the single partition
-        // of DataFusion. Its table holds all of its groups, so that the
-        // accumulators aggregate all rows of a group into a single state, as
-        // DataFusion's do (see `TableCapacity::UNBOUNDED`).
-        if self.spec.aggregates_in_order() {
-            return RadixHashAggregate::local_sink_state(
-                &self.spec,
-                TableCapacity::UNBOUNDED,
-                false,
-            );
         }
         let options = ctx.task_ctx.session_config().options();
         let bypass = self.spec.rows_bypass_tables(options);
@@ -2652,7 +1507,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
         if self.spec.is_ungrouped() {
             UngroupedAggregate::finalize(&self.spec, gstate)
         } else {
-            RadixHashAggregate::finalize(&self.spec, gstate)
+            RadixHashAggregate::finalize(gstate)
         }
     }
 
@@ -3384,86 +2239,6 @@ mod tests {
                     assert_eq!(merged.schema(), schema);
                 }
             }
-        }
-        Ok(())
-    }
-
-    /// The aggregations of `plan` that [`PhysicalHashAggregate::try_lower`]
-    /// lowers (with their inputs bridged), from the top: an aggregation of two
-    /// stages once.
-    fn lowered_aggregations(plan: &Plan) -> Result<Vec<PhysicalHashAggregate>> {
-        if let Some(aggregate) = try_lower(plan)? {
-            return Ok(vec![aggregate]);
-        }
-        let mut aggregates = vec![];
-        for child in plan.children() {
-            aggregates.extend(lowered_aggregations(child)?);
-        }
-        Ok(aggregates)
-    }
-
-    /// The first aggregation of `plan` from the top, as the constructors build
-    /// it over its bridged input, also if [`PhysicalHashAggregate::try_lower`]
-    /// leaves it to DataFusion.
-    fn built_aggregation(plan: &Plan) -> Result<Option<PhysicalHashAggregate>> {
-        let bridge = |input: &Plan| -> Arc<dyn PhysicalOperator> {
-            Arc::new(crate::bridge::BridgeOperator::new(Arc::clone(input)))
-        };
-        if let Some(top) = plan.downcast_ref::<AggregateExec>() {
-            match top.mode() {
-                AggregateMode::Single | AggregateMode::SinglePartitioned => {
-                    let input = bridge(top.input());
-                    return PhysicalHashAggregate::try_new_single_stage(top, input)
-                        .map(Some);
-                }
-                AggregateMode::Final | AggregateMode::FinalPartitioned => {
-                    if let Some(partial) = partial_aggregate(top.input()) {
-                        let input = bridge(partial.input());
-                        return PhysicalHashAggregate::try_new_two_stage(
-                            partial, top, input,
-                        )
-                        .map(Some);
-                    }
-                }
-                AggregateMode::Partial | AggregateMode::PartialReduce => {}
-            }
-        }
-        for child in plan.children() {
-            if let Some(aggregate) = built_aggregation(child)? {
-                return Ok(Some(aggregate));
-            }
-        }
-        Ok(None)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn inputs_have_at_most_the_rows_of_their_exact_statistics() -> Result<()> {
-        // The 5,000 rows of `t1`, from the exact statistics of its `MemTable`,
-        // through the nodes that produce at most the rows of their input (see
-        // `max_rows`): a projection, a filter, a sort (also with a limit, a
-        // bound above its 10 rows); but no bound of a join or an aggregation.
-        let ctx = crate::test_utils::datafusion_context(test_session_config());
-        crate::test_utils::register_test_tables(&ctx)?;
-        for (sql, rows) in [
-            ("SELECT a, b FROM t1", Some(5_000)),
-            (
-                "SELECT a + 1 AS x FROM t1 WHERE b > 0 ORDER BY x LIMIT 10",
-                Some(5_000),
-            ),
-            (
-                "SELECT a + 1 AS x FROM t1 WHERE b > 0 ORDER BY x",
-                Some(5_000),
-            ),
-            // At most a row for every pair of rows of `t1` (5,000) and `t2`
-            // (150), and every row of either.
-            (
-                "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.k",
-                Some(5_001 * 151),
-            ),
-            ("SELECT a FROM t1 GROUP BY a", None),
-        ] {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            assert_eq!(max_rows(&plan), rows, "{sql}");
         }
         Ok(())
     }
@@ -4224,12 +2999,27 @@ mod tests {
             ),
             ("SELECT d, MIN([a, b]) FROM t1 GROUP BY d", false, false),
         ];
-        // (The specs of the aggregations, also of those that `try_lower` leaves
-        // to DataFusion for other reasons.)
-        for (sql, untrusted, trusted) in queries {
+        /// The first aggregation of the plan of `sql` that is lowered, from the
+        /// top.
+        async fn lowered_aggregation(
+            ctx: &datafusion::prelude::SessionContext,
+            sql: &str,
+        ) -> Result<PhysicalHashAggregate> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let aggregate = built_aggregation(&plan)?
-                .unwrap_or_else(|| panic!("no aggregation: {sql}"));
+            let mut aggregate = None;
+            let mut node = Arc::clone(&plan);
+            while aggregate.is_none() {
+                aggregate = try_lower(&node)?;
+                let Some(child) = node.children().first().map(|&child| Arc::clone(child))
+                else {
+                    break;
+                };
+                node = child;
+            }
+            Ok(aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}")))
+        }
+        for (sql, untrusted, trusted) in queries {
+            let aggregate = lowered_aggregation(&ctx, sql).await?;
             let spec = &aggregate.spec;
             for options in &untrusting_sessions {
                 assert_eq!(spec.rows_bypass_tables(options), untrusted, "{sql}");
@@ -4239,12 +3029,9 @@ mod tests {
             }
             assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
         }
-        // The aggregations of user-defined functions that look like
-        // DataFusion's `count` and `sum` (see `lookalike_count`), and replace
-        // them, are left to DataFusion (see `updates_like_datafusion`): no
-        // aggregation of their plans is lowered. (That their functions are not
-        // trusted either, see
-        // `trusted_aggregate_functions_are_identified_by_their_implementation_types`.)
+        // The aggregates of user-defined functions that look like DataFusion's
+        // `count` and `sum` (see `lookalike_count`), and replace them, are not
+        // trusted.
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
         ctx.register_udaf(super::super::test_support::lookalike_count());
@@ -4254,8 +3041,11 @@ mod tests {
             "SELECT a, count(*) FROM t1 GROUP BY a",
             "SELECT a, MAX(b), sum(b) FROM t1 GROUP BY a",
         ] {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            assert!(lowered_aggregations(&plan)?.is_empty(), "{sql}");
+            let aggregate = lowered_aggregation(&ctx, sql).await?;
+            assert!(aggregate.spec.bypass, "{sql}");
+            for options in untrusting_sessions.iter().chain([&trusting]) {
+                assert!(!aggregate.spec.rows_bypass_tables(options), "{sql}");
+            }
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
@@ -4392,165 +3182,6 @@ mod tests {
             .map(|lookalike| aggregate(Arc::clone(lookalike)))
         {
             assert!(!given.trusts(&aggregate?));
-        }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregates_split_exactly_if_their_values_do_not_depend_on_it() -> Result<()>
-    {
-        use super::super::test_support::{lookalike_count, lookalike_sum};
-        // Whether the values of the aggregates of an aggregation are the same
-        // however the rows of a group are split into partial states (see
-        // `splits_exactly`): `c` is a `DOUBLE`, `g` a decimal, `a` an `INT`, `b`
-        // and `id` `BIGINT`s.
-        let ctx = crate::test_utils::datafusion_context(test_session_config());
-        crate::test_utils::register_test_tables(&ctx)?;
-        let lookalikes = crate::test_utils::datafusion_context(test_session_config());
-        crate::test_utils::register_test_tables(&lookalikes)?;
-        lookalikes.register_udaf(lookalike_count());
-        lookalikes.register_udaf(lookalike_sum());
-        for (ctx, sql, exact) in [
-            // Counts, extremes (floating point values by their total order),
-            // bits, sketches, medians, and integer and decimal sums.
-            (
-                &ctx,
-                "SELECT d, COUNT(*), COUNT(DISTINCT b), MIN(c), MAX(c), MIN(h), \
-                 BIT_XOR(a), BOOL_AND(e), APPROX_DISTINCT(c), MEDIAN(c), SUM(a), \
-                 SUM(g), AVG(g), SUM(DISTINCT b), COUNT(c) FILTER (WHERE e) \
-                 FROM t1 GROUP BY d",
-                true,
-            ),
-            (&ctx, "SELECT DISTINCT a, d FROM t1", true),
-            // The averages of the 5,000 `INT`s of `t1`, whose `Float64` sums are
-            // exact (see `sums_exactly_as_floats`), also when DataFusion casts
-            // them in a projection below the aggregation (`__common_expr_1`).
-            (&ctx, "SELECT d, AVG(a), SUM(a) FROM t1 GROUP BY d", true),
-            (
-                &ctx,
-                "SELECT d, SUM(a), AVG(a), MEDIAN(a), APPROX_DISTINCT(a) FROM t1 GROUP BY d",
-                true,
-            ),
-            // Ordered aggregates of their own order (see
-            // `orders_its_arguments`).
-            (
-                &ctx,
-                "SELECT d, ARRAY_AGG(id ORDER BY id), FIRST_VALUE(a ORDER BY a), \
-                 LAST_VALUE(h ORDER BY h DESC), NTH_VALUE(id, 2 ORDER BY b, id), \
-                 ARRAY_AGG(DISTINCT a ORDER BY a) FROM t1 GROUP BY d",
-                true,
-            ),
-            // Sums of floating point values (also the averages of integers,
-            // which DataFusion adds up as floating point values), first and
-            // last values, arrays, and other functions.
-            (&ctx, "SELECT d, COUNT(*), SUM(c) FROM t1 GROUP BY d", false),
-            (&ctx, "SELECT d, AVG(c) FROM t1 GROUP BY d", false),
-            (&ctx, "SELECT d, MAX(a), AVG(b) FROM t1 GROUP BY d", false),
-            (&ctx, "SELECT d, FIRST_VALUE(a) FROM t1 GROUP BY d", false),
-            (
-                &ctx,
-                "SELECT d, LAST_VALUE(a ORDER BY id) FROM t1 GROUP BY d",
-                false,
-            ),
-            (&ctx, "SELECT d, ARRAY_AGG(a) FROM t1 GROUP BY d", false),
-            (&ctx, "SELECT d, STDDEV(b) FROM t1 GROUP BY d", false),
-            (
-                &ctx,
-                "SELECT d, STRING_AGG(h, ',') FROM t1 GROUP BY d",
-                false,
-            ),
-        ] {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let aggregate = built_aggregation(&plan)?.unwrap_or_else(|| panic!("{sql}"));
-            assert_eq!(aggregate.spec.splits_exactly, exact, "{sql}");
-            // `try_lower` lowers the aggregations of the 4 partitions of `t1` if
-            // they split exactly, or are ordered (whose values the native
-            // operator orders itself, see `try_lower`).
-            let lowered = exact || sql.contains("ORDER BY");
-            assert_eq!(
-                lowered_aggregations(&plan)?.len(),
-                usize::from(lowered),
-                "{sql}"
-            );
-        }
-        // The bounds of the exact sums of casts into `Float64`: of up to 2^38
-        // `SMALLINT`s and 2^22 `INT`s, of no `BIGINT`s, and of a known number of
-        // rows only; also through a projection.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("s", DataType::Int16, true),
-            Field::new("i", DataType::Int32, true),
-            Field::new("l", DataType::Int64, true),
-            Field::new("u", DataType::UInt8, true),
-            Field::new("f", DataType::Float64, true),
-        ]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion_physical_plan::empty::EmptyExec::new(Arc::clone(&schema)),
-        );
-        let cast = |name: &str| -> Result<Arc<dyn PhysicalExpr>> {
-            Ok(Arc::new(CastExpr::new(
-                col(name, &schema)?,
-                DataType::Float64,
-                None,
-            )))
-        };
-        for (argument, rows, exact) in [
-            (cast("s")?, Some(1 << 38), true),
-            (cast("s")?, Some((1 << 38) + 1), false),
-            (cast("s")?, None, false),
-            (cast("i")?, Some(1 << 22), true),
-            (cast("i")?, Some((1 << 22) + 1), false),
-            (cast("u")?, Some((1 << 53) / 255), true),
-            (cast("u")?, Some((1 << 53) / 255 + 1), false),
-            (cast("l")?, Some(1), false),
-            (col("f", &schema)?, Some(1), false),
-        ] {
-            assert_eq!(
-                sums_exactly_as_floats(&argument, &input, &|| rows),
-                exact,
-                "{argument} of {rows:?} rows"
-            );
-        }
-        let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
-            vec![
-                (cast("s")?, "c".to_string()),
-                (col("f", &schema)?, "f".to_string()),
-            ],
-            Arc::clone(&input),
-        )?);
-        let projected = projection.schema();
-        let one = || Some(1);
-        assert!(sums_exactly_as_floats(
-            &col("c", &projected)?,
-            &projection,
-            &one
-        ));
-        assert!(!sums_exactly_as_floats(
-            &col("f", &projected)?,
-            &projection,
-            &one
-        ));
-        // The lookalikes of DataFusion's `count` and `sum` (see
-        // `lookalike_count`), which DataFusion's types do not implement, do not
-        // split their rows exactly; their aggregations are left to DataFusion
-        // (see `updates_like_datafusion`).
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion_physical_plan::empty::EmptyExec::new(Arc::clone(&schema)),
-        );
-        for lookalike in [lookalike_count(), lookalike_sum()] {
-            let aggregate =
-                AggregateExprBuilder::new(Arc::new(lookalike), vec![col("v", &schema)?])
-                    .schema(Arc::clone(&schema))
-                    .alias("aggregate")
-                    .build()?;
-            assert!(!splits_exactly(&aggregate, &input, &|| Some(1)));
-        }
-        for sql in [
-            "SELECT d, count(a) FROM t1 GROUP BY d",
-            "SELECT d, sum(a) FROM t1 GROUP BY d",
-        ] {
-            let plan = lookalikes.sql(sql).await?.create_physical_plan().await?;
-            assert!(lowered_aggregations(&plan)?.is_empty(), "{sql}");
         }
         Ok(())
     }

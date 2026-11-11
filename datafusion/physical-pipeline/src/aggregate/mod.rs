@@ -294,20 +294,6 @@ pub(crate) mod test_support {
         schema: SchemaRef,
     }
 
-    impl TestFilter {
-        /// The predicate of the filter.
-        pub(crate) fn predicate(&self) -> &Arc<dyn PhysicalExpr> {
-            &self.predicate
-        }
-    }
-
-    impl TestProjection {
-        /// The expressions of the projection.
-        pub(crate) fn exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
-            &self.exprs
-        }
-    }
-
     impl PhysicalOperator for TestFilter {
         fn name(&self) -> &str {
             "TestFilter"
@@ -528,25 +514,6 @@ pub(crate) mod test_support {
     ) where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        let lowered =
-            assert_lowered_fails_like_datafusion_with_setup(sql, config, setup, message)
-                .await;
-        assert!(lowered > 0, "No aggregation was lowered\nquery: {sql}");
-    }
-
-    /// Like [`assert_aggregate_fails_like_datafusion_with_setup`], but without
-    /// requiring that an aggregation is lowered, e.g. for the aggregations that
-    /// [`PhysicalHashAggregate::try_lower`] leaves to DataFusion. Returns the
-    /// number of aggregations that [`lower`] lowered.
-    pub(crate) async fn assert_lowered_fails_like_datafusion_with_setup<F>(
-        sql: &str,
-        config: SessionConfig,
-        setup: F,
-        message: &str,
-    ) -> usize
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
         let ctx = datafusion_context(config.clone());
         setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
@@ -559,7 +526,6 @@ pub(crate) mod test_support {
             ),
             Err(e) => assert_same_error(&error, &e, &format!("planner, query: {sql}")),
         }
-        let mut lowered = 0;
         for (lower, tables) in [
             (lower as fn(&_) -> _, "default"),
             (lower_with_tiny_tables, "tiny"),
@@ -572,7 +538,7 @@ pub(crate) mod test_support {
                 .await
                 .expect("physical planning");
             let root = lower(&plan).expect("lowering");
-            lowered = count::<PhysicalHashAggregate>(&root);
+            assert!(count::<PhysicalHashAggregate>(&root) > 0, "{sql}");
             let exec: Arc<dyn ExecutionPlan> =
                 Arc::new(PipelineRootExec::try_new(root, plan).expect("root"));
             match collect(exec, ctx.task_ctx()).await {
@@ -586,7 +552,6 @@ pub(crate) mod test_support {
                 ),
             }
         }
-        lowered
     }
 
     /// A function `count` that looks like DataFusion's built-in `count`: of
@@ -820,7 +785,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion::prelude::SessionContext;
     use datafusion_common::Result;
 
     use datafusion::prelude::ParquetReadOptions;
@@ -839,33 +804,6 @@ mod tests {
     async fn assert_all_parity(queries: &[&str]) {
         for sql in queries {
             assert_aggregate_parity(sql).await;
-        }
-    }
-
-    /// Assert that the aggregations of `queries` are left to DataFusion (see
-    /// [`PhysicalHashAggregate::try_lower`]) in a session of configuration
-    /// `config`, by the planner and by [`lower`], and that the results are
-    /// DataFusion's: e.g. the aggregations of several partitions whose
-    /// aggregates may not split their rows exactly, and those of ordered
-    /// aggregates whose rows may tie.
-    async fn assert_all_left_to_datafusion(queries: &[&str], config: SessionConfig) {
-        let setup = async |ctx: &SessionContext| register_test_tables(ctx);
-        for sql in queries {
-            let root =
-                assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
-            assert_eq!(count::<PhysicalHashAggregate>(&root), 0, "{sql}");
-            let ctx = crate::test_utils::pipeline_context(config.clone());
-            register_test_tables(&ctx).expect("tables");
-            let plan = ctx
-                .sql(sql)
-                .await
-                .expect("planning")
-                .create_physical_plan()
-                .await
-                .expect("physical planning");
-            if let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() {
-                assert_eq!(count::<PhysicalHashAggregate>(root.operator()), 0, "{sql}");
-            }
         }
     }
 
@@ -1059,23 +997,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_aggregate_functions() {
-        // The averages of `BIGINT`s, which DataFusion adds up as `Float64`
-        // values, may not split their rows exactly: DataFusion's, of the
-        // partitions of `t1` (see `PhysicalHashAggregate::try_lower`). Those of
-        // the `INT`s of `t1` are exact (see `sums_exactly_as_floats`).
-        assert_all_left_to_datafusion(
-            &[
-                "SELECT e, SUM(b), AVG(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), \
-               APPROX_DISTINCT(h) FROM t1 GROUP BY e",
-            ],
-            test_session_config(),
-        )
-        .await;
         assert_all_parity(&[
             "SELECT d, SUM(a), AVG(a), MIN(a), MAX(a), COUNT(a), MEDIAN(a), \
              APPROX_DISTINCT(a) FROM t1 GROUP BY d",
-            "SELECT e, SUM(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), APPROX_DISTINCT(h) \
-             FROM t1 GROUP BY e",
+            "SELECT e, SUM(b), AVG(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), \
+             APPROX_DISTINCT(h) FROM t1 GROUP BY e",
             "SELECT d, MEDIAN(c), MIN(c), MAX(c), APPROX_DISTINCT(f) FROM t1 GROUP BY d",
             "SELECT d, AVG(g), MEDIAN(g), SUM(g) FROM t1 GROUP BY d",
             "SELECT e, BOOL_AND(a > 0), BOOL_OR(b > 5000), BIT_AND(a), BIT_OR(b), \
@@ -1169,9 +1095,7 @@ mod tests {
                 config = config.set_str(key, value);
             }
             for sql in [
-                // (Of strings of views: those of `Utf8`, `d`, may not fit an
-                // array once a join repeats them, see `materializes_safely`.)
-                "SELECT t1.a, COUNT(*), SUM(t2.w), MIN(t1.h) FROM t1 JOIN t2 ON t1.a = t2.k \
+                "SELECT t1.a, COUNT(*), SUM(t2.w), MIN(t1.d) FROM t1 JOIN t2 ON t1.a = t2.k \
                  GROUP BY t1.a",
                 "SELECT d, e, COUNT(*), SUM(a), AVG(g) FROM t1 GROUP BY d, e",
                 "SELECT id % 100 AS k, COUNT(*), MEDIAN(a) FROM t1 GROUP BY id % 100",
