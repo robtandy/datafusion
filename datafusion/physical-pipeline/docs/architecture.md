@@ -574,7 +574,12 @@ DataFusion still executes:
   encodings with other child fields than Arrow's, see `can_gather`);
 - the windows above TopKs of unbounded inputs that DataFusion's TopK may end
   early, which a native window, which reads all of its input first, would
-  wait for forever.
+  wait for forever;
+- the sorts, and the merges of the sorted partitions of windows, by keys of
+  unions (also inside other values): the native sort orders the rows by their
+  keys in the Arrow row format, which orders the values of a union by their
+  type first, also for a descending key, and would return other rows (e.g.
+  under `ORDER BY ... LIMIT`).
 
 ## Native operators
 

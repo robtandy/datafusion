@@ -121,7 +121,10 @@
 //!   refuse them;
 //! * the windows above TopKs of unbounded inputs that DataFusion may end early
 //!   (see `ends_unbounded_input_early_below`), which a native window, which
-//!   reads all of its input first, would wait for forever.
+//!   reads all of its input first, would wait for forever;
+//! * the merges of the sorted partitions of windows by keys of unions (also
+//!   inside other values), which the native sort orders otherwise, as the
+//!   sorts by such keys (see `Lowering::try_lower_merge_of_window`).
 //!
 //! # `EXPLAIN` and `EXPLAIN ANALYZE`
 //!
@@ -786,8 +789,9 @@ impl Lowering<'_> {
     /// whose memory pool has no limit (see
     /// [`lower_execution_plan_with_runtime`]), and if every partition of the
     /// input of the merge is ordered by its keys (otherwise its output would
-    /// not be sorted). A merge of no partitions, on which DataFusion fails, is
-    /// not lowered either.
+    /// not be sorted), and by keys that are not of unions (which the native
+    /// sort orders otherwise). A merge of no partitions, on which DataFusion
+    /// fails, is not lowered either.
     fn try_lower_merge_of_window(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -814,11 +818,22 @@ impl Lowering<'_> {
                 _ => return Ok(None),
             }
         }
+        // The native sort orders the rows by their keys in the row format,
+        // which orders the values of a union by their type first, also for a
+        // descending key, and its nulls among the values of their type, unlike
+        // DataFusion's merge (see `crate::sort::try_lower`): a merge by keys
+        // of unions (also inside other values) would return other rows.
         let schema = merge.input().schema();
-        if !merge
-            .input()
-            .equivalence_properties()
-            .ordering_satisfy(merge.expr().clone())?
+        let keys_of_unions = merge.expr().iter().any(|key| {
+            key.expr
+                .data_type(&schema)
+                .map_or(true, |data_type| contains_union(&data_type))
+        });
+        if keys_of_unions
+            || !merge
+                .input()
+                .equivalence_properties()
+                .ordering_satisfy(merge.expr().clone())?
             || !crate::sort::SortKeys::supports(merge.expr(), &schema)?
         {
             return Ok(None);
@@ -1321,6 +1336,25 @@ fn passes_states_on(stage: &Arc<dyn ExecutionPlan>, partial: &AggregateExec) -> 
             && reduce.input().schema() == partial.schema()
             && reduce.schema() == partial.schema()
     })
+}
+
+/// Whether values of `data_type` are unions, or have unions inside them.
+fn contains_union(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Union(..) => true,
+        DataType::Dictionary(_, values) => contains_union(values),
+        DataType::RunEndEncoded(_, values) => contains_union(values.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => contains_union(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| contains_union(field.data_type()))
+        }
+        _ => false,
+    }
 }
 
 /// Whether `input` is `side`, or a node below it through nodes of a single
@@ -2957,6 +2991,210 @@ mod tests {
             outcomes.assert_datafusion_fails();
             outcomes.assert_pipeline_rows(expected.pipeline.as_ref().unwrap());
             assert_eq!(count::<PhysicalWindow>(&outcomes.operator), 1);
+        }
+        Ok(())
+    }
+
+    /// A window function that returns dense unions of two children of
+    /// integers, `(type id, value)`: `(1, n)`, `(1, n - 1)`, ... for the first
+    /// half of the `n` rows of its partition, and `(0, n / 2)`, ..., `(0, 1)`
+    /// for the second half (or, if `nested`, lists of one of these unions),
+    /// which it declares to be in descending order (as `ROW_NUMBER` declares
+    /// its numbers to be in ascending order): DataFusion orders unions by
+    /// their type ids first, then by their values.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct DescendingUnions {
+        signature: datafusion_expr::Signature,
+        nested: bool,
+    }
+
+    impl DescendingUnions {
+        fn new(nested: bool) -> Self {
+            Self {
+                signature: datafusion_expr::Signature::exact(
+                    vec![],
+                    datafusion_expr::Volatility::Immutable,
+                ),
+                nested,
+            }
+        }
+
+        fn union_type() -> DataType {
+            DataType::Union(Self::fields(), arrow::datatypes::UnionMode::Dense)
+        }
+
+        fn item() -> arrow::datatypes::FieldRef {
+            Arc::new(Field::new("item", Self::union_type(), false))
+        }
+
+        fn fields() -> arrow::datatypes::UnionFields {
+            arrow::datatypes::UnionFields::try_new(
+                vec![0, 1],
+                vec![
+                    Field::new("a", DataType::Int32, false),
+                    Field::new("b", DataType::Int32, false),
+                ],
+            )
+            .unwrap()
+        }
+    }
+
+    impl datafusion_expr::WindowUDFImpl for DescendingUnions {
+        fn name(&self) -> &str {
+            "descending_unions"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn partition_evaluator(
+            &self,
+            _args: datafusion_expr::function::PartitionEvaluatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::PartitionEvaluator>> {
+            Ok(Box::new(DescendingUnionsEvaluator {
+                nested: self.nested,
+            }))
+        }
+
+        fn field(
+            &self,
+            field_args: datafusion_expr::function::WindowUDFFieldArgs,
+        ) -> Result<arrow::datatypes::FieldRef> {
+            let data_type = match self.nested {
+                true => DataType::List(Self::item()),
+                false => Self::union_type(),
+            };
+            Ok(Field::new(field_args.name(), data_type, false).into())
+        }
+
+        fn sort_options(&self) -> Option<arrow::compute::SortOptions> {
+            Some(arrow::compute::SortOptions {
+                descending: true,
+                nulls_first: false,
+            })
+        }
+    }
+
+    /// The evaluator of [`DescendingUnions`].
+    #[derive(Debug)]
+    struct DescendingUnionsEvaluator {
+        nested: bool,
+    }
+
+    impl datafusion_expr::PartitionEvaluator for DescendingUnionsEvaluator {
+        fn evaluate_all(
+            &mut self,
+            _values: &[arrow::array::ArrayRef],
+            num_rows: usize,
+        ) -> Result<arrow::array::ArrayRef> {
+            let rows = num_rows as i32;
+            let half = rows / 2;
+            let type_ids = (0..rows).map(|i| i8::from(i < half)).collect();
+            let offsets = (0..rows)
+                .map(|i| if i < half { i } else { i - half })
+                .collect();
+            let values = |range: std::ops::Range<i32>| -> arrow::array::ArrayRef {
+                Arc::new(Int32Array::from_iter_values(range.map(|i| rows - i)))
+            };
+            let unions = Arc::new(arrow::array::UnionArray::try_new(
+                DescendingUnions::fields(),
+                type_ids,
+                Some(offsets),
+                vec![values(half..rows), values(0..half)],
+            )?);
+            if !self.nested {
+                return Ok(unions);
+            }
+            Ok(Arc::new(arrow::array::ListArray::try_new(
+                DescendingUnions::item(),
+                arrow::buffer::OffsetBuffer::from_lengths(vec![1; num_rows]),
+                unions,
+                None,
+            )?))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_windows_by_keys_of_unions_are_left_to_datafusion() -> Result<()> {
+        // `... ORDER BY rn DESC LIMIT 1` over a window whose function returns
+        // the unions `(1, 4)`, `(1, 3)`, `(0, 2)`, `(0, 1)` of the rows `id` 0
+        // to 3, in descending order: DataFusion's merge returns the row 0. The
+        // native sort orders unions by the row format, by their type ids first
+        // also for a descending key: it would return another row, a wrong
+        // result. So the merge stays in DataFusion (see
+        // `Lowering::try_lower_merge_of_window`), as the sort module leaves
+        // sorts by keys of unions (also nested) to DataFusion.
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..4))],
+        )?;
+        // The window of the unions (or of lists of them), and the merge of its
+        // partitions by them, with a fetch of 1.
+        let plan = |nested: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                &[vec![rows.clone()]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let udwf = Arc::new(datafusion_expr::WindowUDF::new_from_impl(
+                DescendingUnions::new(nested),
+            ));
+            let window_expr = datafusion_physical_plan::windows::create_window_expr(
+                &datafusion_expr::WindowFunctionDefinition::WindowUDF(udwf),
+                "rn".to_string(),
+                &[],
+                &[],
+                &[],
+                Arc::new(datafusion_expr::WindowFrame::new(None)),
+                Arc::clone(&schema),
+                false,
+                false,
+                None,
+            )?;
+            let window: Arc<dyn ExecutionPlan> =
+                Arc::new(WindowAggExec::try_new(vec![window_expr], scan, true)?);
+            let ordering = LexOrdering::new([PhysicalSortExpr::new(
+                col("rn", &window.schema())?,
+                arrow::compute::SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            )])
+            .unwrap();
+            Ok(Arc::new(
+                SortPreservingMergeExec::new(ordering, window).with_fetch(Some(1)),
+            ))
+        };
+        let config = test_session_config();
+        let task_ctx =
+            || Arc::new(TaskContext::default().with_session_config(config.clone()));
+        let ids = |batches: Vec<RecordBatch>| -> Vec<i32> {
+            batches
+                .iter()
+                .flat_map(|batch| {
+                    let ids = batch
+                        .column(0)
+                        .as_primitive::<arrow::datatypes::Int32Type>();
+                    ids.values().to_vec()
+                })
+                .collect()
+        };
+        for nested in [false, true] {
+            // The window declares the order of the merge: it is not sorted.
+            let merge = plan(nested)?;
+            let window = Arc::clone(merge.children()[0]);
+            let ordering = merge.output_ordering().unwrap().clone();
+            assert!(window.equivalence_properties().ordering_satisfy(ordering)?);
+            let root = lower_for_default_runtime(plan(nested)?, &config)?;
+            let tree = format_operator_tree(root.operator());
+            assert!(root.operator().is::<BridgeOperator>(), "{tree}");
+            let expected = ids(collect(merge, task_ctx()).await?);
+            assert_eq!(expected, vec![0], "nested: {nested}");
+            let actual = ids(collect(root as Arc<dyn ExecutionPlan>, task_ctx()).await?);
+            assert_eq!(actual, expected, "nested: {nested}: {tree}");
         }
         Ok(())
     }
