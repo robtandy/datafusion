@@ -4717,6 +4717,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_chunks_with_a_selection_and_run_end_encoded_columns() -> Result<()> {
+        // A probe chunk with a selection, and a run-end encoded probe column
+        // (runs of 7 rows) that the joins output (or filter on): the rows of
+        // the output are taken from the physical columns, through the
+        // selection, and have the values of DataFusion's join of the selected
+        // rows (compared by their values: the runs of the outputs may differ).
+        let schema = |side: &str| {
+            let runs = DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Utf8, true)),
+            );
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}k"), DataType::Int32, true),
+                Field::new(format!("{side}r"), runs, true),
+            ]))
+        };
+        let batch = |side: &str, rows: i32| -> Result<RecordBatch> {
+            let keys =
+                Int32Array::from_iter((0..rows).map(|i| (i % 5 != 2).then_some(i % 17)));
+            let run_ends = Int32Array::from_iter_values(
+                (1..=(rows + 6) / 7).map(|run| (run * 7).min(rows)),
+            );
+            let values = StringArray::from_iter(
+                (0..(rows + 6) / 7)
+                    .map(|run| (run % 4 != 3).then(|| format!("{side}{}", run % 3))),
+            );
+            let runs = arrow::array::RunArray::<arrow::datatypes::Int32Type>::try_new(
+                &run_ends, &values,
+            )?;
+            Ok(RecordBatch::try_new(
+                schema(side),
+                vec![Arc::new(keys), Arc::new(runs)],
+            )?)
+        };
+        let build = DataChunk::from_record_batch(batch("l", 40)?);
+        let rows = (0..900).filter(|i| i % 3 != 1).collect::<Vec<u32>>();
+        let probe = DataChunk::from_record_batch(batch("r", 900)?)
+            .with_selection(SelectionVector::from(rows))?;
+        let filter = filter_on_schemas(&schema("l"), &schema("r"))?;
+        for join_type in ALL_JOIN_TYPES {
+            for filter in [None, Some(filter.clone())] {
+                let case = format!("{join_type}, filter: {}", filter.is_some());
+                let on = vec![(col("lk", &schema("l"))?, col("rk", &schema("r"))?)];
+                let join = Arc::new(PhysicalHashJoin::try_new(
+                    Arc::new(TestSource::with_schema(schema("l"), vec![build.clone()])),
+                    Arc::new(TestSource::with_schema(schema("r"), vec![probe.clone()])),
+                    on,
+                    filter.clone(),
+                    join_type,
+                    None,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?);
+                let actual = with_timeout(Executor::collect(join, task_ctx(), 3)).await?;
+                let expected =
+                    datafusion_join_of_chunks(&build, &probe, join_type, "k", filter)
+                        .await?;
+                assert_eq!(
+                    displayed_rows(&actual),
+                    displayed_rows(&expected.batches),
+                    "{case}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The residual filter `lr <> rr` of the inputs of
+    /// `probe_chunks_with_a_selection_and_run_end_encoded_columns`, of the
+    /// schemas `left` and `right`.
+    fn filter_on_schemas(left: &Schema, right: &Schema) -> Result<JoinFilter> {
+        let schema = Arc::new(Schema::new(vec![
+            left.field(1).clone(),
+            right.field(1).clone(),
+        ]));
+        let expression = binary_expr(
+            col(left.field(1).name(), &schema)?,
+            Operator::NotEq,
+            col(right.field(1).name(), &schema)?,
+        );
+        Ok(JoinFilter::new(
+            expression,
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+            ],
+            schema,
+        ))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn semi_anti_and_mark_joins_of_large_probe_chunks() -> Result<()> {
         // A probe chunk of more than `DEFAULT_VECTOR_SIZE` rows: the joins that
         // select their probe rows still output chunks of at most that many.
