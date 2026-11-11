@@ -17,26 +17,25 @@ This document describes the design of the engine and the contracts that
 operators must follow. It is the reference for everybody implementing native
 operators in this crate.
 
-## Hard requirement: byte-for-byte compatibility
+## Correctness: results and schemas
 
-Every query executed through `PipelineQueryPlanner` must produce **exactly**
-the output of default DataFusion:
-
-- the same output `SchemaRef`: field names, data types, nullability and
-  metadata (field and schema level);
-- the same Arrow data, compared byte for byte after canonicalization (see
-  [Differential testing](#differential-testing)). Only the row order may
-  differ, and only if the query has no top-level `ORDER BY`.
+Every query executed through `PipelineQueryPlanner` must return a correct
+answer to its SQL, with **exactly** the output `SchemaRef` of the plan that it
+lowers: field names, data types, nullability and metadata (field and schema
+level). It does not have to return DataFusion's bytes, nor raise DataFusion's
+errors: floating-point rounding, the row order that SQL does not define,
+behaviour that depends on batches, partitioning or parallelism, which of
+several errors is raised, whether an error is raised for rows that the engine
+never evaluates, capacity limits and error messages are the engine's own. And
+nothing is left to DataFusion to reproduce DataFusion's behaviour: see
+[Compatibility with DataFusion](compatibility.md), which replaces the earlier
+requirement of byte-for-byte and error parity.
 
 To make this achievable, the engine never re-plans a query: it starts from
 the `ExecutionPlan` produced by DataFusion's `DefaultPhysicalPlanner`, reuses
 its schemas and its `PhysicalExpr`s (with all coercions applied), and keeps
-all scan pushdowns. Native operators must reproduce the semantics of the
-DataFusion operator they replace, including error behavior. See
-[Error parity](error-parity.md) for how the planner decides which parts of a
-plan stay in DataFusion so that their errors match, and for the errors that
-are out of the scope of parity: those of reading or decoding the rows of
-Parquet files that the dynamic filters of the two engines skip differently.
+all scan pushdowns. Native operators must implement the semantics of the
+DataFusion operator they replace.
 
 ## Overview
 
@@ -510,40 +509,77 @@ shared by all threads, which sink their rows into them (and the aggregations
 and windows partition them by their keys themselves), so no rows are shuffled
 through channels.
 
-Any node it does not recognize (e.g. a sort-merge join, a scalar subquery, a
-recursive query or a custom node) is wrapped, with its whole subtree, in a
-`BridgeOperator`, so every query can be executed. So are the nodes whose
-results or errors a native operator would not reproduce exactly. Every
-native operator documents which nodes it reproduces in its `try_lower` (or
-`supports_*`) function, and the module documentation of `planner.rs` lists
-the rules of the planner itself. In short, DataFusion executes:
+Any node it does not recognize (e.g. a sort-merge join, a recursive query or
+a custom node) is wrapped, with its whole subtree, in a `BridgeOperator`, so
+every query can be executed. Every native operator documents which nodes it
+implements in its `try_lower` (or `supports_*`) function, and the module
+documentation of `planner.rs` lists the rules of the planner itself.
 
-- the plans below a limit that stops the execution early (but for sorts and
-  windows, which read all of their input in both engines);
-- operators with an expression whose errors depend on the batches it is
-  evaluated on, or with more than one part that may fail (which error comes
-  first depends on the batches), and, on several threads, operators with a
-  part that may fail (the threads evaluate the chunks of a partition in
-  parallel, DataFusion its rows in order): e.g. the decimal arithmetic of
-  TPC-H, which may overflow;
-- nodes that coalesce or concatenate batches of types whose concatenation may
-  fail (dictionaries, run-end encodings, strings and lists with 32-bit
-  offsets), and, below a node of the same pipeline that may fail, nodes that
-  pull ahead of their consumers (`FilterExec`, coalescing repartitions, hash
-  and nested loop joins, which coalesce their output);
-- joins and TopKs whose dynamic filters prune the reads of inputs that may
-  fail (e.g. CSV scans, or work that may fail above Parquet scans, whose
-  reading and decoding is treated as unable to fail, see
-  [Error parity](error-parity.md)), and windows above TopKs that may end
-  some of their partitions early.
+The planner does not judge how the expressions of a node may fail, nor on
+which rows, threads or batches they are evaluated (see
+[Compatibility with DataFusion](compatibility.md)): it lowers every node that
+a native operator implements, also below limits, on any number of threads,
+above and below other operators that may fail, and over inputs that may fail.
+For example, the decimal division of TPC-H Q8 (by a sum that may be 0), the
+casts of strings of a filter on 16 threads, user-defined functions, and the
+hash joins and TopKs whose dynamic filters prune the scans below them are
+native.
 
-Windows, nested loop joins and cross joins keep all of their rows in memory
-without reserving it in the memory pool, while the DataFusion nodes that they
-replace reserve their memory (and fail, or spill, once the pool is
-exhausted): they are only lowered for sessions whose memory pool has no
-limit. `lower_execution_plan` (for any session) and
-`PipelineRootExec::reset_state` lower as if the pool had a limit, and as if
-the session had the options for which the fewest nodes can be lowered.
+- A native TopK whose dynamic filter a scan below it reads updates that
+  filter with its threshold, so that the scan skips the files, row groups and
+  rows that it rules out, as DataFusion's TopK does.
+- A native hash join sets its dynamic filter to the bounds of its build keys,
+  whatever its probe side evaluates, so that the scans below it skip the
+  files, row groups and rows that cannot match, e.g. the joins of TPC-H Q15
+  and Q17 over Parquet.
+- The nodes that only distribute or coalesce rows are removed whatever the
+  types of their rows (DataFusion may fail to concatenate dictionaries or
+  strings with 32-bit offsets that the native operators never concatenate).
+- Below a merge with a fetch (`CoalescePartitionsExec`), the fetch of a
+  `FilterExec`, a `HashJoinExec` or a `LocalLimitExec` that limits every
+  partition of its input is redundant: the native limit replaces them (e.g.
+  `WHERE ... LIMIT`).
+- The filters of a pipeline that may stop before its input ends (below a
+  limit, a filter with a fetch or an aggregation with a soft limit, up to the
+  pipeline breakers below them, or in the subquery of a scalar subquery, which
+  fails at its second row) are not wrapped in a `CachingOperator`, which would hold their rows back until it is
+  full or its input ends: a limit above a stream that stays pending once it
+  has produced its rows ends with them, as in DataFusion.
+- A node with a fetch of 0 is lowered to a source of no rows, without its
+  input.
+- A native filter evaluates a conjunct that may fail only on the rows that the
+  conjuncts before it select (`x <> 0 AND 10 / x > 1` never divides by zero),
+  and rejects the rows for which a conjunct is `NULL` at once.
+
+DataFusion still executes:
+
+- the nodes that no native operator implements yet (e.g. sort-merge and
+  symmetric hash joins, recursive queries, `StreamingTableExec`s) and
+  user-defined `ExecutionPlan`s, with their subtrees;
+- the nodes that the native operators refuse themselves (see their
+  `try_lower` functions);
+- windows, nested loop joins and cross joins in sessions whose memory pool
+  has a limit: they keep all of their rows in memory without reserving it in
+  the memory pool, while the DataFusion nodes that they replace reserve their
+  memory (and fail, or spill, once the pool is exhausted).
+  `lower_execution_plan` (for any session) and `PipelineRootExec::reset_state`
+  lower as if the pool had a limit, and as if the session had the options for
+  which the fewest nodes can be lowered;
+- the sorts, windows, aggregations and joins of values that address more than
+  their memory (run-end encodings with run ends of fewer than 64 bits, lists
+  of nulls with 32-bit offsets), which the native operators would materialize
+  as they gather their rows, before the memory pool could refuse them;
+- the filters and projections of inputs whose rows the native operators
+  cannot gather (lists of values that take less than a byte each, run-end
+  encodings with other child fields than Arrow's, see `can_gather`);
+- the windows above TopKs of unbounded inputs that DataFusion's TopK may end
+  early, which a native window, which reads all of its input first, would
+  wait for forever;
+- the sorts, and the merges of the sorted partitions of windows, by keys of
+  unions (also inside other values): the native sort orders the rows by their
+  keys in the Arrow row format, which orders the values of a union by their
+  type first, also for a descending key, and would return other rows (e.g.
+  under `ORDER BY ... LIMIT`).
 
 ## Native operators
 
@@ -569,57 +605,31 @@ Joins are also operators of their probe pipelines.
 analytical queries (correlated subqueries, `EXISTS`, `IN`, multi-stage
 aggregations, grouping sets, windows, skewed hash joins, nested loop and cross
 joins, TopKs, set operations) over `MemTable`s and Parquet files on both
-engines, and asserts their byte parity. `tpch_queries_are_lowered_as_listed`
-asserts the exact lowering of every TPC-H query (`TPCH_COVERAGE`): the
-numbers of native and of all operators, and the DataFusion plans that run in
-`BridgeOperator`s, each with why the native operators leave it to DataFusion.
-On 4 threads, with the sessions of the suite (which trust DataFusion's
-built-in functions by default, see `TrustedFunctions`):
+engines, and asserts that they return the same results (whose canonical forms
+are byte-identical: these results are unambiguous).
+`tpch_queries_are_lowered_as_listed` asserts the exact lowering of every TPC-H
+query (`TPCH_COVERAGE`): on 4 threads, with the sessions of the suite, all 22
+queries run fully natively over both sources, without `BridgeOperator`s, and
+are lowered to exactly the listed numbers of operators.
 
-- Over `MemTable`s, 21 of the 22 queries run fully natively: all but Q8. Their
-  decimal arithmetic, and the casts of numbers into decimals with which Q11
-  compares the sums of its groups with its scalar subquery, can only fail
-  with overflows, and are evaluated natively on any number of threads, as are
-  the scalar subqueries of Q11, Q15 and Q22 (`ScalarSubqueryExec`), the
-  `date_part` of Q7 to Q9, the `substr` of Q22 and the residual filter of the
-  semi join of Q17. The native projection refuses the projection of Q8: a
-  decimal division by a sum that may be 0, which may fail with several kinds
-  of errors.
-- Over Parquet, 19 queries run fully natively: all but Q8 and the queries
-  whose hash joins have dynamic filters that prune the reads of the Parquet
-  scans of their probe sides, below work that may fail on the rows that
-  DataFusion skips (the native join sets its filter to other values, the
-  bounds of its build keys): the decimal arithmetic of the revenues of Q15
-  and the cast into a decimal of the average quantities of Q17. (The residual
-  filter of the semi join below the join of Q20, which casts integers into
-  floats, cannot fail: the planner judges the keys and the filters of joins
-  on the rows that they evaluate them on.)
+- The decimal arithmetic of TPC-H, the casts of numbers into decimals with
+  which Q11 compares the sums of its groups with its scalar subquery, the
+  scalar subqueries of Q11, Q15 and Q22 (`ScalarSubqueryExec`), the
+  `date_part` of Q7 to Q9, the `substr` of Q22, the residual filters of the
+  semi joins of Q17 and Q20, and the decimal division of Q8 (by a sum that may
+  be 0) are native, on any number of threads.
+- Over Parquet, the hash joins of Q15 and Q17 have dynamic filters that the
+  Parquet scans of their probe sides read, below decimal arithmetic that may
+  overflow: the native joins set them to the bounds of their build keys.
 - The TopK of Q18 has a dynamic filter that the scan of `orders` reads, below
-  hash joins and an aggregation, which reads all of its input before the
-  TopK sees its first group: in both engines, the filter prunes nothing, and
-  the TopK is native (see `Lowering::try_lower_sort`). So are the TopKs whose
-  dynamic filters scans read through nodes that only pass rows on, without
-  work that may fail on the rows they prune, e.g. the `LIKE` of ClickBench's
-  `hits23`: the native TopK updates the filter, so that the scans of Parquet
-  files skip the reads that its threshold rules out.
+  hash joins and an aggregation; the native TopK updates it, as do the TopKs of
+  ClickBench's `hits23` and `hits25`, so that the scans of Parquet files skip
+  the reads that its threshold rules out.
 
-When it decides whether a TopK or a hash join with a dynamic filter runs
-natively, the planner treats reading and decoding a scan of Parquet files as
-unable to fail, and judges only the expressions of the scan: its pushed-down
-predicate and its projection (see `source_may_fail`). The errors of reading or
-decoding the rows that the dynamic filter of only one of the engines skips
-(e.g. of a custom `ParquetFileReaderFactory`, of a corrupt file, of INT96
-timestamps that overflow the unit of the table, or of dictionary keys that
-overflow their type) are out of the scope of error parity: see §6 of
-[Error parity](error-parity.md). The planner never identifies reader factories
-or schema providers by their `Debug` text. The scans of CSV files may fail to
-parse any of their values.
-
-All window queries of the stress corpus run on native windows but the two
+All window queries of the stress corpus run on native windows, also those
 whose windows are stacked on windows of other partitions or orders, which
-DataFusion sorts or merges in between (`PhysicalWindow::try_lower` does not
-look through them), and all of its nested loop and cross joins run natively
-(`windows_and_loop_joins_of_the_stress_corpus_are_native`).
+DataFusion sorts or merges in between, and all of its nested loop and cross
+joins run natively (`windows_and_loop_joins_of_the_stress_corpus_are_native`).
 
 ## Benchmarks
 
@@ -647,8 +657,11 @@ aggregate functions the rows of the threads whose groups hardly repeat bypass
 their tables and are aggregated once, by the final aggregation of their radix
 partitions (the _After_ columns, see `rows_can_bypass_tables`).
 
-The measurements below were taken on a 16-core Neoverse-N1 machine with 16
-threads, with the same build for both runs: the median of 5 executions, in ms
+The measurements below predate the [correctness policy](compatibility.md) of
+2026-11-11, which removed the planner's rules that left nodes to DataFusion to
+reproduce its errors: their native coverage is that of the time. They were
+taken on a 16-core Neoverse-N1 machine with 16 threads, with the same build
+for both runs: the median of 5 executions, in ms
 (without planning), and the native operators / all operators of the lowered
 plan (a plan of one operator runs entirely in DataFusion, in a
 `BridgeOperator`; the queries whose plans are partly native leave the
@@ -817,7 +830,11 @@ Of note:
 
 ## Differential testing
 
-`test_utils.rs` provides the harness that proves byte compatibility:
+`test_utils.rs` provides the harness that compares the results of both
+engines. Results are compared by meaning (see
+[Compatibility with DataFusion](compatibility.md#testing)); for queries whose
+results are unambiguous, comparing their canonical forms byte for byte does
+that:
 
 ```rust
 #[tokio::test]
@@ -880,6 +897,9 @@ mod test_utils;
 - Keep chunks at most `DEFAULT_VECTOR_SIZE` rows.
 - Never change the schema of the data: reuse the `SchemaRef`s and
   `PhysicalExpr`s of the DataFusion plan being lowered.
-- Prove every native operator with `assert_byte_eq_with_datafusion` tests,
-  including empty inputs, nulls, all relevant data types and skewed
-  partitions.
+- Test every native operator against DataFusion, by meaning (see
+  [Compatibility with DataFusion](compatibility.md#testing); with
+  `assert_byte_eq_with_datafusion` for unambiguous results), including empty
+  inputs, nulls, all relevant data types and skewed partitions. Where one
+  engine fails and the other does not, show that the difference is one that
+  the compatibility policy allows.

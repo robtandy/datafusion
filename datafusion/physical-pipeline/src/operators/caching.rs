@@ -32,7 +32,10 @@
 //!
 //! Since chunks are only emitted once the cache is full, caching delays the
 //! output of a pipeline: it should not be used below a `LIMIT` that may stop
-//! the pipeline early (DuckDB does not cache in such pipelines either).
+//! the pipeline early (DuckDB does not cache in such pipelines either), whose
+//! input may never end, e.g. a stream that stays pending once it has produced
+//! the rows of the limit. The [`PipelineQueryPlanner`](crate::PipelineQueryPlanner)
+//! does not cache the filters of such pipelines.
 
 use std::sync::Arc;
 
