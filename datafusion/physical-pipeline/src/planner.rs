@@ -218,6 +218,7 @@ use crate::operators::materialized_cte::{
 };
 use crate::operators::partial_sort::PhysicalPartialSort;
 use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
+use crate::operators::piecewise_merge_join::nested_loop_join_of;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
@@ -597,6 +598,11 @@ impl Lowering<'_> {
                 return Ok(join);
             }
             if let Some(join) = self.try_lower_loop_join(plan)? {
+                return Ok(join);
+            }
+            if let Some(join) = nested_loop_join_of(plan)?
+                && let Some(join) = self.try_lower_loop_join(&join)?
+            {
                 return Ok(join);
             }
         }
