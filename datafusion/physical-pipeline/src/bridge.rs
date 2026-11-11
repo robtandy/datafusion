@@ -6,8 +6,15 @@
 //! engine.
 //!
 //! * [`BridgeOperator`] runs any [`ExecutionPlan`] as a parallel source of
-//!   the pipeline engine. The planner uses it as a fallback for every node it
-//!   does not lower to a native operator.
+//!   the pipeline engine. The planner wraps in it, with its subtree, every
+//!   node that it does not lower to a native operator (see the module
+//!   documentation of `planner.rs`): user-defined `ExecutionPlan`s, the node
+//!   types that no native operator implements yet (e.g. sort-merge and
+//!   symmetric hash joins, recursive queries), the nodes that the native
+//!   operators refuse themselves, and the nodes left to DataFusion by the
+//!   rules about memory (e.g. the windows and loop joins of sessions whose
+//!   memory pool has a limit). It never runs a node only so that the results
+//!   or the errors are DataFusion's (see `docs/compatibility.md`).
 //! * [`PipelineRootExec`] is an [`ExecutionPlan`] that runs a
 //!   [`PhysicalOperator`] tree with the [`Executor`] and streams its output,
 //!   so that the pipeline engine plugs into DataFusion's `SessionContext`.

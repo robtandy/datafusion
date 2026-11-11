@@ -117,7 +117,7 @@ impl PhysicalLimit {
     ///   partition), and the native limit replaces both. So does the fetch of
     ///   a `FilterExec` or a `HashJoinExec` (e.g. of `WHERE ... LIMIT`, or of
     ///   a join below a limit), possibly below projections: the input is
-    ///   lowered without that fetch (see [`without_redundant_fetch`]), which
+    ///   lowered without that fetch (see `without_redundant_fetch`), which
     ///   the native filters and joins, without partitions, could not apply
     ///   to every partition, and so is a `LocalLimitExec` below projections.
     ///

@@ -2777,7 +2777,7 @@ pub(crate) mod test_support {
         (projections, filters)
     }
 
-    /// The tables of the error parity tests: [`register_all_tables`] and the
+    /// The tables of the tests of errors: [`register_all_tables`] and the
     /// guard tables `dense`, `sparse`, `nulls` and `nulls_ok`.
     pub(crate) async fn guard_tables(ctx: &SessionContext) -> Result<()> {
         register_all_tables(ctx)?;
