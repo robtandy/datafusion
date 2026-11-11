@@ -892,6 +892,10 @@ pub(crate) mod test_support {
     /// `LIMIT`, whose values of `v` are the `limit` best ones of `all`, in
     /// their order: which of the rows that tie with the last one the query
     /// returns is the engine's own.
+    // Arrow buffer memory accounting (the `arrow-buffer/pool` feature, enabled
+    // by `--all-features`) does not affect the equality or hashing of
+    // `ScalarValue`s. Not `expect`: the lint only fires with that feature.
+    #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
     pub(crate) fn assert_top_rows(
         actual: &[RecordBatch],
         all: &[RecordBatch],
@@ -931,6 +935,10 @@ pub(crate) mod test_support {
     /// `ORDER BY`, of distinct rows (e.g. `SELECT DISTINCT ...`), are `limit`
     /// distinct rows (or all of them) of `all`, the rows of the query without
     /// its `LIMIT`: which rows the query returns is the engine's own.
+    // Arrow buffer memory accounting (the `arrow-buffer/pool` feature, enabled
+    // by `--all-features`) does not affect the equality or hashing of
+    // `ScalarValue`s. Not `expect`: the lint only fires with that feature.
+    #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
     pub(crate) fn assert_any_rows(
         actual: &[RecordBatch],
         all: &[RecordBatch],
