@@ -1956,9 +1956,9 @@ impl Judgement {
     /// judged on the schema of its input if it has a single child, the keys and
     /// the filter of a join on the schemas of the rows they are evaluated on
     /// (the keys of each side on its rows, the filter on the columns of the
-    /// candidate pairs that it reads, see [`join_expression_schema`]), and
-    /// without schema otherwise, which is conservative (expressions that may
-    /// fail then fail on empty batches). The aggregations that merge partial states
+    /// candidate pairs that it reads, see [`join_expressions`]), and without
+    /// schema otherwise, which is conservative (expressions that may fail then
+    /// fail on empty batches). The aggregations that merge partial states
     /// evaluate no expression on their input (the arguments of their aggregate
     /// functions are those of the partial aggregations), and the dynamic
     /// filters that `plan` produces (e.g. the threshold of a TopK) compare the
@@ -1978,16 +1978,19 @@ impl Judgement {
             [child] => child.schema(),
             _ => Arc::new(Schema::empty()),
         };
+        // The keys and the filter of a join, in each of their roles: one
+        // expression may be a key of both sides, evaluated on the rows of each.
+        let join_expressions = join_expressions(plan);
+        for (expr, join_schema) in &join_expressions {
+            judgement.add(expr, join_schema);
+        }
         let produced = plan.dynamic_expressions_produced();
         let listed = plan.apply_expressions(&mut |expr| {
-            if !produced
-                .iter()
-                .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
-            {
-                match join_expression_schema(plan, expr) {
-                    Some(join_schema) => judgement.add(expr, &join_schema),
-                    None => judgement.add(expr, &schema),
-                }
+            let is = |other: &Arc<dyn PhysicalExpr>| {
+                std::ptr::addr_eq(Arc::as_ptr(other), Arc::as_ptr(expr))
+            };
+            if !produced.iter().any(is) && !join_expressions.iter().any(|(e, _)| is(e)) {
+                judgement.add(expr, &schema);
             }
             Ok(TreeNodeRecursion::Continue)
         });
@@ -2033,31 +2036,35 @@ impl Judgement {
     }
 }
 
-/// The schema of the rows on which `plan`, a hash join or a nested loop join,
-/// evaluates its expression `expr`: the schema of its left (build) input for
-/// one of its left keys, of its right (probe) input for one of its right keys,
-/// and the schema of its filter (the columns of both sides that the filter
-/// reads) for its filter. `None` for any other node or expression.
-fn join_expression_schema(
-    plan: &dyn ExecutionPlan,
-    expr: &Arc<dyn PhysicalExpr>,
-) -> Option<SchemaRef> {
-    let is = |candidate: &Arc<dyn PhysicalExpr>| Arc::ptr_eq(candidate, expr);
-    let (keys, filter) = match plan.downcast_ref::<HashJoinExec>() {
-        Some(join) => (join.on(), join.filter()),
-        None => (&[][..], plan.downcast_ref::<NestedLoopJoinExec>()?.filter()),
+/// The keys and the filter of `plan`, a hash join or a nested loop join, each
+/// with the schema of the rows on which `plan` evaluates it: its left (build)
+/// keys on the rows of its left input, its right (probe) keys on those of its
+/// right input, and its filter on its own schema (the columns of both sides
+/// that the filter reads). In each of their roles: the same expression may be
+/// a key of both sides (e.g. `CAST(v@0 AS BIGINT)`, of the integers `v` of one
+/// side and of the strings `v` of the other), judged on the rows of each.
+/// Empty for any other node.
+fn join_expressions(plan: &dyn ExecutionPlan) -> Vec<(Arc<dyn PhysicalExpr>, SchemaRef)> {
+    let (keys, filter) = if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        (join.on(), join.filter())
+    } else if let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() {
+        (&[][..], join.filter())
+    } else {
+        return vec![];
     };
     let children = plan.children();
-    if let Some(filter) = filter.filter(|filter| is(filter.expression())) {
-        return Some(Arc::clone(filter.schema()));
+    let [left, right] = children.as_slice() else {
+        return vec![];
+    };
+    let mut expressions = Vec::with_capacity(2 * keys.len() + 1);
+    for (left_key, right_key) in keys {
+        expressions.push((Arc::clone(left_key), left.schema()));
+        expressions.push((Arc::clone(right_key), right.schema()));
     }
-    if keys.iter().any(|(left, _)| is(left)) {
-        return children.first().map(|left| left.schema());
+    if let Some(filter) = filter {
+        expressions.push((Arc::clone(filter.expression()), Arc::clone(filter.schema())));
     }
-    if keys.iter().any(|(_, right)| is(right)) {
-        return children.get(1).map(|right| right.schema());
-    }
-    None
+    expressions
 }
 
 /// The judgement of the keys that `sort`, a [`PhysicalSort`] or a
@@ -5125,6 +5132,108 @@ mod tests {
         let config = test_session_config().with_target_partitions(1);
         let root = assert_parity_with(sql, config, setup_test_tables).await;
         assert_native(sql, &root);
+        assert_eq!(count::<PhysicalSort>(&root), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_over_joins_whose_shared_keys_may_fail_on_their_probe_side_stay_in_datafusion()
+    -> Result<()> {
+        use datafusion_common::{JoinType, NullEquality};
+        use datafusion_expr::Operator;
+        use datafusion_physical_expr::expressions::{binary, cast, lit};
+
+        // A `CollectLeft` join on one key expression, `CAST(v@0 AS BIGINT)`,
+        // that both sides share: the integers `v` of its build side, which
+        // cannot fail to cast, and the strings `v` of its probe side, which
+        // can: `SORT_RUN_ROWS` rows `'1'`, then `'bad_integer'`, in batches of
+        // 4096 rows. A sort by `10 / d` above it, whose first `d` is 0:
+        // DataFusion's sort reads all of its input before it evaluates its
+        // keys, so it fails to cast the probe key; the native sort sorts (and
+        // evaluates the keys of) runs of `SORT_RUN_ROWS` rows as it reads its
+        // input, and would divide by zero first. The key is judged on the rows
+        // of each side: on the probe side, it may fail.
+        let rows = crate::sort::sort_sink::SORT_RUN_ROWS + 1;
+        let build_schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let build = RecordBatch::try_new(
+            Arc::clone(&build_schema),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let probe_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Utf8View, false),
+            Field::new("d", DataType::Int32, false),
+        ]));
+        let mut v = vec!["1"; rows];
+        v[rows - 1] = "bad_integer";
+        let mut d = vec![1; rows];
+        d[0] = 0;
+        let probe = (0..rows)
+            .step_by(4096)
+            .map(|offset| {
+                let end = (offset + 4096).min(rows);
+                RecordBatch::try_new(
+                    Arc::clone(&probe_schema),
+                    vec![
+                        Arc::new(arrow::array::StringViewArray::from(
+                            v[offset..end].to_vec(),
+                        )),
+                        Arc::new(Int32Array::from(d[offset..end].to_vec())),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key = cast(col("v", &build_schema)?, &build_schema, DataType::Int64)?;
+        let sort = |divide: bool| {
+            let (build, probe) = (build.clone(), probe.clone());
+            let (build_schema, probe_schema) =
+                (Arc::clone(&build_schema), Arc::clone(&probe_schema));
+            let key = Arc::clone(&key);
+            move || -> Arc<dyn ExecutionPlan> {
+                let join: Arc<dyn ExecutionPlan> = Arc::new(
+                    HashJoinExec::try_new(
+                        MemorySourceConfig::try_new_exec(
+                            &[vec![build.clone()]],
+                            Arc::clone(&build_schema),
+                            None,
+                        )
+                        .unwrap(),
+                        MemorySourceConfig::try_new_exec(
+                            std::slice::from_ref(&probe),
+                            Arc::clone(&probe_schema),
+                            None,
+                        )
+                        .unwrap(),
+                        vec![(Arc::clone(&key), Arc::clone(&key))],
+                        None,
+                        &JoinType::Inner,
+                        None,
+                        PartitionMode::CollectLeft,
+                        NullEquality::NullEqualsNothing,
+                        false,
+                    )
+                    .unwrap(),
+                );
+                let schema = join.schema();
+                let d = col("d", &schema).unwrap();
+                let expr = match divide {
+                    true => binary(lit(10), Operator::Divide, d, &schema).unwrap(),
+                    false => d,
+                };
+                let ordering = LexOrdering::new([PhysicalSortExpr::new_default(expr)])
+                    .expect("a sort key");
+                Arc::new(SortExec::new(ordering, join))
+            }
+        };
+        let mut config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(4096);
+        config.options_mut().execution.sort_in_place_threshold_bytes = 1 << 30;
+        let error = Some("Cannot cast string 'bad_integer'");
+        let root = assert_plan_outcome(sort(true), config.clone(), error).await;
+        assert_eq!(count::<PhysicalSort>(&root), 0);
+        // By a key that cannot fail, the sort is native.
+        let root = assert_plan_outcome(sort(false), config, error).await;
         assert_eq!(count::<PhysicalSort>(&root), 1);
         Ok(())
     }
