@@ -1457,10 +1457,7 @@ mod tests {
     use super::super::PhysicalHashAggregate;
     use super::super::test_support::{assert_aggregate_parity_with_setup, lower};
     use crate::executor::Executor;
-    use crate::test_utils::{
-        assert_byte_eq_with_datafusion_with_config, canonical_batch, datafusion_context,
-        test_session_config,
-    };
+    use crate::test_utils::{canonical_batch, datafusion_context, test_session_config};
 
     /// The partition of the group of the keys of `row`.
     fn partition_of_row(keys: &[ArrayRef], row: usize) -> usize {
@@ -2894,6 +2891,169 @@ mod tests {
         Ok(())
     }
 
+    /// A function `batch_sum` that adds up the values of every batch first.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct BatchSum {
+        signature: datafusion_expr::Signature,
+    }
+
+    impl datafusion_expr::AggregateUDFImpl for BatchSum {
+        fn name(&self) -> &str {
+            "batch_sum"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Float64)
+        }
+
+        fn accumulator(
+            &self,
+            _: datafusion_expr::function::AccumulatorArgs,
+        ) -> Result<Box<dyn datafusion_expr::Accumulator>> {
+            Ok(Box::new(BatchSumAccumulator(0.0)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct BatchSumAccumulator(f64);
+
+    impl datafusion_expr::Accumulator for BatchSumAccumulator {
+        fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+            let values = values[0].as_primitive::<arrow::datatypes::Float64Type>();
+            self.0 += values.values().iter().sum::<f64>();
+            Ok(())
+        }
+
+        fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+            let sums = states[0].as_primitive::<arrow::datatypes::Float64Type>();
+            self.0 += sums.values().iter().sum::<f64>();
+            Ok(())
+        }
+
+        fn state(&mut self) -> Result<Vec<datafusion_common::ScalarValue>> {
+            Ok(vec![datafusion_common::ScalarValue::Float64(Some(self.0))])
+        }
+
+        fn evaluate(&mut self) -> Result<datafusion_common::ScalarValue> {
+            Ok(datafusion_common::ScalarValue::Float64(Some(self.0)))
+        }
+
+        fn size(&self) -> usize {
+            size_of::<Self>()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accumulators_that_depend_on_their_batches_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // A single partition of one batch of 8,192 rows, `k = 1`, and `f = 0` but
+        // `f[0] = 1e16`, `f[2048] = -1e16` and `f[2049] = 1`. The accumulators
+        // that add up the values of a batch first get `1.0` from DataFusion's
+        // batch, but `0.0` from the chunks of 2,048 rows of the native operator
+        // (`1e16 + (-1e16 + 1)`): [`BatchSum`], a user-defined aggregate (whose
+        // accumulators may compute anything from their batches), and
+        // DataFusion's `SUM` and `AVG` of floating point values without `GROUP
+        // BY`. The t-digests of `approx_median` and `approx_percentile_cont`
+        // merge every batch, so that their quantiles of the 8,192 distinct
+        // values `g` differ too (e.g. 5615.31 and 5615.61). So their
+        // aggregations are left to DataFusion (see `updates_like_datafusion`),
+        // in both sessions: those of user-defined aggregates always, those of
+        // the built-in ones of a single partition, whose results are
+        // deterministic. The grouped `SUM` and `AVG` add up their rows one by
+        // one, and stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("g", DataType::Float64, false),
+        ]));
+        let mut f = vec![0.0; 8_192];
+        f[0] = 1e16;
+        f[2_048] = -1e16;
+        f[2_049] = 1.0;
+        let g =
+            (0..8_192i64).map(|i| ((i * 7_919) % 8_191) as f64 * 1.37 + (i % 13) as f64);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(arrow::array::Float64Array::from(f)),
+                Arc::new(arrow::array::Float64Array::from_iter_values(g)),
+            ],
+        )?;
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![vec![batch.clone()]],
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            ctx.register_udaf(datafusion_expr::AggregateUDF::from(BatchSum {
+                signature: datafusion_expr::Signature::exact(
+                    vec![DataType::Float64],
+                    datafusion_expr::Volatility::Immutable,
+                ),
+            }));
+            Ok(())
+        };
+        // The queries, the target partitions on which they run, and whether
+        // their aggregations are native.
+        let queries: [(&str, &[usize], bool); 7] = [
+            (
+                "SELECT k, batch_sum(f) FROM t GROUP BY k",
+                &[1, 4, 16],
+                false,
+            ),
+            ("SELECT batch_sum(f) FROM t", &[1, 4, 16], false),
+            ("SELECT SUM(f), AVG(f) FROM t", &[1], false),
+            (
+                "SELECT k, approx_median(g), approx_percentile_cont(g, 0.9) FROM t \
+                 GROUP BY k",
+                &[1],
+                false,
+            ),
+            ("SELECT approx_percentile_cont(g, 0.13) FROM t", &[1], false),
+            (
+                "SELECT k, SUM(f), AVG(f), STDDEV(g) FROM t GROUP BY k",
+                &[1],
+                true,
+            ),
+            ("SELECT COUNT(*), MIN(f), MAX(g), SUM(k) FROM t", &[1], true),
+        ];
+        for (sql, partitions, native) in queries {
+            for &target_partitions in partitions {
+                for trusted in [false, true] {
+                    let mut config =
+                        test_session_config().with_target_partitions(target_partitions);
+                    if trusted {
+                        config = trusting(config);
+                    }
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    // DataFusion's sums: 1.0.
+                    if sql.contains("SUM(f)") || sql.contains("batch_sum(f)") {
+                        let column = usize::from(sql.starts_with("SELECT k"));
+                        let output = ctx.sql(sql).await?.collect().await?;
+                        let sums = output[0]
+                            .column(column)
+                            .as_primitive::<arrow::datatypes::Float64Type>();
+                        assert_eq!(sums.values().as_ref(), &[1.0], "{sql}");
+                    }
+                    if native {
+                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
+                        assert_aggregate_parity_with_setup(sql, config, &setup).await;
+                    } else {
+                        assert_left_to_datafusion(sql, config, &setup).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations of the plan of `sql` that the planner
     /// lowers in a session of configuration `config` set up by `setup`.
     async fn planned_aggregations<F>(
@@ -3195,34 +3355,19 @@ mod tests {
                 assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
             }
             // User-defined functions that look like DataFusion's `count` and
-            // `sum`, and replace them (see `lookalike_count`): their rows never
-            // bypass the tables.
+            // `sum`, and replace them (see `lookalike_count`): their
+            // aggregations are left to DataFusion (see `updates_like_datafusion`).
             let setup_lookalikes = async |ctx: &SessionContext| -> Result<()> {
                 setup(ctx).await?;
                 ctx.register_udaf(lookalike_count());
                 ctx.register_udaf(lookalike_sum());
                 Ok(())
             };
-            let datafusion = datafusion_context(config.clone());
-            setup_lookalikes(&datafusion).await?;
-            let ctx = crate::test_utils::pipeline_context(config.clone());
-            setup_lookalikes(&ctx).await?;
             for sql in [
                 "SELECT k, count(v), sum(v) FROM hc GROUP BY k",
                 "SELECT k, count(*), MAX(v) FROM hc GROUP BY k",
             ] {
-                let thread = planned_aggregation_thread(&ctx, sql, &batches, 4).await?;
-                assert!(!thread.bypassed, "{sql}");
-                assert_eq!(
-                    thread.output,
-                    datafusion_aggregation(&datafusion, sql).await?
-                );
-                assert_byte_eq_with_datafusion_with_config(
-                    sql,
-                    config.clone(),
-                    &setup_lookalikes,
-                )
-                .await;
+                assert_left_to_datafusion(sql, config.clone(), &setup_lookalikes).await?;
             }
         }
         Ok(())
@@ -3463,6 +3608,37 @@ mod tests {
         Ok(())
     }
 
+    /// Assert that the aggregation of `sql` (see [`aggregation`]) in a session
+    /// of configuration `config`, set up by `setup`, is left to DataFusion, by
+    /// [`PhysicalHashAggregate::try_lower`] and by the planner (see
+    /// `updates_like_datafusion`), and that the pipeline engine returns
+    /// DataFusion's results.
+    async fn assert_left_to_datafusion<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        use super::super::test_support::assert_lowered_parity_with_setup;
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let plan = aggregation(&plan).expect("an aggregation");
+        assert!(
+            PhysicalHashAggregate::try_lower(&plan, lower)?.is_none(),
+            "{sql}"
+        );
+        assert_eq!(
+            planned_aggregations(sql, &config, &setup).await?,
+            0,
+            "{sql}"
+        );
+        assert_lowered_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
     /// A function `count` of a type named `Count` too, which replaces
     /// DataFusion's `COUNT` and counts the `true` values of its argument.
     #[derive(Debug, PartialEq, Eq, Hash)]
@@ -3524,9 +3700,12 @@ mod tests {
     async fn user_defined_counts_are_aggregated_like_datafusion() -> Result<()> {
         // `count` of [`Count`] over 40,000 distinct keys of a single
         // partition, in batches of 2,048 rows, whose arguments are all `true`:
-        // the rows after the first 32,768 fill the table of the thread, whose
-        // accumulators read the values of the arguments (the rows of an
-        // aggregation with aggregates do not bypass the tables).
+        // the rows after the first 32,768 would fill the table of a thread,
+        // whose rows would bypass it if `count` were trusted. The aggregations
+        // of user-defined aggregates are left to DataFusion (see
+        // `updates_like_datafusion`), also in the sessions that trust
+        // DataFusion's `count`, which [`Count`] replaces (its type is not
+        // DataFusion's, see `TrustedAggregateFunctions`).
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("b", DataType::Boolean, false),
@@ -3579,29 +3758,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(counts.len(), 40_000);
         assert!(counts.iter().all(|&count| count == 1));
-        // Also in a session that trusts DataFusion's `count`, which [`Count`]
-        // replaces: its type is not DataFusion's (see
-        // `TrustedAggregateFunctions`). On 1, 4 and 16 threads.
-        for target_partitions in [4, 16] {
+        // On 1, 4 and 16 threads.
+        for target_partitions in [1, 4, 16] {
             for trusted in [false, true] {
                 let mut config =
                     test_session_config().with_target_partitions(target_partitions);
                 if trusted {
                     config = trusting(config);
                 }
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                for threads in [1, 4, 16] {
-                    assert_bypassed_parity(
-                        &ctx,
-                        sql,
-                        TableCapacity::default(),
-                        threads,
-                        false,
-                    )
-                    .await?;
-                }
-                assert_aggregate_parity_with_setup(sql, config, &setup).await;
+                assert_left_to_datafusion(sql, config, &setup).await?;
             }
         }
         Ok(())
@@ -3674,17 +3839,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn accumulators_fail_on_the_rows_after_full_tables_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
-        // 32,768 distinct keys, which fill the table of a thread, then a
+        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which would fill the table of a thread, then a
         // negative value, which `non_negative_sum` rejects, then a string that
         // is not an integer, whose cast fails: DataFusion fails on the negative
-        // value. So does the native aggregation, on a single thread, of a
-        // single stage (of a partition) and of two (of two partitions, one of
-        // them empty), also in a session that trusts DataFusion's built-in
-        // aggregate functions: the rows of aggregations with aggregates whose
-        // functions the session does not trust do not bypass the tables (see
-        // `AggregateSpec::rows_bypass_tables`), whose accumulators aggregate
-        // every row when it is consumed.
+        // value. So does the pipeline engine, on a single thread, of a single
+        // stage (of a partition) and of two (of two partitions, one of them
+        // empty), in both sessions: the aggregations of user-defined aggregates
+        // are left to DataFusion (see `updates_like_datafusion`), whose
+        // accumulators aggregate every row when it is consumed.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -3723,25 +3886,23 @@ mod tests {
                 ctx.register_udaf(datafusion_expr::AggregateUDF::from(udaf));
                 Ok(())
             };
-            let config = trusting(test_session_config().with_target_partitions(1));
-            let ctx = datafusion_context(config.clone());
-            setup(&ctx).await?;
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let aggregate = PhysicalHashAggregate::try_lower(
-                &aggregation(&plan).expect("an aggregation"),
-                lower,
-            )?
-            .expect("a lowered aggregation");
-            assert!(
-                !aggregate.spec().rows_bypass_tables(config.options()),
-                "{} partitions",
-                partitions.len()
-            );
-            let message = "non_negative_sum rejects the negative value -5";
-            assert_aggregate_fails_like_datafusion_with_setup(
-                sql, config, setup, message,
-            )
-            .await;
+            for trusted in [false, true] {
+                let mut config = test_session_config().with_target_partitions(1);
+                if trusted {
+                    config = trusting(config);
+                }
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let plan = aggregation(&plan).expect("an aggregation");
+                assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
+                let message = "non_negative_sum rejects the negative value -5";
+                let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                    sql, config, &setup, message,
+                )
+                .await;
+                assert_eq!(lowered, 0, "{} partitions", partitions.len());
+            }
         }
         Ok(())
     }
@@ -3871,17 +4032,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn running_totals_of_user_defined_aggregates_are_aggregated_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_aggregate_parity_with_setup;
-        // 32,768 distinct keys of value 1, which fill the table of a thread,
-        // then the rows `(50000, 1)` and `(50000, -1)` of a group, in a batch or
-        // in two: the running total of the group gets to 1, then 0, as in
-        // DataFusion, and never to -1 (which it rejects). The rows of the
-        // aggregations of user-defined functions do not bypass the tables, also
-        // in the sessions that trust DataFusion's built-in aggregate functions,
-        // also if the user-defined function is named `sum`, of a type named
-        // `Sum` (see `TrustedAggregateFunctions`): the accumulators aggregate
-        // every row when it is consumed, with the rows of its group that the
-        // table aggregated so far.
+        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys of value 1, which would fill the table of a
+        // thread, then the rows `(50000, 1)` and `(50000, -1)` of a group, in a
+        // batch or in two. The aggregations of user-defined aggregates are left
+        // to DataFusion (see `updates_like_datafusion`), also in the sessions
+        // that trust DataFusion's built-in aggregate functions, also if the
+        // user-defined function is named `sum`, of a type named `Sum` (see
+        // `TrustedAggregateFunctions`), so that their accumulators get
+        // DataFusion's batches, and their running totals are DataFusion's: 1,
+        // then 0, whatever the number of threads. Or -1, which they reject, in
+        // the two batches on several threads, whose partial aggregations of the
+        // partitions of DataFusion's round-robin repartitioning aggregate them
+        // apart.
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -3896,21 +4059,14 @@ mod tests {
             )
         };
         let distinct = batch((0..32_768).collect(), vec![1; 32_768])?;
-        for (last, thread_counts) in [
-            (
-                vec![batch(vec![50_000, 50_000], vec![1, -1])?],
-                &[1, 4, 16][..],
-            ),
-            // On several threads, DataFusion's partial aggregations of the
-            // partitions of its round-robin repartitioning aggregate the two
-            // batches apart (and reject -1), the native threads the chunks of
-            // their morsels: on one thread only.
+        for (last, apart) in [
+            (vec![batch(vec![50_000, 50_000], vec![1, -1])?], false),
             (
                 vec![
                     batch(vec![50_000], vec![1])?,
                     batch(vec![50_000], vec![-1])?,
                 ],
-                &[1],
+                true,
             ),
         ] {
             let mut rows = vec![distinct.clone()];
@@ -3923,12 +4079,22 @@ mod tests {
                     register_running_totals(ctx, &partitions, function)
                 };
                 let sql = format!("SELECT k, {function}(v) AS s FROM t GROUP BY k");
-                for &threads in thread_counts {
+                for threads in [1, 4, 16] {
                     for trusted in [false, true] {
                         let mut config =
                             test_session_config().with_target_partitions(threads);
                         if trusted {
                             config = trusting(config);
+                        }
+                        if apart && threads > 1 {
+                            let message = "negative running total: -1";
+                            let lowered =
+                                assert_lowered_fails_like_datafusion_with_setup(
+                                    &sql, config, &setup, message,
+                                )
+                                .await;
+                            assert_eq!(lowered, 0, "{sql}");
+                            continue;
                         }
                         let ctx = datafusion_context(config.clone());
                         setup(&ctx).await?;
@@ -3937,15 +4103,7 @@ mod tests {
                             groups.iter().map(RecordBatch::num_rows).sum::<usize>(),
                             32_769
                         );
-                        assert_bypassed_parity(
-                            &ctx,
-                            &sql,
-                            TableCapacity::default(),
-                            threads,
-                            false,
-                        )
-                        .await?;
-                        assert_aggregate_parity_with_setup(&sql, config, &setup).await;
+                        assert_left_to_datafusion(&sql, config, &setup).await?;
                     }
                 }
             }
@@ -3956,15 +4114,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn user_defined_sums_fail_on_the_rows_after_full_tables_like_datafusion()
     -> Result<()> {
-        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
-        // 32,768 distinct keys, which fill the table of a thread, then a row
-        // whose value makes the running total of its group negative, which
+        use super::super::test_support::assert_lowered_fails_like_datafusion_with_setup;
+        // 32,768 distinct keys, which would fill the table of a thread, then a
+        // row whose value makes the running total of its group negative, which
         // [`Sum`] (a function `sum` of a type named `Sum`, which replaces
         // DataFusion's) rejects, then a string that is not an integer, whose
         // cast fails: DataFusion fails on the negative running total. So does
-        // the native aggregation, of one stage and of two, also in a session
-        // that trusts DataFusion's built-in aggregate functions: [`Sum`] is not
-        // trusted, so the rows of its aggregation do not bypass the tables.
+        // the pipeline engine, of one stage and of two, also in a session that
+        // trusts DataFusion's built-in aggregate functions: the aggregations of
+        // user-defined aggregates are left to DataFusion (see
+        // `updates_like_datafusion`).
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -4000,53 +4159,17 @@ mod tests {
                 let ctx = datafusion_context(config.clone());
                 setup(&ctx).await?;
                 let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-                let aggregate = PhysicalHashAggregate::try_lower(
-                    &aggregation(&plan).expect("an aggregation"),
-                    lower,
-                )?
-                .expect("a lowered aggregation");
-                let spec = aggregate.spec();
-                assert!(spec.bypass && !spec.rows_bypass_tables(config.options()));
-                assert_aggregate_fails_like_datafusion_with_setup(
+                let plan = aggregation(&plan).expect("an aggregation");
+                assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
+                assert_eq!(planned_aggregations(sql, &config, &setup).await?, 0);
+                let lowered = assert_lowered_fails_like_datafusion_with_setup(
                     sql,
                     config.clone(),
                     &setup,
                     message,
                 )
                 .await;
-                // Had the rows of the aggregation bypassed the table (had `sum`
-                // been trusted, by its name or the name of its type), the
-                // negative value would have been aggregated later, by the
-                // final aggregation, after the cast failed.
-                let local = RadixHashAggregate::local_sink_state(
-                    &spec,
-                    TableCapacity::default(),
-                    true,
-                )?;
-                let mut sink = (spec, local, RadixHashAggregate::global_sink_state()?);
-                let (spec, local, global) = &mut sink;
-                let error = batches
-                    .iter()
-                    .flat_map(|batch| {
-                        (0..batch.num_rows()).step_by(DEFAULT_VECTOR_SIZE).map(
-                            move |offset| {
-                                batch.slice(
-                                    offset,
-                                    DEFAULT_VECTOR_SIZE.min(batch.num_rows() - offset),
-                                )
-                            },
-                        )
-                    })
-                    .try_for_each(|chunk| {
-                        RadixHashAggregate::sink(
-                            spec,
-                            chunk,
-                            global.as_ref(),
-                            local.as_mut(),
-                        )
-                    })
-                    .expect_err("a cast error");
-                assert!(error.to_string().contains("not an integer"), "{error}");
+                assert_eq!(lowered, 0);
             }
         }
         Ok(())

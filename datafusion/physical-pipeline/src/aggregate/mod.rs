@@ -514,6 +514,25 @@ pub(crate) mod test_support {
     ) where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
+        let lowered =
+            assert_lowered_fails_like_datafusion_with_setup(sql, config, setup, message)
+                .await;
+        assert!(lowered > 0, "No aggregation was lowered\nquery: {sql}");
+    }
+
+    /// Like [`assert_aggregate_fails_like_datafusion_with_setup`], but without
+    /// requiring that an aggregation is lowered, e.g. for the aggregations that
+    /// [`PhysicalHashAggregate::try_lower`] leaves to DataFusion. Returns the
+    /// number of aggregations that [`lower`] lowered.
+    pub(crate) async fn assert_lowered_fails_like_datafusion_with_setup<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        message: &str,
+    ) -> usize
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
         let ctx = datafusion_context(config.clone());
         setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
@@ -526,6 +545,7 @@ pub(crate) mod test_support {
             ),
             Err(e) => assert_same_error(&error, &e, &format!("planner, query: {sql}")),
         }
+        let mut lowered = 0;
         for (lower, tables) in [
             (lower as fn(&_) -> _, "default"),
             (lower_with_tiny_tables, "tiny"),
@@ -538,7 +558,7 @@ pub(crate) mod test_support {
                 .await
                 .expect("physical planning");
             let root = lower(&plan).expect("lowering");
-            assert!(count::<PhysicalHashAggregate>(&root) > 0, "{sql}");
+            lowered = count::<PhysicalHashAggregate>(&root);
             let exec: Arc<dyn ExecutionPlan> =
                 Arc::new(PipelineRootExec::try_new(root, plan).expect("root"));
             match collect(exec, ctx.task_ctx()).await {
@@ -552,6 +572,7 @@ pub(crate) mod test_support {
                 ),
             }
         }
+        lowered
     }
 
     /// A function `count` that looks like DataFusion's built-in `count`: of

@@ -7,7 +7,7 @@
 
 use std::any::{Any, TypeId};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, Scalar, UInt32Array,
@@ -580,6 +580,10 @@ impl PhysicalHashAggregate {
     ///   input has (after their input was replaced without recomputing their
     ///   properties): DataFusion then aggregates some partitions of their
     ///   input only, or fails;
+    /// * aggregations with an aggregate whose accumulators may get other
+    ///   values from the chunks of the native operator than from DataFusion's
+    ///   batches (see [`updates_like_datafusion`]): user-defined aggregates,
+    ///   and some built-in aggregates of a single partition;
     /// * aggregations with a soft limit on their groups (`lim=[n]` without
     ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
     ///   LIMIT n`: each stage stops reading its input once it has `n` groups,
@@ -642,6 +646,19 @@ impl PhysicalHashAggregate {
         }
         if let Some(last) = last
             && (!is_final_of(last, raw) || !advertises_its_input_partitions(last))
+        {
+            return Ok(None);
+        }
+        let single_partition = raw.input().output_partitioning().partition_count() == 1;
+        let grouped = !raw.group_expr().is_true_no_grouping();
+        let schema = raw.input().schema();
+        if [Some(raw), last]
+            .into_iter()
+            .flatten()
+            .flat_map(|aggregate| aggregate.aggr_expr())
+            .any(|aggregate| {
+                !updates_like_datafusion(aggregate, grouped, single_partition, &schema)
+            })
         {
             return Ok(None);
         }
@@ -1099,6 +1116,84 @@ fn rows_can_bypass_tables(
             .all(|update| update.arguments.iter().all(is_flat))
 }
 
+/// The built-in aggregate functions of DataFusion: their names, and the types
+/// that implement them (see [`implementation_type`]).
+static DATAFUSION_AGGREGATES: LazyLock<Vec<(String, TypeId)>> = LazyLock::new(|| {
+    datafusion_functions_aggregate::all_default_aggregate_functions()
+        .iter()
+        .map(|function| (function.name().to_string(), implementation_type(function)))
+        .collect()
+});
+
+/// The name of `function` if it is one of DataFusion's built-in aggregate
+/// functions: if it is implemented by the type that implements the built-in
+/// function of its name (as [`TrustedAggregateFunctions`] identifies them).
+fn builtin_name(function: &AggregateUDF) -> Option<&'static str> {
+    let implementation = implementation_type(function);
+    DATAFUSION_AGGREGATES
+        .iter()
+        .find(|(name, builtin)| name == function.name() && *builtin == implementation)
+        .map(|(name, _)| name.as_str())
+}
+
+/// Whether the accumulators of `aggregate`, of an aggregation (`grouped`, or
+/// without `GROUP BY`) over the input `schema`, get the values of DataFusion's
+/// accumulators, which DataFusion updates with its batches, and the native
+/// operator with its chunks of at most [`DEFAULT_VECTOR_SIZE`] rows.
+///
+/// * A user-defined aggregate may compute anything from the rows of a call of
+///   its accumulator (e.g. add up the values of a batch first, then add that
+///   sum to its total): its aggregations are left to DataFusion.
+/// * DataFusion's built-in accumulators update their states row by row, or
+///   collect or combine their values exactly, so that their values do not
+///   depend on the batches of their rows, but the t-digests of
+///   `approx_percentile_cont`, `approx_percentile_cont_with_weight` and
+///   `approx_median`, which merge every batch into a digest, and the sums
+///   (and averages) of floating point values without `GROUP BY`, whose
+///   accumulators add up every batch first (their grouped accumulators add up
+///   their rows one by one). Their aggregations of a single partition
+///   (`single_partition`), whose results are deterministic, are left to
+///   DataFusion. (DataFusion's results of several partitions depend on the
+///   order in which their partial states arrive.)
+fn updates_like_datafusion(
+    aggregate: &AggregateFunctionExpr,
+    grouped: bool,
+    single_partition: bool,
+    schema: &SchemaRef,
+) -> bool {
+    let Some(name) = builtin_name(aggregate.fun()) else {
+        return false;
+    };
+    if !single_partition {
+        return true;
+    }
+    match name {
+        "approx_percentile_cont"
+        | "approx_percentile_cont_with_weight"
+        | "approx_median" => false,
+        "sum" | "avg" if !grouped => adds_up_exactly(aggregate, schema),
+        _ => true,
+    }
+}
+
+/// Whether the arguments of `aggregate`, over the input `schema`, are integers
+/// or decimals, which a `sum` or an `avg` adds up with (wrapping) integer
+/// arithmetic, in any order to the same values (see [`splits_exactly`]).
+fn adds_up_exactly(aggregate: &AggregateFunctionExpr, schema: &SchemaRef) -> bool {
+    aggregate.expressions().iter().all(|argument| {
+        argument.data_type(schema).is_ok_and(|data_type| {
+            data_type.is_integer()
+                || matches!(
+                    data_type,
+                    DataType::Decimal32(_, _)
+                        | DataType::Decimal64(_, _)
+                        | DataType::Decimal128(_, _)
+                        | DataType::Decimal256(_, _)
+                )
+        })
+    })
+}
+
 /// The built-in aggregate functions of DataFusion whose accumulators cannot
 /// fail on the rows that they aggregate, nor on the partial states that they
 /// merge (see [`TrustedAggregateFunctions`]): their name, and the function of
@@ -1174,18 +1269,7 @@ fn splits_exactly(aggregate: &AggregateFunctionExpr, schema: &SchemaRef) -> bool
     match name {
         "count" | "min" | "max" | "bit_and" | "bit_or" | "bit_xor" | "bool_and"
         | "bool_or" | "approx_distinct" | "median" => true,
-        "sum" | "avg" => aggregate.expressions().iter().all(|argument| {
-            argument.data_type(schema).is_ok_and(|data_type| {
-                data_type.is_integer()
-                    || matches!(
-                        data_type,
-                        DataType::Decimal32(_, _)
-                            | DataType::Decimal64(_, _)
-                            | DataType::Decimal128(_, _)
-                            | DataType::Decimal256(_, _)
-                    )
-            })
-        }),
+        "sum" | "avg" => adds_up_exactly(aggregate, schema),
         _ => false,
     }
 }
@@ -2288,6 +2372,20 @@ mod tests {
         Ok(())
     }
 
+    /// The aggregations of `plan` that [`PhysicalHashAggregate::try_lower`]
+    /// lowers (with their inputs bridged), from the top: an aggregation of two
+    /// stages once.
+    fn lowered_aggregations(plan: &Plan) -> Result<Vec<PhysicalHashAggregate>> {
+        if let Some(aggregate) = try_lower(plan)? {
+            return Ok(vec![aggregate]);
+        }
+        let mut aggregates = vec![];
+        for child in plan.children() {
+            aggregates.extend(lowered_aggregations(child)?);
+        }
+        Ok(aggregates)
+    }
+
     /// The aggregation with a top-k limit at the top of `plan`.
     fn top_k_aggregation(plan: &Plan) -> Option<Plan> {
         if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
@@ -3051,16 +3149,7 @@ mod tests {
             sql: &str,
         ) -> Result<PhysicalHashAggregate> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let mut aggregate = None;
-            let mut node = Arc::clone(&plan);
-            while aggregate.is_none() {
-                aggregate = try_lower(&node)?;
-                let Some(child) = node.children().first().map(|&child| Arc::clone(child))
-                else {
-                    break;
-                };
-                node = child;
-            }
+            let aggregate = lowered_aggregations(&plan)?.into_iter().next();
             Ok(aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}")))
         }
         for (sql, untrusted, trusted) in queries {
@@ -3074,9 +3163,12 @@ mod tests {
             }
             assert_eq!(spec.rows_bypass_tables(&trusting), trusted, "{sql}");
         }
-        // The aggregates of user-defined functions that look like DataFusion's
-        // `count` and `sum` (see `lookalike_count`), and replace them, are not
-        // trusted.
+        // The aggregations of user-defined functions that look like
+        // DataFusion's `count` and `sum` (see `lookalike_count`), and replace
+        // them, are left to DataFusion (see `updates_like_datafusion`): no
+        // aggregation of their plans is lowered. (That their functions are not
+        // trusted either, see
+        // `trusted_aggregate_functions_are_identified_by_their_implementation_types`.)
         let ctx = crate::test_utils::datafusion_context(test_session_config());
         crate::test_utils::register_test_tables(&ctx)?;
         ctx.register_udaf(super::super::test_support::lookalike_count());
@@ -3086,11 +3178,8 @@ mod tests {
             "SELECT a, count(*) FROM t1 GROUP BY a",
             "SELECT a, MAX(b), sum(b) FROM t1 GROUP BY a",
         ] {
-            let aggregate = lowered_aggregation(&ctx, sql).await?;
-            assert!(aggregate.spec.bypass, "{sql}");
-            for options in untrusting_sessions.iter().chain([&trusting]) {
-                assert!(!aggregate.spec.rows_bypass_tables(options), "{sql}");
-            }
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            assert!(lowered_aggregations(&plan)?.is_empty(), "{sql}");
         }
         // Narrow fixed-size binaries only.
         assert!(is_flat_type(&DataType::FixedSizeBinary(16)));
@@ -3276,24 +3365,31 @@ mod tests {
                 "SELECT d, STRING_AGG(h, ',') FROM t1 GROUP BY d",
                 false,
             ),
-            // Lookalikes of DataFusion's `count` and `sum` (see
-            // `lookalike_count`), which DataFusion's types do not implement.
-            (&lookalikes, "SELECT d, count(a) FROM t1 GROUP BY d", false),
-            (&lookalikes, "SELECT d, sum(a) FROM t1 GROUP BY d", false),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let mut aggregate = None;
-            let mut node = Arc::clone(&plan);
-            while aggregate.is_none() {
-                aggregate = try_lower(&node)?;
-                let Some(child) = node.children().first().map(|&child| Arc::clone(child))
-                else {
-                    break;
-                };
-                node = child;
-            }
-            let aggregate = aggregate.unwrap_or_else(|| panic!("no aggregation: {sql}"));
+            let aggregates = lowered_aggregations(&plan)?;
+            let aggregate = aggregates.first().unwrap_or_else(|| panic!("{sql}"));
             assert_eq!(aggregate.spec.splits_exactly, exact, "{sql}");
+        }
+        // The lookalikes of DataFusion's `count` and `sum` (see
+        // `lookalike_count`), which DataFusion's types do not implement, do not
+        // split their rows exactly; their aggregations are left to DataFusion
+        // (see `updates_like_datafusion`).
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+        for lookalike in [lookalike_count(), lookalike_sum()] {
+            let aggregate =
+                AggregateExprBuilder::new(Arc::new(lookalike), vec![col("v", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("aggregate")
+                    .build()?;
+            assert!(!splits_exactly(&aggregate, &schema));
+        }
+        for sql in [
+            "SELECT d, count(a) FROM t1 GROUP BY d",
+            "SELECT d, sum(a) FROM t1 GROUP BY d",
+        ] {
+            let plan = lookalikes.sql(sql).await?.create_physical_plan().await?;
+            assert!(lowered_aggregations(&plan)?.is_empty(), "{sql}");
         }
         Ok(())
     }
