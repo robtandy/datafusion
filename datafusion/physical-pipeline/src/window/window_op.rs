@@ -56,11 +56,18 @@
 //! of the sort, so the buckets are partitioned by the partition keys of the
 //! stage with the fewest of them.
 //!
-//! Where DataFusion sorts or merges the rows between two window nodes (for
-//! windows with other partitions or orders), or the partitions of the upper
-//! node are not runs of rows of the sort of the lower one, the upper node is a
-//! window operator of its own, which partitions and sorts the output of the
-//! window operator of the lower one again.
+//! Where DataFusion sorts the rows between two window nodes of several
+//! partitions, for an upper node of another order whose partition keys
+//! include the group keys of the window below, the upper node is a
+//! *re-sorting* stage: every one of its window partitions is within a group,
+//! so it sorts the rows of every group again (by its partition keys and the
+//! ordering of its input) before it evaluates them, rather than partitioning
+//! and sorting all rows again. Otherwise, where DataFusion sorts or merges the
+//! rows between two window nodes (for windows with other partitions or
+//! orders), or the partitions of the upper node are not runs of rows of the
+//! sort of the lower one, the upper node is a window operator of its own,
+//! which partitions and sorts the output of the window operator of the lower
+//! one again.
 //!
 //! # Order
 //!
@@ -191,6 +198,13 @@ struct WindowStage {
     /// Whether the partitions of the stage are the groups of rows with equal
     /// group keys.
     whole_groups: bool,
+    /// For a *re-sorting* stage, the order in which it evaluates the rows of a
+    /// group: its partition keys (unless they lead its ordering) and the
+    /// ordering of the input of its window node. The stage sorts the rows of
+    /// every group by these keys first, as DataFusion sorts the rows between
+    /// the two window nodes. `None` if the stage evaluates the rows of a group
+    /// in the order of the stage before.
+    sort: Option<SortKeys>,
     /// The schema of the rows with the window values: the input columns,
     /// then one column per window expression.
     schema: SchemaRef,
@@ -231,6 +245,7 @@ impl WindowStage {
             window_exprs,
             partition_by,
             whole_groups: false,
+            sort: None,
             schema,
         })
     }
@@ -250,6 +265,10 @@ impl WindowStage {
                     .collect(),
                 &options,
             )?,
+            None => batch,
+        };
+        let batch = match &self.sort {
+            Some(keys) => sorted_rows(keys, &self.input_schema, batch)?,
             None => batch,
         };
         let partitions: Vec<Range<usize>> = if self.whole_groups {
@@ -297,6 +316,31 @@ impl WindowStage {
             columns,
             &options,
         )?)
+    }
+}
+
+/// The rows of `batch` (with schema `schema`) sorted by `keys`, in one batch.
+fn sorted_rows(
+    keys: &SortKeys,
+    schema: &SchemaRef,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    let runs = keys.sort(schema, std::slice::from_ref(&batch), None)?;
+    match runs.len() {
+        0 => Ok(batch),
+        1 => Ok(runs
+            .into_iter()
+            .map(SortedRun::into_batch)
+            .next()
+            .unwrap_or(batch)),
+        // The runs hold consecutive rows of the sort.
+        _ => {
+            let batches = runs
+                .into_iter()
+                .map(SortedRun::into_batch)
+                .collect::<Vec<_>>();
+            Ok(concat_batches(schema, &batches)?)
+        }
     }
 }
 
@@ -402,30 +446,20 @@ impl WindowSpec {
         // The rows that DataFusion's window node reads are in the order in
         // which the first stage read them (`ordering`); the native window
         // evaluates them in the order of its sort, which is that order only
-        // if the partition keys of the first stage lead it.
-        if !self.partition_keys_lead {
+        // if the partition keys of the first stage lead it, and no stage
+        // sorted the rows of the groups again.
+        if !self.partition_keys_lead
+            || self.stages.iter().any(|stage| stage.sort.is_some())
+        {
             return Ok(None);
         }
         let mut stage = WindowStage::try_new(projection, input_schema, window_exprs)?;
         // The partition keys of the stage, as columns of the input of the
         // window: they must be the first keys of the sort, so that the
         // partitions of the stage are runs of rows of the sort.
-        let mut columns = vec![];
-        for key in &stage.partition_by {
-            let Some(column) = key.downcast_ref::<Column>() else {
-                return Ok(None);
-            };
-            let column = match &stage.projection {
-                Some(projection) => projection.get(column.index()).copied(),
-                None => Some(column.index()),
-            };
-            let Some(column) = column.and_then(|column| self.input_column(column)) else {
-                return Ok(None);
-            };
-            if !columns.contains(&column) {
-                columns.push(column);
-            }
-        }
+        let Some(columns) = self.partition_columns(&stage) else {
+            return Ok(None);
+        };
         let prefix = sort_prefix(self.keys.as_ref(), columns.len());
         let leads = prefix.len() == columns.len()
             && prefix.iter().all(|key| {
@@ -447,6 +481,98 @@ impl WindowSpec {
         self.schema = Arc::clone(&stage.schema);
         self.stages.push(stage);
         Ok(Some(self))
+    }
+
+    /// This window with one more, *re-sorting*, stage: the window functions
+    /// `window_exprs`, on the output of the last stage projected to the
+    /// columns `projection` (all of them if `None`), with schema
+    /// `input_schema`, in the order `ordering` within its window partitions:
+    /// the stage sorts the rows of every group by its partition keys and
+    /// `ordering` before it evaluates them, as DataFusion sorts the rows
+    /// between two window nodes of other orders. `None` if the window is
+    /// ordered (its rows are emitted in the order of the input of its last
+    /// window node), or if a window partition of the stage may span several
+    /// groups: its partition keys must include the group keys.
+    fn with_resorting_stage(
+        mut self,
+        projection: Option<Vec<usize>>,
+        input_schema: &SchemaRef,
+        window_exprs: Vec<Arc<dyn WindowExpr>>,
+        ordering: Option<LexOrdering>,
+    ) -> Result<Option<Self>> {
+        if self.ordered {
+            return Ok(None);
+        }
+        let mut stage = WindowStage::try_new(projection, input_schema, window_exprs)?;
+        let Some(columns) = self.partition_columns(&stage) else {
+            return Ok(None);
+        };
+        let covers_groups = !self.group_keys.is_empty()
+            && self.group_keys.iter().all(|key| {
+                key.downcast_ref::<Column>()
+                    .is_some_and(|key| columns.contains(&key.index()))
+            });
+        if !covers_groups {
+            return Ok(None);
+        }
+        // The order of the rows of a group: the partition keys of the stage,
+        // unless they lead `ordering`, then `ordering`.
+        let partition_by = distinct(&stage.partition_by);
+        let partition_keys_lead = partition_by.iter().all(|key| {
+            ordering.as_ref().is_some_and(|ordering| {
+                ordering
+                    .iter()
+                    .take(partition_by.len())
+                    .any(|sort_expr| sort_expr.expr.as_ref() == key.as_ref())
+            })
+        });
+        let sort_exprs = match partition_keys_lead {
+            true => vec![],
+            false => partition_by
+                .iter()
+                .map(|key| PhysicalSortExpr::new_default(Arc::clone(key)))
+                .collect(),
+        }
+        .into_iter()
+        .chain(ordering.into_iter().flatten());
+        let Some(sort) = LexOrdering::new(sort_exprs) else {
+            return Ok(None);
+        };
+        if !SortKeys::supports(&sort, input_schema)?
+            || sort.iter().any(|sort_expr| {
+                sort_expr
+                    .expr
+                    .data_type(input_schema)
+                    .map_or(true, |data_type| has_union(&data_type))
+            })
+        {
+            return Ok(None);
+        }
+        stage.sort = Some(SortKeys::try_new(sort, input_schema)?);
+        stage.whole_groups = columns.len() == self.group_keys.len();
+        self.schema = Arc::clone(&stage.schema);
+        self.stages.push(stage);
+        Ok(Some(self))
+    }
+
+    /// The partition keys of `stage`, a stage on the output of the last stage,
+    /// as distinct columns of the input of the window, `None` if one of them
+    /// is not a column of the input of the window (e.g. a window value or a
+    /// computed key).
+    fn partition_columns(&self, stage: &WindowStage) -> Option<Vec<usize>> {
+        let mut columns = vec![];
+        for key in &stage.partition_by {
+            let column = key.downcast_ref::<Column>()?;
+            let column = match &stage.projection {
+                Some(projection) => *projection.get(column.index())?,
+                None => column.index(),
+            };
+            let column = self.input_column(column)?;
+            if !columns.contains(&column) {
+                columns.push(column);
+            }
+        }
+        Some(columns)
     }
 
     /// The column of the input of the window that the column `column` of the
@@ -555,8 +681,9 @@ impl PhysicalWindow {
     /// `BoundedWindowAggExec` computes the same values incrementally. It
     /// reads its input whatever established the order of the input (sorts,
     /// merges, windows below, sorted scans), and it is stacked on the native
-    /// window of a window below, as a stage or as a window of its own (where
-    /// DataFusion sorts or merges in between). The nodes below the window that
+    /// window of a window below, as a stage, as a re-sorting stage, or as a
+    /// window of its own (where DataFusion sorts or merges in between). The
+    /// nodes below the window that
     /// only distribute and sort its input are replaced too (the native window
     /// partitions and sorts its input itself): `SortExec`s,
     /// `SortPreservingMergeExec`s, `CoalescePartitionsExec`s and
@@ -821,6 +948,26 @@ fn analyze(
     {
         return Ok(Some((spec, rows)));
     }
+    // A window stacked on a window below it with other orders, where
+    // DataFusion sorts the rows (and maybe repartitions them) in between, is a
+    // re-sorting stage of the native window of the window below if its window
+    // partitions are within the groups of that window: it sorts the rows of
+    // every group again (see `WindowSpec::with_resorting_stage`).
+    if !ordered
+        && let Some(WindowBelow {
+            projection,
+            window: below,
+        }) = window_below_any_sort(input)
+        && let Some((below_spec, rows)) = analyze(below)?
+        && let Some(spec) = below_spec.with_resorting_stage(
+            projection,
+            &input_schema,
+            window_exprs.to_vec(),
+            input.output_ordering().cloned(),
+        )?
+    {
+        return Ok(Some((spec, rows)));
+    }
     // Otherwise the native window partitions and sorts the rows of its input
     // itself, by the ordering of its input: whatever established it (a sort, a
     // merge, a window below or a scan of sorted files), the window partitions
@@ -941,6 +1088,37 @@ fn window_below(input: &Arc<dyn ExecutionPlan>) -> Option<WindowBelow<'_>> {
         } else {
             return None;
         };
+    }
+}
+
+/// The window node below `input`, the input of a window node, through
+/// projections of columns and the nodes that only distribute and sort rows
+/// (see [`without_distribution`]), which a re-sorting stage replaces.
+fn window_below_any_sort(input: &Arc<dyn ExecutionPlan>) -> Option<WindowBelow<'_>> {
+    let mut projection: Option<Vec<usize>> = None;
+    let mut node = input;
+    loop {
+        let stripped = without_distribution(node);
+        if window_node(stripped).is_some() {
+            return Some(WindowBelow {
+                projection,
+                window: stripped,
+            });
+        }
+        let exec = stripped.downcast_ref::<ProjectionExec>()?;
+        let columns = exec
+            .expr()
+            .iter()
+            .map(|expr| expr.expr.downcast_ref::<Column>().map(Column::index))
+            .collect::<Option<Vec<_>>>()?;
+        projection = Some(match projection {
+            Some(projection) => projection
+                .iter()
+                .map(|&column| columns.get(column).copied())
+                .collect::<Option<Vec<_>>>()?,
+            None => columns,
+        });
+        node = exec.input();
     }
 }
 
@@ -1328,7 +1506,10 @@ impl PhysicalOperator for PhysicalWindow {
                     .map(|expr| expr.name().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("[{exprs}]")
+                match &stage.sort {
+                    Some(keys) => format!("[{exprs}] (sort=[{}])", keys.ordering()),
+                    None => format!("[{exprs}]"),
+                }
             })
             .collect::<Vec<_>>()
             .join(" -> ");
@@ -1996,57 +2177,113 @@ mod tests {
         }
     }
 
+    /// Assert that `sql` matches DataFusion with 1, 4 and 16 target
+    /// partitions, with all of its window nodes lowered to native windows: as
+    /// many as `windows` says (with 1 target partition, with more).
+    async fn assert_stacked_windows(sql: &str, windows: [usize; 2]) {
+        for (partitions, windows) in [(1, windows[0]), (4, windows[1]), (16, windows[1])]
+        {
+            let config = test_session_config().with_target_partitions(partitions);
+            let plan = physical_plan(sql, config.clone()).await;
+            let root = assert_native_parity_with_config(sql, config).await;
+            let tree = format_operator_tree(&root);
+            let context = format!(
+                "query: {sql}\n{} partitions\n{}\n{tree}",
+                partitions,
+                displayable(plan.as_ref()).indent(true)
+            );
+            assert_eq!(stages(&root), window_nodes(&plan), "{context}");
+            assert_eq!(count::<PhysicalWindow>(&root), windows, "{context}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn windows_stacked_on_windows_of_other_partitions_or_orders_are_native() {
         // DataFusion sorts or merges the rows between the windows (as for the
-        // window queries of the stress corpus that used to be left to it): the
+        // window queries of the stress corpus that used to be left to it). The
         // upper window is a native window over the native window of the lower
-        // one, which partitions and sorts its rows again.
+        // one, which partitions and sorts its rows again, or a re-sorting stage
+        // of the lower one if its window partitions are within the groups of
+        // the lower one (see
+        // `windows_of_the_same_partitions_in_other_orders_are_re_sorting_stages`).
         for (sql, windows) in [
             // A merge of the sorted partitions of the lower window, for an
-            // ordered window by its partition keys.
+            // ordered window by its partition keys (a stage of the lower window
+            // on one partition, where DataFusion does not sort in between).
             (
                 "SELECT id, a, c, RANK() OVER (PARTITION BY a ORDER BY c DESC, id) AS r, DENSE_RANK() OVER (ORDER BY a) AS dr FROM t1",
-                2,
-            ),
-            // A sort of every partition of the lower window, for an upper one of
-            // the same partitions in another order.
-            (
-                "SELECT d, id, b, NTILE(4) OVER (PARTITION BY d ORDER BY b, id) AS q, FIRST_VALUE(id) OVER (PARTITION BY d ORDER BY b DESC, id) AS f FROM t1",
-                2,
-            ),
-            (
-                "SELECT h, id, b, NTILE(4) OVER (PARTITION BY h ORDER BY b, id) AS q, LAST_VALUE(id) OVER (PARTITION BY h ORDER BY b DESC, id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS f FROM t1",
-                2,
+                [1, 2],
             ),
             // Three windows of different partitions.
             (
                 "SELECT id, ROW_NUMBER() OVER (PARTITION BY e ORDER BY id) AS r1, SUM(b) OVER (PARTITION BY d ORDER BY id) AS s, COUNT(*) OVER (ORDER BY id DESC) AS n FROM t1",
-                3,
+                [3, 3],
             ),
             // A window over a window, through a projection that computes a
             // value.
             (
                 "SELECT id, rn, SUM(x) OVER (PARTITION BY e ORDER BY id) AS s FROM (SELECT id, e, rn, rn * 2 AS x FROM (SELECT id, e, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1))",
-                2,
+                [2, 2],
             ),
         ] {
-            for partitions in [1, 4] {
-                let config = test_session_config().with_target_partitions(partitions);
-                let plan = physical_plan(sql, config.clone()).await;
-                let root = assert_native_parity_with_config(sql, config).await;
-                let tree = format_operator_tree(&root);
-                let context = format!(
-                    "query: {sql}\n{}\n{tree}",
-                    displayable(plan.as_ref()).indent(true)
-                );
-                assert_eq!(stages(&root), window_nodes(&plan), "{context}");
-                assert!(count::<PhysicalWindow>(&root) <= windows, "{context}");
-                if partitions == 4 {
-                    assert_eq!(count::<PhysicalWindow>(&root), windows, "{context}");
-                }
-            }
+            assert_stacked_windows(sql, windows).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_of_the_same_partitions_in_other_orders_are_re_sorting_stages() {
+        // A window of several partitions whose partition keys include those of
+        // the window below it, in another order (DataFusion sorts the rows of
+        // every partition again between them): a stage of the native window of
+        // the window below that sorts the rows of every group again. Windows of
+        // a single partition, whose rows are emitted in order, are windows of
+        // their own.
+        for (sql, windows) in [
+            (
+                "SELECT d, id, b, NTILE(4) OVER (PARTITION BY d ORDER BY b, id) AS q, FIRST_VALUE(id) OVER (PARTITION BY d ORDER BY b DESC, id) AS f FROM t1",
+                [2, 1],
+            ),
+            (
+                "SELECT h, id, b, NTILE(4) OVER (PARTITION BY h ORDER BY b, id) AS q, LAST_VALUE(id) OVER (PARTITION BY h ORDER BY b DESC, id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS f FROM t1",
+                [2, 1],
+            ),
+            // Three stages, two of which sort again.
+            (
+                "SELECT id, SUM(b) OVER (PARTITION BY d ORDER BY id) AS s, LAG(id) OVER (PARTITION BY d ORDER BY b DESC, id) AS l, RANK() OVER (PARTITION BY d ORDER BY a NULLS FIRST, id) AS r FROM t1",
+                [3, 1],
+            ),
+            // Finer partitions in the re-sorting stage (several of its window
+            // partitions in a group).
+            (
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS r1, ROW_NUMBER() OVER (PARTITION BY d, e ORDER BY b, id) AS r2 FROM t1",
+                [2, 1],
+            ),
+            // A computed partition key (projected below the windows).
+            (
+                "SELECT id, COUNT(*) OVER (PARTITION BY a % 3 ORDER BY id) AS n1, SUM(b) OVER (PARTITION BY a % 3 ORDER BY b, id) AS n2 FROM t1",
+                [2, 1],
+            ),
+            // Through a projection of columns, over a stage.
+            (
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS r1, SUM(rn) OVER (PARTITION BY d ORDER BY b, id) AS s FROM (SELECT id, d, b, ROW_NUMBER() OVER (PARTITION BY d ORDER BY a, id) AS rn FROM t1)",
+                [3, 1],
+            ),
+            // Partitions of the upper window that span several groups of the
+            // lower one: a window of its own.
+            (
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY d, e ORDER BY id) AS r1, SUM(a) OVER (PARTITION BY e ORDER BY b, id) AS s FROM t1",
+                [2, 2],
+            ),
+        ] {
+            assert_stacked_windows(sql, windows).await;
+        }
+        // An empty input (of a single partition, which DataFusion does not
+        // repartition: ordered windows).
+        assert_stacked_windows(
+            "SELECT id, NTILE(4) OVER (PARTITION BY d ORDER BY b, id) AS q, FIRST_VALUE(id) OVER (PARTITION BY d ORDER BY b DESC, id) AS f FROM t_empty",
+            [2, 2],
+        )
+        .await;
     }
 
     // ---------------------------------------------------------------------
