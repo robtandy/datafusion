@@ -1180,8 +1180,7 @@ pub fn compare_results(
 }
 
 /// Check that the schemas of the plans are equal, and that every batch of the
-/// pipeline engine has the output schema (or the schema of the batches of
-/// DataFusion, if they do not have the output schema).
+/// pipeline engine has exactly the output schema.
 fn compare_schemas(
     expected: &EngineOutput,
     actual: &EngineOutput,
@@ -1194,14 +1193,11 @@ fn compare_schemas(
             actual.schema
         ));
     }
-    let datafusion_batches = expected.batches.first().map(RecordBatch::schema);
     if let Some(schema) = actual
         .batches
         .iter()
         .map(RecordBatch::schema)
-        .find(|schema| {
-            *schema != actual.schema && Some(schema) != datafusion_batches.as_ref()
-        })
+        .find(|schema| *schema != actual.schema)
     {
         return Err(format!(
             "the schema of a batch of the pipeline engine is not the output schema: \
@@ -1325,16 +1321,64 @@ impl SortedReference {
     }
 }
 
-/// The sorted rows of one [`Shape`], by class, and the rows of a result
-/// assigned to each of these classes.
-#[derive(Default)]
-struct ShapeClasses {
-    /// The classes with rows of the shape, in their order, and these rows.
-    classes: Vec<(usize, Vec<usize>)>,
-    /// The rows of the result assigned to each class.
-    assigned: Vec<Vec<usize>>,
-    /// The first class with rows that are not assigned yet.
-    first_open: usize,
+/// For each class of sorted rows, the other classes whose keys tie with its
+/// keys (in their order). Only keys with the same [`Shape`] can tie (their
+/// values but their floating-point values are equal): their floating-point
+/// values are compared within `tie_tolerance`.
+// The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
+// for memory accounting with the `arrow-buffer/pool` feature (enabled by
+// `--all-features`): it affects neither their equality nor their hashing. Not
+// `expect`: the lint only fires with that feature.
+#[allow(clippy::allow_attributes, clippy::mutable_key_type)]
+fn tied_classes(classes: &[(Range<usize>, Row)], tie_tolerance: f64) -> Vec<Vec<usize>> {
+    let mut tied = vec![vec![]; classes.len()];
+    let mut classes_of_shape: HashMap<Shape<'_>, Vec<usize>> = HashMap::new();
+    for (class, (_, keys)) in classes.iter().enumerate() {
+        if keys.iter().any(Value::has_floats) {
+            classes_of_shape.entry(Shape(keys)).or_default().push(class);
+        }
+    }
+    for members in classes_of_shape
+        .values()
+        .filter(|members| members.len() > 1)
+    {
+        let vectors = members
+            .iter()
+            .map(|&class| {
+                let mut floats = vec![];
+                for value in &classes[class].1 {
+                    value.collect_floats(&mut floats);
+                }
+                floats.into_iter().map(normalized).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (a, others) in equal_pairs(&vectors, &vectors, tie_tolerance)
+            .into_iter()
+            .enumerate()
+        {
+            for b in others.into_iter().filter(|&b| b != a) {
+                tied[members[a]].push(members[b]);
+            }
+        }
+    }
+    for others in &mut tied {
+        others.sort_unstable();
+        others.dedup();
+    }
+    tied
+}
+
+/// The normalized floating-point values of `row`, as bits: rows of the same
+/// [`Shape`] with the same bits are equal.
+fn float_bits(row: &[Value]) -> Vec<u64> {
+    let mut floats = vec![];
+    for value in row {
+        value.collect_floats(&mut floats);
+    }
+    floats
+        .into_iter()
+        .map(|value| normalized(value).to_bits())
+        .collect()
 }
 
 /// Compare the rows `result` of `names.1` with the sorted rows of `names.0`,
@@ -1342,11 +1386,17 @@ struct ShapeClasses {
 /// returns from an order of all sorted rows in which rows are only out of
 /// their sorted order relative to rows that they tie with.
 ///
-/// The rows of `result` are assigned, in order, to the first class of sorted
-/// rows with their values that keeps `result` in order. Then the rows that
-/// the `OFFSET` skips (the first sorted rows that `result` does not have)
-/// must not be ordered after rows of `result` that they do not tie with, nor
-/// the rows that the `LIMIT` cuts before them.
+/// The sorted rows are divided into classes of rows whose keys are exactly
+/// equal. The rows of a class may be at the positions of its rows, and of the
+/// rows of the classes that it ties with. A maximum matching of the rows of
+/// `result` to the sorted rows with their values (within the tolerance) at
+/// their positions assigns each row of `result` to a class; rows with equal
+/// values are then assigned in the order of their classes. Finally, a row of
+/// `result` must tie with the earlier rows of `result` that the query orders
+/// after it, the rows that the `OFFSET` skips (the first sorted rows that
+/// `result` does not have) with the rows of `result` that the query orders
+/// before them, and the rows that the `LIMIT` cuts with those that it orders
+/// after them.
 // The rows of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a
 // `Mutex` for memory accounting with the `arrow-buffer/pool` feature (enabled
 // by `--all-features`): it affects neither their equality nor their hashing.
@@ -1368,12 +1418,11 @@ fn compare_sorted(
             count_rows(window.len())
         ));
     }
+    let classes = &sorted.classes;
     // The keys of each engine may be off by the tolerance. Ties are not
     // transitive: two rows that tie with a row may not tie with each other.
-    let tie_tolerance = 2.0 * tolerance;
-    let ties = |a: usize, b: usize| {
-        a == b || rows_equal(&sorted.classes[a].1, &sorted.classes[b].1, tie_tolerance)
-    };
+    let tied = tied_classes(classes, 2.0 * tolerance);
+    let ties = |a: usize, b: usize| a == b || tied[a].binary_search(&b).is_ok();
     let display = |row: &Row| {
         row.iter()
             .map(ToString::to_string)
@@ -1388,123 +1437,159 @@ fn compare_sorted(
              within twice the tolerance"
         )
     };
-    let differs = |i: usize| {
-        format!(
-            "row {i} of {result_name} differs: it is not among the sorted rows of \
-             {reference_name} that the query may return (with their \
-             multiplicities)\ncolumns: ({columns})\n  row {i}: ({})\n  sorted row {} of \
-             {reference_name}: ({})",
-            display(&result[i]),
-            window.start + i,
-            display(&sorted.values[window.start + i])
-        )
-    };
 
-    // The sorted rows of each shape, by class.
-    let mut shapes: HashMap<Shape<'_>, ShapeClasses> = HashMap::new();
-    for (class, (range, _)) in sorted.classes.iter().enumerate() {
-        for row in range.clone() {
-            let shape = shapes.entry(Shape(&sorted.values[row])).or_default();
-            match shape.classes.last_mut() {
-                Some((last, rows)) if *last == class => rows.push(row),
-                _ => {
-                    shape.classes.push((class, vec![row]));
-                    shape.assigned.push(vec![]);
-                }
-            }
+    // The first and the last positions of sorted rows at which the rows of
+    // each class may be.
+    let bounds = classes
+        .iter()
+        .enumerate()
+        .map(|(class, (rows, _))| {
+            let tied_rows = |range: Range<usize>| {
+                tied[class]
+                    .iter()
+                    .filter(|other| range.contains(*other))
+                    .map(|&other| classes[other].0.len())
+                    .sum::<usize>()
+            };
+            (
+                rows.start - tied_rows(0..class),
+                rows.end - 1 + tied_rows(class + 1..classes.len()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // The groups of sorted rows of a class with equal values, and the groups
+    // of each class and shape.
+    let mut groups: Vec<(usize, usize, usize)> = vec![];
+    let mut group_of = HashMap::new();
+    let mut groups_of: HashMap<(usize, Shape<'_>), Vec<usize>> = HashMap::new();
+    for (class, (rows, _)) in classes.iter().enumerate() {
+        for row in rows.clone() {
+            let values = &sorted.values[row];
+            let group = *group_of
+                .entry((class, Shape(values), float_bits(values)))
+                .or_insert_with(|| {
+                    groups_of
+                        .entry((class, Shape(values)))
+                        .or_default()
+                        .push(groups.len());
+                    groups.push((class, row, 0));
+                    groups.len() - 1
+                });
+            groups[group].2 += 1;
         }
     }
 
-    // The class of each row of the result so far, and the first row of the
-    // result of each class.
-    let mut class_of = Vec::with_capacity(result.len());
-    let mut first_row_of = BTreeMap::new();
+    // The groups that each row of the result may be: their classes may be at
+    // its position, and their values are its values.
+    let mut by_first_position = (0..classes.len()).collect::<Vec<_>>();
+    by_first_position.sort_by_key(|&class| bounds[class].0);
+    let (mut next, mut active) = (0, vec![]);
+    let mut candidates = Vec::with_capacity(result.len());
     for (i, row) in result.iter().enumerate() {
-        let Some(shape) = shapes.get_mut(&Shape(row)) else {
-            return Err(differs(i));
-        };
+        let position = window.start + i;
+        while next < classes.len() && bounds[by_first_position[next]].0 <= position {
+            active.push(by_first_position[next]);
+            next += 1;
+        }
+        active.retain(|&class| bounds[class].1 >= position);
         let floats = row.iter().any(Value::has_floats);
-        let is_full = |shape: &ShapeClasses, e: usize| {
-            shape.assigned[e].len() == shape.classes[e].1.len()
-        };
-        while shape.first_open < shape.classes.len() && is_full(shape, shape.first_open) {
-            shape.first_open += 1;
-        }
-        let mut out_of_order = None;
-        let mut chosen = None;
-        for e in shape.first_open..shape.classes.len() {
-            let (class, rows) = &shape.classes[e];
-            if is_full(shape, e)
-                || (floats
-                    && !rows
-                        .iter()
-                        .any(|&r| rows_equal(&sorted.values[r], row, tolerance)))
-            {
-                continue;
-            }
-            // The earlier rows of the result that the query orders after this
-            // row must tie with it.
-            match first_row_of
-                .range(class + 1..)
-                .find(|&(&later, _)| !ties(*class, later))
-            {
-                Some((&later, &earlier)) => {
-                    out_of_order.get_or_insert((*class, later, earlier));
-                }
-                None => {
-                    chosen = Some(e);
-                    break;
+        let mut groups_of_row = vec![];
+        for &class in &active {
+            for &group in groups_of.get(&(class, Shape(row))).into_iter().flatten() {
+                if !floats || rows_equal(&sorted.values[groups[group].1], row, tolerance)
+                {
+                    groups_of_row.push(group);
                 }
             }
         }
-        let Some(e) = chosen else {
-            let Some((class, later, earlier)) = out_of_order else {
-                return Err(differs(i));
-            };
+        candidates.push(groups_of_row);
+    }
+
+    // A maximum matching of the rows of the result to the sorted rows.
+    let mut supply = vec![1; result.len()];
+    let mut demand = groups.iter().map(|group| group.2).collect::<Vec<_>>();
+    let flow = max_flow(&candidates, &mut supply, &mut demand);
+    if let Some(i) = supply.iter().position(|&rows| rows > 0) {
+        let row = &result[i];
+        let floats = row.iter().any(Value::has_floats);
+        // Whether sorted rows of other positions have its values.
+        let elsewhere = groups.iter().find(|&&(_, group_row, _)| {
+            let values = &sorted.values[group_row];
+            Shape(values) == Shape(row) && (!floats || rows_equal(values, row, tolerance))
+        });
+        let position = window.start + i;
+        let position_class = classes
+            .iter()
+            .position(|(rows, _)| rows.contains(&position))
+            .expect("the window has sorted rows");
+        return Err(match elsewhere {
+            Some(&(class, _, _)) if candidates[i].is_empty() => format!(
+                "row {i} of {result_name} is out of order: the sorted rows of \
+                 {reference_name} with its values may not be at its position \
+                 ({rule})\ncolumns: ({columns})\n  row {i}: ({}), keys: ({})\n  sorted \
+                 row {position} of {reference_name}: ({}), keys: ({})",
+                display(row),
+                display(&classes[class].1),
+                display(&sorted.values[position]),
+                display(&classes[position_class].1)
+            ),
+            _ => format!(
+                "row {i} of {result_name} differs: it is not among the sorted rows of \
+                 {reference_name} that the query may return at its position (with \
+                 their multiplicities)\ncolumns: ({columns})\n  row {i}: ({})\n  sorted \
+                 row {position} of {reference_name}: ({})",
+                display(row),
+                display(&sorted.values[position])
+            ),
+        });
+    }
+    let mut group_of_row = candidates
+        .iter()
+        .zip(&flow)
+        .map(|(candidate_groups, flow)| {
+            candidate_groups[flow.iter().position(|&rows| rows > 0).unwrap_or(0)]
+        })
+        .collect::<Vec<_>>();
+    // Rows with equal values are interchangeable: assign them in the order of
+    // their classes, so that they are not out of order among themselves.
+    let mut rows_of_values: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
+    for (i, row) in result.iter().enumerate() {
+        rows_of_values
+            .entry((Shape(row), float_bits(row)))
+            .or_default()
+            .push(i);
+    }
+    for rows in rows_of_values.values().filter(|rows| rows.len() > 1) {
+        let mut assigned = rows.iter().map(|&i| group_of_row[i]).collect::<Vec<_>>();
+        assigned.sort_by_key(|&group| (groups[group].0, group));
+        for (&i, group) in rows.iter().zip(assigned) {
+            group_of_row[i] = group;
+        }
+    }
+
+    // The class of each row of the result, and the first row of the result
+    // of each class.
+    let mut first_row_of = BTreeMap::new();
+    for (i, &group) in group_of_row.iter().enumerate() {
+        let class = groups[group].0;
+        // The earlier rows of the result that the query orders after this
+        // row must tie with it.
+        if let Some((&later, &earlier)) = first_row_of
+            .range(class + 1..)
+            .find(|&(&later, _)| !ties(class, later))
+        {
             return Err(format!(
                 "row {i} of {result_name} is out of order: the query orders it before row \
                  {earlier}, and their keys do not tie ({rule})\ncolumns: ({columns})\n  \
                  row {earlier}: ({}), keys: ({})\n  row {i}: ({}), keys: ({})",
                 display(&result[earlier]),
-                display(&sorted.classes[later].1),
-                display(row),
-                display(&sorted.classes[class].1)
+                display(&classes[later].1),
+                display(&result[i]),
+                display(&classes[class].1)
             ));
-        };
-        shape.assigned[e].push(i);
-        let class = shape.classes[e].0;
-        class_of.push(class);
-        first_row_of.entry(class).or_insert(i);
-    }
-
-    // A class may have several rows with close floating-point values: they are
-    // matched exactly.
-    for shape in shapes.values() {
-        for ((_, rows), assigned) in shape.classes.iter().zip(&shape.assigned) {
-            if assigned.is_empty() || !result[assigned[0]].iter().any(Value::has_floats) {
-                continue;
-            }
-            let floats = |rows: &[Row], indices: &[usize]| {
-                indices
-                    .iter()
-                    .map(|&i| {
-                        let mut floats = vec![];
-                        for value in &rows[i] {
-                            value.collect_floats(&mut floats);
-                        }
-                        floats
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let (_, unmatched) = match_floats(
-                &floats(&sorted.values, rows),
-                &floats(result, assigned),
-                tolerance,
-            );
-            if let Some(i) = unmatched.iter().map(|&u| assigned[u]).min() {
-                return Err(differs(i));
-            }
         }
+        first_row_of.entry(class).or_insert(i);
     }
 
     // An order of all sorted rows: the rows that the OFFSET skips (the first
@@ -1512,13 +1597,12 @@ fn compare_sorted(
     // the rows that the LIMIT cuts. A skipped row must tie with the rows of the
     // result that the query orders before it, and a cut row with those that
     // the query orders after it.
-    let mut unused = sorted
-        .classes
+    let mut unused = classes
         .iter()
-        .map(|(range, _)| range.len())
+        .map(|(rows, _)| rows.len())
         .collect::<Vec<_>>();
-    for &class in &class_of {
-        unused[class] -= 1;
+    for &group in &group_of_row {
+        unused[groups[group].0] -= 1;
     }
     let mut skip = window.start;
     for (class, &count) in unused.iter().enumerate() {
@@ -1536,8 +1620,8 @@ fn compare_sorted(
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the skipped rows: ({})",
                 display(&result[row]),
-                display(&sorted.classes[earlier].1),
-                display(&sorted.classes[class].1)
+                display(&classes[earlier].1),
+                display(&classes[class].1)
             ));
         }
         if count > skipped
@@ -1552,8 +1636,8 @@ fn compare_sorted(
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the cut rows: ({})",
                 display(&result[row]),
-                display(&sorted.classes[later].1),
-                display(&sorted.classes[class].1)
+                display(&classes[later].1),
+                display(&classes[class].1)
             ));
         }
     }
@@ -2150,12 +2234,16 @@ fn close_values(values: &[f64], value: f64, tolerance: f64) -> Range<usize> {
 /// Push a maximum flow from the expected vectors, which supply `supply` rows
 /// each, through the `pairs` of vectors that are equal, to the actual
 /// vectors, which demand `demand` rows each. Leaves in `supply` and `demand`
-/// the rows that are not matched.
+/// the rows that are not matched, and returns the rows through each pair.
 ///
 /// A greedy flow is augmented along shortest paths (Edmonds-Karp): from an
 /// expected vector with supply, forward through pairs, and backward through
 /// pairs with flow, to an actual vector with demand.
-fn max_flow(pairs: &[Vec<usize>], supply: &mut [usize], demand: &mut [usize]) {
+fn max_flow(
+    pairs: &[Vec<usize>],
+    supply: &mut [usize],
+    demand: &mut [usize],
+) -> Vec<Vec<usize>> {
     // The flow through each pair, and the pairs into each actual vector.
     let mut flow = pairs
         .iter()
@@ -2202,7 +2290,7 @@ fn max_flow(pairs: &[Vec<usize>], supply: &mut [usize], demand: &mut [usize]) {
             }
         }
         let Some(end) = end else {
-            return;
+            return flow;
         };
         // The rows that the path can carry, then push them along it.
         let mut rows = demand[end];
@@ -3045,18 +3133,37 @@ mod tests {
 
     /// The order of a query that selects the values `v` of `(k, v)` rows,
     /// ordered by `k`: their sorted rows are `sorted` (without the LIMIT and
-    /// OFFSET of the query, which returns at most `fetch` of them).
-    fn sorted_by_k(sorted: &[(i32, &str)], fetch: Option<usize>) -> ResultOrder {
-        let batch = kv_batch(sorted);
+    /// OFFSET of the query, which skips `skip` of them and returns at most
+    /// `fetch`).
+    fn sorted_by_k(
+        sorted: &[(i32, &str)],
+        skip: usize,
+        fetch: Option<usize>,
+    ) -> ResultOrder {
+        hidden_key_order(&kv_batch(sorted), skip, fetch)
+    }
+
+    /// The order of a query that selects the second column of the rows
+    /// `sorted`, ordered by their first column (`m.k`), which it skips `skip`
+    /// of and returns at most `fetch` of.
+    fn hidden_key_order(
+        sorted: &RecordBatch,
+        skip: usize,
+        fetch: Option<usize>,
+    ) -> ResultOrder {
+        let schema = sorted.schema();
         let reference = batch_of(vec![
-            ("v", Arc::clone(batch.column(1))),
-            ("key", Arc::clone(batch.column(0))),
+            (
+                schema.field(1).name().as_str(),
+                Arc::clone(sorted.column(1)),
+            ),
+            ("key", Arc::clone(sorted.column(0))),
         ]);
         ResultOrder::Sorted(SortedReference {
             batches: vec![reference],
             columns: 1,
             keys: vec!["m.k".to_string()],
-            skip: 0,
+            skip,
             fetch,
         })
     }
@@ -3263,14 +3370,18 @@ mod tests {
         let err = same_results(expected(), swapped(), &by_k).unwrap_err();
         assert!(
             err.starts_with(
-                "row 1 of the pipeline engine is out of order: the query orders it \
-                 before row 0, and their keys do not tie (rows tie if their ORDER BY \
-                 keys (k) are equal, floating-point keys within twice the tolerance)"
+                "row 0 of the pipeline engine is out of order: the sorted rows of \
+                 DataFusion with its values may not be at its position (rows tie if \
+                 their ORDER BY keys (k) are equal, floating-point keys within twice the \
+                 tolerance)"
             ),
             "{err}"
         );
         assert!(err.contains("row 0: (2, \"b\"), keys: (2)"), "{err}");
-        assert!(err.contains("row 1: (1, \"a\"), keys: (1)"), "{err}");
+        assert!(
+            err.contains("sorted row 0 of DataFusion: (1, \"a\"), keys: (1)"),
+            "{err}"
+        );
         let in_order = vec![kv_batch(&rows[..1]), kv_batch(&[]), kv_batch(&rows[1..])];
         same_results(expected(), in_order, &by_k).unwrap();
 
@@ -3301,7 +3412,7 @@ mod tests {
         let by_kv = sorted_by(&ties(), &["k", "v"], 0, None);
         let err = same_results(ties(), other_order(), &by_kv).unwrap_err();
         assert!(
-            err.starts_with("row 1 of the pipeline engine is out of order"),
+            err.starts_with("row 0 of the pipeline engine is out of order"),
             "{err}"
         );
         // The rows that tie stay among the rows they tie with...
@@ -3314,7 +3425,7 @@ mod tests {
         ])];
         let err = same_results(ties(), moved, &by_k).unwrap_err();
         assert!(
-            err.starts_with("row 2 of the pipeline engine is out of order"),
+            err.starts_with("row 1 of the pipeline engine is out of order"),
             "{err}"
         );
         // ...and they are compared as a multiset.
@@ -3329,7 +3440,8 @@ mod tests {
         assert!(
             err.starts_with(
                 "row 1 of the pipeline engine differs: it is not among the sorted rows \
-                 of DataFusion that the query may return (with their multiplicities)"
+                 of DataFusion that the query may return at its position (with their \
+                 multiplicities)"
             ),
             "{err}"
         );
@@ -3399,13 +3511,16 @@ mod tests {
         let err = same_results(two(), after_the_cut, &limit_2).unwrap_err();
         assert!(
             err.starts_with(
-                "row 1 of the pipeline engine is not among the rows that the query \
-                 returns: the LIMIT cuts sorted rows of DataFusion that the query orders \
-                 before it, and whose keys do not tie with its keys"
+                "row 1 of the pipeline engine is out of order: the sorted rows of \
+                 DataFusion with its values may not be at its position"
             ),
             "{err}"
         );
-        assert!(err.contains("keys of the cut rows: (2)"), "{err}");
+        assert!(err.contains("row 1: (3, \"c\"), keys: (3)"), "{err}");
+        assert!(
+            err.contains("sorted row 1 of DataFusion: (2, \"b\"), keys: (2)"),
+            "{err}"
+        );
         // The rows before them are compared as usual.
         let other_first = vec![kv_batch(&[(1, "z"), (2, "b"), (2, "c")])];
         let err = same_results(expected(), other_first, &limit_3).unwrap_err();
@@ -3439,10 +3554,7 @@ mod tests {
         let after_the_cut = vec![kv_batch(&[(1, "b"), (3, "d")])];
         let err = same_results(expected(), after_the_cut, &offset_1).unwrap_err();
         assert!(
-            err.starts_with(
-                "row 1 of the pipeline engine is not among the rows that the query \
-                 returns: the LIMIT cuts sorted rows"
-            ),
+            err.starts_with("row 1 of the pipeline engine is out of order"),
             "{err}"
         );
         // A sorted row that the OFFSET skips, which does not tie with them.
@@ -3452,11 +3564,7 @@ mod tests {
         let err =
             same_results(vec![kv_batch(&[(3, "c")])], skipped, &offset_2).unwrap_err();
         assert!(
-            err.starts_with(
-                "row 0 of the pipeline engine is not among the rows that the query \
-                 returns: the OFFSET skips sorted rows of DataFusion that the query \
-                 orders after it, and whose keys do not tie with its keys"
-            ),
+            err.starts_with("row 0 of the pipeline engine is out of order"),
             "{err}"
         );
         // The LIMIT and the OFFSET cut the same rows that tie.
@@ -3472,13 +3580,13 @@ mod tests {
     fn same_results_see_the_ties_on_keys_that_are_not_selected() {
         // The query selects `v` of rows ordered by `k`: unique keys.
         let rows = [(1, "a"), (2, "b"), (3, "c")];
-        let by_k = sorted_by_k(&rows, None);
+        let by_k = sorted_by_k(&rows, 0, None);
         same_results(vec![v_batch(&rows)], vec![v_batch(&rows)], &by_k).unwrap();
         let reversed = [(3, "c"), (2, "b"), (1, "a")];
         let err = same_results(vec![v_batch(&rows)], vec![v_batch(&reversed)], &by_k)
             .unwrap_err();
         assert!(
-            err.starts_with("row 1 of the pipeline engine is out of order"),
+            err.starts_with("row 0 of the pipeline engine is out of order"),
             "{err}"
         );
         assert!(err.contains("ORDER BY keys (m.k)"), "{err}");
@@ -3486,20 +3594,20 @@ mod tests {
 
         // Rows that tie on the key, which is not selected.
         let ties = [(1, "a"), (1, "b"), (2, "c")];
-        let by_k = sorted_by_k(&ties, None);
+        let by_k = sorted_by_k(&ties, 0, None);
         let swapped = [(1, "b"), (1, "a"), (2, "c")];
         same_results(vec![v_batch(&ties)], vec![v_batch(&swapped)], &by_k).unwrap();
         let moved = [(1, "a"), (2, "c"), (1, "b")];
         let err =
             same_results(vec![v_batch(&ties)], vec![v_batch(&moved)], &by_k).unwrap_err();
         assert!(
-            err.starts_with("row 2 of the pipeline engine is out of order"),
+            err.starts_with("row 1 of the pipeline engine is out of order"),
             "{err}"
         );
 
         // ...and that a LIMIT cuts.
         let sorted = [(1, "a"), (2, "b"), (2, "c"), (2, "d")];
-        let limit_3 = sorted_by_k(&sorted, Some(3));
+        let limit_3 = sorted_by_k(&sorted, 0, Some(3));
         let expected = || vec![v_batch(&sorted[..3])];
         let others = [(1, "a"), (2, "d"), (2, "b")];
         same_results(expected(), vec![v_batch(&others)], &limit_3).unwrap();
@@ -3511,6 +3619,52 @@ mod tests {
                 same_results(expected(), vec![v_batch(&actual)], &limit_3).unwrap_err();
             assert!(err.contains("of the pipeline engine differs"), "{err}");
         }
+    }
+
+    #[test]
+    fn same_results_assign_the_rows_to_the_sorted_rows_at_their_positions() {
+        // The values of the rows of `k = 1` and `k = 3` are equal: the rows that
+        // the query returns are those at its positions.
+        let sorted = [(1, "a"), (2, "b"), (3, "a")];
+        for (skip, fetch, rows) in [
+            (2, None, &[(3, "a")][..]),
+            (2, Some(1), &[(3, "a")]),
+            (1, None, &[(2, "b"), (3, "a")]),
+            (0, Some(1), &[(1, "a")]),
+            (0, None, &sorted),
+        ] {
+            let order = sorted_by_k(&sorted, skip, fetch);
+            same_results(vec![v_batch(rows)], vec![v_batch(rows)], &order)
+                .unwrap_or_else(|e| panic!("{skip} {fetch:?}: {e}"));
+        }
+        let offset_2 = sorted_by_k(&sorted, 2, None);
+        let other = vec![v_batch(&[(2, "b")])];
+        let err = same_results(vec![v_batch(&[(3, "a")])], other, &offset_2).unwrap_err();
+        assert!(
+            err.starts_with("row 0 of the pipeline engine is out of order"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn same_results_match_close_floats_across_classes_that_tie() {
+        // The query selects `y` of rows ordered by `x`, whose keys tie: `1 -
+        // 0.9e-9` can only be the `y` of the first row, and `1 + 0.9e-9` either.
+        let sorted = xy_batch(&[(1.0, 1.0), (1.0 + 1.5e-9, 1.0 + 1.8e-9)]);
+        let order = hidden_key_order(&sorted, 0, None);
+        let y = |values: &[f64]| {
+            let y = Float64Array::from(values.to_vec());
+            vec![batch_of(vec![("y", Arc::new(y) as ArrayRef)])]
+        };
+        let expected = || y(&[1.0, 1.0 + 1.8e-9]);
+        same_results(expected(), y(&[1.0 + 0.9e-9, 1.0 - 0.9e-9]), &order).unwrap();
+        same_results(expected(), y(&[1.0 - 0.9e-9, 1.0 + 0.9e-9]), &order).unwrap();
+        let err = same_results(expected(), y(&[1.0 - 0.9e-9, 1.0 - 0.9e-9]), &order)
+            .unwrap_err();
+        assert!(
+            err.starts_with("row 1 of the pipeline engine differs"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3785,9 +3939,9 @@ mod tests {
         // ...but not relative to rows that they do not tie with, although
         // each ties with the next.
         for (order, row) in [
-            ([3, 2, 1, 0], 2),
-            ([2, 1, 0, 3], 2),
-            ([0, 3, 1, 2], 2),
+            ([3, 2, 1, 0], 0),
+            ([2, 1, 0, 3], 0),
+            ([0, 3, 1, 2], 1),
             ([1, 2, 0, 3], 2),
         ] {
             let err =
@@ -3808,11 +3962,7 @@ mod tests {
             let err =
                 same_results(close_rows(&[0]), close_rows(&[row]), &limit_1).unwrap_err();
             assert!(
-                err.starts_with(
-                    "row 0 of the pipeline engine is not among the rows that the query \
-                     returns: the LIMIT cuts sorted rows of DataFusion that the query \
-                     orders before it"
-                ),
+                err.starts_with("row 0 of the pipeline engine is out of order"),
                 "{row}: {err}"
             );
             // DataFusion's result is compared with its sorted rows too.
@@ -3825,8 +3975,17 @@ mod tests {
         let limit_2 = sorted_by(&sorted, &["s"], 0, Some(2));
         same_results(close_rows(&[0, 1]), close_rows(&[1, 0]), &limit_2).unwrap();
         same_results(close_rows(&[0, 1]), close_rows(&[0, 2]), &limit_2).unwrap();
+        // Rows `b` and `c` may be first and second, but the LIMIT would then cut
+        // row `a`, which does not tie with `c`.
+        let err =
+            same_results(close_rows(&[0, 1]), close_rows(&[1, 2]), &limit_2).unwrap_err();
         assert!(
-            same_results(close_rows(&[0, 1]), close_rows(&[1, 2]), &limit_2).is_err()
+            err.starts_with(
+                "row 1 of the pipeline engine is not among the rows that the query \
+                 returns: the LIMIT cuts sorted rows of DataFusion that the query orders \
+                 before it, and whose keys do not tie with its keys"
+            ),
+            "{err}"
         );
         // Under OFFSET 3, the last row.
         let offset_3 = sorted_by(&sorted, &["s"], 3, None);
@@ -3835,14 +3994,25 @@ mod tests {
             let err = same_results(close_rows(&[3]), close_rows(&[row]), &offset_3)
                 .unwrap_err();
             assert!(
-                err.starts_with(
-                    "row 0 of the pipeline engine is not among the rows that the query \
-                     returns: the OFFSET skips sorted rows of DataFusion that the query \
-                     orders after it"
-                ),
+                err.starts_with("row 0 of the pipeline engine is out of order"),
                 "{row}: {err}"
             );
         }
+        // Under OFFSET 1, rows `a`, `b` and `c` may be at the positions of `b`,
+        // `c` and `d`, but the OFFSET would then skip row `d`, which does not
+        // tie with `a`.
+        let offset_1 = sorted_by(&sorted, &["s"], 1, None);
+        same_results(close_rows(&[1, 2, 3]), close_rows(&[0, 2, 3]), &offset_1).unwrap();
+        let err = same_results(close_rows(&[1, 2, 3]), close_rows(&[0, 1, 2]), &offset_1)
+            .unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 0 of the pipeline engine is not among the rows that the query \
+                 returns: the OFFSET skips sorted rows of DataFusion that the query \
+                 orders after it, and whose keys do not tie with its keys"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3940,8 +4110,8 @@ mod tests {
             );
         }
 
-        // The batches of the pipeline engine have the output schema, or the
-        // schema of the batches of DataFusion.
+        // The batches of the pipeline engine have exactly the output schema,
+        // even if the batches of DataFusion do not.
         let options = ComparisonOptions::default();
         let expected = output(vec![batch.clone()], false);
         let mut actual = output(vec![batch.clone()], false);
@@ -3959,7 +4129,13 @@ mod tests {
             batches: actual.batches.clone(),
             ..expected
         };
-        compare_results(&expected, &actual, UNORDERED, &options).unwrap();
+        let err = compare_results(&expected, &actual, UNORDERED, &options).unwrap_err();
+        assert!(
+            err.contains(
+                "the schema of a batch of the pipeline engine is not the output"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -4354,7 +4530,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(
-        expected = "Results differ: row 2 of the pipeline engine is out of order"
+        expected = "Results differ: row 0 of the pipeline engine is out of order"
     )]
     async fn assert_same_results_panics_on_rows_out_of_order_by_close_floats() {
         let setup = reversed_close_rows();
@@ -4367,12 +4543,43 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(
-        expected = "Results differ: row 0 of the pipeline engine is not among the rows that the query returns: the LIMIT cuts"
+        expected = "Results differ: row 0 of the pipeline engine is out of order: the sorted rows of DataFusion with its values may not be at its position"
     )]
     async fn assert_same_results_panics_on_another_first_row_by_close_floats() {
         let setup = reversed_close_rows();
         assert_same_results_as_datafusion_with_setup(
             "SELECT v FROM m ORDER BY s LIMIT 1",
+            &setup,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_return_the_rows_at_the_offset() {
+        // The values of the rows of `k = 1` and `k = 3` are equal.
+        let rows = kv_batch(&[(1, "a"), (2, "b"), (3, "a")]);
+        let setup = per_engine_tables(rows.clone(), rows);
+        for sql in [
+            "SELECT v FROM m ORDER BY k OFFSET 2",
+            "SELECT v FROM m ORDER BY k LIMIT 1 OFFSET 2",
+            "SELECT v FROM m ORDER BY k OFFSET 1",
+            "SELECT v FROM m ORDER BY k DESC OFFSET 1",
+            "SELECT v FROM m ORDER BY k DESC LIMIT 1 OFFSET 2",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_match_close_floats_of_rows_that_tie() {
+        // Each value of `y` of the pipeline engine is within the tolerance of the
+        // value of the other row of DataFusion, whose key ties with its key.
+        let setup = per_engine_tables(
+            xy_batch(&[(1.0, 1.0), (1.0 + 1.5e-9, 1.0 + 1.8e-9)]),
+            xy_batch(&[(1.0, 1.0 + 0.9e-9), (1.0 + 1.5e-9, 1.0 - 0.9e-9)]),
+        );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT y FROM m ORDER BY x",
             &setup,
         )
         .await;
@@ -4435,7 +4642,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(
-        expected = "Results differ: row 1 of the pipeline engine is out of order"
+        expected = "Results differ: row 0 of the pipeline engine is out of order"
     )]
     async fn assert_same_results_panics_on_rows_out_of_the_order_of_keys_not_selected() {
         let setup = per_engine_tables(
