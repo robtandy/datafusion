@@ -95,17 +95,32 @@
 //! nodes of its probe side that can prune rows with it (e.g. Parquet scans,
 //! which skip whole files and row groups), and sets it once the build side is
 //! collected (see `HashJoinExec::dynamic_expressions_produced`). A
-//! [`PhysicalHashJoin`] lowered from such a join sets the filter to the bounds
-//! of its build keys (`key >= min AND key <= max`, or `false` if no build row
-//! can match) when its build side is finalized, and marks it complete (see
-//! `PhysicalHashJoin::dynamic_filter_predicate`): DataFusion's filter also
-//! checks the membership of the keys (an `IN` list or a hash table lookup),
-//! so the probe side of a native join may see more rows than DataFusion's,
-//! which the join drops (they cannot match): the result is the same. (The
-//! probe side may then evaluate its expressions on rows that DataFusion skips,
-//! and fail on them: whether an error is raised for rows that only one of the
-//! engines evaluates is not part of the result, see the correctness policy in
-//! `docs/compatibility.md`.)
+//! [`PhysicalHashJoin`] lowered from such a join sets the filter, like
+//! DataFusion's, to the bounds and the membership of its build keys when its
+//! build side is finalized, and marks it complete (see
+//! `PhysicalHashJoin::dynamic_filter_predicate`):
+//!
+//! * the bounds `key >= min AND key <= max` (or `false` if no build row can
+//!   match);
+//! * for a build side of few distinct keys (DataFusion's limits of its `IN`
+//!   lists, `hash_join_inlist_pushdown_max_distinct_values` and
+//!   `hash_join_inlist_pushdown_max_size`), `key IN (...)` of the build keys,
+//!   with which scans also prune pages, and row groups by their statistics
+//!   and bloom filters;
+//! * otherwise a lookup of the keys in the [`JoinHashTable`]
+//!   ([`JoinHashTableLookupExpr`], DataFusion's `HashTableLookupExpr`), with
+//!   which scans filter their rows (with `pushdown_filters`).
+//!
+//! The probe side, and the pipeline breakers on it, wait for the build side
+//! (see [Pipelines](#pipelines)), so the filter is complete before any scan of
+//! the probe side opens its files. The scans of the probe side of a native
+//! join may see other rows than DataFusion's (e.g. those that the lookup of a
+//! hash table accepts, as their hashes collide with the hash of a build key,
+//! are other rows in the two engines), which the join drops (they cannot
+//! match): the result is the same. (The probe side may then evaluate its
+//! expressions on rows that DataFusion skips, and fail on them: whether an
+//! error is raised for rows that only one of the engines evaluates is not part
+//! of the result, see the correctness policy in `docs/compatibility.md`.)
 //!
 //! # Semantics
 //!
@@ -131,32 +146,35 @@
 //! the join does not implement, are left to DataFusion).
 
 use std::any::Any;
-use std::fmt::Write;
+use std::fmt::{self, Write};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
-    new_null_array,
+    make_comparator, new_null_array,
 };
 use arrow::buffer::NullBuffer;
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_select::take::take;
 use datafusion_common::ScalarValue;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::config::OptimizerOptions;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_datafusion_err,
     internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_expr::Operator;
+use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
-use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, IsNullExpr, lit,
+    BinaryExpr, Column, DynamicFilterPhysicalExpr, InListExpr, IsNullExpr, lit,
 };
 use datafusion_physical_expr::utils::conjunction;
+use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::joins::HashJoinExec;
@@ -193,9 +211,9 @@ pub struct PhysicalHashJoin {
     spec: JoinSpec,
     /// The dynamic filters of the `HashJoinExec` the join was lowered from
     /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
-    /// its probe side read: the join sets them to the bounds of its build keys
-    /// (see [`Self::dynamic_filter_predicate`]), and marks them complete,
-    /// when its build side is finalized.
+    /// its probe side read: the join sets them to the bounds and the
+    /// membership of its build keys (see [`Self::dynamic_filter_predicate`]),
+    /// and marks them complete, when its build side is finalized.
     dynamic_filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
 }
 
@@ -235,7 +253,8 @@ struct JoinSpec {
     /// largest value), for the dynamic filters of the join (see
     /// [`PhysicalHashJoin::dynamic_filter_predicate`]): the keys whose values
     /// are ordered like they are equal (see [`has_exact_bounds`]) of a join
-    /// with dynamic filters.
+    /// with dynamic filters. The values of these keys are also equal as join
+    /// keys exactly if they are equal in an `IN` list.
     bounded_keys: Vec<bool>,
     /// The probe columns of the probe keys, if all of them are columns: the
     /// join then only compacts these columns of a probe chunk with a selection
@@ -580,7 +599,7 @@ impl PhysicalHashJoin {
             return Ok(None);
         }
         // The dynamic filters that nodes of the probe side read: the native
-        // join sets them to the bounds of its build keys.
+        // join sets them to the bounds and the membership of its build keys.
         let Some(dynamic_filters) = dynamic_filters(plan) else {
             return Ok(None);
         };
@@ -616,8 +635,8 @@ impl PhysicalHashJoin {
         {
             return Ok(None);
         }
-        // The join sets its dynamic filters to the bounds of the keys that
-        // have exact bounds (see `dynamic_filter_predicate`).
+        // The join sets its dynamic filters to the bounds (and `IN` lists) of
+        // the keys that have exact bounds (see `dynamic_filter_predicate`).
         if !dynamic_filters.is_empty() {
             let build_schema = join.left().schema();
             spec.bounded_keys = join
@@ -671,12 +690,14 @@ impl PhysicalHashJoin {
         }
         let build_empty = state.build_rows.load(Ordering::Relaxed) == 0;
         let table = state.finish_build(spec)?;
-        if !self.dynamic_filters.is_empty()
-            && let Some(predicate) =
-                self.dynamic_filter_predicate(&table, &state.key_stats.lock())
-        {
-            for filter in &self.dynamic_filters {
-                filter.update(Arc::clone(&predicate))?;
+        if !self.dynamic_filters.is_empty() {
+            let options = &ctx.task_ctx.session_config().options().optimizer;
+            let predicate =
+                self.dynamic_filter_predicate(&table, &state.key_stats.lock(), options)?;
+            if let Some(predicate) = predicate {
+                for filter in &self.dynamic_filters {
+                    filter.update(Arc::clone(&predicate))?;
+                }
             }
         }
         // The probe side is not read if the join cannot produce output.
@@ -689,67 +710,164 @@ impl PhysicalHashJoin {
     }
 
     /// The predicate of the probe keys that the dynamic filters of the join are
-    /// set to once its build side is collected: like DataFusion's (without its
-    /// `IN` lists and hash table lookups), `key >= min AND key <= max` for every
-    /// key with exact bounds (see [`JoinSpec::bounded_keys`]), with `OR key IS
-    /// NULL` if the NULL keys of the build side can match (under
-    /// `NullEqualsNull`), and `false` if no build row can match. The nodes of
-    /// the probe side that read the filters (e.g. Parquet scans) then skip the
-    /// files, row groups, pages and rows whose keys no build key equals, which
-    /// the join would drop anyway.
+    /// set to once its build side is collected, like DataFusion's: the bounds
+    /// and the membership of the build keys, `false` if no build row can match.
+    /// The nodes of the probe side that read the filters (e.g. Parquet scans)
+    /// then skip the files, row groups, pages and rows whose keys no build key
+    /// equals, which the join would drop anyway. For every key:
     ///
-    /// `None` (the filters stay `true`) if no key has bounds, and for the joins
-    /// that emit their probe rows without a match, and the null-aware ones,
-    /// whose probe rows count also if they do not match.
+    /// * `key >= min AND key <= max`, if it has exact bounds (see
+    ///   [`JoinSpec::bounded_keys`]);
+    /// * if the build side has few distinct keys (at most
+    ///   `hash_join_inlist_pushdown_max_distinct_values` of them, of at most
+    ///   `hash_join_inlist_pushdown_max_size` bytes: the limits of DataFusion's
+    ///   `IN` lists), `key IN (...)` of the distinct values of the build keys,
+    ///   with which scans also prune pages and row groups by their statistics
+    ///   and bloom filters: for the keys with exact bounds, but booleans and
+    ///   the integer keys whose values are all the values of their bounds, for
+    ///   which the bounds are exact (as in DuckDB, which pushes no `IN` list
+    ///   for them either);
+    /// * with `OR key IS NULL` if NULL build keys match (with
+    ///   `NullEqualsNull`).
+    ///
+    /// And, unless these are exact (for a single key with an `IN` list, or
+    /// whose build keys are all the values of its bounds), a lookup of the keys
+    /// in the hash table ([`JoinHashTableLookupExpr`], DataFusion's
+    /// `HashTableLookupExpr`), with which scans filter their rows (with
+    /// `pushdown_filters`). The `IN` lists are of single keys, not of the
+    /// tuples of several keys (DataFusion's `struct(...) IN (...)`, which
+    /// statistics, pages and bloom filters cannot prune with): the lookup
+    /// checks the tuples.
+    ///
+    /// `None` (the filters stay `true`) for the joins that emit their probe
+    /// rows without a match, and the null-aware ones, whose probe rows count
+    /// also if they do not match.
     fn dynamic_filter_predicate(
         &self,
-        table: &JoinHashTable,
+        table: &Arc<JoinHashTable>,
         stats: &BuildKeyStats,
-    ) -> Option<PhysicalExprRef> {
+        options: &OptimizerOptions,
+    ) -> Result<Option<PhysicalExprRef>> {
         let spec = &self.spec;
         if spec.null_aware || spec.emits_unmatched_probe_rows() {
-            return None;
+            return Ok(None);
         }
         if table.is_empty() {
-            return Some(lit(false));
+            return Ok(Some(lit(false)));
         }
         let null_keys_match = spec.null_equality == NullEquality::NullEqualsNull;
-        let predicates = spec
-            .on
+        // The distinct keys of a build side of few of them, for `IN` lists (not
+        // gathered if their fixed-width values alone take too many bytes).
+        let num_distinct_keys = table.num_distinct_keys();
+        let fixed_width = spec
+            .key_schema
+            .fields()
             .iter()
-            .zip(&stats.bounds)
-            .zip(&spec.bounded_keys)
-            .filter(|((_, bounds), bounded)| **bounded && !bounds.failed)
-            .filter_map(|(((_, probe_key), bounds), _)| {
-                let range = bounds.min_max.as_ref().map(|(min, max)| {
-                    let at_least = BinaryExpr::new(
-                        Arc::clone(probe_key),
-                        Operator::GtEq,
-                        lit(min.clone()),
-                    );
-                    let at_most = BinaryExpr::new(
-                        Arc::clone(probe_key),
-                        Operator::LtEq,
-                        lit(max.clone()),
-                    );
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(at_least),
-                        Operator::And,
-                        Arc::new(at_most),
-                    )) as PhysicalExprRef
-                });
-                let is_null = (null_keys_match && bounds.has_null).then(|| {
-                    Arc::new(IsNullExpr::new(Arc::clone(probe_key))) as PhysicalExprRef
-                });
-                match (range, is_null) {
-                    (Some(range), Some(is_null)) => {
-                        Some(Arc::new(BinaryExpr::new(range, Operator::Or, is_null)) as _)
-                    }
-                    (range, is_null) => range.or(is_null),
+            .map(|field| field.data_type().primitive_width().unwrap_or(0))
+            .sum::<usize>();
+        let distinct_keys = if num_distinct_keys
+            <= options.hash_join_inlist_pushdown_max_distinct_values
+            && num_distinct_keys.saturating_mul(fixed_width)
+                <= options.hash_join_inlist_pushdown_max_size
+        {
+            let keys = table.distinct_keys()?;
+            let size = keys
+                .iter()
+                .map(|key| key.get_array_memory_size())
+                .sum::<usize>();
+            (size <= options.hash_join_inlist_pushdown_max_size).then_some(keys)
+        } else {
+            None
+        };
+        let probe_schema = self.probe_side().schema();
+        let mut predicates = Vec::with_capacity(spec.num_keys() + 1);
+        // Whether the predicates are true for exactly the probe keys that a
+        // build row has.
+        let mut exact = spec.num_keys() == 1;
+        for (key, (_, probe_key)) in spec.on.iter().enumerate() {
+            let bounds = Some(&stats.bounds[key])
+                .filter(|bounds| spec.bounded_keys[key] && !bounds.failed);
+            let range = bounds
+                .and_then(|bounds| bounds.min_max.as_ref())
+                .map(|(min, max)| range_predicate(probe_key, min, max));
+            // Whether a build row with a NULL key matches the probe rows with a
+            // NULL key.
+            let null_matches = null_keys_match
+                && match (bounds, &distinct_keys) {
+                    (Some(bounds), _) => bounds.has_null,
+                    (None, Some(keys)) => keys[key].logical_null_count() > 0,
+                    (None, None) => true,
+                };
+            // The `IN` list of the key, and whether the predicates of the key are
+            // true for exactly the values of the build keys.
+            let boolean = *spec.key_schema.field(key).data_type() == DataType::Boolean;
+            let values = match &distinct_keys {
+                Some(keys) if spec.bounded_keys[key] && !boolean => {
+                    Some(sorted_distinct_values(&keys[key])?)
                 }
-            })
-            .collect::<Vec<_>>();
-        (!predicates.is_empty()).then(|| conjunction(predicates))
+                _ => None,
+            };
+            let (in_list, key_exact) = match values {
+                // The bounds of booleans are their values.
+                _ if boolean => (None, range.is_some()),
+                // Only NULLs: the predicate is `key IS NULL` (see below).
+                Some(values) if values.is_empty() => (None, bounds.is_some()),
+                // The values fill their bounds, which are exact.
+                Some(values) if range.is_some() && fills_its_range(values.as_ref()) => {
+                    (None, true)
+                }
+                Some(values) => {
+                    let in_list = InListExpr::try_new_from_array(
+                        Arc::clone(probe_key),
+                        values,
+                        false,
+                        &probe_schema,
+                    )?;
+                    (Some(Arc::new(in_list) as PhysicalExprRef), true)
+                }
+                // A single integer key (only those have a range) of a build side
+                // of many keys: are they all the values of their bounds?
+                None => {
+                    let valid_keys = table
+                        .num_distinct_keys()
+                        .saturating_sub(usize::from(null_matches));
+                    let fills_bounds = stats.range.is_some_and(|key_range| {
+                        key_range.max() - key_range.min() + 1 == valid_keys as i128
+                    });
+                    (None, range.is_some() && fills_bounds)
+                }
+            };
+            let is_null = null_matches.then(|| {
+                Arc::new(IsNullExpr::new(Arc::clone(probe_key))) as PhysicalExprRef
+            });
+            let values = range.into_iter().chain(in_list).collect::<Vec<_>>();
+            let predicate = match (values.is_empty(), is_null) {
+                (false, Some(is_null)) => Some(Arc::new(BinaryExpr::new(
+                    conjunction(values),
+                    Operator::Or,
+                    is_null,
+                )) as PhysicalExprRef),
+                (false, None) => Some(conjunction(values)),
+                // All build keys are NULL: only NULL probe keys match them.
+                (true, Some(is_null))
+                    if bounds.is_some_and(|bounds| bounds.min_max.is_none()) =>
+                {
+                    Some(is_null)
+                }
+                _ => None,
+            };
+            exact &= key_exact && predicate.is_some();
+            predicates.extend(predicate);
+        }
+        if !exact {
+            let keys = spec
+                .on
+                .iter()
+                .map(|(_, probe_key)| Arc::clone(probe_key))
+                .collect();
+            predicates.push(Arc::new(JoinHashTableLookupExpr::new(keys, table)));
+        }
+        Ok(Some(conjunction(predicates)))
     }
 
     /// The build side (DataFusion's left input).
@@ -1511,6 +1629,47 @@ fn has_exact_bounds(data_type: &DataType) -> bool {
                 | DataType::BinaryView
                 | DataType::FixedSizeBinary(_)
         )
+}
+
+/// `key >= min AND key <= max`.
+fn range_predicate(
+    key: &PhysicalExprRef,
+    min: &ScalarValue,
+    max: &ScalarValue,
+) -> PhysicalExprRef {
+    let at_least = BinaryExpr::new(Arc::clone(key), Operator::GtEq, lit(min.clone()));
+    let at_most = BinaryExpr::new(Arc::clone(key), Operator::LtEq, lit(max.clone()));
+    Arc::new(BinaryExpr::new(
+        Arc::new(at_least),
+        Operator::And,
+        Arc::new(at_most),
+    ))
+}
+
+/// The distinct valid values of `values`, sorted, e.g. for an `IN` list.
+fn sorted_distinct_values(values: &ArrayRef) -> Result<ArrayRef> {
+    let values = if values.logical_null_count() > 0 {
+        arrow::compute::filter(values, &arrow::compute::is_not_null(values)?)?
+    } else {
+        Arc::clone(values)
+    };
+    let sorted = arrow::compute::sort(&values, None)?;
+    let compare = make_comparator(&sorted, &sorted, SortOptions::default())?;
+    let first_of_value = (0..sorted.len())
+        .map(|i| i == 0 || compare(i - 1, i).is_ne())
+        .collect::<Vec<_>>();
+    Ok(arrow::compute::filter(
+        &sorted,
+        &BooleanArray::from(first_of_value),
+    )?)
+}
+
+/// Whether `values`, distinct valid values of an integer type (see
+/// [`KeyRange::supports`]), are all the values between the smallest and the
+/// largest of them.
+fn fills_its_range(values: &dyn Array) -> bool {
+    KeyRange::of_array(values)
+        .is_some_and(|range| range.max() - range.min() + 1 == values.len() as i128)
 }
 
 /// Whether a `HashJoinExec` has a prepared build side attached, whose left
@@ -2309,6 +2468,135 @@ impl PhysicalOperator for JoinHashTableBuild {
     }
 }
 
+/// The membership of the probe keys of a [`PhysicalHashJoin`] in its build
+/// keys, with which the join sets its dynamic filters (see
+/// `PhysicalHashJoin::dynamic_filter_predicate`), like DataFusion's
+/// `HashTableLookupExpr`: whether a build row of the [`JoinHashTable`] of the
+/// join may have the keys of a row (see [`JoinHashTable::may_contain_keys`]).
+/// It is `true` for every row with a match, and `false` for almost all
+/// others: a dense index looks the keys up exactly, a hashed table by the
+/// hashes of the keys (and their key filter), without comparing them, which
+/// is cheap enough for scans to filter their rows with it. It is never NULL.
+///
+/// The expression evaluates its children, the probe keys of the join, on the
+/// rows it filters. It does not keep the table alive (nor its rows and their
+/// memory, which the join reserved), only as long as the execution of the join
+/// holds it: until the execution completes, after the probe side, and the
+/// scans below it, read all their rows. Afterwards, it is `true` for every
+/// row. So it is for keys of other types than the keys of the table (e.g. if
+/// a scan evaluates them on rows of other types), which it cannot look up.
+#[derive(Debug)]
+pub struct JoinHashTableLookupExpr {
+    /// The probe keys.
+    keys: Vec<PhysicalExprRef>,
+    table: Weak<JoinHashTable>,
+}
+
+impl JoinHashTableLookupExpr {
+    /// The lookup of the keys `keys` (one for every key of the table) in
+    /// `table`.
+    pub fn new(keys: Vec<PhysicalExprRef>, table: &Arc<JoinHashTable>) -> Self {
+        Self {
+            keys,
+            table: Arc::downgrade(table),
+        }
+    }
+
+    /// The keys that are looked up.
+    pub fn keys(&self) -> &[PhysicalExprRef] {
+        &self.keys
+    }
+
+    /// The hash table, unless the execution of its join completed.
+    pub fn table(&self) -> Option<Arc<JoinHashTable>> {
+        self.table.upgrade()
+    }
+}
+
+impl fmt::Display for JoinHashTableLookupExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "hash_lookup(")?;
+        for (i, key) in self.keys.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{key}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl PartialEq for JoinHashTableLookupExpr {
+    fn eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.table, &other.table) && self.keys == other.keys
+    }
+}
+
+impl Eq for JoinHashTableLookupExpr {}
+
+impl Hash for JoinHashTableLookupExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.keys.hash(state);
+        self.table.as_ptr().hash(state);
+    }
+}
+
+impl PhysicalExpr for JoinHashTableLookupExpr {
+    fn data_type(&self, _input_schema: &Schema) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        let all = || Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))));
+        let Some(table) = self.table.upgrade() else {
+            return all();
+        };
+        let keys = evaluate_expressions_to_arrays(&self.keys, batch)?;
+        let layout = table.layout();
+        if keys.len() != table.num_keys()
+            || keys
+                .iter()
+                .enumerate()
+                .any(|(i, key)| key.data_type() != layout.column(i).data_type())
+        {
+            return all();
+        }
+        let contained = table.may_contain_keys(&keys)?;
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::new(
+            contained, None,
+        ))))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        self.keys.iter().collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self {
+            keys: children,
+            table: Weak::clone(&self.table),
+        }))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "hash_lookup(")?;
+        for (i, key) in self.keys.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            key.fmt_sql(f)?;
+        }
+        write!(f, ")")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2395,6 +2683,21 @@ mod tests {
     /// * scans with the native sources;
     /// * every other node is bridged, with its subtree.
     fn lower(plan: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>> {
+        lower_with(plan, &|scan, _| Ok(scan))
+    }
+
+    /// Wraps the native source of a scan (of the second argument).
+    type WrapScan<'a> = &'a dyn Fn(
+        Arc<dyn PhysicalOperator>,
+        &Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn PhysicalOperator>>;
+
+    /// [`lower`], with the native sources of the scans wrapped by `wrap_scan`.
+    fn lower_with(
+        plan: &Arc<dyn ExecutionPlan>,
+        wrap_scan: WrapScan<'_>,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let lower = |input: &Arc<dyn ExecutionPlan>| lower_with(input, wrap_scan);
         if let Some(join) = PhysicalHashJoin::try_lower(plan, lower)? {
             return Ok(Arc::new(join));
         }
@@ -2476,7 +2779,7 @@ mod tests {
             }));
         }
         if let Some(source) = crate::sources::try_create_scan_source(plan)? {
-            return Ok(source);
+            return wrap_scan(source, plan);
         }
         Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
     }
@@ -5497,13 +5800,24 @@ mod tests {
         .await
     }
 
+    /// `values`, separated by commas, as an `IN` list displays them.
+    fn listed<T: ToString>(values: impl IntoIterator<Item = T>) -> String {
+        values
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_that_produce_dynamic_filters_are_native() -> Result<()> {
         // Joins of the memory table `b` (the build side) with the Parquet
         // table `p`, whose scans read the dynamic filters of the joins. The
         // joins are native: they set the filters to the bounds of their build
-        // keys (`10` and `300`), with which the scans skip the row groups of
-        // the other keys, and mark them complete.
+        // keys (`10` and `300`) and to the `IN` list of their 30 distinct keys,
+        // with which the scans skip the row groups of the other keys, and mark
+        // them complete.
+        let in_list = listed((1..=30).map(|i| i * 10));
         let dir = tempfile::tempdir()?;
         write_parquet_table_p(dir.path())?;
         let setup =
@@ -5549,7 +5863,13 @@ mod tests {
                     // No build row can match: the probe side is not read.
                     assert_eq!(filter, "false", "{sql}");
                 } else {
-                    assert_eq!(filter, "k@0 >= 10 AND k@0 <= 300", "{sql}");
+                    assert_eq!(
+                        filter,
+                        format!(
+                            "k@0 >= 10 AND k@0 <= 300 AND k@0 IN (SET) ([{in_list}])"
+                        ),
+                        "{sql}"
+                    );
                     let pruned = pruned(&scan, "files_ranges_pruned_statistics")
                         + pruned(&scan, "row_groups_pruned_statistics");
                     assert!(pruned > 0, "{sql}");
@@ -5562,12 +5882,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dynamic_filters_are_set_to_the_bounds_of_the_build_keys() -> Result<()> {
+    async fn dynamic_filters_are_set_to_the_bounds_and_the_membership_of_the_build_keys()
+    -> Result<()> {
         // Joins of memory tables with the Parquet table `p`, whose scans read
         // the dynamic filters of the joins: they are set to the bounds of the
-        // build keys with exact bounds (not floats), keep the probe rows with a
-        // NULL key if NULL build keys match them (`IS NOT DISTINCT FROM`), and
-        // are `false` if no build row can match.
+        // build keys with exact bounds (not floats), and to the `IN` lists of
+        // their distinct values, of every key (of few distinct keys), and to a
+        // lookup of the keys in the hash table but for a single key with an
+        // `IN` list, keep the probe rows with a NULL key if NULL build keys
+        // match them (`IS NOT DISTINCT FROM`), and are `false` if no build row
+        // can match.
+        let k = listed((1..=30).map(|i| i * 10));
+        // The values of `w`, but that of the NULL key, which matches nothing.
+        let w = listed((0..30).chain([31]));
         let dir = tempfile::tempdir()?;
         write_parquet_table_p(dir.path())?;
         let setup = async |ctx: &SessionContext| {
@@ -5592,29 +5919,35 @@ mod tests {
         for (sql, expected) in [
             (
                 "SELECT b.w, p.k FROM b JOIN p ON b.k = p.k AND b.w = p.d",
-                "k@0 >= 10 AND k@0 <= 300 AND d@1 >= 0 AND d@1 <= 31",
+                format!(
+                    "k@0 >= 10 AND k@0 <= 300 AND k@0 IN (SET) ([{k}]) \
+                     AND d@1 >= 0 AND d@1 <= 31 AND d@1 IN (SET) ([{w}]) \
+                     AND hash_lookup(k@0, d@1)"
+                ),
             ),
             (
                 "SELECT c.x, p.k FROM c JOIN p ON c.s = p.s",
-                "s@1 >= s11 AND s@1 <= s3",
+                "s@1 >= s11 AND s@1 <= s3 AND s@1 IN (SET) ([s11, s3])".to_string(),
             ),
             (
                 "SELECT c.s, p.k FROM c JOIN p ON c.x = CAST(p.d AS DOUBLE)",
-                "true",
+                "hash_lookup(CAST(p.d AS Float64)@2)".to_string(),
             ),
             (
                 "SELECT b.w, p.k FROM b JOIN p ON b.k IS NOT DISTINCT FROM p.d",
-                "d@1 >= 10 AND d@1 <= 300 OR d@1 IS NULL",
+                format!(
+                    "d@1 >= 10 AND d@1 <= 300 AND d@1 IN (SET) ([{k}]) OR d@1 IS NULL"
+                ),
             ),
             // The build row of `w = 30` has a NULL key: the probe side of the
             // inner join is not read, the scan of the `Left` join reads nothing.
             (
                 "SELECT b.w, p.k FROM b JOIN p ON b.k = p.k WHERE b.w = 30",
-                "false",
+                "false".to_string(),
             ),
             (
                 "SELECT b.w, p.d FROM b LEFT JOIN p ON b.k = p.k WHERE b.w = 30",
-                "false",
+                "false".to_string(),
             ),
         ] {
             let ctx = datafusion_context(config.clone());
@@ -5633,6 +5966,628 @@ mod tests {
             assert_eq!(filters[0].current()?.to_string(), expected, "{sql}");
             assert_join_parity_with_setup(sql, config.clone(), &setup, 1).await;
         }
+        Ok(())
+    }
+
+    /// Write the Parquet table `q` of `(k, s, u)` to `dir`: 4,000 rows, in row
+    /// groups of 100 rows and data pages of 10 rows, sorted by `k` (`0` to
+    /// `3999`) and by `s` (`v0000` to `v3999`), and `u` (`u0000` to `u3999`),
+    /// in the order of a permutation (see [`u_of`]) that spreads the values of
+    /// every row group and page over (almost) all values, with a bloom filter.
+    fn write_parquet_table_q(dir: &std::path::Path) -> Result<()> {
+        let u = ::parquet::schema::types::ColumnPath::from("u");
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .set_column_bloom_filter_enabled(u.clone(), true)
+            .set_column_bloom_filter_max_ndv(u.clone(), 100)
+            .set_column_bloom_filter_fpp(u, 0.001)
+            .build();
+        let batch = q_rows((0..4000).collect())?;
+        let batch = RecordBatch::try_from_iter([
+            ("k", Arc::clone(batch.column(0))),
+            ("s", arrow::compute::cast(batch.column(1), &DataType::Utf8)?),
+            ("u", arrow::compute::cast(batch.column(2), &DataType::Utf8)?),
+        ])?;
+        let path = dir.join("q").join("q.parquet");
+        write_parquet(&path, batch.schema(), &[batch], Some(properties))
+    }
+
+    /// The `u` of the key `k` of the table `q` (see [`write_parquet_table_q`]):
+    /// `k * 7919 % 4000`, a permutation of the keys, which steps by `-81`.
+    fn u_of(k: i64) -> String {
+        format!("u{:04}", k * 7919 % 4000)
+    }
+
+    /// The rows `(k, s, u)` of the keys `keys` of the table `q`, with the strings
+    /// of DataFusion's scans of Parquet files (`Utf8View`).
+    fn q_rows(keys: Vec<i64>) -> Result<RecordBatch> {
+        let s = keys.iter().map(|k| format!("v{k:04}"));
+        let u = keys.iter().map(|&k| u_of(k));
+        Ok(RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from(keys.clone())) as ArrayRef),
+            (
+                "s",
+                Arc::new(StringViewArray::from_iter_values(s)) as ArrayRef,
+            ),
+            (
+                "u",
+                Arc::new(StringViewArray::from_iter_values(u)) as ArrayRef,
+            ),
+        ])?)
+    }
+
+    /// Register the Parquet table `q` of [`write_parquet_table_q`] in `dir`, and
+    /// memory tables of rows of `q`: `two`, of the keys `5` and `3995` (in the
+    /// first and the last row group, whose bounds hold every row group and
+    /// page), `many`, of every 20th key (200 keys, more than the `IN` lists of
+    /// dynamic filters hold), and `full`, of all keys.
+    async fn register_tables_q(
+        ctx: &SessionContext,
+        dir: &std::path::Path,
+    ) -> Result<()> {
+        ctx.register_batch("two", q_rows(vec![5, 3995])?)?;
+        ctx.register_batch("many", q_rows((0..200).map(|i| i * 20).collect())?)?;
+        ctx.register_batch("full", q_rows((0..4000).collect())?)?;
+        let path = dir.join("q");
+        ctx.register_parquet(
+            "q",
+            path.to_str().expect("a UTF-8 path"),
+            ParquetReadOptions::default(),
+        )
+        .await
+    }
+
+    /// The number of the nodes of type `T` of `expr`.
+    fn count_exprs<T: PhysicalExpr>(expr: &PhysicalExprRef) -> usize {
+        usize::from(expr.is::<T>())
+            + expr
+                .children()
+                .into_iter()
+                .map(count_exprs::<T>)
+                .sum::<usize>()
+    }
+
+    /// The rows that the probe side of the (first) native join of `exec`
+    /// produced in its last execution.
+    fn probe_rows(exec: &PipelineRootExec) -> usize {
+        let metrics = exec.execution_metrics().expect("an execution");
+        let joins = native_hash_joins(exec.operator());
+        metrics
+            .get(joins[0].probe_side().as_ref())
+            .expect("metrics of the probe side")
+            .output_rows()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn membership_filters_prune_what_the_bounds_do_not() -> Result<()> {
+        // Joins of memory tables (the build sides) with the Parquet table `q`,
+        // whose scan reads the dynamic filter of the join: the bounds of the
+        // build keys hold all row groups and pages of `q`, and prune nothing,
+        // but the membership of the keys prunes:
+        //
+        // * with an `IN` list of the 2 keys of `two`, the scan prunes 38 of the
+        //   40 row groups by their statistics (by `k` or `s`), or by their bloom
+        //   filters (by `u`, of which every row group holds values of the whole
+        //   range), and the pages of the other row groups but those of the
+        //   keys, by the page index (2 pages of 10 rows are left, 20 rows);
+        // * with the lookups of the 200 keys of `many` in the hash table (a
+        //   dense index, for `k`, or hashed strings, for `s`), or of the keys
+        //   of `two` if the `IN` lists may have no values (and with `k` of
+        //   `full`, whose keys fill their bounds, without any), the scan filters
+        //   the rows with `pushdown_filters`: it produces the rows that match.
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_q(dir.path())?;
+        let setup = async |ctx: &SessionContext| register_tables_q(ctx, dir.path()).await;
+        /// A join with `q`, and how its dynamic filter prunes the scan of `q`.
+        #[derive(Clone, Copy)]
+        struct Case {
+            sql: &'static str,
+            /// `hash_join_inlist_pushdown_max_distinct_values`.
+            max_values: usize,
+            /// The `IN` lists and the lookups of the filter.
+            in_lists: usize,
+            lookups: usize,
+            /// The row groups that the statistics prune, and that the bloom
+            /// filters prune (at least).
+            statistics: usize,
+            bloom: usize,
+            /// The rows that match, which the scan produces with
+            /// `pushdown_filters`, and the rows it produces without, if known.
+            matches: usize,
+            rows: Option<usize>,
+        }
+        impl Case {
+            fn new(
+                sql: &'static str,
+                in_lists: usize,
+                lookups: usize,
+                matches: usize,
+            ) -> Self {
+                Self {
+                    sql,
+                    max_values: 150,
+                    in_lists,
+                    lookups,
+                    statistics: 0,
+                    bloom: 0,
+                    matches,
+                    rows: None,
+                }
+            }
+        }
+        let by_key = "SELECT two.s, q.u FROM two JOIN q ON two.k = q.k";
+        let cases = [
+            Case {
+                statistics: 38,
+                rows: Some(20),
+                ..Case::new(by_key, 1, 0, 2)
+            },
+            Case {
+                statistics: 38,
+                rows: Some(20),
+                ..Case::new("SELECT two.k, q.u FROM two JOIN q ON two.s = q.s", 1, 0, 2)
+            },
+            Case {
+                bloom: 30,
+                ..Case::new("SELECT two.k, q.s FROM two JOIN q ON two.u = q.u", 1, 0, 2)
+            },
+            Case {
+                rows: Some(3990),
+                ..Case::new(
+                    "SELECT many.s, q.u FROM many JOIN q ON many.k = q.k",
+                    0,
+                    1,
+                    200,
+                )
+            },
+            Case {
+                rows: Some(3990),
+                ..Case::new(
+                    "SELECT many.k, q.u FROM many JOIN q ON many.s = q.s",
+                    0,
+                    1,
+                    200,
+                )
+            },
+            // `IN` lists of no value.
+            Case {
+                max_values: 0,
+                rows: Some(4000),
+                ..Case::new(by_key, 0, 1, 2)
+            },
+            Case {
+                rows: Some(4000),
+                ..Case::new(
+                    "SELECT full.s, q.u FROM full JOIN q ON full.k = q.k",
+                    0,
+                    0,
+                    4000,
+                )
+            },
+        ];
+        for pushdown_filters in [false, true] {
+            for Case {
+                sql,
+                max_values,
+                in_lists,
+                lookups,
+                statistics,
+                bloom,
+                matches,
+                rows,
+            } in cases
+            {
+                let case = format!(
+                    "{sql}, {max_values} values, pushdown_filters: {pushdown_filters}"
+                );
+                let mut config = test_session_config();
+                let options = config.options_mut();
+                options.execution.parquet.pushdown_filters = pushdown_filters;
+                // The memory tables are the build sides.
+                options.optimizer.join_reordering = false;
+                options
+                    .optimizer
+                    .hash_join_inlist_pushdown_max_distinct_values = max_values;
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let join = find_hash_join(&plan).expect("a hash join");
+                let filters = dynamic_filters(&join).expect("dynamic filters");
+                assert_eq!(filters.len(), 1, "{case}");
+                let scan = find_parquet_scan(&plan).expect("a Parquet scan");
+                let root = lower(&plan)?;
+                assert_eq!(count::<PhysicalHashJoin>(&root), 1, "{case}");
+                let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                let batches = with_timeout(collect(
+                    Arc::clone(&exec) as Arc<dyn ExecutionPlan>,
+                    ctx.task_ctx(),
+                ))
+                .await?;
+                assert_eq!(count_rows(&batches), matches, "{case}");
+
+                let filter = filters[0].current()?;
+                assert_eq!(count_exprs::<InListExpr>(&filter), in_lists, "{case}");
+                assert_eq!(
+                    count_exprs::<JoinHashTableLookupExpr>(&filter),
+                    lookups,
+                    "{case}: {filter}"
+                );
+                assert_eq!(
+                    pruned(&scan, "row_groups_pruned_statistics"),
+                    statistics,
+                    "{case}: {filter}"
+                );
+                let pruned_bloom = pruned(&scan, "row_groups_pruned_bloom_filter");
+                assert!(pruned_bloom >= bloom, "{case}: {pruned_bloom}");
+                let probe_rows = probe_rows(&exec);
+                if pushdown_filters {
+                    // A hashed lookup accepts every key if all hashes collide.
+                    if lookups == 0
+                        || sql.contains("q.k")
+                        || !hashes_are_forced_to_collide()
+                    {
+                        assert_eq!(probe_rows, matches, "{case}: {filter}");
+                    }
+                } else if let Some(rows) = rows {
+                    assert_eq!(probe_rows, rows, "{case}: {filter}");
+                }
+
+                assert_join_parity_with_setup(sql, config, &setup, 1).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn membership_filters_of_keys_of_many_types() -> Result<()> {
+        // Joins of the memory table `l` (the build side) with the Parquet table
+        // `r` (of `data_batch`: keys of many types, with duplicates, NULLs,
+        // `-0.0` and `NaN`), whose scan reads the dynamic filter of the join:
+        // `IN` lists of the few distinct keys of `l` (but its floats, and its
+        // integers that fill their bounds), lookups of its floats and of
+        // several keys, with every join type that has a dynamic filter, and
+        // NULLs that are equal or not. Both engines return the same rows, with
+        // and without `pushdown_filters`.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("r").join("r.parquet");
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(256))
+            .build();
+        let probe = data_batch("r", 0..3000, 3);
+        write_parquet(&path, probe.schema(), &[probe], Some(properties))?;
+        let path = dir.path().join("r");
+        let path = path.to_str().expect("a UTF-8 path").to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_batch("l", data_batch("l", 0..40, 0))?;
+            ctx.register_parquet("r", &path, ParquetReadOptions::default())
+                .await
+        };
+        let joins = [
+            "l.lk = r.rk",
+            "l.lf = r.rf",
+            "l.ls = r.rs",
+            "l.lv = r.rv",
+            "l.ld = r.rd",
+            "l.lt = r.rt",
+            "l.lk = r.rk AND l.ls = r.rs",
+            "l.lf = r.rf AND l.lv = r.rv AND l.ld = r.rd",
+            "l.lk IS NOT DISTINCT FROM r.rk",
+            "l.ls IS NOT DISTINCT FROM r.rs AND l.lt IS NOT DISTINCT FROM r.rt",
+            "l.lid * 7 = r.rid",
+        ];
+        // Inner joins on all keys, the other join types on a key of an `IN`
+        // list, a key of a lookup and several keys.
+        let mut queries = joins
+            .iter()
+            .map(|on| (format!("SELECT l.lid, r.rid FROM l JOIN r ON {on}"), false))
+            .collect::<Vec<_>>();
+        for on in [joins[0], joins[1], joins[6]] {
+            queries.extend([
+                format!("SELECT l.lid, r.rid FROM l LEFT JOIN r ON {on}"),
+                format!("SELECT l.lid FROM l WHERE EXISTS (SELECT 1 FROM r WHERE {on})"),
+                format!("SELECT l.lid FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE {on})"),
+            ]
+            .map(|sql| (sql, true)));
+        }
+        for (sql, with_pushdown_only) in &queries {
+            for pushdown_filters in [true, false] {
+                if *with_pushdown_only && !pushdown_filters {
+                    continue;
+                }
+                let mut config = test_session_config();
+                let options = config.options_mut();
+                options.execution.parquet.pushdown_filters = pushdown_filters;
+                options.optimizer.join_reordering = false;
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let filters = hash_join_execs(&plan)
+                    .into_iter()
+                    .flat_map(|join| join.dynamic_expressions_produced())
+                    .count();
+                assert_eq!(filters, 1, "{sql}");
+                assert_join_parity_with_setup(sql, config.clone(), &setup, 1).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// A source that records, when its global state is created (when its
+    /// pipeline starts, before it opens any file), whether the dynamic filters
+    /// `filters` are complete, and their predicates.
+    #[derive(Debug)]
+    struct FilterObserver {
+        source: Arc<dyn PhysicalOperator>,
+        filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
+        observed: Arc<Mutex<Vec<(bool, PhysicalExprRef)>>>,
+    }
+
+    impl PhysicalOperator for FilterObserver {
+        fn name(&self) -> &str {
+            "FilterObserver"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.source.schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            self.source.parallel_source()
+        }
+
+        fn get_global_source_state(
+            &self,
+            ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            for filter in &self.filters {
+                let observed = (filter.is_complete(), filter.current()?);
+                self.observed.lock().push(observed);
+            }
+            self.source.get_global_source_state(ctx)
+        }
+
+        fn get_local_source_state(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            self.source.get_local_source_state(ctx, gstate)
+        }
+
+        fn get_data(
+            &self,
+            ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            self.source.get_data(ctx, gstate, lstate)
+        }
+    }
+
+    /// The dynamic filters that the expressions of `plan` (e.g. the predicate
+    /// of a scan) read.
+    fn dynamic_filters_read_by(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Vec<Arc<DynamicFilterPhysicalExpr>> {
+        use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+        let mut filters = vec![];
+        plan.apply_expressions(&mut |expr| {
+            expr.apply(|expr| {
+                let any: Arc<dyn Any + Send + Sync> = Arc::clone(expr) as _;
+                filters.extend(any.downcast::<DynamicFilterPhysicalExpr>().ok());
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+        .expect("the expressions of the plan");
+        filters
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dynamic_filters_are_complete_before_the_probe_side_opens_its_files()
+    -> Result<()> {
+        // The scans of `q` that read the dynamic filters of joins: on the probe
+        // side of the join, and on the build side of a join on the probe side
+        // of the join (a pipeline breaker of its probe side), whose filter
+        // `FilterPushdown` pushes through the join below. When their pipelines
+        // start, before they open any file, the filters are complete: the
+        // probe side, and its pipeline breakers, wait for the build side of the
+        // join, which sets the filters to the bounds and the `IN` list of its
+        // keys (`5` and `3995` of `two`), with which the scans prune all but 2
+        // of the 40 row groups of `q`.
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_q(dir.path())?;
+        let setup = async |ctx: &SessionContext| register_tables_q(ctx, dir.path()).await;
+        let mut config = test_session_config();
+        // The memory tables, and `q` in the join below, are the build sides.
+        config.options_mut().optimizer.join_reordering = false;
+        for (sql, joins) in [
+            ("SELECT two.s, q.u FROM two JOIN q ON two.k = q.k", 1),
+            (
+                "SELECT two.s, x.u FROM two JOIN \
+                 (SELECT q.k, full.u FROM q JOIN full ON q.s = full.s) x ON two.k = x.k",
+                2,
+            ),
+        ] {
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            assert_eq!(count_hash_joins(&plan), joins, "{sql}");
+            // The scan is on the probe side of the join, and on the build side
+            // of the join below.
+            let join = find_hash_join(&plan).expect("a hash join");
+            let probe = Arc::clone(join.children()[1]);
+            assert!(find_parquet_scan(&probe).is_some(), "{sql}");
+            if joins == 2 {
+                let below = find_hash_join(&probe).expect("a join below");
+                let build = Arc::clone(below.children()[0]);
+                assert!(find_parquet_scan(&build).is_some(), "{sql}");
+            }
+            let scan = find_parquet_scan(&plan).expect("a Parquet scan");
+            let observed = Arc::new(Mutex::new(vec![]));
+            let root = lower_with(&plan, &|source, scan| {
+                if !source.is::<crate::sources::ParquetScanSource>() {
+                    return Ok(source);
+                }
+                Ok(Arc::new(FilterObserver {
+                    source,
+                    filters: dynamic_filters_read_by(scan),
+                    observed: Arc::clone(&observed),
+                }))
+            })?;
+            assert_eq!(count::<PhysicalHashJoin>(&root), joins, "{sql}");
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let batches = with_timeout(collect(exec, ctx.task_ctx())).await?;
+            assert_eq!(count_rows(&batches), 2, "{sql}");
+            let observed = std::mem::take(&mut *observed.lock());
+            assert_eq!(observed.len(), 1, "{sql}");
+            let (complete, predicate) = &observed[0];
+            assert!(complete, "{sql}: {predicate}");
+            assert_eq!(
+                predicate.to_string(),
+                "k@0 >= 5 AND k@0 <= 3995 AND k@0 IN (SET) ([5, 3995])",
+                "{sql}"
+            );
+            assert_eq!(pruned(&scan, "row_groups_pruned_statistics"), 38, "{sql}");
+            assert_join_parity_with_setup(sql, config.clone(), &setup, joins).await;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hash_table_lookups_of_probe_keys() -> Result<()> {
+        // A table of the build keys 1, 2, 3 and NULL (which matches nothing),
+        // hashed, and the lookup of the probe keys `k` in it.
+        let build_keys: ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(3), Some(1), None, Some(2)]));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let layout = Arc::new(TupleDataLayout::try_new(Arc::clone(&schema), true)?);
+        let mut data = PartitionedTupleData::try_new(layout, 2)?;
+        let mut hashes = vec![];
+        hash_join_keys(std::slice::from_ref(&build_keys), 4, &mut hashes)?;
+        let chunk = DataChunk::try_new(schema, vec![build_keys], None)?;
+        data.append_chunk(&chunk, &hashes)?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 20));
+        let table = Arc::new(JoinHashTable::try_new(
+            data,
+            1,
+            NullEquality::NullEqualsNothing,
+            false,
+            MemoryConsumer::new("JoinHashTable").register(&pool),
+        )?);
+        assert_eq!(table.num_distinct_keys(), 3);
+
+        let probe_schema = Schema::new(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("k", DataType::Int64, true),
+        ]);
+        let lookup: PhysicalExprRef = Arc::new(JoinHashTableLookupExpr::new(
+            vec![col("k", &probe_schema)?],
+            &table,
+        ));
+        assert_eq!(lookup.to_string(), "hash_lookup(k@1)");
+        assert_eq!(lookup.data_type(&probe_schema)?, DataType::Boolean);
+        assert!(!lookup.nullable(&probe_schema)?);
+        let probe = RecordBatch::try_new(
+            Arc::new(probe_schema.clone()),
+            vec![
+                Arc::new(Int32Array::from(vec![4, 3, 2, 1, 0])),
+                Arc::new(Int64Array::from(vec![
+                    Some(1),
+                    Some(4),
+                    None,
+                    Some(3),
+                    Some(0),
+                ])),
+            ],
+        )?;
+        let accepted = |lookup: &PhysicalExprRef| -> Result<BooleanArray> {
+            let accepted = lookup.evaluate(&probe)?.into_array(probe.num_rows())?;
+            Ok(accepted.as_boolean().clone())
+        };
+        let expected = BooleanArray::from(vec![true, false, false, true, false]);
+        if !hashes_are_forced_to_collide() {
+            assert_eq!(accepted(&lookup)?, expected);
+        }
+        // The lookup of other columns, as for a scan whose rows have other
+        // indices, keeps the table.
+        let remapped = Arc::clone(&lookup)
+            .with_new_children(vec![Arc::new(Column::new("k", 0)) as _])?;
+        assert_eq!(remapped.to_string(), "hash_lookup(k@0)");
+        assert_ne!(&remapped, &lookup);
+        let remapped = remapped.with_new_children(vec![col("k", &probe_schema)?])?;
+        assert_eq!(&remapped, &lookup);
+        // Keys of another type than the keys of the table are accepted, as
+        // are all keys once the table is released.
+        let other_type: PhysicalExprRef = Arc::new(JoinHashTableLookupExpr::new(
+            vec![col("x", &probe_schema)?],
+            &table,
+        ));
+        assert_eq!(accepted(&other_type)?, BooleanArray::from(vec![true; 5]));
+        drop(table);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(accepted(&lookup)?, BooleanArray::from(vec![true; 5]));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hash_table_lookups_do_not_keep_the_tables_alive() -> Result<()> {
+        // The dynamic filter of the join of `many` and `q` looks the probe
+        // keys up in the hash table of the join, which it does not keep alive:
+        // once the execution completed, the memory of the join is released,
+        // and the lookup accepts every row.
+        let dir = tempfile::tempdir()?;
+        write_parquet_table_q(dir.path())?;
+        let mut config = test_session_config();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        config.options_mut().optimizer.join_reordering = false;
+        let ctx = datafusion_context(config);
+        register_tables_q(&ctx, dir.path()).await?;
+        let sql = "SELECT many.k, q.u FROM many JOIN q ON many.s = q.s";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let join = find_hash_join(&plan).expect("a hash join");
+        let filters = dynamic_filters(&join).expect("dynamic filters");
+        let root = lower(&plan)?;
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let batches = with_timeout(collect(exec, ctx.task_ctx())).await?;
+        assert_eq!(count_rows(&batches), 200);
+        assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
+
+        let filter = filters[0].current()?;
+        let mut lookups = vec![];
+        datafusion_common::tree_node::TreeNode::apply(&filter, |expr| {
+            if expr.is::<JoinHashTableLookupExpr>() {
+                lookups.push(Arc::clone(expr));
+            }
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        })?;
+        let [lookup] = lookups.as_slice() else {
+            panic!("one lookup: {filter}");
+        };
+        let table = lookup
+            .downcast_ref::<JoinHashTableLookupExpr>()
+            .and_then(JoinHashTableLookupExpr::table);
+        assert!(table.is_none(), "{filter}");
+        // Rows of the probe side, of which only the first one matches.
+        let rows = q_rows(vec![0, 1, 2])?;
+        let probe_schema = join.children()[1].schema();
+        let columns = probe_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::clone(rows.column_by_name(field.name()).unwrap()))
+            .collect();
+        let probe = RecordBatch::try_new(probe_schema, columns)?;
+        let accepted = lookup.evaluate(&probe)?.into_array(probe.num_rows())?;
+        assert_eq!(accepted.as_boolean(), &BooleanArray::from(vec![true; 3]));
         Ok(())
     }
 
@@ -7195,8 +8150,8 @@ mod tests {
 
     impl Eq for Sequence {}
 
-    impl std::hash::Hash for Sequence {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    impl Hash for Sequence {
+        fn hash<H: Hasher>(&self, state: &mut H) {
             Arc::as_ptr(&self.evaluations).hash(state);
         }
     }
@@ -7210,14 +8165,14 @@ mod tests {
             Ok(false)
         }
 
-        fn evaluate(
-            &self,
-            batch: &RecordBatch,
-        ) -> Result<datafusion_expr::ColumnarValue> {
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
             let value = self.evaluations.fetch_add(1, Ordering::Relaxed) + 1;
-            Ok(datafusion_expr::ColumnarValue::Array(Arc::new(
-                Int32Array::from(vec![value; batch.num_rows()]),
-            )))
+            Ok(ColumnarValue::Array(Arc::new(Int32Array::from(vec![
+                value;
+                batch
+                    .num_rows(
+                    )
+            ]))))
         }
 
         fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
