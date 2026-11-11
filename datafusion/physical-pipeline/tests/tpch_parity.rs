@@ -17,19 +17,18 @@
 //!
 //! and asserts that
 //!
-//! 1. both engines produce exactly the same output schema and byte-for-byte
-//!    the same Arrow data, with the comparison of
+//! 1. both engines produce exactly the same output schema and the same
+//!    results, compared in their canonical forms with the comparison of
 //!    `assert_byte_eq_with_datafusion` (only the row order of results
-//!    without a top-level `ORDER BY` may differ);
+//!    without a top-level `ORDER BY` may differ; the results of these queries
+//!    are unambiguous, see `docs/compatibility.md`);
 //! 2. the TPC-H results are not trivial: every TPC-H query returns rows and
-//!    every column of its result has non-null values, so that the parity
+//!    every column of its result has non-null values, so that the comparison
 //!    holds on real data;
-//! 3. the pipeline engine lowers every TPC-H query over both sources exactly
-//!    as [`TPCH_COVERAGE`] lists: the same numbers of native operators and of
-//!    all operators, and the same DataFusion nodes in `BridgeOperator`s (the
-//!    nodes that the native operators leave to DataFusion to keep its results
-//!    and errors exact, each listed with the reason), so that any change of
-//!    the native coverage, in either direction, updates the list.
+//! 3. the pipeline engine lowers every TPC-H query over both sources fully
+//!    natively, without `BridgeOperator`s, to exactly as many operators as
+//!    [`TPCH_COVERAGE`] lists, so that any change of the lowering of TPC-H
+//!    updates the list.
 //!
 //! The benchmark `benches/pipeline_vs_default.rs` includes this file as a
 //! module to reuse the data generator and the queries.
@@ -2117,9 +2116,6 @@ pub(crate) struct Lowering {
     /// The number of nodes of the DataFusion plans that run in
     /// `BridgeOperator`s.
     pub(crate) bridged_nodes: usize,
-    /// The names of the roots of the DataFusion plans that run in
-    /// `BridgeOperator`s.
-    pub(crate) roots: Vec<String>,
 }
 
 impl Lowering {
@@ -2142,7 +2138,6 @@ impl Lowering {
             operators: count_operators(root.operator()),
             bridged,
             bridged_nodes: plans.iter().map(count_nodes).sum(),
-            roots: plans.iter().map(|plan| plan.name().to_string()).collect(),
         })
     }
 
@@ -2165,107 +2160,70 @@ async fn tpch_lowerings(source: &Source) -> Result<Vec<Lowering>> {
     Ok(lowerings)
 }
 
-/// Why the native operators leave the root of a bridged plan of a TPC-H query
-/// to DataFusion: as they handle it today, running it natively would not keep
-/// DataFusion's results and errors exact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Why {
-    /// An operator with a part that may fail with other errors than overflows
-    /// (e.g. a cast of strings into numbers, whose errors name the values that
-    /// fail), which the native operators would evaluate on the chunks of a
-    /// partition in parallel, on several threads, so that another row than in
-    /// DataFusion could fail first (see `PipelineQueryPlanner`; the parts that
-    /// can only fail with overflows, e.g. the decimal arithmetic of Q1 and the
-    /// casts of the sums of Q11 into decimals, are evaluated on any number of
-    /// threads).
-    ParallelErrors,
-    /// `PhysicalProjection::supports_projection_exec` refuses the projection:
-    /// the classification of errors judges that its parts may fail with
-    /// different kinds of errors (the decimal division of Q8, by a sum that
-    /// may be 0, which fails with a division by zero or with an overflow), of
-    /// which DataFusion raises the error of the first row of its partition
-    /// that fails, but a pipeline the error of the chunk that fails first on
-    /// any of its threads.
-    Projection,
-    /// A hash join whose dynamic filter a Parquet scan of its probe side
-    /// uses: the scan skips the reads that the filter rejects, a native join
-    /// sets its filter to other values (the bounds of its build keys), and the
-    /// probe side has work that may fail on the rows that DataFusion skips
-    /// (see `PipelineQueryPlanner`): the decimal arithmetic of the revenues of
-    /// Q15 and the cast into a decimal of the average quantities of Q17, which
-    /// may overflow.
-    JoinDynamicFilter,
-}
-
-/// The exact lowering of a TPC-H query (by number) over a source: the numbers
-/// of the native operators and of all operators of its operator tree, the
-/// number of the DataFusion nodes that its `BridgeOperator`s run, and the
-/// roots of the plans that they run, each with why the native operators leave
-/// it to DataFusion.
-type Coverage = (usize, usize, usize, usize, &'static [(&'static str, Why)]);
+/// The exact lowering of a TPC-H query (by number) over a source: the number
+/// of operators of its operator tree, all of which are native.
+type Coverage = (usize, usize);
 
 /// How the pipeline engine lowers every TPC-H query, for every source (with
-/// the configuration of the suite, on 4 threads): see
-/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly. Q8 (over
-/// both sources), Q15 and Q17 (over Parquet) still leave parts of their plans
-/// to DataFusion; lowering them natively too is tracked in #53.
+/// the configuration of the suite, on 4 threads): fully natively, see
+/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly.
 #[rustfmt::skip]
 const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
     ("MemTable", [
-        (1, 7, 7, 0, &[]),
-        (2, 26, 26, 0, &[]),
-        (3, 14, 14, 0, &[]),
-        (4, 10, 10, 0, &[]),
-        (5, 18, 18, 0, &[]),
-        (6, 5, 5, 0, &[]),
-        (7, 21, 21, 0, &[]),
-        (8, 1, 2, 31, &[("ProjectionExec", Why::Projection)]),
-        (9, 17, 17, 0, &[]),
-        (10, 14, 14, 0, &[]),
-        (11, 23, 23, 0, &[]),
-        (12, 8, 8, 0, &[]),
-        (13, 10, 10, 0, &[]),
-        (14, 8, 8, 0, &[]),
-        (15, 18, 18, 0, &[]),
-        (16, 13, 13, 0, &[]),
-        (17, 11, 11, 0, &[]),
-        (18, 12, 12, 0, &[]),
-        (19, 9, 9, 0, &[]),
-        (20, 18, 18, 0, &[]),
-        (21, 22, 22, 0, &[]),
-        (22, 15, 15, 0, &[]),
+        (1, 7),
+        (2, 26),
+        (3, 14),
+        (4, 10),
+        (5, 18),
+        (6, 5),
+        (7, 21),
+        (8, 25),
+        (9, 17),
+        (10, 14),
+        (11, 23),
+        (12, 8),
+        (13, 10),
+        (14, 8),
+        (15, 18),
+        (16, 13),
+        (17, 11),
+        (18, 12),
+        (19, 9),
+        (20, 18),
+        (21, 22),
+        (22, 15),
     ]),
     ("Parquet", [
-        (1, 7, 7, 0, &[]),
-        (2, 26, 26, 0, &[]),
-        (3, 14, 14, 0, &[]),
-        (4, 10, 10, 0, &[]),
-        (5, 18, 18, 0, &[]),
-        (6, 5, 5, 0, &[]),
-        (7, 21, 21, 0, &[]),
-        (8, 1, 2, 33, &[("ProjectionExec", Why::Projection)]),
-        (9, 17, 17, 0, &[]),
-        (10, 14, 14, 0, &[]),
-        (11, 23, 23, 0, &[]),
-        (12, 8, 8, 0, &[]),
-        (13, 10, 10, 0, &[]),
-        (14, 8, 8, 0, &[]),
-        (15, 9, 10, 10, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (16, 13, 13, 0, &[]),
-        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
-        (18, 12, 12, 0, &[]),
-        (19, 9, 9, 0, &[]),
-        (20, 18, 18, 0, &[]),
-        (21, 22, 22, 0, &[]),
-        (22, 15, 15, 0, &[]),
+        (1, 7),
+        (2, 26),
+        (3, 14),
+        (4, 10),
+        (5, 18),
+        (6, 5),
+        (7, 21),
+        (8, 25),
+        (9, 17),
+        (10, 14),
+        (11, 23),
+        (12, 8),
+        (13, 10),
+        (14, 8),
+        (15, 18),
+        (16, 13),
+        (17, 11),
+        (18, 12),
+        (19, 9),
+        (20, 18),
+        (21, 22),
+        (22, 15),
     ]),
 ];
 
 /// The differences between `lowerings`, the lowerings of the queries (Q1,
 /// Q2, ...) over the source `source`, and `expected`, their coverage (see
 /// [`Coverage`]): one message per query that is lowered differently, with
-/// the entry that describes its lowering (to update the list with, with the
-/// reasons of new bridged plans).
+/// the entry that describes its lowering (to update the list with), and the
+/// plans that it leaves to DataFusion, if any.
 fn coverage_differences(
     source: &str,
     lowerings: &[Lowering],
@@ -2281,32 +2239,22 @@ fn coverage_differences(
     }
     for (i, (lowering, listed)) in lowerings.iter().zip(expected).enumerate() {
         let query = i + 1;
-        let &(number, native, operators, bridged_nodes, roots) = listed;
-        let listed_roots = roots.iter().map(|(root, _)| *root).collect::<Vec<_>>();
+        let &(number, operators) = listed;
         if number == query
-            && lowering.native_operators() == native
             && lowering.operators == operators
-            && lowering.bridged_nodes == bridged_nodes
-            && lowering.roots == listed_roots
+            && lowering.bridged.is_empty()
+            && lowering.bridged_nodes == 0
         {
             continue;
         }
-        let actual_roots = lowering
-            .roots
-            .iter()
-            .map(|root| format!("(\"{root}\", Why::?)"))
-            .collect::<Vec<_>>()
-            .join(", ");
         differences.push(format!(
             "Q{query} over {source} is lowered to {} native of {} operators, with {} \
-             DataFusion nodes in BridgeOperators, but {listed:?} is listed; it is \
-             ({query}, {}, {}, {}, &[{actual_roots}]), whose bridged plans are\n  {}",
+             DataFusion nodes in BridgeOperators, but {listed:?} is listed (all of \
+             them native); it is ({query}, {}), whose bridged plans are\n  {}",
             lowering.native_operators(),
             lowering.operators,
             lowering.bridged_nodes,
-            lowering.native_operators(),
             lowering.operators,
-            lowering.bridged_nodes,
             lowering.bridged.join("\n  ")
         ));
     }
@@ -2314,11 +2262,9 @@ fn coverage_differences(
 }
 
 /// The pipeline engine lowers every TPC-H query over both sources exactly as
-/// [`TPCH_COVERAGE`] lists: the same numbers of native operators and of all
-/// operators, the same number of DataFusion nodes in `BridgeOperator`s, and
-/// bridged plans with the same roots, so that every change of the native
-/// coverage of TPC-H, in either direction, updates the list (with the reasons
-/// of the plans that are left to DataFusion).
+/// [`TPCH_COVERAGE`] lists: fully natively, without `BridgeOperator`s, to the
+/// listed number of operators, so that every change of the lowering of TPC-H
+/// updates the list.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tpch_queries_are_lowered_as_listed() -> Result<()> {
     let mut differences = vec![];
@@ -2341,16 +2287,12 @@ async fn tpch_queries_are_lowered_as_listed() -> Result<()> {
 
 /// The scalar subqueries of TPC-H Q11, Q15 and Q22 (their
 /// `ScalarSubqueryExec`s) run natively, with the filters and projections that
-/// compute and read their results (the casts with which Q11 compares the sums
-/// of its groups with its result, which only fail on the sums that overflow
-/// the decimal): on 4 threads, over both sources, these queries run without
-/// `BridgeOperator`s in sessions that trust DataFusion's built-in functions
-/// (the `substr` of Q22, see `TrustedFunctions`), with the results of
-/// DataFusion. But for the hash join of Q15 over Parquet, whose dynamic filter
-/// prunes the reads of the Parquet scan of `lineitem` below it, whose decimal
-/// arithmetic may overflow on the rows that DataFusion skips (which
-/// `PhysicalHashJoin::try_lower` leaves to DataFusion): without the dynamic
-/// filter, it is native too.
+/// compute and read their results: on 4 threads, over both sources, these
+/// queries run without `BridgeOperator`s, with the results of DataFusion, also
+/// in sessions that register the functions they trust (see
+/// `TrustedFunctions`), and with and without the dynamic filters of joins (the
+/// hash join of Q15 over Parquet, whose dynamic filter prunes the reads of the
+/// Parquet scan of `lineitem` below it, is native in both cases).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scalar_subqueries_of_tpch_are_native() -> Result<()> {
     use datafusion_physical_pipeline::operators::adaptive_filter::TrustedFunctions;
@@ -2365,16 +2307,7 @@ async fn scalar_subqueries_of_tpch_are_native() -> Result<()> {
         let setup = async |ctx: &SessionContext| source.register(ctx).await;
         for query in [11, 15, 22] {
             let sql = tpch::query(query);
-            let parquet_join = query == 15 && matches!(source, Source::Parquet(_));
-            let configs = if parquet_join {
-                vec![
-                    (config.clone(), false),
-                    (without_join_filters.clone(), true),
-                ]
-            } else {
-                vec![(config.clone(), true)]
-            };
-            for (config, native) in configs {
+            for config in [config.clone(), without_join_filters.clone()] {
                 let (expected, actual) = run_engines(sql, config, &setup).await?;
                 let context = format!("Q{query} over {}", source.name());
                 compare_outputs(&expected, &actual)
@@ -2392,8 +2325,11 @@ async fn scalar_subqueries_of_tpch_are_native() -> Result<()> {
                     .operator();
                 assert_eq!(root.name(), "PhysicalScalarSubquery", "{context}");
                 let lowering = Lowering::of(&actual.plan)?;
-                let roots: &[&str] = if native { &[] } else { &["HashJoinExec"] };
-                assert_eq!(lowering.roots, roots, "{context}: {:?}", lowering.bridged);
+                assert!(
+                    lowering.bridged.is_empty(),
+                    "{context}: {:?}",
+                    lowering.bridged
+                );
             }
         }
     }
@@ -2459,30 +2395,23 @@ async fn windows_and_loop_joins_of_the_stress_corpus_are_native() -> Result<()> 
 }
 
 /// [`coverage_differences`] finds every query that is lowered otherwise than
-/// listed, in either direction, which is what the exact coverage assertion
-/// relies on.
+/// listed, which is what the exact coverage assertion relies on.
 #[test]
 fn coverage_differences_find_every_difference() {
     let lowering = |operators, bridged: &[&str], bridged_nodes| Lowering {
         operators,
         bridged: bridged.iter().map(|root| format!("{root}: ...")).collect(),
         bridged_nodes,
-        roots: bridged.iter().map(|root| (*root).to_string()).collect(),
     };
-    let expected: [Coverage; 2] = [
-        (1, 2, 3, 6, &[("AggregateExec", Why::ParallelErrors)]),
-        (2, 4, 4, 0, &[]),
-    ];
-    let lowerings = || vec![lowering(3, &["AggregateExec"], 6), lowering(4, &[], 0)];
+    let expected: [Coverage; 2] = [(1, 3), (2, 4)];
+    let lowerings = || vec![lowering(3, &[], 0), lowering(4, &[], 0)];
     assert!(coverage_differences("MemTable", &lowerings(), &expected).is_empty());
-    // Each of these lowerings of Q1 differs from the list, by fewer or more
-    // bridged nodes, another root, more operators or a fully native plan.
+    // Each of these lowerings of Q1 differs from the list: with bridged
+    // nodes, or with fewer or more operators.
     for q1 in [
         lowering(3, &["AggregateExec"], 5),
-        lowering(3, &["AggregateExec"], 7),
-        lowering(3, &["ProjectionExec"], 6),
-        lowering(4, &["AggregateExec"], 6),
-        lowering(3, &[], 0),
+        lowering(2, &[], 0),
+        lowering(4, &[], 0),
     ] {
         let mut lowerings = lowerings();
         lowerings[0] = q1;

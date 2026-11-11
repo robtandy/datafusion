@@ -43,10 +43,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::filter::FilterExec;
+use datafusion_physical_plan::joins::HashJoinExec;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
+    ReplaceChildrenOptions,
+};
 
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -108,7 +114,12 @@ impl PhysicalLimit {
     ///   input is a `LocalLimitExec` that keeps at least `fetch` rows of every
     ///   partition, that limit does not restrict which rows the merge can
     ///   return (at most `fetch` rows, which may all come from one
-    ///   partition), and the native limit replaces both.
+    ///   partition), and the native limit replaces both. So does the fetch of
+    ///   a `FilterExec` or a `HashJoinExec` (e.g. of `WHERE ... LIMIT`, or of
+    ///   a join below a limit), possibly below projections: the input is
+    ///   lowered without that fetch (see [`without_redundant_fetch`]), which
+    ///   the native filters and joins, without partitions, could not apply
+    ///   to every partition, and so is a `LocalLimitExec` below projections.
     ///
     /// The order of the input is preserved (see [`Self::with_preserve_order`])
     /// unless it is arbitrary in DataFusion too: the input merges several
@@ -119,11 +130,13 @@ impl PhysicalLimit {
     /// have exactly one partition, a `CoalescePartitionsExec` whose input has
     /// none, and a `LocalLimitExec` that advertises another number of
     /// partitions than its input has (DataFusion executes some partitions of
-    /// its input only, or fails). Nor are limits of no rows (`fetch == 0`): DataFusion's merge
-    /// then ends without waiting for its input, and its limits end with the
-    /// first batch of their input, even an empty one, or once the skipped rows
-    /// are read, which a native limit, called with the non-empty chunks of its
-    /// input, cannot reproduce.
+    /// its input only, or fails). Nor are limits of no rows (`fetch == 0`),
+    /// which produce no rows without executing their input (DataFusion's
+    /// merge ends without waiting for its input, and its limits end with the
+    /// first batch of their input), while a native limit is called with the
+    /// chunks of its input, which may never come: a planner replaces them by
+    /// a source of no rows (as the
+    /// [`PipelineQueryPlanner`](crate::PipelineQueryPlanner) does).
     ///
     /// `lower_input` lowers the input of the node. Returns `Ok(None)` for any
     /// other node.
@@ -140,7 +153,13 @@ impl PhysicalLimit {
                 if input.output_partitioning().partition_count() != 1 {
                     return Ok(None);
                 }
-                (input, limit.skip(), limit.fetch(), order_matters(input))
+                let preserve_order = order_matters(input);
+                (
+                    Arc::clone(input),
+                    limit.skip(),
+                    limit.fetch(),
+                    preserve_order,
+                )
             } else if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
                 let input = limit.input();
                 if input.output_partitioning().partition_count() > 1
@@ -148,24 +167,17 @@ impl PhysicalLimit {
                 {
                     return Ok(None);
                 }
-                (input, 0, Some(limit.fetch()), order_matters(input))
+                let preserve_order = order_matters(input);
+                (Arc::clone(input), 0, Some(limit.fetch()), preserve_order)
             } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>()
                 && let Some(fetch) = coalesce.fetch()
             {
                 if coalesce.input().output_partitioning().partition_count() == 0 {
                     return Ok(None);
                 }
-                let input = match coalesce.input().downcast_ref::<LocalLimitExec>() {
-                    Some(local)
-                        if local.fetch() >= fetch
-                            && advertises_its_input_partitions(coalesce.input()) =>
-                    {
-                        local.input()
-                    }
-                    _ => coalesce.input(),
-                };
+                let input = without_redundant_fetch(coalesce.input(), fetch)?;
                 let preserve_order = input.output_partitioning().partition_count() <= 1
-                    && order_matters(input);
+                    && order_matters(&input);
                 (input, 0, Some(fetch), preserve_order)
             } else {
                 return Ok(None);
@@ -173,7 +185,7 @@ impl PhysicalLimit {
         if fetch == Some(0) {
             return Ok(None);
         }
-        let input = lower_input(input)?;
+        let input = lower_input(&input)?;
         if input.schema() != plan.schema() {
             return internal_err!(
                 "The lowered input {} of {} has schema {:?}, expected {:?}",
@@ -215,6 +227,42 @@ impl PhysicalLimit {
     fn end(&self) -> Option<usize> {
         self.fetch.map(|fetch| self.skip.saturating_add(fetch))
     }
+}
+
+/// `plan`, the input of a merge of its partitions that keeps at most `rows`
+/// rows (a `CoalescePartitionsExec` with a fetch), without a `LocalLimitExec`,
+/// or the fetch of a `FilterExec` or a `HashJoinExec`, that keeps at least
+/// `rows` rows of every partition (possibly below projections, which pass
+/// every row of their partition on): such a limit does not restrict which
+/// rows the merge can return (at most `rows` rows, which may all come from
+/// one partition). `plan` itself otherwise.
+fn without_redundant_fetch(
+    plan: &Arc<dyn ExecutionPlan>,
+    rows: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let input = without_redundant_fetch(projection.input(), rows)?;
+        if Arc::ptr_eq(&input, projection.input()) {
+            return Ok(Arc::clone(plan));
+        }
+        return Arc::clone(plan).replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        );
+    }
+    if let Some(local) = plan.downcast_ref::<LocalLimitExec>()
+        && local.fetch() >= rows
+        && advertises_its_input_partitions(plan)
+    {
+        return without_redundant_fetch(local.input(), rows);
+    }
+    if (plan.is::<FilterExec>() || plan.is::<HashJoinExec>())
+        && plan.fetch().is_some_and(|fetch| fetch >= rows)
+        && let Some(unlimited) = plan.with_fetch(None)
+    {
+        return Ok(unlimited);
+    }
+    Ok(Arc::clone(plan))
 }
 
 /// Whether `plan`, a `LocalLimitExec`, advertises the partitions of its input:

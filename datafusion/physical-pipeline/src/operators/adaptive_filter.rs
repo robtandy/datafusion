@@ -20,21 +20,27 @@
 //!
 //! # Fallible conjuncts
 //!
-//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), must fail
-//! exactly when it fails in DataFusion. DataFusion evaluates the conjuncts in
-//! the order of the predicate, and the rows a fallible conjunct is evaluated
-//! on depend on the conjuncts before it (see
-//! [`PhysicalFilter`](super::filter::PhysicalFilter)). So a fallible conjunct
-//! never moves, and no conjunct moves across it: only runs of consecutive
-//! infallible conjuncts between fallible ones (the *segments* of the filter)
-//! are reordered. Within a segment the order has no observable effect: the
-//! conjuncts cannot fail, and the rows that the next fallible conjunct sees
-//! are those that no conjunct of the segment rejects, whatever their order.
-//! DuckDB is stricter and does not reorder at all if a conjunct can fail. A
-//! conjunct is considered infallible only if it is built from expressions
-//! that are known to never fail, see [`fallibility`].
+//! A conjunct that can fail, e.g. `10 / x > 1` (division by zero), is only
+//! evaluated on the rows that the conjuncts before it in the predicate select
+//! (see [`PhysicalFilter`](super::filter::PhysicalFilter)), so that guards
+//! such as `x <> 0 AND 10 / x > 1` keep it from the rows on which it fails. So
+//! a fallible conjunct never moves, and no conjunct moves across it: only runs
+//! of consecutive infallible conjuncts between fallible ones (the *segments*
+//! of the filter) are reordered. Within a segment the order has no observable
+//! effect: the conjuncts cannot fail, and the rows that the next fallible
+//! conjunct sees are those that no conjunct of the segment rejects, whatever
+//! their order. DuckDB is stricter and does not reorder at all if a conjunct
+//! can fail. A conjunct is considered infallible only if it is built from
+//! expressions that are known to never fail, see [`fallibility`].
 //!
 //! # Errors that depend on DataFusion's batches
+//!
+//! The rest of this classification describes when DataFusion's errors depend
+//! on its batches, or on the order in which it evaluates the parts of an
+//! expression. The native operators do not reproduce DataFusion's errors (see
+//! `docs/compatibility.md`): the native joins, aggregations and windows still
+//! use it to leave some of their nodes to DataFusion, until their own issues
+//! remove these rules.
 //!
 //! DataFusion decides per batch, from the share of rows that are left, on
 //! which rows it evaluates the conjuncts after the first one of an `AND`, and
@@ -74,9 +80,9 @@
 //!
 //! String constants are copied for every row of a batch by whoever evaluates
 //! them, so they overflow the 32-bit offsets of strings on batches of enough
-//! rows: constants of a few bytes are only evaluated natively if the plan
-//! bounds the rows of the batches of DataFusion (see
-//! [`depends_on_batches_with_rows`]).
+//! rows: constants of a few bytes only do not depend on the batches if the
+//! plan bounds the rows of the batches of DataFusion (see
+//! `depends_on_batches_with_rows`).
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
@@ -437,7 +443,7 @@ pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
 
 /// How `expr` itself (not its children) can fail, if it may copy string and
 /// binary constants of at most `bytes` bytes for every row of the batches it is
-/// evaluated on (see [`depends_on_batches_with_rows`]).
+/// evaluated on (see `depends_on_batches_with_rows`).
 fn node_fallibility(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
@@ -1550,7 +1556,7 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   views point to), or a constant (that is not null, nor an empty string or
 ///   binary, nor, if the batches are known to have few enough rows, a string
 ///   or binary of at most [`MAX_CONSTANT_BYTES`] bytes, see
-///   [`depends_on_batches_with_rows`]), into strings or binaries with 32-bit
+///   `depends_on_batches_with_rows`), into strings or binaries with 32-bit
 ///   offsets (at any depth): e.g. `CAST(d AS Utf8)` unpacks a dictionary of a
 ///   single string of 2 MiB, which 1024 rows, but not 1023, overflow, without
 ///   taking more memory than one row, `CASE WHEN x THEN '…' END` copies a
@@ -1565,7 +1571,7 @@ fn is_safe_division(binary: &BinaryExpr, schema: &Schema) -> bool {
 ///   their operand, functions that return parts of the values of their first
 ///   argument, e.g. `substr`, and `CASE` expressions whose values come from a
 ///   single column of their type, or are all constants that the batches can
-///   hold for each of their rows, see [`depends_on_batches_with_rows`], e.g.
+///   hold for each of their rows, see `depends_on_batches_with_rows`, e.g.
 ///   `CASE WHEN x THEN '1-URGENT' ELSE '2-HIGH' END`);
 /// * a part of `expr` negates an operand that may evaluate to a scalar on some
 ///   batches and to an array on others (e.g. a `CASE`, which returns the
@@ -1614,7 +1620,7 @@ pub fn depends_on_batches(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool
 /// part of `date_part`, see `function_fallibility`): e.g. a constant of 1 KiB
 /// overflows the 32-bit offsets of strings on a batch of 2^21 rows, which a
 /// batch without columns has without memory.
-pub fn depends_on_batches_with_rows(
+fn depends_on_batches_with_rows(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &Schema,
     max_rows: Option<usize>,
@@ -1809,17 +1815,6 @@ impl Failures {
 /// part on a chunk. A `CASE` does not fail itself, but its branches may.
 pub fn failures(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Failures {
     failures_with(expr, schema, 0)
-}
-
-/// The parts of `expr` that may fail (see [`failures`]), knowing that
-/// DataFusion evaluates `expr` on batches of at most `max_rows` rows (if
-/// known, see [`depends_on_batches_with_rows`]).
-pub fn failures_with_rows(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-    max_rows: Option<usize>,
-) -> Failures {
-    failures_with(expr, schema, constant_bytes(max_rows))
 }
 
 /// The parts of `expr` that may fail, if it may copy constants of at most
@@ -2621,12 +2616,12 @@ fn is_broadcast_constant(
 /// such constants (but null or empty ones) if the plan bounds the rows of the
 /// batches of DataFusion, and only as many bytes as these batches hold for
 /// each of their rows (see `constant_bytes` and
-/// [`depends_on_batches_with_rows`]).
+/// `depends_on_batches_with_rows`).
 pub const MAX_CONSTANT_BYTES: usize = 1024;
 
 /// The most bytes of a string or binary constant that an expression may copy
 /// for every row of batches of at most `max_rows` rows without depending on
-/// them (see [`depends_on_batches_with_rows`]): none if `max_rows` is not
+/// them (see `depends_on_batches_with_rows`): none if `max_rows` is not
 /// known, otherwise at most [`MAX_CONSTANT_BYTES`], and few enough for the
 /// 32-bit offsets of strings (`i32::MAX` bytes) of `max_rows` copies, and of
 /// the copies for the rows of a chunk (at most [`DEFAULT_VECTOR_SIZE`] rows).
