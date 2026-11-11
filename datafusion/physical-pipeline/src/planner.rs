@@ -5940,12 +5940,13 @@ mod tests {
 
     /// [`assert_read_errors_out_of_scope`] of the plans of `sql`, in a session
     /// with `config` of the tables that `setup` registers, whose scans of files
-    /// `transform` changes (e.g. into scans with other reader factories).
+    /// `transform` changes, if any (e.g. into scans with other reader
+    /// factories).
     async fn assert_read_errors_of_query_out_of_scope<F>(
         sql: &str,
         config: SessionConfig,
         setup: F,
-        transform: &dyn Fn(&FileScanConfig) -> FileScanConfig,
+        transform: Option<&dyn Fn(&FileScanConfig) -> FileScanConfig>,
         native: fn(&Arc<dyn PhysicalOperator>) -> usize,
         error: &str,
     ) -> Result<()>
@@ -5956,6 +5957,9 @@ mod tests {
         setup(&ctx).await?;
         let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let Some(transform) = transform else {
+                return Ok(plan);
+            };
             let plan = plan.transform_up(|node| {
                 let Some(config) = node
                     .downcast_ref::<DataSourceExec>()
@@ -5971,11 +5975,6 @@ mod tests {
             Ok(plan.data)
         };
         assert_read_errors_out_of_scope(&ctx, &config, make_plan, native, error).await
-    }
-
-    /// A scan of files as it is.
-    fn as_it_is(config: &FileScanConfig) -> FileScanConfig {
-        config.clone()
     }
 
     /// A scan of files with the explicit schema `schema` for every file
@@ -6070,7 +6069,7 @@ mod tests {
             sql,
             config,
             setup,
-            &as_it_is,
+            None,
             count::<PhysicalHashJoin>,
             "Cannot cast string 'bad_integer' to value of Int32 type",
         )
@@ -6142,7 +6141,7 @@ mod tests {
                 sql,
                 config.clone(),
                 &setup,
-                &as_it_is,
+                None,
                 count::<PhysicalTopK>,
                 "Cannot cast string 'bad_integer' to value of Int32 type",
             )
@@ -6269,7 +6268,7 @@ mod tests {
                 sql,
                 config.clone(),
                 &setup,
-                &as_it_is,
+                None,
                 count::<PhysicalTopK>,
                 "converted value exceeds the representable i64 range",
             )
@@ -6339,7 +6338,7 @@ mod tests {
             "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
             config,
             setup,
-            &|config| with_explicit_schemas(config, &schema),
+            Some(&|config| with_explicit_schemas(config, &schema)),
             count::<PhysicalTopK>,
             "Encountered misaligned row with length 3 (expected length 2)",
         )
@@ -6383,7 +6382,7 @@ mod tests {
             "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
             config,
             setup,
-            &|config| with_explicit_schemas(config, &reader_schema),
+            Some(&|config| with_explicit_schemas(config, &reader_schema)),
             count::<PhysicalTopK>,
             "converted value exceeds the representable i64 range",
         )
@@ -6442,7 +6441,7 @@ mod tests {
             "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
             config,
             setup,
-            &|config| with_explicit_schemas(config, &schema),
+            Some(&|config| with_explicit_schemas(config, &schema)),
             count::<PhysicalTopK>,
             "Incompatible supplied Arrow schema",
         )
@@ -6511,7 +6510,7 @@ mod tests {
             "SELECT k FROM p WHERE v IS NOT NULL AND s LIKE '%foo%' ORDER BY k LIMIT 1",
             config,
             setup,
-            &as_it_is,
+            None,
             count::<PhysicalTopK>,
             "dictionary too large for index type",
         )
@@ -6626,7 +6625,7 @@ mod tests {
             "SELECT k, s FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1",
             config,
             setup,
-            &with_faults,
+            Some(&with_faults),
             count::<PhysicalTopK>,
             "the metadata of the file cannot be read",
         )
