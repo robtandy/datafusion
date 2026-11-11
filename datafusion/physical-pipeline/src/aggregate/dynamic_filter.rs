@@ -590,6 +590,10 @@ pub(crate) fn has_exact_bounds(data_type: &DataType) -> bool {
 /// files adds them to its predicate). Returns `plan` with the nodes that
 /// took filters, `None` if no node did.
 ///
+/// The filters are not pushed into a node with a fetch (e.g. a limit, a TopK
+/// or a scan with a limit): it keeps the first rows of its input, which would
+/// be other rows if the filters pruned some of them.
+///
 /// Unlike the rule, only `filters` are pushed down, not the filters of the
 /// nodes themselves, which are already where the rule pushed them, and the
 /// nodes above the leaves only get their new children: they drop the filters
@@ -602,6 +606,9 @@ fn push_down(
     filters: Vec<Arc<dyn PhysicalExpr>>,
     config: &ConfigOptions,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    if plan.fetch().is_some() {
+        return Ok(None);
+    }
     let children = plan.children();
     if children.is_empty() {
         let result = ChildPushdownResult {
@@ -1234,6 +1241,50 @@ mod tests {
         assert_eq!(filter.current()?.to_string(), "true", "{sql}");
         assert_eq!(execution.scanned_rows, all_rows, "{sql}");
         assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_are_not_published_below_nodes_with_a_fetch() -> Result<()> {
+        // The aggregations do not publish filters through the TopK and the
+        // limit (with which DataFusion stops reading the scans) below them:
+        // they would keep other rows if the scans skipped some.
+        let dir = write_tables()?;
+        let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
+        let config = test_session_config().with_target_partitions(1);
+        let ctx = datafusion_context(config.clone());
+        register_tables(&ctx, dir.path()).await?;
+        for sql in [
+            "SELECT MIN(x), MAX(x) FROM (SELECT x FROM m ORDER BY id LIMIT 10)",
+            "SELECT MIN(x), MAX(x) FROM (SELECT x FROM m WHERE e LIMIT 10)",
+            "SELECT DISTINCT k FROM (SELECT k FROM t ORDER BY k DESC LIMIT 100) \
+             ORDER BY k LIMIT 3",
+        ] {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            // A node below the (first) aggregation has a fetch.
+            let mut aggregation = None;
+            plan.apply(|node| {
+                if node.is::<AggregateExec>() {
+                    aggregation = Some(Arc::clone(node));
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            let aggregation = aggregation.expect("an aggregation");
+            let mut fetches = 0;
+            aggregation.apply(|node| {
+                fetches += usize::from(node.fetch().is_some());
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            assert!(fetches > 0, "{sql}");
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            assert!(native_filters(&root).is_empty(), "{sql}");
+            if sql.contains("ORDER BY id") || sql.contains("DESC LIMIT 100") {
+                let reference = without_limited_aggregations(config.clone());
+                assert_lowered_results_with_setup(sql, config.clone(), reference, &setup)
+                    .await;
+            }
+        }
         Ok(())
     }
 
