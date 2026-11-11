@@ -209,6 +209,7 @@ use crate::operator::{
 };
 use crate::operators::async_func::PhysicalAsyncFunc;
 use crate::operators::caching::CachingOperator;
+use crate::operators::data_sink::PhysicalDataSink;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
@@ -608,6 +609,12 @@ impl Lowering<'_> {
         if let Some(unnest) = PhysicalUnnest::try_lower(plan, |input| self.lower(input))?
         {
             return Ok(Arc::new(unnest));
+        }
+        // A sink reads all of its input.
+        if let Some(sink) =
+            PhysicalDataSink::try_lower(plan, |input| self.lower_in(input, false))?
+        {
+            return Ok(Arc::new(sink));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             return self.lower_projection(plan, projection);

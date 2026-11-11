@@ -7,6 +7,7 @@
 pub mod adaptive_filter;
 pub mod async_func;
 pub mod caching;
+pub mod data_sink;
 pub mod filter;
 pub mod limit;
 #[cfg(test)]
