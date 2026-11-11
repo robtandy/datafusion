@@ -294,6 +294,20 @@ pub(crate) mod test_support {
         schema: SchemaRef,
     }
 
+    impl TestFilter {
+        /// The predicate of the filter.
+        pub(crate) fn predicate(&self) -> &Arc<dyn PhysicalExpr> {
+            &self.predicate
+        }
+    }
+
+    impl TestProjection {
+        /// The expressions of the projection.
+        pub(crate) fn exprs(&self) -> &[Arc<dyn PhysicalExpr>] {
+            &self.exprs
+        }
+    }
+
     impl PhysicalOperator for TestFilter {
         fn name(&self) -> &str {
             "TestFilter"

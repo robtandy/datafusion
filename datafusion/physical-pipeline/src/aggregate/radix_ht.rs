@@ -3689,9 +3689,12 @@ mod tests {
         // one: `CAST(x AS DECIMAL(3, 0))` fails first, with the invalid argument
         // of `1000` (too large for the precision). The native operator
         // evaluates them on its chunks: `CAST(y AS DECIMAL(38, 25))` failed
-        // first, with the arithmetic overflow of rescaling `i64::MAX`. Such
-        // aggregations, with several parts that may fail not only with
-        // arithmetic overflows, are left to DataFusion (see
+        // first, with the arithmetic overflow of rescaling `i64::MAX`. Likewise
+        // if one of the casts is evaluated by a native filter or projection
+        // below the aggregation, in its pipeline: DataFusion evaluates it on
+        // the whole batch before the aggregation sees it. Such aggregations,
+        // with several parts that may fail not only with arithmetic
+        // overflows, are left to DataFusion (see
         // `fail_in_the_order_of_the_batches`), on any number of threads; with
         // a single cast, or with decimal arithmetic only (as in TPC-H), they
         // stay native.
@@ -3748,6 +3751,17 @@ mod tests {
                          GROUP BY k",
                         "Failed to cast field",
                     ),
+                    (
+                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))) FROM t \
+                         WHERE CAST(x AS DECIMAL(3, 0)) + 0.5 > 1 GROUP BY k",
+                        x_fails,
+                    ),
+                    (
+                        "SELECT k, SUM(CAST(y AS DECIMAL(38, 25))), SUM(d) FROM \
+                         (SELECT k, y, CAST(x AS DECIMAL(3, 0)) + 0.5 AS d FROM t) \
+                         GROUP BY k",
+                        x_fails,
+                    ),
                 ] {
                     let lowered = assert_lowered_fails_like_datafusion_with_setup(
                         sql,
@@ -3763,15 +3777,18 @@ mod tests {
                         "{sql}"
                     );
                 }
-                let sql =
-                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), COUNT(*) FROM t GROUP BY k";
-                assert_aggregate_fails_like_datafusion_with_setup(
-                    sql,
-                    config.clone(),
-                    &setup,
-                    "1000 is too large to store in a Decimal128 of precision 3",
-                )
-                .await;
+                for sql in [
+                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))), COUNT(*) FROM t GROUP BY k",
+                    "SELECT k, SUM(CAST(x AS DECIMAL(3, 0))) FROM t WHERE y > 0 GROUP BY k",
+                ] {
+                    assert_aggregate_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        "1000 is too large to store in a Decimal128 of precision 3",
+                    )
+                    .await;
+                }
                 let sql = "SELECT k, SUM(p * (1 - q)), SUM(p * (1 - q) * (1 + q)) FROM t \
                            GROUP BY k";
                 assert!(
