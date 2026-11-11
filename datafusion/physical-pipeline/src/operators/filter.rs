@@ -5157,15 +5157,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+    async fn filters_of_dense_unions_of_shared_strings_are_native() {
         let _large = one_large_test_at_a_time().await;
         // Rows of a dense union may point to the same value of a child, which
         // Arrow copies for every row when it extracts the child (casting the
         // union) or filters the union: the 32-bit offsets of 1200 copies of a
         // string of 2 MiB overflow on the batch of `FilterExec`, but not those
-        // of 600 copies on the chunks of the native filter.
+        // of 600 copies on the chunks of the native filter, which succeeds where
+        // DataFusion fails, as `docs/compatibility.md` allows (capacity limits).
+        // On each half of the batch, DataFusion succeeds too: together, they
+        // have as many rows as the native filter returns.
         let batch = dense_union_of_a_large_string();
         let schema = batch.schema();
+        let halves = [batch.slice(0, 2048), batch.slice(2048, 2048)];
         let cast = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
             Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
                 physical_expr("u", &schema),
@@ -5174,29 +5178,42 @@ mod tests {
             )),
         )) as Arc<dyn PhysicalExpr>;
         for predicate in [cast, physical_expr("id > 0", &schema)] {
-            let plan = || -> Arc<dyn ExecutionPlan> {
+            let plan = |batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
                 Arc::new(
                     FilterExec::try_new(
                         Arc::clone(&predicate),
-                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                        scan_batches(&schema, batches),
                     )
                     .unwrap(),
                 )
             };
-            let filter_plan = plan();
+            let filter_plan = plan(std::slice::from_ref(&batch));
             let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let outcome = assert_same_outcome_in_datafusion(
-                plan(),
-                Arc::new(TaskContext::default()),
-            )
-            .await;
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let task_ctx = Arc::new(TaskContext::default());
+            let datafusion =
+                outcome(Arc::clone(&filter_plan), Arc::clone(&task_ctx)).await;
             assert!(
-                outcome
+                datafusion
                     .as_ref()
                     .is_err_and(|error| error.to_lowercase().contains("overflow")),
-                "{predicate}: {outcome:?}"
+                "{predicate}: {datafusion:?}"
             );
+            let operator = lower(&filter_plan).unwrap();
+            assert_eq!(NativeOperators::of(&operator).filters, 1, "{predicate}");
+            let native = outcome(
+                executable(operator, filter_plan).unwrap(),
+                Arc::clone(&task_ctx),
+            )
+            .await;
+            let mut expected = 0;
+            for half in &halves {
+                let rows =
+                    outcome(plan(std::slice::from_ref(half)), Arc::clone(&task_ctx))
+                        .await;
+                expected += rows.unwrap_or_else(|error| panic!("{predicate}: {error}"));
+            }
+            assert_eq!(native, Ok(expected), "{predicate}");
         }
     }
 

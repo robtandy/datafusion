@@ -39,7 +39,7 @@
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UnionMode};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, internal_datafusion_err, internal_err, not_impl_err};
 use datafusion_physical_expr::expressions::{
@@ -52,7 +52,6 @@ use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::projection::ProjectionExec;
 use itertools::Itertools;
 
-use super::adaptive_filter::has_32_bit_offsets;
 use crate::chunk::{DataChunk, Gather, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
@@ -500,8 +499,7 @@ pub(crate) fn takes_little_memory(data_type: &DataType) -> bool {
 /// bits, which count at most 512 MiB of booleans), and whose cost is
 /// proportional to the number of values. DataFusion filters such arrays
 /// without copying their values. Nor run-end encoded arrays whose child fields
-/// are not Arrow's, which Arrow's `filter` renames, nor dense unions with
-/// children with 32-bit offsets, whose values rows may share.
+/// are not Arrow's, which Arrow's `filter` renames.
 pub(crate) fn can_gather(data_type: &DataType) -> bool {
     match data_type {
         DataType::List(field)
@@ -514,16 +512,6 @@ pub(crate) fn can_gather(data_type: &DataType) -> bool {
         }
         DataType::Struct(fields) => {
             fields.iter().all(|field| can_gather(field.data_type()))
-        }
-        // Rows of a dense union may point to the same value of a child, which
-        // `take` (and DataFusion's `filter`) copy for every row, so the 32-bit
-        // offsets of the child may overflow on some batches and not others.
-        DataType::Union(fields, UnionMode::Dense)
-            if fields
-                .iter()
-                .any(|(_, field)| has_32_bit_offsets(field.data_type())) =>
-        {
-            false
         }
         DataType::Union(fields, _) => fields
             .iter()
@@ -549,7 +537,7 @@ mod tests {
     use arrow::array::{
         ArrayRef, AsArray, Int32Array, Int64Array, StringArray, StringViewArray,
     };
-    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, UnionMode};
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::DataFusionError;
     use datafusion_datasource::memory::MemorySourceConfig;
@@ -1635,13 +1623,13 @@ mod tests {
                 false,
             ),
             (list(DataType::Struct(Vec::<Field>::new().into()), 4), false),
-            // Rows of dense unions may share the strings of a child, but not
-            // those of sparse unions, nor values without offsets.
-            (union(DataType::Utf8, UnionMode::Dense), false),
+            // Rows of dense unions may share the strings or lists of a child,
+            // which gathering them copies for every row, as DataFusion does.
+            (union(DataType::Utf8, UnionMode::Dense), true),
             (union(list(DataType::Int32, 2), UnionMode::Dense), true),
             (
                 union(DataType::new_list(DataType::Int8, true), UnionMode::Dense),
-                false,
+                true,
             ),
             (union(DataType::Utf8, UnionMode::Sparse), true),
             (union(DataType::Float64, UnionMode::Dense), true),
@@ -2068,16 +2056,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+    async fn casts_of_dense_unions_of_shared_strings_are_native() {
+        let _large = one_large_test_at_a_time().await;
         // Casting a dense union extracts its child of strings first, copying a
         // string of 2 MiB for each of the 1200 rows of the batch of
         // `ProjectionExec` that point to it, whose 32-bit offsets overflow,
         // whatever the type it casts into, but not for the 600 rows of a chunk
-        // (see `filters_of_dense_unions_of_shared_strings_stay_in_datafusion`).
+        // of the native projection (`docs/compatibility.md` allows the engines
+        // to have other capacity limits, and to raise other errors).
         let batch = dense_union_of_a_large_string();
         let schema = batch.schema();
+        let halves = [batch.slice(0, 2048), batch.slice(2048, 2048)];
         for to in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
-            let plan = || -> Arc<dyn ExecutionPlan> {
+            let plan = |batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
                 let cast =
                     Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
                         physical_expr("u", &schema),
@@ -2087,21 +2078,47 @@ mod tests {
                 Arc::new(
                     ProjectionExec::try_new(
                         [ProjectionExpr::new(cast as Arc<dyn PhysicalExpr>, "c")],
-                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                        scan_batches(&schema, batches),
                     )
                     .unwrap(),
                 )
             };
-            let projection_plan = plan();
+            let projection_plan = plan(std::slice::from_ref(&batch));
             let exec = projection_plan.downcast_ref::<ProjectionExec>().unwrap();
-            assert!(!PhysicalProjection::supports_projection_exec(exec), "{to}");
+            assert!(PhysicalProjection::supports_projection_exec(exec), "{to}");
             let task_ctx = Arc::new(TaskContext::default());
-            let outcome = assert_same_outcome_in_datafusion(plan(), task_ctx).await;
+            let datafusion =
+                outcome(Arc::clone(&projection_plan), Arc::clone(&task_ctx)).await;
             assert!(
-                outcome
+                datafusion
                     .as_ref()
                     .is_err_and(|error| error.to_lowercase().contains("overflow")),
-                "{to}: {outcome:?}"
+                "{to}: {datafusion:?}"
+            );
+            let operator = lower(&projection_plan).unwrap();
+            assert_eq!(NativeOperators::of(&operator).projections, 1, "{to}");
+            let native = executable(operator, projection_plan).unwrap();
+            let native = outcome(native, Arc::clone(&task_ctx)).await;
+            // The cast returns nulls for the integers of the union, in a column
+            // that the plan declares non-nullable: on each half of the batch,
+            // DataFusion does not overflow, and fails on these nulls, as the
+            // native projection does on the whole batch.
+            for half in &halves {
+                let expected =
+                    outcome(plan(std::slice::from_ref(half)), Arc::clone(&task_ctx))
+                        .await;
+                assert!(
+                    expected
+                        .as_ref()
+                        .is_err_and(|error| error.contains("non-nullable")),
+                    "{to}: {expected:?}"
+                );
+            }
+            assert!(
+                native
+                    .as_ref()
+                    .is_err_and(|error| error.contains("non-nullable")),
+                "{to}: {native:?}"
             );
         }
     }
