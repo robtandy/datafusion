@@ -55,8 +55,9 @@
 //! its input itself.
 //!
 //! The filters of the pipelines that may stop before their inputs end (below
-//! limits and filters with a fetch, and in the subqueries of scalar
-//! subqueries) are not cached: see `Lowering::lower_in`.
+//! limits, filters with a fetch and aggregations with a soft limit, and in
+//! the subqueries of scalar subqueries) are not cached: see
+//! `Lowering::lower_in`.
 //!
 //! Windows, nested loop joins and cross joins keep all of their rows in
 //! memory without reserving it in the memory pool, while the DataFusion nodes
@@ -470,9 +471,9 @@ struct Lowering<'a> {
     /// limit.
     runtime: Option<&'a RuntimeEnv>,
     /// Whether the node being lowered is in a pipeline that may stop before
-    /// its input ends (see [`Self::lower_in`]): below a limit or a filter with
-    /// a fetch, or in the subquery of a scalar subquery, which fails at its
-    /// second row.
+    /// its input ends (see [`Self::lower_in`]): below a limit, a filter with a
+    /// fetch or an aggregation with a soft limit, or in the subquery of a
+    /// scalar subquery, which fails at its second row.
     early_stop: Cell<bool>,
 }
 
@@ -513,9 +514,9 @@ impl Lowering<'_> {
     /// produced them (DuckDB does not cache in such pipelines either). The
     /// nodes that pass the rows of their inputs on in their pipelines (filters,
     /// projections, unions, limits, the probe sides of joins and the input of
-    /// a scalar subquery) keep `early_stop` for their inputs, and the limits
-    /// and the filters with a fetch, which stop their pipelines once they have
-    /// their rows, set it.
+    /// a scalar subquery) keep `early_stop` for their inputs, and the limits,
+    /// the filters with a fetch and the aggregations with a soft limit, which
+    /// stop their pipelines once they have their rows, set it.
     fn lower_in(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -708,8 +709,17 @@ impl Lowering<'_> {
         let Some(raw) = raw_aggregate(&plan) else {
             return Ok(None);
         };
+        // An aggregation with a soft limit on its groups (without an order,
+        // e.g. of `SELECT DISTINCT k ... LIMIT 3`) may stop once it has them
+        // (see `AggregateSpec::soft_limit`): its input may stop early. Any
+        // other aggregation reads all of its input.
+        let soft_limit = [plan.downcast_ref::<AggregateExec>(), Some(raw)]
+            .into_iter()
+            .flatten()
+            .filter_map(AggregateExec::limit_options)
+            .any(|options| options.descending().is_none());
         let aggregate = PhysicalHashAggregate::try_lower(&plan, |input| {
-            self.lower_in(without_ordering_sort(raw, input), false)
+            self.lower_in(without_ordering_sort(raw, input), soft_limit)
         })?;
         Ok(aggregate.map(|aggregate| Arc::new(aggregate) as Arc<dyn PhysicalOperator>))
     }
@@ -6681,6 +6691,67 @@ mod tests {
                 let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
                 assert_eq!(rows, 1, "{engine}: {name}");
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn soft_limits_end_with_the_rows_of_inputs_that_then_stay_pending() -> Result<()>
+    {
+        // `SELECT DISTINCT x ... LIMIT 3` over 128 positive rows, and then
+        // nothing more: DataFusion's aggregation stops once it has the 3
+        // groups of its soft limit (its filter emits batches of 32 rows), and
+        // so does the native one, whose input does not cache the rows of its
+        // filter (see `Lowering::lower_in`).
+        let config = test_session_config()
+            .with_batch_size(32)
+            .with_target_partitions(1);
+        let ctx = datafusion_context(config.clone());
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(1..=128))],
+        )?;
+        ctx.register_batch("t", rows.clone())?;
+        let sql = "SELECT DISTINCT x FROM t WHERE x > 0 LIMIT 3";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        // The scan, replaced by a stream that stays pending after its rows.
+        let plan = || -> Arc<dyn ExecutionPlan> {
+            Arc::clone(&plan)
+                .transform_up(|node| {
+                    Ok(match node.children().is_empty() {
+                        true => Transformed::yes(Arc::new(PendsAfterRows::new(vec![
+                            rows.clone(),
+                        ])) as _),
+                        false => Transformed::no(node),
+                    })
+                })
+                .unwrap()
+                .data
+        };
+        let root = create_pipeline_plan(plan())?;
+        let operator = root.operator();
+        let tree = format_operator_tree(operator);
+        assert_eq!(bridged_plans(operator).len(), 1, "only the source: {tree}");
+        let count = (
+            crate::operators::union::test_support::count::<PhysicalHashAggregate>(
+                operator,
+            ),
+            crate::operators::union::test_support::count::<PhysicalFilter>(operator),
+            crate::operators::union::test_support::count::<CachingOperator>(operator),
+        );
+        assert_eq!(count, (1, 1, 0), "{tree}");
+        for (engine, plan) in [("DataFusion", plan()), ("pipeline", root as _)] {
+            let task_ctx =
+                Arc::new(TaskContext::default().with_session_config(config.clone()));
+            let batches = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                collect(plan, task_ctx),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{engine} does not end {sql}"))?;
+            let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(rows, 3, "{engine}: {sql}");
         }
         Ok(())
     }

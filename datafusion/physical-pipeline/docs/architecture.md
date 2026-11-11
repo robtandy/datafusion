@@ -540,9 +540,9 @@ native.
   partition of its input is redundant: the native limit replaces them (e.g.
   `WHERE ... LIMIT`).
 - The filters of a pipeline that may stop before its input ends (below a
-  limit or a filter with a fetch, up to the pipeline breakers below them, or
-  in the subquery of a scalar subquery, which fails at its second row) are not
-  wrapped in a `CachingOperator`, which would hold their rows back until it is
+  limit, a filter with a fetch or an aggregation with a soft limit, up to the
+  pipeline breakers below them, or in the subquery of a scalar subquery, which
+  fails at its second row) are not wrapped in a `CachingOperator`, which would hold their rows back until it is
   full or its input ends: a limit above a stream that stays pending once it
   has produced its rows ends with them, as in DataFusion.
 - A node with a fetch of 0 is lowered to a source of no rows, without its
@@ -556,9 +556,8 @@ DataFusion still executes:
 - the nodes that no native operator implements yet (e.g. sort-merge and
   symmetric hash joins, recursive queries, `StreamingTableExec`s) and
   user-defined `ExecutionPlan`s, with their subtrees;
-- the nodes that the native operators refuse themselves in their `try_lower`
-  functions (the parity-only refusals of the sorts, windows and aggregations
-  are removed by their own issues);
+- the nodes that the native operators refuse themselves (see their
+  `try_lower` functions);
 - windows, nested loop joins and cross joins in sessions whose memory pool
   has a limit: they keep all of their rows in memory without reserving it in
   the memory pool, while the DataFusion nodes that they replace reserve their
@@ -622,11 +621,10 @@ are lowered to exactly the listed numbers of operators.
   ClickBench's `hits23` and `hits25`, so that the scans of Parquet files skip
   the reads that its threshold rules out.
 
-All window queries of the stress corpus run on native windows but the two
+All window queries of the stress corpus run on native windows, also those
 whose windows are stacked on windows of other partitions or orders, which
-DataFusion sorts or merges in between (`PhysicalWindow::try_lower` does not
-look through them), and all of its nested loop and cross joins run natively
-(`windows_and_loop_joins_of_the_stress_corpus_are_native`).
+DataFusion sorts or merges in between, and all of its nested loop and cross
+joins run natively (`windows_and_loop_joins_of_the_stress_corpus_are_native`).
 
 ## Benchmarks
 

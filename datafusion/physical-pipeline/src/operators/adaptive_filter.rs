@@ -46,10 +46,9 @@
 //! user-defined function that shadows one (e.g. Spark's `abs`, of `SparkAbs`)
 //! stays opaque: the filter never moves it, nor any conjunct across it.
 //!
-//! The classification only decides which conjuncts the filter may reorder
-//! (and, until their own issues remove these rules, which nodes some other
-//! native operators leave to DataFusion): the planner does not judge how
-//! expressions may fail (see `docs/compatibility.md`).
+//! The classification only decides which conjuncts the filter may reorder:
+//! neither the planner nor the other native operators judge how expressions
+//! may fail (see `docs/compatibility.md`).
 //!
 //! Like DataFusion's optimizer, the conjuncts are not reordered at all if one
 //! of them is volatile (e.g. `random() < 0.5`): reordering changes how often
@@ -397,12 +396,6 @@ fn fallibility_with(
         .into_iter()
         .map(|child| fallibility_with(child, schema, bytes))
         .fold(node_fallibility(expr, schema, bytes), Ord::max)
-}
-
-/// Whether evaluating `expr` (on `schema`) can never fail, whatever the
-/// values of its input rows (see [`fallibility`]).
-pub fn is_infallible(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-    fallibility(expr, schema) == Fallibility::Infallible
 }
 
 /// How `expr` itself (not its children) can fail, if it may copy string and
@@ -1981,11 +1974,6 @@ mod tests {
         ] {
             let expr = physical_expr(predicate, &schema);
             assert_eq!(fallibility(&expr, &schema), expected, "{predicate}");
-            assert_eq!(
-                is_infallible(&expr, &schema),
-                expected == Infallible,
-                "{predicate}"
-            );
         }
         assert_eq!(
             fallible_conjuncts(
@@ -3002,7 +2990,11 @@ mod tests {
             "to_timestamp_seconds(u)",
         ] {
             let expr = physical_expr(expr, &schema);
-            assert!(is_infallible(&expr, &schema), "{expr}");
+            assert_eq!(
+                fallibility(&expr, &schema),
+                Fallibility::Infallible,
+                "{expr}"
+            );
             let result = expr.evaluate(&batch).and_then(|value| value.into_array(3));
             assert!(result.is_ok(), "{expr}: {result:?}");
         }
