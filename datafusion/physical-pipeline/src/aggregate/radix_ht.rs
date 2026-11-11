@@ -3825,6 +3825,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_that_may_fail_evaluate_their_rows_in_order() -> Result<()> {
+        use super::super::test_support::assert_aggregate_fails_like_datafusion_with_setup;
+        use crate::operator::PhysicalOperator;
+        // The review of d0a259437: one batch of 8,192 rows, `x = 1` but
+        // `x[2047] = 10^13` and `x[2048] = i64::MAX`. `CAST(x AS DECIMAL(38,
+        // 25))` fails on both, with the invalid argument of a value too large for
+        // the precision, and with the arithmetic overflow of rescaling
+        // `i64::MAX`: DataFusion on the first, the native operators on 4 and 16
+        // threads on the second (whose chunk a thread failed on first). An
+        // aggregation that may fail, or whose pipeline may (see `own_parts`
+        // and `pipeline_parts`), evaluates its rows in order, on a single
+        // thread (see `AggregateSpec::evaluates_in_order`), so that it fails on
+        // the first of them that fails in DataFusion; the others stay
+        // parallel.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let mut x = vec![1; 8_192];
+        x[2_047] = 10_000_000_000_000;
+        x[2_048] = i64::MAX;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from(x)),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        let message = "10000000000000.0000000000000000000000000 is too large to store in a \
+                       Decimal128 of precision 38";
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false);
+                if trusted {
+                    config = trusting(config);
+                }
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                for (sql, in_order) in [
+                    (
+                        "SELECT k, SUM(CAST(x AS DECIMAL(38, 25))) FROM t GROUP BY k",
+                        true,
+                    ),
+                    ("SELECT SUM(CAST(x AS DECIMAL(38, 25))) FROM t", true),
+                    ("SELECT k, SUM(x), COUNT(*) FROM t GROUP BY k", false),
+                ] {
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let plan = aggregation(&plan).expect("an aggregation");
+                    let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
+                        .unwrap_or_else(|| panic!("not lowered: {sql}"));
+                    assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
+                    if in_order {
+                        // (The threads of a parallel sink failed on the second
+                        // value every time.)
+                        for _ in 0..5 {
+                            assert_aggregate_fails_like_datafusion_with_setup(
+                                sql,
+                                config.clone(),
+                                &setup,
+                                message,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn competing_failures_of_aggregates_are_left_to_datafusion() -> Result<()> {
         use super::super::test_support::{
             assert_aggregate_fails_like_datafusion_with_setup,
@@ -3904,10 +3978,18 @@ mod tests {
         )?;
         let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
         let x_fails = "Failed to cast field 'x' from Int64 to Decimal128(3, 0)";
-        for target_partitions in [1, 4, 16] {
-            for trusted in [false, true] {
-                let mut config =
-                    test_session_config().with_target_partitions(target_partitions);
+        let configs = [1, 4, 16].into_iter().flat_map(|target_partitions| {
+            [false, true].into_iter().flat_map(move |trusted| {
+                [true, false]
+                    .into_iter()
+                    .map(move |repartition| (target_partitions, trusted, repartition))
+            })
+        });
+        for (target_partitions, trusted, repartition) in configs {
+            {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(repartition);
                 if trusted {
                     config = trusting(config);
                 }
@@ -3947,6 +4029,18 @@ mod tests {
                     (
                         "SELECT k, SUM(a20 * a20), SUM(b20 * b20) FROM t GROUP BY k",
                         "Overflow happened on: 99999999999999999999 * 99999999999999999999",
+                    ),
+                    // The `ORDER BY` of an aggregate, which DataFusion evaluates
+                    // with its arguments (the review of d0a259437).
+                    (
+                        "SELECT k, FIRST_VALUE(k ORDER BY CAST(x AS DECIMAL(3, 0))), \
+                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t GROUP BY k",
+                        x_fails,
+                    ),
+                    (
+                        "SELECT FIRST_VALUE(k ORDER BY CAST(x AS DECIMAL(3, 0))), \
+                         SUM(CAST(y AS DECIMAL(38, 25))) FROM t",
+                        x_fails,
                     ),
                     (
                         "SELECT k, SUM(c37 + CAST(1 AS DECIMAL(11, 10))), \

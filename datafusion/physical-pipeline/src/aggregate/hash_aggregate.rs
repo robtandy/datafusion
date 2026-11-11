@@ -131,6 +131,15 @@ pub(crate) struct AggregateSpec {
     /// The number of partitions of the input of the stage that consumes the
     /// input rows, which DataFusion aggregates on their own.
     pub(crate) input_partitions: usize,
+    /// Whether the aggregation of a single partition of DataFusion, or a
+    /// native operator of its pipeline, may fail (see `own_parts` and
+    /// `pipeline_parts`): its pipelines then run on a single thread, which
+    /// evaluates the rows in order, and so fails on the first of them that
+    /// fails in DataFusion (the threads of a pipeline evaluate the chunks of a
+    /// partition in parallel, and any of them may fail first). (DataFusion
+    /// evaluates several partitions in parallel, and fails on the first of
+    /// them that fails.)
+    pub(crate) evaluates_in_order: bool,
 }
 
 impl AggregateSpec {
@@ -894,6 +903,8 @@ impl PhysicalHashAggregate {
             .chain(merge.iter().map(Arc::as_ref))
             .all(|aggregate| splits_exactly(aggregate, raw.input(), &max_rows));
         let input_partitions = raw.input().output_partitioning().partition_count();
+        let evaluates_in_order =
+            input_partitions == 1 && own_parts(raw) + pipeline_parts(&input) > 0;
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),
@@ -910,6 +921,7 @@ impl PhysicalHashAggregate {
                 bypass,
                 splits_exactly,
                 input_partitions,
+                evaluates_in_order,
             }),
         })
     }
@@ -1409,27 +1421,42 @@ fn fail_in_the_order_of_the_batches(
     raw: &AggregateExec,
     input: &Arc<dyn PhysicalOperator>,
 ) -> bool {
+    let own = own_parts(raw);
+    own > 0 && own + pipeline_parts(input) > 1
+}
+
+/// The number of the parts that `raw`, the `AggregateExec` that consumes the
+/// input rows, evaluates on every batch that may fail (see [`refined_parts`]):
+/// its group keys, the arguments and the `ORDER BY` expressions of its
+/// aggregates (which DataFusion evaluates with their arguments) and their
+/// filters, and the accumulators that fail to be created for every group (see
+/// [`fails_for_each_group`]).
+fn own_parts(raw: &AggregateExec) -> usize {
     let schema = raw.input().schema();
     let grouped = !raw.group_expr().is_true_no_grouping();
-    let own = raw
+    let expressions = raw
         .group_expr()
         .expr()
         .iter()
         .map(|(expr, _)| Arc::clone(expr))
-        .chain(
-            raw.aggr_expr()
-                .iter()
-                .flat_map(|aggregate| aggregate.expressions()),
-        )
+        .chain(raw.aggr_expr().iter().flat_map(|aggregate| {
+            aggregate.expressions().into_iter().chain(
+                aggregate
+                    .order_bys()
+                    .iter()
+                    .map(|sort| Arc::clone(&sort.expr))
+                    .collect::<Vec<_>>(),
+            )
+        }))
         .chain(raw.filter_expr().iter().flatten().cloned())
         .map(|expr| refined_parts(&expr, &schema))
-        .sum::<usize>()
-        + raw
-            .aggr_expr()
-            .iter()
-            .filter(|aggregate| fails_for_each_group(aggregate, grouped))
-            .count();
-    own > 0 && own + pipeline_parts(input) > 1
+        .sum::<usize>();
+    let accumulators = raw
+        .aggr_expr()
+        .iter()
+        .filter(|aggregate| fails_for_each_group(aggregate, grouped))
+        .count();
+    expressions + accumulators
 }
 
 /// Whether the accumulator of `aggregate` (of an aggregation `grouped` or
@@ -2078,10 +2105,11 @@ impl PhysicalOperator for PhysicalHashAggregate {
     }
 
     /// Not if the aggregation aggregates its input in order (see
-    /// `AggregateSpec::aggregates_in_order`): the pipelines that end in it
+    /// `AggregateSpec::aggregates_in_order`), or if it or its pipeline may fail
+    /// (see `AggregateSpec::evaluates_in_order`): the pipelines that end in it
     /// then run on a single thread.
     fn parallel_sink(&self) -> bool {
-        !self.spec.aggregates_in_order()
+        !self.spec.aggregates_in_order() && !self.spec.evaluates_in_order
     }
 
     fn get_global_sink_state(
