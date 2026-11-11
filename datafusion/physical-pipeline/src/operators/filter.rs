@@ -11,10 +11,9 @@
 //! 1. The predicate is split into its conjuncts by an [`AdaptiveFilter`],
 //!    which also decides the order in which they are evaluated.
 //! 2. The conjuncts are evaluated one after the other, each on the columns
-//!    it references. A conjunct rejects the rows for which it is `false`. A
-//!    row is selected if every conjunct is `true` for it: a `NULL` row is not
-//!    selected, but, as in DataFusion, it is not rejected either, so the
-//!    following conjuncts are still evaluated on it.
+//!    it references. A row is selected if every conjunct is `true` for it: a
+//!    conjunct rejects the rows for which it is `false` or `NULL`, and the
+//!    following conjuncts are not evaluated on them.
 //! 3. As soon as every row is rejected, the remaining conjuncts are skipped
 //!    and no output is produced.
 //! 4. The output chunk shares the columns of the input (`Arc` clones, after
@@ -26,20 +25,14 @@
 //!
 //! A conjunct that can fail (see
 //! [`fallibility`](super::adaptive_filter::fallibility)), e.g.
-//! `10 / x > 1`, is evaluated on exactly the rows on which DataFusion
-//! evaluates it (`BinaryExpr::evaluate_conjunction`), so that the filter
-//! fails exactly when `FilterExec` fails on the same rows:
-//!
-//! * on the rows that the conjuncts before it did not reject, if they
-//!   rejected some rows and at most 20% of the rows of the chunk are left
-//!   (DataFusion's `PRE_SELECTION_THRESHOLD`): `x <> 0 AND 10 / x > 1` does
-//!   not divide by zero if at least 80% of the rows have `x = 0`;
-//! * on all rows of the chunk otherwise, including the rejected ones:
-//!   `x <> 0 AND 10 / x > 1` divides by zero if some, but less than 80%, of
-//!   the rows have `x = 0`.
-//!
-//! The [`AdaptiveFilter`] never moves a conjunct across a fallible one, so a
-//! fallible conjunct always follows the same conjuncts as in DataFusion.
+//! `10 / x > 1`, is only evaluated on the rows that the conjuncts before it
+//! did not reject, and the [`AdaptiveFilter`] never moves a conjunct across
+//! a fallible one: `x <> 0 AND 10 / x > 1` never divides by zero, however
+//! many of the rows of a chunk have `x = 0`. (DataFusion evaluates such a
+//! conjunct on all rows of a batch unless at most 20% of them are left, see
+//! `BinaryExpr::evaluate_conjunction`, so it may fail where the native
+//! filter does not: which rows an engine evaluates an expression on is its
+//! own, see `docs/compatibility.md`.)
 //!
 //! A conjunct that cannot fail is evaluated on the rows that were not
 //! rejected, or, if more than a quarter of the physical rows are left, on
@@ -53,23 +46,10 @@
 //!
 //! # Lowering a `FilterExec`
 //!
-//! DataFusion applies its 20% threshold to the batches it filters, the
-//! filter to its chunks, which are not DataFusion's batches (sources split
-//! batches into chunks, operators coalesce their output into batches, and
-//! pipelines skip empty chunks, while `FilterExec` also evaluates its
-//! predicate on empty batches). So [`PhysicalFilter::try_from_filter_exec`]
-//! only lowers predicates whose errors do not depend on the batches (see
-//! [`depends_on_batches`]): for the others, e.g. `x <> 0 AND 10 / x > 1`,
-//! `x = 0 OR 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'` (whose pattern does
-//! not compile), the `FilterExec` must be executed by DataFusion, on the
-//! batches of its input plan. For the same reason, a `FilterExec` with a
-//! `fetch`, which stops after the batch in which the fetch is reached, is
-//! only lowered if its predicate cannot fail at all (and not with a fetch of
-//! 0), and a `FilterExec` whose output has dictionaries with narrow keys,
-//! which it may fail to merge when it coalesces its output batches, is not
-//! lowered. A planner must also keep the plans below a limit that stops the
-//! execution early in DataFusion, see
-//! [`PhysicalFilter::supports_filter_exec`].
+//! [`PhysicalFilter::try_from_filter_exec`] lowers every `FilterExec`, whatever
+//! its predicate, but those whose input the native operators cannot gather
+//! the rows of, and those that limit every partition of an input of several
+//! partitions to their fetch, see [`PhysicalFilter::supports_filter_exec`].
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -77,7 +57,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Array, AsArray, RecordBatch};
-use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use datafusion_common::instant::Instant;
 use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err, plan_err};
@@ -87,25 +67,13 @@ use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use itertools::Itertools;
 
-use super::adaptive_filter::{
-    AdaptiveFilter, AdaptiveFilterState, depends_on_batches,
-    depends_on_batches_with_rows, is_infallible,
-};
-use super::projection::{
-    BoundExprs, can_gather, check_lowered_input, logical_rows, max_batch_rows,
-    takes_little_memory,
-};
+use super::adaptive_filter::{AdaptiveFilter, AdaptiveFilterState};
+use super::projection::{BoundExprs, can_gather, check_lowered_input, logical_rows};
 use crate::chunk::{DataChunk, SelectionVector};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
     PhysicalOperator, downcast_state, downcast_state_mut,
 };
-
-/// DataFusion's `PRE_SELECTION_THRESHOLD` (in `BinaryExpr`): before a
-/// conjunct that may fail is evaluated, the rows that the conjuncts before
-/// it rejected are only removed if at most this fraction of the rows is
-/// left.
-const PRE_SELECTION_THRESHOLD: f32 = 0.2;
 
 /// An infallible conjunct is evaluated on all physical rows of a chunk,
 /// instead of only on the rows that are not rejected, if more than one in
@@ -125,9 +93,6 @@ pub struct PhysicalFilter {
     filter: AdaptiveFilter,
     /// The conjuncts of `filter`, bound to the input columns they reference.
     conjuncts: Vec<BoundExprs>,
-    /// The position of the last fallible conjunct (fallible conjuncts never
-    /// move).
-    last_fallible: Option<usize>,
     /// The input columns of the output, if not all of them.
     projection: Option<Vec<usize>>,
     /// The maximum number of rows to produce.
@@ -152,92 +117,21 @@ impl PhysicalFilter {
         Self::try_new_with_schema(input, predicate, projection, schema)
     }
 
-    /// Whether [`Self::try_from_filter_exec`] can lower `exec` with exactly
-    /// its semantics, including its errors. It cannot if
+    /// Whether [`Self::try_from_filter_exec`] can lower `exec`. It lowers
+    /// every predicate, whatever it may fail with (e.g. `x <> 0 AND 10 / x >
+    /// 1`, which DataFusion may evaluate on rows with `x = 0`, see the
+    /// [module documentation](self)), also with a fetch, but not if
     ///
-    /// * the errors of the predicate depend on how DataFusion splits the
-    ///   rows into batches, empty ones included (see [`depends_on_batches`]),
-    ///   e.g. `x <> 0 AND 10 / x > 1` or `x = 0 OR s ~ 'a{1000000}'`:
-    ///   DataFusion must evaluate it on the batches of the input plan of
-    ///   `exec`. String constants, which the predicate may copy for every row
-    ///   (e.g. `CASE WHEN x THEN 'HIGH' ELSE 'LOW' END = 'HIGH'`), only do not
-    ///   if the plan bounds the rows of these batches (see
-    ///   [`depends_on_batches_with_rows`]). Functions are opaque, but for the
-    ///   built-in functions of DataFusion whose implementations are known
-    ///   (e.g. `extract(year from o_orderdate)` or
-    ///   `substring(c_phone from 1 for 2)`), in the sessions that trust them,
-    ///   as sessions do by default (see
-    ///   [`TrustedFunctions`](super::adaptive_filter::TrustedFunctions));
     /// * the input of `exec` has lists of values that take less than a byte
     ///   each (e.g. fixed-size lists of `1 << 30` nulls, booleans, or empty
     ///   lists or binaries), which the native operators cannot gather with
     ///   `take`, or run-end encoded arrays whose child fields are not Arrow's
     ///   (see `can_gather`);
-    /// * the output of `exec` has dictionaries with keys of less than 32 bits,
-    ///   of values that take less than a byte each (e.g. nulls), or with keys
-    ///   of less than 64 bits and values that Arrow does not merge but adds up
-    ///   (other than strings, binaries and primitive values, e.g. fixed-size
-    ///   binaries, which may share their storage), run ends of less than 32
-    ///   bits, or lists, strings or binaries with 32-bit offsets (`Utf8`,
-    ///   `Binary`, but not their large or view types), at any depth, also as
-    ///   the values of dictionaries: `FilterExec` coalesces its output
-    ///   batches, merging the dictionaries of distinct batches, which fails if
-    ///   they have more values than the keys can index (e.g. two batches of
-    ///   100 distinct values, with `Int8` keys, or dictionaries of `1 << 30`
-    ///   and `(1 << 30) + 1` nulls, which take no memory and which Arrow does
-    ///   not merge, with `Int32` keys), and adding up offsets, which fails
-    ///   beyond `i32::MAX` values or bytes (e.g. two lists of `1 << 30` nulls,
-    ///   or 32 copies of a batch with a string of 64 MiB, which share its
-    ///   buffer). Whether it fails depends on the batches of the input plan,
-    ///   and the native filter does not coalesce its output. Nor run-end
-    ///   encoded arrays whose child fields are not Arrow's, which Arrow's
-    ///   `filter` renames;
     /// * `exec` has a `fetch` and its input has several partitions: the
     ///   fetch limits every partition, but the chunks of a pipeline do not
-    ///   belong to partitions;
-    /// * `exec` has a `fetch` and its predicate can fail: `FilterExec`
-    ///   evaluates the predicate on whole batches until the fetch is reached,
-    ///   so it may fail on rows the native filter, which stops earlier, never
-    ///   sees;
-    /// * `exec` has a `fetch` of 0: `FilterExec` evaluates its predicate on
-    ///   the first batch of its input, even an empty one, and stops, but
-    ///   pipelines skip empty chunks, so the native filter would pull more of
-    ///   its input (whose errors it would raise).
-    ///
-    /// A planner must also keep the plans below a limit that stops the
-    /// execution early (e.g. the input of a `GlobalLimitExec`, of a node with
-    /// a fetch, or of an aggregation with a soft limit) in DataFusion, filters
-    /// included, unless a sort that reads all of its input is in between: a
-    /// sort whose order its input does not satisfy, without a fetch or with
-    /// a fetch that shares no prefix with the order of its input (a sort that
-    /// its input satisfies streams it, and such a TopK may stop early).
-    /// DataFusion pulls its input lazily, batch by batch, but for
-    /// `FilterExec`, which pulls ahead to coalesce its output, so the rows that
-    /// are evaluated before the limit is reached, and so the errors, depend on
-    /// these pulls, which a pipeline (on several threads, with a cache of
-    /// small chunks) does not reproduce.
-    ///
-    /// Likewise, a planner must keep a filter or a projection with a part that
-    /// may fail (see [`Failures`](super::adaptive_filter::Failures)) in
-    /// DataFusion, with its input plan, if native operators below it in the
-    /// same pipeline have parts that may fail too, unless all of these parts
-    /// can only fail with arithmetic overflows (e.g. decimal arithmetic):
-    /// DataFusion evaluates each operator on a whole batch before the next one,
-    /// a pipeline each chunk with all of its operators, so which error comes
-    /// first depends on the batches.
-    ///
-    /// And a planner must keep `exec` in DataFusion, with its input plan, if a
-    /// node above it (in DataFusion or not, e.g. a projection or the key of a
-    /// sort) has a part that may fail, and its predicate or a node of its
-    /// input plan (in DataFusion or not, sources included) has one too (unless,
-    /// likewise, all of them can only fail with arithmetic overflows):
-    /// `FilterExec` coalesces its output, so it pulls later batches of its
-    /// input, and raises their errors, before the nodes above it see the rows
-    /// of the earlier ones, which the native filter passes on at once (e.g.
-    /// `10 / x` above `FilterExec(x >= 0)` above `CAST(s AS BIGINT)`, which
-    /// fails on the second batch: DataFusion raises the cast error, but
-    /// native operators above a native filter would divide the rows of the
-    /// first batch by zero first).
+    ///   belong to partitions. (A limit above such a filter that keeps at
+    ///   most as many rows of all partitions makes the fetch redundant: see
+    ///   [`PhysicalLimit::try_lower`](super::limit::PhysicalLimit::try_lower).)
     pub fn supports_filter_exec(exec: &FilterExec) -> bool {
         unsupported_filter_exec(exec).is_none()
     }
@@ -308,16 +202,11 @@ impl PhysicalFilter {
                 BoundExprs::try_new([Arc::clone(conjunct.expr())], input_schema.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
-        let last_fallible = filter
-            .conjuncts()
-            .iter()
-            .rposition(|conjunct| conjunct.is_fallible());
         Ok(Self {
             children: vec![input],
             predicate,
             filter,
             conjuncts,
-            last_fallible,
             projection,
             fetch: None,
             schema,
@@ -329,9 +218,7 @@ impl PhysicalFilter {
     /// `FilterExec` with a single input partition, a filter with a fetch is
     /// executed by a single thread (see [`PhysicalOperator::parallel_operator`]),
     /// so that it filters its input in order. It stops as soon as the fetch
-    /// is reached, so if its predicate can fail, it may not fail where
-    /// `FilterExec`, which evaluates whole batches, fails (see
-    /// [`Self::supports_filter_exec`]).
+    /// is reached.
     pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
         self
@@ -356,28 +243,13 @@ impl PhysicalFilter {
     pub fn fetch(&self) -> Option<usize> {
         self.fetch
     }
-
-    /// Whether the errors of the predicate depend on how the rows are split
-    /// into batches (see [`depends_on_batches`]), in which case the filter
-    /// may fail on other inputs than `FilterExec`, which evaluates it on
-    /// other batches.
-    pub fn errors_depend_on_batches(&self) -> bool {
-        depends_on_batches(&self.predicate, self.children[0].schema().as_ref())
-    }
 }
 
-/// Why `exec` cannot be lowered with exactly its semantics, see
-/// [`PhysicalFilter::supports_filter_exec`].
+/// Why `exec` cannot be lowered, see [`PhysicalFilter::supports_filter_exec`].
 fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
-    let input_schema = exec.input().schema();
-    let max_rows = max_batch_rows(exec.input());
-    if depends_on_batches_with_rows(exec.predicate(), input_schema.as_ref(), max_rows) {
-        return Some(format!(
-            "the errors of its predicate {} depend on DataFusion's batches",
-            exec.predicate()
-        ));
-    }
-    if let Some(field) = input_schema
+    if let Some(field) = exec
+        .input()
+        .schema()
         .fields()
         .iter()
         .find(|field| !can_gather(field.data_type()))
@@ -389,109 +261,14 @@ fn unsupported_filter_exec(exec: &FilterExec) -> Option<String> {
             field.name()
         ));
     }
-    if let Some(field) = exec
-        .schema()
-        .fields()
-        .iter()
-        .find(|field| may_fail_to_coalesce(field.data_type()))
-    {
-        return Some(format!(
-            "it may fail to coalesce the dictionaries, run ends, lists or strings of its output column '{}'",
-            field.name()
-        ));
-    }
-    if exec.fetch()? == 0 {
-        return Some(
-            "it has a fetch of 0: `FilterExec` evaluates its predicate on the first \
-             batch of its input, even an empty one, and stops, but pipelines skip \
-             empty chunks"
-                .to_owned(),
-        );
-    }
+    exec.fetch()?;
     let partitions = exec.input().output_partitioning().partition_count();
     if partitions > 1 {
         return Some(format!(
             "it limits each of its {partitions} input partitions to its fetch"
         ));
     }
-    if !is_infallible(exec.predicate(), input_schema.as_ref()) {
-        return Some(format!(
-            "it has a fetch and its predicate {} can fail",
-            exec.predicate()
-        ));
-    }
     None
-}
-
-/// Whether `FilterExec` may fail to coalesce batches of `data_type`, at any
-/// depth: it concatenates the arrays of the batches it coalesces, which
-/// merges the dictionaries of distinct batches, and fails when their keys
-/// cannot index all of their values (keys of less than 32 bits, or values that
-/// take less than a byte each, e.g. nulls, which Arrow does not merge, and of
-/// which any number takes no memory, or keys of less than 64 bits and values
-/// that Arrow does not merge, but adds up, which may share their storage,
-/// see [`merges_dictionary_values`]), adds up run ends (run ends of less than
-/// 32 bits), and the offsets of lists (32-bit offsets, which lists of nulls
-/// overflow without memory), and of strings and binaries (32-bit offsets,
-/// which overflow beyond 2 GiB of bytes, which batches that share their
-/// buffers reach without memory, e.g. copies of a batch with a large string).
-/// And Arrow's `filter` rebuilds run-end encoded arrays with its own child
-/// fields, so their fields must be Arrow's.
-fn may_fail_to_coalesce(data_type: &DataType) -> bool {
-    let narrow = |index: &DataType| {
-        !matches!(
-            index,
-            DataType::Int32 | DataType::Int64 | DataType::UInt32 | DataType::UInt64
-        )
-    };
-    match data_type {
-        DataType::Dictionary(keys, values) => {
-            narrow(keys)
-                || takes_little_memory(values)
-                // Arrow adds up the values of the dictionaries it does not
-                // merge, which may share their storage.
-                || (!matches!(keys.as_ref(), DataType::Int64 | DataType::UInt64)
-                    && !merges_dictionary_values(values))
-                || may_fail_to_coalesce(values)
-        }
-        // Arrow's `filter` rebuilds run-end encoded arrays with its own fields
-        // (see `RunArray::try_new`), so the output would not have its type.
-        DataType::RunEndEncoded(run_ends, values) => {
-            narrow(run_ends.data_type())
-                || **run_ends
-                    != Field::new("run_ends", run_ends.data_type().clone(), false)
-                || **values != Field::new("values", values.data_type().clone(), true)
-                || may_fail_to_coalesce(values.data_type())
-        }
-        // Their 32-bit offsets overflow on more than `i32::MAX` values, which
-        // need no memory if they are nulls.
-        DataType::List(_) | DataType::ListView(_) | DataType::Map(..) => true,
-        // Their 32-bit offsets overflow beyond 2 GiB of bytes, in batches
-        // that may share their buffers.
-        DataType::Utf8 | DataType::Binary => true,
-        DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _) => may_fail_to_coalesce(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| may_fail_to_coalesce(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| may_fail_to_coalesce(field.data_type())),
-        _ => false,
-    }
-}
-
-/// Whether Arrow merges (deduplicating their values) the dictionaries of
-/// `values` that it concatenates (see `should_merge_dictionary_values`):
-/// strings, binaries and primitive values. It adds up the values of others,
-/// which more than `i32::MAX` may be without taking more memory, if the
-/// dictionaries share their storage (e.g. slices of one array).
-fn merges_dictionary_values(values: &DataType) -> bool {
-    matches!(
-        values,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-    ) || values.is_primitive()
 }
 
 /// The global state of a [`PhysicalFilter`]: the rows it may still produce.
@@ -555,16 +332,10 @@ enum Selected {
 enum Mask {
     /// Every row is `true`.
     True,
-    /// Every row is `false`.
+    /// No row is `true`: every row is `false` or `NULL`.
     False,
-    /// Every row is `NULL`.
-    Null,
-    /// The rows that are not `false` (`true` or `NULL`), and those that are
-    /// `NULL` (`None` if none is).
-    Mixed {
-        not_false: BooleanBuffer,
-        null: Option<BooleanBuffer>,
-    },
+    /// The rows that are `true`.
+    Some(BooleanBuffer),
 }
 
 /// The rows of a [`Mask`]: how the rows the conjunct was evaluated on relate
@@ -572,28 +343,23 @@ enum Mask {
 enum MaskRows<'a> {
     /// The rows that are not rejected, in order.
     Undecided,
-    /// All logical rows.
-    Logical,
     /// All physical rows; the logical rows are `incoming` (all physical rows
     /// if `None`).
     Physical(Option<&'a SelectionVector>),
 }
 
 /// The logical rows of a chunk that the conjuncts evaluated so far did not
-/// reject, as bitmaps over the logical rows.
+/// reject: those for which all of them are `true`, as a bitmap over the
+/// logical rows. A row for which a conjunct is `NULL` is never selected, so
+/// it is rejected at once, like a `false` row: the next conjuncts are not
+/// evaluated on it.
 struct Undecided {
     /// The number of logical rows of the chunk.
     num_rows: usize,
     /// The rows that are not rejected (`None` for all logical rows).
     rows: Option<BooleanBuffer>,
-    /// The rows of `rows` for which a conjunct was `NULL` (`None` if none
-    /// is). Such rows are not selected, but the next conjuncts are still
-    /// evaluated on them.
-    nulls: Option<BooleanBuffer>,
     /// The number of rows of `rows`.
     count: usize,
-    /// The number of rows of `nulls`.
-    null_count: usize,
 }
 
 impl Undecided {
@@ -601,20 +367,13 @@ impl Undecided {
         Self {
             num_rows,
             rows: None,
-            nulls: None,
             count: num_rows,
-            null_count: 0,
         }
     }
 
     /// The number of rows that are not rejected.
     fn len(&self) -> usize {
         self.count
-    }
-
-    /// The number of rows for which every conjunct so far was `true`.
-    fn true_count(&self) -> usize {
-        self.count - self.null_count
     }
 
     /// The physical rows that are not rejected (`None` for all physical
@@ -637,76 +396,45 @@ impl Undecided {
         Some(Cow::Owned(SelectionVector::from(physical)))
     }
 
-    /// Reject the rows for which the conjunct with result `mask` is `false`,
-    /// and record those for which it is `NULL`.
+    /// Reject the rows for which the conjunct with result `mask` is not
+    /// `true`.
     fn update(&mut self, mask: Mask, mask_rows: &MaskRows<'_>) {
-        let (not_false, null) = match mask {
+        let selected = match mask {
             Mask::True => return,
             Mask::False => {
                 self.rows = Some(BooleanBuffer::new_unset(self.num_rows));
-                self.nulls = None;
                 self.count = 0;
-                self.null_count = 0;
                 return;
             }
-            Mask::Null => {
-                self.nulls = Some(
-                    self.rows
-                        .clone()
-                        .unwrap_or_else(|| BooleanBuffer::new_set(self.num_rows)),
-                );
-                self.null_count = self.count;
-                return;
-            }
-            Mask::Mixed { not_false, null } => (not_false, null),
+            Mask::Some(selected) => selected,
         };
         // The mask, over the logical rows.
-        let (not_false, null) = match mask_rows {
-            MaskRows::Logical | MaskRows::Physical(None) => (not_false, null),
+        let selected = match mask_rows {
+            MaskRows::Physical(None) => selected,
             MaskRows::Undecided => match &self.rows {
-                None => (not_false, null),
+                None => selected,
                 // Scatter the results to the rows they were computed for.
-                Some(rows) => (
-                    scatter(&not_false, rows, self.num_rows),
-                    null.map(|null| scatter(&null, rows, self.num_rows)),
-                ),
+                Some(rows) => scatter(&selected, rows, self.num_rows),
             },
-            MaskRows::Physical(Some(incoming)) => (
-                gather(&not_false, incoming),
-                null.map(|null| gather(&null, incoming)),
-            ),
+            MaskRows::Physical(Some(incoming)) => gather(&selected, incoming),
         };
         let rows = match &self.rows {
-            Some(rows) => rows & &not_false,
-            None => not_false,
-        };
-        let nulls = match (&self.nulls, null) {
-            (None, None) => None,
-            (Some(nulls), None) => Some(nulls & &rows),
-            (None, Some(null)) => Some(&null & &rows),
-            (Some(nulls), Some(null)) => Some(&(nulls | &null) & &rows),
+            Some(rows) => rows & &selected,
+            None => selected,
         };
         self.count = rows.count_set_bits();
-        self.null_count = nulls.as_ref().map_or(0, BooleanBuffer::count_set_bits);
-        self.nulls = nulls.filter(|_| self.null_count > 0);
         self.rows = Some(rows);
     }
 
     /// The selected rows: those for which every conjunct was `true`.
     fn into_selected(self, incoming: Option<&SelectionVector>) -> Selected {
-        let true_count = self.true_count();
-        if true_count == 0 {
+        if self.count == 0 {
             return Selected::Nothing;
         }
-        let selected = match (self.rows, self.nulls) {
-            (None, None) => return Selected::All,
-            (Some(rows), None) => rows,
-            (rows, Some(nulls)) => {
-                let rows = rows.unwrap_or_else(|| BooleanBuffer::new_set(self.num_rows));
-                &rows & &!&nulls
-            }
+        let Some(selected) = self.rows else {
+            return Selected::All;
         };
-        let mut physical = Vec::with_capacity(true_count);
+        let mut physical = Vec::with_capacity(self.count);
         match incoming {
             Some(incoming) => {
                 let incoming = incoming.indices();
@@ -845,13 +573,8 @@ impl PhysicalFilter {
         let timed = state.is_adaptive();
         for position in 0..self.conjuncts.len() {
             if undecided.len() == 0 {
-                // Every row is rejected: DataFusion stops here too.
-                break;
-            }
-            if undecided.true_count() == 0
-                && self.last_fallible.is_none_or(|last| position > last)
-            {
-                // No row can pass, and the remaining conjuncts cannot fail.
+                // Every row is rejected: the remaining conjuncts are not
+                // evaluated.
                 break;
             }
             let conjunct = state.permutation()[position];
@@ -878,20 +601,12 @@ impl PhysicalFilter {
     ) -> Result<()> {
         let bound = &self.conjuncts[conjunct];
         let expr = &bound.exprs()[0];
-        let left = undecided.len();
-        if self.filter.conjuncts()[conjunct].is_fallible() {
-            // Evaluate the conjunct on the rows DataFusion evaluates it on:
-            // only on the rows that are left if some rows were rejected and
-            // at most 20% of them are left, otherwise on all rows.
-            let num_rows = undecided.num_rows;
-            let pre_select = left < num_rows
-                && left as f32 / num_rows as f32 <= PRE_SELECTION_THRESHOLD;
-            if !pre_select {
-                let batch = bound.batch(input, incoming)?;
-                undecided.update(evaluate_mask(expr, &batch)?, &MaskRows::Logical);
-                return Ok(());
-            }
-        } else if left * DENSE_SELECTION > input.physical_len() {
+        // A conjunct that may fail is only evaluated on the rows that are left,
+        // so that it does not fail on the rows that the conjuncts before it
+        // rejected (e.g. `x <> 0 AND 10 / x > 1`).
+        if !self.filter.conjuncts()[conjunct].is_fallible()
+            && undecided.len() * DENSE_SELECTION > input.physical_len()
+        {
             // Many rows are left and the conjunct cannot fail on the other
             // ones: evaluating it on all physical rows is cheaper than
             // gathering its columns.
@@ -936,15 +651,14 @@ impl PhysicalFilter {
 }
 
 /// Evaluate a conjunct on `batch`, with the semantics of `FilterExec`: the
-/// result must be a boolean.
+/// result must be a boolean, and the rows for which it is `true` pass.
 fn evaluate_mask(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Mask> {
     let num_rows = batch.num_rows();
     let array = match expr.evaluate(batch)? {
         ColumnarValue::Scalar(ScalarValue::Boolean(value)) => {
             return Ok(match value {
                 Some(true) => Mask::True,
-                Some(false) => Mask::False,
-                None => Mask::Null,
+                Some(false) | None => Mask::False,
             });
         }
         value => value.into_array(num_rows)?,
@@ -958,28 +672,15 @@ fn evaluate_mask(expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch) -> Result<Ma
             mask.len()
         );
     }
-    let null = mask
-        .nulls()
-        .filter(|nulls| nulls.null_count() > 0)
-        .map(|nulls| !nulls.inner());
-    Ok(match null {
-        None => match mask.values().count_set_bits() {
-            0 => Mask::False,
-            count if count == num_rows => Mask::True,
-            _ => Mask::Mixed {
-                not_false: mask.values().clone(),
-                null: None,
-            },
-        },
-        Some(null) => {
-            if mask.null_count() == num_rows {
-                return Ok(Mask::Null);
-            }
-            Mask::Mixed {
-                not_false: mask.values() | &null,
-                null: Some(null),
-            }
-        }
+    // A `NULL` is not `true`.
+    let selected = match mask.nulls().filter(|nulls| nulls.null_count() > 0) {
+        Some(nulls) => mask.values() & nulls.inner(),
+        None => mask.values().clone(),
+    };
+    Ok(match selected.count_set_bits() {
+        0 => Mask::False,
+        count if count == num_rows => Mask::True,
+        _ => Mask::Some(selected),
     })
 }
 
@@ -1002,7 +703,6 @@ pub(crate) mod test_support {
     use arrow::datatypes::{DataType, Field, Int8Type, Int32Type, Schema, SchemaRef};
     use datafusion::datasource::MemTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_common::{DFSchema, DataFusionError, Result};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::TaskContext;
@@ -1012,13 +712,11 @@ pub(crate) mod test_support {
     };
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-    use datafusion_physical_plan::aggregates::{AggregateExec, AggregateInputMode};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::limit::LocalLimitExec;
     use datafusion_physical_plan::projection::ProjectionExec;
     use datafusion_physical_plan::repartition::RepartitionExec;
-    use datafusion_physical_plan::sorts::sort::SortExec;
     use datafusion_physical_plan::{
         ChildrenPropertiesMode, Distribution, ExecutionPlan, ExecutionPlanProperties,
         Partitioning, ReplaceChildrenOptions, collect,
@@ -1031,9 +729,7 @@ pub(crate) mod test_support {
         ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
         OperatorState, PhysicalOperator,
     };
-    use crate::operators::adaptive_filter::{
-        Failures, TrustedFunctions, depends_on_batches, failures,
-    };
+    use crate::operators::adaptive_filter::TrustedFunctions;
     use crate::operators::caching::CachingOperator;
     use crate::operators::projection::PhysicalProjection;
     use crate::test_utils::{
@@ -1042,27 +738,13 @@ pub(crate) mod test_support {
     };
 
     /// Lower `plan` into an operator tree that executes the `FilterExec`s
-    /// and `ProjectionExec`s natively where this keeps DataFusion's results
-    /// and errors exactly:
+    /// and `ProjectionExec`s natively, and the other nodes with DataFusion:
     ///
     /// * `FilterExec` becomes `CachingOperator(PhysicalFilter)` and
     ///   `ProjectionExec` becomes `PhysicalProjection`, if supported (see
     ///   [`PhysicalFilter::supports_filter_exec`] and
-    ///   [`PhysicalProjection::supports_projection_exec`]).
-    /// * Below a limit that stops the execution early (unless a sort that
-    ///   reads all of its input, see [`reads_all_input`], is in between), the
-    ///   whole plan is executed by DataFusion.
-    /// * Below a node with a part that may fail, a `FilterExec` whose plan has
-    ///   parts that may fail (its predicate included) is executed by
-    ///   DataFusion with its input: it coalesces its output, so it raises the
-    ///   errors of later batches of its input before the nodes above it see
-    ///   the rows of earlier ones (unless all of these parts can only fail
-    ///   with arithmetic overflows, which raise the same error in any order,
-    ///   see [`Failures`]).
-    /// * A `FilterExec` or a `ProjectionExec` that is not lowered, and a node
-    ///   whose expressions may fail depending on DataFusion's batches, are
-    ///   executed by DataFusion with their whole input plan, so that they see
-    ///   DataFusion's batches.
+    ///   [`PhysicalProjection::supports_projection_exec`]), whatever their
+    ///   expressions may fail with, also below limits.
     /// * Scans become the native sources of
     ///   [`try_create_scan_source`](crate::sources::try_create_scan_source).
     /// * `CoalescePartitionsExec` (without fetch) and round robin
@@ -1073,199 +755,34 @@ pub(crate) mod test_support {
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        lower_below(plan, false, Failures::NONE)
-    }
-
-    /// [`lower`] `plan`, which is below a limit that stops the execution
-    /// early if `limited`, and below nodes whose parts that may fail are
-    /// `fallible_above`.
-    fn lower_below(
-        plan: &Arc<dyn ExecutionPlan>,
-        limited: bool,
-        fallible_above: Failures,
-    ) -> Result<Arc<dyn PhysicalOperator>> {
-        if limited && !reads_all_input(plan) {
-            // DataFusion pulls the input of a limit lazily, batch by batch,
-            // but for `FilterExec`, which pulls ahead to coalesce its output:
-            // the rows evaluated before the limit is reached, and so the
-            // errors, depend on these pulls, which a pipeline (on several
-            // threads, with a cache of small chunks) does not reproduce.
-            return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
-        }
-        // DataFusion evaluates each operator on a whole batch before the next
-        // one, a pipeline each chunk with all of its operators: if native
-        // operators of a pipeline have several parts that may fail with
-        // different errors, which error comes first depends on the batches.
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-            // `FilterExec` coalesces its output: it pulls later batches of its
-            // input, whose errors it raises, before the nodes above it see the
-            // rows of earlier ones, which the native filter passes on at once.
-            if conflict(fallible_above, subtree_failures(plan)?) {
-                return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
-            }
             if PhysicalFilter::supports_filter_exec(filter) {
-                let own = failures(filter.predicate(), &filter.input().schema());
-                let input = lower_below(
-                    filter.input(),
-                    filter.fetch().is_some(),
-                    fallible_above.and(own),
-                )?;
-                if !conflict(own, native_failures(&input)) {
-                    let filter: Arc<dyn PhysicalOperator> =
-                        Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
-                    return Ok(Arc::new(CachingOperator::new(filter)));
-                }
+                let input = lower(filter.input())?;
+                let filter: Arc<dyn PhysicalOperator> =
+                    Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
+                return Ok(Arc::new(CachingOperator::new(filter)));
             }
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             if PhysicalProjection::supports_projection_exec(projection) {
-                let input_schema = projection.input().schema();
-                let own = projection
-                    .expr()
-                    .iter()
-                    .map(|expr| failures(&expr.expr, &input_schema))
-                    .fold(Failures::NONE, Failures::and);
-                let input =
-                    lower_below(projection.input(), false, fallible_above.and(own))?;
-                if !conflict(own, native_failures(&input)) {
-                    return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
-                        projection, input,
-                    )?));
-                }
+                let input = lower(projection.input())?;
+                return Ok(Arc::new(PhysicalProjection::try_from_projection_exec(
+                    projection, input,
+                )?));
             }
             return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
         }
         if let Some(scan) = crate::sources::try_create_scan_source(plan)? {
             return Ok(scan);
         }
-        let (batch_dependent, own) = judge_expressions(plan)?;
-        if batch_dependent {
-            return Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))));
-        }
-        let fallible_above = fallible_above.and(own);
         if only_repartitions(plan) {
-            let input = lower_below(plan.children()[0], limited, fallible_above)?;
+            let input = lower(plan.children()[0])?;
             if !input.is::<BridgeOperator>() {
                 return Ok(input);
             }
         }
-        Ok(Arc::new(BridgeOperator::new(bridged_plan(
-            plan,
-            limited,
-            fallible_above,
-        )?)))
-    }
-
-    /// Whether parts of `above` and parts of `below` that may fail (see
-    /// [`Failures`]) may raise different errors, so that which error comes
-    /// first depends on whether `above` or `below` sees a row first: if both
-    /// have parts that may fail, but for parts that can only fail with
-    /// arithmetic overflows, which raise the same error in any order.
-    fn conflict(above: Failures, below: Failures) -> bool {
-        let only_overflows = above.only_overflows() && below.only_overflows();
-        !above.is_none() && !below.is_none() && !only_overflows
-    }
-
-    /// The parts that may fail (see [`failures`]) of the native filters and
-    /// projections of `operator`, which evaluate the same chunks one after the
-    /// other, down to the operators that DataFusion or a source executes.
-    fn native_failures(operator: &Arc<dyn PhysicalOperator>) -> Failures {
-        let input_schema = || operator.children()[0].schema();
-        let own = if let Some(filter) = operator.downcast_ref::<PhysicalFilter>() {
-            failures(filter.predicate(), &input_schema())
-        } else if let Some(projection) = operator.downcast_ref::<PhysicalProjection>() {
-            let input_schema = input_schema();
-            projection
-                .exprs()
-                .iter()
-                .map(|(expr, _)| failures(expr, &input_schema))
-                .fold(Failures::NONE, Failures::and)
-        } else if operator.is::<CachingOperator>() {
-            Failures::NONE
-        } else {
-            return Failures::NONE;
-        };
-        operator
-            .children()
-            .iter()
-            .map(native_failures)
-            .fold(own, Failures::and)
-    }
-
-    /// Whether `plan` reads all of its input, even if a limit above it stops
-    /// early: a sort whose order its input does not satisfy, without fetch,
-    /// or with a fetch (a TopK) that shares no prefix with the order of its
-    /// input. A sort that its input satisfies streams it, and a TopK can stop
-    /// once the next rows of its input sort after its own (see
-    /// `SortExec::execute`).
-    fn reads_all_input(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        let Some(sort) = plan.downcast_ref::<SortExec>() else {
-            return false;
-        };
-        let Ok((prefix, satisfied)) = sort
-            .input()
-            .equivalence_properties()
-            .extract_common_sort_prefix(sort.expr().clone())
-        else {
-            return false;
-        };
-        !satisfied
-            && match sort.fetch() {
-                None => true,
-                Some(fetch) => fetch > 0 && prefix.is_empty(),
-            }
-    }
-
-    /// Whether some expression of `plan` may fail depending on the batches
-    /// it is evaluated on, or several parts of its expressions may fail with
-    /// different errors (see [`Failures`]), and these parts: judged on the
-    /// schema of the input of `plan` if it has a single child, and without
-    /// schema otherwise, which is conservative (expressions that may fail
-    /// then fail on empty batches). The aggregations that merge partial
-    /// states evaluate no expression on their input (the arguments of their
-    /// aggregate functions are those of the partial aggregations).
-    fn judge_expressions(plan: &Arc<dyn ExecutionPlan>) -> Result<(bool, Failures)> {
-        if plan
-            .downcast_ref::<AggregateExec>()
-            .is_some_and(|aggregate| {
-                aggregate.mode().input_mode() == AggregateInputMode::Partial
-            })
-        {
-            return Ok((false, Failures::NONE));
-        }
-        let schema = match plan.children().as_slice() {
-            [child] => child.schema(),
-            _ => Arc::new(Schema::empty()),
-        };
-        let mut batch_dependent = false;
-        let mut parts = Failures::NONE;
-        // The dynamic filters that `plan` produces (e.g. the threshold of a
-        // TopK) compare the values of its own expressions (e.g. its sort
-        // keys), which are judged; those it is given are judged dynamic.
-        let produced = plan.dynamic_expressions_produced();
-        plan.apply_expressions(&mut |expr| {
-            if !produced
-                .iter()
-                .any(|dynamic| std::ptr::addr_eq(Arc::as_ptr(dynamic), Arc::as_ptr(expr)))
-            {
-                batch_dependent |= depends_on_batches(expr, &schema);
-                parts = parts.and(failures(expr, &schema));
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        Ok((batch_dependent || parts.order_matters(), parts))
-    }
-
-    /// The parts that may fail of the expressions of the nodes of `plan` (see
-    /// [`judge_expressions`]), sources included.
-    fn subtree_failures(plan: &Arc<dyn ExecutionPlan>) -> Result<Failures> {
-        plan.children()
-            .into_iter()
-            .map(subtree_failures)
-            .try_fold(judge_expressions(plan)?.1, |parts, child| {
-                Ok(parts.and(child?))
-            })
+        Ok(Arc::new(BridgeOperator::new(bridged_plan(plan)?)))
     }
 
     /// `plan`, to be executed by DataFusion, with its children lowered: a
@@ -1275,26 +792,12 @@ pub(crate) mod test_support {
     /// child has several partitions, which a `PipelineRootExec` (a single
     /// partition) does not keep. DataFusion then executes the child too, with
     /// its own children lowered.
-    ///
-    /// The children of a node with a fetch (or of an aggregation with a soft
-    /// limit, which stops reading its input once it has enough groups) are
-    /// below a limit that stops the execution early, unless the node reads
-    /// all of its input (see [`reads_all_input`]).
-    fn bridged_plan(
-        plan: &Arc<dyn ExecutionPlan>,
-        limited: bool,
-        fallible_above: Failures,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let soft_limit = plan
-            .downcast_ref::<AggregateExec>()
-            .is_some_and(|aggregate| aggregate.limit_options().is_some());
-        let limited =
-            !reads_all_input(plan) && (limited || plan.fetch().is_some() || soft_limit);
+    fn bridged_plan(plan: &Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = plan.children();
         let new_children = children
             .iter()
             .enumerate()
-            .map(|(index, child)| child_plan(plan, index, child, limited, fallible_above))
+            .map(|(index, child)| child_plan(plan, index, child))
             .collect::<Result<Vec<_>>>()?;
         let unchanged = children
             .iter()
@@ -1326,10 +829,8 @@ pub(crate) mod test_support {
         parent: &Arc<dyn ExecutionPlan>,
         index: usize,
         child: &Arc<dyn ExecutionPlan>,
-        limited: bool,
-        fallible_above: Failures,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let lowered = lower_below(child, limited, fallible_above)?;
+        let lowered = lower(child)?;
         if let Some(bridge) = lowered.downcast_ref::<BridgeOperator>() {
             return Ok(Arc::clone(bridge.plan()));
         }
@@ -1348,7 +849,7 @@ pub(crate) mod test_support {
         ) && child.output_ordering().is_none()
             && !limits_partitions;
         if !single_partition && !unconstrained {
-            return bridged_plan(child, limited, fallible_above);
+            return bridged_plan(child);
         }
         Ok(Arc::new(PipelineRootExec::try_new(
             lowered,
@@ -1560,19 +1061,6 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Execute `plan`, created by `make_plan`, with DataFusion and with its
-    /// native operators (see [`lower`]), and assert that either both succeed
-    /// with byte-identical results (in the same order if `ordered`), or both
-    /// fail with the same error. Returns the error, if any, and the native
-    /// operators that were used.
-    pub(crate) async fn assert_native_plan_parity(
-        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
-        ordered: bool,
-    ) -> (Option<String>, NativeOperators) {
-        let config = SessionConfig::new().with_target_partitions(4);
-        assert_native_plan_parity_with_config(make_plan, ordered, config).await
-    }
-
     /// [`assert_native_plan_parity`] with the session configuration `config`
     /// (whose target partitions are the threads of the pipelines).
     pub(crate) async fn assert_native_plan_parity_with_config(
@@ -1621,76 +1109,6 @@ pub(crate) mod test_support {
             }
             (Ok(_), Err(actual)) => panic!("Only the native operators failed: {actual}"),
             (Err(expected), Ok(_)) => panic!("Only DataFusion failed: {expected}"),
-        };
-        (error, operators)
-    }
-
-    /// Run `sql` with DataFusion and with its native operators (see
-    /// [`lower`]), and assert that either both succeed, with byte-identical
-    /// results, or both fail with the same error. Returns the error, if any,
-    /// and the native operators that were used.
-    pub(crate) async fn assert_native_parity_with_setup<F>(
-        sql: &str,
-        setup: F,
-    ) -> (Option<String>, NativeOperators)
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        assert_native_parity_with_config(sql, test_session_config(), setup).await
-    }
-
-    /// [`assert_native_parity_with_setup`] with the session configuration
-    /// `config`.
-    pub(crate) async fn assert_native_parity_with_config<F>(
-        sql: &str,
-        config: SessionConfig,
-        setup: F,
-    ) -> (Option<String>, NativeOperators)
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        let config = trusting(config);
-        let datafusion = datafusion_context(config.clone());
-        setup(&datafusion).await.unwrap();
-        let native = datafusion_context(config);
-        setup(&native).await.unwrap();
-
-        let expected = run_sql(&datafusion, sql).await;
-        let df = native.sql(sql).await.unwrap();
-        let ordered = has_top_level_order_by(df.logical_plan());
-        let plan = df.create_physical_plan().await.unwrap();
-        let operator = lower(&plan).unwrap();
-        let operators = NativeOperators::of(&operator);
-        let root = executable(operator, plan).unwrap();
-        let actual = collect(Arc::clone(&root), native.task_ctx())
-            .await
-            .map(|batches| EngineOutput {
-                plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
-                schema: root.schema(),
-                batches,
-                ordered,
-            });
-        let error = match (expected, actual) {
-            (Ok(expected), Ok(actual)) => {
-                if let Err(message) = compare_outputs(&expected, &actual) {
-                    panic!("Results differ: {message}\nquery: {sql}");
-                }
-                None
-            }
-            (Err(expected), Err(actual)) => {
-                assert_eq!(
-                    error_kind(&expected),
-                    error_kind(&actual),
-                    "Errors differ: {expected} vs {actual}\nquery: {sql}"
-                );
-                Some(expected.find_root().strip_backtrace())
-            }
-            (Ok(_), Err(actual)) => {
-                panic!("Only the native operators failed: {actual}\nquery: {sql}")
-            }
-            (Err(expected), Ok(_)) => {
-                panic!("Only DataFusion failed: {expected}\nquery: {sql}")
-            }
         };
         (error, operators)
     }
@@ -2157,6 +1575,221 @@ pub(crate) mod test_support {
     }
 
     /// Execute `plan` with DataFusion and lowered (see [`lower`]), each on a
+    /// task, and assert that it has native filters or projections, and that
+    /// their outcome is allowed: the same number of rows as DataFusion, or,
+    /// if either engine fails, an error that contains one of `errors`.
+    /// Returns the outcome of DataFusion.
+    ///
+    /// The native operators evaluate the expressions of DataFusion on their
+    /// chunks, not on DataFusion's batches: an expression whose errors depend
+    /// on the rows it is evaluated on together may fail in one engine and not
+    /// in the other, which `docs/compatibility.md` allows (behaviour that
+    /// depends on batch sizes); `errors` are the errors that the test expects
+    /// in either engine.
+    pub(crate) async fn assert_allowed_native_outcome(
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+        errors: &[&str],
+    ) -> std::result::Result<usize, String> {
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        assert!(
+            operators.filters + operators.projections > 0,
+            "no native filter or projection"
+        );
+        let lowered = executable(operator, Arc::clone(&plan)).unwrap();
+        let expected = outcome(plan, Arc::clone(&task_ctx)).await;
+        let actual = outcome(lowered, task_ctx).await;
+        assert_allowed_outcomes(
+            expected.as_ref().map(|_| ()).map_err(String::as_str),
+            actual.as_ref().map(|_| ()).map_err(String::as_str),
+            errors,
+        );
+        if let (Ok(expected), Ok(actual)) = (&expected, &actual) {
+            assert_eq!(actual, expected, "the numbers of rows differ");
+        }
+        expected
+    }
+
+    /// Assert that the outcomes of DataFusion (`expected`) and of the native
+    /// operators (`actual`) are allowed: both succeed, or the errors of those
+    /// that fail contain one of `errors`.
+    fn assert_allowed_outcomes(
+        expected: std::result::Result<(), &str>,
+        actual: std::result::Result<(), &str>,
+        errors: &[&str],
+    ) {
+        let allowed = |error: &str| errors.iter().any(|message| error.contains(message));
+        if let Err(error) = expected {
+            assert!(
+                allowed(error),
+                "DataFusion fails with {error}, expected one of {errors:?}"
+            );
+        }
+        if let Err(error) = actual {
+            assert!(
+                allowed(error),
+                "The native operators fail with {error}, expected one of {errors:?}"
+            );
+        }
+    }
+
+    /// The outcomes of a query or a plan with DataFusion and with its native
+    /// operators (see [`lower`]).
+    #[derive(Debug)]
+    pub(crate) struct NativeOutcome {
+        /// The error of DataFusion, if it fails.
+        pub(crate) datafusion: Option<String>,
+        /// The error of the native operators, if they fail.
+        pub(crate) native: Option<String>,
+        /// The native operators that were used.
+        pub(crate) operators: NativeOperators,
+    }
+
+    /// Execute `plan`, created by `make_plan`, with DataFusion and with its
+    /// native operators (see [`lower`]), in a session configured with
+    /// `config`, and assert that their outcomes are allowed (see
+    /// [`assert_allowed_native_outcome`]): byte-identical results (in the
+    /// same order if `ordered`) if both succeed, and otherwise errors that
+    /// contain one of `errors`.
+    pub(crate) async fn assert_allowed_native_plan_outcome_with_config(
+        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
+        ordered: bool,
+        config: SessionConfig,
+        errors: &[&str],
+    ) -> NativeOutcome {
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let plan = make_plan();
+        let expected =
+            collect(Arc::clone(&plan), Arc::clone(&task_ctx))
+                .await
+                .map(|batches| EngineOutput {
+                    schema: plan.schema(),
+                    batches,
+                    plan,
+                    ordered,
+                });
+        let plan = make_plan();
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        let root = executable(operator, plan).unwrap();
+        let actual =
+            collect(Arc::clone(&root), task_ctx)
+                .await
+                .map(|batches| EngineOutput {
+                    plan: Arc::clone(&root),
+                    schema: root.schema(),
+                    batches,
+                    ordered,
+                });
+        let message = |error: &DataFusionError| error.find_root().strip_backtrace();
+        let (expected_error, actual_error) = (
+            expected.as_ref().err().map(message),
+            actual.as_ref().err().map(message),
+        );
+        assert_allowed_outcomes(
+            expected_error.as_deref().map_or(Ok(()), Err),
+            actual_error.as_deref().map_or(Ok(()), Err),
+            errors,
+        );
+        if let (Ok(expected), Ok(actual)) = (&expected, &actual)
+            && let Err(message) = compare_outputs(expected, actual)
+        {
+            panic!("Results differ: {message}");
+        }
+        NativeOutcome {
+            datafusion: expected_error,
+            native: actual_error,
+            operators,
+        }
+    }
+
+    /// [`assert_allowed_native_plan_outcome_with_config`] on 4 threads.
+    pub(crate) async fn assert_allowed_native_plan_outcome(
+        make_plan: impl Fn() -> Arc<dyn ExecutionPlan>,
+        ordered: bool,
+        errors: &[&str],
+    ) -> NativeOutcome {
+        let config = SessionConfig::new().with_target_partitions(4);
+        assert_allowed_native_plan_outcome_with_config(make_plan, ordered, config, errors)
+            .await
+    }
+
+    /// [`assert_allowed_native_outcome_with_config`] with the configuration
+    /// of the tests.
+    pub(crate) async fn assert_allowed_native_outcome_with_setup<F>(
+        sql: &str,
+        setup: F,
+        errors: &[&str],
+    ) -> NativeOutcome
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        assert_allowed_native_outcome_with_config(
+            sql,
+            test_session_config(),
+            setup,
+            errors,
+        )
+        .await
+    }
+
+    /// Run `sql` with DataFusion and with its native operators (see
+    /// [`lower`]), in sessions configured with `config` and set up with
+    /// `setup`, and assert that their outcomes are allowed (see
+    /// [`assert_allowed_native_plan_outcome_with_config`]).
+    pub(crate) async fn assert_allowed_native_outcome_with_config<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+        errors: &[&str],
+    ) -> NativeOutcome
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let config = trusting(config);
+        let datafusion = datafusion_context(config.clone());
+        setup(&datafusion).await.unwrap();
+        let native = datafusion_context(config);
+        setup(&native).await.unwrap();
+        let expected = run_sql(&datafusion, sql).await;
+        let df = native.sql(sql).await.unwrap();
+        let ordered = has_top_level_order_by(df.logical_plan());
+        let plan = df.create_physical_plan().await.unwrap();
+        let operator = lower(&plan).unwrap();
+        let operators = NativeOperators::of(&operator);
+        let root = executable(operator, plan).unwrap();
+        let actual = collect(Arc::clone(&root), native.task_ctx())
+            .await
+            .map(|batches| EngineOutput {
+                plan: Arc::clone(&root) as Arc<dyn ExecutionPlan>,
+                schema: root.schema(),
+                batches,
+                ordered,
+            });
+        let message = |error: &DataFusionError| error.find_root().strip_backtrace();
+        let (expected_error, actual_error) = (
+            expected.as_ref().err().map(message),
+            actual.as_ref().err().map(message),
+        );
+        assert_allowed_outcomes(
+            expected_error.as_deref().map_or(Ok(()), Err),
+            actual_error.as_deref().map_or(Ok(()), Err),
+            errors,
+        );
+        if let (Ok(expected), Ok(actual)) = (&expected, &actual)
+            && let Err(message) = compare_outputs(expected, actual)
+        {
+            panic!("Results differ: {message}\nquery: {sql}");
+        }
+        NativeOutcome {
+            datafusion: expected_error,
+            native: actual_error,
+            operators,
+        }
+    }
+
+    /// Execute `plan` with DataFusion and lowered (see [`lower`]), each on a
     /// task, and assert that the outcomes are the same, with no native filter
     /// or projection.
     pub(crate) async fn assert_same_outcome_in_datafusion(
@@ -2455,8 +2088,8 @@ pub(crate) mod test_support {
 
     /// One partition of two batches of 2048 rows, `(x, s) = (0, "1")` then
     /// `(0, "invalid")`, projected by `x, CAST(s AS BIGINT) AS c, length(s) AS
-    /// l` (which stays in DataFusion: `length` is a function), and filtered by
-    /// `x >= 0` (whose `FilterExec` coalesces batches of 8192 rows).
+    /// l`, and filtered by `x >= 0` (whose `FilterExec` coalesces batches of
+    /// 8192 rows).
     pub(crate) fn filtered_casts() -> Arc<dyn ExecutionPlan> {
         let batches = [xss(&[((0, "1"), 2048)]), xss(&[((0, "invalid"), 2048)])];
         let schema = batches[0].schema();
@@ -3144,7 +2777,7 @@ pub(crate) mod test_support {
         (projections, filters)
     }
 
-    /// The tables of the error parity tests: [`register_all_tables`] and the
+    /// The tables of the tests of errors: [`register_all_tables`] and the
     /// guard tables `dense`, `sparse`, `nulls` and `nulls_ok`.
     pub(crate) async fn guard_tables(ctx: &SessionContext) -> Result<()> {
         register_all_tables(ctx)?;
@@ -3478,18 +3111,35 @@ mod tests {
         .unwrap()
     }
 
-    /// Filter `input` natively (in the thread state `lstate`) and with
-    /// DataFusion's `FilterExec` kernel, which evaluates the predicate on the
-    /// logical rows of `input`, and assert that both select the same rows or
-    /// both fail with the same error. Returns the error, if any.
-    fn assert_filter_parity(
+    /// The rows of `batch` that pass `predicate`, filtered conjunct by
+    /// conjunct with DataFusion's `FilterExec` kernel: every conjunct is
+    /// evaluated on the rows that the conjuncts before it select, as the
+    /// native filter evaluates the conjuncts that may fail (and the order of
+    /// the others makes no difference). Or the error of the first conjunct
+    /// that fails on these rows.
+    fn filtered_conjunct_by_conjunct(
+        predicate: &Arc<dyn PhysicalExpr>,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch> {
+        let mut batch = batch.clone();
+        for conjunct in datafusion_physical_expr::split_conjunction(predicate) {
+            batch = batch_filter(&batch, conjunct)?;
+        }
+        Ok(batch)
+    }
+
+    /// Filter `input` natively (in the thread state `lstate`) and conjunct by
+    /// conjunct with DataFusion's `FilterExec` kernel (see
+    /// [`filtered_conjunct_by_conjunct`]), and assert that both select the
+    /// same rows or both fail with the same error. Returns the error, if any.
+    fn assert_filters_conjunct_by_conjunct(
         filter: &PhysicalFilter,
         input: &DataChunk,
         gstate: &dyn GlobalOperatorState,
         lstate: &mut dyn OperatorState,
     ) -> Option<String> {
         let batch = input.compact().unwrap();
-        let expected = batch_filter(&batch, filter.predicate());
+        let expected = filtered_conjunct_by_conjunct(filter.predicate(), &batch);
         let actual = drive_with_states(filter, [input.clone()], gstate, lstate).map(
             |(outputs, _)| {
                 let outputs = outputs
@@ -3515,7 +3165,8 @@ mod tests {
                 Some(expected)
             }
             (expected, actual) => panic!(
-                "{}: DataFusion returned {expected:?}, the native filter {actual:?}",
+                "{}: filtering conjunct by conjunct returned {expected:?}, the native \
+                 filter {actual:?}",
                 filter.predicate()
             ),
         }
@@ -3534,12 +3185,13 @@ mod tests {
         .unwrap()
     }
 
-    /// Whether filtering `batch` with `predicate` fails, natively and in
-    /// DataFusion (both must agree).
+    /// Whether filtering `batch` with `predicate` fails, natively and conjunct
+    /// by conjunct (both must agree, see
+    /// [`assert_filters_conjunct_by_conjunct`]).
     fn fails(predicate: &str, batch: &RecordBatch) -> bool {
         let filter = filter_for(predicate, &batch.schema());
         let (gstate, mut lstate) = states(&filter);
-        assert_filter_parity(
+        assert_filters_conjunct_by_conjunct(
             &filter,
             &DataChunk::from(batch.clone()),
             gstate.as_ref(),
@@ -3549,86 +3201,90 @@ mod tests {
     }
 
     #[test]
-    fn dense_guards_fail_like_datafusion() {
+    fn guards_keep_conjuncts_that_may_fail_from_the_rows_they_reject() {
         let some = |values: &[i32]| values.iter().map(|&v| Some(v)).collect::<Vec<_>>();
-        // `x <> 0` leaves 3 of the 4 rows: DataFusion evaluates `10 / x` on
-        // all rows, including `x = 0`, and fails.
-        let batch = xy(some(&[0, 1, 1, 1]), some(&[1, 1, 1, 1]));
-        assert!(fails("x <> 0 AND 10 / x > 1", &batch));
-        // At most 20% of the rows left: only those are divided.
-        let batch = xy(some(&[0, 0, 0, 0, 2]), some(&[1; 5]));
-        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
-        let batch = xy(some(&[0, 0, 0, 0, 0, 0, 0, 2, 3, 0]), some(&[1; 10]));
-        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
-        let batch = xy(some(&[0, 0, 0, 0, 0, 0, 2, 3, 4, 0]), some(&[1; 10]));
-        assert!(fails("x <> 0 AND 10 / x > 1", &batch));
+        // Whatever the share of the rows that `x <> 0` leaves (DataFusion
+        // evaluates `10 / x` on all rows of a batch unless at most 20% of
+        // them are left), the native filter only divides the rows it leaves.
+        for batch in [
+            xy(some(&[0, 1, 1, 1]), some(&[1, 1, 1, 1])),
+            xy(some(&[0, 0, 0, 0, 2]), some(&[1; 5])),
+            xy(some(&[0, 0, 0, 0, 0, 0, 0, 2, 3, 0]), some(&[1; 10])),
+            xy(some(&[0, 0, 0, 0, 0, 0, 2, 3, 4, 0]), some(&[1; 10])),
+            // Everything rejected.
+            xy(some(&[0, 0, 0]), some(&[1, 1, 1])),
+        ] {
+            assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
+        }
         // A guard on another column.
         let batch = xy(some(&[0, 5, 0, 5, 5]), some(&[0, 1, 0, 1, 1]));
-        assert!(fails("y = 1 AND 10 / x > 1", &batch));
-        let batch = xy(some(&[0, 5, 0, 0, 0, 0]), some(&[0, 1, 0, 0, 0, 0]));
         assert!(!fails("y = 1 AND 10 / x > 1", &batch));
-        // Everything rejected: the division is not evaluated.
+        // The first conjunct is evaluated on all rows.
         let batch = xy(some(&[0, 0, 0]), some(&[1, 1, 1]));
-        assert!(!fails("x <> 0 AND 10 / x > 1", &batch));
-        // The first conjunct is always evaluated on all rows.
         assert!(fails("10 / x > 1 AND x <> 0", &batch));
     }
 
     #[test]
-    fn nullable_conjuncts_fail_like_datafusion() {
-        let mut x = vec![Some(0)];
-        x.extend([Some(-1); 9]);
+    fn null_rows_are_rejected_at_once() {
+        // `x > 0` is `NULL` for the first row, which can never be selected: it
+        // is rejected at once, and `10 / y` is not evaluated on it.
+        let mut x = vec![None];
+        x.extend([Some(1); 9]);
         let mut y = vec![Some(0)];
         y.extend([Some(5); 9]);
-        // `x > 0` is `NULL` for the first row, which is not selected but not
-        // rejected either: DataFusion evaluates `10 / y` on it and fails.
-        let mut nullable_x = x.clone();
-        nullable_x[0] = None;
-        assert!(fails(
-            "x > 0 AND 10 / y > 1",
-            &xy(nullable_x.clone(), y.clone())
-        ));
-        assert!(!fails("x > 0 AND 10 / y > 1", &xy(x, y.clone())));
-        // Only `NULL` rows left: they are evaluated too.
-        assert!(fails(
-            "x > 0 AND 10 / y > 1",
-            &xy(vec![None; 10], y.clone())
-        ));
+        assert!(!fails("x > 0 AND 10 / y > 1", &xy(x.clone(), y.clone())));
+        // Only `NULL` rows.
         assert!(!fails(
             "x > 0 AND 10 / y > 1",
-            &xy(vec![None; 10], vec![Some(5); 10])
+            &xy(vec![None; 10], vec![Some(0); 10])
         ));
-        // A `NULL` and a `false` row: the `NULL` row is evaluated.
-        let mut z = vec![None, Some(0)];
-        z.extend([Some(-1); 8]);
-        assert!(fails("x > 0 AND 10 / y > 1", &xy(z, y)));
+        // A `true` row is evaluated.
+        x[0] = Some(1);
+        assert!(fails("x > 0 AND 10 / y > 1", &xy(x, y)));
     }
 
     #[test]
-    fn chunks_with_a_selection_fail_like_their_rows() {
-        // DataFusion evaluates the predicate on the rows of the chunk: those
-        // of its selection.
+    fn chunks_with_a_selection_are_filtered_on_their_rows() {
+        // The filter evaluates the predicate on the rows of the chunk: those
+        // of its selection, which the guard `x <> 0` keeps from the division.
         let mut x = vec![Some(0); 100];
         x[90] = Some(1);
         x[95] = Some(2);
         let batch = xy(x, vec![Some(1); 100]);
         let filter = filter_for("x <> 0 AND 10 / x > 1", &batch.schema());
         let (gstate, mut lstate) = states(&filter);
-        for (selection, fail) in [
-            // 2 of 100 rows: no failure.
-            ((0..100).collect::<Vec<u32>>(), false),
-            // 2 of 4 rows: a failure.
-            (vec![89, 90, 94, 95], true),
-            // 2 of 10 rows: no failure.
-            ((86..96).collect(), false),
-            // 2 of 3 rows, not increasing.
-            (vec![95, 0, 90], true),
+        for selection in [
+            (0..100).collect::<Vec<u32>>(),
+            vec![89, 90, 94, 95],
+            (86..96).collect(),
+            // Not increasing.
+            vec![95, 0, 90],
         ] {
             let input = DataChunk::from(batch.clone())
                 .with_selection(SelectionVector::from(selection))
                 .unwrap();
-            let error =
-                assert_filter_parity(&filter, &input, gstate.as_ref(), lstate.as_mut());
+            let error = assert_filters_conjunct_by_conjunct(
+                &filter,
+                &input,
+                gstate.as_ref(),
+                lstate.as_mut(),
+            );
+            assert!(error.is_none(), "{input:?}");
+        }
+        // Without the guard, the division fails on a row of the selection
+        // only.
+        let filter = filter_for("10 / x > 1", &batch.schema());
+        let (gstate, mut lstate) = states(&filter);
+        for (selection, fail) in [(vec![90, 95], false), (vec![95, 0, 90], true)] {
+            let input = DataChunk::from(batch.clone())
+                .with_selection(SelectionVector::from(selection))
+                .unwrap();
+            let error = assert_filters_conjunct_by_conjunct(
+                &filter,
+                &input,
+                gstate.as_ref(),
+                lstate.as_mut(),
+            );
             assert_eq!(error.is_some(), fail, "{input:?}");
         }
     }
@@ -3637,7 +3293,7 @@ mod tests {
     fn adaptation_does_not_change_errors() {
         // The selective `y = 1` must not move before the division: after
         // warm-up chunks without `x = 0`, a chunk with `x = 0` and `y = 0`
-        // fails, as in DataFusion.
+        // fails, as the division is the first conjunct.
         let batch = |zeros: bool| {
             xy(
                 (0..2048)
@@ -3660,7 +3316,7 @@ mod tests {
         let chunks = super::super::adaptive_filter::WARMUP_CHUNKS
             + super::super::adaptive_filter::ADAPT_INTERVAL;
         for _ in 0..chunks {
-            let error = assert_filter_parity(
+            let error = assert_filters_conjunct_by_conjunct(
                 &filter,
                 &DataChunk::from(batch(false)),
                 gstate.as_ref(),
@@ -3676,7 +3332,7 @@ mod tests {
             .to_vec();
         // The division stays first; `y = 1` moved before `x > 0`.
         assert_eq!(permutation, vec![0, 1, 2]);
-        let error = assert_filter_parity(
+        let error = assert_filters_conjunct_by_conjunct(
             &filter,
             &DataChunk::from(batch(true)),
             gstate.as_ref(),
@@ -3699,7 +3355,7 @@ mod tests {
     }
 
     #[test]
-    fn errors_match_datafusion_on_random_chunks() {
+    fn results_and_errors_are_those_of_filtering_conjunct_by_conjunct() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int32, true),
             Field::new("y", DataType::Int32, true),
@@ -3748,24 +3404,29 @@ mod tests {
                 chunk
             })
             .collect::<Vec<_>>();
-        for predicate in [
-            "x <> 0 AND 10 / x > 1",
-            "y > 2 AND 10 / x > 1",
-            "10 / x > 1 AND y = 1",
-            "y = 1 AND z > 3 AND 10 / x > 1 AND y < 5",
-            "x IS NOT NULL AND y > 0 AND 100 % x = 1 AND z <> 4",
-            "(x = 0 OR 10 / x > 2) AND y > 1",
-            "y <> 0 AND 10 / y > 1 AND x <> 0 AND 10 / x > 1",
-            "x > 0 AND z > 2 AND 10 / (x - 1) > 1",
-            "CASE WHEN x <> 0 THEN 10 / x > 1 ELSE false END AND y > 0",
-            "x > 0 AND y > 0 AND z > 0",
+        // The predicates, and whether they fail on some chunks: guarded
+        // divisions never do.
+        for (predicate, can_fail) in [
+            ("x <> 0 AND 10 / x > 1", false),
+            ("y > 2 AND 10 / x > 1", true),
+            ("10 / x > 1 AND y = 1", true),
+            ("y = 1 AND z > 3 AND 10 / x > 1 AND y < 5", true),
+            ("x IS NOT NULL AND y > 0 AND 100 % x = 1 AND z <> 4", true),
+            ("(x = 0 OR 10 / x > 2) AND y > 1", true),
+            ("y <> 0 AND 10 / y > 1 AND x <> 0 AND 10 / x > 1", false),
+            ("x > 0 AND z > 2 AND 10 / (x - 1) > 1", true),
+            (
+                "CASE WHEN x <> 0 THEN 10 / x > 1 ELSE false END AND y > 0",
+                false,
+            ),
+            ("x > 0 AND y > 0 AND z > 0", false),
         ] {
             let filter = filter_for(predicate, &schema);
             let (gstate, mut lstate) = states(&filter);
             let mut errors = 0;
             let mut rows = 0;
             for chunk in &chunks {
-                match assert_filter_parity(
+                match assert_filters_conjunct_by_conjunct(
                     &filter,
                     chunk,
                     gstate.as_ref(),
@@ -3775,11 +3436,7 @@ mod tests {
                     None => rows += 1,
                 }
             }
-            // Both outcomes are covered (`CASE` guards its division, and the
-            // last predicate cannot fail).
             assert!(rows > 0, "{predicate}");
-            let can_fail =
-                !predicate.starts_with("CASE") && !predicate.ends_with("z > 0");
             assert_eq!(errors > 0, can_fail, "{predicate}");
         }
     }
@@ -3915,17 +3572,6 @@ mod tests {
     }
 
     #[test]
-    fn errors_depend_on_batches_after_the_first_conjunct_and_in_or() {
-        // The first conjunct is evaluated on all rows, whatever the batches.
-        assert!(!new_filter("a > 0 AND b > 0", None).errors_depend_on_batches());
-        assert!(!new_filter("10 / a > 1 AND b > 0", None).errors_depend_on_batches());
-        assert!(new_filter("a > 0 AND 10 / a > 1", None).errors_depend_on_batches());
-        // The right side of an `OR`, also on its own.
-        assert!(new_filter("a = 0 OR 10 / a > 1", None).errors_depend_on_batches());
-        assert!(!new_filter("10 / a > 1 OR a = 0", None).errors_depend_on_batches());
-    }
-
-    #[test]
     fn rejects_non_boolean_predicates() {
         let schema = schema();
         let err = PhysicalFilter::try_new(
@@ -4004,15 +3650,6 @@ mod tests {
         }
     }
 
-    /// Like [`assert_all_native_byte_eq`], for queries whose filters must stay
-    /// in DataFusion, because their errors may depend on DataFusion's batches.
-    async fn assert_all_byte_eq_in_datafusion(queries: &[&str]) {
-        for sql in queries {
-            let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
-            assert_eq!(run.operators.filters, 0, "native filter: {sql}");
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_selective_filters() {
         assert_all_native_byte_eq(&[
@@ -4031,17 +3668,12 @@ mod tests {
             "SELECT * EXCLUDE (name) FROM t2 WHERE k > 0",
         ])
         .await;
-        // `isnan` is a function, which may fail (as far as the filter knows)
-        // on the rows that DataFusion decides per batch to evaluate the right
-        // side of `OR` on.
-        assert_all_byte_eq_in_datafusion(&[
+        // Functions, e.g. `isnan`, on the rows that DataFusion decides per
+        // batch to evaluate the right side of `OR` on, and strings with 32-bit
+        // offsets, which `FilterExec` may fail to concatenate as it coalesces
+        // its output (`d` and `name` are `Utf8`).
+        assert_all_native_byte_eq(&[
             "SELECT id, c FROM t1 WHERE c IS NULL OR c = 0.0 OR isnan(c)",
-        ])
-        .await;
-        // `FilterExec` concatenates the strings of the batches it coalesces,
-        // whose 32-bit offsets may overflow (`d` and `name` are `Utf8`, `h`
-        // `Utf8View`): filters that output them stay in DataFusion.
-        assert_all_byte_eq_in_datafusion(&[
             "SELECT * FROM t1 WHERE a > 10",
             "SELECT id, d FROM t1 WHERE a > 40 OR d = 'gamma'",
             "SELECT * FROM t2 WHERE k > 0",
@@ -4064,7 +3696,7 @@ mod tests {
         .await;
         // A function after the first conjunct (DataFusion's optimizer moves
         // function calls after the cheap conjuncts).
-        assert_all_byte_eq_in_datafusion(&[
+        assert_all_native_byte_eq(&[
             "SELECT id FROM t1 WHERE b % 7 = 1 AND a + b > 100 AND upper(d) = 'ALPHA'",
             "SELECT id FROM t1 WHERE upper(d) = 'ALPHA' AND b % 7 = 1 AND a + b > 100",
         ])
@@ -4080,29 +3712,22 @@ mod tests {
             "SELECT id, x FROM fallible WHERE 10 / (x + 100) < 1 AND x <> 0",
         ])
         .await;
-        // Functions are opaque: whatever they return, they may fail depending
-        // on how many rows they are evaluated on together (e.g. DataFusion
-        // limits the sizes of the strings of `repeat` per batch). But for the
-        // built-in functions whose implementations are known, e.g. `length`,
-        // which cannot fail, and `upper` of views (its strings of 32-bit
-        // offsets may overflow on a batch, not on a chunk).
+        // Functions, whatever they may fail with (e.g. DataFusion limits the
+        // sizes of the strings of `repeat` per batch).
         assert_all_native_byte_eq(&[
             "SELECT id, x FROM fallible WHERE length(s) <> 3",
             "SELECT id, x FROM fallible WHERE length(s) <> 3 AND s LIKE '%1%'",
             "SELECT id, x FROM fallible WHERE s LIKE '%1%' AND length(s) <> 3",
             "SELECT id, x FROM fallible WHERE upper(arrow_cast(s, 'Utf8View')) <> 'N/A 7'",
-        ])
-        .await;
-        assert_all_byte_eq_in_datafusion(&[
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X'",
             "SELECT id, x FROM fallible WHERE upper(s) <> 'X' AND s LIKE '%1%'",
             "SELECT id, x FROM fallible WHERE repeat(s, 2) <> 'X'",
         ])
         .await;
-        // DataFusion divides only the rows with `x <> 0` because, in each
-        // batch, at most 20% of the rows are left: such guards depend on the
-        // batches, so the filters stay in DataFusion.
-        assert_all_byte_eq_in_datafusion(&[
+        // Guards: DataFusion divides only the rows with `x <> 0` because, in
+        // each batch, at most 20% of the rows are left; the native filter
+        // only divides them in any case.
+        assert_all_native_byte_eq(&[
             "SELECT id, x FROM fallible WHERE x <> 0 AND 10 / x > 1",
             "SELECT id, x FROM fallible WHERE x <> 0 AND 10 / x > 1 AND id % 2 = 0",
             "SELECT id FROM fallible WHERE x <> 0 AND 100 % x = 0",
@@ -4115,21 +3740,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn differential_errors_match_datafusion() {
-        // Whether a native filter is used, and whether the query fails (in
-        // both engines).
-        for (sql, native, fails) in [
+    async fn differential_errors_of_native_filters() {
+        // Whether DataFusion fails, and whether the native filter fails: it
+        // only evaluates a conjunct that may fail on the rows that the
+        // conjuncts before it select, whatever the share of them that are
+        // left, and rejects the rows for which a conjunct is `NULL` at once.
+        // DataFusion evaluates the conjuncts after the first one on all rows
+        // of a batch unless at most 20% of them are left, and does not reject
+        // `NULL` rows. All filters are native.
+        for (sql, datafusion_fails, native_fails) in [
             // Dense guards: DataFusion divides all rows, including `x = 0`.
-            // Guards depend on the batches: the filters stay in DataFusion.
             (
                 "SELECT * FROM dense WHERE x <> 0 AND 10 / x > 1",
-                false,
                 true,
+                false,
             ),
             (
                 "SELECT id FROM dense WHERE x > 0 AND x < 100 AND 100 % x = 1",
-                false,
                 true,
+                false,
             ),
             // A selective conjunct after the division does not guard it, even
             // once the conjuncts are reordered at runtime.
@@ -4146,19 +3775,20 @@ mod tests {
             ),
             (
                 "SELECT id, 10 / x AS q FROM sparse WHERE x <> 0",
-                true,
+                false,
                 false,
             ),
             (
                 "SELECT id, 10 / x AS q FROM dense WHERE x <> 0",
-                true,
+                false,
                 false,
             ),
-            // `NULL` rows are not rejected: the division is evaluated on them.
+            // `NULL` rows: DataFusion divides them, the native filter rejects
+            // them first.
             (
                 "SELECT * FROM nulls WHERE a > 0 AND 10 / b > 1",
-                false,
                 true,
+                false,
             ),
             (
                 "SELECT * FROM nulls_ok WHERE a > 0 AND 10 / b > 1",
@@ -4167,7 +3797,7 @@ mod tests {
             ),
             (
                 "SELECT * FROM nulls WHERE a IS NULL AND 10 / b > 1",
-                false,
+                true,
                 true,
             ),
             // No guard.
@@ -4188,10 +3818,20 @@ mod tests {
                 false,
             ),
         ] {
-            let (error, operators) =
-                assert_native_parity_with_setup(sql, guard_tables).await;
-            assert_eq!(operators.filters > 0, native, "{sql}");
-            assert_eq!(error.is_some(), fails, "{sql}: {error:?}");
+            let outcome = assert_allowed_native_outcome_with_config(
+                sql,
+                test_session_config(),
+                guard_tables,
+                &["Divide by zero", "Cannot cast string"],
+            )
+            .await;
+            assert!(outcome.operators.filters > 0, "{sql}");
+            assert_eq!(
+                outcome.datafusion.is_some(),
+                datafusion_fails,
+                "{sql}: {outcome:?}"
+            );
+            assert_eq!(outcome.native.is_some(), native_fails, "{sql}: {outcome:?}");
         }
     }
 
@@ -4208,10 +3848,10 @@ mod tests {
             "SELECT i, sv FROM vd WHERE d8 = 'x5' AND d32 IS NOT NULL",
         ])
         .await;
-        // `FilterExec` coalesces its output, merging the dictionaries of `d8`
-        // (`Int8` keys), which may fail, or concatenating strings (also the
-        // values of dictionaries), whose 32-bit offsets may overflow.
-        assert_all_byte_eq_in_datafusion(&[
+        // Also with dictionaries of narrow keys (`d8`, `Int8` keys) and strings
+        // in the output, which `FilterExec` merges and concatenates as it
+        // coalesces its output (which may fail).
+        assert_all_native_byte_eq(&[
             "SELECT * FROM vd WHERE d32 = 'k3'",
             "SELECT d32, i FROM vd WHERE d32 = 'k3'",
             "SELECT i, d8, sv FROM vd WHERE sv LIKE '%7%' AND d8 <> 'x2'",
@@ -4236,15 +3876,14 @@ mod tests {
         ])
         .await;
         // The limit is pushed into the filter (`fetch = 7`), which is lowered:
-        // with a fetch, it runs on one thread, and pulls its input like
-        // `FilterExec`. Below it, the merge of the sorted partitions, which
-        // stops early, stays in DataFusion with its input (see
-        // `plans_below_limits_stay_in_datafusion`).
+        // with a fetch, it runs on one thread. Below it, the merge of the
+        // sorted partitions (which `lower` does not lower) is executed by
+        // DataFusion, with its input lowered.
         let sql = "SELECT * FROM (SELECT id, a FROM t1 ORDER BY id LIMIT 500) WHERE a > 0 LIMIT 7";
         let run = assert_native_byte_eq_with_setup(sql, all_tables).await;
         assert_eq!(
             (run.operators.filters, run.operators.scans),
-            (1, 0),
+            (1, 1),
             "{sql}"
         );
     }
@@ -4280,13 +3919,13 @@ mod tests {
             assert!(run.operators.filters > 0, "no native filter: {sql}");
             assert!(run.operators.scans > 0, "no native scan: {sql}");
         }
-        // But not with a cast that may fail with another error than an
-        // overflow: `CAST(l_quantity * 1000 AS DECIMAL(38, 6))` of a
-        // `DECIMAL(36, 2)` may overflow its precision.
+        // Also with a cast that may fail with another error than an overflow:
+        // `CAST(l_quantity * 1000 AS DECIMAL(38, 6))` of a `DECIMAL(36, 2)`
+        // may overflow its precision.
         let sql = "SELECT l_orderkey FROM lineitem \
                    WHERE l_extendedprice * (1 - l_discount) * (1 + l_tax) < l_quantity * 1000";
         let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
-        assert_eq!(run.operators.filters, 0, "{sql}");
+        assert_eq!(run.operators.filters, 1, "{sql}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4345,21 +3984,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn operators_that_only_overflow_share_pipelines() {
-        // Parts of a projection and of a filter below it that may only fail
-        // with arithmetic overflows raise the same error, whichever comes
-        // first: both are native.
-        let sql = "SELECT l_extendedprice * (1 - l_discount) AS v FROM lineitem \
-                   WHERE l_extendedprice * l_tax > 10.00";
-        let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
-        assert_eq!((run.operators.projections, run.operators.filters), (1, 1));
-        // But a part that may fail otherwise (a division) above them: the
-        // filter stays in DataFusion, with its input (see
-        // `projections_above_filters_between_failures_keep_their_errors`).
-        let sql = "SELECT 10 / (l_orderkey + 1) AS q FROM lineitem \
-                   WHERE l_extendedprice * l_tax > 10.00";
-        let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
-        assert_eq!((run.operators.projections, run.operators.filters), (1, 0));
+    async fn operators_that_may_fail_share_pipelines() {
+        // Parts of a projection and of a filter below it that may fail, with
+        // arithmetic overflows or with other errors (a division), are native.
+        for sql in [
+            "SELECT l_extendedprice * (1 - l_discount) AS v FROM lineitem \
+             WHERE l_extendedprice * l_tax > 10.00",
+            "SELECT 10 / (l_orderkey + 1) AS q FROM lineitem \
+             WHERE l_extendedprice * l_tax > 10.00",
+        ] {
+            let run = assert_native_byte_eq_with_setup(sql, tpch_tables).await;
+            assert_eq!((run.operators.projections, run.operators.filters), (1, 1));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4456,7 +4092,10 @@ mod tests {
         assert_eq!(rows, 3);
 
         // In SQL, a limit above the filter enforces the fetch over all
-        // partitions: the filter stays in DataFusion, with the same result.
+        // partitions: with the lowering of the tests, which lowers no limit,
+        // the filter stays in DataFusion, with the same result. (The
+        // `PipelineQueryPlanner` lowers the limit, and the filter without its
+        // fetch, see `PhysicalLimit::try_lower`.)
         for sql in [
             "SELECT id FROM t1 WHERE id < 5 LIMIT 100",
             "SELECT id, a FROM t1 WHERE a > 1000 LIMIT 10",
@@ -4500,35 +4139,8 @@ mod tests {
         )
     }
 
-    /// [`filter_exec`] without a fetch, whose output drops the columns of its
-    /// input that `FilterExec` may fail to coalesce (e.g. strings): it is
-    /// lowered if its predicate can be.
-    fn filter_exec_without_strings(
-        predicate: &str,
-        input: Arc<dyn ExecutionPlan>,
-    ) -> Arc<dyn ExecutionPlan> {
-        let schema = input.schema();
-        let projection = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, field)| !may_fail_to_coalesce(field.data_type()))
-            .map(|(index, _)| index)
-            .collect();
-        Arc::new(
-            datafusion_physical_plan::filter::FilterExecBuilder::new(
-                physical_expr(predicate, &schema),
-                input,
-            )
-            .apply_projection(Some(projection))
-            .unwrap()
-            .build()
-            .unwrap(),
-        )
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cases_of_unions_stay_in_datafusion() {
+    async fn cases_of_unions_are_native() {
         // On the batch of `FilterExec`, `CASE` merges the unions of the rows
         // with `b` with nulls for the others, and fails: their union has no
         // nullable field. On the chunks of the native filter, all rows take
@@ -4544,10 +4156,13 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Cannot extend a union with no nullable fields with nulls"],
+        )
+        .await;
         assert!(
             outcome.as_ref().is_err_and(|error| error
                 .contains("Cannot extend a union with no nullable fields with nulls")),
@@ -4556,26 +4171,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_between_failures_stay_in_datafusion() {
+    async fn filters_between_failures_are_native() {
         // `FilterExec(x >= 0)` coalesces its output: it pulls both batches of
         // its input, and the cast of the second one fails, before the filter
         // above it divides by zero the rows of the first one. The native
         // filter passes the rows of the first chunk on at once, and the native
-        // filter above it divides them by zero first.
+        // filter above it may divide them by zero first: which of several
+        // errors is raised is the engine's own.
         let plan = || filter_exec("10 / x + c + l > 0", filtered_casts(), None);
         let config =
             || datafusion::prelude::SessionConfig::new().with_target_partitions(1);
-        let (error, operators) =
-            assert_native_plan_parity_with_config(plan, false, config()).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
+            plan,
+            false,
+            config(),
+            &["Cannot cast string 'invalid'", "Divide by zero"],
+        )
+        .await;
         let error = error.unwrap();
         assert!(error.contains("Cannot cast string 'invalid'"), "{error}");
-        // The filter below stays in DataFusion, with its input; the one above
-        // is lowered.
-        assert_eq!(operators.filters, 1);
+        // Both filters are native.
+        assert_eq!(operators.filters, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn matches_of_patterns_that_may_be_scalars_stay_in_datafusion() {
+    async fn matches_of_patterns_that_may_be_scalars_are_native() {
         // On the batch of `FilterExec`, `CASE` returns an array of patterns,
         // which Arrow compiles, and the pattern of 100000 `s` (each `[sSſ]`)
         // is too big. On the first chunk of the native filter, all rows take
@@ -4591,15 +4215,25 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
         // A pattern that is a column is always an array.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter_exec("s ILIKE p", scan(&batch), None),
             false,
+            &["Unable to build regex"],
         )
         .await;
         assert!(error.is_none(), "{error:?}");
@@ -4607,7 +4241,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn negations_of_values_that_may_be_scalars_stay_in_datafusion() {
+    async fn negations_of_values_that_may_be_scalars_are_native() {
         // On the batch of `FilterExec`, `CASE` returns an array, which `-`
         // negates wrapping: `-(-9223372036854775808)` is
         // `-9223372036854775808`. On the first chunk of the native filter,
@@ -4628,14 +4262,24 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Arithmetic overflow"])
+            .await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
         // The negation of a column is always that of an array.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter_exec("-y < 0", scan(&batch), None),
             false,
+            &["Arithmetic overflow"],
         )
         .await;
         assert!(error.is_none(), "{error:?}");
@@ -4643,7 +4287,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_stay_in_datafusion() {
+    async fn functions_are_native() {
         let _large = one_large_test_at_a_time().await;
         // A function is opaque: whatever it returns, its implementation may
         // fail depending on the rows it is evaluated on together. Here
@@ -4674,10 +4318,13 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Offset overflow error"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -4687,19 +4334,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concatenations_of_strings_stay_in_datafusion() {
+    async fn concatenations_of_strings_are_native() {
         let _large = one_large_test_at_a_time().await;
         // `s || s` builds 2 GiB of strings on the batch of 8192 rows of
         // `FilterExec`, whose 32-bit offsets overflow, but 512 MiB on the
         // chunks of the native filter (whose output drops `s`).
         let batch = large_strings();
-        let plan = || filter_exec_without_strings("(s || s) IS NOT NULL", scan(&batch));
+        let plan = || filter_exec("(s || s) IS NOT NULL", scan(&batch), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Offset overflow error"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -4709,7 +4359,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn functions_building_values_of_variable_lengths_stay_in_datafusion() {
+    async fn functions_building_values_of_variable_lengths_are_native() {
         // DataFusion checks the size of the strings that `repeat` builds on a
         // batch (also with 64-bit offsets): 4 GiB on the batch of 8192 rows of
         // `FilterExec`, more than it allows, but 1 GiB on the chunks of the
@@ -4720,23 +4370,28 @@ mod tests {
         let plan = || filter_exec("repeat(s, n) IS NOT NULL", scan(&batch), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["string size overflow on repeat"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
                 .is_err_and(|error| error.contains("string size overflow on repeat")),
             "{outcome:?}"
         );
-        // Nor is one that returns values of fixed widths lowered: its
-        // implementation may build anything (see `functions_stay_in_datafusion`),
-        // but for the built-in functions whose implementations are known, e.g.
-        // `abs`, which fails on the smallest integer of a row, if at all.
-        let (error, operators) = assert_native_plan_parity(
-            || filter_exec_without_strings("abs(n) > 0", scan(&batch)),
+        // So is one that returns values of fixed widths, e.g. `abs`.
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            || filter_exec("abs(n) > 0", scan(&batch), None),
             false,
+            &["string size overflow on repeat"],
         )
         .await;
         assert!(error.is_none(), "{error:?}");
@@ -4744,11 +4399,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn dynamic_predicates_stay_in_datafusion() {
+    async fn dynamic_predicates_are_native() {
         // The children of a `DynamicFilterPhysicalExpr` are the columns it
         // reads, not the predicate it evaluates, which may change during the
         // execution: here `x <> 0 AND 10 / x > 1`, whose errors depend on the
-        // batches (see `batch_dependent_predicates_stay_in_datafusion`),
+        // batches (see `batch_dependent_predicates_are_native`),
         // alone, or in another predicate.
         let batch = runs(&[(0, 1848), (1, 2248)]);
         let schema = batch.schema();
@@ -4767,20 +4422,25 @@ mod tests {
             };
             let filter_plan = plan();
             let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, false, &["Divide by zero"])
+                .await;
             assert!(
                 error
                     .as_ref()
                     .is_some_and(|error| error.contains("Divide by zero")),
                 "{predicate}: {error:?}"
             );
-            assert_eq!(operators.filters, 0, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn batch_dependent_predicates_stay_in_datafusion() {
+    async fn batch_dependent_predicates_are_native() {
         // One batch of 4096 rows, 1848 zeros then 2248 ones. Split into two
         // chunks, 90% of the rows of the first chunk are zeros, but only 45%
         // of the batch: DataFusion divides all rows by `x` and fails.
@@ -4788,35 +4448,37 @@ mod tests {
         for predicate in ["x <> 0 AND 10 / x > 1", "x = 0 OR 10 / x > 1"] {
             let plan = filter_exec(predicate, scan(&batch), None);
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let err =
-                PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
-                    .unwrap_err();
-            assert!(
-                err.to_string().contains("depend on DataFusion's batches"),
-                "{err}"
-            );
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
 
-            let (error, operators) = assert_native_plan_parity(
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter_exec(predicate, scan(&batch), None),
                 false,
+                &["Divide by zero"],
             )
             .await;
             assert!(error.unwrap().contains("Divide by zero"), "{predicate}");
-            assert_eq!(operators.filters, 0, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
 
             // On the chunks of the pipeline, the predicate does not fail.
             let filter = filter_for(predicate, &batch.schema());
-            assert!(filter.errors_depend_on_batches());
             let chunks =
                 [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
             assert!(drive(&filter, chunks).is_ok(), "{predicate}");
         }
         // Predicates whose errors do not depend on the batches are lowered.
         for (predicate, fails) in [("10 / x > 1 AND x <> 0", true), ("x <> 0", false)] {
-            let (error, operators) = assert_native_plan_parity(
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter_exec(predicate, scan(&batch), None),
                 false,
+                &["Divide by zero"],
             )
             .await;
             assert_eq!(error.is_some(), fails, "{predicate}");
@@ -4867,14 +4529,18 @@ mod tests {
                     .unwrap(),
                 )
             };
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, false, &[]).await;
             assert!(error.is_none(), "{predicate}: {error:?}");
-            assert_eq!(operators.filters, 0, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion() {
+    async fn case_insensitive_patterns_that_fail_on_unicode_are_native() {
         // One batch of 4096 rows, `(x, s) = (1, "a")` then `(0, "é")`. On
         // strings that are all ASCII, Arrow matches an ASCII `ILIKE` pattern
         // without wildcards without a regular expression; on others, it
@@ -4887,21 +4553,30 @@ mod tests {
         let plan = || filter_exec(&predicate, scan(&batch), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
         // On the chunks of the pipeline, the predicate does not fail.
         let filter = filter_for(&predicate, &batch.schema());
-        assert!(filter.errors_depend_on_batches());
         let chunks = [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
         assert!(drive(&filter, chunks).is_ok());
         // Patterns that compile are lowered (without strings in the output).
         for predicate in ["x > 0 AND s ILIKE 'A%'", "x > 0 AND s NOT ILIKE '%É'"] {
-            let (error, operators) = assert_native_plan_parity(
-                || filter_exec_without_strings(predicate, scan(&batch)),
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                || filter_exec(predicate, scan(&batch), None),
                 false,
+                &["Unable to build regex"],
             )
             .await;
             assert!(error.is_none(), "{predicate}");
@@ -4939,20 +4614,24 @@ mod tests {
             let expr = predicate(count_calls(&calls, &schema));
             let plan = filter(Arc::clone(&expr));
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{expr}");
-            assert!(depends_on_batches(&expr, &schema), "{expr}");
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{expr}");
             let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
             AdaptiveFilter::try_new(&expr, &schema).unwrap();
             lower(&plan).unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{expr}");
 
-            let (error, operators) = assert_native_plan_parity(
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter(predicate(count_calls(&Arc::default(), &schema))),
                 false,
+                &[],
             )
             .await;
             assert!(error.is_none(), "{expr}");
-            assert_eq!(operators.filters, 0, "{expr}");
+            assert_eq!(operators.filters, 1, "{expr}");
         }
     }
 
@@ -4971,20 +4650,23 @@ mod tests {
         };
         let plan = filter(Arc::clone(&expr));
         let exec = plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        assert!(depends_on_batches(&expr, &schema));
+        assert!(PhysicalFilter::supports_filter_exec(exec));
         let _ = crate::operators::adaptive_filter::fallibility(&expr, &schema);
-        let _ = crate::operators::adaptive_filter::failures(&expr, &schema);
         lower(&plan).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         // DataFusion selects all rows, natively too.
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter(dynamic_first_call(&Arc::default(), &schema)),
             false,
+            &[],
         )
         .await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
         let outcome = outcome(
             filter(dynamic_first_call(&Arc::default(), &schema)),
             Arc::new(TaskContext::default()),
@@ -4994,7 +4676,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn case_insensitive_patterns_on_bytes_beneath_nulls_stay_in_datafusion() {
+    async fn case_insensitive_patterns_on_bytes_beneath_nulls_are_native() {
         // `x = 0` selects every other row, the first one too, whose string is
         // null above bytes that are not ASCII. DataFusion's `filter` keeps
         // these bytes: Arrow finds that the strings are not all ASCII and
@@ -5008,11 +4690,16 @@ mod tests {
             || filter_exec(&predicate, filter_exec("x = 0", scan(&batch), None), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Unable to build regex"])
+            .await;
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 2);
         let selected = DataChunk::from(batch.clone())
             .with_selection(SelectionVector::from(
                 (0..2048).step_by(2).collect::<Vec<_>>(),
@@ -5022,7 +4709,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fetch_with_comparisons_that_arrow_cannot_evaluate_stays_in_datafusion() {
+    async fn fetch_with_comparisons_that_arrow_cannot_evaluate_is_native() {
         // Arrow cannot compare dictionaries of dictionaries. With `fetch = 0`,
         // `FilterExec` evaluates its predicate on the first batch, and fails.
         let batch = nested_dictionaries();
@@ -5046,33 +4733,47 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            plan,
+            true,
+            &["Invalid comparison operation"],
+        )
+        .await;
         let error = error.unwrap();
         assert!(error.contains("Invalid comparison operation"), "{error}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fetch_with_case_insensitive_patterns_stays_in_datafusion() {
+    async fn fetch_with_case_insensitive_patterns_is_native() {
         // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
         // batch, whose strings are not all ASCII: Arrow compiles the pattern of
         // `ILIKE`, which is too big, and fails (see
-        // `case_insensitive_patterns_that_fail_on_unicode_stay_in_datafusion`).
+        // `case_insensitive_patterns_that_fail_on_unicode_are_native`).
         let batch = xss(&[((1, "a"), 2048), ((0, "é"), 2048)]);
         let predicate = format!("s ILIKE '{}'", "s".repeat(100_000));
         let plan = || filter_exec(&predicate, scan(&batch), Some(0));
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, true, &["Unable to build regex"])
+            .await;
         let error = error.unwrap();
         assert!(error.contains("Unable to build regex"), "{error}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_of_strings_in_shared_buffers_stay_in_datafusion() {
+    async fn filters_of_strings_in_shared_buffers_are_native() {
         let _large = one_large_test_at_a_time().await;
         // `FilterExec` concatenates the strings of the batches it coalesces
         // into batches of 8192 rows, whose 32-bit offsets overflow beyond
@@ -5092,10 +4793,13 @@ mod tests {
         let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Offset overflow error"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -5105,8 +4809,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_of_dictionaries_of_values_that_arrow_does_not_merge_stay_in_datafusion()
-     {
+    async fn filters_of_dictionaries_of_values_that_arrow_does_not_merge_are_native() {
         let _large = one_large_test_at_a_time().await;
         // `FilterExec` concatenates the dictionaries of the batches it
         // coalesces: Arrow merges those of strings, binaries and primitive
@@ -5137,10 +4840,13 @@ mod tests {
         let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Dictionary key bigger than the key type"],
+        )
+        .await;
         assert!(
             outcome.as_ref().is_err_and(
                 |error| error.contains("Dictionary key bigger than the key type")
@@ -5150,7 +4856,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_of_dictionaries_of_values_without_memory_stay_in_datafusion() {
+    async fn filters_of_dictionaries_of_values_without_memory_are_native() {
         // `FilterExec` concatenates the dictionaries of the batches it
         // coalesces: Arrow cannot merge dictionaries of nulls, which take no
         // memory, so it adds up their values, here `(1 << 31) + 1`, more than
@@ -5173,10 +4879,13 @@ mod tests {
         let plan = || filter_exec("x > 0", scan_batches(&schema, &batches), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Dictionary key bigger than the key type"],
+        )
+        .await;
         assert!(
             outcome.as_ref().is_err_and(
                 |error| error.contains("Dictionary key bigger than the key type")
@@ -5186,7 +4895,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_whose_output_dictionaries_may_overflow_stay_in_datafusion() {
+    async fn filters_whose_output_dictionaries_may_overflow_are_native() {
         // One partition of two batches of 100 rows, with 100 distinct values
         // each, in dictionaries with `Int8` keys. `FilterExec` coalesces them
         // into one batch, and merging their 200 values overflows the keys.
@@ -5198,15 +4907,20 @@ mod tests {
         let plan = || filter_exec(predicate, scan_batches(&schema, &batches), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let err =
-            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
-                .unwrap_err();
-        assert!(err.to_string().contains("dictionaries"), "{err}");
+        assert!(PhysicalFilter::supports_filter_exec(exec));
         let overflow = "Dictionary key bigger than the key type";
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            plan,
+            false,
+            &["Dictionary key bigger than the key type"],
+        )
+        .await;
         assert!(error.unwrap().contains(overflow));
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
         let filter = filter_for(predicate, &schema);
         assert!(drive(&filter, batches.iter().cloned().map(DataChunk::from)).is_ok());
 
@@ -5215,14 +4929,19 @@ mod tests {
         let setup = async |ctx: &datafusion::prelude::SessionContext| {
             register_partitions(ctx, "narrow", vec![batches.clone()])
         };
-        let (error, operators) = assert_native_parity_with_config(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_outcome_with_config(
             "SELECT * FROM narrow WHERE d <> 'missing'",
             test_session_config().with_target_partitions(1),
             setup,
+            &["Dictionary key bigger than the key type"],
         )
         .await;
         assert!(error.unwrap().contains(overflow));
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
 
         // Without the dictionaries in its output, or with keys of 32 bits,
         // which can index the values of any batch (of strings with 64-bit
@@ -5239,7 +4958,16 @@ mod tests {
                 .unwrap(),
             )
         };
-        let (error, operators) = assert_native_plan_parity(projected, false).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            projected,
+            false,
+            &["Dictionary key bigger than the key type"],
+        )
+        .await;
         assert!(error.is_none());
         assert_eq!(operators.filters, 1);
         let large = DataType::Dictionary(
@@ -5254,173 +4982,22 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter_exec(predicate, scan_batches(&wide[0].schema(), &wide), None),
             false,
+            &["Dictionary key bigger than the key type"],
         )
         .await;
         assert!(error.is_none());
         assert_eq!(operators.filters, 1);
     }
 
-    #[test]
-    fn finds_outputs_that_may_fail_to_coalesce() {
-        // (Of strings with 64-bit offsets, which concatenate without
-        // overflowing.)
-        let large = |keys: DataType| {
-            DataType::Dictionary(Box::new(keys), Box::new(DataType::LargeUtf8))
-        };
-        let field = |data_type: DataType| Arc::new(Field::new("f", data_type, true));
-        for (data_type, fails) in [
-            (large(DataType::Int8), true),
-            (large(DataType::UInt16), true),
-            (large(DataType::Int32), false),
-            (large(DataType::UInt64), false),
-            // Dictionaries of values that take less than a byte each may have
-            // more values than any keys index, which Arrow concatenates.
-            (
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Null)),
-                true,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::UInt64),
-                    Box::new(DataType::Boolean),
-                ),
-                true,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::Int64),
-                    Box::new(DataType::FixedSizeBinary(0)),
-                ),
-                true,
-            ),
-            // And those of values that Arrow does not merge, but adds up, with
-            // keys of less than 64 bits: they may share their storage.
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::FixedSizeBinary(1)),
-                ),
-                true,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::UInt32),
-                    Box::new(DataType::Struct(
-                        vec![Field::new("i", DataType::Int8, true)].into(),
-                    )),
-                ),
-                true,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::Utf8View),
-                ),
-                true,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::Int64),
-                    Box::new(DataType::FixedSizeBinary(1)),
-                ),
-                false,
-            ),
-            // Arrow merges primitive values (and strings and binaries).
-            (
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int8)),
-                false,
-            ),
-            (
-                DataType::Dictionary(
-                    Box::new(DataType::UInt32),
-                    Box::new(DataType::Decimal128(10, 2)),
-                ),
-                false,
-            ),
-            (DataType::List(field(large(DataType::Int8))), true),
-            // Lists of more than `i32::MAX` values overflow their offsets (lists
-            // of nulls take no memory).
-            (DataType::List(field(DataType::Null)), true),
-            (DataType::List(field(DataType::Int32)), true),
-            (DataType::ListView(field(DataType::Int32)), true),
-            (DataType::LargeList(field(DataType::Null)), false),
-            (DataType::LargeList(field(large(DataType::Int32))), false),
-            (DataType::LargeList(field(large(DataType::Int8))), true),
-            (
-                DataType::Struct(vec![field(large(DataType::UInt8))].into()),
-                true,
-            ),
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("run_ends", DataType::Int16, false)),
-                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
-                ),
-                true,
-            ),
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("run_ends", DataType::Int32, false)),
-                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
-                ),
-                false,
-            ),
-            // The 32-bit offsets of strings and binaries overflow beyond 2 GiB
-            // of bytes, which batches that share their buffers reach without
-            // memory; also as the values of dictionaries, which Arrow may
-            // concatenate, and of runs.
-            (DataType::Utf8, true),
-            (DataType::Binary, true),
-            (
-                DataType::Dictionary(Box::new(DataType::Int64), Box::new(DataType::Utf8)),
-                true,
-            ),
-            (DataType::Struct(vec![field(DataType::Utf8)].into()), true),
-            (DataType::FixedSizeList(field(DataType::Binary), 2), true),
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
-                    Arc::new(Field::new("values", DataType::Utf8, true)),
-                ),
-                true,
-            ),
-            // Not those with 64-bit offsets, nor views.
-            (DataType::LargeUtf8, false),
-            (DataType::LargeBinary, false),
-            (DataType::Utf8View, false),
-            (DataType::BinaryView, false),
-            (DataType::LargeList(field(DataType::LargeUtf8)), false),
-            // Arrow's `filter` renames the fields of run-end encoded arrays.
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("ends", DataType::Int32, false)),
-                    field(DataType::Utf8),
-                ),
-                true,
-            ),
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
-                    Arc::new(Field::new("values", DataType::Utf8, false)),
-                ),
-                true,
-            ),
-            (
-                DataType::RunEndEncoded(
-                    Arc::new(Field::new("run_ends", DataType::Int64, false)),
-                    Arc::new(Field::new("values", DataType::LargeUtf8, true)),
-                ),
-                false,
-            ),
-        ] {
-            assert_eq!(may_fail_to_coalesce(&data_type), fails, "{data_type}");
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn in_lists_with_fallible_values_stay_in_datafusion() {
+    async fn in_lists_with_fallible_values_are_native() {
         // One batch of 4096 rows, `(x, y) = (1, 0)` then `(2, 1)`. `x = 1` is
         // not true on all rows of the batch, so DataFusion evaluates `10 / y`
         // on all of them, and fails. But it is true on all rows of the first
@@ -5429,26 +5006,35 @@ mod tests {
         for predicate in ["x IN (1, 10 / y)", "x NOT IN (1, 10 / y)"] {
             let plan = filter_exec(predicate, scan(&batch), None);
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let (error, operators) = assert_native_plan_parity(
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter_exec(predicate, scan(&batch), None),
                 false,
+                &["Divide by zero"],
             )
             .await;
             assert!(error.unwrap().contains("Divide by zero"), "{predicate}");
-            assert_eq!(operators.filters, 0, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
 
             // On the chunks of the pipeline, the predicate does not fail.
             let filter = filter_for(predicate, &batch.schema());
-            assert!(filter.errors_depend_on_batches());
             let chunks =
                 [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
             assert!(drive(&filter, chunks).is_ok(), "{predicate}");
         }
         // The first value is evaluated on all rows.
-        let (error, operators) = assert_native_plan_parity(
-            || filter_exec_without_strings("x IN (10 / y, 1)", scan(&batch)),
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            || filter_exec("x IN (10 / y, 1)", scan(&batch), None),
             false,
+            &["Divide by zero"],
         )
         .await;
         assert!(error.unwrap().contains("Divide by zero"));
@@ -5456,7 +5042,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn patterns_that_fail_behind_short_circuits_stay_in_datafusion() {
+    async fn patterns_that_fail_behind_short_circuits_are_native() {
         // One batch of 4096 rows, `(x, y) = (0, 1)` then `(1, 0)`. Neither
         // `x = 0` nor `y = 0` is true on all rows of the batch, so DataFusion
         // evaluates `s ~ 'a{1000000}'`, whose pattern is too big to compile.
@@ -5466,26 +5052,35 @@ mod tests {
         let predicate = "x = 0 OR (y = 0 OR s ~ 'a{1000000}')";
         let plan = filter_exec(predicate, scan(&batch), None);
         let exec = plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter_exec(predicate, scan(&batch), None),
             false,
+            &["did not compile"],
         )
         .await;
         assert!(error.unwrap().contains("did not compile"));
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
 
         // On the chunks of the pipeline, the predicate does not fail.
         let filter = filter_for(predicate, &batch.schema());
-        assert!(filter.errors_depend_on_batches());
         let chunks = [batch.slice(0, 2048), batch.slice(2048, 2048)].map(DataChunk::from);
         assert!(drive(&filter, chunks).is_ok());
 
         // A pattern that compiles cannot fail.
         let predicate = "x = 0 OR (y = 0 OR s ~ 'a+')";
-        let (error, operators) = assert_native_plan_parity(
-            || filter_exec_without_strings(predicate, scan(&batch)),
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            || filter_exec(predicate, scan(&batch), None),
             false,
+            &["did not compile"],
         )
         .await;
         assert!(error.is_none());
@@ -5493,7 +5088,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn predicates_that_fail_on_empty_batches_stay_in_datafusion() {
+    async fn predicates_that_fail_on_empty_batches_are_native() {
         // DataFusion evaluates the predicate on every batch, empty ones
         // included, on which `OR` evaluates its right side: after an empty
         // batch, `x = 0 OR s ~ 'a{1000000}'` fails even if `x = 0` on all
@@ -5513,7 +5108,7 @@ mod tests {
             ("regexp_like(s, 'a{1000000}')", vec![empty.clone()], true),
             ("regexp_like(s, 'a{1000000}')", vec![], false),
             // (`regexp_count` only compiles its pattern if there are rows, but
-            // functions are opaque, see `functions_stay_in_datafusion`.)
+            // functions are opaque, see `functions_are_native`.)
             (
                 "regexp_count(s, 'a{1000000}') > 0",
                 vec![empty.clone()],
@@ -5528,11 +5123,16 @@ mod tests {
             let plan = || filter_exec(predicate, scan_batches(&schema, &batches), None);
             let filter_plan = plan();
             let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, false, &["did not compile"])
+                .await;
             let input = format!("{predicate} on {} batches", batches.len());
             assert_eq!(error.is_some(), fails, "{input}: {error:?}");
-            assert_eq!(operators.filters, 0, "{input}");
+            assert_eq!(operators.filters, 1, "{input}");
         }
         // A pattern that compiles cannot fail, with or without empty batches.
         for (predicate, batches, fails) in [
@@ -5540,14 +5140,14 @@ mod tests {
             ("x = 0 OR s ~ 'a+'", vec![zeros], false),
             ("x = 0 OR s ~ 'a+'", vec![], false),
         ] {
-            let (error, operators) = assert_native_plan_parity(
-                || {
-                    filter_exec_without_strings(
-                        predicate,
-                        scan_batches(&schema, &batches),
-                    )
-                },
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                || filter_exec(predicate, scan_batches(&schema, &batches), None),
                 false,
+                &["did not compile"],
             )
             .await;
             let input = format!("{predicate} on {} batches", batches.len());
@@ -5557,15 +5157,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_of_dense_unions_of_shared_strings_stay_in_datafusion() {
+    async fn filters_of_dense_unions_of_shared_strings_are_native() {
         let _large = one_large_test_at_a_time().await;
         // Rows of a dense union may point to the same value of a child, which
         // Arrow copies for every row when it extracts the child (casting the
         // union) or filters the union: the 32-bit offsets of 1200 copies of a
         // string of 2 MiB overflow on the batch of `FilterExec`, but not those
-        // of 600 copies on the chunks of the native filter.
+        // of 600 copies on the chunks of the native filter, which succeeds where
+        // DataFusion fails, as `docs/compatibility.md` allows (capacity limits).
+        // On each half of the batch, DataFusion succeeds too: together, they
+        // have as many rows as the native filter returns.
         let batch = dense_union_of_a_large_string();
         let schema = batch.schema();
+        let halves = [batch.slice(0, 2048), batch.slice(2048, 2048)];
         let cast = Arc::new(datafusion_physical_expr::expressions::IsNullExpr::new(
             Arc::new(datafusion_physical_expr::expressions::CastExpr::new(
                 physical_expr("u", &schema),
@@ -5574,34 +5178,47 @@ mod tests {
             )),
         )) as Arc<dyn PhysicalExpr>;
         for predicate in [cast, physical_expr("id > 0", &schema)] {
-            let plan = || -> Arc<dyn ExecutionPlan> {
+            let plan = |batches: &[RecordBatch]| -> Arc<dyn ExecutionPlan> {
                 Arc::new(
                     FilterExec::try_new(
                         Arc::clone(&predicate),
-                        scan_batches(&schema, std::slice::from_ref(&batch)),
+                        scan_batches(&schema, batches),
                     )
                     .unwrap(),
                 )
             };
-            let filter_plan = plan();
+            let filter_plan = plan(std::slice::from_ref(&batch));
             let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let outcome = assert_same_outcome_in_datafusion(
-                plan(),
-                Arc::new(TaskContext::default()),
-            )
-            .await;
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let task_ctx = Arc::new(TaskContext::default());
+            let datafusion =
+                outcome(Arc::clone(&filter_plan), Arc::clone(&task_ctx)).await;
             assert!(
-                outcome
+                datafusion
                     .as_ref()
                     .is_err_and(|error| error.to_lowercase().contains("overflow")),
-                "{predicate}: {outcome:?}"
+                "{predicate}: {datafusion:?}"
             );
+            let operator = lower(&filter_plan).unwrap();
+            assert_eq!(NativeOperators::of(&operator).filters, 1, "{predicate}");
+            let native = outcome(
+                executable(operator, filter_plan).unwrap(),
+                Arc::clone(&task_ctx),
+            )
+            .await;
+            let mut expected = 0;
+            for half in &halves {
+                let rows =
+                    outcome(plan(std::slice::from_ref(half)), Arc::clone(&task_ctx))
+                        .await;
+                expected += rows.unwrap_or_else(|error| panic!("{predicate}: {error}"));
+            }
+            assert_eq!(native, Ok(expected), "{predicate}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn broadcast_constants_stay_in_datafusion() {
+    async fn broadcast_constants_are_native() {
         // `CASE WHEN x THEN '…' END` copies a string of 2 MiB for every row
         // with `x`: the 32-bit offsets of 2048 copies overflow. `FilterExec`
         // evaluates it on the batch, with 2048 such rows, and panics, but the
@@ -5620,10 +5237,13 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["offset overflow"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -5633,7 +5253,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unpacking_repeated_values_stays_in_datafusion() {
+    async fn unpacking_repeated_values_is_native() {
         // Unpacking a dictionary copies its values for every row that has
         // them: the 32-bit offsets of 1536 strings of 2 MiB overflow.
         // `FilterExec` unpacks all rows of the batch (a quarter of them pass
@@ -5652,10 +5272,13 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Offset overflow error"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -5665,7 +5288,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_of_dictionary_keys_stay_in_datafusion() {
+    async fn casts_of_dictionary_keys_are_native() {
         // Casting a dictionary into another casts its keys, which index its
         // values, however many (nulls take no memory): `1 << 31` does not fit
         // in `Int32` keys. `FilterExec` evaluates the cast on all rows of the
@@ -5684,10 +5307,13 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let outcome =
-            assert_same_outcome_in_datafusion(plan(), Arc::new(TaskContext::default()))
-                .await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let outcome = assert_allowed_native_outcome(
+            plan(),
+            Arc::new(TaskContext::default()),
+            &["Can't cast value 2147483648 to type Int32"],
+        )
+        .await;
         assert!(
             outcome
                 .as_ref()
@@ -5697,12 +5323,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn predicates_on_dictionary_values_stay_in_datafusion() {
+    async fn predicates_on_dictionary_values_are_native() {
         // The first `FilterExec` coalesces the rows `"1"` and `"2"` into one
         // batch, merging the dictionaries of the two batches without the
         // values that no row references, `"x"` and `"y"`, so DataFusion casts
         // `"1"` and `"2"`. The chunks of a pipeline keep their dictionaries:
-        // casting `"x"` fails.
+        // the native filters may fail to cast `"x"` (a value of no row), which
+        // is the engine's own.
         let batches = dictionary_batches();
         let schema = batches[0].schema();
         let plan = || {
@@ -5715,10 +5342,15 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Cannot cast string"])
+            .await;
         assert!(error.is_none());
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 2);
         let chunk = DataChunk::from(batches[0].clone())
             .with_selection(SelectionVector::from(vec![0]))
             .unwrap();
@@ -5757,23 +5389,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn plans_below_limits_stay_in_datafusion() {
+    async fn plans_below_limits_are_native() {
         // `FilterExec` pulls its input until it has a batch of its batch
         // size, or its input ends: with batches of 8192 rows, it pulls the
         // zeros, which the projection divides by, before the limit is reached.
         // A native filter, which does not coalesce its output, reaches it with
         // the ones.
-        let (error, operators) =
-            assert_native_plan_parity(|| limited_filter(2048, 8192), true).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            || limited_filter(2048, 8192),
+            true,
+            &["Divide by zero"],
+        )
+        .await;
         assert!(error.unwrap().contains("Divide by zero"));
-        assert_eq!((operators.filters, operators.projections), (0, 0));
+        assert_eq!((operators.filters, operators.projections), (1, 1));
         // With batches of 32 rows, `FilterExec` returns the ones, and the limit
         // is reached before it pulls the zeros. The native cache keeps the 32
         // rows of a chunk, and pulls the zeros.
-        let (error, operators) =
-            assert_native_plan_parity(|| limited_filter(32, 32), true).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            || limited_filter(32, 32),
+            true,
+            &["Divide by zero"],
+        )
+        .await;
         assert!(error.is_none());
-        assert_eq!((operators.filters, operators.projections), (0, 0));
+        assert_eq!((operators.filters, operators.projections), (1, 1));
     }
 
     /// `FilterExec(q >= 0)`, coalescing its output into batches of 32 rows,
@@ -5854,7 +5502,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_that_may_stop_early_keep_their_input_in_datafusion() {
+    async fn sorts_that_may_stop_early_are_native() {
         // The input of the sort is ordered by `id`. A sort by `id` streams it,
         // and a sort by `(id, q)` with a fetch (a TopK) stops after a batch
         // once it has its rows and the next `id`s are greater: both stop
@@ -5866,9 +5514,13 @@ mod tests {
             || sorted_divisions(&["id", "q"], Some(1), true),
         ];
         for plan in stopping {
-            let (error, operators) = assert_native_plan_parity(plan, true).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, true, &["Divide by zero"]).await;
             assert!(error.is_none(), "{error:?}");
-            assert_eq!((operators.filters, operators.projections), (0, 0));
+            assert_eq!((operators.filters, operators.projections), (1, 1));
         }
         // A sort whose order its input does not satisfy reads all of its
         // input, in DataFusion as natively: what is below it is lowered.
@@ -5877,14 +5529,18 @@ mod tests {
             || sorted_divisions(&["id", "q"], Some(1), false),
         ];
         for plan in reading {
-            let (error, operators) = assert_native_plan_parity(plan, true).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(plan, true, &["Divide by zero"]).await;
             assert!(error.unwrap().contains("Divide by zero"));
             assert_eq!(operators.filters, 1);
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn casts_that_arrow_cannot_evaluate_stay_in_datafusion() {
+    async fn casts_that_arrow_cannot_evaluate_are_native() {
         // On one batch of `(x, y) = (0, 1)` then `(1, 0)` rows, DataFusion
         // evaluates the cast, as neither `x = 0` nor `y = 0` is true on all of
         // its rows, and fails; on the chunks of a pipeline, `x = 0` and then
@@ -5915,14 +5571,23 @@ mod tests {
             };
             let filter_plan = plan();
             let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec));
-            let (error, operators) = assert_native_plan_parity(plan, false).await;
+            assert!(PhysicalFilter::supports_filter_exec(exec));
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                plan,
+                false,
+                &["Unsupported output type for dictionary packing"],
+            )
+            .await;
             let error = error.unwrap();
             assert!(error.contains("dictionary packing"), "{error}");
-            assert_eq!(operators.filters, 0);
+            assert_eq!(operators.filters, 1);
         }
-        // In SQL, the `OR`s are reassociated, but the filter and the
-        // projection stay in DataFusion.
+        // In SQL, the `OR`s are reassociated: the filter and the projection
+        // are native too.
         let setup = async |ctx: &datafusion::prelude::SessionContext| {
             register_partitions(ctx, "t", vec![vec![mixed.clone()]])
         };
@@ -5932,17 +5597,24 @@ mod tests {
             format!("SELECT * FROM t WHERE {predicate}"),
             format!("SELECT {predicate} AS m FROM t"),
         ] {
-            let (_, operators) = assert_native_parity_with_setup(&sql, setup).await;
-            assert_eq!(operators.filters + operators.projections, 0, "{sql}");
+            let NativeOutcome { operators, .. } =
+                assert_allowed_native_outcome_with_setup(
+                    &sql,
+                    setup,
+                    &["Unsupported output type for dictionary packing"],
+                )
+                .await;
+            assert!(operators.filters + operators.projections > 0, "{sql}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn filters_whose_output_lists_may_overflow_stay_in_datafusion() {
-        // `FilterExec` coalesces the first 256 rows of both batches into one,
-        // whose lists have `2 << 30` nulls: more than their 32-bit offsets can
-        // count, and Arrow's `concat` panics. The native filter does not
-        // coalesce its output: it returned the 512 rows.
+    async fn filters_of_lists_of_nulls_stay_in_datafusion() {
+        // Lists of `1 << 30` nulls, which take no memory: the native operators
+        // cannot gather the rows of such lists (see `can_gather`), so the
+        // filter stays in DataFusion. (`FilterExec` coalesces the first 256
+        // rows of both batches into one, whose lists have `2 << 30` nulls: more
+        // than their 32-bit offsets can count, and Arrow's `concat` panics.)
         let batches = long_lists_of_nulls();
         let schema = batches[0].schema();
         let plan = filter_exec("x > 0", scan_batches(&schema, &batches), None);
@@ -5967,8 +5639,9 @@ mod tests {
         // `CASE WHEN x THEN a ELSE b END` merges the lists of `a` on the first
         // 2048 rows (`1 << 30` nulls) and of `b` on the others (`1 << 30` nulls
         // too): on the batch of 4096 rows, their 32-bit offsets overflow, on
-        // each chunk of 2048 rows of a pipeline, they do not. The filter only
-        // outputs `x`.
+        // each chunk of 2048 rows of a pipeline, they do not. But the native
+        // operators cannot gather the rows of lists of nulls, which take no
+        // memory (see `can_gather`): the filter stays in DataFusion.
         let batch = lists_to_merge();
         let schema = batch.schema();
         let plan = || -> Arc<dyn ExecutionPlan> {
@@ -6035,7 +5708,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn predicates_with_several_failures_stay_in_datafusion() {
+    async fn predicates_with_several_failures_are_native() {
         // `FilterExec` evaluates `CAST(s AS INT)` on all rows of the batch
         // before `10 / x`, and fails to cast `"invalid"`; on the first chunk of
         // a pipeline, `"1"` casts, and `10 / x` divides by zero.
@@ -6044,17 +5717,26 @@ mod tests {
         let plan = || filter_exec(predicate, scan(&batch), None);
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
+        assert!(PhysicalFilter::supports_filter_exec(exec));
         // On one thread, a pipeline evaluates the first chunk first.
         let config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
-        let (error, operators) =
-            assert_native_plan_parity_with_config(plan, false, config).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
+            plan,
+            false,
+            config,
+            &["Cannot cast string 'invalid'", "Divide by zero"],
+        )
+        .await;
         assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn chains_with_several_failures_stay_in_datafusion() {
+    async fn chains_with_several_failures_are_native() {
         // `ProjectionExec(x, CAST(s AS INT))` casts all rows of the batch, and
         // fails on `"invalid"`, before `FilterExec(10 / x > 1)` sees the batch;
         // a pipeline evaluates both operators on its first chunk first, and
@@ -6096,18 +5778,31 @@ mod tests {
         // On one thread, a pipeline evaluates the first chunk first.
         let config =
             || datafusion::prelude::SessionConfig::new().with_target_partitions(1);
-        let (error, operators) = assert_native_plan_parity_with_config(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
             || plan("CAST(s AS INT)"),
             false,
             config(),
+            &["Cannot cast string 'invalid'", "Divide by zero"],
         )
         .await;
         assert!(error.unwrap().contains("Cannot cast string 'invalid'"));
-        assert_eq!((operators.filters, operators.projections), (0, 0));
+        assert_eq!((operators.filters, operators.projections), (1, 1));
         // Without a part that may fail in the projection, both are lowered.
-        let (error, operators) =
-            assert_native_plan_parity_with_config(|| plan("x + 1"), false, config())
-                .await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome_with_config(
+            || plan("x + 1"),
+            false,
+            config(),
+            &["Cannot cast string 'invalid'", "Divide by zero"],
+        )
+        .await;
         assert!(error.unwrap().contains("Divide by zero"));
         assert_eq!((operators.filters, operators.projections), (1, 1));
     }
@@ -6138,7 +5833,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn operations_on_types_without_nulls_stay_in_datafusion() {
+    async fn operations_on_types_without_nulls_are_lowered() {
         // The classification probes expressions on columns of nulls of the
         // types of their operands, or on empty batches of their input, which
         // Arrow cannot build for every type: an empty union has no value, so
@@ -6204,24 +5899,27 @@ mod tests {
                 };
                 let filter_plan = plan();
                 let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-                assert!(
-                    !PhysicalFilter::supports_filter_exec(exec),
+                assert_eq!(
+                    PhysicalFilter::supports_filter_exec(exec),
+                    can_gather(&data_type),
                     "{predicate} on {data_type}"
                 );
                 // (`assert_native_plan_parity` cannot encode the rows of types
                 // without arrays.)
-                let outcome = assert_same_outcome_in_datafusion(
-                    plan(),
-                    Arc::new(TaskContext::default()),
-                )
-                .await;
-                assert_eq!(outcome, Ok(0), "{predicate} on {data_type}");
+                let task_ctx = Arc::new(TaskContext::default());
+                let lowered = executable(lower(&plan()).unwrap(), plan()).unwrap();
+                assert_eq!(
+                    outcome(lowered, Arc::clone(&task_ctx)).await,
+                    Ok(0),
+                    "{predicate} on {data_type}"
+                );
+                assert_eq!(outcome(plan(), task_ctx).await, Ok(0));
             }
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn operations_on_unsupported_types_stay_in_datafusion() {
+    async fn operations_on_unsupported_types_are_native() {
         // `NOT` of an integer fails whenever it is evaluated, on an empty batch
         // too, which a pipeline skips.
         let schema = runs(&[]).schema();
@@ -6240,18 +5938,30 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
+            plan,
+            false,
+            &["could not cast array of type Int32"],
+        )
+        .await;
         assert!(error.is_some());
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fetch_zero_stays_in_datafusion() {
+    async fn fetch_zero_is_native() {
         // With `fetch = 0`, `FilterExec` evaluates its predicate on the first
         // batch of its input, even an empty one, and stops: it never pulls the
-        // zeros, which its input divides by. Pipelines skip empty chunks: a
-        // native filter would pull them.
+        // zeros, which its input divides by. Pipelines skip empty chunks: the
+        // native filter pulls them, and may divide by zero, which is the
+        // engine's own (an error for rows beyond a limit, which DataFusion
+        // never evaluates). (The planner lowers a filter with a fetch of 0 to
+        // a source of no rows.)
         let schema = runs(&[]).schema();
         let plan = || {
             let batches = [
@@ -6272,18 +5982,18 @@ mod tests {
         };
         let filter_plan = plan();
         let exec = filter_plan.downcast_ref::<FilterExec>().unwrap();
-        assert!(!PhysicalFilter::supports_filter_exec(exec));
-        let err =
-            PhysicalFilter::try_from_filter_exec(exec, lower(exec.input()).unwrap())
-                .unwrap_err();
-        assert!(err.to_string().contains("fetch of 0"), "{err}");
-        let (error, operators) = assert_native_plan_parity(plan, true).await;
+        assert!(PhysicalFilter::supports_filter_exec(exec));
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, true, &["Divide by zero"]).await;
         assert!(error.is_none(), "{error:?}");
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fetch_with_fallible_predicates_stays_in_datafusion() {
+    async fn fetch_with_fallible_predicates_is_native() {
         // `FilterExec` evaluates its predicate on whole batches until the fetch
         // is reached, on the first batch even with `fetch = 0`.
         for (batch, predicate, fetch) in [
@@ -6293,46 +6003,57 @@ mod tests {
         ] {
             let plan = filter_exec(predicate, scan(&batch), Some(fetch));
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
-            assert!(!PhysicalFilter::supports_filter_exec(exec), "{predicate}");
-            let (error, operators) = assert_native_plan_parity(
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter_exec(predicate, scan(&batch), Some(fetch)),
                 true,
+                &["Divide by zero", "did not compile"],
             )
             .await;
-            assert_eq!(operators.filters, 0, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
             if predicate.contains('/') {
                 assert!(error.unwrap().contains("Divide by zero"), "{predicate}");
             }
         }
-        // A predicate that fails whenever it is evaluated is not lowered
-        // either, but a pattern that compiles cannot fail.
+        // A predicate that fails whenever it is evaluated, and a pattern that
+        // compiles.
         // (Views, which `FilterExec` coalesces without 32-bit offsets.)
         let strings = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
             vec![Arc::new(StringViewArray::from(vec!["a", "b"]))],
         )
         .unwrap();
-        for (predicate, lowered) in [("s ~ 'a{1000000}'", false), ("s LIKE 'a%'", true)] {
+        for (predicate, fails) in [("s ~ 'a{1000000}'", true), ("s LIKE 'a%'", false)] {
             let plan = filter_exec(predicate, scan(&strings), Some(1));
             let exec = plan.downcast_ref::<FilterExec>().unwrap();
-            assert_eq!(
-                PhysicalFilter::supports_filter_exec(exec),
-                lowered,
-                "{predicate}"
-            );
-            let (error, operators) = assert_native_plan_parity(
+            assert!(PhysicalFilter::supports_filter_exec(exec), "{predicate}");
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
                 || filter_exec(predicate, scan(&strings), Some(1)),
                 true,
+                &["Divide by zero", "did not compile"],
             )
             .await;
-            assert_eq!(error.is_some(), !lowered, "{predicate}");
-            assert_eq!(operators.filters, usize::from(lowered), "{predicate}");
+            assert_eq!(error.is_some(), fails, "{predicate}");
+            assert_eq!(operators.filters, 1, "{predicate}");
         }
         // A predicate that cannot fail is lowered with its fetch.
         let batch = runs(&[(1, 2048), (0, 2048)]);
-        let (error, operators) = assert_native_plan_parity(
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(
             || filter_exec("x >= 0", scan(&batch), Some(1)),
             true,
+            &["Divide by zero", "did not compile"],
         )
         .await;
         assert!(error.is_none());
@@ -6340,7 +6061,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn fallible_operators_below_limits_stay_in_datafusion() {
+    async fn fallible_operators_below_limits_are_native() {
         // A limit stops the execution after the batch in which it is
         // reached: DataFusion evaluates `10 / x` on all 4096 rows and fails,
         // a native projection only on the first chunk of 2048 ones.
@@ -6369,25 +6090,41 @@ mod tests {
             )) as Arc<dyn ExecutionPlan>
         };
         for (expr, filter) in [("10 / x", false), ("10 / x > 1", true)] {
-            let (error, operators) =
-                assert_native_plan_parity(|| limit(expr, filter, &batch), true).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                || limit(expr, filter, &batch),
+                true,
+                &["Divide by zero"],
+            )
+            .await;
             assert!(error.unwrap().contains("Divide by zero"), "{expr}");
-            assert_eq!(operators.filters + operators.projections, 0, "{expr}");
+            assert!(operators.filters + operators.projections > 0, "{expr}");
         }
-        // Infallible operators stay in DataFusion below the limit too, with
-        // their input (see `plans_below_limits_stay_in_datafusion`).
+        // So are infallible operators below the limit (see
+        // `plans_below_limits_are_native`).
         for (expr, filter) in [("x + 1", false), ("x >= 0", true)] {
-            let (error, operators) =
-                assert_native_plan_parity(|| limit(expr, filter, &ones), true).await;
+            let NativeOutcome {
+                datafusion: error,
+                operators,
+                ..
+            } = assert_allowed_native_plan_outcome(
+                || limit(expr, filter, &ones),
+                true,
+                &["Divide by zero"],
+            )
+            .await;
             assert!(error.is_none(), "{expr}");
-            assert_eq!(operators.filters + operators.projections, 0, "{expr}");
+            assert!(operators.filters + operators.projections > 0, "{expr}");
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     // `with_limit_options` is the only public way to build a soft limit.
     #[expect(deprecated)]
-    async fn fallible_operators_below_soft_limits_stay_in_datafusion() {
+    async fn fallible_operators_below_soft_limits_are_native() {
         use datafusion_physical_plan::aggregates::{
             AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
         };
@@ -6415,9 +6152,13 @@ mod tests {
             assert!(aggregate.limit_options().is_some());
             Arc::new(aggregate) as Arc<dyn ExecutionPlan>
         };
-        let (error, operators) = assert_native_plan_parity(plan, false).await;
+        let NativeOutcome {
+            datafusion: error,
+            operators,
+            ..
+        } = assert_allowed_native_plan_outcome(plan, false, &["Divide by zero"]).await;
         assert!(error.unwrap().contains("Divide by zero"));
-        assert_eq!(operators.filters, 0);
+        assert_eq!(operators.filters, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
