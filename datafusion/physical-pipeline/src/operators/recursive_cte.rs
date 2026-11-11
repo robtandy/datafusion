@@ -20,9 +20,9 @@
 //! [`PhysicalRecursiveCte`] works like DuckDB's `PhysicalRecursiveCTE`:
 //!
 //! * it is the **sink** of the pipelines of the static term (its child meta
-//!   pipeline, which runs on all threads) and of the pipelines of every
-//!   iteration of the recursive term, which collect the rows of the term
-//!   (`Collector`);
+//!   pipeline, which runs on all threads) and, through a `RecursiveTermSink`,
+//!   of the pipelines of every iteration of the recursive term: both collect
+//!   the rows of their term into the same `Collector`;
 //! * it is the **source** of the pipeline that reads the result of the
 //!   query: it emits the rows of the static term, then runs the first
 //!   iteration over them as the working table, emits its rows, runs the next
@@ -224,6 +224,14 @@ impl PhysicalRecursiveCte {
     /// A fresh copy of the recursive term for an iteration: its DataFusion
     /// plan, reset (see `reset_plan_states`) and lowered for the session of
     /// `task_ctx`.
+    ///
+    /// [`Self::try_lower`] checked that the lowering of the query, for the
+    /// session it was planned for (or for any session), lowers the scans of
+    /// the working table natively. The session of the execution lowers them
+    /// natively too, unless it lowers fewer nodes than the lowering of the
+    /// query (e.g. a plan lowered for a session without a memory limit and
+    /// executed in one with a limit): the iteration then fails, as DataFusion
+    /// would read a working table that the CTE does not fill.
     fn lower_recursive_term(
         &self,
         task_ctx: &TaskContext,
@@ -513,7 +521,7 @@ impl PhysicalOperator for PhysicalRecursiveCte {
                         return Err(error);
                     }
                     // The working table is not read any more: its rows are
-                    // released once their last chunk is.
+                    // released once the rows of the iteration replace them.
                     if let Some(iterations) = &recursion.iterations {
                         iterations.work_tables.table.lock().take();
                     }
@@ -2021,6 +2029,61 @@ mod tests {
                 assert_native_recursion(sql, test_session_config(), async |_| Ok(()))
                     .await;
             assert_eq!(count::<PhysicalRecursiveCte>(&root), 2, "{sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_iteration_runs_a_fresh_copy_of_the_recursive_term() {
+        // The generator of a `generate_series` (which DataFusion executes)
+        // produces its rows once: the second iteration would join with none
+        // of them if it ran the plan of the first one again.
+        for sql in [
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + g.value FROM t \
+             CROSS JOIN generate_series(1, 2) g WHERE n < 6) SELECT * FROM t",
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + g.value FROM t \
+             JOIN generate_series(1, 3) g ON g.value = n % 3 + 1 WHERE n < 20) \
+             SELECT * FROM t",
+        ] {
+            let root =
+                assert_native_recursion(sql, test_session_config(), async |_| Ok(()))
+                    .await;
+            assert!(!bridged_plans(&root).is_empty(), "{sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recursive_queries_anywhere_in_a_query() {
+        let setup = async |ctx: &SessionContext| register_numbers(ctx, 1000);
+        let numbers = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t \
+                       WHERE n < 100)";
+        for sql in [
+            // In a scalar subquery.
+            format!(
+                "SELECT v, ({numbers} SELECT max(n) FROM t) AS m FROM numbers WHERE v < 3"
+            ),
+            // Below an aggregation and a sort.
+            format!(
+                "{numbers} SELECT n % 7 AS k, count(*), sum(n) FROM t GROUP BY n % 7 ORDER BY k"
+            ),
+            // On both sides of hash joins.
+            format!("{numbers} SELECT t.n, v FROM t JOIN numbers ON v = t.n * 3"),
+            format!("{numbers} SELECT t.n, v FROM numbers JOIN t ON v = t.n * 3"),
+            // On the probe side of a join that cannot produce rows, which does
+            // not read it (here, a recursion that does not end).
+            "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) \
+             SELECT * FROM (SELECT v FROM numbers WHERE v < 0) e JOIN t ON e.v = t.n"
+                .to_string(),
+            // In the inputs of unions.
+            format!(
+                "{numbers} SELECT n FROM t UNION ALL SELECT v FROM numbers WHERE v < 5"
+            ),
+            format!("{numbers} SELECT n FROM t UNION SELECT n * 2 FROM t"),
+        ] {
+            for target_partitions in [1, 4] {
+                let config =
+                    test_session_config().with_target_partitions(target_partitions);
+                assert_native_recursion(&sql, config, &setup).await;
+            }
         }
     }
 
