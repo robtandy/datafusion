@@ -217,6 +217,7 @@ use crate::operators::materialized_cte::{
     hoist_materialized_ctes,
 };
 use crate::operators::partial_sort::PhysicalPartialSort;
+use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::union::PhysicalUnion;
@@ -583,6 +584,11 @@ impl Lowering<'_> {
             }
             if let Some(sort) = self.try_lower_merge(plan)? {
                 return Ok(sort);
+            }
+            if let Some(topk) = PhysicalPartitionedTopK::try_lower(plan, |sort| {
+                self.try_lower_sort(sort)
+            })? {
+                return Ok(Arc::new(topk));
             }
             if let Some(aggregate) = self.try_lower_aggregate(plan)? {
                 return Ok(aggregate);

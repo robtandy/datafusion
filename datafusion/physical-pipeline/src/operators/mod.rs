@@ -14,6 +14,7 @@ pub mod limit;
 pub(crate) mod lowering_tests;
 pub mod materialized_cte;
 pub mod partial_sort;
+pub mod partitioned_topk;
 pub mod placeholder_row;
 pub mod projection;
 pub mod union;
