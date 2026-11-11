@@ -540,11 +540,11 @@ native.
   partition of its input is redundant: the native limit replaces them (e.g.
   `WHERE ... LIMIT`).
 - The filters of a pipeline that may stop before its input ends (below a
-  limit, up to the pipeline breakers below it, or in the subquery of a scalar
-  subquery, which fails at its second row) are not wrapped in a
-  `CachingOperator`, which would hold their rows back until it is full or its
-  input ends: a limit above a stream that stays pending once it has produced
-  its rows ends with them, as in DataFusion.
+  limit or a filter with a fetch, up to the pipeline breakers below them, or
+  in the subquery of a scalar subquery, which fails at its second row) are not
+  wrapped in a `CachingOperator`, which would hold their rows back until it is
+  full or its input ends: a limit above a stream that stays pending once it
+  has produced its rows ends with them, as in DataFusion.
 - A node with a fetch of 0 is lowered to a source of no rows, without its
   input.
 - A native filter evaluates a conjunct that may fail only on the rows that the

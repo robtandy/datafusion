@@ -55,8 +55,8 @@
 //! its input itself.
 //!
 //! The filters of the pipelines that may stop before their inputs end (below
-//! limits, and in the subqueries of scalar subqueries) are not cached: see
-//! `Lowering::lower_in`.
+//! limits and filters with a fetch, and in the subqueries of scalar
+//! subqueries) are not cached: see `Lowering::lower_in`.
 //!
 //! Windows, nested loop joins and cross joins keep all of their rows in
 //! memory without reserving it in the memory pool, while the DataFusion nodes
@@ -470,8 +470,9 @@ struct Lowering<'a> {
     /// limit.
     runtime: Option<&'a RuntimeEnv>,
     /// Whether the node being lowered is in a pipeline that may stop before
-    /// its input ends (see [`Self::lower_in`]): below a limit, or in the
-    /// subquery of a scalar subquery, which fails at its second row.
+    /// its input ends (see [`Self::lower_in`]): below a limit or a filter with
+    /// a fetch, or in the subquery of a scalar subquery, which fails at its
+    /// second row.
     early_stop: Cell<bool>,
 }
 
@@ -512,7 +513,9 @@ impl Lowering<'_> {
     /// produced them (DuckDB does not cache in such pipelines either). The
     /// nodes that pass the rows of their inputs on in their pipelines (filters,
     /// projections, unions, limits, the probe sides of joins and the input of
-    /// a scalar subquery) keep `early_stop` for their inputs.
+    /// a scalar subquery) keep `early_stop` for their inputs, and the limits
+    /// and the filters with a fetch, which stop their pipelines once they have
+    /// their rows, set it.
     fn lower_in(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -853,6 +856,10 @@ impl Lowering<'_> {
     /// [`CachingOperator`] (but in a pipeline that may stop early, see
     /// [`Self::lower_in`]), unless the native filter does not implement it
     /// (see [`PhysicalFilter::supports_filter_exec`]).
+    ///
+    /// A filter with a fetch stops its pipeline once it has produced its
+    /// rows, as a limit does: its input is lowered in a pipeline that may stop
+    /// early. (Its own cache, if any, is emitted when it stops.)
     fn lower_filter(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -861,7 +868,8 @@ impl Lowering<'_> {
         if !PhysicalFilter::supports_filter_exec(filter) {
             return Ok(bridge(plan));
         }
-        let input = self.lower(filter.input())?;
+        let early_stop = self.early_stop.get() || filter.fetch().is_some();
+        let input = self.lower_in(filter.input(), early_stop)?;
         let filter = Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
         if self.early_stop.get() {
             return Ok(filter);
@@ -6596,49 +6604,71 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn limits_end_with_the_rows_of_inputs_that_then_stay_pending() -> Result<()> {
-        // 128 positive rows, and then nothing more: DataFusion's limits end
-        // as soon as they have their row, and so do the native ones, whose
-        // pipelines do not cache the rows of their filters (a cache would hold
-        // them back until it is full or its input ends, see
-        // `Lowering::lower_in`).
+        // 128 positive rows, and then nothing more: DataFusion's limits (and
+        // filters with a fetch) end as soon as they have their row, and so do
+        // the native ones, whose pipelines do not cache the rows of the
+        // filters below them (a cache would hold them back until it is full or
+        // its input ends, see `Lowering::lower_in`).
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let rows = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from_iter_values(1..=128))],
         )?;
-        // A filter whose batches have at most `batch_size` rows.
-        let filter = |batch_size: usize| -> FilterExec {
-            let source = Arc::new(PendsAfterRows::new(vec![rows.clone()]));
+        // A filter of `x > 0` over `input`, whose batches have at most
+        // `batch_size` rows.
+        let filter = |input: Arc<dyn ExecutionPlan>, batch_size: usize| -> FilterExec {
             let positive = Arc::new(BinaryExpr::new(
                 col("x", &schema).unwrap(),
                 datafusion_expr::Operator::Gt,
                 Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
             ));
-            FilterExec::try_new(positive, source)
+            FilterExec::try_new(positive, input)
                 .unwrap()
                 .with_batch_size(batch_size)
                 .unwrap()
+        };
+        let source = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(PendsAfterRows::new(vec![rows.clone()]))
         };
         // The plan of `WHERE x > 0 LIMIT 1` over several partitions: a merge
         // with a fetch above a filter with the same fetch (which the native
         // limit makes redundant), with the default batch size.
         let merged = || -> Arc<dyn ExecutionPlan> {
-            let filter = filter(8192).with_fetch(Some(1)).unwrap();
+            let filter = filter(source(), 8192).with_fetch(Some(1)).unwrap();
             Arc::new(CoalescePartitionsExec::new(filter).with_fetch(Some(1)))
         };
         // A global limit above a filter without a fetch, with batches of 32
         // rows, which DataFusion's filter emits once it has 32 rows.
         let limited = || -> Arc<dyn ExecutionPlan> {
-            Arc::new(GlobalLimitExec::new(Arc::new(filter(32)), 0, Some(1)))
+            Arc::new(GlobalLimitExec::new(
+                Arc::new(filter(source(), 32)),
+                0,
+                Some(1),
+            ))
         };
-        let shapes: [&dyn Fn() -> Arc<dyn ExecutionPlan>; 2] = [&merged, &limited];
-        for plan in shapes {
+        // A filter with a fetch, which stops once it has its row, as a limit
+        // does, above a filter without a fetch, with batches of 32 rows: the
+        // native filter with the fetch is cached (its cache is emitted once
+        // it stops), the one below it is not.
+        let filtered = || -> Arc<dyn ExecutionPlan> {
+            let inner = Arc::new(filter(source(), 32));
+            filter(inner, 8192).with_fetch(Some(1)).unwrap()
+        };
+        // The shapes, with their numbers of native filters and of caches.
+        type Shape<'a> = &'a dyn Fn() -> Arc<dyn ExecutionPlan>;
+        let shapes: [(Shape, usize, usize); 3] =
+            [(&merged, 1, 0), (&limited, 1, 0), (&filtered, 2, 1)];
+        for (plan, filters, caches) in shapes {
             let config = test_session_config();
             let root = create_pipeline_plan(plan())?;
-            let limit = root.operator();
-            assert!(limit.is::<PhysicalLimit>(), "{}", limit.name());
-            assert!(limit.children()[0].is::<PhysicalFilter>());
             let name = plan().name().to_owned();
+            let operator = root.operator();
+            assert_eq!(bridged_plans(operator).len(), 1, "{name}: only the source");
+            let count = (
+                crate::operators::union::test_support::count::<PhysicalFilter>(operator),
+                crate::operators::union::test_support::count::<CachingOperator>(operator),
+            );
+            assert_eq!(count, (filters, caches), "{name}");
             for (engine, plan) in [("DataFusion", plan()), ("pipeline", root as _)] {
                 let task_ctx =
                     Arc::new(TaskContext::default().with_session_config(config.clone()));
