@@ -806,7 +806,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field, Int32Type, Schema};
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::Result;
 
     use datafusion::prelude::ParquetReadOptions;
@@ -825,6 +825,33 @@ mod tests {
     async fn assert_all_parity(queries: &[&str]) {
         for sql in queries {
             assert_aggregate_parity(sql).await;
+        }
+    }
+
+    /// Assert that the aggregations of `queries` are left to DataFusion (see
+    /// [`PhysicalHashAggregate::try_lower`]) in a session of configuration
+    /// `config`, by the planner and by [`lower`], and that the results are
+    /// DataFusion's: e.g. the aggregations of several partitions whose
+    /// aggregates may not split their rows exactly, and those of ordered
+    /// aggregates whose rows may tie.
+    async fn assert_all_left_to_datafusion(queries: &[&str], config: SessionConfig) {
+        let setup = async |ctx: &SessionContext| register_test_tables(ctx);
+        for sql in queries {
+            let root =
+                assert_lowered_parity_with_setup(sql, config.clone(), &setup).await;
+            assert_eq!(count::<PhysicalHashAggregate>(&root), 0, "{sql}");
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            register_test_tables(&ctx).expect("tables");
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("planning")
+                .create_physical_plan()
+                .await
+                .expect("physical planning");
+            if let Some(root) = plan.downcast_ref::<crate::bridge::PipelineRootExec>() {
+                assert_eq!(count::<PhysicalHashAggregate>(root.operator()), 0, "{sql}");
+            }
         }
     }
 
@@ -1018,11 +1045,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn differential_aggregate_functions() {
+        // The averages of `BIGINT`s, which DataFusion adds up as `Float64`
+        // values, may not split their rows exactly: DataFusion's, of the
+        // partitions of `t1` (see `PhysicalHashAggregate::try_lower`). Those of
+        // the `INT`s of `t1` are exact (see `sums_exactly_as_floats`).
+        assert_all_left_to_datafusion(
+            &[
+                "SELECT e, SUM(b), AVG(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), \
+               APPROX_DISTINCT(h) FROM t1 GROUP BY e",
+            ],
+            test_session_config(),
+        )
+        .await;
         assert_all_parity(&[
             "SELECT d, SUM(a), AVG(a), MIN(a), MAX(a), COUNT(a), MEDIAN(a), \
              APPROX_DISTINCT(a) FROM t1 GROUP BY d",
-            "SELECT e, SUM(b), AVG(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), \
-             APPROX_DISTINCT(h) FROM t1 GROUP BY e",
+            "SELECT e, SUM(b), MIN(b), MAX(b), COUNT(b), MEDIAN(b), APPROX_DISTINCT(h) \
+             FROM t1 GROUP BY e",
             "SELECT d, MEDIAN(c), MIN(c), MAX(c), APPROX_DISTINCT(f) FROM t1 GROUP BY d",
             "SELECT d, AVG(g), MEDIAN(g), SUM(g) FROM t1 GROUP BY d",
             "SELECT e, BOOL_AND(a > 0), BOOL_OR(b > 5000), BIT_AND(a), BIT_OR(b), \

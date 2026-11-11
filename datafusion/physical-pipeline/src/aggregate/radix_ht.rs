@@ -3176,6 +3176,306 @@ mod tests {
         Ok(())
     }
 
+    /// A `MemTable` `t` of the partitions `partitions` (of the schema of their
+    /// first batch, or of `schema`).
+    fn mem_table_setup(
+        schema: SchemaRef,
+        partitions: Vec<Vec<RecordBatch>>,
+    ) -> impl AsyncFn(&SessionContext) -> Result<()> {
+        async move |ctx: &SessionContext| -> Result<()> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                partitions.clone(),
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            Ok(())
+        }
+    }
+
+    /// The `Float64` values of `column` of the result of `sql`, in DataFusion.
+    async fn datafusion_floats(
+        sql: &str,
+        config: &SessionConfig,
+        setup: impl AsyncFn(&SessionContext) -> Result<()>,
+        column: usize,
+    ) -> Result<Vec<f64>> {
+        let ctx = datafusion_context(config.clone());
+        setup(&ctx).await?;
+        let output = ctx.sql(sql).await?.collect().await?;
+        Ok(output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(column)
+                    .as_primitive::<arrow::datatypes::Float64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_whose_rows_come_in_another_order_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // The values of aggregates that may not split their rows exactly (see
+        // `splits_exactly`) depend on the order of their rows too: DataFusion
+        // aggregates its single partition in the order of its input, and so
+        // must the native operator (see `AggregateSpec::aggregates_in_order`).
+        // But it cannot if it gets the rows in another order, so that such
+        // aggregations are left to DataFusion, with their input.
+        // * `SUM(DISTINCT f)` and `AVG(DISTINCT f)` of the rows `(1, 1e16), (1,
+        //   -1e16), (1, 1)` (the review's case): DataFusion aggregates the
+        //   distinct values of the inner aggregation (of its rewrite into
+        //   `GROUP BY k, f`) in the order of their first rows, `1e16 - 1e16 +
+        //   1`, to `1.0` (and `1/3`), while the native inner aggregation
+        //   produced them in the order of its radix partitions: `0.0`. (Without
+        //   `GROUP BY`, DataFusion's sum of the batch of distinct values is
+        //   `0.0`.)
+        // * A `SUM(f)` next to an ordered aggregate that DataFusion sorts its
+        //   input for, but that orders its values itself (`ARRAY_AGG`, whose
+        //   order is not required), so that the native operator does not sort
+        //   it: of the
+        //   rows `(s, f) = (5, 1e16), (4, 0), (3, 0), (2, -1e16), (1, 1), (0,
+        //   0)`, DataFusion adds up `0 + 1 - 1e16 + 0 + 0 + 1e16`, to `0.0`, the
+        //   native operator `1e16 + 0 + 0 - 1e16 + 1 + 0`, to `1.0`. Next to an
+        //   aggregate that requires its rows in order (`NTH_VALUE`), both sort
+        //   them (by the same order: but for rows that tie in it, see
+        //   `PhysicalHashAggregate::try_lower`), and without DataFusion's sort
+        //   (of `FIRST_VALUE`), neither does: native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+                Arc::new(arrow::array::Float64Array::from(vec![1e16, -1e16, 1.0])),
+            ],
+        )?;
+        let distinct = mem_table_setup(Arc::clone(&schema), vec![vec![rows]]);
+        let sorted_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let sorted = RecordBatch::try_new(
+            Arc::clone(&sorted_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 6])),
+                Arc::new(Int64Array::from(vec![5, 4, 3, 2, 1, 0])),
+                Arc::new(Int64Array::from_iter_values(0..6)),
+                Arc::new(arrow::array::Float64Array::from(vec![
+                    1e16, 0.0, 0.0, -1e16, 1.0, 0.0,
+                ])),
+            ],
+        )?;
+        let sorted = mem_table_setup(Arc::clone(&sorted_schema), vec![vec![sorted]]);
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            // The query, and DataFusion's values of its last column.
+            for (sql, values) in [
+                ("SELECT k, SUM(DISTINCT f) FROM t GROUP BY k", 1.0),
+                ("SELECT k, AVG(DISTINCT f) FROM t GROUP BY k", 1.0 / 3.0),
+                ("SELECT SUM(DISTINCT f) FROM t", 0.0),
+                ("SELECT AVG(DISTINCT f) FROM t", 0.0),
+            ] {
+                let column = usize::from(sql.starts_with("SELECT k"));
+                let floats = datafusion_floats(sql, &config, &distinct, column).await?;
+                assert_eq!(floats, [values], "{sql}");
+                assert_left_to_datafusion(sql, config.clone(), &distinct).await?;
+            }
+            let sql = "SELECT k, SUM(f), ARRAY_AGG(v ORDER BY s) FROM t GROUP BY k";
+            let floats = datafusion_floats(sql, &config, &sorted, 1).await?;
+            assert_eq!(floats, [0.0], "{sql}");
+            assert_left_to_datafusion(sql, config.clone(), &sorted).await?;
+            // The aggregates that split their rows exactly do not depend on
+            // their order, and the others get the rows in DataFusion's order:
+            // native.
+            for (sql, setup) in [
+                (
+                    "SELECT k, COUNT(DISTINCT f), MAX(f) FROM t GROUP BY k",
+                    &distinct,
+                ),
+                (
+                    "SELECT k, SUM(f), FIRST_VALUE(v ORDER BY s) FROM t GROUP BY k",
+                    &sorted,
+                ),
+                (
+                    "SELECT k, SUM(f), NTH_VALUE(v, 2 ORDER BY s) FROM t GROUP BY k",
+                    &sorted,
+                ),
+            ] {
+                assert!(
+                    planned_aggregations(sql, &config, setup).await? > 0,
+                    "{sql}"
+                );
+                assert_aggregate_parity_with_setup(sql, config.clone(), setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_of_several_partitions_that_split_inexactly_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::assert_aggregate_parity_with_setup;
+        // DataFusion aggregates every partition on its own first, in order,
+        // and merges the partial states of a group: its results are
+        // deterministic if they do not depend on the order in which the states
+        // arrive, e.g. if every group has a single one. The native sources
+        // read all partitions as a single queue of chunks, so that the native
+        // operator cannot aggregate every partition on its own: the
+        // aggregations of several partitions whose aggregates may not split
+        // their rows exactly (see `splits_exactly`) are left to DataFusion.
+        // The review's case: `seven_passes` in the first partition, and an
+        // empty second one, on one target partition: DataFusion's `SUM(f)` is
+        // `1.0` and its `AVG(f)` `1/7`, the native ones were `0.0` (also in a
+        // session without the trust extension). (On 4 target partitions,
+        // DataFusion's results depend on the order in which the states arrive:
+        // the results of its executions differ.) The aggregates that split
+        // exactly stay native, and so does the `AVG` of a `SMALLINT` (`w`),
+        // whose sums are exact (see `sums_exactly_as_floats`).
+        let batches = seven_passes()?
+            .into_iter()
+            .map(|batch| {
+                let k = batch.column(0).as_primitive::<Int64Type>();
+                let w: ArrayRef = Arc::new(arrow::array::Int16Array::from_iter_values(
+                    k.values().iter().map(|k| (k % 1_000) as i16),
+                ));
+                let mut columns = batch.columns().to_vec();
+                columns.push(w);
+                let mut fields = batch.schema().fields().to_vec();
+                fields.push(Arc::new(Field::new("w", DataType::Int16, false)));
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batches[0].schema();
+        for (partitions, target_partitions) in [(2, 1), (2, 4), (1, 4)] {
+            let mut table = vec![batches.clone()];
+            table.resize(partitions, vec![]);
+            let setup = mem_table_setup(Arc::clone(&schema), table);
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                let sql = "SELECT k, SUM(f), AVG(f) FROM t GROUP BY k";
+                let sums = datafusion_floats(sql, &config, &setup, 1).await?;
+                assert_eq!(sums.len(), 32_768);
+                if target_partitions == 1 {
+                    assert!(sums.iter().all(|&sum| sum == 1.0));
+                    let averages = datafusion_floats(sql, &config, &setup, 2).await?;
+                    assert!(averages.iter().all(|&average| average == 1.0 / 7.0));
+                }
+                for sql in [
+                    sql,
+                    "SELECT k, STDDEV(f), COUNT(*) FROM t GROUP BY k",
+                    "SELECT k, AVG(v), COUNT(*) FROM t GROUP BY k",
+                    "SELECT SUM(f) FROM t",
+                ] {
+                    if target_partitions == 1 {
+                        assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                    } else {
+                        assert_not_lowered(sql, &config, &setup).await?;
+                    }
+                }
+                for sql in [
+                    "SELECT k, COUNT(*), SUM(v), MIN(f), MAX(f) FROM t GROUP BY k",
+                    "SELECT k, COUNT(*), AVG(w), SUM(w) FROM t GROUP BY k",
+                ] {
+                    assert!(planned_aggregations(sql, &config, &setup).await? > 0);
+                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn percentiles_of_columns_are_left_to_datafusion() -> Result<()> {
+        use super::super::test_support::{
+            assert_aggregate_parity_with_setup,
+            assert_lowered_fails_like_datafusion_with_setup,
+        };
+        // DataFusion's accumulators of `percentile_cont` of a percentile of a
+        // column validate it on every call: its range, and that it is constant
+        // (on every batch without `GROUP BY`, on every row of a group
+        // otherwise). DataFusion updates every aggregate with a whole batch
+        // before the next aggregate, the native operator with its chunks, so
+        // that another error could come first. The review's case: one batch of
+        // 8,192 rows, `k = 1`, `f = 1`, `q1 = 0.5` but its last value `1.5`,
+        // and `q2 = -0.5`. DataFusion fails on the differing values of `q1`,
+        // the native operator failed on the range of `q2` (its first chunk).
+        // Such aggregations are left to DataFusion; literal percentiles, which
+        // DataFusion validates when it creates the accumulators, stay native.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("q1", DataType::Float64, false),
+            Field::new("q2", DataType::Float64, false),
+        ]));
+        let mut q1 = vec![0.5; 8_192];
+        q1[8_191] = 1.5;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0; 8_192])),
+                Arc::new(arrow::array::Float64Array::from(q1)),
+                Arc::new(arrow::array::Float64Array::from(vec![-0.5; 8_192])),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        for target_partitions in [1, 4] {
+            for trusted in [false, true] {
+                let mut config =
+                    test_session_config().with_target_partitions(target_partitions);
+                if trusted {
+                    config = trusting(config);
+                }
+                for sql in [
+                    "SELECT k, percentile_cont(f, q1), percentile_cont(f, q2) FROM t \
+                     GROUP BY k",
+                    "SELECT percentile_cont(f, q1), percentile_cont(f, q2) FROM t",
+                ] {
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let plan = aggregation(&plan).expect("an aggregation");
+                    assert!(PhysicalHashAggregate::try_lower(&plan, lower)?.is_none());
+                    assert_eq!(planned_aggregations(sql, &config, &setup).await?, 0);
+                    let message = "must be constant across the aggregation, found \
+                                   differing values 0.5 and 1.5";
+                    let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        message,
+                    )
+                    .await;
+                    assert_eq!(lowered, 0, "{sql}");
+                }
+            }
+        }
+        for trusted in [false, true] {
+            let mut config = test_session_config().with_target_partitions(1);
+            if trusted {
+                config = trusting(config);
+            }
+            let sql = "SELECT k, percentile_cont(f, 0.25), COUNT(*) FROM t GROUP BY k";
+            assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
+            assert_aggregate_parity_with_setup(sql, config, &setup).await;
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations of the plan of `sql` that the planner
     /// lowers in a session of configuration `config` set up by `setup`.
     async fn planned_aggregations<F>(
@@ -3389,8 +3689,8 @@ mod tests {
         // of the aggregations that aggregate their single partition in order
         // (with aggregates that may not split their rows exactly, see
         // `AggregateSpec::aggregates_in_order` and `TableCapacity::UNBOUNDED`),
-        // whose rows bypass the tables of several partitions in trusting
-        // sessions instead. The results are DataFusion's. Nothing forces
+        // whose aggregations of several partitions are left to DataFusion. The
+        // results are DataFusion's. Nothing forces
         // `AggregateSpec::bypass` here. (Planned on a single target partition,
         // on which the planner lowers all of these aggregations: on several, it
         // leaves those whose partial states are lists or binaries to
@@ -3435,12 +3735,12 @@ mod tests {
                 false,
             ),
             (
-                "SELECT k, ARRAY_AGG(v ORDER BY s), COUNT(*) FROM hc GROUP BY k",
+                "SELECT k, ARRAY_AGG(v ORDER BY v), COUNT(*) FROM hc GROUP BY k",
                 false,
                 false,
             ),
             (
-                "SELECT k, LAST_VALUE(v ORDER BY s DESC), MAX(v) FROM hc GROUP BY k",
+                "SELECT k, LAST_VALUE(v ORDER BY v DESC), MAX(v) FROM hc GROUP BY k",
                 false,
                 false,
             ),
@@ -3508,20 +3808,12 @@ mod tests {
                 assert_left_to_datafusion(sql, config.clone(), &setup_lookalikes).await?;
             }
             // The aggregations that aggregate a single partition in order, of
-            // several partitions: a thread of several bypasses its table as
-            // the session lets it, as DataFusion's built-in aggregate functions
-            // are trusted. (The planner leaves the second to DataFusion there.)
+            // several partitions: left to DataFusion (see
+            // `PhysicalHashAggregate::try_lower`).
             let config = config.with_target_partitions(4);
-            let datafusion = datafusion_context(config.clone());
-            setup(&datafusion).await?;
-            let ctx = crate::test_utils::pipeline_context(config.clone());
-            setup(&ctx).await?;
-            let sql = IN_ORDER[0];
-            let thread = planned_aggregation_thread(&ctx, sql, &batches, 4).await?;
-            assert!(!thread.splits_exactly && !thread.whole, "{sql}");
-            assert_eq!(thread.bypassed, trusted, "{sql} (trusted: {trusted})");
-            let expected = datafusion_aggregation(&datafusion, sql).await?;
-            assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
+            for sql in IN_ORDER {
+                assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+            }
         }
         Ok(())
     }
@@ -3662,7 +3954,10 @@ mod tests {
         // sessions that trust DataFusion's built-in aggregate functions: those
         // whose aggregates are neither `DISTINCT` nor ordered (see
         // `TrustedAggregateFunctions::trusts`). In the other sessions, only the
-        // rows of aggregations without aggregates bypass the tables.
+        // rows of aggregations without aggregates bypass the tables. (The 3
+        // partitions of `u` are aggregated natively if the aggregates split
+        // their rows exactly, see `PhysicalHashAggregate::try_lower`: averages
+        // of decimals, ordered aggregates of their own order.)
         let queries = [
             (
                 "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(sv), AVG(d), BOOL_OR(b) FROM u \
@@ -3693,11 +3988,11 @@ mod tests {
             ),
             (
                 "SELECT k % 97 AS m, MEDIAN(v), APPROX_DISTINCT(s), BOOL_AND(b), \
-                 BIT_AND(v), BIT_OR(v), SUM(d), AVG(v) FROM u GROUP BY k % 97",
+                 BIT_AND(v), BIT_OR(v), SUM(d), AVG(d) FROM u GROUP BY k % 97",
                 true,
             ),
             (
-                "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(sv ORDER BY v, k) \
+                "SELECT k % 50 AS m, ARRAY_AGG(k ORDER BY k), FIRST_VALUE(v ORDER BY v, k) \
                  FROM u GROUP BY k % 50",
                 false,
             ),
@@ -3775,6 +4070,22 @@ mod tests {
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
         use super::super::test_support::assert_lowered_parity_with_setup;
+        assert_not_lowered(sql, &config, &setup).await?;
+        assert_lowered_parity_with_setup(sql, config, &setup).await;
+        Ok(())
+    }
+
+    /// Assert that neither [`PhysicalHashAggregate::try_lower`] nor the
+    /// planner lowers the aggregation of `sql`, in a session of configuration
+    /// `config` set up by `setup`.
+    async fn assert_not_lowered<F>(
+        sql: &str,
+        config: &SessionConfig,
+        setup: F,
+    ) -> Result<()>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
         let ctx = datafusion_context(config.clone());
         setup(&ctx).await?;
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
@@ -3783,12 +4094,7 @@ mod tests {
             PhysicalHashAggregate::try_lower(&plan, lower)?.is_none(),
             "{sql}"
         );
-        assert_eq!(
-            planned_aggregations(sql, &config, &setup).await?,
-            0,
-            "{sql}"
-        );
-        assert_lowered_parity_with_setup(sql, config, &setup).await;
+        assert_eq!(planned_aggregations(sql, config, &setup).await?, 0, "{sql}");
         Ok(())
     }
 
