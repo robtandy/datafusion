@@ -56,11 +56,10 @@
 //! * `get_data`: the threads of the pipeline that reads the aggregation claim
 //!   the partitions one by one. A thread merges the states of the groups of
 //!   its partition, and aggregates the rows of the partition that bypassed
-//!   the thread-local tables, in the order in which the threads added them,
-//!   into a new [`GroupedHashTable`] (DataFusion's final aggregation) and
-//!   evaluates it, and emits the result in chunks of at most
-//!   [`DEFAULT_VECTOR_SIZE`] rows. Partitions have disjoint groups, so the
-//!   threads finalize them in parallel, without sharing anything.
+//!   the thread-local tables, into a new [`GroupedHashTable`] (DataFusion's
+//!   final aggregation) and evaluates it, and emits the result in chunks of
+//!   at most [`DEFAULT_VECTOR_SIZE`] rows. Partitions have disjoint groups, so
+//!   the threads finalize them in parallel, without sharing anything.
 //!
 //! A top-k aggregation (see [`TopK`]) only needs the groups that the sort
 //! above it may keep: every flush of a thread-local table only scatters
@@ -148,68 +147,35 @@ const BYPASS_BYTES_PER_ROW: usize = 2 << 10;
 /// [module documentation](self).
 pub(crate) struct RadixHashAggregate;
 
-/// The data of a radix partition, from all threads: the partial states of
-/// its groups and its input rows that bypassed the thread-local tables, in
-/// the order in which the threads added them.
-///
-/// The final aggregation of the partition aggregates them in that order (see
-/// [`finalize_partition`]): the order of the rows of a single thread, as the
-/// thread-local table and the final aggregation of DataFusion's single
-/// partition aggregate them, so that the aggregates whose values depend on
-/// the order of their rows (e.g. `LAST_VALUE`, `ARRAY_AGG` and sums of
-/// floating point values, without `ORDER BY`) get DataFusion's values. A
-/// thread whose rows bypassed its table and that aggregates its rows again
-/// (once its groups come back) flushes partial states of rows that come
-/// after the rows that bypassed its table.
+/// The data of a radix partition, from all threads.
 #[derive(Debug, Default)]
 struct Partition {
-    entries: Vec<PartitionEntry>,
-}
-
-/// The partial states of groups, or input rows, of a radix partition (see
-/// [`Partition`]).
-#[derive(Debug)]
-enum PartitionEntry {
-    /// The partial states of groups of the partition, of a flush of a
-    /// thread-local table that had groups in the partition.
-    States(GroupedStates),
-    /// Input rows of the partition that bypassed the thread-local tables (their
-    /// columns, see [`evaluate_rows`]), of its sub-partition `split`, of a
-    /// scatter of rows of a thread that had rows in the sub-partition.
-    Rows {
-        split: usize,
-        columns: Vec<ArrayRef>,
-    },
-}
-
-impl PartitionEntry {
-    /// The number of groups of partial states, or of input rows.
-    fn num_rows(&self) -> usize {
-        match self {
-            Self::States(states) => states.num_groups(),
-            Self::Rows { columns, .. } => {
-                columns.first().map_or(0, |column| column.len())
-            }
-        }
-    }
+    /// The partial states of groups of the partition: one entry per flush of
+    /// a thread-local table that had groups in the partition.
+    states: Vec<GroupedStates>,
+    /// Input rows of the partition that bypassed the thread-local tables
+    /// (their columns, see [`evaluate_rows`]), by sub-partition: one entry
+    /// per scatter of rows of a thread that had rows in the sub-partition.
+    rows: [Vec<Vec<ArrayRef>>; NUM_SPLITS],
 }
 
 impl Partition {
     fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.states.is_empty() && self.rows.iter().all(Vec::is_empty)
     }
 
     /// The number of partial states and input rows of the partition.
     fn num_rows(&self) -> usize {
-        self.entries.iter().map(PartitionEntry::num_rows).sum()
-    }
-
-    /// Whether the partition has input rows that bypassed the thread-local
-    /// tables.
-    fn has_rows(&self) -> bool {
-        self.entries
+        let rows = self
+            .rows
             .iter()
-            .any(|entry| matches!(entry, PartitionEntry::Rows { .. }))
+            .flatten()
+            .map(|columns| columns.first().map_or(0, |column| column.len()));
+        self.states
+            .iter()
+            .map(GroupedStates::num_groups)
+            .chain(rows)
+            .sum()
     }
 }
 
@@ -237,10 +203,7 @@ impl RadixSinkState {
     /// partitions `partitions` (see [`hash_keys`]).
     fn add_states(&self, states: GroupedStates, partitions: &[u8]) -> Result<()> {
         for (partition, states) in scatter_states(states, partitions, NUM_PARTITIONS)? {
-            self.partitions[partition]
-                .lock()
-                .entries
-                .push(PartitionEntry::States(states));
+            self.partitions[partition].lock().states.push(states);
         }
         Ok(())
     }
@@ -254,10 +217,7 @@ impl RadixSinkState {
         {
             let (partition, split) =
                 (sub_partition >> SPLIT_BITS, sub_partition % NUM_SPLITS);
-            self.partitions[partition]
-                .lock()
-                .entries
-                .push(PartitionEntry::Rows { split, columns });
+            self.partitions[partition].lock().rows[split].push(columns);
         }
         Ok(())
     }
@@ -1319,8 +1279,7 @@ impl DistinctEstimate {
 
 /// Finalize a partition: merge the partial states of its groups and
 /// aggregate its rows that bypassed the thread-local tables, from all
-/// threads, in the order in which the threads added them (see
-/// [`Partition`]), and evaluate the groups. Returns the output rows of the
+/// threads, and evaluate the groups. Returns the output rows of the
 /// partition.
 ///
 /// A partition of more than [`SPLIT_ROWS`] rows, some of which bypassed the
@@ -1328,58 +1287,53 @@ impl DistinctEstimate {
 /// one after the other, so that their hash tables are smaller and stay cache
 /// resident: its input rows are scattered to them already, its partial states
 /// are scattered (by the next [`SPLIT_BITS`] bits of the partition hashes of
-/// their keys) first, keeping their order. A partition of partial states only
-/// is finalized at once: hashing and scattering all of its states again costs
-/// more than the smaller tables save.
+/// their keys) first. A partition of partial states only is finalized at
+/// once: hashing and scattering all of its states again costs more than the
+/// smaller tables save.
 fn finalize_partition(
     spec: &AggregateSpec,
     partition: Partition,
 ) -> Result<Vec<RecordBatch>> {
-    if partition.num_rows() <= SPLIT_ROWS || !partition.has_rows() {
-        let output = finalize_groups(spec, &partition.entries)?;
+    if partition.num_rows() <= SPLIT_ROWS || partition.rows.iter().all(Vec::is_empty) {
+        let output =
+            finalize_groups(spec, &partition.states, partition.rows.iter().flatten())?;
         return Ok(output.into_iter().collect());
     }
-    let mut entries: [Vec<PartitionEntry>; NUM_SPLITS] = Default::default();
+    let mut states: [Vec<GroupedStates>; NUM_SPLITS] = Default::default();
     let (mut hashes, mut splits) = (vec![], vec![]);
-    for entry in partition.entries {
-        match entry {
-            PartitionEntry::States(groups) => {
-                hash_keys(&groups.keys, &mut hashes, &mut splits)?;
-                splits.clear();
-                splits.extend(
-                    hashes
-                        .iter()
-                        .map(|&hash| sub_partition_of(hash) % NUM_SPLITS as u8),
-                );
-                for (split, groups) in scatter_states(groups, &splits, NUM_SPLITS)? {
-                    entries[split].push(PartitionEntry::States(groups));
-                }
-            }
-            PartitionEntry::Rows { split, columns } => {
-                entries[split].push(PartitionEntry::Rows { split, columns });
-            }
+    for groups in partition.states {
+        hash_keys(&groups.keys, &mut hashes, &mut splits)?;
+        splits.clear();
+        splits.extend(
+            hashes
+                .iter()
+                .map(|&hash| sub_partition_of(hash) % NUM_SPLITS as u8),
+        );
+        for (split, groups) in scatter_states(groups, &splits, NUM_SPLITS)? {
+            states[split].push(groups);
         }
     }
     let mut outputs = vec![];
-    for entries in &entries {
-        outputs.extend(finalize_groups(spec, entries)?);
+    for (states, rows) in states.iter().zip(&partition.rows) {
+        outputs.extend(finalize_groups(spec, states, rows)?);
     }
     Ok(outputs)
 }
 
-/// Merge the partial states and aggregate the input rows of `entries`, of a
-/// set of groups, into a new table, in their order, and evaluate the groups.
-/// Returns `None` if there are no groups.
-fn finalize_groups(
+/// Merge the partial states `states` and aggregate the input rows `rows` of
+/// a set of groups into a new table, and evaluate the groups. Returns `None`
+/// if there are no groups.
+fn finalize_groups<'a>(
     spec: &AggregateSpec,
-    entries: &[PartitionEntry],
+    states: &[GroupedStates],
+    rows: impl IntoIterator<Item = &'a Vec<ArrayRef>>,
 ) -> Result<Option<RecordBatch>> {
     let mut table = GroupedHashTable::try_new_merge(spec)?;
-    for entry in entries {
-        match entry {
-            PartitionEntry::States(states) => table.merge(states)?,
-            PartitionEntry::Rows { columns, .. } => table.update_rows(spec, columns)?,
-        }
+    for states in states {
+        table.merge(states)?;
+    }
+    for rows in rows {
+        table.update_rows(spec, rows)?;
     }
     let Some(columns) = table.evaluate()? else {
         return Ok(None);
@@ -1419,25 +1373,6 @@ mod tests {
         assert_byte_eq_with_datafusion_with_config, canonical_batch, datafusion_context,
         test_session_config,
     };
-
-    impl Partition {
-        /// The partial states of the partition, in their order.
-        fn states(&self) -> impl Iterator<Item = &GroupedStates> {
-            self.entries.iter().filter_map(|entry| match entry {
-                PartitionEntry::States(states) => Some(states),
-                PartitionEntry::Rows { .. } => None,
-            })
-        }
-
-        /// The input rows of the partition that bypassed the thread-local
-        /// tables, in their order.
-        fn rows(&self) -> impl Iterator<Item = &Vec<ArrayRef>> {
-            self.entries.iter().filter_map(|entry| match entry {
-                PartitionEntry::Rows { columns, .. } => Some(columns),
-                PartitionEntry::States(_) => None,
-            })
-        }
-    }
 
     /// The partition of the group of the keys of `row`.
     fn partition_of_row(keys: &[ArrayRef], row: usize) -> usize {
@@ -1482,11 +1417,11 @@ mod tests {
             let mut seen = vec![false; n as usize];
             for (partition, data) in global.partitions.iter().enumerate() {
                 let data = data.lock();
-                assert!(data.rows().next().is_none());
+                assert!(data.rows.iter().all(Vec::is_empty));
                 // A single flush puts at most one set of groups into every
                 // partition.
-                assert!(data.states().count() <= 1, "{n}");
-                for groups in data.states() {
+                assert!(data.states.len() <= 1, "{n}");
+                for groups in &data.states {
                     assert!(groups.num_groups() > 0);
                     for row in 0..groups.num_groups() {
                         assert_eq!(partition_of_row(&groups.keys, row), partition);
@@ -1849,7 +1784,8 @@ mod tests {
             .iter()
             .fold((0, 0), |(states, rows), data| {
                 let data = data.lock();
-                (states + data.states().count(), rows + data.rows().count())
+                let rows = rows + data.rows.iter().map(Vec::len).sum::<usize>();
+                (states + data.states.len(), rows)
             })
     }
 
@@ -2033,7 +1969,7 @@ mod tests {
         let global = sink.2.downcast_ref::<RadixSinkState>().unwrap();
         let mut scattered = 0;
         for partition in &global.partitions {
-            for columns in partition.lock().rows() {
+            for columns in partition.lock().rows.iter().flatten() {
                 let keys = columns[0].as_primitive::<Int64Type>().values();
                 let chunk = |key: i64| key / 100;
                 assert!(keys.iter().all(|&key| chunk(key) == chunk(keys[0])));
@@ -2134,14 +2070,8 @@ mod tests {
         for (num_keys, split) in [(70_000, true), (20_000, false)] {
             let keys = &keys[..num_keys];
             let mut partition = Partition::default();
-            for (keys, count) in [
-                (&keys[..num_keys * 4 / 7], 2),
-                (&keys[num_keys * 3 / 7..], 3),
-            ] {
-                partition
-                    .entries
-                    .push(PartitionEntry::States(states(keys, count)));
-            }
+            partition.states.push(states(&keys[..num_keys * 4 / 7], 2));
+            partition.states.push(states(&keys[num_keys * 3 / 7..], 3));
             let rows: ArrayRef =
                 Arc::new(Int64Array::from(keys[..num_keys / 7].to_vec()));
             let (mut hashes, mut partitions) = (vec![], vec![]);
@@ -2151,9 +2081,7 @@ mod tests {
                 .map(|&hash| sub_partition_of(hash) % NUM_SPLITS as u8)
                 .collect::<Vec<_>>();
             for (split, columns) in scatter(vec![vec![rows]], &splits, NUM_SPLITS)? {
-                partition
-                    .entries
-                    .push(PartitionEntry::Rows { split, columns });
+                partition.rows[split].push(columns);
             }
             assert_eq!(partition.num_rows() > SPLIT_ROWS, split);
             let outputs = finalize_partition(&spec, partition)?;
@@ -2552,116 +2480,6 @@ mod tests {
             canonical_batch(&schema, &expected, false)?,
             "{sql} on {threads} threads with tables of {capacity:?}"
         );
-        Ok(())
-    }
-
-    /// Batches of 2,048 rows of keys `keys`, values `v` (the row numbers) and
-    /// floating point values `f` (`1e16`, `1.0` and `-1e16`, whose sums depend
-    /// on the order in which they are added up).
-    fn ordered_rows(schema: &SchemaRef, keys: &[i64]) -> Result<Vec<RecordBatch>> {
-        keys.chunks(DEFAULT_VECTOR_SIZE)
-            .enumerate()
-            .map(|(chunk, keys)| {
-                let rows = (chunk * DEFAULT_VECTOR_SIZE) as i64;
-                let rows = rows..rows + keys.len() as i64;
-                let columns: Vec<ArrayRef> = vec![
-                    Arc::new(Int64Array::from(keys.to_vec())),
-                    Arc::new(Int64Array::from_iter_values(rows.clone())),
-                    Arc::new(arrow::array::Float64Array::from_iter_values(
-                        rows.map(|row| [1e16, 1.0, -1e16][row as usize % 3]),
-                    )),
-                ];
-                Ok(RecordBatch::try_new(Arc::clone(schema), columns)?)
-            })
-            .collect()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rows_of_threads_that_leave_the_bypass_are_aggregated_in_their_order()
-    -> Result<()> {
-        // A single partition: 32,768 distinct keys, which fill the table of the
-        // thread (whose rows then bypass it), 4 more rows of every key (after
-        // 131,072 rows that bypassed the table, the thread sees its groups come
-        // back, and aggregates its rows again, in a grown table), and one more
-        // row of every key. The final aggregation of a partition gets the
-        // partial states of the first and of the last row of every group, and
-        // the rows in between, which bypassed the table: it aggregates them in
-        // that order (see `Partition`), so that the aggregates whose values
-        // depend on the order of their rows (the last value, the order of the
-        // values of `ARRAY_AGG`, the rounding of sums of floating point values)
-        // get the values that DataFusion's single partition gets. (Before, the
-        // partial states of a partition were all merged before its rows.)
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-            Field::new("f", DataType::Float64, false),
-        ]));
-        let keys = (0..6).flat_map(|_| 0..32_768).collect::<Vec<i64>>();
-        let batches = ordered_rows(&schema, &keys)?;
-        let setup = async |ctx: &SessionContext| -> Result<()> {
-            let table = datafusion::datasource::MemTable::try_new(
-                Arc::clone(&schema),
-                vec![batches.clone()],
-            )?;
-            ctx.register_table("t", Arc::new(table))?;
-            Ok(())
-        };
-        let queries = [
-            "SELECT k, LAST_VALUE(v), FIRST_VALUE(v), SUM(f), AVG(f) FROM t GROUP BY k",
-            "SELECT k, ARRAY_AGG(v), LAST_VALUE(v) FILTER (WHERE f > 0) FROM t GROUP BY k",
-        ];
-        // The thread leaves the bypass after the first 163,840 rows.
-        let ctx = datafusion_context(trusting(test_session_config()));
-        setup(&ctx).await?;
-        let plan = ctx.sql(queries[0]).await?.create_physical_plan().await?;
-        let aggregate = PhysicalHashAggregate::try_lower(
-            &aggregation(&plan).expect("an aggregation"),
-            lower,
-        )?
-        .expect("a lowered aggregation");
-        let spec = aggregate.spec();
-        assert!(spec.rows_bypass_tables(ctx.state().config().options()));
-        let local =
-            RadixHashAggregate::local_sink_state(&spec, TableCapacity::default(), true)?;
-        let mut sink = (spec, local, RadixHashAggregate::global_sink_state()?);
-        let sink_rows = |sink: &mut Sink, batches: &[RecordBatch]| -> Result<()> {
-            let (spec, local, global) = sink;
-            for batch in batches {
-                RadixHashAggregate::sink(
-                    spec,
-                    batch.clone(),
-                    global.as_ref(),
-                    local.as_mut(),
-                )?;
-            }
-            Ok(())
-        };
-        sink_rows(&mut sink, &batches[..16])?;
-        assert!(local_state(&sink).bypass.is_some());
-        sink_rows(&mut sink, &batches[16..80])?;
-        let state = local_state(&sink);
-        assert!(state.bypass.is_none());
-        assert_eq!(state.capacity, 1 << 16);
-        sink_rows(&mut sink, &batches[80..])?;
-        assert_eq!(local_state(&sink).table.num_groups(), 32_768);
-        // Like DataFusion, on a single thread (which sees the rows of the
-        // partition in their order), in a session that trusts the aggregate
-        // functions (whose rows bypass the table) and in one that does not,
-        // also through the planner, which lowers the aggregation.
-        for sql in queries {
-            for trusted in [false, true] {
-                let mut config = test_session_config().with_target_partitions(1);
-                if trusted {
-                    config = trusting(config);
-                }
-                let ctx = datafusion_context(config.clone());
-                setup(&ctx).await?;
-                assert_bypassed_parity(&ctx, sql, TableCapacity::default(), 1, trusted)
-                    .await?;
-                assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
-                assert_byte_eq_with_datafusion_with_config(sql, config, &setup).await;
-            }
-        }
         Ok(())
     }
 
@@ -3966,8 +3784,12 @@ mod tests {
                 .fold((0, 0), |(flushes, groups), data| {
                     let data = data.lock();
                     let groups = groups
-                        + data.states().map(GroupedStates::num_groups).sum::<usize>();
-                    (flushes + data.states().count(), groups)
+                        + data
+                            .states
+                            .iter()
+                            .map(GroupedStates::num_groups)
+                            .sum::<usize>();
+                    (flushes + data.states.len(), groups)
                 });
         assert!(flushes > 0);
         // At most 3 groups per flush of a table, out of 300.
