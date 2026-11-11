@@ -860,12 +860,26 @@ fn build_partition(
 /// row of their chains: an open-addressed table of the offsets of the keys in
 /// their range (plus one: `0` is an empty slot), which grows with the keys, and
 /// whose memory is reserved before it is allocated.
+///
+/// The table only keeps the threads that build the partitions in parallel from
+/// writing the shared cache lines of the entries of the index for every row,
+/// rather than once per key: it is optional. Without room for it (or for a
+/// larger one) in the memory pool, the first rows of the chains are kept in
+/// the entries of the index themselves (those of the keys in the table are
+/// moved there), which only the partition of a key writes (all rows of a key
+/// are in one partition). So a dense index needs no memory beyond its entries
+/// and its chains, which [`DenseBuild::try_new`] reserves before the build:
+/// the dense index of a build side whose hashed tables would fit in the pool
+/// fits too if its entries and chains do.
 struct PartitionKeys<'a> {
+    /// Empty if the first rows of the chains are kept in `entries`.
     keys: Vec<u64>,
     heads: Vec<u64>,
     len: usize,
     /// The bits of the hash of a key that select its first slot.
     shift: u32,
+    /// The entries of the index.
+    entries: &'a [AtomicU64],
     reservation: &'a MemoryReservation,
 }
 
@@ -873,16 +887,20 @@ impl<'a> PartitionKeys<'a> {
     /// The smallest table.
     const MIN_CAPACITY: usize = 64;
 
-    fn try_new(reservation: &'a MemoryReservation) -> Result<Self> {
+    /// The keys of a partition of the index of `entries`, in a table if the
+    /// memory pool of `reservation` has room for it, otherwise in `entries`.
+    fn new(entries: &'a [AtomicU64], reservation: &'a MemoryReservation) -> Self {
         let mut keys = Self {
             keys: vec![],
             heads: vec![],
             len: 0,
             shift: 0,
+            entries,
             reservation,
         };
-        keys.resize(Self::MIN_CAPACITY)?;
-        Ok(keys)
+        // Without room for the table, the entries keep the chains.
+        let _ = keys.resize(Self::MIN_CAPACITY);
+        keys
     }
 
     fn memory_size(&self) -> usize {
@@ -929,31 +947,51 @@ impl<'a> PartitionKeys<'a> {
         slot
     }
 
-    /// The first row of the chain of the key with offset `offset` (packed, `0`
+    /// Make `row` (a packed location) the first row of the chain of the key
+    /// with offset `offset`, and return the previous first row (packed, `0`
     /// for a new key).
     #[inline]
-    fn head(&mut self, offset: u64) -> Result<&mut u64> {
-        let key = offset + 1;
-        let mut slot = self.slot(key);
-        if self.keys[slot] == 0 {
-            // At most half of the slots are used.
-            if 2 * (self.len + 1) > self.keys.len() {
-                self.resize(2 * self.keys.len())?;
-                slot = self.slot(key);
+    fn prepend(&mut self, offset: u64, row: u64) -> u64 {
+        if !self.keys.is_empty() {
+            let key = offset + 1;
+            let mut slot = self.slot(key);
+            if self.keys[slot] != 0 {
+                return std::mem::replace(&mut self.heads[slot], row);
             }
-            self.keys[slot] = key;
-            self.len += 1;
+            // At most half of the slots are used. Without room for a larger
+            // table, the entries keep the chains from now on.
+            let full = 2 * (self.len + 1) > self.keys.len();
+            if !full || self.resize(2 * self.keys.len()).is_ok() {
+                if full {
+                    slot = self.slot(key);
+                }
+                self.keys[slot] = key;
+                self.heads[slot] = row;
+                self.len += 1;
+                return 0;
+            }
+            self.flush();
         }
-        Ok(&mut self.heads[slot])
+        // Only the partition of the key writes its entry.
+        let entry = &self.entries[offset as usize];
+        let previous = entry.load(Ordering::Relaxed);
+        entry.store(row, Ordering::Relaxed);
+        previous
     }
 
-    /// The offsets of the keys and the first rows of their chains.
-    fn chains(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.keys
-            .iter()
-            .zip(&self.heads)
-            .filter(|&(&key, _)| key != 0)
-            .map(|(&key, &head)| ((key - 1) as usize, head))
+    /// Write the first rows of the chains of the keys in the table to their
+    /// entries, and release the table: the entries keep the chains from now
+    /// on.
+    fn flush(&mut self) {
+        for (&key, &head) in self.keys.iter().zip(&self.heads) {
+            if key != 0 {
+                self.entries[(key - 1) as usize].store(head, Ordering::Relaxed);
+            }
+        }
+        self.reservation.shrink(self.memory_size());
+        self.keys = vec![];
+        self.heads = vec![];
+        self.len = 0;
     }
 }
 
@@ -972,7 +1010,8 @@ impl Drop for PartitionKeys<'_> {
 /// the collection; no key is hashed or compared with the keys of other rows.
 /// The first row of the chain of every key of the partition is kept in a table
 /// of the keys of the partition ([`PartitionKeys`]), and written to the entry
-/// of the key once the partition is built: the threads that build other
+/// of the key once the partition is built (or in the entry itself, if the
+/// memory pool has no room for the table): the threads that build other
 /// partitions write the entries of other keys, and the chains of other rows.
 fn build_dense_partition(
     collection: &TupleDataCollection,
@@ -985,7 +1024,7 @@ fn build_dense_partition(
     if range.rows.is_empty() {
         return Ok(0);
     }
-    let mut keys = PartitionKeys::try_new(reservation)?;
+    let mut keys = PartitionKeys::new(&dense.entries, reservation);
     let null_equals_null = null_equality == NullEquality::NullEqualsNull;
     let mut null_chain = 0;
     let mut num_entries = 0;
@@ -999,24 +1038,21 @@ fn build_dense_partition(
             locations.extend((start..end).rev().map(|row| RowLocation::new(block, row)));
             let rows = collection.row_refs(&locations)?;
             for (&location, row) in locations.iter().zip(&rows) {
-                let head = if row.is_valid(0) {
-                    keys.head(plan.offset(plan.reader.read(row.row))?)?
+                let next = if row.is_valid(0) {
+                    keys.prepend(plan.offset(plan.reader.read(row.row))?, pack(location))
                 } else if null_equals_null {
-                    &mut null_chain
+                    std::mem::replace(&mut null_chain, pack(location))
                 } else {
                     // A NULL key matches nothing.
                     continue;
                 };
-                dense.next[first_row + location.row()].store(*head, Ordering::Relaxed);
-                *head = pack(location);
+                dense.next[first_row + location.row()].store(next, Ordering::Relaxed);
                 num_entries += 1;
             }
             end = start;
         }
     }
-    for (key, head) in keys.chains() {
-        dense.entries[key].store(head, Ordering::Relaxed);
-    }
+    keys.flush();
     if null_chain != 0 {
         dense.null_chain.store(null_chain, Ordering::Relaxed);
     }
@@ -1162,7 +1198,8 @@ impl JoinHashTableBuilder {
     ///
     /// * with a [`DenseIndex`] if the range spans at most [`MAX_DENSE_SPAN`]
     ///   keys, and at most 65,536 keys or 8 keys per build row (and if the
-    ///   memory pool has room for it);
+    ///   memory pool has room for its entries and its chains, all the memory
+    ///   that building it needs, see [`PartitionKeys`]);
     /// * otherwise with the hashed tables of the partitions and a
     ///   [`KeyFilter`] of the range, and of the buckets of keys in which build
     ///   keys fall (of at most 2^19 buckets, which the partitions record as
@@ -3257,11 +3294,13 @@ mod tests {
         };
         let index = (17 + 200) * size_of::<u64>();
         // The index, and the keys of a partition while it is built (of at most
-        // 512 slots of 16 bytes for the 200 rows). Without room for the index,
-        // the rows get hashed tables, which need more memory here.
+        // 512 slots of 16 bytes for the 200 rows) if there is room for them
+        // (see `PartitionKeys`). Without room for the index, the rows get
+        // hashed tables, which need more memory here.
         for (limit, dense, fits) in [
             (0, false, false),
             (index - 1, false, false),
+            (index, true, true),
             (index + 8192, true, true),
         ] {
             let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
@@ -3318,5 +3357,109 @@ mod tests {
         assert!(!builder.has_dense_index());
         let table = builder.finish(false).unwrap();
         assert!(!table.has_dense_index() && table.filters_keys(true));
+    }
+
+    #[test]
+    fn dense_indexes_fit_where_their_entries_and_chains_fit() {
+        // A build side of one row: a dense index of one entry and one chain
+        // (16 bytes), or a hashed table of 8 slots and one chain (72 bytes).
+        // Both fit in 100 bytes: the dense index is built without the table of
+        // the keys of its partition (of at least 1,024 bytes, see
+        // `PartitionKeys`), for which there is no room.
+        let build = batch(vec![Some(7)]);
+        let probe_batch = batch(vec![Some(7), Some(8), None, Some(7)]);
+        for (dense, reserved) in [(false, 72), (true, 16)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
+            let mut data = PartitionedTupleData::try_new(layout(schema(), 7), 2).unwrap();
+            let chunk = DataChunk::from_record_batch(build.clone());
+            data.append_chunk(&chunk, &hashes(&build, 1)).unwrap();
+            let mut builder = JoinHashTableBuilder::try_new(
+                data,
+                1,
+                NullEquality::NullEqualsNothing,
+                MemoryConsumer::new("JoinHashTable").register(&pool),
+            )
+            .unwrap()
+            .single_partition_up_to(SMALL_BUILD_ROWS);
+            if dense {
+                builder = builder
+                    .with_key_range(key_range(std::slice::from_ref(&build)))
+                    .unwrap();
+            }
+            assert_eq!(builder.has_dense_index(), dense);
+            let table = builder.finish(false).unwrap();
+            assert_eq!(table.has_dense_index(), dense);
+            assert_eq!(table.reserved_memory(), reserved, "dense: {dense}");
+            assert_eq!(pool.reserved(), reserved, "dense: {dense}");
+            assert_eq!(
+                probe_one_key(&table, &probe_batch, 100),
+                vec![(0, 0), (3, 0)],
+                "dense: {dense}"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_partitions_without_room_for_their_keys_build_the_index_directly() {
+        // 1,000 build rows of the 250 keys `0..250`, every key once in each of
+        // 4 batches, probed with the keys from -10 to 259 and a NULL.
+        let build = (0..4)
+            .map(|b| {
+                let keys = (0..250).map(|i| Some((i * 7 + b * 13) % 250)).collect();
+                batch_with_values(keys, i64::from(b) * 1000)
+            })
+            .collect::<Vec<_>>();
+        let probe_batch = batch((-10..260).map(Some).chain([None]).collect());
+        let expected = expected(&build, &probe_batch, NullEquality::NullEqualsNothing);
+        let index = (250 + 1000) * size_of::<u64>();
+        // The smallest table of the keys of a partition: 64 slots of 16 bytes,
+        // for up to 32 keys.
+        let smallest_keys = PartitionKeys::MIN_CAPACITY * 2 * size_of::<u64>();
+        // In a single partition (with 250 keys), or in 4 partitions built by 4
+        // threads at once (in one with `force_hash_collisions`). The pool has
+        // room for the index only: the partitions keep the first rows of their
+        // chains in the entries of the index from the start. Or for the index
+        // and the smallest table of the keys of a partition, but not for a
+        // larger one: a partition with more than 32 keys moves the first rows
+        // in its table to the entries once its table is full. Or for all
+        // tables.
+        for radix_bits in [0, 2] {
+            for limit in [index, index + smallest_keys + 100, 100 * index] {
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+                let mut data =
+                    PartitionedTupleData::try_new(layout(schema(), 64), radix_bits)
+                        .unwrap();
+                for batch in &build {
+                    let chunk = DataChunk::from_record_batch(batch.clone());
+                    data.append_chunk(&chunk, &hashes(batch, 1)).unwrap();
+                }
+                let builder = JoinHashTableBuilder::try_new(
+                    data,
+                    1,
+                    NullEquality::NullEqualsNothing,
+                    MemoryConsumer::new("JoinHashTable").register(&pool),
+                )
+                .unwrap()
+                .with_key_range(key_range(&build))
+                .unwrap();
+                assert!(builder.has_dense_index(), "{limit}");
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| while builder.build_next_partition().unwrap() {});
+                    }
+                });
+                let table = builder.finish(false).unwrap();
+                assert!(table.has_dense_index());
+                // The tables of the keys of the partitions are released.
+                assert_eq!(table.reserved_memory(), index, "{radix_bits}, {limit}");
+                assert_eq!(pool.reserved(), index, "{radix_bits}, {limit}");
+                // All matches, in the order of the build rows.
+                assert_eq!(
+                    probe_one_key(&table, &probe_batch, 300),
+                    expected,
+                    "{radix_bits}, {limit}"
+                );
+            }
+        }
     }
 }
