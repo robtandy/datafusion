@@ -221,7 +221,10 @@ impl GroupedHashTable {
     /// The final table of a partition aggregates the rows that bypassed the
     /// thread-local tables so, with the accumulators of the final
     /// aggregation: only for aggregations whose final aggregates are those
-    /// that consume the input rows (see `AggregateSpec::bypass`).
+    /// that consume the input rows (see `AggregateSpec::bypass`). And the
+    /// thread-local table of a top-k aggregation the rows that its cutoff
+    /// does not rule out, whose keys and arguments were evaluated to compare
+    /// them with the cutoff (see `RadixLocalState::aggregate`).
     pub(crate) fn update_rows(
         &mut self,
         spec: &AggregateSpec,

@@ -87,14 +87,17 @@ use arrow::array::{
     downcast_primitive,
 };
 use arrow::buffer::NullBuffer;
-use arrow::compute::{filter_record_batch, interleave, take};
+use arrow::compute::{filter, filter_record_batch, interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
+use datafusion_physical_expr::PhysicalExpr;
 use parking_lot::Mutex;
 
 use super::grouped_ht::{GroupedHashTable, GroupedStates, evaluate_rows};
-use super::hash_aggregate::{AggregateSpec, InputBuffer, TopK, TopKOrder};
+use super::hash_aggregate::{
+    AggregateSpec, InputBuffer, TopK, TopKOrder, rebuilt_literal,
+};
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, SinkFinalize,
@@ -311,10 +314,12 @@ impl RadixLocalState {
     /// aggregates its rows again, in a table that holds its groups.
     ///
     /// The rows of a top-k aggregation that its cutoff rules out (see
-    /// [`TopK::candidates`]) are not aggregated, and its table is also flushed
-    /// once it aggregated as many rows as it can hold groups, even if it is
-    /// not full: the flush of a table keeps its top groups, whose values are
-    /// better than those of the other groups of the table. The thread of an
+    /// [`TopK::candidates`]) are not aggregated (the keys and arguments of its
+    /// rows are evaluated once, to compare them with the cutoff and to
+    /// aggregate them), and its table is also flushed once it aggregated as
+    /// many rows as it can hold groups, even if it is not full: the flush of a
+    /// table keeps its top groups, whose values are better than those of the
+    /// other groups of the table. The thread of an
     /// aggregation with a soft limit finishes once its table holds the groups
     /// of the limit.
     fn aggregate(
@@ -366,25 +371,27 @@ impl RadixLocalState {
             }
             return Ok(());
         }
-        let candidates;
-        let batch = match (&spec.top_k, &self.cutoff) {
+        // The rows of a top-k aggregation that its cutoff does not rule out,
+        // whose keys and arguments are evaluated once (see
+        // `top_k_candidates`).
+        let candidates = match (&spec.top_k, &self.cutoff) {
             (Some(top_k), Some(cutoff)) => {
-                let values = top_k_input_values(spec, top_k, batch)?;
-                match top_k.candidates(&values, cutoff)? {
-                    Some(selected) => {
-                        candidates = filter_record_batch(batch, &selected)?;
-                        &candidates
-                    }
-                    None => batch,
-                }
+                Some(top_k_candidates(spec, top_k, cutoff, batch)?)
             }
-            _ => batch,
+            _ => None,
         };
-        if batch.num_rows() == 0 {
+        let num_rows = match &candidates {
+            Some(columns) => columns.first().map_or(0, |column| column.len()),
+            None => batch.num_rows(),
+        };
+        if num_rows == 0 {
             return Ok(());
         }
-        self.table.update(spec, batch)?;
-        self.table_rows += batch.num_rows();
+        match &candidates {
+            Some(columns) => self.table.update_rows(spec, columns)?,
+            None => self.table.update(spec, batch)?,
+        }
+        self.table_rows += num_rows;
         let num_groups = self.table.num_groups();
         if spec.soft_limit.is_some_and(|limit| num_groups >= limit) {
             self.finished = true;
@@ -485,25 +492,74 @@ fn top_k_values<'a>(top_k: &TopK, states: &'a GroupedStates) -> Result<&'a dyn A
     }
 }
 
-/// The values of the input rows of `batch` of the top-k aggregation `top_k`
-/// of `spec` that order their groups: their group keys, or the argument of
-/// the aggregate.
-fn top_k_input_values(
+/// The columns (see [`evaluate_rows`]) of the input rows of `batch` of the
+/// top-k aggregation `top_k` of `spec` that its cutoff `cutoff` does not rule
+/// out (see [`TopK::candidates`]): no columns if it rules out all rows.
+///
+/// The values that order the groups of the rows (their keys, or the argument
+/// of the aggregate) are evaluated once for all rows, to compare them with the
+/// cutoff, and those of the candidates are aggregated (they may be volatile);
+/// the key of an aggregation by its aggregate is evaluated for the candidates
+/// only.
+fn top_k_candidates(
     spec: &AggregateSpec,
     top_k: &TopK,
+    cutoff: &ArrayRef,
     batch: &RecordBatch,
-) -> Result<ArrayRef> {
-    let values = match top_k.order {
-        TopKOrder::Key => spec.group_by.expr().first().map(|(key, _)| key),
-        TopKOrder::Aggregate => spec
-            .update
-            .first()
-            .and_then(|update| update.arguments.first()),
+) -> Result<Vec<ArrayRef>> {
+    // A top-k aggregation has a single key, without grouping sets, and no
+    // aggregates if it is ordered by its key, or a single `MIN` / `MAX` of a
+    // single argument, without a filter or an order, if it is ordered by it.
+    let ([(key, _)], true) = (spec.group_by.expr(), spec.group_by.is_single()) else {
+        return internal_err!("{OPERATOR} found no single key of a top-k aggregation");
     };
-    match values {
-        Some(values) => values.evaluate(batch)?.into_array(batch.num_rows()),
-        None => internal_err!("{OPERATOR} found no value to order the input rows by"),
+    let argument = match (top_k.order, spec.update.as_slice()) {
+        (TopKOrder::Key, []) => None,
+        (TopKOrder::Aggregate, [update])
+            if update.arguments.len() == 1 && update.filter.is_none() =>
+        {
+            Some(&update.arguments[0])
+        }
+        _ => {
+            return internal_err!(
+                "{OPERATOR} found other aggregates than those of a top-k aggregation"
+            );
+        }
+    };
+    let num_rows = batch.num_rows();
+    let evaluate = |expr: &Arc<dyn PhysicalExpr>, batch: &RecordBatch| {
+        expr.evaluate(batch)?.into_array(batch.num_rows())
+    };
+    // A literal argument is rebuilt, not evaluated (nor stored).
+    let literal = argument.and_then(|argument| rebuilt_literal(argument));
+    let values = match (argument, literal) {
+        (None, _) => evaluate(key, batch)?,
+        (Some(_), Some(literal)) => literal.to_array_of_size(num_rows)?,
+        (Some(argument), None) => evaluate(argument, batch)?,
+    };
+    let selected = top_k.candidates(&values, cutoff)?;
+    if selected
+        .as_ref()
+        .is_some_and(|selected| selected.true_count() == 0)
+    {
+        return Ok(vec![]);
     }
+    let values = match &selected {
+        Some(selected) => filter(values.as_ref(), selected)?,
+        None => values,
+    };
+    if argument.is_none() {
+        return Ok(vec![values]);
+    }
+    let candidates = match &selected {
+        Some(selected) => &filter_record_batch(batch, selected)?,
+        None => batch,
+    };
+    let mut columns = vec![evaluate(key, candidates)?];
+    if literal.is_none() {
+        columns.push(values);
+    }
+    Ok(columns)
 }
 
 /// The rows of a thread that bypass its table (see
@@ -4236,6 +4292,166 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(key_values(&output), expected);
         Ok(())
+    }
+
+    /// `tick(v)`: a volatile function that numbers the rows it is evaluated
+    /// for, from 1, and counts them in `ticks` (its argument only makes it a
+    /// function of the rows).
+    #[derive(Debug)]
+    struct Tick {
+        ticks: Arc<AtomicUsize>,
+        signature: datafusion_expr::Signature,
+    }
+
+    impl PartialEq for Tick {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.ticks, &other.ticks)
+        }
+    }
+
+    impl Eq for Tick {}
+
+    impl std::hash::Hash for Tick {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.ticks).hash(state);
+        }
+    }
+
+    impl datafusion_expr::ScalarUDFImpl for Tick {
+        fn name(&self) -> &str {
+            "tick"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn invoke_with_args(
+            &self,
+            args: datafusion_expr::ScalarFunctionArgs,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            let rows = args.number_rows;
+            let first = self.ticks.fetch_add(rows, Ordering::SeqCst) as i64;
+            let ticks = Int64Array::from_iter_values(first + 1..=first + rows as i64);
+            Ok(datafusion_expr::ColumnarValue::Array(Arc::new(ticks)))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn volatile_values_of_top_k_aggregations_are_evaluated_once() -> Result<()> {
+        use super::super::test_support::lower_with_tiny_tables;
+        use crate::bridge::PipelineRootExec;
+        // 40,000 distinct keys `k` of a single partition, in batches of 2,048
+        // rows: the first 32,768 rows of a thread fill its table, whose flush
+        // sets a cutoff, which the rows after it are compared with (all of them
+        // with tiny tables). `tick(v)` numbers the rows it is evaluated for:
+        // evaluated once for every row, its values are 1 to 40,000, the
+        // greatest 40,000. The native top-k aggregation evaluates its keys and
+        // arguments (`GROUP BY tick(v)`, `MAX(tick(v))`) once, both to compare
+        // them with the cutoff and to aggregate them (evaluated again for the
+        // rows that passed the cutoff, the greatest value was 47,232).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batches = (0..40_000)
+            .step_by(2_048)
+            .map(|start| {
+                let rows = start..(start + 2_048).min(40_000);
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(
+                            rows.clone().map(|i| (i * 7_919) % 40_009),
+                        )),
+                        Arc::new(Int64Array::from_iter_values(rows)),
+                    ],
+                )
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let setup = |ctx: &SessionContext| -> Result<Arc<AtomicUsize>> {
+            let table = datafusion::datasource::MemTable::try_new(
+                Arc::clone(&schema),
+                vec![batches.clone()],
+            )?;
+            ctx.register_table("t", Arc::new(table))?;
+            let ticks = Arc::new(AtomicUsize::new(0));
+            ctx.register_udf(datafusion_expr::ScalarUDF::new_from_impl(Tick {
+                ticks: Arc::clone(&ticks),
+                signature: datafusion_expr::Signature::exact(
+                    vec![DataType::Int64],
+                    datafusion_expr::Volatility::Volatile,
+                ),
+            }));
+            Ok(ticks)
+        };
+        // The greatest value of the output column `column` of `batches`.
+        let greatest = |batches: &[RecordBatch], column: usize| {
+            let values = batches
+                .iter()
+                .flat_map(|batch| batch.column(column).as_primitive::<Int64Type>().iter())
+                .collect::<Vec<_>>();
+            assert_eq!(values.len(), 1, "{values:?}");
+            values[0]
+        };
+        for (sql, column) in [
+            (
+                "SELECT k, MAX(tick(v)) AS m FROM t GROUP BY k \
+                 ORDER BY m DESC NULLS LAST LIMIT 1",
+                1,
+            ),
+            // (A key of the aggregation, which DataFusion evaluates in it: of a
+            // `SELECT DISTINCT tick(v)`, in a projection below it.)
+            (
+                "SELECT tick(v) AS x FROM t GROUP BY tick(v) ORDER BY x DESC LIMIT 1",
+                0,
+            ),
+        ] {
+            for target_partitions in [1, 4] {
+                let config =
+                    test_session_config().with_target_partitions(target_partitions);
+                let context = format!("{sql} on {target_partitions} partitions");
+                // DataFusion.
+                let ctx = datafusion_context(config.clone());
+                let ticks = setup(&ctx)?;
+                let output = ctx.sql(sql).await?.collect().await?;
+                assert_eq!(greatest(&output, column), Some(40_000), "{context}");
+                assert_eq!(ticks.load(Ordering::SeqCst), 40_000, "{context}");
+                // The native top-k aggregation, with tables of the default
+                // capacity and tiny ones.
+                for tiny in [false, true] {
+                    let ctx = datafusion_context(config.clone());
+                    let ticks = setup(&ctx)?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let root = if tiny {
+                        lower_with_tiny_tables(&plan)?
+                    } else {
+                        lower(&plan)?
+                    };
+                    assert_eq!(native_top_k(&root), 1, "{context}");
+                    let exec: Arc<dyn ExecutionPlan> =
+                        Arc::new(PipelineRootExec::try_new(root, plan)?);
+                    let output =
+                        datafusion_physical_plan::collect(exec, ctx.task_ctx()).await?;
+                    let context = format!("{context}, tiny tables: {tiny}");
+                    assert_eq!(greatest(&output, column), Some(40_000), "{context}");
+                    assert_eq!(ticks.load(Ordering::SeqCst), 40_000, "{context}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of native top-k aggregations of `root`.
+    fn native_top_k(root: &Arc<dyn crate::PhysicalOperator>) -> usize {
+        let top_k = root
+            .downcast_ref::<PhysicalHashAggregate>()
+            .is_some_and(|aggregate| aggregate.spec().top_k.is_some());
+        usize::from(top_k) + root.children().iter().map(native_top_k).sum::<usize>()
     }
 
     #[test]
