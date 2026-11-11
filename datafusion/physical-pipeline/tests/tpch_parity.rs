@@ -2187,24 +2187,14 @@ enum Why {
     /// that fails, but a pipeline the error of the chunk that fails first on
     /// any of its threads.
     Projection,
-    /// `PhysicalHashJoin::try_lower` refuses the join: its residual filter
-    /// has decimal arithmetic, which may fail on some rows, and which
-    /// DataFusion evaluates on up to `batch_size` candidate pairs of a probe
-    /// batch before it emits any of them, while the native join emits chunk by
-    /// chunk (and could stop before it reaches a row on which DataFusion
-    /// fails).
-    JoinFilter,
     /// A hash join whose dynamic filter a Parquet scan of its probe side
     /// uses: the scan skips the reads that the filter rejects, a native join
-    /// sets its filter to other values, and the probe side has decimal
-    /// arithmetic that may fail on the rows that DataFusion skips (see
-    /// `PipelineQueryPlanner`).
+    /// sets its filter to other values (the bounds of its build keys), and the
+    /// probe side has work that may fail on the rows that DataFusion skips
+    /// (see `PipelineQueryPlanner`): the decimal arithmetic of the revenues of
+    /// Q15 and the cast into a decimal of the average quantities of Q17, which
+    /// may overflow.
     JoinDynamicFilter,
-    /// A TopK whose dynamic filter the Parquet scan of orders uses, below
-    /// hash joins and an aggregation, which `crate::sort::try_lower` leaves to
-    /// DataFusion: the work of these nodes on the rows that the filter prunes
-    /// depends on when its threshold tightens.
-    TopKDynamicFilter,
 }
 
 /// The exact lowering of a TPC-H query (by number) over a source: the numbers
@@ -2216,7 +2206,9 @@ type Coverage = (usize, usize, usize, usize, &'static [(&'static str, Why)]);
 
 /// How the pipeline engine lowers every TPC-H query, for every source (with
 /// the configuration of the suite, on 4 threads): see
-/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly.
+/// [`tpch_queries_are_lowered_as_listed`], which asserts it exactly. Q8 (over
+/// both sources), Q15 and Q17 (over Parquet) still leave parts of their plans
+/// to DataFusion; lowering them natively too is tracked in #53.
 #[rustfmt::skip]
 const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
     ("MemTable", [
@@ -2236,7 +2228,7 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (14, 8, 8, 0, &[]),
         (15, 18, 18, 0, &[]),
         (16, 13, 13, 0, &[]),
-        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinFilter)]),
+        (17, 11, 11, 0, &[]),
         (18, 12, 12, 0, &[]),
         (19, 9, 9, 0, &[]),
         (20, 18, 18, 0, &[]),
@@ -2260,10 +2252,10 @@ const TPCH_COVERAGE: &[(&str, [Coverage; 22])] = &[
         (14, 8, 8, 0, &[]),
         (15, 9, 10, 10, &[("HashJoinExec", Why::JoinDynamicFilter)]),
         (16, 13, 13, 0, &[]),
-        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinFilter)]),
-        (18, 0, 1, 19, &[("SortPreservingMergeExec", Why::TopKDynamicFilter)]),
+        (17, 2, 3, 12, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (18, 12, 12, 0, &[]),
         (19, 9, 9, 0, &[]),
-        (20, 1, 2, 21, &[("HashJoinExec", Why::JoinDynamicFilter)]),
+        (20, 18, 18, 0, &[]),
         (21, 22, 22, 0, &[]),
         (22, 15, 15, 0, &[]),
     ]),
@@ -2798,5 +2790,43 @@ fn lowering_counts_native_and_bridged_operators() -> Result<()> {
 
     // Plans of default DataFusion are not pipeline plans.
     assert!(Lowering::of(&plan).is_err());
+    Ok(())
+}
+
+/// The TopK of TPC-H Q18 over Parquet is native also when DataFusion plans
+/// `Partitioned` hash joins, as for the larger tables of the benchmark: its
+/// aggregation then reads the partitions of the semi join below it directly,
+/// with the scan of `orders`, which reads the dynamic filter of the TopK, below
+/// the build sides of joins, which they read all of before they probe them, and
+/// a repartitioning, every partition of which ends with the last of its input:
+/// the filter prunes nothing before the scan read all of its files, in both
+/// engines.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn topk_of_tpch_q18_over_partitioned_joins_is_native() -> Result<()> {
+    let mut config = test_session_config();
+    let optimizer = &mut config.options_mut().optimizer;
+    optimizer.hash_join_single_partition_threshold = 0;
+    optimizer.hash_join_single_partition_threshold_rows = 0;
+    let source = Source::parquet();
+    let setup = async |ctx: &SessionContext| source.register(ctx).await;
+    let sql = tpch::query(18);
+    let (expected, actual) = run_engines(sql, config, &setup).await?;
+    compare_outputs(&expected, &actual)
+        .unwrap_or_else(|message| panic!("Q18 over Parquet: {message}"));
+    let exec = actual
+        .plan
+        .downcast_ref::<PipelineRootExec>()
+        .expect("a pipeline plan");
+    let plan = displayable(exec.input().as_ref()).indent(false).to_string();
+    assert!(
+        plan.contains("AggregateExec: mode=SinglePartitioned")
+            && plan.contains("HashJoinExec: mode=Partitioned"),
+        "{plan}"
+    );
+    let names = operator_names(exec.operator());
+    assert!(
+        names.iter().any(|name| name == "PhysicalTopK"),
+        "{names:?}\n{plan}"
+    );
     Ok(())
 }

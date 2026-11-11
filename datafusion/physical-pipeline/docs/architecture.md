@@ -32,7 +32,11 @@ To make this achievable, the engine never re-plans a query: it starts from
 the `ExecutionPlan` produced by DataFusion's `DefaultPhysicalPlanner`, reuses
 its schemas and its `PhysicalExpr`s (with all coercions applied), and keeps
 all scan pushdowns. Native operators must reproduce the semantics of the
-DataFusion operator they replace, including error behavior.
+DataFusion operator they replace, including error behavior. See
+[Error parity](error-parity.md) for how the planner decides which parts of a
+plan stay in DataFusion so that their errors match, and for the errors that
+are out of the scope of parity: those of reading or decoding the rows of
+Parquet files that the dynamic filters of the two engines skip differently.
 
 ## Overview
 
@@ -528,8 +532,10 @@ the rules of the planner itself. In short, DataFusion executes:
   pull ahead of their consumers (`FilterExec`, coalescing repartitions, hash
   and nested loop joins, which coalesce their output);
 - joins and TopKs whose dynamic filters prune the reads of inputs that may
-  fail (e.g. Parquet scans), and windows above TopKs that may end some of
-  their partitions early.
+  fail (e.g. CSV scans, or work that may fail above Parquet scans, whose
+  reading and decoding is treated as unable to fail, see
+  [Error parity](error-parity.md)), and windows above TopKs that may end
+  some of their partitions early.
 
 Windows, nested loop joins and cross joins keep all of their rows in memory
 without reserving it in the memory pool, while the DataFusion nodes that they
@@ -567,29 +573,47 @@ engines, and asserts their byte parity. `tpch_queries_are_lowered_as_listed`
 asserts the exact lowering of every TPC-H query (`TPCH_COVERAGE`): the
 numbers of native and of all operators, and the DataFusion plans that run in
 `BridgeOperator`s, each with why the native operators leave it to DataFusion.
-On 4 threads, with the sessions of the suite (which do not trust DataFusion's
-built-in functions, see `TrustedFunctions`):
+On 4 threads, with the sessions of the suite (which trust DataFusion's
+built-in functions by default, see `TrustedFunctions`):
 
-- Over `MemTable`s, 16 of the 22 queries run fully natively: Q1 to Q6, Q10,
-  Q12 to Q16 and Q18 to Q21. Their decimal arithmetic, which can only fail
-  with arithmetic overflows, is evaluated natively on any number of threads,
-  and so are the scalar subqueries of Q15 (`ScalarSubqueryExec`).
-- The native projection refuses the projections of Q7 and Q9 (`date_part`,
-  which the classification of errors only knows in sessions that trust
-  DataFusion's built-in functions), of Q8 (a decimal division by a sum that
-  may be 0, which may fail with several kinds of errors) and of Q22
-  (`substr`, likewise untrusted, whose repartitioning over `MemTable`s, and
-  filter over Parquet, stay in DataFusion too).
-- The filter and the projection of Q11 cast decimals, which may fail with
-  other errors than overflows (whose messages name the values that fail), so
-  they stay in DataFusion on several threads; the semi join of Q17 has a
-  residual filter with decimal arithmetic, which DataFusion evaluates on whole
-  batches of candidate pairs.
-- Over Parquet, 13 queries run fully natively: the hash joins of Q15 and Q20
-  have dynamic filters that prune the reads of the Parquet scans below them
-  (whose decimal arithmetic may fail on the rows that DataFusion skips), and
-  the TopK of Q18 a dynamic filter that prunes the scan of `orders`: they stay
-  in DataFusion too.
+- Over `MemTable`s, 21 of the 22 queries run fully natively: all but Q8. Their
+  decimal arithmetic, and the casts of numbers into decimals with which Q11
+  compares the sums of its groups with its scalar subquery, can only fail
+  with overflows, and are evaluated natively on any number of threads, as are
+  the scalar subqueries of Q11, Q15 and Q22 (`ScalarSubqueryExec`), the
+  `date_part` of Q7 to Q9, the `substr` of Q22 and the residual filter of the
+  semi join of Q17. The native projection refuses the projection of Q8: a
+  decimal division by a sum that may be 0, which may fail with several kinds
+  of errors.
+- Over Parquet, 19 queries run fully natively: all but Q8 and the queries
+  whose hash joins have dynamic filters that prune the reads of the Parquet
+  scans of their probe sides, below work that may fail on the rows that
+  DataFusion skips (the native join sets its filter to other values, the
+  bounds of its build keys): the decimal arithmetic of the revenues of Q15
+  and the cast into a decimal of the average quantities of Q17. (The residual
+  filter of the semi join below the join of Q20, which casts integers into
+  floats, cannot fail: the planner judges the keys and the filters of joins
+  on the rows that they evaluate them on.)
+- The TopK of Q18 has a dynamic filter that the scan of `orders` reads, below
+  hash joins and an aggregation, which reads all of its input before the
+  TopK sees its first group: in both engines, the filter prunes nothing, and
+  the TopK is native (see `Lowering::try_lower_sort`). So are the TopKs whose
+  dynamic filters scans read through nodes that only pass rows on, without
+  work that may fail on the rows they prune, e.g. the `LIKE` of ClickBench's
+  `hits23`: the native TopK updates the filter, so that the scans of Parquet
+  files skip the reads that its threshold rules out.
+
+When it decides whether a TopK or a hash join with a dynamic filter runs
+natively, the planner treats reading and decoding a scan of Parquet files as
+unable to fail, and judges only the expressions of the scan: its pushed-down
+predicate and its projection (see `source_may_fail`). The errors of reading or
+decoding the rows that the dynamic filter of only one of the engines skips
+(e.g. of a custom `ParquetFileReaderFactory`, of a corrupt file, of INT96
+timestamps that overflow the unit of the table, or of dictionary keys that
+overflow their type) are out of the scope of error parity: see §6 of
+[Error parity](error-parity.md). The planner never identifies reader factories
+or schema providers by their `Debug` text. The scans of CSV files may fail to
+parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
@@ -638,119 +662,119 @@ high-cardinality aggregations, in the two runs).
 
 | Query  | Rows | MemTable: DataFusion | Before | After | Speedup | Native | Parquet: DataFusion | Before | After | Speedup | Native |
 | ------ | ---: | -------------------: | -----: | ----: | ------: | -----: | ------------------: | -----: | ----: | ------: | -----: |
-| q1     |    4 |                 7.93 |   4.26 |  4.32 |   1.84x |    7/7 |               10.89 |   9.51 |  9.54 |   1.14x |    7/7 |
-| q2     |   48 |                 5.84 |   4.45 |  4.47 |   1.31x |  26/26 |                8.64 |  11.40 | 11.59 |   0.75x |  26/26 |
-| q3     |   10 |                 3.65 |   4.33 |  4.81 |   0.76x |  14/14 |                8.20 |  10.01 | 10.23 |   0.80x |  14/14 |
-| q4     |    5 |                 5.45 |   5.15 |  5.69 |   0.96x |  10/10 |                4.98 |   6.28 |  6.17 |   0.81x |  10/10 |
-| q5     |    5 |                 4.09 |   6.76 |  6.54 |   0.63x |  18/18 |                8.61 |  13.96 | 13.63 |   0.63x |  18/18 |
-| q6     |    1 |                 0.79 |   1.80 |  0.96 |   0.82x |    5/5 |                2.97 |   3.38 |  3.50 |   0.85x |    5/5 |
-| q7     |    4 |                20.02 |  14.09 | 15.29 |   1.31x |  21/21 |                9.60 |  19.19 | 18.91 |   0.51x |  21/21 |
-| q8     |    2 |                 3.65 |   4.23 |  4.30 |   0.85x |    1/2 |               10.37 |  11.63 | 11.97 |   0.87x |    1/2 |
-| q9     |  175 |                 9.29 |   9.95 | 10.20 |   0.91x |  17/17 |               13.26 |  18.91 | 18.50 |   0.72x |  17/17 |
-| q10    |   20 |                 6.23 |   7.12 |  7.62 |   0.82x |  14/14 |               10.24 |  13.25 | 13.52 |   0.76x |  14/14 |
-| q11    | 2443 |                 3.24 |   3.28 |  3.23 |   1.00x |    4/6 |                6.71 |   6.93 |  7.01 |   0.96x |    4/6 |
-| q12    |    2 |                 4.20 |   4.36 |  4.24 |   0.99x |    8/8 |                5.42 |   5.98 |  5.84 |   0.93x |    8/8 |
-| q13    |   39 |                 6.28 |   6.00 |  6.07 |   1.03x |  10/10 |                7.66 |  10.92 | 10.67 |   0.72x |  10/10 |
-| q14    |    1 |                 2.04 |   2.12 |  2.21 |   0.92x |    8/8 |                4.77 |   5.20 |  5.08 |   0.94x |    8/8 |
-| q15    |    1 |                 4.13 |   3.20 |  3.23 |   1.28x |  18/18 |                8.53 |   8.25 |  8.30 |   1.03x |   9/10 |
-| q16    | 2925 |                 6.66 |   4.93 |  4.80 |   1.39x |  13/13 |                7.57 |   8.34 |  8.69 |   0.87x |  13/13 |
-| q17    |    1 |                 7.85 |   7.46 |  8.59 |   0.91x |    2/3 |               17.84 |  18.39 | 18.13 |   0.98x |    2/3 |
-| q18    |  100 |                36.47 |  23.15 | 23.04 |   1.58x |  12/12 |               16.61 |  15.71 | 16.00 |   1.04x |    0/1 |
-| q19    |    1 |                 2.41 |   1.79 |  1.81 |   1.33x |    9/9 |                8.46 |   8.37 |  8.14 |   1.04x |    9/9 |
-| q20    |   17 |                 4.20 |   4.52 |  4.59 |   0.92x |  18/18 |                9.96 |   9.26 | 10.18 |   0.98x |    1/2 |
-| q21    |   45 |                15.39 |  17.57 | 17.70 |   0.87x |  22/22 |               14.70 |  26.30 | 25.86 |   0.57x |  22/22 |
-| q22    |    7 |                 2.31 |   2.44 |  2.40 |   0.96x |  15/15 |                5.98 |   6.22 |  5.97 |   1.00x |  15/15 |
-| hits0  |    1 |                 0.06 |   0.09 |  0.08 |   0.75x |    2/2 |                0.07 |   0.11 |  0.09 |   0.78x |    2/2 |
-| hits1  |    1 |                 0.36 |   0.50 |  0.47 |   0.77x |    5/5 |                1.65 |   1.80 |  1.69 |   0.98x |    5/5 |
-| hits2  |    1 |                 0.47 |   0.63 |  0.58 |   0.81x |    3/3 |                1.86 |   1.60 |  1.88 |   0.99x |    3/3 |
-| hits4  |    1 |                 7.67 |   4.86 |  4.82 |   1.59x |    4/4 |                8.76 |   9.07 |  8.84 |   0.99x |    4/4 |
-| hits5  |    1 |                 6.69 |   4.51 |  4.77 |   1.40x |    4/4 |                8.99 |   8.63 |  8.92 |   1.01x |    4/4 |
-| hits6  |    1 |                 0.31 |   0.42 |  0.46 |   0.67x |    2/2 |                0.07 |   0.08 |  0.09 |   0.78x |    2/2 |
-| hits7  |   30 |                 1.67 |   0.85 |  0.90 |   1.86x |    6/6 |                2.78 |   2.04 |  2.14 |   1.30x |    6/6 |
-| hits8  |   10 |                14.06 |  10.38 | 10.88 |   1.29x |    5/5 |               13.71 |  12.71 | 12.46 |   1.10x |    5/5 |
-| hits10 |    8 |                 4.85 |   3.48 |  3.60 |   1.35x |    7/7 |                7.06 |   6.50 |  6.48 |   1.09x |    7/7 |
-| hits12 |   10 |                 6.84 |   4.84 |  4.95 |   1.38x |    6/6 |                8.47 |   9.51 |  8.87 |   0.95x |    6/6 |
-| hits14 |   10 |                 8.34 |   7.02 |  7.81 |   1.07x |    6/6 |               10.55 |  10.34 | 11.71 |   0.90x |    6/6 |
-| hits15 |   10 |                 8.50 |   5.95 |  6.33 |   1.34x |    4/4 |               10.41 |   9.94 | 10.47 |   0.99x |    4/4 |
-| hits16 |   10 |                16.13 |  13.92 | 14.40 |   1.12x |    4/4 |               16.48 |  18.38 | 18.19 |   0.91x |    4/4 |
-| hits20 |    1 |                 2.83 |   1.76 |  1.90 |   1.49x |    5/5 |                5.71 |   5.47 |  6.02 |   0.95x |    5/5 |
-| hits21 |   10 |                 5.05 |   4.33 |  3.85 |   1.31x |    6/6 |                9.79 |   9.45 |  9.94 |   0.98x |    6/6 |
-| hits23 |   10 |                 4.59 |   4.26 |  3.45 |   1.33x |    4/4 |               15.60 |  15.45 | 16.46 |   0.95x |    0/1 |
-| hits25 |   10 |                 1.76 |   1.38 |  1.18 |   1.49x |    4/4 |                3.44 |   3.03 |  3.08 |   1.12x |    4/4 |
-| hits27 |   25 |                 5.63 |   3.92 |  3.57 |   1.58x |    8/8 |                9.31 |   9.28 |  9.22 |   1.01x |    0/1 |
-| hits29 |    1 |                 0.44 |   0.59 |  0.59 |   0.75x |    4/4 |                1.32 |   1.24 |  1.20 |   1.10x |    3/3 |
-| hits30 |   10 |                 7.15 |   6.01 |  6.92 |   1.03x |    6/6 |                9.82 |  12.18 | 11.30 |   0.87x |    6/6 |
-| hits32 |   10 |                16.11 |  14.35 | 13.12 |   1.23x |    4/4 |               16.81 |  17.64 | 16.36 |   1.03x |    4/4 |
-| hits33 |   10 |                16.23 |  15.40 | 16.87 |   0.96x |    4/4 |               18.74 |  23.96 | 21.96 |   0.85x |    4/4 |
-| hits35 |   10 |                10.28 |   8.05 |  8.15 |   1.26x |    5/5 |               10.48 |  11.45 | 10.41 |   1.01x |    5/5 |
-| hits36 |   10 |                 5.33 |   4.96 |  4.52 |   1.18x |    6/6 |                9.97 |  10.21 | 10.80 |   0.92x |    6/6 |
-| hits42 |   10 |                 2.35 |   2.00 |  2.15 |   1.09x |    3/4 |                5.54 |   5.02 |  5.03 |   1.10x |    3/4 |
+| q1     |    4 |                 6.14 |   4.03 |  4.01 |   1.53x |    7/7 |               10.92 |  10.56 |  9.55 |   1.14x |    7/7 |
+| q2     |   48 |                 5.19 |   6.13 |  5.91 |   0.88x |  26/26 |                8.81 |  13.20 | 12.93 |   0.68x |  26/26 |
+| q3     |   10 |                 3.47 |   4.34 |  4.34 |   0.80x |  14/14 |                8.45 |  10.59 |  9.60 |   0.88x |  14/14 |
+| q4     |    5 |                 4.76 |   5.34 |  5.23 |   0.91x |  10/10 |                4.82 |   6.31 |  6.14 |   0.79x |  10/10 |
+| q5     |    5 |                 3.96 |   6.39 |  6.39 |   0.62x |  18/18 |                9.08 |  13.96 | 13.49 |   0.67x |  18/18 |
+| q6     |    1 |                 0.65 |   0.93 |  0.89 |   0.73x |    5/5 |                3.09 |   3.39 |  3.45 |   0.90x |    5/5 |
+| q7     |    4 |                23.19 |  14.24 | 14.22 |   1.63x |  21/21 |                9.56 |  18.42 | 18.56 |   0.52x |  21/21 |
+| q8     |    2 |                 3.27 |   4.16 |  4.06 |   0.81x |    1/2 |               10.25 |  12.38 | 11.65 |   0.88x |    1/2 |
+| q9     |  175 |                 7.77 |   9.74 |  9.70 |   0.80x |  17/17 |               12.77 |  18.13 | 18.42 |   0.69x |  17/17 |
+| q10    |   20 |                 7.01 |   7.13 |  6.99 |   1.00x |  14/14 |               10.52 |  13.08 | 13.64 |   0.77x |  14/14 |
+| q11    | 2443 |                 3.09 |   3.18 |  3.05 |   1.01x |  23/23 |                6.35 |   8.36 |  8.12 |   0.78x |  23/23 |
+| q12    |    2 |                 3.79 |   4.00 |  3.98 |   0.95x |    8/8 |                5.32 |   5.85 |  6.00 |   0.89x |    8/8 |
+| q13    |   39 |                 6.08 |   5.42 |  5.42 |   1.12x |  10/10 |                7.94 |  10.34 | 10.43 |   0.76x |  10/10 |
+| q14    |    1 |                 1.80 |   2.07 |  2.08 |   0.87x |    8/8 |                4.46 |   4.90 |  4.95 |   0.90x |    8/8 |
+| q15    |    1 |                 3.99 |   4.34 |  4.31 |   0.92x |  18/18 |                8.88 |   7.19 |  7.56 |   1.17x |   9/10 |
+| q16    | 2925 |                 6.46 |   4.50 |  4.63 |   1.40x |  13/13 |                7.85 |   8.77 |  8.49 |   0.93x |  13/13 |
+| q17    |    1 |                 5.35 |   6.40 |  6.34 |   0.84x |  11/11 |               17.47 |  18.52 | 18.07 |   0.97x |    2/3 |
+| q18    |  100 |                36.54 |  23.36 | 23.32 |   1.57x |  12/12 |               16.19 |  24.44 | 25.15 |   0.64x |  12/12 |
+| q19    |    1 |                 2.33 |   1.82 |  1.75 |   1.33x |    9/9 |                8.57 |   8.74 |  8.20 |   1.04x |    9/9 |
+| q20    |   17 |                 3.90 |   7.25 |  6.94 |   0.56x |  18/18 |                9.42 |  13.80 | 13.71 |   0.69x |  18/18 |
+| q21    |   45 |                 9.94 |  16.92 | 17.04 |   0.58x |  22/22 |               15.38 |  26.01 | 27.10 |   0.57x |  22/22 |
+| q22    |    7 |                 2.18 |   2.40 |  2.48 |   0.88x |  15/15 |                6.24 |   6.00 |  6.22 |   1.00x |  15/15 |
+| hits0  |    1 |                 0.07 |   0.08 |  0.09 |   0.76x |    2/2 |                0.07 |   0.09 |  0.09 |   0.84x |    2/2 |
+| hits1  |    1 |                 0.36 |   0.46 |  0.47 |   0.77x |    5/5 |                1.59 |   1.78 |  1.72 |   0.93x |    5/5 |
+| hits2  |    1 |                 0.45 |   0.67 |  0.70 |   0.65x |    3/3 |                1.86 |   1.66 |  1.93 |   0.96x |    3/3 |
+| hits4  |    1 |                 5.57 |   4.58 |  4.61 |   1.21x |    4/4 |                9.67 |   8.50 |  9.44 |   1.02x |    4/4 |
+| hits5  |    1 |                 4.99 |   4.46 |  4.59 |   1.09x |    4/4 |                8.61 |   8.37 |  7.64 |   1.13x |    4/4 |
+| hits6  |    1 |                 0.33 |   0.41 |  0.43 |   0.77x |    2/2 |                0.07 |   0.09 |  0.08 |   0.86x |    2/2 |
+| hits7  |   30 |                 1.69 |   0.91 |  0.87 |   1.95x |    6/6 |                3.11 |   2.04 |  2.06 |   1.51x |    6/6 |
+| hits8  |   10 |                11.80 |   8.68 |  9.26 |   1.28x |    5/5 |               13.40 |  12.43 | 12.91 |   1.04x |    5/5 |
+| hits10 |    8 |                 4.58 |   3.23 |  3.36 |   1.36x |    7/7 |                6.73 |   6.23 |  6.16 |   1.09x |    7/7 |
+| hits12 |   10 |                 6.26 |   5.39 |  4.81 |   1.30x |    6/6 |                8.50 |   9.21 |  8.77 |   0.97x |    6/6 |
+| hits14 |   10 |                 7.99 |   7.61 |  6.76 |   1.18x |    6/6 |               10.60 |  10.16 | 11.56 |   0.92x |    6/6 |
+| hits15 |   10 |                 7.48 |   6.05 |  5.79 |   1.29x |    4/4 |                9.63 |   9.33 |  9.62 |   1.00x |    4/4 |
+| hits16 |   10 |                13.81 |  12.87 | 13.01 |   1.06x |    4/4 |               16.77 |  18.12 | 17.55 |   0.96x |    4/4 |
+| hits20 |    1 |                 1.72 |   1.83 |  1.81 |   0.95x |    5/5 |                6.23 |   6.41 |  6.30 |   0.99x |    5/5 |
+| hits21 |   10 |                 4.83 |   3.73 |  3.77 |   1.28x |    6/6 |                9.93 |   9.93 |  9.82 |   1.01x |    6/6 |
+| hits23 |   10 |                 3.54 |   3.38 |  3.37 |   1.05x |    4/4 |               17.08 |  20.24 | 18.42 |   0.93x |    4/4 |
+| hits25 |   10 |                 1.42 |   1.14 |  1.11 |   1.27x |    4/4 |                3.50 |   3.30 |  3.18 |   1.10x |    4/4 |
+| hits27 |   25 |                 4.22 |   3.38 |  3.38 |   1.25x |    8/8 |                9.61 |   9.76 |  7.37 |   1.30x |    0/1 |
+| hits29 |    1 |                 0.44 |   0.59 |  0.60 |   0.72x |    4/4 |                1.28 |   1.44 |  1.25 |   1.03x |    3/3 |
+| hits30 |   10 |                 7.64 |   6.07 |  7.69 |   0.99x |    6/6 |               10.07 |  11.83 | 11.16 |   0.90x |    6/6 |
+| hits32 |   10 |                15.69 |  13.73 | 13.09 |   1.20x |    4/4 |               16.92 |  18.59 | 17.10 |   0.99x |    4/4 |
+| hits33 |   10 |                14.97 |  15.98 | 15.85 |   0.94x |    4/4 |               21.58 |  23.94 | 25.04 |   0.86x |    4/4 |
+| hits35 |   10 |                 8.88 |   8.77 |  7.98 |   1.11x |    5/5 |               11.03 |  11.70 | 11.10 |   0.99x |    5/5 |
+| hits36 |   10 |                 4.82 |   4.18 |  4.46 |   1.08x |    6/6 |                9.86 |  10.09 | 10.68 |   0.92x |    6/6 |
+| hits42 |   10 |                 2.25 |   1.91 |  1.92 |   1.17x |    3/4 |                5.47 |   5.45 |  5.29 |   1.03x |    3/4 |
 
 | Source   | Trusted aggregates | DataFusion (ms) | Pipeline (ms) | Speedup | Geometric mean speedup | Fully native queries |
 | -------- | ------------------ | --------------: | ------------: | ------: | ---------------------: | -------------------: |
-| MemTable | no (before)        |          299.14 |        267.39 |   1.12x |                  1.04x |                43/47 |
-| MemTable | yes (after)        |          315.81 |        272.45 |   1.16x |                  1.10x |                43/47 |
-| Parquet  | no (before)        |          412.39 |        462.48 |   0.89x |                  0.92x |                38/47 |
-| Parquet  | yes (after)        |          409.38 |        461.06 |   0.89x |                  0.91x |                38/47 |
+| MemTable | no (before)        |          285.90 |        264.20 |   1.08x |                  1.01x |                45/47 |
+| MemTable | yes (after)        |          286.66 |        262.84 |   1.09x |                  1.01x |                45/47 |
+| Parquet  | no (before)        |          412.13 |        483.61 |   0.85x |                  0.88x |                42/47 |
+| Parquet  | yes (after)        |          415.52 |        477.67 |   0.87x |                  0.91x |                42/47 |
 
 ### TPC-H SF 1, 10,000,000 `hits` rows
 
 | Query  |  Rows | MemTable: DataFusion | Before |  After | Speedup | Native | Parquet: DataFusion | Before |  After | Speedup | Native |
 | ------ | ----: | -------------------: | -----: | -----: | ------: | -----: | ------------------: | -----: | -----: | ------: | -----: |
-| q1     |     4 |                32.24 |  32.66 |  32.80 |   0.98x |    7/7 |               63.93 |  63.92 |  66.83 |   0.96x |    7/7 |
-| q2     |   100 |                13.71 |  12.82 |  13.56 |   1.01x |  26/26 |               17.78 |  28.89 |  29.30 |   0.61x |  26/26 |
-| q3     |    10 |                19.83 |  19.79 |  20.34 |   0.97x |  14/14 |               34.24 |  43.24 |  47.15 |   0.73x |  14/14 |
-| q4     |     5 |                24.96 |  34.42 |  35.64 |   0.70x |  10/10 |               19.01 |  26.29 |  26.18 |   0.73x |  10/10 |
-| q5     |     5 |                38.36 |  36.31 |  38.24 |   1.00x |  18/18 |               46.54 |  67.03 |  69.25 |   0.67x |  18/18 |
-| q6     |     1 |                 3.91 |   5.68 |   5.74 |   0.68x |    5/5 |               15.26 |  20.14 |  19.88 |   0.77x |    5/5 |
-| q7     |     4 |               150.17 |  84.81 |  86.71 |   1.73x |  21/21 |               55.38 | 100.49 | 109.60 |   0.51x |  21/21 |
-| q8     |     2 |                14.68 |  14.08 |  14.29 |   1.03x |    1/2 |               40.17 |  36.61 |  39.29 |   1.02x |    1/2 |
-| q9     |   175 |                86.96 |  57.69 |  65.33 |   1.33x |  17/17 |               60.60 | 100.77 | 106.72 |   0.57x |  17/17 |
-| q10    |    20 |                28.04 |  25.93 |  26.13 |   1.07x |  14/14 |               43.31 |  54.99 |  57.35 |   0.76x |  14/14 |
-| q11    |   746 |                 6.11 |   6.12 |   6.13 |   1.00x |    4/6 |               12.86 |  12.04 |  12.54 |   1.03x |    4/6 |
-| q12    |     2 |                14.37 |  18.71 |  18.82 |   0.76x |    8/8 |               23.14 |  25.16 |  27.93 |   0.83x |    8/8 |
-| q13    |    41 |                25.96 |  36.62 |  37.00 |   0.70x |  10/10 |               42.88 |  47.58 |  62.03 |   0.69x |  10/10 |
-| q14    |     1 |                 5.53 |   5.25 |   5.32 |   1.04x |    8/8 |               19.58 |  20.36 |  23.17 |   0.85x |    8/8 |
-| q15    |     1 |                10.38 |   9.37 |   9.91 |   1.05x |   9/10 |               36.36 |  33.37 |  37.85 |   0.96x |   9/10 |
-| q16    | 18399 |                15.06 |  14.61 |  14.51 |   1.04x |  13/13 |               18.23 |  20.19 |  22.45 |   0.81x |  13/13 |
-| q17    |     1 |                72.41 |  85.20 |  74.17 |   0.98x |    2/3 |              125.21 | 119.42 | 130.05 |   0.96x |    2/3 |
-| q18    |   100 |               166.56 | 141.10 | 149.41 |   1.11x |    2/3 |              116.84 | 112.57 | 114.74 |   1.02x |    0/1 |
-| q19    |     1 |                18.18 |  11.87 |  12.24 |   1.49x |    9/9 |               36.32 |  35.73 |  39.69 |   0.92x |    9/9 |
-| q20    |   178 |                19.32 |  18.06 |  18.85 |   1.02x |    7/8 |               34.61 |  30.24 |  32.84 |   1.05x |    1/2 |
-| q21    |   100 |               158.62 | 110.28 | 125.56 |   1.26x |  22/22 |               99.24 | 168.92 | 175.90 |   0.56x |  22/22 |
-| q22    |     7 |                 7.05 |   7.46 |   7.29 |   0.97x |  15/15 |               12.49 |  13.82 |  16.21 |   0.77x |  15/15 |
-| hits0  |     1 |                 0.10 |   0.12 |   0.13 |   0.77x |    2/2 |                0.07 |   0.09 |   0.09 |   0.78x |    2/2 |
-| hits1  |     1 |                 0.99 |   2.19 |   2.36 |   0.42x |    5/5 |                6.56 |   8.08 |   7.82 |   0.84x |    5/5 |
-| hits2  |     1 |                 1.57 |   2.47 |   2.50 |   0.63x |    3/3 |                7.29 |   8.99 |   8.49 |   0.86x |    3/3 |
-| hits4  |     1 |                65.31 |  26.04 |  25.44 |   2.57x |    4/4 |               76.68 |  37.50 |  37.18 |   2.06x |    4/4 |
-| hits5  |     1 |                64.13 |  61.75 |  52.17 |   1.23x |    4/4 |               83.20 |  75.79 |  80.75 |   1.03x |    4/4 |
-| hits6  |     1 |                 0.93 |   1.46 |   1.40 |   0.66x |    2/2 |                0.08 |   0.09 |   0.10 |   0.80x |    2/2 |
-| hits7  |    30 |                 3.63 |   3.39 |   3.12 |   1.16x |    6/6 |                8.44 |   8.75 |   9.13 |   0.92x |    6/6 |
-| hits8  |    10 |                92.32 |  69.49 |  62.66 |   1.47x |    5/5 |              108.99 |  82.30 |  85.69 |   1.27x |    5/5 |
-| hits10 |     8 |                22.56 |  21.02 |  19.67 |   1.15x |    7/7 |               35.69 |  34.51 |  37.43 |   0.95x |    7/7 |
-| hits12 |    10 |                71.40 |  61.01 |  48.49 |   1.47x |    6/6 |               78.07 |  80.13 |  60.47 |   1.29x |    6/6 |
-| hits14 |    10 |                69.67 |  77.88 |  62.55 |   1.11x |    6/6 |               79.75 |  91.39 |  79.28 |   1.01x |    6/6 |
-| hits15 |    10 |                81.31 |  54.00 |  29.85 |   2.72x |    4/4 |               97.17 |  68.75 |  43.99 |   2.21x |    4/4 |
-| hits16 |    10 |               123.31 | 155.60 |  99.16 |   1.24x |    4/4 |              154.06 | 186.40 | 136.24 |   1.13x |    4/4 |
-| hits20 |     1 |                13.22 |  15.05 |  14.15 |   0.93x |    5/5 |               40.14 |  38.39 |  40.49 |   0.99x |    5/5 |
-| hits21 |    10 |                22.75 |  25.47 |  24.66 |   0.92x |    6/6 |               56.76 |  56.12 |  61.78 |   0.92x |    6/6 |
-| hits23 |    10 |                23.92 |  28.79 |  27.03 |   0.88x |    4/4 |              128.07 | 119.89 | 128.41 |   1.00x |    0/1 |
-| hits25 |    10 |                 6.08 |   7.21 |   6.77 |   0.90x |    4/4 |               18.37 |  17.16 |  17.75 |   1.03x |    4/4 |
-| hits27 |    25 |                26.27 |  25.29 |  24.13 |   1.09x |    8/8 |               49.12 |  50.34 |  52.20 |   0.94x |    0/1 |
-| hits29 |     1 |                 1.76 |   3.14 |   2.47 |   0.71x |    4/4 |                4.05 |   4.62 |   4.55 |   0.89x |    3/3 |
-| hits30 |    10 |                49.95 |  51.65 |  44.50 |   1.12x |    6/6 |               63.73 |  80.29 |  66.62 |   0.96x |    6/6 |
-| hits32 |    10 |               148.26 | 155.61 |  89.97 |   1.65x |    4/4 |              165.68 | 159.41 | 108.23 |   1.53x |    4/4 |
-| hits33 |    10 |               232.60 | 208.18 | 135.15 |   1.72x |    4/4 |              237.71 | 255.36 | 160.34 |   1.48x |    4/4 |
-| hits35 |    10 |                69.70 |  74.57 |  53.44 |   1.30x |    5/5 |               77.46 |  91.86 |  61.30 |   1.26x |    5/5 |
-| hits36 |    10 |                37.28 |  38.99 |  38.71 |   0.96x |    6/6 |               59.98 |  75.51 |  69.59 |   0.86x |    6/6 |
-| hits42 |    10 |                 7.62 |   7.76 |   8.01 |   0.95x |    3/4 |               21.59 |  22.25 |  21.93 |   0.98x |    3/4 |
+| q1     |     4 |                31.27 |  33.22 |  32.68 |   0.96x |    7/7 |               58.38 |  63.93 |  64.20 |   0.91x |    7/7 |
+| q2     |   100 |                12.91 |  14.56 |  14.39 |   0.90x |  26/26 |               15.54 |  27.99 |  28.95 |   0.54x |  26/26 |
+| q3     |    10 |                19.90 |  21.70 |  20.04 |   0.99x |  14/14 |               32.62 |  42.47 |  41.82 |   0.78x |  14/14 |
+| q4     |     5 |                23.57 |  35.54 |  34.22 |   0.69x |  10/10 |               18.13 |  24.75 |  24.56 |   0.74x |  10/10 |
+| q5     |     5 |                36.74 |  37.10 |  36.96 |   0.99x |  18/18 |               43.63 |  66.92 |  64.88 |   0.67x |  18/18 |
+| q6     |     1 |                 3.06 |   5.69 |   5.75 |   0.53x |    5/5 |               14.90 |  19.04 |  17.99 |   0.83x |    5/5 |
+| q7     |     4 |               158.95 |  79.72 |  83.09 |   1.91x |  21/21 |               51.40 |  98.53 | 104.27 |   0.49x |  21/21 |
+| q8     |     2 |                13.35 |  14.29 |  14.21 |   0.94x |    1/2 |               37.75 |  38.22 |  39.28 |   0.96x |    1/2 |
+| q9     |   175 |                86.49 |  57.68 |  57.91 |   1.49x |  17/17 |               53.45 | 100.18 |  98.71 |   0.54x |  17/17 |
+| q10    |    20 |                27.64 |  26.30 |  26.36 |   1.05x |  14/14 |               38.84 |  53.96 |  50.75 |   0.77x |  14/14 |
+| q11    |   746 |                 6.02 |   8.28 |   8.68 |   0.69x |  23/23 |               11.56 |  19.91 |  19.67 |   0.59x |  23/23 |
+| q12    |     2 |                14.53 |  19.86 |  18.63 |   0.78x |    8/8 |               21.47 |  25.07 |  25.74 |   0.83x |    8/8 |
+| q13    |    41 |                24.41 |  37.46 |  37.17 |   0.66x |  10/10 |               36.06 |  47.92 |  46.23 |   0.78x |  10/10 |
+| q14    |     1 |                 5.01 |   5.44 |   5.35 |   0.94x |    8/8 |               18.79 |  20.54 |  21.51 |   0.87x |    8/8 |
+| q15    |     1 |                10.58 |  12.67 |   9.08 |   1.17x |   9/10 |               31.73 |  32.47 |  33.27 |   0.95x |   9/10 |
+| q16    | 18399 |                15.55 |  14.66 |  14.70 |   1.06x |  13/13 |               17.59 |  20.65 |  20.05 |   0.88x |  13/13 |
+| q17    |     1 |                73.07 |  50.36 |  43.08 |   1.70x |  11/11 |              118.44 | 112.62 | 117.07 |   1.01x |    2/3 |
+| q18    |   100 |               142.36 | 137.69 | 132.45 |   1.07x |    2/3 |              106.25 | 104.54 | 107.39 |   0.99x |    2/3 |
+| q19    |     1 |                10.78 |  11.15 |  11.18 |   0.96x |    9/9 |               36.03 |  34.18 |  37.50 |   0.96x |    9/9 |
+| q20    |   178 |                17.01 |  20.74 |  19.64 |   0.87x |    7/8 |               33.88 |  43.22 |  44.72 |   0.76x |  18/18 |
+| q21    |   100 |               156.34 | 113.01 | 113.76 |   1.37x |  22/22 |               92.43 | 171.25 | 165.97 |   0.56x |  22/22 |
+| q22    |     7 |                 7.26 |   7.25 |   7.15 |   1.02x |  15/15 |               12.22 |  16.31 |  15.39 |   0.79x |  15/15 |
+| hits0  |     1 |                 0.09 |   0.12 |   0.12 |   0.72x |    2/2 |                0.07 |   0.09 |   0.10 |   0.72x |    2/2 |
+| hits1  |     1 |                 0.96 |   2.15 |   2.20 |   0.43x |    5/5 |                5.37 |   8.29 |   7.51 |   0.72x |    5/5 |
+| hits2  |     1 |                 1.58 |   2.45 |   2.62 |   0.60x |    3/3 |                7.29 |   8.22 |   8.33 |   0.88x |    3/3 |
+| hits4  |     1 |                55.14 |  25.93 |  24.32 |   2.27x |    4/4 |               68.67 |  37.22 |  36.82 |   1.87x |    4/4 |
+| hits5  |     1 |                63.56 |  52.42 |  56.06 |   1.13x |    4/4 |               73.04 |  79.87 |  76.83 |   0.95x |    4/4 |
+| hits6  |     1 |                 0.80 |   1.40 |   1.42 |   0.56x |    2/2 |                0.08 |   0.09 |   0.10 |   0.81x |    2/2 |
+| hits7  |    30 |                 3.75 |   3.04 |   3.45 |   1.09x |    6/6 |                7.16 |   8.76 |   8.48 |   0.84x |    6/6 |
+| hits8  |    10 |                89.93 |  67.14 |  65.04 |   1.38x |    5/5 |               97.79 |  80.51 |  81.51 |   1.20x |    5/5 |
+| hits10 |     8 |                23.40 |  20.90 |  19.37 |   1.21x |    7/7 |               33.19 |  34.38 |  34.36 |   0.97x |    7/7 |
+| hits12 |    10 |                64.17 |  57.07 |  42.89 |   1.50x |    6/6 |               79.18 |  77.47 |  61.51 |   1.29x |    6/6 |
+| hits14 |    10 |                63.36 |  67.13 |  57.77 |   1.10x |    6/6 |               82.72 |  92.12 |  74.62 |   1.11x |    6/6 |
+| hits15 |    10 |                75.08 |  54.08 |  28.81 |   2.61x |    4/4 |               87.33 |  69.38 |  43.06 |   2.03x |    4/4 |
+| hits16 |    10 |               122.55 | 147.68 |  94.51 |   1.30x |    4/4 |              142.77 | 182.06 | 127.90 |   1.12x |    4/4 |
+| hits20 |     1 |                12.87 |  14.09 |  14.11 |   0.91x |    5/5 |               36.72 |  38.74 |  38.87 |   0.94x |    5/5 |
+| hits21 |    10 |                21.58 |  31.76 |  23.06 |   0.94x |    6/6 |               53.02 |  57.42 |  58.70 |   0.90x |    6/6 |
+| hits23 |    10 |                21.45 |  31.21 |  26.49 |   0.81x |    4/4 |              123.19 | 126.89 | 126.72 |   0.97x |    4/4 |
+| hits25 |    10 |                 6.46 |   7.72 |   6.81 |   0.95x |    4/4 |               17.49 |  18.28 |  17.74 |   0.99x |    4/4 |
+| hits27 |    25 |                23.15 |  26.91 |  23.63 |   0.98x |    8/8 |               48.70 |  50.90 |  48.09 |   1.01x |    0/1 |
+| hits29 |     1 |                 1.64 |   2.47 |   3.00 |   0.55x |    4/4 |                4.05 |   4.66 |   4.84 |   0.84x |    3/3 |
+| hits30 |    10 |                44.82 |  47.42 |  40.20 |   1.12x |    6/6 |               63.08 |  84.23 |  65.44 |   0.96x |    6/6 |
+| hits32 |    10 |               155.16 | 126.76 |  93.85 |   1.65x |    4/4 |              162.03 | 161.97 | 104.68 |   1.55x |    4/4 |
+| hits33 |    10 |               207.07 | 187.98 | 129.98 |   1.59x |    4/4 |              238.16 | 249.76 | 158.22 |   1.51x |    4/4 |
+| hits35 |    10 |                66.36 |  67.77 |  48.12 |   1.38x |    5/5 |               74.64 |  85.21 |  59.92 |   1.25x |    5/5 |
+| hits36 |    10 |                31.99 |  34.69 |  33.16 |   0.96x |    6/6 |               62.32 |  73.46 |  69.24 |   0.90x |    6/6 |
+| hits42 |    10 |                 5.80 |   5.67 |   5.58 |   1.04x |    3/4 |               22.94 |  22.58 |  23.14 |   0.99x |    3/4 |
 
 | Source   | Trusted aggregates | DataFusion (ms) | Pipeline (ms) | Speedup | Geometric mean speedup | Fully native queries |
 | -------- | ------------------ | --------------: | ------------: | ------: | ---------------------: | -------------------: |
-| MemTable | no (before)        |         2205.44 |       1966.98 |   1.12x |                  1.01x |                40/47 |
-| MemTable | yes (after)        |         2169.05 |       1696.48 |   1.28x |                  1.06x |                40/47 |
-| Parquet  | no (before)        |         2503.64 |       2835.78 |   0.88x |                  0.87x |                38/47 |
-| Parquet  | yes (after)        |         2632.73 |       2646.77 |   0.99x |                  0.93x |                38/47 |
+| MemTable | no (before)        |         2094.14 |       1850.34 |   1.13x |                  0.99x |                42/47 |
+| MemTable | yes (after)        |         2059.54 |       1593.02 |   1.29x |                  1.02x |                42/47 |
+| Parquet  | no (before)        |         2511.62 |       2837.22 |   0.89x |                  0.86x |                41/47 |
+| Parquet  | yes (after)        |         2492.10 |       2526.63 |   0.99x |                  0.91x |                41/47 |
 
 Of note:
 
@@ -760,30 +784,36 @@ Of note:
   thread-local tables with trusted aggregate functions. With 1,000,000 rows,
   the threads have few rows each (62,500 on 16 threads), and their tables
   rarely fill up, so the bypass hardly matters. With 10,000,000 rows, it makes
-  `hits15` 1.8x (MemTable) and 1.6x (Parquet) faster than before, `hits16`,
-  `hits32` and `hits33` between 1.4x and 1.7x, `hits35` 1.4x to 1.5x and
-  `hits30` 1.2x, while `hits36` filters most of its rows out before its
-  aggregation, which hardly changes. Over `MemTable`s, `hits15` is 2.7x faster than
-  DataFusion, `hits32` and `hits33` 1.7x, and `hits16` (1.3x slower than
-  DataFusion before) 1.2x faster; the totals of all queries are 14% (MemTable)
-  and 7% (Parquet) lower.
-- With DataFusion's built-in functions trusted, all TPC-H queries run fully
-  natively over `MemTable`s at SF 0.1 but Q8 (a decimal division), Q11 (casts
-  of decimals) and Q17 (the residual filter of its semi join). At SF 1, the
-  join of Q15 and the semi joins of Q18 and Q20 are `Partitioned` hash joins
-  that the native hash join leaves to DataFusion (see
-  `PhysicalHashJoin::try_lower`). Over Parquet, the hash joins of Q15 and
-  Q20 and the TopK of Q18 have dynamic filters that prune the Parquet scans
-  below them (see [Native coverage of TPC-H](#native-coverage-of-tpc-h)).
+  `hits15` 1.9x (MemTable) and 1.6x (Parquet) faster than before, `hits16`,
+  `hits32`, `hits33` and `hits35` between 1.3x and 1.6x, and `hits30` 1.2x to
+  1.3x, while `hits36` filters most of its rows out before its aggregation,
+  which hardly changes. Over `MemTable`s, `hits15` is 2.6x faster than
+  DataFusion, `hits32` and `hits33` 1.6x, and `hits16` (1.2x slower than
+  DataFusion before) 1.3x faster; the totals of all queries are 14% (MemTable)
+  and 11% (Parquet) lower.
+- All TPC-H queries run fully natively over `MemTable`s at SF 0.1 but Q8 (a
+  decimal division by a sum that may be 0). At SF 1, the join of Q15 and the
+  semi joins of Q18 and Q20 are `Partitioned` hash joins that the native hash
+  join leaves to DataFusion (see `PhysicalHashJoin::try_lower`). Over
+  Parquet, the hash joins of Q15 and Q17 have dynamic filters that prune the
+  Parquet scans below them, and Q20 runs fully natively (see
+  [Native coverage of TPC-H](#native-coverage-of-tpc-h)). The TopK of Q18,
+  whose dynamic filter the scan of `orders` reads below an aggregation (and,
+  at SF 1, below the build sides of `Partitioned` joins), so that it prunes
+  nothing, is native over Parquet too: at SF 0.1, Q18 is then fully native,
+  but slower than in DataFusion, which ran it before (0.64x); at SF 1, where
+  its semi join stays in DataFusion, it is as fast.
 - The ClickBench-style queries run fully natively but for the aggregation of
   `hits42` (by `date_trunc`, which may fail on a row with other errors than
   overflows, so that DataFusion evaluates it on several threads), and over
-  Parquet `hits23` (a
-  TopK whose dynamic filter prunes the Parquet scan) and `hits27` (a TopK by a
-  floating-point average, which the native TopK only lowers over inputs that
-  execute again as they executed once, see `executes_again_as_if_for_the_first_time`). The queries of
-  less than a millisecond or two (`hits0`, `hits1`, `hits2`, `hits6`,
-  `hits29`) pay the fixed cost of setting up the pipelines.
+  Parquet `hits27` (a TopK by a floating-point average, which the native TopK
+  only lowers over inputs that execute again as they executed once, see
+  `executes_again_as_if_for_the_first_time`). The TopKs of `hits23` and
+  `hits25` are native over Parquet: their scans read the dynamic filters of
+  the TopKs through filters that cannot fail (`LIKE` and `<>`), and the native
+  TopKs update these filters. The queries of less than a millisecond or two
+  (`hits0`, `hits1`, `hits2`, `hits6`, `hits29`) pay the fixed cost of setting
+  up the pipelines.
 
 ## Differential testing
 
