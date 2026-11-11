@@ -34,8 +34,13 @@
 //! directly in the typed arrays (in the order of the row format, floats in
 //! their total order). The keys of all other sorts are encoded in the Arrow
 //! row format, in which comparing two keys is a `memcmp`, so the merge works
-//! for every sort key the row format supports (sorts of other keys are left
-//! to DataFusion).
+//! for every sort key the row format supports.
+//!
+//! Rows are materialized in runs and chunks that fit into Arrow arrays: rows
+//! whose values do not fit into one array (e.g. more than the 2 GiB of
+//! strings that 32-bit offsets address, or more dictionary values than
+//! narrow keys address) are split into several runs and chunks (see
+//! [`merge`]).
 //!
 //! # Lowering
 //!
@@ -46,31 +51,28 @@
 //!   single partition, e.g. a `CoalescePartitionsExec`, which the native sort
 //!   replaces: it sorts all partitions of its input);
 //! * a `SortPreservingMergeExec` over a `SortExec` that sorts every
-//!   partition, possibly through `ProjectionExec`s of columns and literals
-//!   (DataFusion plans the projection of `GROUP BY ... ORDER BY` between them)
-//!   and merges of the single partition below them (as for `SELECT b FROM t
-//!   ORDER BY a LIMIT k`). The native sort sorts all rows of the input of the
-//!   `SortExec` by the order of the top merge, above the projections, which
-//!   are lowered with the input.
+//!   partition, possibly through `ProjectionExec`s (DataFusion plans the
+//!   projection of `GROUP BY ... ORDER BY` between them) and merges of the
+//!   single partition below them (as for `SELECT b FROM t ORDER BY a LIMIT
+//!   k`). The native sort sorts all rows of the input of the `SortExec` by
+//!   the keys of the `SortExec`, or, with projections, the projected rows
+//!   (the projections are lowered with the input) by the keys of the top
+//!   merge.
 //!
 //! The result keeps `fetch` rows if the `SortExec` or a merge has a fetch:
 //! that is a [`PhysicalTopK`], whose threshold updates the
 //! [`DynamicFilterPhysicalExpr`] of the `SortExec` (which DataFusion pushes
-//! into the scans below it), or, for a merge with a fetch of a sort of keys
-//! that can fail to evaluate, a [`PhysicalSort`] with a fetch, which evaluates
-//! the keys of all rows like DataFusion's sort. A TopK by float keys checks
-//! the last row of its result, and executes DataFusion's TopK instead if
-//! DataFusion's result may differ (see [`FloatKeyFallback`]). Sorts whose rows
-//! (or errors) the native operators cannot reproduce exactly are not lowered,
-//! so that DataFusion executes them, see [`try_lower`].
+//! into the scans below it, so that they skip the rows that cannot make it
+//! into the result). The native operators decide the order of the rows with
+//! equal sort keys themselves, also of the ties of the last row of a TopK
+//! (which rows they keep): floats compare in their total order, in which
+//! `-0.0` comes before `0.0`.
 //!
 //! The native operators keep all rows in memory: they do not spill and do
-//! not reserve memory in the memory pool. As in DataFusion, rows with equal
-//! sort keys may come in any order.
+//! not reserve memory in the memory pool.
 //!
 //! [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -80,42 +82,23 @@ use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err};
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::source::DataSourceExec;
-use datafusion_expr::{Operator, Volatility};
 use datafusion_physical_expr::LexOrdering;
-use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, DynamicFilterPhysicalExpr, IsNotNullExpr, IsNullExpr, Literal,
-    NotExpr,
-};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::projection::update_expr;
-use datafusion_physical_expr_common::physical_expr::is_volatile;
-use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::empty::EmptyExec;
-use datafusion_physical_plan::execution_plan::reset_plan_states;
-use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::joins::{CrossJoinExec, HashJoinExec, NestedLoopJoinExec};
-use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
-use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::ProjectionExec;
-use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::{
-    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, PhysicalExpr,
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
     ReplaceChildrenOptions,
 };
 use parking_lot::Mutex;
 
-use crate::bridge::BridgeOperator;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
-    EmptyState, ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
-    SourceResult, downcast_state,
+    GlobalSourceState, PhysicalOperator, SourceResult, downcast_state,
 };
 
 pub mod merge;
@@ -145,119 +128,48 @@ pub use topk_sink::{FloatKeyFallback, PhysicalTopK, TopKDynamicFilter};
 ///   every merge must be ordered by the order of the merge, so that the top
 ///   merge produces all rows of the input of the `SortExec` in its order, as
 ///   the native sort does. Without projections, the native sort sorts by the
-///   keys of the `SortExec`, and evaluates them on all rows as DataFusion
-///   does. With projections, which must project columns and literals only, it
-///   sorts the projected rows (the projections are lowered with the input) by
-///   the keys of the top merge.
+///   keys of the `SortExec` (whose order satisfies the order of the merges).
+///   With projections, it sorts the projected rows (the projections are
+///   lowered with the input) by the keys of the top merge.
 ///
 /// A fetch of the `SortExec` (a TopK of every partition) and the fetches of
 /// the merges keep the smallest number of rows, if that is a top-k of the
 /// whole input: the merges must not keep more rows than the fetch of a sort of
-/// several partitions. That is a [`PhysicalTopK`], which updates the
+/// several partitions. That is a [`PhysicalTopK`] (a [`PhysicalSort`] with a
+/// fetch of 0, which reads nothing), which updates the
 /// [`DynamicFilterPhysicalExpr`] of the `SortExec` for its leading sort keys
 /// that are (through the projections) the leading sort keys of the
-/// `SortExec`. Over a `SortExec` without fetch, whose keys DataFusion
-/// evaluates on all rows, a merge with a fetch is a [`PhysicalSort`] with a
-/// fetch instead if a key can fail to evaluate: a TopK discards rows before
-/// it evaluates their keys.
+/// `SortExec`.
 ///
-/// Sorts whose rows the native operators cannot reproduce exactly are not
-/// lowered (`Ok(None)`), so that DataFusion executes them:
+/// The native operators are correct for any keys (which they evaluate on the
+/// rows that they need, in chunks of their own), with any number of rows and
+/// with any input (which they read once). The plans that they do not lower
+/// (`Ok(None)`) are those of which they would not compute the result:
 ///
-/// * sorts of no rows (`fetch == Some(0)`), which DataFusion ends without
-///   reading their input;
-/// * sorts whose input is already sorted (DataFusion passes the input
-///   through, with a limit, so it may not read all of it), and TopKs whose
-///   input is sorted by a prefix of the sort keys, which DataFusion ends as
-///   soon as no later row can make it into the result;
-/// * TopKs (sorts with a fetch) with a key that can fail to evaluate (other
-///   than a column or a literal): DataFusion's TopK evaluates its keys only on
-///   the batches that its threshold does not discard entirely, so which keys
-///   it evaluates depends on the order of its batches;
-/// * TopKs with a float key that their threshold compares, unless the native
-///   TopK keeps the rows of DataFusion's TopK: as many rows (the fetch of the
-///   `SortExec`), by its keys (through the projections above it), and the
-///   plan executes again as if it had not been executed. Its threshold
-///   compares `-0.0 = 0.0` while it sorts `-0.0` first, so which rows it
-///   returns can depend on the order of its batches, but only if the last row
-///   of the result has a zero in such a key: the native TopK checks that row,
-///   and executes DataFusion's TopK instead if it does (see
-///   [`FloatKeyFallback`]). That second execution of the input returns what a
-///   single execution returns only if every execution reads the same data and
-///   no volatile function is called: in-memory batches (no streams that can
-///   only be read once, nor files, which may change or fail to be read in
-///   between) through nodes that compute their output from their input only,
-///   without volatile functions;
-/// * TopKs whose dynamic filter DataFusion pushed into a node below them (e.g.
-///   a Parquet scan), if that node or a node between it and the TopK
-///   evaluates an expression that can fail, is not a scan, projection,
-///   filter, union, merge or repartition of partitions, or has a fetch (it
-///   stops after a number of rows that pass the filter): the filter prunes
-///   the rows of that node as the threshold tightens, which happens at other
-///   times in DataFusion than natively, so these nodes process other rows;
-/// * merges over projections whose keys, or the keys of whose sort, can fail
-///   to evaluate: the native sort evaluates only the keys of the top merge;
-/// * merges without projections with a key that can fail to evaluate and is
-///   not the key of the sort at its position;
-/// * projections between the merges and the sort that compute a value (other
-///   than a column or a literal): DataFusion evaluates them lazily, on the
-///   sorted rows that the merges read, which read the first batches of every
-///   partition and stop with their fetch, or when a node above them stops
-///   reading (e.g. a limit). The native sort projects all rows before it
-///   sorts them, in chunks of its input, and a computation can fail. So can
-///   a literal with 32-bit offsets (e.g. a string, repeated for every row of
-///   a chunk), so such projections are left to DataFusion too;
-/// * plans that DataFusion does not execute as a sort of all rows of the
-///   input: nodes that advertise a different number of partitions than their
-///   input has, merges of no partitions, and sorts of several partitions that
-///   are not merged;
+/// * plans that do not sort all rows of the input of the `SortExec` into one
+///   sorted output: nodes that advertise a different number of partitions
+///   than their input has (stale properties), merges of no partitions, sorts
+///   of several partitions that are not merged, and merges whose input is not
+///   ordered by them, which interleave rather than sort;
+/// * fetches of merges of a TopK of several partitions that keep more rows
+///   than that TopK: their rows are not the first rows of the sort of all
+///   rows;
+/// * sorts of inputs that never end (unbounded inputs): the native operators
+///   read all of their input before they emit a row, while DataFusion
+///   streams such sorts (it passes an input that is sorted already through,
+///   and ends a TopK whose input is sorted by a prefix of its keys as soon as
+///   no later row can make it into the result);
 /// * sort keys that the Arrow row format does not support, and keys of unions
-///   (also inside other values): the native sort orders keys by the row
-///   format (unless the sort kernel sorts them), which orders unions unlike
-///   DataFusion's sort, e.g. the values of each type in ascending order for a
-///   descending key;
-/// * rows with dictionaries with keys of fewer than 32 bits, or run-end
-///   encodings with run ends of fewer than 32 bits (also in nested types): the
-///   native sort materializes runs (of up to [`SORT_RUN_ROWS`] rows) and
-///   chunks of more rows than DataFusion's batches, whose dictionaries can
-///   need more values, and whose runs more rows, than such keys and run ends
-///   address, where DataFusion's batches fit. This includes columns of the
-///   `SortExec` that projections above it remove: DataFusion sorts them,
-///   and whether it fails depends on its batches;
-/// * sort keys (of the sort or of a merge) that evaluate to such encodings,
-///   or that compute values with 32-bit offsets, also inside the key (e.g.
-///   `CAST(CAST(s AS Dictionary(Int8, Utf8)) AS Utf8)`, `upper(d)` or
-///   `CAST(repeat(s, 12582912) AS Utf8)`, but not a column of such values):
-///   the native sort evaluates its keys on each chunk, DataFusion on its
-///   batches, or on all rows of a small partition at once, so one of them
-///   can fail where the other does not;
-/// * TopKs of more than one row whose rows have values with 32-bit offsets
-///   (`Utf8`, `Binary`, lists, maps, also inside dictionaries, run-end
-///   encodings and structs), and sorts of run-end encoded values with 32-bit
-///   offsets. DataFusion's TopK gathers all its rows into one batch (when it
-///   emits and when it compacts them), and its sort takes chunks of
-///   `batch_size` sorted rows, in which run-end encoded values can need a
-///   value per row. Neither splits rows that need more than the 2 GiB that
-///   32-bit offsets address, so whether DataFusion fails depends on its
-///   batches; the native operators split such rows into smaller runs and
-///   chunks, as DataFusion's merges do. TopKs of at most
-///   [`MAX_TOPK_ROWS_WITH_OFFSETS`] rows whose values with 32-bit offsets are
-///   `Utf8` or `Binary` columns of in-memory batches (`MemorySourceConfig`s)
-///   that occupy less than [`MAX_TOPK_INPUT_OFFSET_BYTES`] are lowered: none
-///   of their rows can need more than an array addresses;
-/// * sorts without a fetch of values with 32-bit offsets, in sessions whose
-///   `sort_in_place_threshold_bytes` exceeds 2 GiB: DataFusion's sort
-///   concatenates the batches of a partition while they occupy fewer bytes,
-///   and such a concatenation can need more than 32-bit offsets address. Up
-///   to 2 GiB (1 MiB by default), its concatenations fit.
+///   (also inside other values): the row format orders the values of a union
+///   by their type first, also for descending keys, and its nulls among the
+///   values of their type, so that a descending key would not be in the
+///   reverse order of the ascending one, and nulls would not come first or
+///   last.
 ///
-/// [`SORT_RUN_ROWS`]: sort_sink::SORT_RUN_ROWS
-///
-/// `options` are the options of the session that executes `plan`: e.g.
-/// whether DataFusion's sort concatenates large batches depends on them.
-/// `lower_input` lowers the input of the sort (with the projections above
-/// it). Returns `Ok(None)` for any other node, without calling
-/// `lower_input`.
+/// `options` are the options of the session that executes `plan`, on which
+/// the native operators do not depend. `lower_input` lowers the input of the
+/// sort (with the projections above it). Returns `Ok(None)` for any other
+/// node, without calling `lower_input`.
 ///
 /// [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
 pub fn try_lower<F>(
@@ -278,7 +190,7 @@ where
     Ok(Some(operator))
 }
 
-/// A sort of a DataFusion plan that the native operators reproduce, see
+/// A sort of a DataFusion plan that the native operators lower, see
 /// [`try_lower`].
 #[derive(Debug)]
 pub(crate) struct SortPlan {
@@ -287,7 +199,7 @@ pub(crate) struct SortPlan {
     /// The number of rows to keep.
     fetch: Option<usize>,
     /// Whether the native operator is a [`PhysicalTopK`] (with `fetch`), or a
-    /// [`PhysicalSort`] (with `fetch`, if any).
+    /// [`PhysicalSort`] (with `fetch`, if any: a fetch of 0).
     topk: bool,
     /// The rows to sort: the input of the `SortExec` (or the input of the
     /// `CoalescePartitionsExec` it sorts), with the projections between the
@@ -297,16 +209,13 @@ pub(crate) struct SortPlan {
     /// update it: with the expressions of the `SortExec`'s input that its
     /// leading sort keys correspond to.
     dynamic_filter: Option<TopKDynamicFilter>,
-    /// For a TopK whose threshold compares floats, DataFusion's TopK (the
-    /// plan), which the native TopK runs if its result may differ.
-    float_key_fallback: Option<FloatKeyFallback>,
 }
 
 impl SortPlan {
     /// Analyze `plan`, executed with `options`, see [`try_lower`].
     pub(crate) fn try_new(
         plan: &Arc<dyn ExecutionPlan>,
-        options: &ConfigOptions,
+        _options: &ConfigOptions,
     ) -> Result<Option<Self>> {
         let partitions =
             |plan: &Arc<dyn ExecutionPlan>| plan.output_partitioning().partition_count();
@@ -371,58 +280,11 @@ impl SortPlan {
             }
             _ => return Ok(None),
         };
-        if fetch == Some(0) {
-            return Ok(None);
-        }
 
-        // DataFusion passes a sorted input through (with a limit), and ends a
-        // TopK whose input is sorted by a prefix of the keys early: they may
-        // not read all of their input, the native operators do.
-        let input_properties = sort_input.equivalence_properties();
-        if input_properties.ordering_satisfy(sort.expr().clone())? {
-            return Ok(None);
-        }
-        if sort.fetch().is_some()
-            && !input_properties
-                .extract_common_sort_prefix(sort.expr().clone())?
-                .0
-                .is_empty()
-        {
-            return Ok(None);
-        }
-
-        // DataFusion materializes some rows of the sort in single arrays,
-        // without splitting rows that do not fit (32-bit offsets address 2 GiB
-        // of values): its TopK gathers all its rows into one batch, also while
-        // it compacts them, and its sort takes chunks of `batch_size` sorted
-        // rows of each run, in which run-end encoded values can need a value
-        // per row. Whether it fails depends on its batches; the native
-        // operators split such rows, so these sorts are left to DataFusion,
-        // unless the rows of the TopK cannot need that many bytes (see
-        // `topk_rows_fit_into_arrays`).
-        let rows = sort.schema();
-        let types = || rows.fields().iter().map(|field| field.data_type());
-        let unsplit = match sort.fetch() {
-            Some(fetch) => {
-                fetch > 1
-                    && types().any(has_32_bit_offsets)
-                    && !topk_rows_fit_into_arrays(sort, fetch)
-            }
-            None => types().any(has_run_end_encoded_offsets),
-        };
-        if unsplit {
-            return Ok(None);
-        }
-        // DataFusion's sort also concatenates the batches of a partition (or
-        // groups of them) while they occupy fewer than
-        // `sort_in_place_threshold_bytes` (their memory and the bytes of their
-        // rows). Above 2 GiB, a concatenation of values with 32-bit offsets
-        // can need more than those address, and fails.
-        let threshold = options.execution.sort_in_place_threshold_bytes;
-        if sort.fetch().is_none()
-            && threshold > i32::MAX as usize
-            && types().any(has_32_bit_offsets)
-        {
+        // The native operators read all of their input before they emit a row:
+        // an input that never ends is left to DataFusion, which streams the
+        // sorts of such inputs (see `try_lower`).
+        if sort_input.boundedness().is_unbounded() {
             return Ok(None);
         }
 
@@ -437,112 +299,21 @@ impl SortPlan {
                 return Ok(None);
             }
         }
-        // DataFusion evaluates the keys of the sort on all rows, and the keys of
-        // the merges on the rows they read. Without projections, the native
-        // sort sorts by the keys of the sort (whose order satisfies the order of
-        // the merges): it evaluates them on all rows too, and a key of a merge
-        // must be the key of the sort at its position, or not fail. With
-        // projections, it sorts the projected rows by the keys of the top merge,
-        // and evaluates neither the keys of the sort nor those of the other
-        // merges: none of them may fail.
+        // Without projections, the native sort sorts by the keys of the sort,
+        // whose order satisfies the order of the merges. With projections, it
+        // sorts the projected rows by the keys of the top merge, the order of
+        // the result.
         let projected = chain.iter().any(|node| node.is::<ProjectionExec>());
-        let ordering = if let Some(top) = merges.first().filter(|_| projected) {
-            if !cannot_fail(sort.expr())
-                || merges.iter().any(|merge| !cannot_fail(merge.expr()))
-            {
-                return Ok(None);
-            }
-            top.expr().clone()
-        } else {
-            let keys_of_the_sort = merges.iter().all(|merge| {
-                merge.expr().iter().enumerate().all(|(index, key)| {
-                    cannot_fail_to_evaluate(&key.expr)
-                        || sort.expr().get(index).is_some_and(|sort_key| {
-                            sort_key.expr.as_ref() == key.expr.as_ref()
-                        })
-                })
-            });
-            if !keys_of_the_sort {
-                return Ok(None);
-            }
-            sort.expr().clone()
+        let ordering = match merges.first().filter(|_| projected) {
+            Some(top) => top.expr().clone(),
+            None => sort.expr().clone(),
         };
-
-        // DataFusion's TopK (a sort with a fetch) evaluates its keys only on
-        // the batches that its threshold does not discard entirely: which keys
-        // it evaluates depends on the order of its batches, which the native
-        // operators do not reproduce. Such TopKs are left to DataFusion if a
-        // key can fail.
-        if sort.fetch().is_some() && !cannot_fail(sort.expr()) {
-            return Ok(None);
-        }
-        // Its threshold also compares floats with `-0.0 = 0.0`, while it sorts
-        // `-0.0` first: once its threshold is a zero, it discards the zeros of
-        // the other sign that come later, also those that it sorts before the
-        // threshold. That changes its result only if the last row of the
-        // result has a zero in a float key that the threshold compares (see
-        // `FloatKeyFallback`), which the native TopK checks: then it runs
-        // DataFusion's TopK instead. So its last row must be the last row of
-        // DataFusion's TopK: it keeps as many rows, by the keys of the sort
-        // (through the projections, see below). And DataFusion's TopK then
-        // executes after the native TopK read its input, which must therefore
-        // execute again as if it had not been executed (see
-        // `executes_again_as_if_for_the_first_time`): otherwise, such TopKs are
-        // left to DataFusion, which executes their input once.
-        let float_keys = match sort.fetch() {
-            Some(_) => compared_float_keys(sort.expr(), &sort_input.schema())?,
-            None => vec![],
-        };
-        if !float_keys.is_empty()
-            && (fetch != sort.fetch() || !executes_again_as_if_for_the_first_time(plan)?)
-        {
-            return Ok(None);
-        }
-        // The dynamic filter of DataFusion's TopK prunes the rows of the nodes
-        // that consume it as the threshold tightens, at other times than the
-        // native TopK does: such TopKs are left to DataFusion if the work on
-        // the pruned rows can fail.
-        if sort.fetch().is_some()
-            && let Some(filter_id) = sort
-                .dynamic_expressions_produced()
-                .iter()
-                .find_map(|expr| expr.expression_id())
-            && pruned_work_cannot_fail(sort_input, filter_id)? == Some(false)
-        {
-            return Ok(None);
-        }
-        // Over a sort without fetch, a merge with a fetch reads the sorted rows
-        // of all of the input, whose keys are all evaluated: the native operator
-        // is a TopK, which discards rows before it evaluates their keys, only if
-        // its keys cannot fail. Otherwise it is a sort with a fetch.
-        let topk = fetch.is_some() && cannot_fail(&ordering);
-
-        // DataFusion evaluates the projections between the merges and the sort
-        // lazily, on the sorted rows that are read: the merges read the first
-        // batches of every partition, and stop with their fetch or when a node
-        // above them (e.g. a limit) stops reading. The native sort projects all
-        // rows (in chunks of its input) before it sorts them, which only makes
-        // no difference for projections that cannot fail (of columns and
-        // literals), and that compute no values of which an array holds only
-        // so many (e.g. a string literal, repeated for every row).
+        // A TopK keeps at least one row; a sort of no rows reads nothing.
+        let topk = fetch.is_some_and(|fetch| fetch > 0);
         let projections = chain
             .iter()
             .filter_map(|node| node.downcast_ref::<ProjectionExec>())
             .collect::<Vec<_>>();
-        if !float_keys.is_empty() && !orders_like_the_sort(sort, &ordering, &projections)?
-        {
-            return Ok(None);
-        }
-        for projection in &projections {
-            let schema = projection.input().schema();
-            for expr in projection.expr() {
-                if !cannot_fail_to_evaluate(&expr.expr)
-                    || computes_limited_values(&expr.expr, &schema)?
-                {
-                    return Ok(None);
-                }
-            }
-        }
 
         // The rows to sort: the input of the sort, without a merge of its
         // partitions, with the projections above it.
@@ -563,51 +334,18 @@ impl SortPlan {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )?;
         }
-        if !SortKeys::supports(&ordering, &input.schema())? {
+        // The native sort orders its rows by their keys in the row format,
+        // unless the sort kernel sorts them. The row format orders the values
+        // of a union by their type first, also for a descending key, and its
+        // nulls among the values of their type: such keys would not be ordered
+        // as `ORDER BY` orders them.
+        let schema = input.schema();
+        if !SortKeys::supports(&ordering, &schema)? {
             return Ok(None);
         }
-        // The native sort materializes runs (and chunks) of more rows than the
-        // batches of DataFusion's sort, so their dictionaries can need more
-        // values than narrow keys address, and their run-end encodings longer
-        // runs than narrow run ends address, where DataFusion's batches fit.
-        // DataFusion's sort materializes the rows of the `SortExec`, also the
-        // columns that projections above it remove (which the native sort
-        // projects before it sorts), and whether it fails depends on its
-        // batches too.
-        let narrow = |schema: SchemaRef| {
-            schema
-                .fields()
-                .iter()
-                .any(|field| has_narrow_encoding(field.data_type()))
-        };
-        if narrow(sort.schema()) || narrow(input.schema()) {
-            return Ok(None);
-        }
-        // For the same reason, keys that compute values of which an array holds
-        // only so many: the native sort evaluates its keys on each chunk, while
-        // DataFusion evaluates the keys of its sort on its batches, or on all
-        // rows of a small partition at once (which it sorts together), and the
-        // keys of its merges on their batches. And keys of unions (also inside
-        // other values): the native sort orders them by the row format, which
-        // orders unions unlike DataFusion's sort (`make_comparator`), e.g. the
-        // values of a type in ascending order for a descending key.
-        let keys = [
-            (&ordering, input.schema()),
-            (sort.expr(), sort_input.schema()),
-        ]
-        .into_iter()
-        .chain(
-            merges
-                .iter()
-                .map(|merge| (merge.expr(), merge.input().schema())),
-        );
-        for (ordering, schema) in keys {
-            for sort_expr in ordering.iter() {
-                if computes_limited_values(&sort_expr.expr, &schema)?
-                    || has_union(&sort_expr.expr.data_type(&schema)?)
-                {
-                    return Ok(None);
-                }
+        for sort_expr in ordering.iter() {
+            if has_union(&sort_expr.expr.data_type(&schema)?) {
+                return Ok(None);
             }
         }
 
@@ -615,15 +353,12 @@ impl SortPlan {
             true => dynamic_filter(sort, &ordering, &projections)?,
             false => None,
         };
-        let float_key_fallback = (topk && !float_keys.is_empty())
-            .then(|| FloatKeyFallback::new(Arc::clone(plan), float_keys));
         Ok(Some(Self {
             ordering,
             fetch,
             topk,
             input,
             dynamic_filter,
-            float_key_fallback,
         }))
     }
 
@@ -662,9 +397,6 @@ impl SortPlan {
         let mut topk = PhysicalTopK::try_new(input, self.ordering, fetch)?;
         if let Some(filter) = self.dynamic_filter {
             topk = topk.with_dynamic_filter(filter)?;
-        }
-        if let Some(fallback) = self.float_key_fallback {
-            topk = topk.with_float_key_fallback(fallback)?;
         }
         Ok(topk)
     }
@@ -737,365 +469,6 @@ fn dynamic_filter(
     Ok(Some(TopKDynamicFilter::new(filter, keys)))
 }
 
-/// Whether `plan` can be executed again, after an execution (and with
-/// `reset_plan_states`), as if it had not been executed before: whether its
-/// second execution is like a first one, which sees no effect of the first
-/// execution and has none on it, so that it returns rows that a single
-/// execution of `plan` could return (and fails like one).
-///
-/// That is proven for plans that read only in-memory batches, which every
-/// execution reads again (`MemorySourceConfig`s, empty and placeholder rows),
-/// through nodes that compute their output from their input only (filters,
-/// projections, repartitionings, coalesced, merged and interleaved partitions,
-/// unions, aggregations, hash and nested loop joins, cross joins, sorts and
-/// limits), with expressions and aggregate functions that are not volatile.
-/// A volatile function may have state (e.g. count its calls) or return other
-/// values when called again. Any other plan may not execute again as it
-/// executed once: e.g. a stream that can only be read once, a scan of files,
-/// which may change or fail to be read in between, or a write.
-fn executes_again_as_if_for_the_first_time(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> Result<bool> {
-    let computes_from_its_input = match plan.downcast_ref::<DataSourceExec>() {
-        Some(scan) => scan.data_source().is::<MemorySourceConfig>(),
-        None => {
-            plan.is::<EmptyExec>()
-                || plan.is::<PlaceholderRowExec>()
-                || plan.is::<FilterExec>()
-                || plan.is::<ProjectionExec>()
-                || plan.is::<RepartitionExec>()
-                || plan.is::<CoalescePartitionsExec>()
-                || plan.is::<SortPreservingMergeExec>()
-                || plan.is::<InterleaveExec>()
-                || plan.is::<UnionExec>()
-                || plan.is::<AggregateExec>()
-                || plan.is::<HashJoinExec>()
-                || plan.is::<NestedLoopJoinExec>()
-                || plan.is::<CrossJoinExec>()
-                || plan.is::<SortExec>()
-                || plan.is::<GlobalLimitExec>()
-                || plan.is::<LocalLimitExec>()
-        }
-    };
-    if !computes_from_its_input {
-        return Ok(false);
-    }
-    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
-        && aggregate
-            .aggr_expr()
-            .iter()
-            .any(|expr| expr.fun().signature().volatility == Volatility::Volatile)
-    {
-        return Ok(false);
-    }
-    let mut volatile = false;
-    plan.apply_expressions(&mut |expr| {
-        volatile = volatile || calls_volatile_functions(expr)?;
-        Ok(match volatile {
-            true => TreeNodeRecursion::Stop,
-            false => TreeNodeRecursion::Continue,
-        })
-    })?;
-    if volatile {
-        return Ok(false);
-    }
-    for child in plan.children() {
-        if !executes_again_as_if_for_the_first_time(child)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Whether `expr` or an expression in it is volatile (see [`is_volatile`]),
-/// also the current expression of a dynamic filter, which is not one of its
-/// children.
-fn calls_volatile_functions(expr: &Arc<dyn PhysicalExpr>) -> Result<bool> {
-    if is_volatile(expr) {
-        return Ok(true);
-    }
-    let mut volatile = false;
-    expr.apply(|node| {
-        if let Some(dynamic) = node.downcast_ref::<DynamicFilterPhysicalExpr>()
-            && calls_volatile_functions(&dynamic.current()?)?
-        {
-            volatile = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(volatile)
-}
-
-/// Whether the sort keys `ordering` of the rows that `projections` (from the
-/// top) project from the rows of `sort` are the sort keys of `sort` (through
-/// the projections), all of them, with the same options: whether they order
-/// the rows exactly like `sort`.
-fn orders_like_the_sort(
-    sort: &SortExec,
-    ordering: &LexOrdering,
-    projections: &[&ProjectionExec],
-) -> Result<bool> {
-    if ordering.len() != sort.expr().len() {
-        return Ok(false);
-    }
-    for (sort_expr, sort_key) in ordering.iter().zip(sort.expr().iter()) {
-        let mut expr = Some(Arc::clone(&sort_expr.expr));
-        for projection in projections {
-            expr = match expr {
-                Some(expr) => update_expr(&expr, projection.expr(), true)?,
-                None => None,
-            };
-        }
-        let same = expr.is_some_and(|expr| expr.as_ref() == sort_key.expr.as_ref());
-        if !same || sort_expr.options != sort_key.options {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Whether `expr` cannot fail to evaluate: a column, a literal, a dynamic
-/// filter (which compares columns with literals), or a comparison, boolean
-/// combination, negation or null check of such expressions.
-fn cannot_fail_to_evaluate(expr: &Arc<dyn PhysicalExpr>) -> bool {
-    if expr.is::<Column>()
-        || expr.is::<Literal>()
-        || expr.is::<DynamicFilterPhysicalExpr>()
-    {
-        return true;
-    }
-    let infallible = match expr.downcast_ref::<BinaryExpr>() {
-        Some(binary) => matches!(
-            binary.op(),
-            Operator::Eq
-                | Operator::NotEq
-                | Operator::Lt
-                | Operator::LtEq
-                | Operator::Gt
-                | Operator::GtEq
-                | Operator::IsDistinctFrom
-                | Operator::IsNotDistinctFrom
-                | Operator::And
-                | Operator::Or
-        ),
-        None => {
-            expr.is::<NotExpr>() || expr.is::<IsNullExpr>() || expr.is::<IsNotNullExpr>()
-        }
-    };
-    infallible && expr.children().into_iter().all(cannot_fail_to_evaluate)
-}
-
-/// How the dynamic filter with id `filter_id` of a TopK whose input is `plan`
-/// affects `plan`: the nodes that consume the filter (e.g. a Parquet scan)
-/// skip the rows that it rejects, so which rows they, and the nodes between
-/// them and the TopK, process depends on when the threshold of the TopK
-/// tightens, which differs between DataFusion and the native TopK.
-///
-/// Returns `None` if no node of `plan` consumes the filter, `Some(true)` if
-/// the nodes that consume it and the nodes above them only pass rows through
-/// (scans, projections, filters, unions, merges and repartitions of
-/// partitions, without a fetch: a node with a fetch stops after a number of
-/// rows that pass the filter) and only evaluate expressions that cannot
-/// fail, so that skipping rows makes no difference but in speed, and
-/// `Some(false)` otherwise.
-fn pruned_work_cannot_fail(
-    plan: &Arc<dyn ExecutionPlan>,
-    filter_id: u64,
-) -> Result<Option<bool>> {
-    let mut consumes = false;
-    let mut cannot_fail = true;
-    plan.apply_expressions(&mut |expr| {
-        expr.apply(|expr| {
-            consumes |= expr.expression_id() == Some(filter_id);
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        cannot_fail &= cannot_fail_to_evaluate(expr);
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    let mut below = None;
-    for child in plan.children() {
-        if let Some(safe) = pruned_work_cannot_fail(child, filter_id)? {
-            below = Some(below.unwrap_or(true) && safe);
-        }
-    }
-    if !consumes && below.is_none() {
-        return Ok(None);
-    }
-    let passes_rows = (plan.is::<DataSourceExec>()
-        || plan.is::<ProjectionExec>()
-        || plan.is::<FilterExec>()
-        || plan.is::<UnionExec>()
-        || plan.is::<CoalescePartitionsExec>()
-        || plan.is::<RepartitionExec>())
-        && plan.fetch().is_none();
-    Ok(Some(below.unwrap_or(true) && passes_rows && cannot_fail))
-}
-
-/// Whether no key of `ordering` can fail to evaluate.
-fn cannot_fail(ordering: &LexOrdering) -> bool {
-    ordering
-        .iter()
-        .all(|sort_expr| cannot_fail_to_evaluate(&sort_expr.expr))
-}
-
-/// The positions of the sort keys `ordering` (of rows with schema `schema`)
-/// that the threshold of DataFusion's TopK compares and that are floats: the
-/// keys with floats before the first nested key (at which it stops
-/// comparing).
-fn compared_float_keys(ordering: &LexOrdering, schema: &Schema) -> Result<Vec<usize>> {
-    let mut keys = vec![];
-    for (index, data_type) in data_types(ordering, schema)?.iter().enumerate() {
-        if data_type.is_nested() {
-            break;
-        }
-        if has_floats(data_type) {
-            keys.push(index);
-        }
-    }
-    Ok(keys)
-}
-
-/// The most rows of a TopK whose rows have `Utf8` or `Binary` values that the
-/// native operators lower (see [`try_lower`]).
-pub const MAX_TOPK_ROWS_WITH_OFFSETS: usize = 65_536;
-
-/// The most bytes of the `Utf8` and `Binary` values of the in-memory input of
-/// a TopK whose rows have such values that the native operators lower (see
-/// [`try_lower`]): half of what their 32-bit offsets address.
-pub const MAX_TOPK_INPUT_OFFSET_BYTES: usize = 1 << 30;
-
-/// Whether the rows of `sort`, DataFusion's TopK of `fetch` rows, cannot
-/// need more bytes than the 32-bit offsets of a single array address, when
-/// DataFusion gathers them into one batch: its rows have values with 32-bit
-/// offsets only in `Utf8` and `Binary` columns (not inside other values,
-/// which can repeat child values, nor run-end encoded or in dictionaries,
-/// whose values a row can repeat), it keeps at most
-/// [`MAX_TOPK_ROWS_WITH_OFFSETS`] rows, and its rows are rows of in-memory
-/// batches whose `Utf8` and `Binary` values occupy less than
-/// [`MAX_TOPK_INPUT_OFFSET_BYTES`] (see [`in_memory_offset_bytes`]): the
-/// values of any of its rows fit into an array.
-fn topk_rows_fit_into_arrays(sort: &SortExec, fetch: usize) -> bool {
-    let offsets_in_columns_only = sort.schema().fields().iter().all(|field| {
-        let data_type = field.data_type();
-        !has_32_bit_offsets(data_type)
-            || matches!(data_type, DataType::Utf8 | DataType::Binary)
-    });
-    fetch <= MAX_TOPK_ROWS_WITH_OFFSETS
-        && offsets_in_columns_only
-        && in_memory_offset_bytes(sort.input())
-            .is_some_and(|bytes| bytes < MAX_TOPK_INPUT_OFFSET_BYTES)
-}
-
-/// The bytes of the `Utf8` and `Binary` values of the rows of `plan`, if
-/// these are values of in-memory batches: `plan` scans
-/// `MemorySourceConfig`s, the bytes of the `Utf8` and `Binary` values of
-/// whose batches it returns (as a concatenation of each column of a batch
-/// would need them, also if batches share their buffers), and filters,
-/// repartitions, merges or unions their rows, or projects their columns
-/// (without computing values with 32-bit offsets). Every array of
-/// such values of the rows of `plan` has at most that many bytes. `None`
-/// for any other plan.
-fn in_memory_offset_bytes(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
-    if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
-        let config = scan.data_source().downcast_ref::<MemorySourceConfig>()?;
-        let mut bytes = 0_usize;
-        for batch in config.partitions().iter().flatten() {
-            let columns = match config.projection() {
-                Some(projection) => projection
-                    .iter()
-                    .map(|&index| batch.columns().get(index))
-                    .collect::<Option<Vec<_>>>()?,
-                None => batch.columns().iter().collect(),
-            };
-            for column in columns {
-                bytes = bytes.checked_add(offset_value_bytes(column.as_ref()))?;
-            }
-        }
-        return Some(bytes);
-    }
-    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        // A projection must not compute values with 32-bit offsets, which may
-        // need more bytes than its input.
-        let schema = projection.input().schema();
-        for expr in projection.expr() {
-            if !expr.expr.is::<Column>()
-                && has_32_bit_offsets(&expr.expr.data_type(&schema).ok()?)
-            {
-                return None;
-            }
-        }
-    } else if !(plan.is::<FilterExec>()
-        || plan.is::<RepartitionExec>()
-        || plan.is::<CoalescePartitionsExec>()
-        || plan.is::<UnionExec>())
-    {
-        return None;
-    }
-    let mut bytes = 0_usize;
-    for child in plan.children() {
-        bytes = bytes.checked_add(in_memory_offset_bytes(child)?)?;
-    }
-    Some(bytes)
-}
-
-/// Whether values of `data_type` (or of its children) are dictionary encoded
-/// with keys of fewer than 32 bits, or run-end encoded with run ends of fewer
-/// than 32 bits: an array of those addresses at most 65536 dictionary values
-/// or 32767 rows.
-fn has_narrow_encoding(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Dictionary(keys, values) => {
-            matches!(
-                keys.as_ref(),
-                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
-            ) || has_narrow_encoding(values)
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            run_ends.data_type() == &DataType::Int16
-                || has_narrow_encoding(values.data_type())
-        }
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => has_narrow_encoding(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| has_narrow_encoding(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| has_narrow_encoding(field.data_type())),
-        _ => false,
-    }
-}
-
-/// Whether values of `data_type` (or of its children, dictionary values or
-/// run-end encoded values) have 32-bit offsets, which address at most 2 GiB
-/// of values (or 2^31 child values) in one array.
-fn has_32_bit_offsets(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Utf8
-        | DataType::Binary
-        | DataType::List(_)
-        | DataType::ListView(_)
-        | DataType::Map(_, _) => true,
-        DataType::Dictionary(_, values) => has_32_bit_offsets(values),
-        DataType::RunEndEncoded(_, values) => has_32_bit_offsets(values.data_type()),
-        DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _) => has_32_bit_offsets(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| has_32_bit_offsets(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| has_32_bit_offsets(field.data_type())),
-        _ => false,
-    }
-}
-
 /// Whether values of `data_type` are unions, or have unions inside them.
 fn has_union(data_type: &DataType) -> bool {
     match data_type {
@@ -1111,66 +484,6 @@ fn has_union(data_type: &DataType) -> bool {
         DataType::Struct(fields) => {
             fields.iter().any(|field| has_union(field.data_type()))
         }
-        _ => false,
-    }
-}
-
-/// Whether values of `data_type` (or of its children) are run-end encoded
-/// with values that have 32-bit offsets (see [`has_32_bit_offsets`]): rows of
-/// such an array taken in another order can need a value per row.
-fn has_run_end_encoded_offsets(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::RunEndEncoded(_, values) => has_32_bit_offsets(values.data_type()),
-        DataType::Dictionary(_, values) => has_run_end_encoded_offsets(values),
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => has_run_end_encoded_offsets(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| has_run_end_encoded_offsets(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| has_run_end_encoded_offsets(field.data_type())),
-        _ => false,
-    }
-}
-
-/// Whether evaluating `expr` on rows with schema `schema` computes values of
-/// which an array holds only so many: values with a narrow encoding (see
-/// [`has_narrow_encoding`]), or values with 32-bit offsets (see
-/// [`has_32_bit_offsets`]) that `expr` or an expression in it computes, such
-/// as `CAST(repeat(s, 12582912) AS Utf8)` (2 GiB in 171 rows) or a literal
-/// string (repeated for every row). A column computes nothing: its values
-/// are those of its input. Whether evaluating such an expression fails
-/// depends on how many rows it is evaluated on at once.
-fn computes_limited_values(
-    expr: &Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-) -> Result<bool> {
-    let data_type = expr.data_type(schema)?;
-    if has_narrow_encoding(&data_type)
-        || (!expr.is::<Column>() && has_32_bit_offsets(&data_type))
-    {
-        return Ok(true);
-    }
-    for child in expr.children() {
-        if computes_limited_values(child, schema)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Whether the values of `data_type` are floats (possibly dictionary or
-/// run-end encoded).
-fn has_floats(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
-        DataType::Dictionary(_, values) => has_floats(values),
-        DataType::RunEndEncoded(_, values) => has_floats(values.data_type()),
         _ => false,
     }
 }
@@ -1557,107 +870,44 @@ fn data_types(ordering: &LexOrdering, schema: &Schema) -> Result<Vec<DataType>> 
 }
 
 /// The sorted output of a [`PhysicalSort`] or [`PhysicalTopK`], set up when
-/// the sink is finalized and handed to the source.
+/// the sink is finalized and handed to the source: the merge of the runs that
+/// the sink collected.
 #[derive(Debug, Default)]
 pub(crate) struct SortedOutput {
-    output: Mutex<Option<Output>>,
-}
-
-/// What the source of a [`PhysicalSort`] or [`PhysicalTopK`] emits.
-#[derive(Debug)]
-enum Output {
-    /// The merge of the runs that the sink collected.
-    Merger(RunMerger),
-    /// The merged rows, in chunks of at most [`DEFAULT_VECTOR_SIZE`] rows.
-    Batches(VecDeque<RecordBatch>),
-    /// The output of a DataFusion plan, see [`FloatKeyFallback`].
-    Plan(Arc<dyn ExecutionPlan>),
+    merger: Mutex<Option<RunMerger>>,
 }
 
 impl SortedOutput {
     /// Set the merger of the runs collected by the sink.
     pub(crate) fn set(&self, merger: RunMerger) {
-        *self.output.lock() = Some(Output::Merger(merger));
-    }
-
-    /// Set the merged rows, in chunks of at most [`DEFAULT_VECTOR_SIZE`] rows.
-    pub(crate) fn set_batches(&self, batches: VecDeque<RecordBatch>) {
-        *self.output.lock() = Some(Output::Batches(batches));
-    }
-
-    /// Emit the output of the DataFusion plan `plan` instead.
-    pub(crate) fn set_plan(&self, plan: Arc<dyn ExecutionPlan>) {
-        *self.output.lock() = Some(Output::Plan(plan));
+        *self.merger.lock() = Some(merger);
     }
 
     /// The global source state of the operator `name`, which takes over the
-    /// output: the merger, the merged rows, or the execution of a plan (with
-    /// a fresh state, see `reset_plan_states`).
-    pub(crate) fn take_source(
-        &self,
-        ctx: &ExecutionContext,
-        name: &str,
-    ) -> Result<Arc<dyn GlobalSourceState>> {
-        let source = match self.output.lock().take() {
-            Some(Output::Merger(merger)) => SortedSource::Merger(Mutex::new(merger)),
-            Some(Output::Batches(batches)) => SortedSource::Batches(Mutex::new(batches)),
-            Some(Output::Plan(plan)) => {
-                let bridge = BridgeOperator::new(reset_plan_states(plan)?);
-                let state = bridge.get_global_source_state(ctx)?;
-                SortedSource::Plan { bridge, state }
-            }
-            None => return internal_err!("{name} is read before its sink is finalized"),
-        };
-        Ok(Arc::new(source))
+    /// merger.
+    pub(crate) fn take_source(&self, name: &str) -> Result<Arc<dyn GlobalSourceState>> {
+        match self.merger.lock().take() {
+            Some(merger) => Ok(Arc::new(SortedSource(Mutex::new(merger)))),
+            None => internal_err!("{name} is read before its sink is finalized"),
+        }
     }
 }
 
-/// The global source state of a [`PhysicalSort`] or [`PhysicalTopK`]. The
-/// source is not parallel, so a single thread reads it.
-enum SortedSource {
-    Merger(Mutex<RunMerger>),
-    Batches(Mutex<VecDeque<RecordBatch>>),
-    /// A DataFusion plan, executed as by a [`BridgeOperator`], with its
-    /// global source state.
-    Plan {
-        bridge: BridgeOperator,
-        state: Arc<dyn GlobalSourceState>,
-    },
-}
+/// The global source state of a [`PhysicalSort`] or [`PhysicalTopK`]: the
+/// merger of its runs. The source is not parallel, so a single thread reads
+/// it.
+struct SortedSource(Mutex<RunMerger>);
 
 impl GlobalSourceState for SortedSource {}
 
-/// The local source state of the source state `gstate` of the operator
-/// `name`.
-pub(crate) fn sorted_local_source_state(
-    ctx: &ExecutionContext,
-    gstate: &dyn GlobalSourceState,
-    name: &str,
-) -> Result<Box<dyn LocalSourceState>> {
-    match downcast_state::<SortedSource>(gstate.as_any(), name)? {
-        SortedSource::Plan { bridge, state } => {
-            bridge.get_local_source_state(ctx, state.as_ref())
-        }
-        _ => Ok(Box::new(EmptyState)),
-    }
-}
-
-/// The next chunk of the sorted output of the source state `gstate` (with
-/// the local state `lstate`) of the operator `name`.
+/// The next chunk of the sorted output of the source state `gstate` of the
+/// operator `name`.
 pub(crate) fn next_sorted_chunk(
-    ctx: &ExecutionContext,
     gstate: &dyn GlobalSourceState,
-    lstate: &mut dyn LocalSourceState,
     name: &str,
 ) -> Result<SourceResult> {
-    let batch = match downcast_state::<SortedSource>(gstate.as_any(), name)? {
-        SortedSource::Merger(merger) => merger.lock().next_batch(DEFAULT_VECTOR_SIZE)?,
-        SortedSource::Batches(batches) => batches.lock().pop_front(),
-        SortedSource::Plan { bridge, state } => {
-            return bridge.get_data(ctx, state.as_ref(), lstate);
-        }
-    };
-    Ok(match batch {
+    let SortedSource(merger) = downcast_state::<SortedSource>(gstate.as_any(), name)?;
+    Ok(match merger.lock().next_batch(DEFAULT_VECTOR_SIZE)? {
         Some(batch) => SourceResult::Chunk(DataChunk::from_record_batch(batch)),
         None => SourceResult::Finished,
     })
@@ -1695,7 +945,8 @@ pub(crate) mod test_support {
     use crate::sources::try_create_scan_source;
     use crate::test_utils::{
         EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
-        datafusion_context, register_test_tables, run_sql, test_session_config,
+        datafusion_context, has_top_level_order_by, register_test_tables, run_sql,
+        test_session_config,
     };
 
     /// Lower `plan` with the native operators, standing in for the planner
@@ -1885,6 +1136,137 @@ pub(crate) mod test_support {
         }
         root
     }
+
+    /// Plan `sql` on `ctx` and lower it with [`lower`]: the lowered operator
+    /// tree, and its outcome.
+    pub(crate) async fn run_lowered(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> (Arc<dyn PhysicalOperator>, Result<EngineOutput>) {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("planning")
+            .create_physical_plan()
+            .await
+            .expect("physical planning");
+        let root = lower(&plan).expect("lowering");
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            PipelineRootExec::try_new(Arc::clone(&root), plan).expect("a pipeline root"),
+        );
+        let execution = collect(Arc::clone(&exec), ctx.task_ctx());
+        let outcome = tokio::time::timeout(Duration::from_secs(60), execution)
+            .await
+            .unwrap_or_else(|_| panic!("The execution did not complete\nquery: {sql}"))
+            .map(|batches| EngineOutput {
+                schema: exec.schema(),
+                plan: exec,
+                batches,
+                ordered: true,
+            });
+        (root, outcome)
+    }
+
+    /// Assert that `sql`, a query with an `ORDER BY ... LIMIT fetch OFFSET
+    /// offset`, returns with the plan lowered by [`lower`] exactly the rows
+    /// `offset..offset + fetch` of `sorted_sql`, the same query without the
+    /// limit, which DataFusion sorts in full (on sessions configured with
+    /// `config` and set up with `setup`). Its `ORDER BY` must order the rows
+    /// of the result totally (but for rows that are identical).
+    ///
+    /// That is the result of the native TopK: the first rows of the order of
+    /// its keys, in which floats compare in their total order as in a sort
+    /// (`-0.0` before `0.0`). DataFusion's own TopK may keep other rows among
+    /// those that tie in SQL with its last row (e.g. zeros of the other sign),
+    /// so the native result is checked against its sort. Returns the lowered
+    /// operator tree.
+    pub(crate) async fn assert_first_rows_of_the_sort<F>(
+        sql: &str,
+        sorted_sql: &str,
+        (offset, fetch): (usize, usize),
+        config: SessionConfig,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config);
+        setup(&ctx).await.expect("setup");
+        let sorted = run_sql(&ctx, sorted_sql).await.expect("DataFusion's sort");
+        let schema = sorted.schema;
+        let all = arrow::compute::concat_batches(&schema, &sorted.batches)
+            .expect("the sorted rows");
+        let start = offset.min(all.num_rows());
+        let first = all.slice(start, fetch.min(all.num_rows() - start));
+        let (root, outcome) = run_lowered(&ctx, sql).await;
+        let actual = outcome.unwrap_or_else(|e| {
+            panic!(
+                "Failed to run the lowered plan: {e}\nquery: {sql}\nlowered: {}",
+                format_operator_tree(&root)
+            )
+        });
+        let expected = EngineOutput {
+            schema: Arc::clone(&actual.schema),
+            plan: Arc::clone(&actual.plan),
+            batches: vec![first],
+            ordered: true,
+        };
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!(
+                "Not the first rows of the sort: {message}\nquery: {sql}\nlowered: {}",
+                format_operator_tree(&root)
+            );
+        }
+        root
+    }
+
+    /// Assert that `sql`, lowered with [`lower`], returns the rows of
+    /// `expected_sql` on DataFusion (in order if `sql` has a top-level `ORDER
+    /// BY`), or, if `error` is not `None`, fails with an error that contains
+    /// it, on sessions configured with `config` and set up with `setup`. With
+    /// an `error`, for queries on which either engine may fail for rows that
+    /// the other one never evaluates (as the correctness policy allows), with
+    /// an `expected_sql` without those rows; without, e.g. for queries on which
+    /// DataFusion fails where the native operators do not (its capacity
+    /// limits). Returns the lowered operator tree, and whether the lowered plan
+    /// failed.
+    pub(crate) async fn assert_rows_or_error<F>(
+        sql: &str,
+        expected_sql: &str,
+        error: Option<&str>,
+        config: SessionConfig,
+        setup: F,
+    ) -> (Arc<dyn PhysicalOperator>, bool)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(config);
+        setup(&ctx).await.expect("setup");
+        let query = ctx.sql(sql).await.expect("planning");
+        let ordered = has_top_level_order_by(query.logical_plan());
+        let mut expected = run_sql(&ctx, expected_sql)
+            .await
+            .expect("DataFusion's result");
+        let (root, outcome) = run_lowered(&ctx, sql).await;
+        let tree = format_operator_tree(&root);
+        match outcome {
+            Ok(mut actual) => {
+                expected.ordered = ordered;
+                actual.ordered = ordered;
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\nquery: {sql}\nlowered: {tree}");
+                }
+                (root, false)
+            }
+            Err(e) => {
+                assert!(
+                    error.is_some_and(|error| e.to_string().contains(error)),
+                    "query: {sql}: {e}\nlowered: {tree}"
+                );
+                (root, true)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1894,8 +1276,8 @@ mod tests {
     use arrow::array::{
         AsArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
         FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
-        LargeListArray, LargeStringArray, ListArray, ListViewArray, MapArray, RunArray,
-        StringArray, StringViewArray, StructArray, TimestampNanosecondArray, UnionArray,
+        LargeListArray, ListArray, ListViewArray, MapArray, RunArray, StringArray,
+        StringViewArray, StructArray, TimestampNanosecondArray, UnionArray,
     };
     use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow::compute::{SortOptions, concat_batches};
@@ -1914,10 +1296,11 @@ mod tests {
     use rand::{Rng, SeedableRng};
 
     use super::test_support::{
-        assert_native_byte_eq, assert_parity, assert_parity_with_config, lower,
-        lower_with,
+        assert_first_rows_of_the_sort, assert_native_byte_eq, assert_parity,
+        assert_parity_with_config, assert_rows_or_error, lower, lower_with, run_lowered,
     };
     use datafusion_common::ScalarValue;
+    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_plan::filter::FilterExecBuilder;
     use datafusion_physical_plan::limit::GlobalLimitExec;
 
@@ -1932,13 +1315,10 @@ mod tests {
     };
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::{data_batch, data_schema, write_parquet};
-    use crate::test_utils::{
-        assert_byte_eq_with_datafusion_with_config, compare_outputs, datafusion_context,
-        pipeline_context, run_engines, run_sql, test_session_config, test_table_t1,
-    };
+    use crate::test_utils::{datafusion_context, test_session_config, test_table_t1};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::datasource::MemTable;
-    use datafusion::prelude::SessionConfig;
+    use datafusion_common::DataFusionError;
     use datafusion_execution::SendableRecordBatchStream;
     use datafusion_expr::{
         ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
@@ -1947,6 +1327,7 @@ mod tests {
     use datafusion_physical_plan::collect;
     use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
+    use datafusion_physical_plan::union::UnionExec;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     // ---------------------------------------------------------------------
@@ -2388,12 +1769,7 @@ mod tests {
     // Lowering
     // ---------------------------------------------------------------------
 
-    /// `t1` with its 4 skewed partitions (`partitions == 4`), in a single
-    /// partition (`1`) or without partitions (`0`).
-    /// The partitions of `t1`, with `d` as `Utf8View`: TopKs of rows with
-    /// 32-bit offsets are left to DataFusion (see
-    /// `topks_of_rows_with_32_bit_offsets_are_left_to_datafusion`), and the
-    /// tests of the lowering would not lower them.
+    /// The partitions of `t1`, with `d` as `Utf8View`.
     fn t1_partitions() -> (SchemaRef, Vec<Vec<RecordBatch>>) {
         let t1 = test_table_t1().unwrap();
         let schema = t1[0][0].schema();
@@ -2435,6 +1811,8 @@ mod tests {
         (schema, t1)
     }
 
+    /// `t1` with its 4 skewed partitions (`partitions == 4`), in a single
+    /// partition (`1`) or without partitions (`0`).
     fn t1_scan(partitions: usize) -> Arc<dyn ExecutionPlan> {
         let (schema, t1) = t1_partitions();
         let t1 = match partitions {
@@ -2514,12 +1892,12 @@ mod tests {
         }
     }
 
-    /// The fetch of a lowered sort: `None` for a [`PhysicalSort`] without
-    /// fetch, `Some(k)` for a [`PhysicalTopK`].
+    /// The fetch of a lowered sort: the fetch of a [`PhysicalSort`] (`None`,
+    /// or `Some(0)` for a sort of no rows), `Some(k)` for a [`PhysicalTopK`].
     fn lowered_fetch(operator: &Arc<dyn PhysicalOperator>) -> Option<usize> {
         if let Some(sort) = operator.downcast_ref::<PhysicalSort>() {
-            assert_eq!(sort.fetch(), None);
-            None
+            assert!(matches!(sort.fetch(), None | Some(0)), "{:?}", sort.fetch());
+            sort.fetch()
         } else {
             Some(operator.downcast_ref::<PhysicalTopK>().expect("a sort").k())
         }
@@ -2569,10 +1947,10 @@ mod tests {
             (1, Some(10), None, Some(Some(10))),
             (1, Some(10), Some(4), Some(Some(4))),
             (1, None, None, Some(None)),
-            // Sorts of no rows are left to DataFusion.
-            (4, Some(0), Some(0), None),
-            (4, None, Some(0), None),
-            (1, Some(0), None, None),
+            // Sorts of no rows are sorts with a fetch of 0, which read nothing.
+            (4, Some(0), Some(0), Some(Some(0))),
+            (4, None, Some(0), Some(Some(0))),
+            (1, Some(0), None, Some(Some(0))),
         ] {
             let plan = merge(
                 sort_exec(
@@ -2667,43 +2045,120 @@ mod tests {
         assert!(try_lower_bridged(&sort_exec(t1_scan(4), &keys, false, None)).is_none());
         assert!(try_lower_bridged(&sort_exec(t1_scan(4), &keys, true, None)).is_none());
         assert!(try_lower_bridged(&sort_exec(t1_scan(0), &keys, true, None)).is_none());
-        assert!(
-            try_lower_bridged(&sort_exec(t1_scan(1), &keys, false, Some(0))).is_none()
-        );
+        // A sort of no rows is a sort with a fetch of 0, which reads nothing.
+        let (sort, _) = try_lower_bridged(&sort_exec(t1_scan(1), &keys, false, Some(0)))
+            .expect("a sort of no rows");
+        assert!(sort.is::<PhysicalSort>());
+        assert_eq!(lowered_fetch(&sort), Some(0));
     }
 
-    #[test]
-    fn sorts_of_sorted_inputs_are_left_to_datafusion() {
-        // DataFusion passes an input that is sorted already through.
-        let scan = sorted_t1_scan();
-        for fetch in [None, Some(3)] {
-            let plan = sort_exec(Arc::clone(&scan), &[("id", false)], false, fetch);
-            assert!(try_lower_bridged(&plan).is_none(), "fetch {fetch:?}");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_sorted_inputs_are_native() {
+        // DataFusion passes an input that is sorted already through (with a
+        // limit), and ends a TopK whose input is sorted by a prefix of its keys
+        // early: the native operators read all of their (finite) input and sort
+        // it, which returns the same rows.
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(test_session_config()),
+        );
+        for (keys, fetch) in [
+            (&[("id", false)][..], None),
+            (&[("id", false)][..], Some(3)),
+            (&[("id", false), ("a", false)][..], Some(3)),
+            (&[("id", false), ("a", false)][..], None),
+            (&[("a", false), ("id", false)][..], Some(3)),
+        ] {
+            let make = || Ok(sort_exec(sorted_t1_scan(), keys, false, fetch));
+            let root =
+                assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+                    .await;
+            assert_eq!(sorts(&root), 1, "{keys:?}, fetch {fetch:?}");
         }
-        // A TopK of an input sorted by a prefix of its keys ends early.
-        let plan = sort_exec(
-            Arc::clone(&scan),
-            &[("id", false), ("a", false)],
-            false,
-            Some(3),
+    }
+
+    /// A partition of `batch`, and then of nothing, ever: a stream that never
+    /// ends.
+    #[derive(Debug)]
+    struct NeverEnds {
+        batch: RecordBatch,
+    }
+
+    impl PartitionStream for NeverEnds {
+        fn schema(&self) -> &SchemaRef {
+            self.batch.schema_ref()
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<datafusion_execution::TaskContext>,
+        ) -> SendableRecordBatchStream {
+            use futures::StreamExt;
+            let batch = futures::stream::iter([Ok(self.batch.clone())]);
+            Box::pin(RecordBatchStreamAdapter::new(
+                self.batch.schema(),
+                batch.chain(futures::stream::pending()),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_of_inputs_that_never_end_are_left_to_datafusion() -> Result<()> {
+        // A stream of the sorted values `0..100`, which then never ends.
+        // DataFusion passes it through a sort by `v`, and ends a TopK by `v`
+        // once no later row can make it into its result; the native operators
+        // read all of their input before they emit a row, and would wait
+        // forever. Sorts of unbounded inputs are left to DataFusion; the sorts
+        // of the same, finite, stream are native.
+        let schema = values_schema();
+        let batch = values_chunk(0..100).into_record_batch()?;
+        let stream = |infinite: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let partition: Arc<dyn PartitionStream> = Arc::new(NeverEnds {
+                batch: batch.clone(),
+            });
+            let ordering = ordering(&schema, &[("v", false)]);
+            Ok(Arc::new(StreamingTableExec::try_new(
+                Arc::clone(&schema),
+                vec![partition],
+                None,
+                vec![ordering],
+                infinite,
+                None,
+            )?))
+        };
+        for fetch in [None, Some(3)] {
+            let plan = sort_exec(stream(true)?, &[("v", false)], false, fetch);
+            assert!(try_lower_bridged(&plan).is_none(), "fetch {fetch:?}");
+            let plan = sort_exec(stream(false)?, &[("v", false)], false, fetch);
+            assert!(try_lower_bridged(&plan).is_some(), "fetch {fetch:?}");
+        }
+        // The TopK returns its rows, in DataFusion.
+        let plan = sort_exec(stream(true)?, &[("v", false)], false, Some(3));
+        let root = lower(&plan)?;
+        assert_eq!(sorts(&root), 0);
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(test_session_config()),
         );
-        assert!(try_lower_bridged(&plan).is_none());
-        // Without a fetch the sort reads its whole input, and so does a TopK
-        // whose keys do not start with the order of the input.
-        let plan = sort_exec(
-            Arc::clone(&scan),
-            &[("id", false), ("a", false)],
-            false,
-            None,
-        );
-        assert!(try_lower_bridged(&plan).is_some());
-        let plan = sort_exec(
-            Arc::clone(&scan),
-            &[("a", false), ("id", false)],
-            false,
-            Some(3),
-        );
-        assert!(try_lower_bridged(&plan).is_some());
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            collect(exec, task_ctx),
+        )
+        .await
+        .expect("no hang")?;
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, [0, 1, 2]);
+        Ok(())
     }
 
     #[test]
@@ -2820,9 +2275,10 @@ mod tests {
                 assert_eq!(topk.dynamic_filter().unwrap().keys()[0].to_string(), "id@0");
             }
         }
-        // DataFusion evaluates a computed projection lazily, on the sorted
-        // rows that the merge (and the nodes above it) reads, with or without
-        // fetches: it is left to DataFusion.
+        // A computed projection, which DataFusion evaluates lazily on the
+        // sorted rows that the merge reads, is lowered with the input: the
+        // native sort sorts the projected rows by the keys of the merge (see
+        // `computed_projections_above_sorts_are_native` for their results).
         for (sort_fetch, merge_fetch) in
             [(None, None), (None, Some(5)), (Some(5), Some(5))]
         {
@@ -2831,10 +2287,14 @@ mod tests {
                 &[("x", true)],
                 merge_fetch,
             );
-            assert!(
-                try_lower_bridged(&plan).is_none(),
-                "{sort_fetch:?} / {merge_fetch:?}"
-            );
+            let case = format!("{sort_fetch:?} / {merge_fetch:?}");
+            let (sort, input) = try_lower_bridged(&plan).expect("a sort");
+            assert_eq!(lowered_fetch(&sort), merge_fetch, "{case}");
+            assert_eq!(lowered_ordering(&sort), "x@0 DESC", "{case}");
+            let projection = input
+                .downcast_ref::<ProjectionExec>()
+                .unwrap_or_else(|| panic!("{case}: {}", input.name()));
+            assert!(projection.input().is::<DataSourceExec>(), "{case}");
         }
     }
 
@@ -2850,7 +2310,7 @@ mod tests {
             (None, Some(10), Some(Some(10))),
             (Some(7), None, Some(Some(7))),
             (None, None, Some(None)),
-            (Some(0), Some(10), None),
+            (Some(0), Some(10), Some(Some(0))),
         ] {
             let plan = merge(
                 rename(
@@ -2884,7 +2344,8 @@ mod tests {
                 }
             }
         }
-        // A computed projection between the merges is evaluated lazily too.
+        // A computed projection between the merges is lowered with the input
+        // too.
         for (inner_fetch, top_fetch) in [(Some(3), None), (None, Some(3)), (None, None)] {
             let plan = merge(
                 project(
@@ -2894,8 +2355,10 @@ mod tests {
                 &[("x", true)],
                 top_fetch,
             );
-            assert!(
-                try_lower_bridged(&plan).is_none(),
+            let (sort, _) = try_lower_bridged(&plan).expect("a sort");
+            assert_eq!(
+                lowered_fetch(&sort),
+                inner_fetch.or(top_fetch),
                 "{inner_fetch:?} / {top_fetch:?}"
             );
         }
@@ -3021,23 +2484,16 @@ mod tests {
             "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s NULLS FIRST, id",
             "SELECT id, named_struct('x', a, 'y', h) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
             "SELECT id, arrow_cast(make_array(c), 'LargeList(Float64)') AS l FROM t1 ORDER BY l, id LIMIT 2400",
-        ])
-        .await;
-        // TopKs of rows with values that have 32-bit offsets, also in
-        // dictionaries, lists and structs, are left to DataFusion, see
-        // `topks_of_rows_with_32_bit_offsets_are_left_to_datafusion`.
-        for sql in [
+            // TopKs of rows with values that have 32-bit offsets, also in
+            // dictionaries, lists and structs.
             "SELECT id, arrow_cast(d, 'Dictionary(Int64, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
             "SELECT id, make_array(a, b) AS l FROM t1 ORDER BY l DESC, id LIMIT 40",
             "SELECT id, named_struct('x', a, 'y', d) AS s FROM t1 ORDER BY s DESC, id LIMIT 17",
-        ] {
-            assert_eq!(sorts(&assert_parity(sql).await), 0, "{sql}");
-        }
-        // Dictionaries with narrow keys are left to DataFusion, see
-        // `sorts_of_narrow_dictionaries_are_left_to_datafusion`.
-        let sql = "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 \
-                   ORDER BY dd DESC NULLS LAST, id LIMIT 30";
-        assert_eq!(sorts(&assert_parity(sql).await), 0);
+            // Dictionaries with narrow keys.
+            "SELECT id, arrow_cast(d, 'Dictionary(Int8, Utf8)') AS dd FROM t1 ORDER BY dd DESC NULLS LAST, id LIMIT 30",
+            "SELECT id, arrow_cast(d, 'Dictionary(Int16, Utf8)') AS dd FROM t1 ORDER BY dd, id",
+        ])
+        .await;
     }
 
     /// A table `z` with a float column `v` and a unique `id`, in a single
@@ -3063,47 +2519,38 @@ mod tests {
         Ok(())
     }
 
-    /// The native TopKs below `root`, and how many executions of each ran
-    /// DataFusion's TopK instead (`None` if it does not check its floats).
-    fn topk_fallbacks(root: &Arc<dyn PhysicalOperator>) -> Vec<Option<usize>> {
-        let mut fallbacks = vec![];
-        if let Some(topk) = root.downcast_ref::<PhysicalTopK>() {
-            fallbacks.push(topk.float_key_fallback().map(FloatKeyFallback::executions));
-        }
-        for child in root.children() {
-            fallbacks.extend(topk_fallbacks(child));
-        }
-        fallbacks
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_of_float_keys_whose_last_row_is_a_zero_run_datafusion_s_topk()
+    async fn topks_of_float_keys_whose_last_row_is_a_zero_keep_the_first_rows_of_the_sort()
     -> Result<()> {
-        // DataFusion's TopK compares `-0.0 = 0.0` but sorts `-0.0` first: once
-        // its heap is full of `0.0`s, its threshold `v < 0.0` discards the
-        // `-0.0`s that come later, which its sort returns first. Which rows it
-        // returns depends on the order of its batches. The last row of the
-        // result of these TopKs is a zero, so the native TopK runs DataFusion's
-        // TopK instead of returning its own result (its own threshold keeps
-        // both zeros, it returned the `-0.0`s first).
+        // A batch of 3000 zeros of one sign, then a batch of 5 zeros of the
+        // other sign: the last rows of these TopKs are zeros. The native TopK
+        // keeps the first rows of its sort, in which `-0.0` comes before `0.0`,
+        // as DataFusion's sort orders them (DataFusion's TopK may keep other
+        // zeros, which tie in SQL), also by keys that can fail to evaluate. It
+        // used to execute DataFusion's TopK instead.
         for (first, then, descending) in [(0.0, -0.0, ""), (-0.0, 0.0, " DESC")] {
             let setup = async |ctx: &SessionContext| register_zeros(ctx, first, then);
             for target_partitions in [1, 4] {
                 let config =
                     test_session_config().with_target_partitions(target_partitions);
-                for sql in [
-                    format!("SELECT v FROM z ORDER BY v{descending} LIMIT 10"),
-                    format!("SELECT v, id FROM z ORDER BY v{descending}, id LIMIT 3002"),
+                for (select, order, fetch) in [
+                    ("v", format!("v{descending}"), 10),
+                    ("v, id", format!("v{descending}, id"), 3002),
+                    ("v", format!("id % 2, v{descending}"), 10),
                 ] {
-                    let root = assert_native_byte_eq(&sql, config.clone(), &setup).await;
+                    let sorted = format!("SELECT {select} FROM z ORDER BY {order}");
+                    let sql = format!("{sorted} LIMIT {fetch}");
+                    let root = assert_first_rows_of_the_sort(
+                        &sql,
+                        &sorted,
+                        (0, fetch),
+                        config.clone(),
+                        &setup,
+                    )
+                    .await;
                     let tree = format_operator_tree(&root);
-                    assert_eq!(topk_fallbacks(&root), [Some(1)], "{sql}\n{tree}");
+                    assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
                 }
-                // A key that can fail is left to DataFusion.
-                let sql =
-                    format!("SELECT v FROM z ORDER BY id % 2, v{descending} LIMIT 10");
-                let root = assert_native_byte_eq(&sql, config.clone(), &setup).await;
-                assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
             }
         }
         Ok(())
@@ -3112,9 +2559,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_of_float_keys_are_native() -> Result<()> {
         // Floats with zeros of both signs, NaNs and infinities, in skewed
-        // partitions of several batches. The last row of the result of these
-        // TopKs has no zero in a float key, so DataFusion's threshold discarded
-        // no row of it, and the native TopK returns its own result.
+        // partitions of several batches.
         let schema = Arc::new(Schema::new(vec![
             Field::new("v", DataType::Float64, true),
             Field::new("w", DataType::Float32, true),
@@ -3168,17 +2613,24 @@ mod tests {
             ] {
                 let root = assert_native_byte_eq(sql, config.clone(), &setup).await;
                 let tree = format_operator_tree(&root);
-                assert_eq!(topk_fallbacks(&root), [Some(0)], "{sql}\n{tree}");
+                assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
             }
             // The last row has a zero (`-0.0`), also after a key that decides:
-            // DataFusion's TopK runs.
-            for sql in [
-                "SELECT v, id FROM f ORDER BY v, id LIMIT 1301",
-                "SELECT v, id FROM f ORDER BY id, v LIMIT 1101",
-            ] {
-                let root = assert_native_byte_eq(sql, config.clone(), &setup).await;
+            // the native TopK keeps the first rows of the sort (see
+            // `topks_of_float_keys_whose_last_row_is_a_zero_keep_the_first_rows_of_the_sort`).
+            for (order, fetch) in [("v, id", 1301), ("id, v", 1101)] {
+                let sorted = format!("SELECT v, id FROM f ORDER BY {order}");
+                let sql = format!("{sorted} LIMIT {fetch}");
+                let root = assert_first_rows_of_the_sort(
+                    &sql,
+                    &sorted,
+                    (0, fetch),
+                    config.clone(),
+                    &setup,
+                )
+                .await;
                 let tree = format_operator_tree(&root);
-                assert_eq!(topk_fallbacks(&root), [Some(1)], "{sql}\n{tree}");
+                assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
             }
         }
         Ok(())
@@ -3199,7 +2651,6 @@ mod tests {
             let root = assert_parity(sql).await;
             let tree = format_operator_tree(&root);
             assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
-            assert!(topk_fallbacks(&root)[0].is_some(), "{sql}\n{tree}");
         }
     }
 
@@ -3276,58 +2727,14 @@ mod tests {
         }
     }
 
-    /// Run `sql` on both engines, set up with `setup`, which registers a
-    /// table or function whose executions or calls it counts in a new counter
-    /// for each engine, which it adds to `counts`: assert that both engines
-    /// return the same bytes, and count the same executions or calls.
-    /// Returns the lowered operator tree.
-    async fn assert_executed_like_datafusion<F>(
-        sql: &str,
-        counts: &Mutex<Vec<Arc<AtomicUsize>>>,
-        setup: F,
-    ) -> Arc<dyn PhysicalOperator>
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        counts.lock().clear();
-        let (expected, actual) = run_engines(sql, test_session_config(), setup)
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"));
-        let root = Arc::clone(
-            actual
-                .plan
-                .downcast_ref::<PipelineRootExec>()
-                .expect("a pipeline plan")
-                .operator(),
-        );
-        if let Err(message) = compare_outputs(&expected, &actual) {
-            panic!(
-                "Results differ: {message}\nquery: {sql}\n{}",
-                format_operator_tree(&root)
-            );
-        }
-        let counts = counts
-            .lock()
-            .iter()
-            .map(|count| count.load(AtomicOrdering::SeqCst))
-            .collect::<Vec<_>>();
-        assert_eq!(counts.len(), 2, "{sql}");
-        assert_eq!(counts[1], counts[0], "{sql}: DataFusion, pipeline engine");
-        root
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_of_float_keys_whose_input_cannot_be_executed_again_are_left_to_datafusion()
-    -> Result<()> {
-        // A native TopK by float keys runs DataFusion's TopK, which executes
-        // its input again, if the last row of its result is a zero (see
-        // `FloatKeyFallback`), as it is for these queries. That is the same as
-        // an execution of DataFusion's TopK only for an input that every
-        // execution reads again and that has no state: here, a stream that can
-        // only be read once (DataFusion returns `0.0`, the second execution of
-        // the stream no rows), and a volatile function with state (true for
-        // the rows of its first call). Such TopKs are left to DataFusion,
-        // which executes their input once, like the pipeline engine then.
+    async fn topks_of_float_keys_read_their_input_once() -> Result<()> {
+        // TopKs by float keys whose last row is a zero (here `0.0`) used to
+        // execute DataFusion's TopK again, and were left to DataFusion over
+        // inputs that may not execute again as they executed once. They are
+        // native over any input now, which they read once: a stream that can
+        // only be read once, and a volatile function with state (true for the
+        // rows of its first call).
         let schema =
             Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)]));
         let batch = RecordBatch::try_new(
@@ -3346,16 +2753,8 @@ mod tests {
             let table =
                 StreamingTable::try_new(Arc::clone(&schema), vec![Arc::new(partition)])?;
             ctx.register_table("s", Arc::new(table))?;
-            Ok(())
+            Ok::<_, DataFusionError>(())
         };
-        for sql in [
-            "SELECT v FROM s ORDER BY v LIMIT 1",
-            "SELECT v FROM s ORDER BY v NULLS FIRST LIMIT 2",
-            "SELECT v, v + 1 AS w FROM s ORDER BY v LIMIT 1",
-        ] {
-            let root = assert_executed_like_datafusion(sql, &counts, &stream).await;
-            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
-        }
         let volatile = async |ctx: &SessionContext| {
             let table =
                 MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?;
@@ -3366,191 +2765,93 @@ mod tests {
                 calls,
                 signature: Signature::nullary(Volatility::Volatile),
             }));
-            Ok(())
+            Ok::<_, DataFusionError>(())
         };
-        for sql in [
-            "SELECT v FROM t WHERE first_call() ORDER BY v LIMIT 1",
-            "SELECT v, first_call() AS f FROM t ORDER BY v LIMIT 1",
-            "SELECT v FROM (SELECT v FROM t WHERE first_call()) GROUP BY v ORDER BY v LIMIT 1",
+        let float = |v: f64| ScalarValue::Float64(Some(v));
+        for (sql, expected) in [
+            ("SELECT v FROM s ORDER BY v LIMIT 1", vec![vec![float(0.0)]]),
+            (
+                "SELECT v FROM s ORDER BY v NULLS FIRST LIMIT 2",
+                vec![vec![float(0.0)], vec![float(1.0)]],
+            ),
+            (
+                "SELECT v, v + 1 AS w FROM s ORDER BY v LIMIT 1",
+                vec![vec![float(0.0), float(1.0)]],
+            ),
         ] {
-            let root = assert_executed_like_datafusion(sql, &counts, &volatile).await;
-            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+            counts.lock().clear();
+            let ctx = datafusion_context(test_session_config());
+            stream(&ctx).await?;
+            let (root, outcome) = run_lowered(&ctx, sql).await;
+            let tree = format_operator_tree(&root);
+            assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
+            assert_eq!(rows_of(&outcome?.batches), expected, "{sql}");
+            let executions = counts.lock()[0].load(AtomicOrdering::SeqCst);
+            assert_eq!(executions, 1, "{sql}");
         }
-        // Over a table of in-memory batches without volatile functions, the
-        // TopK is native and runs DataFusion's TopK, as its last row is a zero.
-        let ctx = pipeline_context(test_session_config());
-        let table = MemTable::try_new(Arc::clone(&schema), vec![vec![batch.clone()]])?;
-        ctx.register_table("t", Arc::new(table))?;
-        let sql = "SELECT v FROM t ORDER BY v LIMIT 1";
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let output = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
-        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let root = plan
-            .downcast_ref::<PipelineRootExec>()
-            .expect("a pipeline plan");
-        assert_eq!(topk_fallbacks(root.operator()), [Some(1)]);
+        for (sql, expected) in [
+            (
+                "SELECT v FROM t WHERE first_call() ORDER BY v LIMIT 1",
+                vec![vec![float(0.0)]],
+            ),
+            (
+                "SELECT v, first_call() AS f FROM t ORDER BY v LIMIT 1",
+                vec![vec![float(0.0), ScalarValue::Boolean(Some(true))]],
+            ),
+        ] {
+            counts.lock().clear();
+            let ctx = datafusion_context(test_session_config());
+            volatile(&ctx).await?;
+            let (root, outcome) = run_lowered(&ctx, sql).await;
+            let tree = format_operator_tree(&root);
+            assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
+            assert_eq!(rows_of(&outcome?.batches), expected, "{sql}");
+            let calls = counts.lock()[0].load(AtomicOrdering::SeqCst);
+            assert_eq!(calls, 1, "{sql}");
+        }
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn plans_that_execute_again_as_if_for_the_first_time() -> Result<()> {
-        let again = |plan: &Arc<dyn ExecutionPlan>| {
-            executes_again_as_if_for_the_first_time(plan).unwrap()
-        };
-        // In-memory batches, through nodes that compute their output from
-        // their input.
-        let scan = t1_scan(4);
-        let schema = scan.schema();
-        assert!(again(&scan));
-        let a = col("a", &schema)?;
-        let positive = Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Gt, lit(0)));
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExecBuilder::new(positive, Arc::clone(&scan)).build()?);
-        let sort = sort_exec(Arc::clone(&filter), &[("c", false)], true, Some(10));
-        assert!(again(&merge(sort, &[("c", false)], Some(10))));
-        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
-        assert!(again(&empty));
-        let union = UnionExec::try_new(vec![Arc::clone(&scan), empty])?;
-        assert!(again(&union));
-
-        // Volatile functions (with state), also in a dynamic filter, whose
-        // current expression is not one of its children.
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count_calls =
-            crate::operators::filter::test_support::count_calls(&calls, &schema);
-        let first_calls: Arc<dyn PhysicalExpr> =
-            Arc::new(BinaryExpr::new(count_calls, Operator::Eq, lit("1")));
-        let dynamic =
-            crate::operators::filter::test_support::dynamic_first_call(&calls, &schema);
-        assert!(
-            !is_volatile(&dynamic),
-            "the dynamic filter hides its function"
-        );
-        for predicate in [first_calls, dynamic] {
-            let filter: Arc<dyn ExecutionPlan> = Arc::new(
-                FilterExecBuilder::new(Arc::clone(&predicate), Arc::clone(&scan))
-                    .build()?,
-            );
-            assert!(!again(&filter), "{predicate}");
-            let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
-                vec![(predicate, "p".to_string())],
-                Arc::clone(&scan),
-            )?);
-            assert!(!again(&projection));
-            let sort = sort_exec(projection, &[("p", false)], false, Some(3));
-            assert!(!again(&sort));
+    /// The values of the rows of `batches`.
+    fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<ScalarValue>> {
+        let mut rows = vec![];
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                let values = batch
+                    .columns()
+                    .iter()
+                    .map(|column| ScalarValue::try_from_array(column, row))
+                    .collect::<Result<Vec<_>>>()
+                    .expect("values");
+                rows.push(values);
+            }
         }
+        rows
+    }
 
-        // A stream that can only be read once, and a scan of files.
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, true)])),
-            vec![Arc::new(Float64Array::from(vec![1.0]))],
-        )?;
-        let partition = OneShotPartition {
-            schema: batch.schema(),
-            batches: Mutex::new(vec![batch.clone()]),
-            executions: Arc::new(AtomicUsize::new(0)),
-        };
-        let stream: Arc<dyn ExecutionPlan> = Arc::new(StreamingTableExec::try_new(
-            batch.schema(),
-            vec![Arc::new(partition)],
-            None,
-            vec![],
-            false,
-            None,
-        )?);
-        assert!(!again(&stream));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_of_float_keys_over_files_are_native() -> Result<()> {
+        // A TopK by float keys over a scan of Parquet files (which used to be
+        // left to DataFusion, as files may change between two executions).
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("p.parquet");
         write_parquet(&path, data_schema(), &[data_batch(0..100)], None)?;
-        let ctx = datafusion_context(test_session_config());
         let path = path.to_str().expect("a UTF-8 path");
-        ctx.register_parquet("p", path, ParquetReadOptions::default())
-            .await?;
-        let scan = ctx
-            .sql("SELECT * FROM p")
-            .await?
-            .create_physical_plan()
-            .await?;
-        assert!(scan.is::<DataSourceExec>(), "{}", scan.name());
-        assert!(!again(&scan));
-        // A TopK by float keys over such a scan is left to DataFusion.
         let setup = async |ctx: &SessionContext| {
             ctx.register_parquet("p", path, ParquetReadOptions::default())
                 .await
         };
-        let sql = "SELECT id, c FROM p ORDER BY c NULLS FIRST, id LIMIT 10";
-        assert_byte_eq_with_datafusion_with_config(sql, test_session_config(), setup)
-            .await;
-        let root = assert_native_byte_eq(sql, test_session_config(), &setup).await;
-        assert_eq!(sorts(&root), 0, "{}", format_operator_tree(&root));
-        Ok(())
-    }
-
-    #[test]
-    fn float_keys_that_datafusion_s_threshold_compares() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("i", DataType::Int64, true),
-            Field::new("f", DataType::Float64, true),
-            Field::new(
-                "d",
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::Float32),
-                ),
-                true,
-            ),
-            Field::new(
-                "l",
-                DataType::List(Arc::new(Field::new("item", DataType::Float64, true))),
-                true,
-            ),
-        ]));
-        let keys = |names: &[&str]| {
-            let ordering =
-                LexOrdering::new(names.iter().map(|name| {
-                    PhysicalSortExpr::new_default(col(name, &schema).unwrap())
-                }))
-                .unwrap();
-            compared_float_keys(&ordering, &schema).unwrap()
-        };
-        assert_eq!(keys(&["i"]), Vec::<usize>::new());
-        assert_eq!(keys(&["f", "i", "d"]), [0, 2]);
-        // The threshold stops comparing at the first nested key.
-        assert_eq!(keys(&["i", "l", "f"]), Vec::<usize>::new());
-        assert_eq!(keys(&["f", "l", "d"]), [0]);
-
-        // The check of the last row.
-        let fallback = FloatKeyFallback::new(t1_scan(1), vec![1]);
-        let ordering = LexOrdering::new([
-            PhysicalSortExpr::new_default(col("i", &schema)?),
-            PhysicalSortExpr::new_default(col("f", &schema)?),
-        ])
-        .unwrap();
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![Some(0), None, Some(2), Some(3)])),
-                Arc::new(Float64Array::from(vec![
-                    Some(0.0),
-                    Some(-0.0),
-                    None,
-                    Some(f64::NAN),
-                ])),
-                arrow::compute::cast(
-                    &Float32Array::from(vec![0.0_f32; 4]),
-                    schema.field(2).data_type(),
-                )?,
-                Arc::new(ListArray::new_null(
-                    Arc::new(Field::new("item", DataType::Float64, true)),
-                    4,
-                )),
-            ],
-        )?;
-        let differs = (0..4)
-            .map(|row| fallback.may_differ(&ordering, &batch, row))
-            .collect::<Result<Vec<_>>>()?;
-        assert_eq!(differs, [true, true, false, false]);
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            let sorted = "SELECT id, c FROM p ORDER BY c NULLS FIRST, id";
+            let sql = format!("{sorted} LIMIT 10");
+            let root =
+                assert_first_rows_of_the_sort(&sql, sorted, (0, 10), config, &setup)
+                    .await;
+            let tree = format_operator_tree(&root);
+            assert_eq!(count::<PhysicalTopK>(&root), 1, "{tree}");
+            assert!(bridged_plans(&root).is_empty(), "{tree}");
+        }
         Ok(())
     }
 
@@ -3633,18 +2934,35 @@ mod tests {
         MemorySourceConfig::try_new_exec(&partitions, schema, None).unwrap()
     }
 
+    /// The `id`s of the rows of `batches` (in their first column).
+    fn ids(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_of_narrow_dictionaries_that_projections_remove_are_left_to_datafusion()
+    async fn sorts_of_narrow_dictionaries_that_projections_remove_are_native()
     -> Result<()> {
         // `SPM[id] -> Projection[id] -> SortExec[id]` of a partition of three
         // 64-row batches with 192 distinct `Int8`-keyed dictionary values:
         // DataFusion's sort sorts the rows of the `SortExec`, and concatenates
         // the batches of the small partition, whose dictionaries need more
-        // values than the keys address. The native sort projects the rows
-        // before it sorts them, without the dictionaries, and returned the
-        // rows. Such sorts are left to DataFusion; `Int32` keys stay native.
+        // values than the keys address, so it fails. The native sort projects
+        // the rows before it sorts them, without the dictionaries, and returns
+        // the rows (a capacity limit of DataFusion that the native sort does not
+        // have). `Int32` keys fit in both engines.
         let config = test_session_config().with_target_partitions(1);
-        for (key_type, fails) in [(DataType::Int8, true), (DataType::Int32, false)] {
+        for (key_type, datafusion_fails) in
+            [(DataType::Int8, true), (DataType::Int32, false)]
+        {
             let make = || -> Result<Arc<dyn ExecutionPlan>> {
                 let scan = dictionary_scan(key_type.clone(), 1);
                 let sort = sort_exec(scan, &[("id", false)], true, None);
@@ -3653,53 +2971,43 @@ mod tests {
                     ProjectionExec::try_new(vec![(id, "id".to_string())], sort)?;
                 Ok(merge(Arc::new(projection), &[("id", false)], None))
             };
-            let root = match fails {
-                true => {
-                    let message = "Dictionary key bigger than the key type";
-                    assert_lowered_plan_fails_like_datafusion(
-                        make,
-                        lower,
-                        config.clone(),
-                        message,
-                    )
-                    .await
-                }
-                false => {
-                    let task_ctx = Arc::new(
-                        datafusion_execution::TaskContext::default()
-                            .with_session_config(config.clone()),
-                    );
-                    assert_lowered_plan_byte_eq(make, lower, task_ctx, true).await
-                }
-            };
-            assert_eq!(sorts(&root) == 1, !fails, "{key_type}");
+            let task_ctx = Arc::new(
+                datafusion_execution::TaskContext::default()
+                    .with_session_config(config.clone()),
+            );
+            let expected = collect(make()?, Arc::clone(&task_ctx)).await;
+            assert_eq!(expected.is_err(), datafusion_fails, "{key_type}");
+            let plan = make()?;
+            let root = lower(&plan)?;
+            assert_eq!(sorts(&root), 1, "{key_type}");
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let output = collect(exec, task_ctx).await?;
+            assert_eq!(ids(&output), (0..192).collect::<Vec<_>>(), "{key_type}");
         }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_of_narrow_dictionaries_are_left_to_datafusion() {
+    async fn sorts_of_narrow_dictionaries_are_native() {
         // The native sort materializes runs and chunks of more rows than
-        // DataFusion's batches, whose dictionaries can then need more values
-        // than narrow keys address: DataFusion merges the sorted partitions
+        // DataFusion's batches here: DataFusion merges the sorted partitions
         // into batches of 64 rows, each of which uses at most 64 of the 192
-        // values, but 192 values do not fit in `Int8` keys. Such sorts are
-        // left to DataFusion.
+        // values, but 192 values do not fit in `Int8` keys. The native sort
+        // splits runs and chunks whose dictionaries need more values than their
+        // keys address, and returns the same rows, also in TopKs.
         let config = test_session_config()
             .with_target_partitions(1)
             .with_batch_size(64);
         let task_ctx = Arc::new(
             datafusion_execution::TaskContext::default().with_session_config(config),
         );
-        for (key_type, native) in [
-            (DataType::Int8, false),
-            (DataType::UInt8, false),
-            (DataType::Int16, false),
-            (DataType::Int32, true),
+        for key_type in [
+            DataType::Int8,
+            DataType::UInt8,
+            DataType::Int16,
+            DataType::Int32,
         ] {
             for fetch in [None, Some(150)] {
-                // A TopK of rows with `Utf8` values is left to DataFusion too.
-                let native = native && fetch.is_none();
                 let key = key_type.clone();
                 let make = move || -> Result<Arc<dyn ExecutionPlan>> {
                     let sort = sort_exec(
@@ -3713,21 +3021,19 @@ mod tests {
                 let root =
                     assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
                         .await;
-                assert_eq!(sorts(&root) == 1, native, "{key_type}, fetch {fetch:?}");
+                assert_eq!(sorts(&root), 1, "{key_type}, fetch {fetch:?}");
             }
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_by_computed_narrow_dictionaries_are_left_to_datafusion() -> Result<()>
-    {
+    async fn sorts_by_computed_narrow_dictionaries_are_native() -> Result<()> {
         // DataFusion sorts the three 64-row batches of a small partition at
         // once, so it evaluates the key `CAST(s AS Dictionary(Int8, Utf8))` on
-        // all 192 rows, whose 192 distinct values do not fit in `Int8` keys.
-        // The native sort evaluates its keys on each chunk, of 64 rows here,
-        // and returned the rows. Sorts by keys that evaluate to narrow
-        // encodings (also inside the key) are left to DataFusion; `Int32` keys
-        // of `LargeUtf8` values stay native.
+        // all 192 rows, whose 192 distinct values do not fit in `Int8` keys,
+        // and fails. The native sort evaluates its keys on each chunk, of 64
+        // rows here, and returns the rows in the order of the strings `s`, as
+        // the keys of other types do in both engines.
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("s", DataType::Utf8, false),
@@ -3746,89 +3052,69 @@ mod tests {
                 RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
             })
             .collect::<Vec<_>>();
-        let dictionary = |keys: DataType| {
-            DataType::Dictionary(Box::new(keys), Box::new(DataType::Utf8))
+        let dictionary = |keys: DataType, values: DataType| {
+            DataType::Dictionary(Box::new(keys), Box::new(values))
         };
         let cast =
             |expr: Arc<dyn PhysicalExpr>, data_type: DataType| -> Arc<dyn PhysicalExpr> {
                 Arc::new(CastExpr::new(expr, data_type, None))
             };
         let s = col("s", &schema)?;
-        let keys = [
-            // (key, DataFusion fails, native)
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(config.clone()),
+        );
+        let make = |key: Arc<dyn PhysicalExpr>| -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&batches),
+                Arc::clone(&schema),
+                None,
+            )?;
+            let ordering = LexOrdering::new([
+                PhysicalSortExpr::new_default(key),
+                PhysicalSortExpr::new_default(col("id", &schema)?),
+            ])
+            .unwrap();
+            Ok(Arc::new(SortExec::new(ordering, scan)))
+        };
+        // The rows in the order of `s`.
+        let expected = ids(&collect(make(Arc::clone(&s))?, Arc::clone(&task_ctx)).await?);
+        for (key, datafusion_fails) in [
             (
-                cast(Arc::clone(&s), dictionary(DataType::Int8)),
+                cast(Arc::clone(&s), dictionary(DataType::Int8, DataType::Utf8)),
                 true,
-                false,
             ),
             (
                 cast(
-                    cast(Arc::clone(&s), dictionary(DataType::Int8)),
+                    cast(Arc::clone(&s), dictionary(DataType::Int8, DataType::Utf8)),
                     DataType::Utf8,
                 ),
                 true,
-                false,
             ),
             (
-                cast(Arc::clone(&s), dictionary(DataType::Int16)),
-                false,
-                false,
-            ),
-            // `Utf8` values have 32-bit offsets too, see
-            // `sorts_by_computed_keys_with_32_bit_offsets_are_left_to_datafusion`.
-            (
-                cast(Arc::clone(&s), dictionary(DataType::Int32)),
-                false,
+                cast(Arc::clone(&s), dictionary(DataType::Int16, DataType::Utf8)),
                 false,
             ),
             (
                 cast(
                     Arc::clone(&s),
-                    DataType::Dictionary(
-                        Box::new(DataType::Int32),
-                        Box::new(DataType::LargeUtf8),
-                    ),
+                    dictionary(DataType::Int32, DataType::LargeUtf8),
                 ),
                 false,
-                true,
             ),
-        ];
-        let config = test_session_config()
-            .with_target_partitions(1)
-            .with_batch_size(64);
-        for (key, fails, native) in keys {
-            let make = || -> Result<Arc<dyn ExecutionPlan>> {
-                let scan = MemorySourceConfig::try_new_exec(
-                    std::slice::from_ref(&batches),
-                    Arc::clone(&schema),
-                    None,
-                )?;
-                let ordering = LexOrdering::new([
-                    PhysicalSortExpr::new_default(Arc::clone(&key)),
-                    PhysicalSortExpr::new_default(col("id", &schema)?),
-                ])
-                .unwrap();
-                Ok(Arc::new(SortExec::new(ordering, scan)))
-            };
-            let root = match fails {
-                true => {
-                    assert_lowered_plan_fails_like_datafusion(
-                        make,
-                        lower,
-                        config.clone(),
-                        "Dictionary key bigger than the key type",
-                    )
-                    .await
-                }
-                false => {
-                    let task_ctx = Arc::new(
-                        datafusion_execution::TaskContext::default()
-                            .with_session_config(config.clone()),
-                    );
-                    assert_lowered_plan_byte_eq(make, lower, task_ctx, true).await
-                }
-            };
-            assert_eq!(sorts(&root) == 1, native, "{key}");
+        ] {
+            let datafusion =
+                collect(make(Arc::clone(&key))?, Arc::clone(&task_ctx)).await;
+            assert_eq!(datafusion.is_err(), datafusion_fails, "{key}");
+            let plan = make(Arc::clone(&key))?;
+            let root = lower(&plan)?;
+            assert_eq!(sorts(&root), 1, "{key}");
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let output = collect(exec, Arc::clone(&task_ctx)).await?;
+            assert_eq!(ids(&output), expected, "{key}");
         }
         // The same sorts in SQL, where DataFusion simplifies `arrow_cast` into
         // a cast.
@@ -3837,89 +3123,46 @@ mod tests {
             ctx.register_table("t", Arc::new(table))?;
             Ok(())
         };
-        for (keys, fails, native) in [
-            (
-                "Int8, Utf8",
-                Some("Dictionary key bigger than the key type"),
-                false,
-            ),
-            ("Int32, Utf8", None, false),
-            ("Int32, LargeUtf8", None, true),
-        ] {
+        for keys in ["Int8, Utf8", "Int32, Utf8", "Int32, LargeUtf8"] {
             let sql = format!(
                 "SELECT id, s FROM t ORDER BY arrow_cast(s, 'Dictionary({keys})'), id"
             );
-            let root =
-                assert_outcome_like_datafusion(&sql, config.clone(), &setup, fails).await;
-            assert_eq!(sorts(&root) == 1, native, "{sql}");
+            let (root, _) = assert_rows_or_error(
+                &sql,
+                "SELECT id, s FROM t ORDER BY s, id",
+                None,
+                config.clone(),
+                &setup,
+            )
+            .await;
+            assert_eq!(sorts(&root), 1, "{sql}");
         }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_by_computed_keys_with_32_bit_offsets_are_left_to_datafusion()
-    -> Result<()> {
-        // DataFusion sorts the three 64-row batches of a small partition at
-        // once, so it evaluates the key `CAST(repeat(s, 12582912) AS Utf8)`
-        // on all 192 rows: 2.25 GiB of `LargeUtf8` values, more than `Utf8`
-        // addresses. The native sort evaluates its keys on each chunk, of 64
-        // rows here, and returned the rows. Sorts by keys that compute values
-        // with 32-bit offsets (also inside the key) are left to DataFusion.
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("s", DataType::LargeUtf8, false),
-        ]));
-        let batches = (0..3_i64)
-            .map(|batch| {
-                let columns: Vec<ArrayRef> = vec![
-                    Arc::new(Int64Array::from_iter_values(
-                        (0..64).map(|i| batch * 64 + i),
-                    )),
-                    Arc::new(LargeStringArray::from(vec!["x"; 64])),
-                ];
-                RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let setup = async |ctx: &SessionContext| -> Result<()> {
-            let table = MemTable::try_new(Arc::clone(&schema), vec![batches.clone()])?;
-            ctx.register_table("t", Arc::new(table))?;
-            Ok(())
-        };
-        let config = test_session_config().with_target_partitions(1);
-        let sql = "SELECT id FROM t ORDER BY id, arrow_cast(repeat(s, 12582912), 'Utf8')";
-        let message = "LargeString array too large to cast to String array";
-        let root =
-            assert_outcome_like_datafusion(sql, config, &setup, Some(message)).await;
-        assert_eq!(sorts(&root), 0);
-
-        // Columns compute nothing, and other values stay native.
-        for (sql, native) in [
-            ("SELECT id, d FROM t1 ORDER BY d, id", true),
-            ("SELECT id, d FROM t1 ORDER BY upper(d), id", false),
-            ("SELECT id, d FROM t1 ORDER BY length(upper(d)), id", false),
-            (
-                "SELECT id, d FROM t1 ORDER BY arrow_cast(d, 'LargeUtf8'), id",
-                true,
-            ),
-            ("SELECT id, d FROM t1 ORDER BY length(d), id", true),
-            ("SELECT id, a FROM t1 ORDER BY a + b, id", true),
+    async fn sorts_by_computed_keys_are_native() {
+        // Keys that compute values, also with 32-bit offsets, which the native
+        // sort evaluates on its chunks (DataFusion on its batches).
+        for sql in [
+            "SELECT id, d FROM t1 ORDER BY d, id",
+            "SELECT id, d FROM t1 ORDER BY upper(d), id",
+            "SELECT id, d FROM t1 ORDER BY length(upper(d)), id",
+            "SELECT id, d FROM t1 ORDER BY arrow_cast(d, 'LargeUtf8'), id",
+            "SELECT id, d FROM t1 ORDER BY length(d), id",
+            "SELECT id, a FROM t1 ORDER BY a + b, id",
+            "SELECT id, d FROM t1 ORDER BY d || h DESC, id LIMIT 100",
         ] {
             let root = assert_parity(sql).await;
             let tree = format_operator_tree(&root);
-            assert_eq!(sorts(&root) == 1, native, "{sql}\n{tree}");
+            assert_eq!(sorts(&root), 1, "{sql}\n{tree}");
         }
-        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_below_projections_of_large_literals_are_left_to_datafusion()
-    -> Result<()> {
-        // `SPM(fetch=1) -> Projection[id, 2 MiB string] -> SortExec[id]` of one
-        // batch of 1024 rows, with batches of 64 rows: DataFusion evaluates the
-        // literal on the sorted batches that it reads, of 64 rows, while the
-        // native sort projects the chunks of its input, here all 1024 rows,
-        // which need 2 GiB of strings. Projections of literals with 32-bit
-        // offsets are left to DataFusion; other literals stay native.
+    async fn sorts_below_projections_of_literals_are_native() -> Result<()> {
+        // `SPM(fetch=1) -> Projection[id, literal] -> SortExec[id]`: the native
+        // sort projects its input before it sorts it.
         let schema =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ids = Int64Array::from_iter_values((0..1024).rev());
@@ -3928,9 +3171,9 @@ mod tests {
         let task_ctx = Arc::new(
             datafusion_execution::TaskContext::default().with_session_config(config),
         );
-        for (literal, native) in [
-            (ScalarValue::Utf8(Some("x".repeat(2 << 20))), false),
-            (ScalarValue::Int64(Some(7)), true),
+        for literal in [
+            ScalarValue::Utf8(Some("x".repeat(1000))),
+            ScalarValue::Int64(Some(7)),
         ] {
             let make = || -> Result<Arc<dyn ExecutionPlan>> {
                 let scan = MemorySourceConfig::try_new_exec(
@@ -3949,20 +3192,20 @@ mod tests {
             let root =
                 assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
                     .await;
-            assert_eq!(sorts(&root) == 1, native, "{literal:?}");
+            assert_eq!(sorts(&root), 1, "{literal:?}");
         }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_that_datafusion_concatenates_beyond_offsets_are_left_to_it()
-    -> Result<()> {
+    async fn sorts_that_datafusion_concatenates_beyond_offsets_are_native() -> Result<()>
+    {
         // DataFusion's sort concatenates the batches of a partition while they
         // occupy fewer than `sort_in_place_threshold_bytes`. With a threshold
         // of `usize::MAX`, it concatenates 1025 one-row batches whose strings
         // share a 2 MiB buffer, which need 2 GiB of strings in one array, and
-        // fails; the native sort returned the first row. Up to 2 GiB, which
-        // its reservations count for every batch, its concatenations fit.
+        // fails. The native sort does not depend on the threshold: it returns
+        // the first row (a capacity limit of DataFusion that it does not have).
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("s", DataType::Utf8, false),
@@ -3986,43 +3229,49 @@ mod tests {
         };
         let mut config = test_session_config();
         config.options_mut().execution.sort_in_place_threshold_bytes = usize::MAX;
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(config.clone()),
+        );
+        let error = collect(make()?, Arc::clone(&task_ctx))
+            .await
+            .expect_err("DataFusion fails");
+        assert!(
+            error.to_string().contains("Offset overflow error"),
+            "{error}"
+        );
         let options = Arc::clone(config.options());
-        let lower = |plan: &Arc<dyn ExecutionPlan>| lower_with(plan, &options);
-        let message = "Offset overflow error";
-        let root =
-            assert_lowered_plan_fails_like_datafusion(make, lower, config, message).await;
-        assert_eq!(sorts(&root), 0);
-        // With thresholds up to 2 GiB, and for sorts of values without 32-bit
-        // offsets, the sort stays native.
+        let plan = make()?;
+        let root = lower_with(&plan, &options)?;
+        assert_eq!(sorts(&root), 1);
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let output = collect(exec, task_ctx).await?;
+        assert_eq!(ids(&output), [0]);
+        // The native sort does not depend on the options.
         let bridge =
             |plan: &Arc<dyn ExecutionPlan>| -> Result<Arc<dyn PhysicalOperator>> {
                 Ok(Arc::new(BridgeOperator::new(Arc::clone(plan))))
             };
         let mut options = ConfigOptions::default();
-        assert!(try_lower(&make()?, &options, bridge)?.is_some());
-        options.execution.sort_in_place_threshold_bytes = i32::MAX as usize;
-        assert!(try_lower(&make()?, &options, bridge)?.is_some());
-        options.execution.sort_in_place_threshold_bytes = usize::MAX;
-        assert!(try_lower(&make()?, &options, bridge)?.is_none());
-        let view = sort_exec(t1_scan(4), &[("id", false)], true, None);
-        assert!(
-            try_lower(&merge(view, &[("id", false)], None), &options, bridge)?.is_some()
-        );
+        for threshold in [0, i32::MAX as usize, usize::MAX] {
+            options.execution.sort_in_place_threshold_bytes = threshold;
+            assert!(try_lower(&make()?, &options, bridge)?.is_some());
+        }
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_whose_dynamic_filter_reaches_a_fetch_are_left_to_datafusion()
-    -> Result<()> {
+    async fn topks_whose_dynamic_filter_reaches_a_fetch_are_native() -> Result<()> {
         // `SortExec(fetch=1) -> FilterExec(the sort's dynamic filter, fetch=10)`
         // over the one-row batches `[10, 20, 21, ..., 28, 0]`, with batches of
         // one row: DataFusion's TopK publishes the threshold 10 after the first
         // row, so its filter drops 20 to 28 and reads 0 within its fetch of 10
-        // rows. The native TopK publishes its threshold later, and the filter
-        // stopped after 10 to 28, before 0. Which rows a node with a fetch
-        // between the TopK and the nodes that consume its dynamic filter passes
-        // depends on when the threshold tightens: such TopKs are left to
-        // DataFusion. Without the fetch, the TopK stays native.
+        // rows. The native TopK may publish its threshold later, so that the
+        // filter stops after 10 to 28, before 0. Which rows a node with a fetch
+        // between the TopK and the nodes that read its dynamic filter passes
+        // depends on when the threshold tightens, in DataFusion too: the TopK
+        // returns the first of the rows that reach it, `0` or `10`. Without the
+        // fetch, all rows reach it.
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batches = [10, 20, 21, 22, 23, 24, 25, 26, 27, 28, 0]
             .map(|v| {
@@ -4058,7 +3307,7 @@ mod tests {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )
         }
-        for (fetch, native) in [(Some(10), false), (None, true)] {
+        for (fetch, expected) in [(Some(10), &[0, 10][..]), (None, &[0][..])] {
             let make = || -> Result<Arc<dyn ExecutionPlan>> {
                 let scan = MemorySourceConfig::try_new_exec(
                     std::slice::from_ref(&batches),
@@ -4073,10 +3322,14 @@ mod tests {
                     Ok(Arc::new(filter))
                 })
             };
-            let root =
-                assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
-                    .await;
-            assert_eq!(sorts(&root) == 1, native, "fetch {fetch:?}");
+            let plan = make()?;
+            let root = lower(&plan)?;
+            assert_eq!(sorts(&root), 1, "fetch {fetch:?}");
+            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let output = collect(exec, Arc::clone(&task_ctx)).await?;
+            let values = ids(&output);
+            assert_eq!(values.len(), 1, "fetch {fetch:?}");
+            assert!(expected.contains(&values[0]), "fetch {fetch:?}: {values:?}");
         }
         // Also a coalesce with a fetch above the filter.
         let scan = MemorySourceConfig::try_new_exec(
@@ -4090,7 +3343,7 @@ mod tests {
                 CoalescePartitionsExec::new(Arc::new(filter)).with_fetch(Some(10));
             Ok(Arc::new(coalesce))
         })?;
-        assert!(try_lower_bridged(&plan).is_none());
+        assert!(try_lower_bridged(&plan).is_some());
         Ok(())
     }
 
@@ -4392,28 +3645,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_of_rows_with_32_bit_offsets_are_left_to_datafusion() {
-        // DataFusion's TopK gathers its rows into one batch (when it emits and
-        // when it compacts them), without splitting rows that do not fit, so
-        // it fails where the native TopK, which splits them, returns rows.
-        let config = test_session_config();
-        // Two batches with interleaving keys and a constant, distinct, run-end
-        // encoded 2 MiB string each: the top 1024 rows alternate between the
-        // batches and need 2 GiB of values.
-        let make = || -> Result<Arc<dyn ExecutionPlan>> {
-            let scan = interleaving_payloads_scan(run_end_encoded_strings);
-            Ok(sort_exec(scan, &[("k", false)], false, Some(1024)))
-        };
-        let message = "Offset overflow error: 2147483648";
-        let root = assert_lowered_plan_fails_like_datafusion(
-            make,
-            lower,
-            config.clone(),
-            message,
-        )
-        .await;
-        assert_eq!(sorts(&root), 0);
-        // 1100 one-row batches whose strings share a 2 MiB buffer.
+    async fn topks_of_rows_with_32_bit_offsets_are_native() -> Result<()> {
+        // 1100 one-row batches whose strings share a 2 MiB buffer, and a TopK of
+        // 2000 rows: DataFusion's TopK gathers its rows into one batch, which
+        // needs 2.2 GiB of strings, more than 32-bit offsets address, and fails.
+        // The native TopK splits rows that do not fit into one array into
+        // several chunks, and returns them all (a capacity limit of DataFusion
+        // that it does not have).
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("s", DataType::Utf8, false),
@@ -4434,19 +3672,31 @@ mod tests {
             )?;
             Ok(sort_exec(scan, &[("k", false)], false, Some(2000)))
         };
-        let root = assert_lowered_plan_fails_like_datafusion(
-            make,
-            lower,
-            config,
-            "Offset overflow error",
-        )
-        .await;
-        assert_eq!(sorts(&root), 0);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(test_session_config()),
+        );
+        let error = collect(make()?, Arc::clone(&task_ctx))
+            .await
+            .expect_err("DataFusion fails");
+        assert!(
+            error.to_string().contains("Offset overflow error"),
+            "{error}"
+        );
+        let plan = make()?;
+        let root = lower(&plan)?;
+        assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let output = collect(exec, task_ctx).await?;
+        assert!(output.len() > 1, "{} chunks", output.len());
+        assert_eq!(ids(&output), (0..1100).collect::<Vec<_>>());
+        for batch in &output {
+            let s = batch.column(1).as_string::<i32>();
+            assert!((0..batch.num_rows()).all(|row| s.value(row).len() == 2 << 20));
+        }
 
-        // Rows whose values have 32-bit offsets, also inside them, are left to
-        // DataFusion; a TopK of one row cannot need more than an array holds,
-        // nor a TopK of `Utf8` or `Binary` columns of small in-memory batches
-        // (here none, see `topks_of_bounded_strings_are_native`).
+        // TopKs and sorts of rows of any values, also with 32-bit offsets
+        // inside them, are native.
         let field = |data_type: DataType| Arc::new(Field::new("x", data_type, true));
         let dictionary = |values: DataType| {
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(values))
@@ -4455,28 +3705,14 @@ mod tests {
             let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
             DataType::RunEndEncoded(run_ends, field(values))
         };
-        // Their full sorts stay native, except for run-end encoded strings,
-        // see `sorts_of_run_end_encoded_strings_are_left_to_datafusion`.
-        for (data_type, topk_natively, sorted_natively) in [
-            (DataType::Utf8, true, true),
-            (DataType::Binary, true, true),
-            (DataType::List(field(DataType::Int32)), false, true),
-            (DataType::LargeList(field(DataType::Utf8)), false, true),
-            (dictionary(DataType::Utf8), false, true),
-            (
-                DataType::Struct(vec![field(DataType::Utf8)].into()),
-                false,
-                true,
-            ),
-            (run_end_encoded(DataType::Utf8), false, false),
-        ] {
-            let topk = lowers_sort_of_payload(&data_type, Some(2));
-            assert_eq!(topk, topk_natively, "{data_type}");
-            assert!(lowers_sort_of_payload(&data_type, Some(1)), "{data_type}");
-            let lowered = lowers_sort_of_payload(&data_type, None);
-            assert_eq!(lowered, sorted_natively, "{data_type}");
-        }
         for data_type in [
+            DataType::Utf8,
+            DataType::Binary,
+            DataType::List(field(DataType::Int32)),
+            DataType::LargeList(field(DataType::Utf8)),
+            dictionary(DataType::Utf8),
+            DataType::Struct(vec![field(DataType::Utf8)].into()),
+            run_end_encoded(DataType::Utf8),
             DataType::Int64,
             DataType::Utf8View,
             DataType::LargeUtf8,
@@ -4487,8 +3723,14 @@ mod tests {
             DataType::Struct(vec![field(DataType::Utf8View)].into()),
             run_end_encoded(DataType::Int64),
         ] {
-            assert!(lowers_sort_of_payload(&data_type, Some(2)), "{data_type}");
+            for fetch in [None, Some(1), Some(2), Some(1_000_000)] {
+                assert!(
+                    lowers_sort_of_payload(&data_type, fetch),
+                    "{data_type}, fetch {fetch:?}"
+                );
+            }
         }
+        Ok(())
     }
 
     /// A scan of `batches` one-row batches `(k, s)` in one partition, whose `k`
@@ -4512,36 +3754,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_of_bounded_strings_are_native() -> Result<()> {
-        // DataFusion's TopK gathers its rows into one batch. If its rows are
-        // rows of in-memory batches whose `Utf8` and `Binary` values occupy
-        // less than 1 GiB, no rows of them can need more than the 2 GiB that
-        // 32-bit offsets address, and it never fails: such TopKs (of at most
-        // 65536 rows) are native.
+    async fn topks_of_strings_are_native() -> Result<()> {
+        // TopKs of rows with `Utf8` values, of any number of rows, also of
+        // values that a projection computes and of nested values.
         for sql in [
             "SELECT id, d FROM t1 ORDER BY id DESC LIMIT 65536",
             "SELECT d, id FROM t1 WHERE a > 0 ORDER BY d NULLS FIRST, id LIMIT 40",
             "SELECT id, d, d AS e FROM t1 ORDER BY a DESC, id LIMIT 2000",
             "SELECT * FROM (SELECT id, d FROM t1 UNION ALL SELECT k, name FROM t2) \
              ORDER BY id, d LIMIT 5100",
-        ] {
-            let root = assert_parity(sql).await;
-            let tree = format_operator_tree(&root);
-            assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
-        }
-        // Rows of `Utf8` values that a projection computes (which can need more
-        // bytes than its input), or of nested values, are left to DataFusion.
-        for sql in [
             "SELECT id, upper(d) AS u FROM t1 ORDER BY u, id LIMIT 30",
             "SELECT id, arrow_cast(d, 'Binary') AS b FROM t1 ORDER BY b, id LIMIT 30",
             "SELECT id, named_struct('d', d) AS s FROM t1 ORDER BY s, id LIMIT 30",
         ] {
             let root = assert_parity(sql).await;
-            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+            let tree = format_operator_tree(&root);
+            assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
         }
 
-        // The fetch, the bytes of the values, and the nodes between the TopK
-        // and the in-memory batches.
+        // Whatever the fetch, the bytes of the values, and the nodes between
+        // the TopK and its input.
         let topk = |input: Arc<dyn ExecutionPlan>, fetch: usize| {
             let plan = match input.output_partitioning().partition_count() {
                 1 => sort_exec(input, &[("k", false)], false, Some(fetch)),
@@ -4550,59 +3782,42 @@ mod tests {
                     merge(sort, &[("k", false)], Some(fetch))
                 }
             };
-            try_lower_bridged(&plan).is_some()
+            try_lower_bridged(&plan).is_some_and(|(topk, _)| topk.is::<PhysicalTopK>())
         };
         let scan = || shared_strings_scan(100, 1 << 20);
-        assert!(topk(scan(), MAX_TOPK_ROWS_WITH_OFFSETS));
-        assert!(!topk(scan(), MAX_TOPK_ROWS_WITH_OFFSETS + 1));
-        // 1023 and 1024 rows of 1 MiB (in a single buffer of 1 MiB).
-        assert!(topk(shared_strings_scan(1023, 1 << 20), 2));
-        assert!(!topk(shared_strings_scan(1024, 1 << 20), 2));
+        assert!(topk(scan(), 65_536));
+        assert!(topk(scan(), 65_537));
+        assert!(topk(shared_strings_scan(1024, 1 << 20), 2));
         let union = |inputs: Vec<Arc<dyn ExecutionPlan>>| -> Arc<dyn ExecutionPlan> {
             UnionExec::try_new(inputs).unwrap()
         };
-        assert!(topk(union(vec![scan(), scan()]), 10));
         let half = || shared_strings_scan(512, 1 << 20);
-        assert!(!topk(union(vec![half(), half()]), 10));
-        let filter = FilterExecBuilder::new(
-            Arc::new(BinaryExpr::new(
-                col("k", &scan().schema())?,
-                Operator::Gt,
-                lit(3_i64),
-            )),
-            scan(),
-        )
-        .build()?;
-        assert!(topk(Arc::new(filter), 10));
+        assert!(topk(union(vec![half(), half()]), 10));
         let repartition =
             RepartitionExec::try_new(scan(), Partitioning::RoundRobinBatch(4))?;
         assert!(topk(Arc::new(repartition), 10));
-        let projected = |s: Arc<dyn PhysicalExpr>| -> Result<Arc<dyn ExecutionPlan>> {
-            let k = col("k", &scan().schema())?;
-            let exprs = vec![(k, "k".to_string()), (s, "s".to_string())];
-            Ok(Arc::new(ProjectionExec::try_new(exprs, scan())?))
-        };
-        assert!(topk(projected(col("s", &scan().schema())?)?, 10));
         let computed = Arc::new(CastExpr::new(
             col("k", &scan().schema())?,
             DataType::Utf8,
             None,
         ));
-        assert!(!topk(projected(computed)?, 10));
-        // Not in memory.
+        let k = col("k", &scan().schema())?;
+        let exprs = vec![(k, "k".to_string()), (computed as _, "s".to_string())];
+        assert!(topk(Arc::new(ProjectionExec::try_new(exprs, scan())?), 10));
         let limit = Arc::new(GlobalLimitExec::new(scan(), 0, Some(50)));
-        assert!(!topk(limit, 10));
+        assert!(topk(limit, 10));
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn sorts_of_run_end_encoded_strings_are_left_to_datafusion() {
+    async fn sorts_of_run_end_encoded_strings_are_native() -> Result<()> {
         // DataFusion's sort takes chunks of `batch_size` sorted rows of a run
         // without splitting rows that do not fit: one batch of two runs of a
         // 2 MiB string, by keys that interleave the runs, needs a string per
         // sorted row, 2 GiB in a chunk of 1024 rows, and DataFusion fails with
-        // the default `batch_size`. With 64 rows per chunk it would succeed.
-        // Sorts of run-end encoded values with 32-bit offsets are left to it.
+        // the default `batch_size`. The native sort splits its runs and chunks
+        // where the strings do not fit into one array, and returns the rows (a
+        // capacity limit of DataFusion that it does not have).
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("p", run_end_encoded_strings("x").data_type().clone(), true),
@@ -4626,18 +3841,33 @@ mod tests {
             )?;
             Ok(sort_exec(scan, &[("k", false)], false, None))
         };
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default()
+                .with_session_config(test_session_config()),
+        );
+        let error = collect(make()?, Arc::clone(&task_ctx))
+            .await
+            .expect_err("DataFusion fails");
         let message = "Offset overflow error: 2147483648";
-        let root = assert_lowered_plan_fails_like_datafusion(
-            make,
-            lower,
-            test_session_config(),
-            message,
-        )
-        .await;
-        assert_eq!(sorts(&root), 0);
+        assert!(error.to_string().contains(message), "{error}");
+        let plan = make()?;
+        let root = lower(&plan)?;
+        assert_eq!(sorts(&root), 1);
+        let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let output = collect(exec, task_ctx).await?;
+        assert_eq!(ids(&output), (0..1024).collect::<Vec<_>>());
+        for batch in &output {
+            let keys = batch.column(0).as_primitive::<Int64Type>();
+            let payload = batch.column(1).as_run::<Int32Type>();
+            let values = payload.values().as_string::<i32>();
+            for row in 0..batch.num_rows() {
+                let value = values.value(payload.get_physical_index(row));
+                let letter = if keys.value(row) % 2 == 0 { "x" } else { "y" };
+                assert!(value.len() == 2 << 20 && value.starts_with(letter));
+            }
+        }
         // Also merged sorts of partitions, merges with a fetch of a sort, and
-        // nested run-end encoded strings. Run-end encoded values without
-        // 32-bit offsets stay native.
+        // nested run-end encoded strings.
         let merged = |payload: fn(&str) -> ArrayRef, fetch: Option<usize>| {
             let sort = sort_exec(
                 interleaving_payloads_scan(payload),
@@ -4647,8 +3877,8 @@ mod tests {
             );
             try_lower_bridged(&merge(sort, &[("k", false)], fetch)).is_some()
         };
-        assert!(!merged(run_end_encoded_strings, None));
-        assert!(!merged(run_end_encoded_strings, Some(10)));
+        assert!(merged(run_end_encoded_strings, None));
+        assert!(merged(run_end_encoded_strings, Some(10)));
         let field = |data_type: DataType| Arc::new(Field::new("x", data_type, true));
         let run_end_encoded = |values: DataType| {
             let run_ends = Arc::new(Field::new("run_ends", DataType::Int32, false));
@@ -4660,19 +3890,12 @@ mod tests {
             ))))]
             .into(),
         );
-        assert!(!lowers_sort_of_payload(&nested, None));
-        assert!(!lowers_sort_of_payload(
+        assert!(lowers_sort_of_payload(&nested, None));
+        assert!(lowers_sort_of_payload(
             &run_end_encoded(DataType::Binary),
             None
         ));
-        assert!(lowers_sort_of_payload(
-            &run_end_encoded(DataType::Float64),
-            None
-        ));
-        assert!(lowers_sort_of_payload(
-            &run_end_encoded(DataType::LargeUtf8),
-            None
-        ));
+        Ok(())
     }
 
     /// A scan of the rows `(a, b)` of `partitions`, a list of batches per
@@ -4766,26 +3989,27 @@ mod tests {
             let sort = root.downcast_ref::<PhysicalSort>().expect("a sort");
             assert_eq!(sort.ordering().len(), 2, "the keys of the SortExec");
         }
-        // Over a projection, the native sort evaluates only the keys of the
-        // top merge: the keys of the sort must not fail.
+        // Over a projection, the native sort sorts the projected rows by the
+        // keys of the top merge only.
         let scan = ab_scan(&[vec![(vec![1], vec![1])]]);
         let keys = a_and_ten_over_b(&scan.schema());
         let sort = Arc::new(SortExec::new(keys, scan).with_preserve_partitioning(true));
         let plan = merge(rename(sort, "b", "c"), &[("a", false)], None);
-        assert!(try_lower_bridged(&plan).is_none());
+        let (sort, _) = try_lower_bridged(&plan).expect("a sort");
+        assert_eq!(lowered_ordering(&sort), "a@0 ASC NULLS LAST");
     }
 
     /// The rows `a = 0..10_000`, in `partitions` partitions of consecutive
     /// values, each in reverse order, with `b = 1`, but `b = 0` for the last
-    /// row of the sort, `a = 9999`.
-    fn reversed_ab_scan(partitions: usize) -> Arc<dyn ExecutionPlan> {
+    /// row of the sort, `a = 9999`, if `zero`.
+    fn reversed_ab_scan(partitions: usize, zero: bool) -> Arc<dyn ExecutionPlan> {
         let size = 10_000 / partitions as i64;
         let partitions = (0..partitions as i64)
             .map(|partition| {
                 let a = (partition * size..(partition + 1) * size)
                     .rev()
                     .collect::<Vec<_>>();
-                let b = a.iter().map(|&a| i64::from(a != 9999)).collect();
+                let b = a.iter().map(|&a| i64::from(a != 9999 || !zero)).collect();
                 vec![(a, b)]
             })
             .collect::<Vec<_>>();
@@ -4805,107 +4029,151 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn computed_projections_above_sorts_are_left_to_datafusion() -> Result<()> {
+    async fn computed_projections_above_sorts_are_native() -> Result<()> {
         // DataFusion evaluates a projection between a merge and a sort lazily,
         // on the sorted rows that are read: with a fetch of 1 (of the merge, or
         // of a limit above it), on the first batches of every partition only.
         // `10 / b` fails only for the last row of the sort, `a = 9999`, which
         // DataFusion never projects, so it returns `(0, 10)`. The native sort
-        // would project all rows before sorting them.
+        // projects all rows before it sorts them, and fails with the division
+        // by zero of that row: whether an error is raised for rows beyond a
+        // limit is the engine's own. Without the zero, both return `(0, 10)`.
         let config = test_session_config().with_batch_size(1024);
         let task_ctx = Arc::new(
             datafusion_execution::TaskContext::default().with_session_config(config),
         );
         type Make = Box<dyn Fn() -> Result<Arc<dyn ExecutionPlan>>>;
         for partitions in [1, 4] {
-            let sorted = move || {
-                let scan = reversed_ab_scan(partitions);
-                project_ten_over_b(sort_exec(scan, &[("a", false)], true, None))
-            };
-            let plans: [Make; 2] = [
-                // `SPM(fetch=1) -> Projection[a, 10 / b] -> SortExec[a]`.
-                Box::new(move || Ok(merge(sorted(), &[("a", false)], Some(1)))),
-                // `GlobalLimitExec(1) -> SPM -> Projection[a, 10 / b] ->
-                // SortExec[a]`.
-                Box::new(move || {
-                    let merged = merge(sorted(), &[("a", false)], None);
-                    Ok(Arc::new(GlobalLimitExec::new(merged, 0, Some(1))))
-                }),
-            ];
-            for make in plans {
-                let output = collect(make()?, Arc::clone(&task_ctx)).await?;
-                let row = (
-                    output[0].column(0).as_primitive::<Int64Type>().value(0),
-                    output[0].column(1).as_primitive::<Int64Type>().value(0),
-                );
-                assert_eq!(row, (0, 10), "DataFusion's result");
-                let root =
-                    assert_lowered_plan_byte_eq(make, lower, Arc::clone(&task_ctx), true)
+            for zero in [true, false] {
+                let sorted = move || {
+                    let scan = reversed_ab_scan(partitions, zero);
+                    project_ten_over_b(sort_exec(scan, &[("a", false)], true, None))
+                };
+                let plans: [Make; 2] = [
+                    // `SPM(fetch=1) -> Projection[a, 10 / b] -> SortExec[a]`.
+                    Box::new(move || Ok(merge(sorted(), &[("a", false)], Some(1)))),
+                    // `GlobalLimitExec(1) -> SPM -> Projection[a, 10 / b] ->
+                    // SortExec[a]`.
+                    Box::new(move || {
+                        let merged = merge(sorted(), &[("a", false)], None);
+                        Ok(Arc::new(GlobalLimitExec::new(merged, 0, Some(1))))
+                    }),
+                ];
+                for make in plans {
+                    let output = collect(make()?, Arc::clone(&task_ctx)).await?;
+                    let row = (
+                        output[0].column(0).as_primitive::<Int64Type>().value(0),
+                        output[0].column(1).as_primitive::<Int64Type>().value(0),
+                    );
+                    assert_eq!(row, (0, 10), "DataFusion's result");
+                    if !zero {
+                        let root = assert_lowered_plan_byte_eq(
+                            make,
+                            lower,
+                            Arc::clone(&task_ctx),
+                            true,
+                        )
                         .await;
-                assert_eq!(sorts(&root), 0, "{}", format_operator_tree(&root));
+                        assert_eq!(sorts(&root), 1, "{}", format_operator_tree(&root));
+                        continue;
+                    }
+                    let plan = make()?;
+                    let root = lower(&plan)?;
+                    assert_eq!(sorts(&root), 1, "{}", format_operator_tree(&root));
+                    let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                    let error = collect(exec, Arc::clone(&task_ctx))
+                        .await
+                        .expect_err("the native sort projects all rows");
+                    assert!(error.to_string().contains("Divide by zero"), "{error}");
+                }
             }
         }
         Ok(())
     }
 
+    /// Run the plan of `make` lowered with [`lower`] on `threads` threads: it
+    /// must return the rows of the plan of `expected` on DataFusion, or fail
+    /// with a division by zero. Returns the lowered tree.
+    async fn assert_rows_or_division_by_zero(
+        make: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        expected: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
+        threads: usize,
+    ) -> Arc<dyn PhysicalOperator> {
+        let config = test_session_config().with_target_partitions(threads);
+        let task_ctx = Arc::new(
+            datafusion_execution::TaskContext::default().with_session_config(config),
+        );
+        let plan = make().expect("plan");
+        let root = lower(&plan).expect("lowering");
+        let tree = format_operator_tree(&root);
+        let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan).unwrap());
+        match collect(exec, Arc::clone(&task_ctx)).await {
+            Ok(actual) => {
+                let expected = collect(expected().unwrap(), task_ctx).await.unwrap();
+                let schema = expected[0].schema();
+                let concat =
+                    |batches: &[RecordBatch]| concat_batches(&schema, batches).unwrap();
+                assert_eq!(concat(&actual), concat(&expected), "{tree}");
+            }
+            Err(e) => assert!(e.to_string().contains("Divide by zero"), "{e}\n{tree}"),
+        }
+        root
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_of_keys_that_can_fail_are_left_to_datafusion() {
+    async fn topks_of_keys_that_can_fail_are_native() {
         // After 2048 rows with `b = 1`, DataFusion's TopK of `a, 10 / b`
         // evaluates the keys of the whole batch `[(-1, 1), (3000, 0)]`, whose
         // first row comes before its threshold: `10 / 0` fails, although the
-        // TopK discards the row `(3000, 0)`.
+        // TopK discards the row `(3000, 0)`. The native TopK discards the rows
+        // that its threshold rules out before it evaluates their keys, so it
+        // fails only if it evaluates that row before it has a threshold (which
+        // depends on its threads): whether an error is raised for rows that
+        // cannot make it into the result is the engine's own. Otherwise, it
+        // returns the first 10 rows.
+        let scan = |b: i64| {
+            ab_scan(&[vec![
+                ((0..2048).collect(), vec![1; 2048]),
+                (vec![-1, 3000], vec![1, b]),
+            ]])
+        };
+        let topk = |b: i64| -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = scan(b);
+            let keys = a_and_ten_over_b(&scan.schema());
+            Ok(Arc::new(SortExec::new(keys, scan).with_fetch(Some(10))))
+        };
         for threads in [1, 4] {
-            let make = || -> Result<Arc<dyn ExecutionPlan>> {
-                let scan = ab_scan(&[vec![
-                    ((0..2048).collect(), vec![1; 2048]),
-                    (vec![-1, 3000], vec![1, 0]),
-                ]]);
-                let keys = a_and_ten_over_b(&scan.schema());
-                Ok(Arc::new(SortExec::new(keys, scan).with_fetch(Some(10))))
-            };
-            let root = assert_like_datafusion(make, threads, true).await;
-            assert_eq!(sorts(&root), 0, "{}", format_operator_tree(&root));
+            let root =
+                assert_rows_or_division_by_zero(|| topk(0), || topk(1), threads).await;
+            assert!(root.is::<PhysicalTopK>(), "{}", format_operator_tree(&root));
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn merges_with_a_fetch_of_sorts_of_keys_that_can_fail_sort_all_rows() {
+    async fn merges_with_a_fetch_of_sorts_of_keys_that_can_fail_are_topks() {
         // A merge with a fetch of a sort without fetch: DataFusion's sort
         // evaluates `10 / b` on all rows, also on the batch whose rows all come
-        // after the first 10 rows, which a TopK discards before evaluating its
-        // keys. The native operator is a sort with a fetch.
-        for (fails, threads) in [(true, 1), (true, 4), (false, 1), (false, 4)] {
-            let make = move || -> Result<Arc<dyn ExecutionPlan>> {
-                let b = if fails { 0 } else { 5 };
-                let scan = ab_scan(&[vec![
-                    ((0..2048).rev().collect(), vec![1; 2048]),
-                    ((5000..5100).collect(), vec![b; 100]),
-                ]]);
-                let keys = a_and_ten_over_b(&scan.schema());
-                let sort =
-                    SortExec::new(keys.clone(), scan).with_preserve_partitioning(true);
-                Ok(Arc::new(
-                    SortPreservingMergeExec::new(keys, Arc::new(sort))
-                        .with_fetch(Some(10)),
-                ))
-            };
-            let root = assert_like_datafusion(make, threads, fails).await;
-            let sort = root
-                .downcast_ref::<PhysicalSort>()
-                .expect("a sort with a fetch");
-            assert_eq!(sort.fetch(), Some(10));
-        }
-        // With keys that cannot fail, it is a TopK.
-        let make = || -> Result<Arc<dyn ExecutionPlan>> {
-            let scan = ab_scan(&[vec![((0..2048).rev().collect(), vec![1; 2048])]]);
-            Ok(merge(
-                sort_exec(scan, &[("a", false)], true, None),
-                &[("a", false)],
-                Some(10),
+        // after the first 10 rows. The native operator is a TopK, which
+        // discards the rows that cannot make it into the result before it
+        // evaluates their keys (unless it sees them before it has a threshold):
+        // it returns the first 10 rows, or fails like DataFusion.
+        let make = |b: i64| -> Result<Arc<dyn ExecutionPlan>> {
+            let scan = ab_scan(&[vec![
+                ((0..2048).rev().collect(), vec![1; 2048]),
+                ((5000..5100).collect(), vec![b; 100]),
+            ]]);
+            let keys = a_and_ten_over_b(&scan.schema());
+            let sort = SortExec::new(keys.clone(), scan).with_preserve_partitioning(true);
+            Ok(Arc::new(
+                SortPreservingMergeExec::new(keys, Arc::new(sort)).with_fetch(Some(10)),
             ))
         };
-        let root = assert_like_datafusion(make, 4, false).await;
-        assert!(root.is::<PhysicalTopK>());
+        for (b, threads) in [(0, 1), (0, 4), (5, 1), (5, 4)] {
+            let root =
+                assert_rows_or_division_by_zero(|| make(b), || make(5), threads).await;
+            let topk = root.downcast_ref::<PhysicalTopK>().expect("a TopK");
+            assert_eq!(topk.k(), 10);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4945,6 +4213,9 @@ mod tests {
             "SELECT id, c FROM t1 ORDER BY c DESC NULLS LAST, id LIMIT 2500",
             "SELECT c FROM t1 ORDER BY c LIMIT 2300",
             "SELECT id, c FROM t1 ORDER BY c DESC, id LIMIT 3000 OFFSET 2047",
+            // Keys that can fail to evaluate.
+            "SELECT id, b FROM t1 ORDER BY a * 2 + 1 DESC, id LIMIT 33",
+            "SELECT id, b FROM t1 ORDER BY 10 / (a + 51), id LIMIT 33",
         ] {
             let root = assert_parity(sql).await;
             assert_eq!(
@@ -4954,10 +4225,6 @@ mod tests {
                 format_operator_tree(&root)
             );
         }
-        // TopKs of keys that can fail to evaluate are left to DataFusion.
-        let sql = "SELECT id, b FROM t1 ORDER BY a * 2 + 1 DESC, id LIMIT 33";
-        let root = assert_parity(sql).await;
-        assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
         // A limit of the sorted rows.
         let root = assert_parity("SELECT id FROM t1 ORDER BY id LIMIT 5 OFFSET 3").await;
         assert_eq!(count::<PhysicalLimit>(&root), 1);
@@ -5183,53 +4450,18 @@ mod tests {
         let _ = values_schema();
     }
 
-    /// Assert that `sql` (on sessions configured with `config` and set up
-    /// with `setup`) fails with an error containing `fails` in DataFusion and
-    /// lowered with [`lower`], or produces the same bytes if `fails` is
-    /// `None`. Returns the lowered operator tree.
-    async fn assert_outcome_like_datafusion<F>(
-        sql: &str,
-        config: SessionConfig,
-        setup: F,
-        fails: Option<&str>,
-    ) -> Arc<dyn PhysicalOperator>
-    where
-        F: AsyncFn(&SessionContext) -> Result<()>,
-    {
-        let Some(message) = fails else {
-            return assert_native_byte_eq(sql, config, setup).await;
-        };
-        let ctx = datafusion_context(config);
-        setup(&ctx).await.expect("setup");
-        let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
-        assert!(error.to_string().contains(message), "DataFusion: {error}");
-        let plan = ctx
-            .sql(sql)
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let root = lower(&plan).unwrap();
-        let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan).unwrap());
-        let error = collect(exec, ctx.task_ctx())
-            .await
-            .expect_err("the lowered plan fails");
-        assert!(error.to_string().contains(message), "native: {error}");
-        root
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn topks_whose_dynamic_filter_prunes_work_that_can_fail_are_left_to_datafusion()
+    async fn topks_whose_dynamic_filter_prunes_work_that_can_fail_are_native()
     -> Result<()> {
         // 20 Parquet files of 500 rows `(a, b)`, in order of `a`, with `b = 1`
         // but `b = 0` for one row of the second file. The dynamic filter of the
         // TopK prunes the files that its threshold rules out: DataFusion's
         // TopK, on a single partition, tightens it after the first file, so
         // its scan never evaluates `10 / b` on the second one. The native TopK
-        // tightens it later (and its scan reads files on several threads), so
-        // which rows the scan evaluates `10 / b` on differs: such TopKs are
-        // left to DataFusion.
+        // tightens it at other times, and its scan reads files on several
+        // threads, so it may evaluate `10 / b` on the second file, and fail.
+        // Either outcome is correct: whether an error is raised for rows that
+        // a dynamic filter skips is the engine's own.
         let dir = tempfile::tempdir()?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
@@ -5255,32 +4487,34 @@ mod tests {
             ctx.register_parquet("p", &path, ParquetReadOptions::default())
                 .await
         };
-        let config = test_session_config().with_target_partitions(1);
-        for (sql, fails) in [
-            // `10 / b` is pushed into the scan: DataFusion never evaluates it on
-            // the second file.
-            ("SELECT a, 10 / b AS q FROM p ORDER BY a LIMIT 1", false),
-            // DataFusion's filter evaluates it on the second file (read before
-            // the threshold is known).
-            ("SELECT a FROM p WHERE 10 / b > 1 ORDER BY a LIMIT 1", true),
-        ] {
-            let fails = fails.then_some("Divide by zero");
-            let root =
-                assert_outcome_like_datafusion(sql, config.clone(), &setup, fails).await;
-            assert_eq!(sorts(&root), 0, "{sql}\n{}", format_operator_tree(&root));
-        }
-        // Work that cannot fail: the native TopK updates the dynamic filter.
-        for sql in [
-            "SELECT a, b FROM p ORDER BY a LIMIT 1",
-            "SELECT a FROM p WHERE b > 0 AND a IS NOT NULL ORDER BY a DESC LIMIT 3",
-        ] {
-            let root = assert_native_byte_eq(sql, config.clone(), &setup).await;
-            assert_eq!(
-                count::<PhysicalTopK>(&root),
-                1,
-                "{sql}\n{}",
-                format_operator_tree(&root)
-            );
+        for target_partitions in [1, 4] {
+            let config = test_session_config().with_target_partitions(target_partitions);
+            for (sql, expected) in [
+                (
+                    "SELECT a, 10 / b AS q FROM p ORDER BY a LIMIT 1",
+                    "SELECT a, 10 / b AS q FROM p WHERE b = 1 ORDER BY a LIMIT 1",
+                ),
+                (
+                    "SELECT a FROM p WHERE 10 / b > 1 ORDER BY a LIMIT 1",
+                    "SELECT a FROM p WHERE b = 1 ORDER BY a LIMIT 1",
+                ),
+            ] {
+                let error = Some("Divide by zero");
+                let (root, _) =
+                    assert_rows_or_error(sql, expected, error, config.clone(), &setup)
+                        .await;
+                let tree = format_operator_tree(&root);
+                assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
+            }
+            // Work that cannot fail: the native TopK updates the dynamic filter.
+            for sql in [
+                "SELECT a, b FROM p ORDER BY a LIMIT 1",
+                "SELECT a FROM p WHERE b > 0 AND a IS NOT NULL ORDER BY a DESC LIMIT 3",
+            ] {
+                let root = assert_native_byte_eq(sql, config.clone(), &setup).await;
+                let tree = format_operator_tree(&root);
+                assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
+            }
         }
         Ok(())
     }
