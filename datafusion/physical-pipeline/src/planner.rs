@@ -2696,7 +2696,10 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) 
 /// coercions, but it may constrain the values of the file otherwise than its
 /// own types (e.g. fixed-size lists for lists of any length), which the reader
 /// only checks as it decodes them: only files whose explicit schemas have
-/// their own types are judged to be read without failing. (Not its coercion of strings into
+/// their own types are judged to be read without failing. And the types of the
+/// table must be types that the reader decodes without failing, whatever the
+/// values (see [`decodes_without_failing`]): e.g. not dictionaries with narrow
+/// keys, which the values of a column chunk may overflow. (Not its coercion of strings into
 /// dictionaries: such files may fail.) The schema of a table that DataFusion
 /// inferred from its files has their types, but a schema given when the table
 /// was registered may have others, into which the scan casts the values of the
@@ -2803,14 +2806,16 @@ fn reads_files_of_the_types_of_their_table(
         {
             return false;
         }
-        // Of the type of the table, and without nulls if the table has none.
+        // Of the type of the table, which the reader decodes without failing,
+        // and without nulls if the table has none.
         table.fields().iter().all(|field| {
-            file_schema
-                .field_with_name(field.name())
-                .is_ok_and(|file_field| {
-                    file_field.data_type() == field.data_type()
-                        && (field.is_nullable() || !file_field.is_nullable())
-                })
+            decodes_without_failing(field.data_type())
+                && file_schema
+                    .field_with_name(field.name())
+                    .is_ok_and(|file_field| {
+                        file_field.data_type() == field.data_type()
+                            && (field.is_nullable() || !file_field.is_nullable())
+                    })
         })
     };
     config
@@ -2818,6 +2823,56 @@ fn reads_files_of_the_types_of_their_table(
         .iter()
         .flat_map(|group| group.iter())
         .all(has_the_types_of_the_table)
+}
+
+/// Whether the Parquet reader decodes the values of a well-formed file into
+/// arrays of `data_type` without failing, whatever the values: primitive
+/// values, decimals, binaries of a fixed size, views of strings and binaries,
+/// strings and binaries with 64-bit offsets, and lists with 64-bit offsets and
+/// structs of such values. Not strings, binaries, lists and maps with 32-bit
+/// offsets, which the values of a batch may overflow, nor dictionaries, whose
+/// keys the values of a column chunk may overflow (e.g. more than 128 values for
+/// `Int8` keys), nor fixed-size lists, whose lists the reader checks the
+/// lengths of, nor unions and run-end encodings.
+fn decodes_without_failing(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Timestamp(..)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Decimal32(..)
+        | DataType::Decimal64(..)
+        | DataType::Decimal128(..)
+        | DataType::Decimal256(..)
+        | DataType::FixedSizeBinary(_)
+        | DataType::Utf8View
+        | DataType::BinaryView
+        | DataType::LargeUtf8
+        | DataType::LargeBinary => true,
+        DataType::LargeList(field) | DataType::LargeListView(field) => {
+            decodes_without_failing(field.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| decodes_without_failing(field.data_type())),
+        _ => false,
+    }
 }
 
 /// Whether the fields of `schema` are the fields of `of`, in the same order,
@@ -6565,6 +6620,75 @@ mod tests {
             &ctx, &config, sql, &schema,
         )
         .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_files_of_narrow_dictionaries_stay_in_datafusion() -> Result<()> {
+        // A table `k INT, v Dictionary(Int8, VARCHAR), s VARCHAR` of two Parquet
+        // files (of the types of the table): 100 rows `k = 0`, and 200 rows `k =
+        // 1` written as two batches of 100 different values each, in one row
+        // group, whose dictionary of 200 values does not fit `Int8` keys. The
+        // reader fails to read the second file (only `v IS NOT NULL` reads `v`),
+        // which DataFusion's scan prunes with the filter of the TopK, so the TopK
+        // stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new(
+                "v",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                true,
+            ),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let batch = |k: i32, values: Vec<Option<String>>| -> Result<RecordBatch> {
+            let rows = values.len();
+            let v = values
+                .iter()
+                .map(Option::as_deref)
+                .collect::<arrow::array::DictionaryArray<arrow::datatypes::Int8Type>>();
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from(vec![k; rows])),
+                    Arc::new(v),
+                    Arc::new(arrow::array::StringViewArray::from(vec!["foo"; rows])),
+                ],
+            )?)
+        };
+        let first = batch(
+            0,
+            (0..100)
+                .map(|i| (i % 7 != 0).then(|| format!("a{}", i % 10)))
+                .collect(),
+        )?;
+        let wide = |prefix: &str| -> Vec<Option<String>> {
+            (0..100)
+                .map(|i| (i % 9 != 0).then(|| format!("{prefix}{i}")))
+                .collect()
+        };
+        let second = [batch(1, wide("x"))?, batch(1, wide("y"))?];
+        write_parquet(&path.join("0.parquet"), Arc::clone(&schema), &[first], None)?;
+        write_parquet(&path.join("1.parquet"), Arc::clone(&schema), &second, None)?;
+        let path = path.to_str().unwrap();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("p", path, ParquetReadOptions::default())
+                .await
+        };
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let sql =
+            "SELECT k FROM p WHERE v IS NOT NULL AND s LIKE '%foo%' ORDER BY k LIMIT 1";
+        let root = assert_parity_with(sql, config, &setup).await;
+        assert_eq!(
+            count::<PhysicalTopK>(&root),
+            0,
+            "{}",
+            format_operator_tree(&root)
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
