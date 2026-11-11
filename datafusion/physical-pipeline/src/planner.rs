@@ -2726,18 +2726,27 @@ fn reads_files_of_the_types_of_their_table(
     // of the schemas of its files may read them in other types, and a custom
     // reader may fail otherwise than the built-in readers, or read other
     // metadata than DataFusion cached. Neither `ParquetFileReaderFactory` nor
-    // `ParquetSource` lets the factory or the provider be identified otherwise
-    // than by their (derived) `Debug` output: only the built-in factories,
-    // whose `Debug` output is that of their structs, and no provider, are
-    // judged not to fail.
+    // `ParquetSource` lets the factory or the provider be identified (there is
+    // no downcast): the planner compares the (derived) `Debug` output of the
+    // factory with that of the built-in factories over the object store of the
+    // scan and the cache of the runtime (as `ParquetFormat` creates them), and
+    // judges any other factory, and any provider, as possibly failing. (Only a
+    // factory whose `Debug` output impersonates these exactly is not told
+    // apart.)
     let builtin_factory = |factory: &Arc<dyn ParquetFileReaderFactory>| {
+        use datafusion_datasource_parquet::{
+            CachedParquetFileReaderFactory, DefaultParquetFileReaderFactory,
+        };
+        let Ok(store) = runtime.object_store(&config.object_store_url) else {
+            return false;
+        };
         let debug = format!("{factory:?}");
-        [
-            "CachedParquetFileReaderFactory {",
-            "DefaultParquetFileReaderFactory {",
-        ]
-        .iter()
-        .any(|prefix| debug.starts_with(prefix))
+        let cached = CachedParquetFileReaderFactory::new(
+            Arc::clone(&store),
+            runtime.cache_manager.get_file_metadata_cache(),
+        );
+        debug == format!("{cached:?}")
+            || debug == format!("{:?}", DefaultParquetFileReaderFactory::new(store))
     };
     if config.expr_adapter_factory.is_some()
         || !format!("{source:?}").contains("schema_provider: None")
@@ -6765,6 +6774,36 @@ mod tests {
         }
     }
 
+    /// A reader factory named like the built-in `CachedParquetFileReaderFactory`,
+    /// whose readers fail to read the metadata of the files whose paths end with
+    /// `faulty` (see [`CachedParquetFileReaderFactoryWithFaults`]).
+    mod impersonation {
+        use super::*;
+
+        #[derive(Debug)]
+        pub(super) struct CachedParquetFileReaderFactory {
+            pub(super) inner: CachedParquetFileReaderFactoryWithFaults,
+        }
+
+        impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
+            fn create_reader(
+                &self,
+                partition_index: usize,
+                partitioned_file: datafusion_datasource::PartitionedFile,
+                metadata_size_hint: Option<usize>,
+                metrics: &datafusion_physical_plan::metrics::ExecutionPlanMetricsSet,
+            ) -> Result<Box<dyn parquet::arrow::async_reader::AsyncFileReader + Send>>
+            {
+                self.inner.create_reader(
+                    partition_index,
+                    partitioned_file,
+                    metadata_size_hint,
+                    metrics,
+                )
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_over_files_of_custom_readers_stay_in_datafusion() -> Result<()> {
         // Two well-formed Parquet files of the types of their table, of 100 rows
@@ -6774,6 +6813,35 @@ mod tests {
         // factory). DataFusion's scan prunes the second file with the filter of
         // the TopK, without reading its metadata: a TopK over a custom reader,
         // which may fail on any file, stays in DataFusion.
+        // Also with a custom factory of the name of the built-in one.
+        let faults = |inner| CachedParquetFileReaderFactoryWithFaults {
+            inner,
+            faulty: "1.parquet",
+        };
+        let factories: [&dyn Fn(
+            Arc<dyn ParquetFileReaderFactory>,
+        ) -> Arc<dyn ParquetFileReaderFactory>; 2] =
+            [&|inner| Arc::new(faults(inner)), &|inner| {
+                Arc::new(impersonation::CachedParquetFileReaderFactory {
+                    inner: faults(inner),
+                })
+            }];
+        for factory in factories {
+            assert_topk_over_custom_reader_stays_in_datafusion(factory).await?;
+        }
+        Ok(())
+    }
+
+    /// Assert that a TopK over the scan of two Parquet files (100 rows `(0,
+    /// 'foo')` and 10 rows `(1, 'foo')`) with the reader factory that `factory`
+    /// makes of the factory of the scan, whose readers fail to read the metadata
+    /// of the second file, succeeds in DataFusion, produces the same rows
+    /// through the pipeline engine, and stays in DataFusion there.
+    async fn assert_topk_over_custom_reader_stays_in_datafusion(
+        factory: &dyn Fn(
+            Arc<dyn ParquetFileReaderFactory>,
+        ) -> Arc<dyn ParquetFileReaderFactory>,
+    ) -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = two_parquet_files(dir.path(), (0, "foo", 100), (1, "foo", 10))?;
         let config = test_session_config()
@@ -6801,13 +6869,9 @@ mod tests {
                         .parquet_file_reader_factory()
                         .expect("the reader factory of the scan"),
                 );
-                let faults = CachedParquetFileReaderFactoryWithFaults {
-                    inner,
-                    faulty: "1.parquet",
-                };
                 let source = source
                     .clone()
-                    .with_parquet_file_reader_factory(Arc::new(faults));
+                    .with_parquet_file_reader_factory(factory(inner));
                 let config =
                     datafusion_datasource::file_scan_config::FileScanConfigBuilder::from(
                         config.clone(),
