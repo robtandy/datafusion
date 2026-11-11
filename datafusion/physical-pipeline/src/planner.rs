@@ -762,19 +762,20 @@ impl Lowering<'_> {
     /// The filter of the join is routed, like DuckDB's join filters, to every
     /// scan below its probe side that produces some of its probe keys
     /// unchanged (see [`route_join_filters`]): through projections, filters,
-    /// sorts, unions, both inputs of other joins (and from one key of an inner
+    /// sorts, unions, the inputs of other joins (and from one key of an inner
     /// or semi join to the other) and aggregations grouped by the keys, but
-    /// into no input of a join whose unmatched rows it emits (the null side of
-    /// an outer join), and across no node that changes their values or limits
-    /// its rows. Every such scan gets a filter of the keys it produces, over
-    /// its own columns, which the join sets with its own (see
-    /// [`PhysicalHashJoin::with_filter_targets`]), and is lowered with it (see
-    /// [`Self::lower_scan`]): the scans then skip the rows that cannot match.
-    /// E.g. in TPC-H Q21 over memory tables, the scan of `supplier` on the
-    /// build side of its join with `lineitem`, two joins below the join with
-    /// the nation of the query, produces the suppliers of that nation only, so
-    /// that the joins below do not join the lines of the other suppliers. The
-    /// pipelines of these scans wait for the build side of the join (see
+    /// not into the null side of an outer join (whose columns the join fills
+    /// with nulls for the rows of its other side without a match), nor across
+    /// a node that changes their values or limits its rows. Every such scan
+    /// gets a filter of the keys it produces, over its own columns, which the
+    /// join sets with its own (see [`PhysicalHashJoin::with_filter_targets`]),
+    /// and is lowered with it (see [`Self::lower_scan`]): the scans then skip
+    /// the rows that cannot match. E.g. in TPC-H Q21 over memory tables, the
+    /// scan of `supplier` on the build side of its join with `lineitem`, two
+    /// joins below the join with the nation of the query, produces the
+    /// suppliers of that nation only, so that the joins below do not join the
+    /// lines of the other suppliers. The pipelines of these scans wait for the
+    /// build side of the join (see
     /// [`MetaPipelineBuilder::build_with_dependency`]), so its filters are
     /// complete before they open their files.
     fn try_lower_hash_join(
@@ -1682,15 +1683,14 @@ fn route_join_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<JoinFilterRou
             .iter()
             .enumerate()
             .filter_map(|(key, column)| {
-                let field = scan_schema.field(column.as_ref().copied()?);
-                let probe_key = &join.on()[key].1;
+                let column = (*column)?;
+                let field = scan_schema.fields().get(column)?;
+                let (_, probe_key) = join.on().get(key)?;
                 let same_type = probe_key
                     .data_type(&probe_schema)
                     .is_ok_and(|data_type| &data_type == field.data_type());
-                same_type.then(|| {
-                    let column = Column::new(field.name(), (*column)?);
-                    Some((key, Arc::new(column) as Arc<dyn PhysicalExpr>))
-                })?
+                let column = Arc::new(Column::new(field.name(), column));
+                same_type.then_some((key, column as Arc<dyn PhysicalExpr>))
             })
             .unzip();
         if keys.is_empty() {
@@ -8862,6 +8862,387 @@ mod join_filters {
             expected.sort();
             routed.sort();
             assert_eq!(routed, expected, "{sql}");
+        }
+        Ok(())
+    }
+
+    /// The tables of the tests of the semantics of the routing (whose keys `dk`,
+    /// `fk`, `ok` and `nk` join each other):
+    ///
+    /// * `dim(dk, dname)`: the keys 0 to 9;
+    /// * `fact(fi, fk, fv)`: 4,000 rows `fi`, with `fk = fi % 100`, and `fv =
+    ///   fi % 7`;
+    /// * `other(ok, ov)`: 1,000 rows, with `ok = i % 100` and `ov = i % 50`;
+    /// * `nulls(nk)`: 1,000 rows of the keys `i % 20`, but NULL in every 10th
+    ///   row (so that no row has the key 0);
+    /// * `nulldim(dk)`: the keys 0, 1 and NULL.
+    const SEMANTICS_TABLES: &[(&str, &str)] = &[
+        (
+            "dim",
+            "SELECT value AS dk, 'd' || CAST(value AS VARCHAR) AS dname \
+             FROM generate_series(0, 9)",
+        ),
+        (
+            "fact",
+            "SELECT value AS fi, value % 100 AS fk, value % 7 AS fv \
+             FROM generate_series(0, 3999)",
+        ),
+        (
+            "other",
+            "SELECT value % 100 AS ok, value % 50 AS ov FROM generate_series(0, 999)",
+        ),
+        (
+            "nulls",
+            "SELECT CASE WHEN value % 10 = 0 THEN NULL ELSE value % 20 END AS nk \
+             FROM generate_series(0, 999)",
+        ),
+        (
+            "nulldim",
+            "SELECT * FROM (VALUES (0), (1), (NULL)) AS n(dk)",
+        ),
+    ];
+
+    /// Register the memory tables of [`SEMANTICS_TABLES`] in `ctx`, in 3
+    /// partitions.
+    async fn register_semantics_tables(ctx: &SessionContext) -> Result<()> {
+        let generator = datafusion_context(test_session_config());
+        for &(name, sql) in SEMANTICS_TABLES {
+            let df = generator.sql(sql).await?;
+            let schema = Arc::clone(df.schema().inner());
+            let batch = concat_batches(&schema, &df.collect().await?)?;
+            let rows = batch.num_rows();
+            let partitions = vec![
+                vec![batch.slice(0, rows / 2)],
+                vec![batch.slice(rows / 2, rows / 4)],
+                vec![batch.slice(rows / 2 + rows / 4, rows - rows / 2 - rows / 4)],
+            ];
+            ctx.register_table(name, Arc::new(MemTable::try_new(schema, partitions)?))?;
+        }
+        Ok(())
+    }
+
+    /// The configuration of the tests of the semantics: the joins of the
+    /// queries are planned in their order (the first input is the build
+    /// side).
+    fn semantics_config() -> SessionConfig {
+        let mut config = test_session_config();
+        config.options_mut().optimizer.join_reordering = false;
+        config
+    }
+
+    /// A query, and the rows that the scans of some of its columns produce:
+    /// `Some` for a scan filtered by the filter of a join, `None` for a scan
+    /// that is not.
+    type ScanRowsOfQuery = (&'static str, &'static [(&'static str, Option<usize>)]);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn join_filters_follow_the_keys_and_respect_the_semantics_of_the_plan()
+    -> Result<()> {
+        // Joins of the keys `dk` of `dim` with the keys of the memory tables
+        // `fact` (`fk`), `other` (`ok`) and `nulls` (`nk`), below other joins,
+        // aggregations or windows. With the keys of `dname IN ('d0', 'd1',
+        // 'd2')` (which DataFusion infers no filter of `fk` from), the filter of the
+        // join is `fk >= 0 AND fk <= 2`, which 120 of the 4,000 rows of `fact`
+        // and 30 of the 1,000 rows of `other` pass. For every query, the results are
+        // those of DataFusion, and the scans whose keys reach the join
+        // unchanged, only through nodes that drop the rows whose keys the join
+        // drops, produce only the rows that the filter accepts: `Some` of the
+        // rows of a scan (of the column) that is filtered, `None` for one that
+        // is not filtered (and produces all of its rows).
+        let cases: &[ScanRowsOfQuery] = &[
+            // Through an aggregation grouped by the key (renamed by a
+            // projection).
+            (
+                "SELECT d.dname, a.n FROM dim d JOIN \
+                 (SELECT fk AS key, COUNT(*) AS n FROM fact GROUP BY fk) a \
+                 ON d.dk = a.key WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120))],
+            ),
+            // Not across a projection that computes the key.
+            (
+                "SELECT d.dname, a.n FROM dim d JOIN \
+                 (SELECT fk + 1 AS key, COUNT(*) AS n FROM fact GROUP BY fk + 1) a \
+                 ON d.dk = a.key WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", None)],
+            ),
+            // Not below an aggregation of grouping sets that do not all group
+            // by the key (whose rows of the other sets have no key).
+            (
+                "SELECT d.dname, a.n FROM dim d JOIN \
+                 (SELECT fk, COUNT(*) AS n FROM fact GROUP BY ROLLUP (fk)) a \
+                 ON d.dk = a.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", None)],
+            ),
+            // Into all inputs of a union.
+            (
+                "SELECT d.dname, a.n FROM dim d JOIN \
+                 (SELECT k, COUNT(*) AS n FROM \
+                   (SELECT fk AS k FROM fact UNION ALL SELECT ok AS k FROM other) u \
+                  GROUP BY k) a \
+                 ON d.dk = a.k WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ok", Some(30))],
+            ),
+            // Into the side of an outer join whose rows it keeps (the build
+            // side of a left join), not into its other side.
+            (
+                "SELECT d.dname, x.ov FROM dim d JOIN \
+                 (SELECT f.fk, o.ov FROM fact f LEFT JOIN other o ON f.fv = o.ok) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ov", None)],
+            ),
+            // Not into the null side of an outer join (whose rows the join
+            // emits without a match too), nor into its other side: the rows
+            // of `fact` that `other` would no longer match would be emitted
+            // with a NULL `ok`, which the NULL build key matches. (With `=`,
+            // which no NULL matches, DataFusion plans an inner join.)
+            (
+                "SELECT x.fv, x.ok FROM nulldim d JOIN \
+                 (SELECT f.fv, o.ok FROM fact f LEFT JOIN other o ON f.fv = o.ov) x \
+                 ON d.dk IS NOT DISTINCT FROM x.ok",
+                &[("ok", None), ("fv", None)],
+            ),
+            // Into both inputs of an inner join, from the key of one input to
+            // the key of the other.
+            (
+                "SELECT d.dname, x.ov FROM dim d JOIN \
+                 (SELECT f.fk, o.ov FROM fact f JOIN other o ON f.fk = o.ok) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ok", Some(30))],
+            ),
+            // Into the output side of a semi join and of an anti join.
+            (
+                "SELECT d.dname, x.fv FROM dim d JOIN \
+                 (SELECT fk, fv FROM fact WHERE fv IN (SELECT ov FROM other)) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ov", None)],
+            ),
+            (
+                "SELECT d.dname, x.fv FROM dim d JOIN \
+                 (SELECT fk, fv FROM fact WHERE fv NOT IN \
+                   (SELECT ov FROM other WHERE ov > 3)) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ov", None)],
+            ),
+            // Into an input of a cross join.
+            (
+                "SELECT d.dname, x.ov FROM dim d JOIN \
+                 (SELECT f.fk, o.ov FROM fact f CROSS JOIN \
+                   (SELECT ov FROM other WHERE ok < 2) o) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", Some(120)), ("ov", None)],
+            ),
+            // Not from a join that emits its probe rows without a match.
+            (
+                "SELECT d.dname, a.n FROM dim d RIGHT JOIN \
+                 (SELECT fk, COUNT(*) AS n FROM fact GROUP BY fk) a \
+                 ON d.dk = a.fk",
+                &[("fk", None)],
+            ),
+            // Not below a limit (here a TopK), nor a window.
+            (
+                "SELECT d.dname, x.fv FROM dim d JOIN \
+                 (SELECT fk, fv FROM fact ORDER BY fi LIMIT 500) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                &[("fk", None)],
+            ),
+            (
+                "SELECT d.dname, x.fv FROM dim d JOIN \
+                 (SELECT fk, fv, ROW_NUMBER() OVER (PARTITION BY fk ORDER BY fi) AS rn \
+                  FROM fact) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2') AND x.rn <= 2",
+                &[("fk", None)],
+            ),
+            // NULL keys that match (`IS NOT DISTINCT FROM`): the filter of the
+            // build keys 0, 1 and NULL accepts the 50 rows of 1 (no row has the
+            // key 0) and the 100 rows of NULL, that of 0 and 1 only the former.
+            (
+                "SELECT d.dk, a.n FROM nulldim d JOIN \
+                 (SELECT nk, COUNT(*) AS n FROM nulls GROUP BY nk) a \
+                 ON d.dk IS NOT DISTINCT FROM a.nk",
+                &[("nk", Some(150))],
+            ),
+            (
+                "SELECT d.dk, a.n FROM (SELECT dk FROM nulldim WHERE dk IS NOT NULL) d \
+                 JOIN (SELECT nk, COUNT(*) AS n FROM nulls GROUP BY nk) a \
+                 ON d.dk IS NOT DISTINCT FROM a.nk",
+                &[("nk", Some(50))],
+            ),
+        ];
+        let all_rows = |column: &str| match column {
+            "fk" | "fv" => 4000,
+            _ => 1000,
+        };
+        for &(sql, expected) in cases {
+            let (actual, root) =
+                assert_same_results(sql, semantics_config(), register_semantics_tables)
+                    .await;
+            let scans = scans(&actual);
+            for &(column, rows) in expected {
+                let scan = scan_of(&scans, column, sql);
+                let tree = format_operator_tree(&root);
+                match rows {
+                    Some(rows) => {
+                        assert_eq!(
+                            scan.filtered_with.len(),
+                            1,
+                            "{scan:?}\n{sql}\n{tree}"
+                        );
+                        assert_eq!(scan.rows, rows, "{scan:?}\n{sql}\n{tree}");
+                    }
+                    None => {
+                        assert_eq!(
+                            scan.filtered_with,
+                            Vec::<String>::new(),
+                            "{sql}\n{tree}"
+                        );
+                        assert_eq!(scan.rows, all_rows(column), "{scan:?}\n{sql}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn join_filters_prune_scans_of_files() -> Result<()> {
+        // `fact` in a Parquet file sorted by `fk`, in row groups of 100 rows,
+        // and in a CSV file, below a cross join and an aggregation: DataFusion
+        // pushes the filter of the join into neither, while the planner routes
+        // it to both. The Parquet scan prunes the 38 row groups of the other
+        // keys of its 40, and the CSV scan filters its rows.
+        let dir = tempfile::tempdir()?;
+        let generator = datafusion_context(test_session_config());
+        let fact = generator
+            .sql("SELECT fi, fk, fv FROM (SELECT value AS fi, value % 100 AS fk, value % 7 AS fv FROM generate_series(0, 3999)) ORDER BY fk, fi")
+            .await?
+            .collect()
+            .await?;
+        let schema = fact[0].schema();
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let parquet = dir.path().join("pfact").join("part-0.parquet");
+        write_parquet(&parquet, Arc::clone(&schema), &fact, Some(properties))?;
+        let csv = dir.path().join("cfact").join("part-0.csv");
+        crate::sources::test_harness::write_csv(&csv, &fact)?;
+        let setup = async |ctx: &SessionContext| {
+            register_semantics_tables(ctx).await?;
+            let path = |name: &str| dir.path().join(name).to_str().map(str::to_owned);
+            ctx.register_parquet(
+                "pfact",
+                &path("pfact").expect("a path"),
+                Default::default(),
+            )
+            .await?;
+            ctx.register_csv(
+                "cfact",
+                &path("cfact").expect("a path"),
+                Default::default(),
+            )
+            .await?;
+            Ok(())
+        };
+        for (sql, column, rows, pruned) in [
+            (
+                "SELECT d.dname, x.ov FROM dim d JOIN \
+                 (SELECT f.fk, o.ov FROM pfact f CROSS JOIN \
+                   (SELECT ov FROM other WHERE ok < 2) o) x \
+                 ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                "fk",
+                200,
+                (38, 40),
+            ),
+            (
+                "SELECT d.dname, a.n FROM dim d JOIN \
+                 (SELECT fk, COUNT(*) AS n FROM cfact GROUP BY fk) a \
+                 ON d.dk = a.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
+                "fk",
+                120,
+                (0, 0),
+            ),
+        ] {
+            let (actual, _) = assert_same_results(sql, semantics_config(), setup).await;
+            let scans = scans(&actual);
+            let scan = scan_of(&scans, column, sql);
+            assert_eq!(scan.rows, rows, "{scan:?}\n{sql}");
+            assert_eq!(scan.pruned_row_groups, pruned, "{scan:?}\n{sql}");
+            let filters = scan.routed.len() + scan.filtered_with.len();
+            assert_eq!(filters, 1, "{scan:?}\n{sql}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn join_filters_that_reject_few_rows_are_dropped() {
+        // A filter is evaluated on all rows until it has been evaluated on
+        // `JOIN_FILTER_SAMPLE_ROWS` rows (on any number of threads), and then
+        // kept if it rejected at least one in `JOIN_FILTER_MIN_REJECTED` of
+        // them.
+        let chunk = DEFAULT_VECTOR_SIZE;
+        let chunks = JOIN_FILTER_SAMPLE_ROWS / chunk;
+        for (rejected_per_chunk, kept) in [
+            (chunk / JOIN_FILTER_MIN_REJECTED, true),
+            (chunk / 2, true),
+            (chunk / JOIN_FILTER_MIN_REJECTED - 1, false),
+            (0, false),
+        ] {
+            let selectivity = FilterSelectivity::default();
+            for _ in 0..chunks - 1 {
+                selectivity.record(chunk, chunk - rejected_per_chunk);
+                assert!(selectivity.is_evaluated());
+            }
+            selectivity.record(chunk, chunk - rejected_per_chunk);
+            assert_eq!(selectivity.is_evaluated(), kept, "{rejected_per_chunk}");
+            // The decision is final.
+            selectivity.record(chunk, if kept { chunk } else { 0 });
+            assert_eq!(selectivity.is_evaluated(), kept, "{rejected_per_chunk}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scans_stop_evaluating_join_filters_that_reject_few_rows() -> Result<()> {
+        // The 200,000 rows of `big` of the keys `i % 105`, aggregated by their
+        // keys below a join with the keys 0 to 49 or 0 to 99 of `keys`: the
+        // filter of the keys 0 to 49 rejects more than half of the rows, and
+        // its scan produces only the 95,250 rows of these keys; that of the keys
+        // 0 to 99 rejects fewer than one in 8, and its scan stops evaluating it
+        // once it sampled enough rows (some of the 9,520 rows of the other keys
+        // reach the join, which drops them). The results are those of
+        // DataFusion.
+        let setup = async |ctx: &SessionContext| {
+            let generator = datafusion_context(test_session_config());
+            for (name, sql) in [
+                (
+                    "big",
+                    "SELECT value % 105 AS bk FROM generate_series(0, 199999)",
+                ),
+                ("keys50", "SELECT value AS dk FROM generate_series(0, 49)"),
+                ("keys100", "SELECT value AS dk FROM generate_series(0, 99)"),
+            ] {
+                let df = generator.sql(sql).await?;
+                let schema = Arc::clone(df.schema().inner());
+                let batches = df.collect().await?;
+                ctx.register_table(
+                    name,
+                    Arc::new(MemTable::try_new(schema, vec![batches])?),
+                )?;
+            }
+            Ok(())
+        };
+        for (keys, matching) in [("keys50", 95_250), ("keys100", 190_480)] {
+            let sql = format!(
+                "SELECT k.dk, a.n FROM {keys} k JOIN \
+                 (SELECT bk, COUNT(*) AS n FROM big GROUP BY bk) a ON k.dk = a.bk"
+            );
+            let (actual, _) = assert_same_results(&sql, semantics_config(), setup).await;
+            let scans = scans(&actual);
+            let scan = scan_of(&scans, "bk", &sql);
+            assert_eq!(scan.filtered_with.len(), 1, "{scan:?}");
+            if keys == "keys50" {
+                assert_eq!(scan.rows, matching, "{scan:?}");
+            } else {
+                assert!(scan.rows > matching && scan.rows < 200_000, "{scan:?}");
+            }
         }
         Ok(())
     }
