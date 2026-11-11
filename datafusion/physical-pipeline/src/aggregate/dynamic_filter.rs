@@ -1273,4 +1273,179 @@ mod tests {
         }
         Ok(())
     }
+
+    /// A benchmark of aggregations whose dynamic filters prune Parquet scans:
+    /// `MIN` / `MAX` without `GROUP BY` and top-k aggregations of a table `t`
+    /// of `DYNAMIC_FILTER_ROWS` rows (10,000,000) in `DYNAMIC_FILTER_FILES`
+    /// files (16) of row groups of 131,072 rows (as the ClickBench and TPC-H
+    /// benchmark writes them), with ascending ids `id` and timestamps `ts`,
+    /// dates `d` of 31 days, values `v` and advertising engines `a` (zero for
+    /// 95% of the rows) at random, and 1,000 groups `g`. Prints the median
+    /// time of `DYNAMIC_FILTER_ROUNDS` executions (5, without planning) on
+    /// each engine on `DYNAMIC_FILTER_THREADS` threads (all), and the rows
+    /// that the native scans produced. Run it with `cargo test --profile
+    /// release-nonlto -p datafusion-physical-pipeline --lib
+    /// aggregate_dynamic_filters_benchmark -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "a benchmark"]
+    async fn aggregate_dynamic_filters_benchmark() -> Result<()> {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use arrow::array::{
+            ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, RecordBatch,
+        };
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::prelude::{ParquetReadOptions, SessionContext};
+        use datafusion_common::DataFusionError;
+        use datafusion_common::instant::Instant;
+        use datafusion_physical_plan::collect;
+
+        use crate::bridge::PipelineRootExec;
+        use crate::sources::ParquetScanSource;
+        use crate::sources::test_harness::write_parquet;
+        use crate::test_utils::{
+            canonical_batch, datafusion_context, pipeline_context, test_session_config,
+        };
+
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let rows = env("DYNAMIC_FILTER_ROWS", 10_000_000);
+        let files = env("DYNAMIC_FILTER_FILES", 16);
+        let rounds = env("DYNAMIC_FILTER_ROUNDS", 5);
+        let threads = env("DYNAMIC_FILTER_THREADS", threads);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("d", DataType::Date32, false),
+            Field::new("a", DataType::Int16, false),
+            Field::new("g", DataType::Int32, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        // A SplitMix64 hash of `i`, as random values.
+        let random = |i: i64, stream: u64| {
+            let mut z = (i as u64 ^ (stream << 56)).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let dir = tempfile::tempdir()?;
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(128 * 1024))
+            .build();
+        let per_file = rows.div_ceil(files);
+        for file in 0..files {
+            let start = (file * per_file) as i64;
+            let end = ((file + 1) * per_file).min(rows) as i64;
+            let mut batches = vec![];
+            for first in (start..end).step_by(8192) {
+                let ids = first..(first + 8192).min(end);
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from_iter_values(ids.clone())),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.clone()
+                            .map(|i| 1_372_636_800 + i * 3 + (random(i, 0) % 3) as i64),
+                    )),
+                    Arc::new(Date32Array::from_iter_values(
+                        ids.clone().map(|i| 15_887 + (random(i, 1) % 31) as i32),
+                    )),
+                    Arc::new(Int16Array::from_iter_values(ids.clone().map(
+                        |i| match random(i, 2) % 20 {
+                            0 => 1 + (random(i, 3) % 30) as i16,
+                            _ => 0,
+                        },
+                    ))),
+                    Arc::new(Int32Array::from_iter_values(
+                        ids.clone().map(|i| (i % 1000) as i32),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        ids.map(|i| (random(i, 4) >> 1) as i64),
+                    )),
+                ];
+                batches.push(RecordBatch::try_new(Arc::clone(&schema), columns)?);
+            }
+            write_parquet(
+                &dir.path().join(format!("t/part-{file:02}.parquet")),
+                Arc::clone(&schema),
+                &batches,
+                Some(properties.clone()),
+            )?;
+        }
+        let path = dir.path().join("t");
+        let path = path.to_str().expect("a UTF-8 path");
+        let config = test_session_config().with_target_partitions(threads);
+        let engines = [
+            ("datafusion", datafusion_context(config.clone())),
+            ("pipeline", pipeline_context(config)),
+        ];
+        for (_, ctx) in &engines {
+            ctx.register_parquet("t", path, ParquetReadOptions::default())
+                .await?;
+        }
+        let queries = [
+            "SELECT MIN(d), MAX(d) FROM t WHERE a <> 0",
+            "SELECT MAX(v) FROM t WHERE a <> 0",
+            "SELECT MIN(ts), MAX(ts) FROM t WHERE a <> 0",
+            "SELECT DISTINCT id FROM t ORDER BY id LIMIT 10",
+            "SELECT g, MIN(ts) FROM t GROUP BY g ORDER BY MIN(ts) LIMIT 10",
+            "SELECT g, MAX(ts) FROM t GROUP BY g ORDER BY MAX(ts) DESC LIMIT 10",
+        ];
+        // Plan `sql` (anew, as an execution changes the dynamic filters of a
+        // plan) and execute it: the batches, the time of the execution, and
+        // the rows that the native scans produced.
+        let execute = async |ctx: &SessionContext, sql: &str| {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let start = Instant::now();
+            let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+            let elapsed = start.elapsed();
+            let scanned = plan
+                .downcast_ref::<PipelineRootExec>()
+                .and_then(PipelineRootExec::execution_metrics)
+                .map(|metrics| {
+                    metrics
+                        .iter()
+                        .filter(|(operator, _)| operator.is::<ParquetScanSource>())
+                        .map(|(_, metrics)| metrics.output_rows())
+                        .sum::<usize>()
+                });
+            Ok::<_, DataFusionError>((batches, elapsed, scanned, plan.schema()))
+        };
+        let median = |times: &mut Vec<Duration>| {
+            times.sort_unstable();
+            times[times.len() / 2].as_secs_f64() * 1e3
+        };
+        println!(
+            "\n{rows} rows in {files} files, {threads} threads, median of {rounds} \
+             executions in ms\n"
+        );
+        println!("| Query | DataFusion | Pipeline | Rows scanned by the pipeline |");
+        println!("| ----- | ---------: | -------: | ---------------------------: |");
+        for sql in queries {
+            let mut times = vec![vec![]; engines.len()];
+            let mut outputs = vec![];
+            let mut scanned = None;
+            for round in 0..rounds {
+                for (engine, (_, ctx)) in engines.iter().enumerate() {
+                    let (batches, elapsed, rows, schema) = execute(ctx, sql).await?;
+                    times[engine].push(elapsed);
+                    scanned = scanned.or(rows);
+                    if round == 0 {
+                        outputs.push(canonical_batch(&schema, &batches, false)?);
+                    }
+                }
+            }
+            assert_eq!(outputs[0], outputs[1], "{sql}");
+            let [datafusion, pipeline] = [median(&mut times[0]), median(&mut times[1])];
+            println!(
+                "| `{sql}` | {datafusion:.2} | {pipeline:.2} | {} |",
+                scanned.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
 }
