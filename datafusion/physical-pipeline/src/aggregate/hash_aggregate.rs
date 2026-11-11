@@ -628,10 +628,12 @@ impl PhysicalHashAggregate {
     ///   (see `keeps_datafusion_order`), e.g. an aggregation of the distinct
     ///   values of a `SUM(DISTINCT x)`, or whose rows are sorted for ordered
     ///   aggregates (e.g. `ARRAY_AGG(x ORDER BY y)`), by DataFusion or by the
-    ///   native operator, which order the rows that tie in the sort otherwise.
-    ///   (Ordered aggregates order their values themselves: but for rows that
-    ///   tie in their order, their values do not depend on the order of their
-    ///   input.);
+    ///   native operator, which order the rows that tie in the sort otherwise,
+    ///   or of a single partition grouped by a single grouping set in two
+    ///   stages, whose partial aggregation DataFusion may skip, so that a group
+    ///   gets several states that depend on DataFusion's batches. (Ordered
+    ///   aggregates order their values themselves: but for rows that tie in
+    ///   their order, their values do not depend on the order of their input.);
     /// * aggregations with a soft limit on their groups (`lim=[n]` without
     ///   an order), from DataFusion's optimization of `SELECT DISTINCT ...
     ///   LIMIT n`: each stage stops reading its input once it has `n` groups,
@@ -731,6 +733,16 @@ impl PhysicalHashAggregate {
         }) || aggregates()
             .any(|aggregate| aggregate.create_accumulator().is_err());
         if !exact && !single_partition {
+            return Ok(None);
+        }
+        // DataFusion's partial aggregation of a single grouping set skips
+        // aggregating the rows of its partition once most of them make new
+        // groups (see the session's `skip_partial_aggregation_probe_rows_threshold`
+        // and `skip_partial_aggregation_probe_ratio_threshold`, which are not
+        // known here), and passes every further row on as a state of its own:
+        // its final aggregation merges the state of the rows of a group before
+        // with those of the rows after, which depend on DataFusion's batches.
+        if !exact && last.is_some() && grouped && raw.group_expr().is_single() {
             return Ok(None);
         }
         // DataFusion aggregates the rows in the order of its input: sorted, if

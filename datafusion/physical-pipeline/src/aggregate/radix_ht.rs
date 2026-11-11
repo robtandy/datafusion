@@ -2888,8 +2888,20 @@ mod tests {
                     .iter()
                     .all(|&sum| sum == 1.0)
             );
+            // `try_lower` leaves the two stages of a single grouping set to
+            // DataFusion, whose partial stage may skip (see
+            // `aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion`):
+            // not that of these 14,336 rows, below its 100,000 rows. The
+            // operator of the constructor merges the single states.
+            assert!(PhysicalHashAggregate::try_lower(&last, lower)?.is_none());
+            let final_stage = last.downcast_ref::<AggregateExec>().expect("Final");
+            let partial = final_stage
+                .input()
+                .downcast_ref::<AggregateExec>()
+                .expect("Partial");
+            let input = lower(partial.input())?;
             let operator: Arc<dyn crate::PhysicalOperator> = Arc::new(
-                PhysicalHashAggregate::try_lower(&last, lower)?.expect("an aggregation"),
+                PhysicalHashAggregate::try_new_two_stage(partial, final_stage, input)?,
             );
             let thread = aggregation_thread(&operator, ctx.task_ctx(), &batches, 1)?;
             assert!(thread.whole && !thread.evaluated && thread.flushed == 0);
@@ -3094,8 +3106,12 @@ mod tests {
         // the native sums of the partial states of a group were `0.0`. So the
         // aggregations of a single partition whose aggregates do not split
         // exactly (see `splits_exactly`) aggregate it in order, on a single
-        // thread (see `AggregateSpec::aggregates_in_order`), and stay native;
-        // the others stay parallel.
+        // thread (see `AggregateSpec::aggregates_in_order`), and stay native,
+        // but for those grouped by a single grouping set, which DataFusion
+        // aggregates in two stages on several target partitions, and whose
+        // partial stage it may skip (see
+        // `aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion`):
+        // they are left to DataFusion. The others stay parallel.
         let mut f = vec![0.0; 8_192];
         f[0] = 1e16;
         f[2_048] = -1e16;
@@ -3117,19 +3133,19 @@ mod tests {
                 .set_bool("datafusion.optimizer.repartition_file_scans", false)
                 .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
         };
-        // The queries, and whether they aggregate in order.
+        // The queries, and whether they aggregate in order, if they are native.
         let queries = [
-            ("SELECT k, SUM(f), AVG(f) FROM t GROUP BY k", true),
+            ("SELECT k, SUM(f), AVG(f) FROM t GROUP BY k", None),
             (
                 "SELECT k, STDDEV(f), VAR_POP(f), MIN(f) FROM t GROUP BY k",
-                true,
+                None,
             ),
-            ("SELECT STDDEV(f), CORR(f, v), COUNT(*) FROM t", true),
+            ("SELECT STDDEV(f), CORR(f, v), COUNT(*) FROM t", Some(true)),
             (
                 "SELECT k, COUNT(*), SUM(v), MAX(f) FROM t GROUP BY k",
-                false,
+                Some(false),
             ),
-            ("SELECT COUNT(f), SUM(v), MIN(f) FROM t", false),
+            ("SELECT COUNT(f), SUM(v), MIN(f) FROM t", Some(false)),
         ];
         for (batches, configure) in [
             (
@@ -3161,6 +3177,10 @@ mod tests {
                         setup(&ctx).await?;
                         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
                         assert_eq!(input_partitions(&plan), Some(1), "{sql}");
+                        let Some(in_order) = in_order else {
+                            assert_left_to_datafusion(sql, config, &setup).await?;
+                            continue;
+                        };
                         let plan = aggregation(&plan).expect("an aggregation");
                         let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
                             .unwrap_or_else(|| panic!("not lowered: {sql}"));
@@ -3544,6 +3564,114 @@ mod tests {
                 "{sql}"
             );
             assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregations_whose_partial_stage_datafusion_may_skip_are_left_to_datafusion()
+    -> Result<()> {
+        use crate::test_utils::assert_byte_eq_with_datafusion_with_config;
+        use datafusion_physical_plan::ExecutionPlanProperties;
+        // The review's case: a single partition of batches of 8,192 rows, seven
+        // passes over the keys `0..131072`, `v = 1e16 + 2 * pass` and `w = 3 *
+        // pass + 1`, on 4 and 16 target partitions (repartitioning neither the
+        // batches nor the scan, so that the partial aggregation has a single
+        // input partition). DataFusion's partial aggregation of a single
+        // grouping set skips aggregating its rows once most of them make new
+        // groups (by default, if more than 80% of the first 100,000 rows do),
+        // and passes every further row on as a state of its own, which its
+        // final aggregation merges with the state of the rows before: the
+        // native `STDDEV(v)` of every group of all rows was `4.47213595499958`,
+        // DataFusion's `4.515229959514974`, and `VAR_POP` and `CORR` differed
+        // too. Such aggregations are left to DataFusion (see
+        // `PhysicalHashAggregate::try_lower`), also if the session disables
+        // skipping (a ratio of 1.0, on which the native results matched), which
+        // `try_lower` does not see. Without groups (whose partial aggregation
+        // DataFusion never skips), and with aggregates that split exactly, they
+        // stay native. (The results are compared through the planner only:
+        // `try_lower` lowers none of these aggregations.)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+            Field::new("w", DataType::Float64, false),
+        ]));
+        let mut batches = vec![];
+        for pass in 0..7 {
+            for start in (0..131_072).step_by(8_192) {
+                batches.push(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(start..start + 8_192)),
+                        Arc::new(arrow::array::Float64Array::from(vec![
+                            1e16 + 2.0
+                                * pass as f64;
+                            8_192
+                        ])),
+                        Arc::new(arrow::array::Float64Array::from(vec![
+                            3.0 * pass as f64
+                                + 1.0;
+                            8_192
+                        ])),
+                    ],
+                )?);
+            }
+        }
+        let setup = mem_table_setup(Arc::clone(&schema), vec![batches]);
+        let sql = "SELECT k, STDDEV(v), VAR_POP(v), CORR(v, w) FROM t GROUP BY k";
+        // The target partitions, and whether DataFusion may skip.
+        for (target_partitions, skip) in [(4, true), (16, true), (4, false)] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .set_bool(
+                        "datafusion.optimizer.enable_round_robin_repartition",
+                        false,
+                    )
+                    .set_bool("datafusion.optimizer.repartition_file_scans", false);
+                if !skip {
+                    config = config.set_str(
+                        "datafusion.execution.skip_partial_aggregation_probe_ratio_threshold",
+                        "1.0",
+                    );
+                }
+                if trusted {
+                    config = trusting(config);
+                }
+                // Two stages, of a single input partition.
+                let ctx = datafusion_context(config.clone());
+                setup(&ctx).await?;
+                let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                let last = aggregation(&plan).expect("an aggregation");
+                let mut node = Arc::clone(
+                    last.downcast_ref::<AggregateExec>()
+                        .expect("an AggregateExec")
+                        .input(),
+                );
+                while node.downcast_ref::<AggregateExec>().is_none() {
+                    node = Arc::clone(node.children()[0]);
+                }
+                let partial = node.downcast_ref::<AggregateExec>().expect("two stages");
+                assert_eq!(partial.mode(), &AggregateMode::Partial);
+                assert_eq!(partial.input().output_partitioning().partition_count(), 1);
+                assert_not_lowered(sql, &config, &setup).await?;
+                assert_byte_eq_with_datafusion_with_config(sql, config.clone(), &setup)
+                    .await;
+                if target_partitions == 4 && skip {
+                    for sql in [
+                        "SELECT STDDEV(v), VAR_POP(v), CORR(v, w) FROM t",
+                        "SELECT k, COUNT(*), MIN(v), MAX(w) FROM t GROUP BY k",
+                    ] {
+                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
+                        assert_byte_eq_with_datafusion_with_config(
+                            sql,
+                            config.clone(),
+                            &setup,
+                        )
+                        .await;
+                    }
+                }
+            }
         }
         Ok(())
     }
