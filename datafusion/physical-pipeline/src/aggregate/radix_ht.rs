@@ -3748,6 +3748,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accumulators_that_fail_to_be_created_for_their_groups_are_left_to_datafusion()
+    -> Result<()> {
+        use super::super::test_support::{
+            assert_aggregate_fails_like_datafusion_with_setup,
+            assert_lowered_fails_like_datafusion_with_setup,
+        };
+        // The review of 4bfef9fea: one batch of 8,192 rows, `k = 1`, `f = 1.0`
+        // and `x = 1` but `x[8191] = 1000`. `NTH_VALUE`, whose function does not
+        // support groups accumulators, of the invalid index `0` fails to create
+        // its accumulator, which DataFusion and the native operator create for
+        // every group as its first row comes (see `fails_for_each_group`):
+        // DataFusion after it evaluated `CAST(x AS DECIMAL(3, 0))` on the whole
+        // batch, raising its invalid argument; the native operator after it
+        // evaluated it on the first chunk, raising the internal error of the
+        // index. Such aggregations are left to DataFusion (see
+        // `fail_in_the_order_of_the_batches`). Alone, the `NTH_VALUE` fails
+        // natively like in DataFusion; and without `GROUP BY`, both create the
+        // accumulator when they create their streams (see
+        // `fails_when_created`), and fail with its error first.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+            Field::new("x", DataType::Int64, false),
+        ]));
+        let mut x = vec![1; 8_192];
+        x[8_191] = 1_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0; 8_192])),
+                Arc::new(Int64Array::from(x)),
+            ],
+        )?;
+        let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+        let index_fails = "Nth value indices are 1 based. 0 is invalid index";
+        for target_partitions in [1, 4, 16] {
+            for trusted in [false, true] {
+                let mut config = test_session_config()
+                    .with_target_partitions(target_partitions)
+                    .with_repartition_aggregations(false);
+                if trusted {
+                    config = trusting(config);
+                }
+                let sql = "SELECT k, NTH_VALUE(f, 0), SUM(CAST(x AS DECIMAL(3, 0))) FROM t \
+                           GROUP BY k";
+                let lowered = assert_lowered_fails_like_datafusion_with_setup(
+                    sql,
+                    config.clone(),
+                    &setup,
+                    "1000 is too large to store in a Decimal128 of precision 3",
+                )
+                .await;
+                assert_eq!(lowered, 0, "{sql}");
+                assert_eq!(
+                    planned_aggregations(sql, &config, &setup).await?,
+                    0,
+                    "{sql}"
+                );
+                for sql in [
+                    "SELECT k, NTH_VALUE(f, 0) FROM t GROUP BY k",
+                    "SELECT NTH_VALUE(f, 0), SUM(CAST(x AS DECIMAL(3, 0))) FROM t",
+                ] {
+                    assert_aggregate_fails_like_datafusion_with_setup(
+                        sql,
+                        config.clone(),
+                        &setup,
+                        index_fails,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn competing_failures_of_aggregates_are_left_to_datafusion() -> Result<()> {
         use super::super::test_support::{
             assert_aggregate_fails_like_datafusion_with_setup,

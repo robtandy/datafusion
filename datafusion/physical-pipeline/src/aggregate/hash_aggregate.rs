@@ -733,12 +733,13 @@ impl PhysicalHashAggregate {
         // exactly, or they are ordered (whose values the native operator
         // orders itself, see `without_input_order`), or the aggregation fails
         // before it aggregates any row, natively as in DataFusion, as one of its
-        // accumulators cannot be created (e.g. of a percentile out of range).
+        // accumulators cannot be created when the streams are (see
+        // `fails_when_created`, e.g. of a percentile out of range).
         let exact = aggregates().all(|aggregate| {
             splits_exactly(aggregate, raw.input(), &max_rows)
                 || !aggregate.order_bys().is_empty()
         }) || aggregates()
-            .any(|aggregate| aggregate.create_accumulator().is_err());
+            .any(|aggregate| fails_when_created(aggregate, grouped));
         if !exact && !single_partition {
             return Ok(None);
         }
@@ -1393,7 +1394,9 @@ fn sums_exactly_as_floats(
 /// aggregates, then their filters), each on all rows of a batch before the
 /// next one, and an operator on a batch before the operator above it; the
 /// native operators evaluate them on their chunks, so that another of them
-/// may fail first, also with an error of the same kind: e.g. of `SUM(CAST(x
+/// may fail first, also with an error of the same kind (an accumulator that
+/// fails to be created for every group counts as a part that may fail, see
+/// [`fails_for_each_group`]): e.g. of `SUM(CAST(x
 /// AS DECIMAL(3, 0)))` and `SUM(CAST(y AS DECIMAL(38, 25)))` (or of a filter
 /// `CAST(x AS DECIMAL(3, 0)) + 0.5 > 1` below `SUM(CAST(y AS DECIMAL(38,
 /// 25)))`), of a batch in which `x` overflows on its last row, and `y` on its
@@ -1407,6 +1410,7 @@ fn fail_in_the_order_of_the_batches(
     input: &Arc<dyn PhysicalOperator>,
 ) -> bool {
     let schema = raw.input().schema();
+    let grouped = !raw.group_expr().is_true_no_grouping();
     let own = raw
         .group_expr()
         .expr()
@@ -1419,8 +1423,42 @@ fn fail_in_the_order_of_the_batches(
         )
         .chain(raw.filter_expr().iter().flatten().cloned())
         .map(|expr| refined_parts(&expr, &schema))
-        .sum::<usize>();
+        .sum::<usize>()
+        + raw
+            .aggr_expr()
+            .iter()
+            .filter(|aggregate| fails_for_each_group(aggregate, grouped))
+            .count();
     own > 0 && own + pipeline_parts(input) > 1
+}
+
+/// Whether the accumulator of `aggregate` (of an aggregation `grouped` or
+/// not) cannot be created, and DataFusion and the native operator fail when
+/// they create their streams and states, before they evaluate any row: its
+/// accumulator, without `GROUP BY`, or its groups accumulator, if its function
+/// supports them. (Otherwise, they create an accumulator for every group, as
+/// its first row comes, see [`fails_for_each_group`].)
+fn fails_when_created(aggregate: &AggregateFunctionExpr, grouped: bool) -> bool {
+    if grouped {
+        aggregate.groups_accumulator_supported()
+            && aggregate.create_groups_accumulator().is_err()
+    } else {
+        aggregate.create_accumulator().is_err()
+    }
+}
+
+/// Whether the accumulator of `aggregate`, of an aggregation with `GROUP BY`
+/// (`grouped`) whose function does not support groups accumulators, cannot be
+/// created: DataFusion and the native operator create it for every group, as
+/// its first row comes (see `GroupsAccumulatorAdapter`), and fail then, after
+/// DataFusion evaluated the arguments of all aggregates on all rows of the
+/// batch, the native operator on those of a chunk, e.g. of `NTH_VALUE(f, 0)`
+/// (of an invalid index). It is a part that may fail (see
+/// [`fail_in_the_order_of_the_batches`]).
+fn fails_for_each_group(aggregate: &AggregateFunctionExpr, grouped: bool) -> bool {
+    grouped
+        && !aggregate.groups_accumulator_supported()
+        && aggregate.create_accumulator().is_err()
 }
 
 /// The number of the parts of `expr` (over `schema`) that may fail (see
