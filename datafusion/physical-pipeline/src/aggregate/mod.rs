@@ -35,14 +35,14 @@
 //!   partitions and finalize each of them on its own, merging the partial
 //!   states of its groups into a new hash table.
 //!
-//! # Byte-for-byte compatibility
+//! # Correctness
 //!
-//! The operator computes exactly what DataFusion computes: it uses the
-//! expressions, the accumulators ([`Accumulator`] and [`GroupsAccumulator`],
-//! created by the `AggregateFunctionExpr`s of the plan) and the output schema
-//! of the `AggregateExec`s it replaces, and DataFusion's own group key
-//! storage (`GroupValues`), so the groups (`NULL`s, `-0.0`, `NaN`s, ...)
-//! and the aggregate values are DataFusion's, including:
+//! The operator computes what DataFusion computes: it uses the expressions,
+//! the accumulators ([`Accumulator`] and [`GroupsAccumulator`], created by the
+//! `AggregateFunctionExpr`s of the plan) and the output schema of the
+//! `AggregateExec`s it replaces, and DataFusion's own group key storage
+//! (`GroupValues`), so the groups (`NULL`s, `-0.0`, `NaN`s, ...) and the
+//! aggregate values are DataFusion's, including:
 //!
 //! * `FILTER (WHERE ...)`: the arguments of an aggregate are evaluated for
 //!   the rows that pass its filter only;
@@ -59,10 +59,18 @@
 //!   that order the values themselves. Aggregates with a hard ordering
 //!   requirement (e.g. `NTH_VALUE(x, n ORDER BY y)`, `STRING_AGG(x, ','
 //!   ORDER BY y)`) get their rows in that order: every thread sorts its rows
-//!   before it aggregates them, as DataFusion sorts every input partition.
+//!   before it aggregates them, as DataFusion sorts every input partition;
+//! * the limits of DataFusion's aggregations of `SELECT DISTINCT ... LIMIT n`
+//!   and of `ORDER BY ... LIMIT n` by the group key or by a `MIN` / `MAX`
+//!   aggregate: the operator produces groups among which the limit or the
+//!   sort above it finds its rows.
 //!
-//! Only the order of the output rows differs: DataFusion's order of groups
-//! is not defined either.
+//! What depends on how the rows are split into batches, partial states,
+//! partitions and threads is the engine's own, as is which error a failing
+//! query raises: the order of the output rows (DataFusion's order of groups
+//! is not defined either), the rounding of floating point sums, the order of
+//! the values of an `ARRAY_AGG` without `ORDER BY`, which of the groups that
+//! tie a top-k aggregation keeps, and which groups a soft limit keeps.
 //!
 //! [`Accumulator`]: datafusion_expr::Accumulator
 //! [`GroupsAccumulator`]: datafusion_expr::GroupsAccumulator
@@ -87,14 +95,16 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow::array::{AsArray, RecordBatch, RecordBatchOptions};
+    use std::collections::HashSet;
+
+    use arrow::array::{Array, AsArray, RecordBatch, RecordBatchOptions};
     use arrow::compute::{
-        SortColumn, concat_batches, filter_record_batch, lexsort_to_indices,
-        take_record_batch,
+        SortColumn, SortOptions, concat, concat_batches, filter_record_batch,
+        lexsort_to_indices, sort_to_indices, take, take_record_batch,
     };
     use arrow::datatypes::SchemaRef;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::{DataFusionError, Result, internal_err};
+    use datafusion_common::{DataFusionError, Result, ScalarValue, internal_err};
     use datafusion_expr::AggregateUDF;
     use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -121,9 +131,8 @@ pub(crate) mod test_support {
     use crate::operators::union::PhysicalUnion;
     use crate::operators::union::test_support::count;
     use crate::test_utils::{
-        EngineOutput, assert_byte_eq_with_datafusion_with_config, compare_outputs,
-        datafusion_context, pipeline_context, register_test_tables, run_sql,
-        test_session_config,
+        EngineOutput, compare_outputs, datafusion_context, has_top_level_order_by,
+        pipeline_context, register_test_tables, run_sql, test_session_config,
     };
 
     /// Lower `plan` with the native operators, standing in for the planner:
@@ -471,60 +480,39 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Assert that `actual`, an error of the pipeline engine, is `expected`,
-    /// the error of DataFusion: an error of the same kind (the variant of its
-    /// root error, and of the Arrow error that it is), with the same message.
-    pub(crate) fn assert_same_error(
-        expected: &DataFusionError,
-        actual: &DataFusionError,
-        context: &str,
-    ) {
-        let kind = |error: &DataFusionError| {
-            let debug = match error.find_root() {
-                DataFusionError::ArrowError(error, _) => format!("ArrowError::{error:?}"),
-                error => format!("{error:?}"),
-            };
-            debug.split('(').next().unwrap_or_default().to_owned()
-        };
-        assert_eq!(
-            kind(expected),
-            kind(actual),
-            "Errors of different kinds: DataFusion: {expected}\npipeline engine: \
-             {actual}\n{context}"
-        );
-        assert_eq!(
-            expected.find_root().strip_backtrace(),
-            actual.find_root().strip_backtrace(),
-            "Different errors\n{context}"
-        );
-    }
-
-    /// Assert that `sql` fails with an error that contains `message`, both on
-    /// DataFusion and on the pipeline engine, with the same error (see
-    /// [`assert_same_error`]): through the `PipelineQueryPlanner` and with the
-    /// plan lowered by [`lower`], in which at least one aggregation is a
-    /// [`PhysicalHashAggregate`], with the default and with tiny thread-local
-    /// tables. Both sessions have the configuration `config`, and `setup`
-    /// registers the tables of the query.
-    pub(crate) async fn assert_aggregate_fails_like_datafusion_with_setup<F>(
+    /// Assert that `sql` fails on DataFusion and on the pipeline engine, with
+    /// errors that contain one of `messages` (which of several errors a query
+    /// raises is each engine's own): through the `PipelineQueryPlanner` and
+    /// with the plan lowered by [`lower`], in which at least one aggregation is
+    /// a [`PhysicalHashAggregate`], with the default and with tiny
+    /// thread-local tables. Both sessions have the configuration `config`, and
+    /// `setup` registers the tables of the query.
+    pub(crate) async fn assert_aggregate_fails_with_setup<F>(
         sql: &str,
         config: SessionConfig,
         setup: F,
-        message: &str,
+        messages: &[&str],
     ) where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
+        let check = |engine: &str, error: &DataFusionError| {
+            let error = error.to_string();
+            assert!(
+                messages.iter().any(|message| error.contains(message)),
+                "{engine} fails with another error than {messages:?}: {error}\nquery: {sql}"
+            );
+        };
         let ctx = datafusion_context(config.clone());
         setup(&ctx).await.expect("setup");
         let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
-        assert!(error.to_string().contains(message), "DataFusion: {error}");
+        check("DataFusion", &error);
         let pipeline = pipeline_context(config);
         setup(&pipeline).await.expect("setup");
         match run_sql(&pipeline, sql).await {
             Ok(_) => panic!(
                 "The pipeline engine succeeds, DataFusion fails: {error}\nquery: {sql}"
             ),
-            Err(e) => assert_same_error(&error, &e, &format!("planner, query: {sql}")),
+            Err(e) => check("The planner", &e),
         }
         for (lower, tables) in [
             (lower as fn(&_) -> _, "default"),
@@ -545,11 +533,7 @@ pub(crate) mod test_support {
                 Ok(_) => panic!(
                     "The pipeline engine succeeds, DataFusion fails: {error}\nquery: {sql}"
                 ),
-                Err(e) => assert_same_error(
-                    &error,
-                    &e,
-                    &format!("{tables} tables, query: {sql}"),
-                ),
+                Err(e) => check(&format!("The lowering ({tables} tables)"), &e),
             }
         }
     }
@@ -569,12 +553,21 @@ pub(crate) mod test_support {
         AggregateUDF::from(lookalikes::Sum::new())
     }
 
-    /// The types of [`lookalike_count`] and [`lookalike_sum`].
+    /// A function `max` that looks like DataFusion's built-in `max`, like
+    /// [`lookalike_count`], of the same order (`is_descending`), whose
+    /// aggregates DataFusion's top-k aggregations may order their groups by.
+    pub(crate) fn lookalike_max() -> AggregateUDF {
+        AggregateUDF::from(lookalikes::Max::new())
+    }
+
+    /// The types of [`lookalike_count`], [`lookalike_sum`] and
+    /// [`lookalike_max`].
     mod lookalikes {
         use std::sync::Arc;
 
         use arrow::datatypes::{DataType, FieldRef};
         use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::functions_aggregate::min_max::max_udaf;
         use datafusion::functions_aggregate::sum::sum_udaf;
         use datafusion_common::{Result, ScalarValue};
         use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -666,12 +659,24 @@ pub(crate) mod test_support {
                     fn set_monotonicity(&self, data_type: &DataType) -> SetMonotonicity {
                         Self::builtin().inner().set_monotonicity(data_type)
                     }
+
+                    fn coerce_types(
+                        &self,
+                        arg_types: &[DataType],
+                    ) -> Result<Vec<DataType>> {
+                        Self::builtin().inner().coerce_types(arg_types)
+                    }
+
+                    fn is_descending(&self) -> Option<bool> {
+                        Self::builtin().inner().is_descending()
+                    }
                 }
             };
         }
 
         lookalike!(Count, "count", count_udaf);
         lookalike!(Sum, "sum", sum_udaf);
+        lookalike!(Max, "max", max_udaf);
     }
 
     /// Assert that `sql` produces byte-identical results on DataFusion and on
@@ -725,24 +730,107 @@ pub(crate) mod test_support {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        assert_byte_eq_with_datafusion_with_config(sql, config.clone(), &setup).await;
+        assert_lowered_results_with_setup(sql, config.clone(), config, setup).await
+    }
 
-        let ctx = datafusion_context(config);
+    /// `config` without DataFusion's limited aggregations (`lim=[n]`, see
+    /// [`PhysicalHashAggregate::try_lower`]): DataFusion then produces all
+    /// groups of its aggregations, and its sorts and limits above them select
+    /// their rows, the results that the native limited aggregations are
+    /// checked against.
+    pub(crate) fn without_limited_aggregations(config: SessionConfig) -> SessionConfig {
+        config
+            .set_bool("datafusion.optimizer.enable_topk_aggregation", false)
+            .set_bool(
+                "datafusion.optimizer.enable_distinct_aggregation_soft_limit",
+                false,
+            )
+    }
+
+    /// Assert that `sql` produces the results of DataFusion in a session of
+    /// configuration `reference` (e.g. `config` or
+    /// [`without_limited_aggregations`]) on the pipeline engine in a session
+    /// of configuration `config`: through the `PipelineQueryPlanner` and with
+    /// the plan lowered by [`lower`], with the default and with tiny
+    /// thread-local tables. `setup` registers the tables of the query. Returns
+    /// the lowered operator tree.
+    pub(crate) async fn assert_lowered_results_with_setup<F>(
+        sql: &str,
+        config: SessionConfig,
+        reference: SessionConfig,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let ctx = datafusion_context(reference);
         setup(&ctx).await.expect("setup");
         let expected = run_sql(&ctx, sql).await.expect("DataFusion");
         let mut lowered = None;
+        for (engine, actual, root) in lowered_outputs(sql, config, &setup).await {
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!(
+                    "Results differ ({engine}): {message}\nquery: {sql}\nlowered: {}",
+                    format_operator_tree(&root)
+                );
+            }
+            if engine != "planner" {
+                lowered.get_or_insert(root);
+            }
+        }
+        lowered.expect("a lowered plan")
+    }
+
+    /// The outputs of `sql` on the pipeline engine in sessions of
+    /// configuration `config` set up by `setup`: through the
+    /// `PipelineQueryPlanner` (`planner`), and with the plan lowered by
+    /// [`lower`], with the default and with tiny thread-local tables
+    /// (`default` and `tiny`), with their lowered operator trees.
+    pub(crate) async fn lowered_outputs<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Vec<(&'static str, EngineOutput, Arc<dyn PhysicalOperator>)>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let mut outputs = vec![];
+        let pipeline = pipeline_context(config.clone());
+        setup(&pipeline).await.expect("setup");
+        let planned = run_sql(&pipeline, sql)
+            .await
+            .unwrap_or_else(|e| panic!("The planner fails: {e}\nquery: {sql}"));
+        let Some(root) = planned.plan.downcast_ref::<PipelineRootExec>() else {
+            panic!("The pipeline engine did not plan the query\nquery: {sql}");
+        };
+        let root = Arc::clone(root.operator());
+        outputs.push(("planner", planned, root));
+        outputs.extend(test_lowering_outputs(sql, config, setup).await);
+        outputs
+    }
+
+    /// The outputs of `sql` with the plan lowered by [`lower`], with the
+    /// default and with tiny thread-local tables, in sessions of
+    /// configuration `config` set up by `setup`, see [`lowered_outputs`].
+    pub(crate) async fn test_lowering_outputs<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> Vec<(&'static str, EngineOutput, Arc<dyn PhysicalOperator>)>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let mut outputs = vec![];
+        let ctx = datafusion_context(config);
+        setup(&ctx).await.expect("setup");
         for (lower, tables) in [
             (lower as fn(&_) -> _, "default"),
             (lower_with_tiny_tables, "tiny"),
         ] {
             // A new plan: executing a plan changes the state of some nodes.
-            let plan = ctx
-                .sql(sql)
-                .await
-                .expect("planning")
-                .create_physical_plan()
-                .await
-                .expect("physical planning");
+            let df = ctx.sql(sql).await.expect("planning");
+            let ordered = has_top_level_order_by(df.logical_plan());
+            let plan = df.create_physical_plan().await.expect("physical planning");
             let root = lower(&plan).expect("lowering");
             let exec: Arc<dyn ExecutionPlan> = Arc::new(
                 PipelineRootExec::try_new(Arc::clone(&root), plan).expect("root"),
@@ -756,22 +844,96 @@ pub(crate) mod test_support {
                         format_operator_tree(&root)
                     )
                 });
-            let actual = EngineOutput {
+            let output = EngineOutput {
                 schema: exec.schema(),
                 plan: exec,
                 batches,
-                ordered: expected.ordered,
+                ordered,
             };
-            if let Err(message) = compare_outputs(&expected, &actual) {
-                panic!(
-                    "Results differ ({tables} tables): {message}\nquery: {sql}\n\
-                     lowered: {}",
-                    format_operator_tree(&root)
-                );
-            }
-            lowered.get_or_insert(root);
+            outputs.push((tables, output, root));
         }
-        lowered.expect("a lowered plan")
+        outputs
+    }
+
+    /// The rows of `batches`.
+    pub(crate) fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<ScalarValue>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(move |row| {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| ScalarValue::try_from_array(column, row))
+                        .collect::<Result<Vec<_>>>()
+                        .expect("a row of scalars")
+                })
+            })
+            .collect()
+    }
+
+    /// Assert that `actual`, the rows of a query `... ORDER BY v [DESC] LIMIT
+    /// limit` whose rows may tie in `v` (their column `value`, `NULL`s last),
+    /// are rows of `all`, the rows of the query without its `ORDER BY` and
+    /// `LIMIT`, whose values of `v` are the `limit` best ones of `all`, in
+    /// their order: which of the rows that tie with the last one the query
+    /// returns is the engine's own.
+    pub(crate) fn assert_top_rows(
+        actual: &[RecordBatch],
+        all: &[RecordBatch],
+        value: usize,
+        descending: bool,
+        limit: usize,
+        context: &str,
+    ) {
+        let values = |batches: &[RecordBatch]| {
+            let arrays = batches
+                .iter()
+                .map(|batch| batch.column(value).as_ref())
+                .collect::<Vec<_>>();
+            concat(&arrays).expect("the values of the rows")
+        };
+        let all_values = values(all);
+        let options = SortOptions::new(descending, false);
+        let best = sort_to_indices(&all_values, Some(options), Some(limit))
+            .expect("the best values");
+        let best = take(&all_values, &best, None).expect("the best values");
+        let actual_values = values(actual);
+        assert_eq!(
+            actual_values.to_data(),
+            best.to_data(),
+            "Not the best values (in their order): {context}"
+        );
+        let all = rows_of(all).into_iter().collect::<HashSet<_>>();
+        for row in rows_of(actual) {
+            assert!(
+                all.contains(&row),
+                "Not a row of the query: {row:?}, {context}"
+            );
+        }
+    }
+
+    /// Assert that `actual`, the rows of a query `... LIMIT limit` without an
+    /// `ORDER BY`, of distinct rows (e.g. `SELECT DISTINCT ...`), are `limit`
+    /// distinct rows (or all of them) of `all`, the rows of the query without
+    /// its `LIMIT`: which rows the query returns is the engine's own.
+    pub(crate) fn assert_any_rows(
+        actual: &[RecordBatch],
+        all: &[RecordBatch],
+        limit: usize,
+        context: &str,
+    ) {
+        let all = rows_of(all).into_iter().collect::<HashSet<_>>();
+        let actual = rows_of(actual);
+        assert_eq!(actual.len(), limit.min(all.len()), "{context}");
+        let distinct = actual.iter().collect::<HashSet<_>>();
+        assert_eq!(distinct.len(), actual.len(), "Rows twice: {context}");
+        for row in &actual {
+            assert!(
+                all.contains(row),
+                "Not a row of the query: {row:?}, {context}"
+            );
+        }
     }
 }
 
@@ -1172,12 +1334,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn soft_limited_distinct_aggregations_are_left_to_datafusion() {
-        // Tables of a single partition. DataFusion's `DISTINCT ... LIMIT n`
-        // stops reading as soon as it has `n` groups: after the first batch
-        // here, so it never divides by zero (`t`), and returns the groups of
-        // the rows it read first (`s`). A native aggregation would read all
-        // batches.
+    async fn soft_limited_distinct_aggregations_are_native() {
+        // `SELECT DISTINCT ... LIMIT n`: DataFusion's aggregations (with a soft
+        // limit, `lim=[n]`) stop reading their input once they have `n` groups,
+        // and so do the native ones, whose threads stop once one of them has
+        // `n` groups. The limit above returns any `n` of them.
         let setup = async |ctx: &SessionContext| {
             register_test_tables(ctx)?;
             let schema =
@@ -1188,11 +1349,6 @@ mod tests {
                     vec![Arc::new(Int32Array::from(values)) as ArrayRef],
                 )
             };
-            let t = vec![vec![batch(vec![1])?, batch(vec![0])?]];
-            ctx.register_table(
-                "t",
-                Arc::new(MemTable::try_new(Arc::clone(&schema), t)?),
-            )?;
             let s = vec![vec![
                 batch(vec![5, 3])?,
                 batch(vec![4, 4, 1])?,
@@ -1201,23 +1357,106 @@ mod tests {
             ctx.register_table("s", Arc::new(MemTable::try_new(schema, s)?))?;
             Ok(())
         };
-        for (sql, thread_counts) in [
-            (
-                "SELECT COUNT(*) FROM (SELECT DISTINCT 1000 / a FROM t LIMIT 1)",
-                &[1, 4][..],
-            ),
-            (
-                "SELECT COUNT(*), MIN(x), MAX(x) FROM (SELECT DISTINCT a AS x FROM s LIMIT 2)",
-                &[1],
-            ),
-        ] {
-            for &threads in thread_counts {
-                let config = test_session_config().with_target_partitions(threads);
-                let root = assert_aggregate_parity_with_setup(sql, config, &setup).await;
-                // Only the outer aggregation is native.
-                assert_eq!(count::<PhysicalHashAggregate>(&root), 1, "{sql}");
+        for threads in [1, 4, 16] {
+            let config = test_session_config().with_target_partitions(threads);
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await.expect("setup");
+            for (sql, all, limit) in [
+                (
+                    "SELECT DISTINCT a FROM s LIMIT 2",
+                    "SELECT DISTINCT a FROM s",
+                    2,
+                ),
+                (
+                    "SELECT DISTINCT d, e FROM t1 LIMIT 3",
+                    "SELECT DISTINCT d, e FROM t1",
+                    3,
+                ),
+                (
+                    "SELECT DISTINCT id % 1000 AS m, h FROM t1 LIMIT 10",
+                    "SELECT DISTINCT id % 1000 AS m, h FROM t1",
+                    10,
+                ),
+                // More groups than there are.
+                (
+                    "SELECT DISTINCT a FROM t1 LIMIT 1000",
+                    "SELECT DISTINCT a FROM t1",
+                    1000,
+                ),
+                (
+                    "SELECT DISTINCT d FROM t1 WHERE id < 0 LIMIT 3",
+                    "SELECT DISTINCT d FROM t1 WHERE id < 0",
+                    3,
+                ),
+            ] {
+                let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await;
+                let plan = plan.expect("physical planning");
+                assert!(!soft_limits(&plan).is_empty(), "{sql}");
+                let all = ctx.sql(all).await.unwrap().collect().await.unwrap();
+                // (The planner leaves the plans below limits to DataFusion.)
+                for (engine, output, root) in
+                    lowered_outputs(sql, config.clone(), &setup).await
+                {
+                    let context = format!("{engine} on {threads} threads, query: {sql}");
+                    if engine != "planner" {
+                        assert_eq!(native_soft_limits(&root), [limit], "{context}");
+                    }
+                    assert_any_rows(&output.batches, &all, limit, &context);
+                }
             }
         }
+        // Aggregated again, which only counts the groups.
+        assert_aggregate_parity(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT d FROM t1 LIMIT 3)",
+        )
+        .await;
+        // A thread stops consuming its input once it has the groups of the
+        // limit: on a single thread, the aggregation never sees (nor divides
+        // by) the zero of the second batch.
+        let setup = async |ctx: &SessionContext| {
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            let batch = |values: Vec<i32>| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+                )
+            };
+            let t = vec![vec![batch(vec![1])?, batch(vec![0])?]];
+            ctx.register_table("t", Arc::new(MemTable::try_new(schema, t)?))?;
+            Ok(())
+        };
+        let sql = "SELECT COUNT(*) FROM (SELECT DISTINCT 1000 / a FROM t LIMIT 1)";
+        let config = test_session_config().with_target_partitions(1);
+        let root = assert_aggregate_parity_with_setup(sql, config, setup).await;
+        assert_eq!(native_soft_limits(&root), [1]);
+    }
+
+    /// The limits of the `AggregateExec`s with a soft limit in `plan`.
+    fn soft_limits(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+        let mut limits = vec![];
+        if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+            && let Some(limit) = aggregate.limit_options()
+            && limit.descending().is_none()
+        {
+            limits.push(limit.limit());
+        }
+        for child in plan.children() {
+            limits.extend(soft_limits(child));
+        }
+        limits
+    }
+
+    /// The soft limits of the native aggregations of `root`.
+    fn native_soft_limits(root: &Arc<dyn crate::PhysicalOperator>) -> Vec<usize> {
+        let mut limits = vec![];
+        if let Some(aggregate) = root.downcast_ref::<PhysicalHashAggregate>() {
+            limits.extend(aggregate.spec().soft_limit);
+        }
+        for child in root.children() {
+            limits.extend(native_soft_limits(child));
+        }
+        limits
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1226,12 +1465,9 @@ mod tests {
         // group key (`a`) or a `MIN` / `MAX` aggregate keeps only the top
         // `n` groups in every stage, so the projection between it and the
         // sort only evaluates `1000 / ...` for those, never for `0`. So does
-        // the native aggregation by the group key, which produces the same
-        // groups, if the final stage has a single partition (on 1 thread
-        // here): DataFusion keeps the top groups of every partition otherwise,
-        // which depend on the partitioning, and are left to it. So are the
-        // aggregations by a `MIN` / `MAX`, whose groups depend on the order of
-        // the rows when their values tie.
+        // the native top-k aggregation, which keeps the top groups of all of
+        // its groups, on any number of threads, of keys and values of any
+        // type.
         let setup = async |ctx: &SessionContext| register_test_tables(ctx);
         let distinct = "SELECT 1000 / a AS v, a FROM (VALUES (0), (1), (2), (3)) AS t(a) \
              GROUP BY a ORDER BY a DESC LIMIT 1";
@@ -1243,31 +1479,29 @@ mod tests {
         let partitioned = &[AggregateMode::FinalPartitioned, AggregateMode::Partial][..];
         for (sql, stages, native_aggregations) in [
             // A single stage on 1 thread, and two stages that are fused on 4.
-            (distinct, [single, partitioned], [1, 0]),
-            (max, [single, partitioned], [0, 0]),
-            // `t1` has 4 partitions. Its `d` is a `Utf8` string, whose top-k
-            // aggregations are left to DataFusion; its `h` a `Utf8View`.
+            (distinct, [single, partitioned], 1),
+            (max, [single, partitioned], 1),
+            // `t1` has 4 partitions. Its `d` is a `Utf8` string, its `h` a
+            // `Utf8View`.
             (
                 "SELECT DISTINCT d FROM t1 ORDER BY d LIMIT 3",
                 [coalesced, partitioned],
-                [0, 0],
+                1,
             ),
             (
                 "SELECT DISTINCT h FROM t1 ORDER BY h LIMIT 3",
                 [coalesced, partitioned],
-                [1, 0],
+                1,
             ),
             // An aggregation of the result of a top-k aggregation.
             (
                 "SELECT COUNT(*), SUM(v) FROM (SELECT 1000 / a AS v, a \
                  FROM (VALUES (0), (1), (2), (3)) AS t(a) GROUP BY a ORDER BY a DESC LIMIT 2)",
                 [single, partitioned],
-                [2, 1],
+                2,
             ),
         ] {
-            for ((threads, stages), native_aggregations) in
-                [1, 4].into_iter().zip(stages).zip(native_aggregations)
-            {
+            for (threads, stages) in [1, 4].into_iter().zip(stages) {
                 let config = test_session_config().with_target_partitions(threads);
                 let ctx = datafusion_context(config.clone());
                 setup(&ctx).await.expect("setup");
@@ -1307,7 +1541,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn grouping_ids_of_many_columns_like_datafusion() {
+    async fn grouping_ids_of_many_columns() {
         // `__grouping_id` holds a bit per group column and the ordinal of a
         // repeated grouping set, in at most 64 bits. Without input rows, the
         // native aggregation computes it for the grouping sets without
@@ -1335,11 +1569,11 @@ mod tests {
                 );
                 match error {
                     Some(error) => {
-                        assert_aggregate_fails_like_datafusion_with_setup(
+                        assert_aggregate_fails_with_setup(
                             &sql,
                             config.clone(),
                             &setup,
-                            error,
+                            &[error],
                         )
                         .await
                     }
@@ -1375,7 +1609,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn aggregation_errors_like_datafusion() {
+    async fn aggregations_fail_on_the_errors_of_their_rows() {
         for (sql, message) in [
             ("SELECT SUM(1000 / a) FROM t1", "Divide by zero"),
             (
@@ -1387,15 +1621,15 @@ mod tests {
                 "Divide by zero",
             ),
         ] {
-            // On 1, 4 and 16 threads: on several, the planner leaves the
-            // aggregations of divisions to DataFusion (they fail with several
-            // kinds of errors), the lowering of the tests does not.
+            // On 1, 4 and 16 threads (on several, the planner leaves the
+            // aggregations of divisions to DataFusion, the lowering of the tests
+            // does not).
             for target_partitions in [1, 4, 16] {
-                assert_aggregate_fails_like_datafusion_with_setup(
+                assert_aggregate_fails_with_setup(
                     sql,
                     test_session_config().with_target_partitions(target_partitions),
                     async |ctx: &SessionContext| register_test_tables(ctx),
-                    message,
+                    &[message],
                 )
                 .await;
             }

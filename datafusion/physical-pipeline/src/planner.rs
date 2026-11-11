@@ -6945,23 +6945,24 @@ mod tests {
             "{plan}"
         );
 
-        // A bridged plan is shown below its bridge: a window with an average of
-        // decimals, which the native window leaves to DataFusion (it may
-        // overflow on some rows).
+        // A bridged plan is shown below its bridge: a recursive query, which
+        // has no native operator yet.
         let explained = explain(
-            "EXPLAIN SELECT id, AVG(g) OVER (PARTITION BY d ORDER BY id) AS m FROM t1",
+            "EXPLAIN WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r \
+             WHERE n < 3) SELECT n * 2 AS m FROM r",
         )
         .await;
         let plan = plan_of(&explained, "physical_plan");
-        assert!(plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"));
         assert!(
-            plan.contains(
-                "\n    BridgeOperator, pipelines=[0]\n      BoundedWindowAggExec: "
-            ),
+            plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"),
             "{plan}"
         );
         assert!(
-            plan.contains("\n          RepartitionExec: partitioning=Hash"),
+            plan.contains("\n    BridgeOperator, pipelines=[0]\n      RepartitionExec: "),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("\n        RecursiveQueryExec: name=r"),
             "{plan}"
         );
 
@@ -7001,17 +7002,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_selects_the_metrics_of_every_operator() {
-        // A native sort of a bridged plan (a window with an average of
-        // decimals, which the native window leaves to DataFusion), whose nodes
-        // have metrics too.
-        let query = "SELECT e, rn FROM (SELECT e, \
-                     AVG(g) OVER (PARTITION BY e ORDER BY id) AS rn FROM t1) \
-                     ORDER BY rn DESC, e";
+        // A native sort of a bridged plan (a recursive query, which has no
+        // native operator yet), whose nodes have metrics too.
+        let query = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r \
+                     WHERE n < 3) SELECT n FROM r ORDER BY n DESC";
         let analyzed = async |options: &str| {
             let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
             let plan = plan_of(&explained, "Plan with Metrics").to_string();
             assert!(plan.contains("PhysicalSort"), "{plan}");
-            assert!(plan.contains("BoundedWindowAggExec"), "{plan}");
+            assert!(plan.contains("RecursiveQueryExec"), "{plan}");
             plan
         };
         // Without metrics, of the native operators and of the bridged nodes.
@@ -7051,7 +7050,7 @@ mod tests {
         let explained = explain(&sql).await;
         for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
             let plan = plan_of(&explained, rendering);
-            for node in ["PhysicalSort", "BoundedWindowAggExec"] {
+            for node in ["PhysicalSort", "RecursiveQueryExec"] {
                 let line = plan
                     .lines()
                     .find(|line| line.trim_start().starts_with(node))

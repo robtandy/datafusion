@@ -31,8 +31,10 @@
 //! Window nodes that DataFusion stacks on each other without a sort in
 //! between are evaluated as *stages* of one window operator, on the same
 //! sorted rows, so that they read the rows in the same order as in
-//! DataFusion. See [`window_op`] for the details and
-//! [`PhysicalWindow::try_lower`] for the plans it lowers.
+//! DataFusion. A window node above a sort or a merge of the rows of another
+//! one (of other partitions or orders) is a window operator of its own, over
+//! the window operator of the other one. See [`window_op`] for the details
+//! and [`PhysicalWindow::try_lower`] for the plans it lowers.
 
 pub mod window_op;
 
