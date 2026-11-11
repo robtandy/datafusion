@@ -113,6 +113,18 @@ pub(crate) struct AggregateSpec {
 }
 
 impl AggregateSpec {
+    /// Whether the aggregation must aggregate the rows of its input in order,
+    /// on a single thread, into a single state per group: if DataFusion
+    /// aggregates a single partition, in order, and the values of some
+    /// aggregate depend on how the rows of a group are split into partial
+    /// states (see [`splits_exactly`]). (The threads of a pipeline evaluate the
+    /// chunks of a partition of DataFusion in parallel, and DataFusion's
+    /// results on several partitions depend on the order in which their
+    /// partial states arrive.)
+    pub(crate) fn aggregates_in_order(&self) -> bool {
+        self.input_partitions == 1 && !self.splits_exactly
+    }
+
     /// Whether there is no `GROUP BY` (and no grouping sets): the
     /// aggregation produces exactly one row.
     pub(crate) fn is_ungrouped(&self) -> bool {
@@ -1552,8 +1564,11 @@ impl PhysicalOperator for PhysicalHashAggregate {
         true
     }
 
+    /// Not if the aggregation aggregates its input in order (see
+    /// [`AggregateSpec::aggregates_in_order`]): the pipelines that end in it
+    /// then run on a single thread.
     fn parallel_sink(&self) -> bool {
-        true
+        !self.spec.aggregates_in_order()
     }
 
     fn get_global_sink_state(
@@ -1575,19 +1590,13 @@ impl PhysicalOperator for PhysicalHashAggregate {
         if self.spec.is_ungrouped() {
             return UngroupedAggregate::local_sink_state(&self.spec);
         }
-        // A single thread of the aggregation of a single partition of
-        // DataFusion sees the rows in the order of that partition. If the
-        // values of its aggregates may depend on how the rows of a group are
-        // split into partial states (see `splits_exactly`), its table holds all
-        // of its groups, so that the accumulators aggregate all rows of a group
-        // into a single state, as DataFusion's do (see
-        // `TableCapacity::UNBOUNDED`). (DataFusion's results on several
-        // partitions depend on the order in which their partial states
-        // arrive.)
-        if ctx.num_threads == 1
-            && self.spec.input_partitions == 1
-            && !self.spec.splits_exactly
-        {
+        // The single thread of an aggregation that aggregates its input in
+        // order (see `AggregateSpec::aggregates_in_order` and
+        // `parallel_sink`) sees the rows in the order of the single partition
+        // of DataFusion. Its table holds all of its groups, so that the
+        // accumulators aggregate all rows of a group into a single state, as
+        // DataFusion's do (see `TableCapacity::UNBOUNDED`).
+        if self.spec.aggregates_in_order() {
             return RadixHashAggregate::local_sink_state(
                 &self.spec,
                 TableCapacity::UNBOUNDED,

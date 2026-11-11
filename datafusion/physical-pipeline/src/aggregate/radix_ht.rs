@@ -29,9 +29,11 @@
 //!   synchronization. The table has a bounded capacity, so that it stays
 //!   cache resident: when it is full, it is *flushed*, as DuckDB abandons its
 //!   thread-local tables (or it grows, if the groups of the thread keep
-//!   coming back, see `RadixLocalState::aggregate`). But the table of the
-//!   single thread of an aggregation with aggregates holds all of its groups
-//!   (see [`TableCapacity::UNBOUNDED`]).
+//!   coming back, see `RadixLocalState::aggregate`). But an aggregation of a
+//!   single partition of DataFusion whose aggregates may not split their rows
+//!   exactly aggregates it on a single thread, in order, whose table holds all
+//!   of its groups (see `AggregateSpec::aggregates_in_order` and
+//!   [`TableCapacity::UNBOUNDED`]).
 //! * A thread whose full table has almost as many groups as it aggregated
 //!   rows (e.g. for a `GROUP BY` of an id) gains nothing from aggregating
 //!   them, it only builds a hash table for them in vain: it stops, like
@@ -625,7 +627,7 @@ impl TableCapacity {
     /// as the accumulators of DataFusion's aggregation of a single partition
     /// do. This is the table of the single thread of an aggregation of a
     /// single partition of DataFusion whose aggregates may not split their
-    /// rows exactly (see `PhysicalHashAggregate::get_local_sink_state`): the
+    /// rows exactly (see `AggregateSpec::aggregates_in_order`): the
     /// partial states of the flushes of a table (and the rows that bypass it)
     /// split the rows of a group into several states, which changes the values
     /// of the accumulators that depend on how their rows are grouped, e.g. the
@@ -2697,10 +2699,13 @@ mod tests {
                 assert!(float(1).values().iter().all(|&sum| sum == 1.0));
                 assert!(float(2).values().iter().all(|&avg| avg == 1.0 / 7.0));
             }
-            // A single thread of aggregates that may not split their rows
+            // The single thread of aggregates that may not split their rows
             // exactly never flushes the table (nor bypasses it): one partial
-            // state per group, which the final aggregation evaluates. The other
-            // threads flush their tables, and bypass them in a trusting session.
+            // state per group, which the final aggregation evaluates. (The
+            // executor runs their pipelines on a single thread on any number of
+            // threads, see `AggregateSpec::aggregates_in_order`.) The threads
+            // of the other aggregates flush their tables, and bypass them in a
+            // trusting session.
             let pipeline = crate::test_utils::pipeline_context(config.clone());
             setup(&pipeline).await?;
             for (sql, exact) in queries {
@@ -2708,7 +2713,7 @@ mod tests {
                     let thread =
                         planned_aggregation_thread(&pipeline, sql, &batches, threads)
                             .await?;
-                    let whole = threads == 1 && !exact;
+                    let whole = !exact;
                     assert_eq!(thread.splits_exactly, exact, "{sql}");
                     assert_eq!(thread.whole, whole, "{sql} on {threads} threads");
                     assert_eq!(thread.evaluated, whole, "{sql} on {threads} threads");
@@ -2717,12 +2722,8 @@ mod tests {
                     if whole {
                         assert_eq!(thread.groups, 32_768);
                     }
-                    // (A thread of several threads splits the rows of groups
-                    // into partial states, as DataFusion's partitions do.)
-                    if whole || exact {
-                        let expected = datafusion_aggregation(&ctx, sql).await?;
-                        assert_eq!(thread.output, expected, "{sql} on {threads} threads");
-                    }
+                    let expected = datafusion_aggregation(&ctx, sql).await?;
+                    assert_eq!(thread.output, expected, "{sql} on {threads} threads");
                 }
             }
             for (sql, _) in queries {
@@ -3054,6 +3055,127 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_partitions_are_aggregated_in_order_on_several_threads() -> Result<()>
+    {
+        use crate::operator::PhysicalOperator;
+        /// The number of partitions of the input of the first stage of the
+        /// aggregation of `plan`.
+        fn input_partitions(plan: &Arc<dyn ExecutionPlan>) -> Option<usize> {
+            use datafusion_physical_plan::ExecutionPlanProperties;
+            if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+                && matches!(
+                    aggregate.mode(),
+                    AggregateMode::Partial
+                        | AggregateMode::Single
+                        | AggregateMode::SinglePartitioned
+                )
+            {
+                return Some(aggregate.input().output_partitioning().partition_count());
+            }
+            plan.children().into_iter().find_map(input_partitions)
+        }
+        // DataFusion aggregates the rows of a single partition one after the
+        // other, on any number of target partitions: the review's single batch
+        // of 8,192 rows (`k = 1`, and `f = 0` but `f[0] = 1e16`, `f[2048] =
+        // -1e16` and `f[2049] = 1`), which it does not repartition, and the 112
+        // batches of `seven_passes` if it repartitions neither scans nor
+        // batches. Its sums of `f` are `1.0`. The threads of a pipeline
+        // evaluate the chunks of a partition in parallel: on 4 and 16 threads,
+        // the native sums of the partial states of a group were `0.0`. So the
+        // aggregations of a single partition whose aggregates do not split
+        // exactly (see `splits_exactly`) aggregate it in order, on a single
+        // thread (see `AggregateSpec::aggregates_in_order`), and stay native;
+        // the others stay parallel.
+        let mut f = vec![0.0; 8_192];
+        f[0] = 1e16;
+        f[2_048] = -1e16;
+        f[2_049] = 1.0;
+        let one = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", DataType::Int64, false),
+                Field::new("f", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1; 8_192])),
+                Arc::new(Int64Array::from_iter_values(0..8_192)),
+                Arc::new(arrow::array::Float64Array::from(f)),
+            ],
+        )?;
+        let unpartitioned = |config: SessionConfig| {
+            config
+                .set_bool("datafusion.optimizer.repartition_file_scans", false)
+                .set_bool("datafusion.optimizer.enable_round_robin_repartition", false)
+        };
+        // The queries, and whether they aggregate in order.
+        let queries = [
+            ("SELECT k, SUM(f), AVG(f) FROM t GROUP BY k", true),
+            (
+                "SELECT k, STDDEV(f), VAR_POP(f), MIN(f) FROM t GROUP BY k",
+                true,
+            ),
+            ("SELECT STDDEV(f), CORR(f, v), COUNT(*) FROM t", true),
+            (
+                "SELECT k, COUNT(*), SUM(v), MAX(f) FROM t GROUP BY k",
+                false,
+            ),
+            ("SELECT COUNT(f), SUM(v), MIN(f) FROM t", false),
+        ];
+        for (batches, configure) in [
+            (
+                vec![one],
+                (|config| config) as fn(SessionConfig) -> SessionConfig,
+            ),
+            (seven_passes()?, unpartitioned),
+        ] {
+            let schema = batches[0].schema();
+            let setup = async |ctx: &SessionContext| -> Result<()> {
+                let table = datafusion::datasource::MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![batches.clone()],
+                )?;
+                ctx.register_table("t", Arc::new(table))?;
+                Ok(())
+            };
+            for (sql, in_order) in queries {
+                for target_partitions in [4, 16] {
+                    for trusted in [false, true] {
+                        let mut config = configure(
+                            test_session_config()
+                                .with_target_partitions(target_partitions),
+                        );
+                        if trusted {
+                            config = trusting(config);
+                        }
+                        let ctx = datafusion_context(config.clone());
+                        setup(&ctx).await?;
+                        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                        assert_eq!(input_partitions(&plan), Some(1), "{sql}");
+                        let plan = aggregation(&plan).expect("an aggregation");
+                        let aggregate = PhysicalHashAggregate::try_lower(&plan, lower)?
+                            .unwrap_or_else(|| panic!("not lowered: {sql}"));
+                        assert_eq!(aggregate.parallel_sink(), !in_order, "{sql}");
+                        if sql.contains("SUM(f)") {
+                            let output = ctx.sql(sql).await?.collect().await?;
+                            let sums = output.iter().flat_map(|batch| {
+                                batch
+                                    .column(1)
+                                    .as_primitive::<arrow::datatypes::Float64Type>()
+                                    .values()
+                                    .to_vec()
+                            });
+                            assert!(sums.into_iter().all(|sum| sum == 1.0), "{sql}");
+                        }
+                        assert_eq!(planned_aggregations(sql, &config, &setup).await?, 1);
+                        assert_aggregate_parity_with_setup(sql, config, &setup).await;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The number of native aggregations of the plan of `sql` that the planner
     /// lowers in a session of configuration `config` set up by `setup`.
     async fn planned_aggregations<F>(
@@ -3264,29 +3386,41 @@ mod tests {
         // `DISTINCT` nor ordered), and in all sessions if there are no
         // aggregates, as before sessions could trust aggregate functions. The
         // rows of the other aggregations never bypass the tables, nor do those
-        // of the aggregations with aggregates of a single thread (see
-        // `TableCapacity::UNBOUNDED`). The results are DataFusion's. Nothing
-        // forces `AggregateSpec::bypass` here. (Planned on a single target
-        // partition, on which the planner lowers all of these aggregations: on
-        // several, it leaves those whose partial states are lists or binaries
-        // to DataFusion, see the module documentation of `planner`.)
+        // of the aggregations that aggregate their single partition in order
+        // (with aggregates that may not split their rows exactly, see
+        // `AggregateSpec::aggregates_in_order` and `TableCapacity::UNBOUNDED`),
+        // whose rows bypass the tables of several partitions in trusting
+        // sessions instead. The results are DataFusion's. Nothing forces
+        // `AggregateSpec::bypass` here. (Planned on a single target partition,
+        // on which the planner lowers all of these aggregations: on several, it
+        // leaves those whose partial states are lists or binaries to
+        // DataFusion, see the module documentation of `planner`.)
         let batches = hc_batches()?;
+        const IN_ORDER: [&str; 2] = [
+            "SELECT k, COUNT(*), SUM(v), MAX(v), AVG(v) FROM hc GROUP BY k",
+            "SELECT k, ARRAY_AGG(v), FIRST_VALUE(v), LAST_VALUE(s), MIN(s) FROM hc \
+             GROUP BY k",
+        ];
         let queries = [
             // The query, whether its rows bypass the tables in a session that
             // does not trust DataFusion's built-in aggregate functions, and in
             // a session that does.
             (
-                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM hc GROUP BY k",
+                "SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v) FROM hc GROUP BY k",
                 false,
                 true,
             ),
             (
                 "SELECT k, BOOL_AND(b), BOOL_OR(b), BIT_AND(v), BIT_OR(v), BIT_XOR(v), \
-                 APPROX_DISTINCT(s), MEDIAN(v), ARRAY_AGG(v), FIRST_VALUE(v), \
-                 LAST_VALUE(s), COUNT(v) FILTER (WHERE b) FROM hc GROUP BY k",
+                 APPROX_DISTINCT(s), MEDIAN(v), COUNT(v) FILTER (WHERE b) FROM hc \
+                 GROUP BY k",
                 false,
                 true,
             ),
+            // Aggregates that may not split their rows exactly, of a single
+            // partition: aggregated in order.
+            (IN_ORDER[0], false, false),
+            (IN_ORDER[1], false, false),
             ("SELECT k, s FROM hc GROUP BY k, s", true, true),
             ("SELECT DISTINCT k, v FROM hc", true, true),
             // `DISTINCT` and ordered aggregates.
@@ -3338,8 +3472,12 @@ mod tests {
                 let bypass = if trusted { with_trust } else { untrusted };
                 let expected = datafusion_aggregation(&datafusion, sql).await?;
                 // A thread of several bypasses the table as the session lets it,
-                // and gets DataFusion's results.
+                // and gets DataFusion's results (of a single thread, that
+                // aggregates all rows of a group into a single state, if the
+                // aggregation aggregates in order).
                 let thread = planned_aggregation_thread(&ctx, sql, &batches, 4).await?;
+                assert_eq!(thread.whole, !thread.splits_exactly, "{sql}");
+                assert!(thread.whole || !IN_ORDER.contains(&sql), "{sql}");
                 assert_eq!(thread.bypassed, bypass, "{sql} (trusted: {trusted})");
                 assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
                 // A single thread aggregates all rows of a group into a single
@@ -3369,6 +3507,21 @@ mod tests {
             ] {
                 assert_left_to_datafusion(sql, config.clone(), &setup_lookalikes).await?;
             }
+            // The aggregations that aggregate a single partition in order, of
+            // several partitions: a thread of several bypasses its table as
+            // the session lets it, as DataFusion's built-in aggregate functions
+            // are trusted. (The planner leaves the second to DataFusion there.)
+            let config = config.with_target_partitions(4);
+            let datafusion = datafusion_context(config.clone());
+            setup(&datafusion).await?;
+            let ctx = crate::test_utils::pipeline_context(config.clone());
+            setup(&ctx).await?;
+            let sql = IN_ORDER[0];
+            let thread = planned_aggregation_thread(&ctx, sql, &batches, 4).await?;
+            assert!(!thread.splits_exactly && !thread.whole, "{sql}");
+            assert_eq!(thread.bypassed, trusted, "{sql} (trusted: {trusted})");
+            let expected = datafusion_aggregation(&datafusion, sql).await?;
+            assert_eq!(thread.output, expected, "{sql} (trusted: {trusted})");
         }
         Ok(())
     }
