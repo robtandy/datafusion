@@ -613,7 +613,12 @@ providers of their schemas, and the scans of files with explicit schemas (in
 which the reader reads them) of other types than those the reader derives from
 the files themselves: such schemas may constrain their values (e.g. fixed-size
 lists for lists of any length), which the reader only checks as it decodes
-them. The scans of CSV files may fail to parse any of their values.
+them. And so may the scans of columns of types that the reader may fail to
+decode, whatever the files: dictionaries (whose keys the values of a column
+chunk may overflow, e.g. more than 128 values for `Int8` keys), strings,
+binaries, lists and maps with 32-bit offsets (which the values of a batch may
+overflow) and fixed-size lists (whose lengths the reader checks). The scans of
+CSV files may fail to parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
