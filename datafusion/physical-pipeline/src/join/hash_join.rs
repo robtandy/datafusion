@@ -6422,6 +6422,16 @@ mod tests {
             setup(&ctx).await?;
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             assert_eq!(count_hash_joins(&plan), joins, "{sql}");
+            // The scan is on the probe side of the join, and on the build side
+            // of the join below.
+            let join = find_hash_join(&plan).expect("a hash join");
+            let probe = Arc::clone(join.children()[1]);
+            assert!(find_parquet_scan(&probe).is_some(), "{sql}");
+            if joins == 2 {
+                let below = find_hash_join(&probe).expect("a join below");
+                let build = Arc::clone(below.children()[0]);
+                assert!(find_parquet_scan(&build).is_some(), "{sql}");
+            }
             let scan = find_parquet_scan(&plan).expect("a Parquet scan");
             let observed = Arc::new(Mutex::new(vec![]));
             let root = lower_with(&plan, &|source, scan| {
