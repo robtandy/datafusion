@@ -18,7 +18,8 @@
 //! the filter to the rows that may change them: `a < min(a) OR b > max(b) OR
 //! ...` (`true` while an aggregate has no value yet). An aggregation lowered
 //! from such an `AggregateExec` updates the same filter the same way, with the
-//! bounds of the accumulators of all of its threads after every chunk (see
+//! bounds of the accumulators of all of its threads, which every thread
+//! publishes at most once per batch of rows (see
 //! [`AggregateFilter::update_bounds`]), and marks it complete once it
 //! aggregated its input.
 //!
@@ -274,11 +275,14 @@ impl AggregateFilter {
     }
 
     /// The bounds of all threads of an execution of the aggregation, if the
-    /// filter is a [`FilterKind::Bounds`] filter: `NULL` (no bound yet).
-    pub(crate) fn shared_bounds(&self) -> Option<SharedBounds> {
+    /// filter is a [`FilterKind::Bounds`] filter: `NULL` (no bound yet). A
+    /// thread publishes its bounds at most once per `batch_size` rows (see
+    /// [`Self::update_bounds`]).
+    pub(crate) fn shared_bounds(&self, batch_size: usize) -> Option<SharedBounds> {
         match &self.kind {
             FilterKind::Bounds(bounded) => Some(SharedBounds {
                 bounds: Mutex::new(vec![ScalarValue::Null; bounded.len()]),
+                batch_size,
             }),
             FilterKind::Cutoff { .. } => None,
         }
@@ -286,25 +290,41 @@ impl AggregateFilter {
 
     /// Update `shared`, the bounds of all threads, with the values of
     /// `accumulators`, the accumulators of the aggregates of a thread that
-    /// aggregated a chunk, and set the filter to the rows that may change
-    /// them if they changed, like the partitions of DataFusion's
+    /// aggregated `rows` more rows, and set the filter to the rows that may
+    /// change them if they changed, like the partitions of DataFusion's
     /// `AggregateExec` do after every batch: `a < min(a) OR b > max(b) OR
     /// ...`, or `true` while an aggregate has no bound (a row that does not
     /// change the other bounds may give it its first value).
     ///
-    /// `known` are the bounds of all threads that the thread saw last: only
+    /// `thread` holds the bounds of all threads that the thread saw last: only
     /// if the value of one of its accumulators is better, the thread locks
-    /// the bounds of all threads (and updates `known`), so that the threads
-    /// rarely wait for each other once the bounds are tight.
+    /// the bounds of all threads (and updates them), so that the threads
+    /// rarely wait for each other once the bounds are tight. And as
+    /// DataFusion's partitions, which publish their bounds after every batch
+    /// of their input, a thread publishes its bounds at most once per
+    /// `batch_size` rows (but its first ones at once, and its last ones when
+    /// it is done, if `done`): every change of a filter makes the scans that
+    /// read it rebuild their pruning predicates (after every batch), so that
+    /// bounds that change all the time (e.g. the `MAX` of ascending values,
+    /// which prunes nothing) cost more than they prune.
     pub(crate) fn update_bounds(
         &self,
         accumulators: &mut [Box<dyn Accumulator>],
-        known: &mut [ScalarValue],
+        thread: &mut ThreadBounds,
         shared: &SharedBounds,
+        rows: usize,
+        done: bool,
     ) -> Result<()> {
         let FilterKind::Bounds(bounded) = &self.kind else {
             return Ok(());
         };
+        if let Some(pending) = &mut thread.rows {
+            *pending += rows;
+            if *pending < shared.batch_size && !done {
+                return Ok(());
+            }
+        }
+        let known = &mut thread.known;
         let mut values = Vec::with_capacity(bounded.len());
         let mut improves = false;
         for (aggregate, known) in bounded.iter().zip(known.iter()) {
@@ -321,6 +341,7 @@ impl AggregateFilter {
         if !improves {
             return Ok(());
         }
+        thread.rows = Some(0);
         let mut bounds = shared.bounds.lock();
         let mut changed = false;
         for ((aggregate, value), bound) in
@@ -421,13 +442,29 @@ fn bounds_predicate(
 pub(crate) struct SharedBounds {
     /// The bound of every bounded aggregate, `NULL` if it has none yet.
     bounds: Mutex<Vec<ScalarValue>>,
+    /// A thread publishes its bounds at most once per this many rows.
+    batch_size: usize,
 }
 
 impl SharedBounds {
-    /// No bounds, as a thread knows them before it aggregated a row.
-    pub(crate) fn unknown(&self) -> Vec<ScalarValue> {
-        vec![ScalarValue::Null; self.bounds.lock().len()]
+    /// The state of a thread that did not aggregate a row yet.
+    pub(crate) fn thread_bounds(&self) -> ThreadBounds {
+        ThreadBounds {
+            known: vec![ScalarValue::Null; self.bounds.lock().len()],
+            rows: None,
+        }
     }
+}
+
+/// What a thread knows of the [`SharedBounds`] of the threads of an
+/// aggregation (see [`AggregateFilter::update_bounds`]).
+#[derive(Debug)]
+pub(crate) struct ThreadBounds {
+    /// The bounds of all threads that the thread saw last.
+    known: Vec<ScalarValue>,
+    /// The rows that the thread aggregated since it last published its
+    /// bounds, `None` if it did not publish any yet.
+    rows: Option<usize>,
 }
 
 /// The best cutoff (see [`TopK::cutoff`]) that the threads of an execution of

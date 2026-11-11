@@ -1513,7 +1513,8 @@ impl PhysicalOperator for PhysicalHashAggregate {
         // Whether the threads update the dynamic filter of the aggregation.
         let filters = filters_enabled(ctx);
         if self.spec.is_ungrouped() {
-            UngroupedAggregate::global_sink_state(&self.spec, filters)
+            let batch_size = ctx.task_ctx.session_config().batch_size();
+            UngroupedAggregate::global_sink_state(&self.spec, filters, batch_size)
         } else {
             RadixHashAggregate::global_sink_state(filters)
         }

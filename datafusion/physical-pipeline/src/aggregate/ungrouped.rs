@@ -28,21 +28,21 @@
 //!
 //! An aggregation of `MIN` and `MAX` aggregates with a dynamic filter (see
 //! [`super::dynamic_filter`]) shares the bounds of the accumulators of all
-//! threads in its global state: after every chunk, a thread whose
-//! accumulators have better bounds than those it knows updates them, and the
-//! filter, as the partitions of DataFusion's `AggregateStream` do after every
-//! batch.
+//! threads in its global state: a thread whose accumulators have better
+//! bounds than those it knows updates them, and the filter, at most once per
+//! batch of rows, as the partitions of DataFusion's `AggregateStream` do after
+//! every batch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::RecordBatch;
-use datafusion_common::{Result, ScalarValue, internal_err};
+use datafusion_common::{Result, internal_err};
 use datafusion_expr::Accumulator;
 use datafusion_physical_plan::filter::batch_filter;
 use parking_lot::Mutex;
 
-use super::dynamic_filter::SharedBounds;
+use super::dynamic_filter::{SharedBounds, ThreadBounds};
 use super::hash_aggregate::{AggregateSpec, InputBuffer};
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -76,13 +76,35 @@ struct UngroupedLocalState {
     accumulators: Vec<Box<dyn Accumulator>>,
     /// The input rows, if they must be sorted before they are aggregated.
     buffer: InputBuffer,
-    /// The bounds of all threads that the thread saw last, if the threads
+    /// What the thread knows of the bounds of all threads, if the threads
     /// update the dynamic filter of the aggregation (see
     /// `AggregateFilter::update_bounds`).
-    known_bounds: Vec<ScalarValue>,
+    bounds: Option<ThreadBounds>,
 }
 
 impl LocalSinkState for UngroupedLocalState {}
+
+impl UngroupedLocalState {
+    /// Update the bounds of all threads and the dynamic filter of the
+    /// aggregation `spec`, if its threads update it, with the bounds of the
+    /// accumulators of the thread, which aggregated `rows` more rows (see
+    /// `AggregateFilter::update_bounds`), and are `done` if the thread
+    /// aggregated all of its rows.
+    fn update_bounds(
+        &mut self,
+        spec: &AggregateSpec,
+        global: &UngroupedSinkState,
+        rows: usize,
+        done: bool,
+    ) -> Result<()> {
+        if let (Some(filter), Some(shared), Some(thread)) =
+            (&spec.dynamic_filter, &global.bounds, &mut self.bounds)
+        {
+            filter.update_bounds(&mut self.accumulators, thread, shared, rows, done)?;
+        }
+        Ok(())
+    }
+}
 
 /// The global source state: the output row and whether it was emitted.
 #[derive(Debug)]
@@ -100,13 +122,14 @@ impl GlobalSourceState for UngroupedSourceState {
 impl UngroupedAggregate {
     /// The global sink state of an execution of `spec`, whose threads update
     /// its dynamic filter, if it has one, if `filters` (see
-    /// `filters_enabled`).
+    /// `filters_enabled`), at most once per `batch_size` rows.
     pub(crate) fn global_sink_state(
         spec: &AggregateSpec,
         filters: bool,
+        batch_size: usize,
     ) -> Result<Arc<dyn GlobalSinkState>> {
         let bounds = match (&spec.dynamic_filter, filters) {
-            (Some(filter), true) => filter.shared_bounds(),
+            (Some(filter), true) => filter.shared_bounds(batch_size),
             _ => None,
         };
         Ok(Arc::new(UngroupedSinkState {
@@ -123,11 +146,7 @@ impl UngroupedAggregate {
         Ok(Box::new(UngroupedLocalState {
             accumulators: update_accumulators(spec)?,
             buffer: InputBuffer::default(),
-            known_bounds: global
-                .bounds
-                .as_ref()
-                .map(SharedBounds::unknown)
-                .unwrap_or_default(),
+            bounds: global.bounds.as_ref().map(SharedBounds::thread_bounds),
         }))
     }
 
@@ -144,17 +163,8 @@ impl UngroupedAggregate {
             return Ok(());
         }
         update(spec, &mut local.accumulators, &batch)?;
-        if let Some(filter) = &spec.dynamic_filter {
-            let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
-            if let Some(bounds) = &global.bounds {
-                filter.update_bounds(
-                    &mut local.accumulators,
-                    &mut local.known_bounds,
-                    bounds,
-                )?;
-            }
-        }
-        Ok(())
+        let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
+        local.update_bounds(spec, global, batch.num_rows(), false)
     }
 
     pub(crate) fn combine(
@@ -170,6 +180,9 @@ impl UngroupedAggregate {
                 update(spec, &mut local.accumulators, &batch)?;
             }
         }
+        // The last bounds of the thread, for the threads that are still
+        // aggregating.
+        local.update_bounds(spec, global, 0, true)?;
         let mut accumulators = global.accumulators.lock();
         if accumulators.is_none() {
             if spec.single_stage {
