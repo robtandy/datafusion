@@ -56,29 +56,39 @@
 //! of the sort, so the buckets are partitioned by the partition keys of the
 //! stage with the fewest of them.
 //!
+//! Where DataFusion sorts or merges the rows between two window nodes (for
+//! windows with other partitions or orders), or the partitions of the upper
+//! node are not runs of rows of the sort of the lower one, the upper node is a
+//! window operator of its own, which partitions and sorts the output of the
+//! window operator of the lower one again.
+//!
 //! # Order
 //!
 //! The rows of a window partition are evaluated in the order in which
-//! DataFusion's window node reads them: the ordering of its input, which a
-//! `SortExec` below it established, with the partition keys first if the
-//! ordering does not start with them. Rows that this ordering does not order
-//! (ties) come in any order, as from DataFusion's sort.
+//! DataFusion's window node reads them: the ordering of its input (whatever
+//! established it: a sort, a merge of sorted partitions, a window below or a
+//! scan of sorted files), with the partition keys first if the ordering does
+//! not start with them. Rows that this ordering does not order (peers) come
+//! in any order, which SQL does not define.
 //!
 //! A window whose DataFusion node has a single output partition, i.e. whose
 //! consumers may rely on the order of its output, uses a single bucket and
-//! emits its rows in their sort order, on a single thread. Its input is still
-//! sorted by all threads into runs, which a single thread merges. A window
-//! of several output partitions emits the buckets in any order, in
+//! emits its rows in the order of its input, on a single thread. Its input is
+//! still sorted by all threads into runs, which a single thread merges. If the
+//! partition keys do not lead the ordering of its input (a
+//! `BoundedWindowAggExec` in `Linear` or `PartiallySorted` mode), the window
+//! sorts the rows it evaluated again, by that ordering, before it emits them.
+//! A window of several output partitions emits the buckets in any order, in
 //! parallel, and the rows of each window partition in their order.
 //!
 //! The window operator keeps all rows in memory: it does not spill, and
 //! does not reserve memory in the memory pool, so windows are only lowered
 //! for memory pools without a limit. It reads all rows of its input before it
-//! emits anything, so windows are only lowered where DataFusion's window does
-//! so too, below a sort (see [`PhysicalWindow::try_lower`]).
+//! emits anything, so windows over inputs that never end are left to
+//! DataFusion, whose windows stream (see [`PhysicalWindow::try_lower`]).
 
 use std::collections::VecDeque;
-use std::fmt::{self, Write};
+use std::fmt::Write;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -97,22 +107,15 @@ use datafusion_common::{
 };
 use datafusion_execution::memory_pool::MemoryLimit;
 use datafusion_execution::runtime_env::RuntimeEnv;
-use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::window::{
-    PlainAggregateWindowExpr, SlidingAggregateWindowExpr, StandardWindowExpr, WindowExpr,
-};
+use datafusion_physical_expr::window::WindowExpr;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
-use datafusion_physical_plan::union::UnionExec;
-use datafusion_physical_plan::windows::{
-    BoundedWindowAggExec, WindowAggExec, WindowUDFExpr,
-};
+use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use parking_lot::Mutex;
 
@@ -123,9 +126,8 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
     TaskInterrupt, downcast_state, downcast_state_mut,
 };
-use crate::operators::adaptive_filter::is_infallible;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
-use crate::sort::merge::{RunMerger, SortedRun};
+use crate::sort::merge::{RunMerger, SortedRun, is_capacity_error};
 use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
 use crate::sort::{SortKeys, memory_size};
 
@@ -159,8 +161,14 @@ struct WindowSpec {
     /// the rows are evaluated (and emitted) in the order of `ordering`.
     partition_keys_lead: bool,
     /// Whether all rows are evaluated in one bucket and emitted in the order
-    /// of `keys`.
+    /// of the input of the window: of `keys`, or of `emit_order`.
     ordered: bool,
+    /// The order in which an ordered window emits its rows if it is not the
+    /// order of `keys`: the ordering of its input, which its partition keys do
+    /// not lead (see the [module documentation](self)). The window sorts the
+    /// rows of its single bucket by `keys` to evaluate them, and the evaluated
+    /// rows by this order.
+    emit_order: Option<SortKeys>,
     /// Whether the group keys can be hashed, to distribute the rows over
     /// buckets.
     hashable: bool,
@@ -322,6 +330,21 @@ impl WindowSpec {
                     .any(|sort_expr| sort_expr.expr.as_ref() == key.as_ref())
             })
         });
+        // An ordered window emits its rows in the order of its input: if the
+        // partition keys do not lead it, the evaluated rows are sorted by it
+        // again (its expressions are bound to the input of the window, whose
+        // columns lead the rows with the window values).
+        let emit_order = match &ordering {
+            Some(ordering) if ordered && !partition_keys_lead => {
+                if !SortKeys::supports(ordering, &stage.schema)? {
+                    return not_impl_err!(
+                        "PhysicalWindow cannot sort rows by {ordering}: the row format does not support its types"
+                    );
+                }
+                Some(SortKeys::try_new(ordering.clone(), &stage.schema)?)
+            }
+            _ => None,
+        };
         let sort_exprs = match partition_keys_lead {
             true => vec![],
             false => partition_by
@@ -359,6 +382,7 @@ impl WindowSpec {
             group_keys,
             partition_keys_lead,
             ordered,
+            emit_order,
             schema,
         })
     }
@@ -499,9 +523,11 @@ impl PhysicalWindow {
     /// columns of the input, then one column per window expression.
     ///
     /// If `ordered`, all rows are evaluated on one thread and emitted in the
-    /// order of their sort: by `ordering` if the partition keys lead it,
-    /// otherwise by the partition keys and then by `ordering`. Otherwise, the
-    /// window partitions are evaluated in parallel and emitted in any order.
+    /// order `ordering` (by the partition keys without ordering): the window
+    /// sorts them by the partition keys and `ordering` to evaluate them, and,
+    /// if the partition keys do not lead `ordering`, the evaluated rows by
+    /// `ordering` again. Otherwise, the window partitions are evaluated in
+    /// parallel and emitted in any order.
     pub fn try_new(
         input: Arc<dyn PhysicalOperator>,
         window_exprs: Vec<Arc<dyn WindowExpr>>,
@@ -519,88 +545,52 @@ impl PhysicalWindow {
     /// nodes below it that only distribute and sort its input (and the window
     /// nodes it is stacked on), to a [`PhysicalWindow`] with the same
     /// semantics and schema, for an execution with the runtime `runtime`.
-    /// `lower_input` lowers the input of these nodes. Returns `Ok(None)` for
-    /// any other node, without calling `lower_input`, and for the windows that
-    /// are left to DataFusion:
+    /// `lower_input` lowers the input of these nodes.
+    ///
+    /// The native window evaluates every window expression (of any window
+    /// function or aggregate, built-in or user-defined, with any frame,
+    /// `FILTER` and arguments) with [`WindowExpr::evaluate`] on all rows of
+    /// each window partition, in the order of the input of the window node
+    /// (see the [module documentation](self)), as `WindowAggExec` does:
+    /// `BoundedWindowAggExec` computes the same values incrementally. It
+    /// reads its input whatever established the order of the input (sorts,
+    /// merges, windows below, sorted scans), and it is stacked on the native
+    /// window of a window below, as a stage or as a window of its own (where
+    /// DataFusion sorts or merges in between). The nodes below the window that
+    /// only distribute and sort its input are replaced too (the native window
+    /// partitions and sorts its input itself): `SortExec`s,
+    /// `SortPreservingMergeExec`s, `CoalescePartitionsExec`s and
+    /// `RepartitionExec`s (round robin or hash) without a fetch that read all
+    /// partitions of their input.
+    ///
+    /// Returns `Ok(None)` for any other node, without calling `lower_input`,
+    /// and for the windows that are left to DataFusion:
     ///
     /// * all windows if the memory pool of `runtime` has a limit (or an
     ///   unknown one): the sorts that the native window replaces reserve
     ///   memory (and fail, or spill, when the pool is exhausted), the native
     ///   window does not;
-    /// * windows that DataFusion can evaluate before it read all rows of
-    ///   their input, while the native window reads all of them first: then
-    ///   DataFusion's window emits rows of an input that never ends, or before
-    ///   a later error of its input (e.g. under a limit). A
-    ///   `BoundedWindowAggExec` emits its rows as it reads them: it is native
-    ///   only below sorts that read all rows first (a `SortExec` that sorts,
-    ///   not one whose input is sorted already, which DataFusion passes
-    ///   through), or merges of such sorts that wait for the first rows of all
-    ///   of them (a `SortPreservingMergeExec`, not a `CoalescePartitionsExec`).
-    ///   A `WindowAggExec` reads all rows of its partition first. Several
-    ///   window partitions read all rows of the input only if a
-    ///   repartitioning (a `RepartitionExec`) distributes them below the
-    ///   window, through nodes that read all of their partition (not a filter
-    ///   with a fetch, which ends its partition once it emitted that many
-    ///   rows): otherwise one emits rows while another one waits for its
-    ///   input, e.g. above a partitioned join;
-    /// * windows DataFusion does not evaluate on all rows of each window
-    ///   partition: with a `WindowStateObserver`; of no partitions (DataFusion
-    ///   executes nothing); of several partitions without partition keys, or
-    ///   whose input is not partitioned by its partition keys (DataFusion
-    ///   evaluates every partition separately); whose partitions are not
-    ///   those of their input (stale properties);
-    /// * windows whose input is in an order that DataFusion did not establish
-    ///   with a sort (or a merge of several partitions in no particular
-    ///   order) below the window: e.g. a scan of a sorted file, which
-    ///   DataFusion reads in its order, also where its ordering has ties. The
-    ///   native window sorts its rows by that ordering, so it could evaluate
-    ///   rows with equal keys in another order. A window stacked on another
-    ///   one (through projections of columns and redistributions that keep
-    ///   the order) reads the rows in the order in which the window below
-    ///   evaluated them: it is lowered as a stage of the window below (see
-    ///   the [module documentation](self)), if its partitions are runs of
-    ///   rows of the sort of that window, and left to DataFusion otherwise;
-    /// * windows with an expression that can fail on some rows
-    ///   (conservatively, see [`is_infallible`]): the arguments, partition
-    ///   keys and order keys of the window functions, a `FILTER` of an
-    ///   aggregate (always, as it cannot be inspected), and the keys of the
-    ///   ordering of the rows. DataFusion evaluates them on other batches,
-    ///   and `BoundedWindowAggExec` emits its rows as it goes, so that, e.g.
-    ///   under a limit, one of them could fail where the other does not.
-    ///   Window expressions of other types than DataFusion's (standard,
-    ///   aggregate and sliding aggregate ones) are left to DataFusion too;
-    /// * windows with a window function whose evaluation can fail on some
-    ///   rows: all functions but DataFusion's window functions (`row_number`,
-    ///   `rank`, `lag`, `nth_value`, ...) and its aggregates `count`, `sum`,
-    ///   `min`, `max` and `avg` of floating-point values (an average of
-    ///   decimals fails where it does not fit its type), which only fail on
-    ///   invalid literal arguments, on the first window partition. E.g. a
-    ///   user-defined function: `BoundedWindowAggExec` evaluates it as it
-    ///   reads its rows, and a limit above it can stop it before a row that
-    ///   fails, while the native window evaluates whole window partitions.
-    ///   The functions are recognized by their name and the name of the type
-    ///   that implements them (see `is_builtin`), so a function registered
-    ///   under the name of one of DataFusion's is left to DataFusion too;
-    /// * windows whose rows of a single partition must be in an order that
-    ///   does not start with the partition keys (a `BoundedWindowAggExec` in
-    ///   `Linear` or `PartiallySorted` mode with a single partition): the
-    ///   native window emits its rows in the order of its sort, which starts
-    ///   with the partition keys;
-    /// * windows whose input or output has dictionaries with keys of 8 or 16
-    ///   bits, or run-end encodings with 16-bit run ends: the native window
-    ///   gathers other rows together than DataFusion (whole partitions,
-    ///   buckets, sorted runs and chunks), which can overflow such keys or
-    ///   run ends where DataFusion's batches do not, or the other way round;
+    /// * windows with a `WindowStateObserver`, a callback that observes the
+    ///   accumulators of DataFusion's window as its partitions close, which
+    ///   the native window does not have;
+    /// * windows that are not one window over all rows of their input: of no
+    ///   partitions (DataFusion executes nothing), of several partitions
+    ///   without partition keys or whose input is not partitioned by its
+    ///   partition keys (DataFusion evaluates every partition separately), and
+    ///   whose partitions are not those of their input (stale properties);
+    /// * windows over inputs that never end (unbounded inputs): the native
+    ///   window reads all of its input before it emits a row, while
+    ///   DataFusion's window streams;
     /// * windows whose rows are ordered by keys that the Arrow row format does
-    ///   not support, or by unions (the native window sorts by the row
-    ///   format, which orders unions differently from DataFusion's sort).
+    ///   not support, or by unions: the row format orders the values of a
+    ///   union by their type first, also for descending keys, and its nulls
+    ///   among the values of their type, so that such keys would not be in the
+    ///   order of the window.
     ///
-    /// The nodes below the window that only distribute and sort its input
-    /// are replaced too (the native window partitions and sorts its input
-    /// itself): `SortExec`s, `SortPreservingMergeExec`s,
-    /// `CoalescePartitionsExec`s and `RepartitionExec`s (round robin or hash)
-    /// without limit, whose expressions cannot fail, and that read all
-    /// partitions of their input.
+    /// A window whose input projects the rows of the sorts or redistributions
+    /// below it (a `ProjectionExec` between them) is not lowered either: the
+    /// planner lowers it with the projection moved below the sorts (see
+    /// `with_projection_below_sort` in the planner).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         runtime: &RuntimeEnv,
@@ -794,6 +784,11 @@ fn analyze(
     if partitions == 0 || partitions != input.output_partitioning().partition_count() {
         return Ok(None);
     }
+    // The native window reads all rows of its input before it emits any: an
+    // input that never ends is left to DataFusion, whose window streams.
+    if input.boundedness().is_unbounded() {
+        return Ok(None);
+    }
     let partition_by = first.partition_by();
     let ordered = partitions == 1;
     // DataFusion evaluates every partition of the window separately: its
@@ -810,177 +805,65 @@ fn analyze(
         return Ok(None);
     }
     let input_schema = input.schema();
-    if !window_exprs
-        .iter()
-        .all(|expr| window_expr_cannot_fail(expr, &input_schema))
-        || plan
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| has_narrow_encoding(field.data_type()))
+    // A window stacked on a window below it, without a node in between that
+    // sorts or merges the rows, reads them in the order in which the window
+    // below evaluated them: it is evaluated as a stage of the native window of
+    // the window below, on the same sorted rows, if its partitions are runs of
+    // these rows (see `WindowSpec::with_stage`).
+    if let Some(WindowBelow {
+        projection,
+        window: below,
+    }) = window_below(input)
+        && let Some((below_spec, rows)) = analyze(below)?
+        && below_spec.ordered == ordered
+        && let Some(spec) =
+            below_spec.with_stage(projection, &input_schema, window_exprs.to_vec())?
     {
+        return Ok(Some((spec, rows)));
+    }
+    // Otherwise the native window partitions and sorts the rows of its input
+    // itself, by the ordering of its input: whatever established it (a sort, a
+    // merge, a window below or a scan of sorted files), the window partitions
+    // are evaluated in that order (with the partition keys first), and rows
+    // that it does not order are peers, whose order is the engine's own. A
+    // window above another one with other partitions or orders, which
+    // DataFusion sorts or merges in between, is a native window over the
+    // native window of the window below.
+    let rows = without_distribution(input);
+    // A projection between the window and the sorts or redistributions below
+    // it is not looked through: the planner lowers such a window with the
+    // projection moved below the sorts (see `with_projection_below_sort` in
+    // the planner), which only changes on which rows the projection is
+    // evaluated.
+    if projects_distributed_rows(rows) {
         return Ok(None);
     }
-    let (rows, order) = without_distribution(input);
-    // The native window reads all of its input before it emits anything, as
-    // DataFusion's window does only if its input does not emit before all rows
-    // were read: otherwise DataFusion's window emits rows of inputs that never
-    // end, or before a later error of its input, e.g. under a limit. A
-    // `WindowAggExec` reads all rows of its partition first, a
-    // `BoundedWindowAggExec` evaluates them as it reads them.
-    let reads_all = if plan.is::<WindowAggExec>() {
-        ends_once_all_rows_were_read(input)
-    } else {
-        emits_once_rows_were_read(input, true)
-    };
-    let spec = if reads_all
-        && (order.sorted || order.interleaved || sorted_by_sorts(rows))
-    {
-        // The rows are sorted (or merged in no particular order) below the
-        // window: the native window sorts them by the ordering of its input.
-        let ordering = input.output_ordering().cloned();
-        if ordering.as_ref().is_some_and(|ordering| {
-            ordering.iter().any(|sort_expr| {
-                !is_infallible(&sort_expr.expr, &input_schema)
-                    || sort_expr
-                        .expr
-                        .data_type(&input_schema)
-                        .map_or(true, |data_type| has_union(&data_type))
-            })
-        }) {
-            return Ok(None);
-        }
-        match WindowSpec::try_new(&input_schema, window_exprs.to_vec(), ordering, ordered)
-        {
-            Ok(spec) => spec,
-            Err(DataFusionError::NotImplemented(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        }
-    } else {
-        // The rows are in the order of a window below (or of another node,
-        // left to DataFusion).
-        let Some(WindowBelow {
-            projection,
-            window: below,
-        }) = window_below(input)
-        else {
-            return Ok(None);
-        };
-        let Some((below_spec, rows)) = analyze(below)? else {
-            return Ok(None);
-        };
-        if below_spec.ordered != ordered {
-            return Ok(None);
-        }
-        match below_spec.with_stage(projection, &input_schema, window_exprs.to_vec())? {
-            Some(spec) => return Ok(Some((spec, rows))),
-            None => return Ok(None),
-        }
-    };
-    if ordered && !spec.partition_keys_lead && !spec.group_keys.is_empty() {
+    let ordering = input.output_ordering().cloned();
+    if ordering.as_ref().is_some_and(|ordering| {
+        ordering.iter().any(|sort_expr| {
+            sort_expr
+                .expr
+                .data_type(&input_schema)
+                .map_or(true, |data_type| has_union(&data_type))
+        })
+    }) {
         return Ok(None);
     }
+    let spec = match WindowSpec::try_new(
+        &input_schema,
+        window_exprs.to_vec(),
+        ordering,
+        ordered,
+    ) {
+        Ok(spec) => spec,
+        Err(DataFusionError::NotImplemented(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     Ok(Some((spec, rows)))
-}
-
-/// Whether the rows of `plan` are in an order that sorts established, which
-/// read all of their input before they emit anything: it is a `SortExec` that
-/// sorts (e.g. with a fetch, which the window does not replace), or a
-/// `SortPreservingMergeExec` or a `UnionExec` of such rows (DataFusion pushes
-/// sorts below unions).
-fn sorted_by_sorts(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
-        sorted_by_sorts(merge.input())
-    } else if let Some(union) = plan.downcast_ref::<UnionExec>() {
-        !union.inputs().is_empty() && union.inputs().iter().all(sorted_by_sorts)
-    } else {
-        plan.downcast_ref::<SortExec>().is_some_and(sorts)
-    }
-}
-
-/// Whether every partition of `plan` ends only once all rows below it were
-/// read: it has a single partition, or its partitions are those of a
-/// repartitioning (a `RepartitionExec`, each partition of which ends only once
-/// all of its input was read), passed through nodes that read all of the
-/// partition of their input that they emit (projections, filters and sorts
-/// without a fetch, and sorts that sort, which read all of their input also
-/// with a fetch). A node with a fetch that emits rows as it reads them (a
-/// filter, or a sort that passes its sorted input through) ends every
-/// partition once it emitted that many rows of it, whether the other
-/// partitions ended or not. Otherwise a partition of a window above `plan`
-/// can emit its rows while another one waits for its input (forever, for an
-/// input that never ends), or before the input of another one fails.
-fn ends_once_all_rows_were_read(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    if partitions(plan) <= 1 || plan.is::<RepartitionExec>() {
-        return true;
-    }
-    let input = if let Some(sort) = plan.downcast_ref::<SortExec>() {
-        if sort.fetch().is_some() && !sorts(sort) {
-            return false;
-        }
-        sort.input()
-    } else if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
-        projection.input()
-    } else if let Some(filter) = plan.downcast_ref::<FilterExec>() {
-        if filter.fetch().is_some() {
-            return false;
-        }
-        filter.input()
-    } else {
-        return false;
-    };
-    partitions(input) == partitions(plan) && ends_once_all_rows_were_read(input)
-}
-
-/// Whether every partition of `plan` emits its first row only once all rows
-/// below `plan` were read (if `all`), or all rows that the partition reads.
-/// The partitions of a sort that sorts (see [`sorts`]) read all rows of their
-/// partition of the input first, which are all rows if these partitions end
-/// only once all rows were read (see [`ends_once_all_rows_were_read`]). The
-/// merges of sorted partitions (a `SortPreservingMergeExec`, or a
-/// `RepartitionExec` that preserves their order) wait for the first rows of all
-/// of them; a `CoalescePartitionsExec` (or a `RepartitionExec` that does not
-/// preserve the order) emits the rows of every partition as they come.
-fn emits_once_rows_were_read(plan: &Arc<dyn ExecutionPlan>, all: bool) -> bool {
-    // The only partition of a plan reads all rows below it.
-    let all = all && partitions(plan) > 1;
-    if let Some(sort) = plan.downcast_ref::<SortExec>() {
-        if sorts(sort) {
-            !all || ends_once_all_rows_were_read(sort.input())
-        } else {
-            emits_once_rows_were_read(sort.input(), all)
-        }
-    } else if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
-        emits_once_rows_were_read(merge.input(), false)
-    } else if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
-        repartition.preserve_order()
-            && emits_once_rows_were_read(repartition.input(), false)
-    } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
-        partitions(coalesce.input()) <= 1
-            && emits_once_rows_were_read(coalesce.input(), all)
-    } else if let Some(union) = plan.downcast_ref::<UnionExec>() {
-        !all && union
-            .inputs()
-            .iter()
-            .all(|input| emits_once_rows_were_read(input, false))
-    } else {
-        false
-    }
 }
 
 fn partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
     plan.output_partitioning().partition_count()
-}
-
-/// Whether `sort` sorts its input: DataFusion passes an input that is sorted
-/// already through (with its fetch), and sorts (or keeps the top rows of)
-/// another one, reading all of it before it emits anything.
-fn sorts(sort: &SortExec) -> bool {
-    !sort
-        .input()
-        .equivalence_properties()
-        .ordering_satisfy(sort.expr().clone())
-        .unwrap_or(true)
 }
 
 /// A DataFusion window node: its window expressions and its input.
@@ -1047,7 +930,7 @@ fn window_below(input: &Arc<dyn ExecutionPlan>) -> Option<WindowBelow<'_>> {
             exec.input()
         } else if let Some(repartition) = node.downcast_ref::<RepartitionExec>()
             && (repartition.preserve_order() || partitions(repartition.input()) == 1)
-            && partitioning_cannot_fail(repartition)
+            && distributes_rows(repartition)
         {
             repartition.input()
         } else if let Some(coalesce) = node.downcast_ref::<CoalescePartitionsExec>()
@@ -1077,142 +960,12 @@ fn same_keys(previous: &[ArrayRef], keys: &[ArrayRef]) -> Result<bool> {
     Ok(true)
 }
 
-/// Whether evaluating `expr` on rows with schema `schema` cannot fail: it is
-/// a standard, aggregate or sliding aggregate window expression (of
-/// DataFusion) without `FILTER`, of a window function whose evaluation cannot
-/// fail (see [`INFALLIBLE_WINDOW_FUNCTIONS`] and
-/// [`aggregate_cannot_fail`]), and whose arguments, partition keys and order
-/// keys cannot fail (see [`is_infallible`]).
-fn window_expr_cannot_fail(expr: &Arc<dyn WindowExpr>, schema: &Schema) -> bool {
-    let any = expr.as_any();
-    let function_cannot_fail = if let Some(standard) =
-        any.downcast_ref::<StandardWindowExpr>()
-    {
-        standard
-            .get_standard_func_expr()
-            .as_any()
-            .downcast_ref::<WindowUDFExpr>()
-            .is_some_and(|udwf| {
-                let fun = udwf.fun();
-                is_builtin(fun.name(), fun.inner(), &INFALLIBLE_WINDOW_FUNCTIONS)
-            })
-    } else if let Some(aggregate) = any.downcast_ref::<PlainAggregateWindowExpr>() {
-        !has_filter(expr) && aggregate_cannot_fail(aggregate.get_aggregate_expr(), schema)
-    } else if let Some(aggregate) = any.downcast_ref::<SlidingAggregateWindowExpr>() {
-        !has_filter(expr) && aggregate_cannot_fail(aggregate.get_aggregate_expr(), schema)
-    } else {
-        false
-    };
-    let expressions = expr.all_expressions();
-    function_cannot_fail
-        && expressions
-            .args
-            .iter()
-            .chain(&expressions.partition_by_exprs)
-            .chain(&expressions.order_by_exprs)
-            .all(|expr| is_infallible(expr, schema))
-}
-
-/// DataFusion's window functions whose evaluation cannot fail on some rows
-/// only, by their name and the name of the type that implements them (see
-/// [`is_builtin`]): they only fail on invalid literal arguments (e.g.
-/// `NTILE(0)`), which they reject when they create their evaluator, i.e. on
-/// the first window partition, before any row is emitted (in DataFusion and
-/// natively).
-///
-/// The evaluation of other window functions (e.g. user-defined ones) could
-/// fail on some rows only: DataFusion's `BoundedWindowAggExec` evaluates its
-/// rows as it reads them (so that a limit above it can stop it before such a
-/// row), and `WindowAggExec` evaluates all window partitions before it emits
-/// any row, while the native window evaluates every window partition (all of
-/// its rows at once) only as it emits it.
-const INFALLIBLE_WINDOW_FUNCTIONS: [(&str, &str); 11] = [
-    ("row_number", "RowNumber"),
-    ("rank", "Rank"),
-    ("dense_rank", "Rank"),
-    ("percent_rank", "Rank"),
-    ("cume_dist", "CumeDist"),
-    ("ntile", "Ntile"),
-    ("lag", "WindowShift"),
-    ("lead", "WindowShift"),
-    ("first_value", "NthValue"),
-    ("last_value", "NthValue"),
-    ("nth_value", "NthValue"),
-];
-
-/// DataFusion's aggregate functions whose accumulators cannot fail on some
-/// rows only (see [`INFALLIBLE_WINDOW_FUNCTIONS`] and [`is_builtin`]): `sum`
-/// wraps on overflow, `count`, `min` and `max` only fail on types they do not
-/// support, when they create their accumulator.
-const INFALLIBLE_AGGREGATE_FUNCTIONS: [(&str, &str); 4] = [
-    ("count", "Count"),
-    ("sum", "Sum"),
-    ("min", "Min"),
-    ("max", "Max"),
-];
-
-/// Whether the accumulators of `aggregate` (with arguments of schema
-/// `schema`) cannot fail on some rows only: those of the aggregate functions
-/// [`INFALLIBLE_AGGREGATE_FUNCTIONS`], and of `avg` of floating-point values
-/// (DataFusion casts integers to `Float64` for it). An average of decimals
-/// fails where it does not fit its type.
-fn aggregate_cannot_fail(aggregate: &AggregateFunctionExpr, schema: &Schema) -> bool {
-    let fun = aggregate.fun();
-    is_builtin(fun.name(), fun.inner(), &INFALLIBLE_AGGREGATE_FUNCTIONS)
-        || (is_builtin(fun.name(), fun.inner(), &[("avg", "Avg")])
-            && aggregate.expressions().iter().all(|arg| {
-                arg.data_type(schema)
-                    .is_ok_and(|data_type| data_type.is_floating())
-            }))
-}
-
-/// Whether the function of name `name`, implemented by `implementation`, is
-/// one of `builtins`, by its name and the name of the type that implements it
-/// (which the `Debug` representation of `implementation` starts with). A
-/// function registered under the name of a DataFusion function (which replaces
-/// it) is another type. (The native window cannot compare the functions
-/// themselves, as DataFusion's optimizer does: it does not depend on
-/// DataFusion's function crates.)
-fn is_builtin(
-    name: &str,
-    implementation: &dyn fmt::Debug,
-    builtins: &[(&str, &str)],
-) -> bool {
-    let debug = format!("{implementation:?}");
-    let type_name = debug
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next()
-        .unwrap_or_default();
-    builtins
-        .iter()
-        .any(|&(builtin, builtin_type)| name == builtin && type_name == builtin_type)
-}
-
-/// Whether an aggregate window expression has a `FILTER`. Its filter is not
-/// public, but its `Debug` representation ends with it: an expression that
-/// does not end with `filter: None` is considered to have one.
-fn has_filter(expr: &Arc<dyn WindowExpr>) -> bool {
-    !format!("{expr:?}").ends_with("filter: None }")
-}
-
-/// What the nodes removed from the input of a window did with its rows.
-#[derive(Debug, Default, Clone, Copy)]
-struct Reordering {
-    /// A `SortExec` sorted them (see [`sorts`]).
-    sorted: bool,
-    /// A `CoalescePartitionsExec` or `RepartitionExec` merged the rows of
-    /// several partitions in no particular order.
-    interleaved: bool,
-}
-
 /// `plan`, the input of a window, without the nodes that only distribute and
-/// sort its rows (see [`PhysicalWindow::try_lower`]), and what these nodes
-/// did with the order of the rows.
-fn without_distribution(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> (&Arc<dyn ExecutionPlan>, Reordering) {
+/// sort its rows (see [`PhysicalWindow::try_lower`]): sorts, merges of sorted
+/// partitions, merges of partitions and repartitionings, without a fetch, that
+/// read all partitions of their input.
+fn without_distribution(plan: &Arc<dyn ExecutionPlan>) -> &Arc<dyn ExecutionPlan> {
     let mut plan = plan;
-    let mut order = Reordering::default();
     loop {
         let next = if let Some(sort) = plan.downcast_ref::<SortExec>() {
             // A sort of all its input reads only the first partition of it.
@@ -1221,89 +974,44 @@ fn without_distribution(
             } else {
                 partitions(sort.input()) == 1
             };
-            let schema = sort.input().schema();
-            let stripped = sort.fetch().is_none()
-                && reads_all
-                && sort
-                    .expr()
-                    .iter()
-                    .all(|sort_expr| is_infallible(&sort_expr.expr, &schema));
-            order.sorted |= stripped && sorts(sort);
-            stripped.then(|| sort.input())
+            (sort.fetch().is_none() && reads_all).then(|| sort.input())
         } else if let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() {
-            let schema = merge.input().schema();
-            (merge.fetch().is_none()
-                && partitions(merge.input()) > 0
-                && merge
-                    .expr()
-                    .iter()
-                    .all(|sort_expr| is_infallible(&sort_expr.expr, &schema)))
-            .then(|| merge.input())
+            (merge.fetch().is_none() && partitions(merge.input()) > 0)
+                .then(|| merge.input())
         } else if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
-            let stripped = coalesce.fetch().is_none() && partitions(coalesce.input()) > 0;
-            order.interleaved |= stripped && partitions(coalesce.input()) > 1;
-            stripped.then(|| coalesce.input())
+            (coalesce.fetch().is_none() && partitions(coalesce.input()) > 0)
+                .then(|| coalesce.input())
         } else if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
-            let stripped = partitioning_cannot_fail(repartition)
-                && partitions(repartition.input()) > 0;
-            order.interleaved |= stripped
-                && !repartition.preserve_order()
-                && partitions(repartition.input()) > 1;
-            stripped.then(|| repartition.input())
+            (distributes_rows(repartition) && partitions(repartition.input()) > 0)
+                .then(|| repartition.input())
         } else {
             None
         };
         match next {
             Some(next) => plan = next,
-            None => return (plan, order),
+            None => return plan,
         }
     }
 }
 
-/// Whether the partitioning of `repartition` (round robin, or by the hash of
-/// expressions) cannot fail.
-fn partitioning_cannot_fail(repartition: &RepartitionExec) -> bool {
-    let schema = repartition.input().schema();
-    match repartition.partitioning() {
-        Partitioning::RoundRobinBatch(_) => true,
-        Partitioning::Hash(exprs, _) => {
-            exprs.iter().all(|expr| is_infallible(expr, &schema))
-        }
-        _ => false,
+/// Whether `plan` projects (through one or more `ProjectionExec`s) the rows
+/// of nodes that only distribute or sort them (see [`without_distribution`]).
+fn projects_distributed_rows(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut node = plan;
+    while let Some(projection) = node.downcast_ref::<ProjectionExec>() {
+        node = projection.input();
     }
+    !Arc::ptr_eq(node, plan) && !Arc::ptr_eq(without_distribution(node), node)
 }
 
-/// Whether values of `data_type` (or of its children) are dictionary encoded
-/// with keys of 8 or 16 bits, or run-end encoded with run ends of 16 bits:
-/// arrays of those hold only so many distinct values or rows, so that
-/// whether gathering rows into one array overflows them depends on which
-/// rows are gathered together.
-fn has_narrow_encoding(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::Dictionary(keys, values) => {
-            matches!(
-                keys.as_ref(),
-                DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16
-            ) || has_narrow_encoding(values)
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            run_ends.data_type() == &DataType::Int16
-                || has_narrow_encoding(values.data_type())
-        }
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => has_narrow_encoding(field.data_type()),
-        DataType::Struct(fields) => fields
-            .iter()
-            .any(|field| has_narrow_encoding(field.data_type())),
-        DataType::Union(fields, _) => fields
-            .iter()
-            .any(|(_, field)| has_narrow_encoding(field.data_type())),
-        _ => false,
-    }
+/// Whether `repartition` distributes the rows of its input over its
+/// partitions (round robin, or by the hash of expressions), which the native
+/// window does itself, by its partition keys.
+fn distributes_rows(repartition: &RepartitionExec) -> bool {
+    matches!(
+        repartition.partitioning(),
+        Partitioning::RoundRobinBatch(_) | Partitioning::Hash(_, _)
+    )
 }
 
 /// Whether values of `data_type` are unions, or have unions inside them.
@@ -1481,6 +1189,10 @@ struct BucketEmitter {
     /// Evaluated rows that were not emitted yet, in order.
     pending: VecDeque<RecordBatch>,
     pending_rows: usize,
+    /// For a window with an emit order (see [`WindowSpec::emit_order`]): the
+    /// evaluated rows of all groups, sorted by that order, once all groups
+    /// were evaluated.
+    reordered: Option<RunMerger>,
 }
 
 impl BucketEmitter {
@@ -1490,12 +1202,16 @@ impl BucketEmitter {
             next_group: 0,
             pending: VecDeque::new(),
             pending_rows: 0,
+            reordered: None,
         }
     }
 
     /// The next chunk of at most [`DEFAULT_VECTOR_SIZE`] rows, `None` once all
     /// rows of the bucket were emitted.
     fn next_chunk(&mut self, window: &PhysicalWindow) -> Result<Option<DataChunk>> {
+        if let Some(emit_order) = &window.spec.emit_order {
+            return self.next_reordered_chunk(window, emit_order);
+        }
         while self.pending_rows < DEFAULT_VECTOR_SIZE
             && self.next_group < self.bucket.groups.len()
         {
@@ -1533,12 +1249,57 @@ impl BucketEmitter {
                 break;
             }
         }
-        self.pending_rows -= len;
         let batch = match parts.as_slice() {
             [part] => part.clone(),
-            _ => concat_batches(&window.spec.schema, &parts)?,
+            _ => match concat_batches(&window.spec.schema, &parts) {
+                Ok(batch) => batch,
+                // The parts do not fit into one batch (e.g. their dictionaries
+                // need more values than their keys address): emit them one by
+                // one.
+                Err(error) if is_capacity_error(&error) => {
+                    let mut parts = parts.into_iter();
+                    let first = parts
+                        .next()
+                        .ok_or_else(|| internal_datafusion_err!("A chunk of no parts"))?;
+                    for part in parts.rev() {
+                        self.pending.push_front(part);
+                    }
+                    first
+                }
+                Err(error) => return Err(error.into()),
+            },
         };
+        self.pending_rows -= batch.num_rows();
         Ok(Some(DataChunk::from_record_batch(batch)))
+    }
+
+    /// The next chunk of the rows of a window with the emit order
+    /// `emit_order`: the rows of all groups, once evaluated, sorted by it.
+    fn next_reordered_chunk(
+        &mut self,
+        window: &PhysicalWindow,
+        emit_order: &SortKeys,
+    ) -> Result<Option<DataChunk>> {
+        if self.reordered.is_none() {
+            let mut evaluated = Vec::with_capacity(self.bucket.groups.len());
+            while self.next_group < self.bucket.groups.len() {
+                let range = self.bucket.groups[self.next_group].clone();
+                self.next_group += 1;
+                evaluated.push(window.evaluate_group(&self.bucket, range)?);
+            }
+            // The rows of the bucket are evaluated: release them.
+            self.bucket = SortedBucket::new(vec![], vec![]);
+            let schema = &window.spec.schema;
+            let runs = emit_order.sort(schema, &evaluated, None)?;
+            drop(evaluated);
+            self.reordered = Some(RunMerger::new(Arc::clone(schema), runs, None));
+        }
+        let Some(merger) = &mut self.reordered else {
+            return internal_err!("The rows of the window were not sorted");
+        };
+        Ok(merger
+            .next_batch(DEFAULT_VECTOR_SIZE)?
+            .map(DataChunk::from_record_batch))
     }
 }
 
@@ -1941,6 +1702,8 @@ mod tests {
     };
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::runtime_env::RuntimeEnv;
+    use datafusion_physical_plan::filter::FilterExec;
+    use datafusion_physical_plan::union::UnionExec;
 
     /// The number of stages of the native windows of the tree below (and
     /// including) `operator`.
@@ -2233,6 +1996,59 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_stacked_on_windows_of_other_partitions_or_orders_are_native() {
+        // DataFusion sorts or merges the rows between the windows (as for the
+        // window queries of the stress corpus that used to be left to it): the
+        // upper window is a native window over the native window of the lower
+        // one, which partitions and sorts its rows again.
+        for (sql, windows) in [
+            // A merge of the sorted partitions of the lower window, for an
+            // ordered window by its partition keys.
+            (
+                "SELECT id, a, c, RANK() OVER (PARTITION BY a ORDER BY c DESC, id) AS r, DENSE_RANK() OVER (ORDER BY a) AS dr FROM t1",
+                2,
+            ),
+            // A sort of every partition of the lower window, for an upper one of
+            // the same partitions in another order.
+            (
+                "SELECT d, id, b, NTILE(4) OVER (PARTITION BY d ORDER BY b, id) AS q, FIRST_VALUE(id) OVER (PARTITION BY d ORDER BY b DESC, id) AS f FROM t1",
+                2,
+            ),
+            (
+                "SELECT h, id, b, NTILE(4) OVER (PARTITION BY h ORDER BY b, id) AS q, LAST_VALUE(id) OVER (PARTITION BY h ORDER BY b DESC, id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS f FROM t1",
+                2,
+            ),
+            // Three windows of different partitions.
+            (
+                "SELECT id, ROW_NUMBER() OVER (PARTITION BY e ORDER BY id) AS r1, SUM(b) OVER (PARTITION BY d ORDER BY id) AS s, COUNT(*) OVER (ORDER BY id DESC) AS n FROM t1",
+                3,
+            ),
+            // A window over a window, through a projection that computes a
+            // value.
+            (
+                "SELECT id, rn, SUM(x) OVER (PARTITION BY e ORDER BY id) AS s FROM (SELECT id, e, rn, rn * 2 AS x FROM (SELECT id, e, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1))",
+                2,
+            ),
+        ] {
+            for partitions in [1, 4] {
+                let config = test_session_config().with_target_partitions(partitions);
+                let plan = physical_plan(sql, config.clone()).await;
+                let root = assert_native_parity_with_config(sql, config).await;
+                let tree = format_operator_tree(&root);
+                let context = format!(
+                    "query: {sql}\n{}\n{tree}",
+                    displayable(plan.as_ref()).indent(true)
+                );
+                assert_eq!(stages(&root), window_nodes(&plan), "{context}");
+                assert!(count::<PhysicalWindow>(&root) <= windows, "{context}");
+                if partitions == 4 {
+                    assert_eq!(count::<PhysicalWindow>(&root), windows, "{context}");
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Lowering
     // ---------------------------------------------------------------------
@@ -2259,49 +2075,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_that_differ_from_datafusion_are_left_to_it() {
+    async fn windows_over_inputs_in_any_order_are_native() {
         // DataFusion reads the rows of a sorted input in its order, ties
-        // included; the native window would sort them again.
+        // included; the native window sorts them by that order, and its peers
+        // come in any order. The functions whose values do not depend on the
+        // order of peers return DataFusion's values.
         for sql in [
-            "SELECT id, ROW_NUMBER() OVER (ORDER BY a) AS rn FROM sorted",
-            "SELECT id, LAG(id) OVER (ORDER BY a) AS prev FROM sorted",
-            "SELECT id, ROW_NUMBER() OVER () AS rn FROM sorted",
+            "SELECT id, RANK() OVER (ORDER BY a) AS r FROM sorted",
+            "SELECT id, COUNT(*) OVER (ORDER BY a) AS n FROM sorted",
+            "SELECT id, SUM(b) OVER (ORDER BY a) AS s FROM sorted",
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM sorted",
+            // Without order, any row number.
+            "SELECT ROW_NUMBER() OVER () AS rn FROM sorted",
         ] {
             let root =
                 assert_native_parity_with_setup(sql, test_session_config(), setup_sorted)
                     .await;
-            assert_eq!(count::<PhysicalWindow>(&root), 0, "query: {sql}");
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "query: {sql}");
         }
-        // With a sort, the window is native.
-        let root = assert_native_parity_with_setup(
-            "SELECT id, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM sorted",
-            test_session_config(),
-            setup_sorted,
-        )
-        .await;
+        // The row numbers of the peers of `a`, in any order: every row once,
+        // with its rank among the rows of other values of `a`.
+        let ctx = datafusion_context(test_session_config());
+        setup_sorted(&ctx).await.unwrap();
+        let sql = "SELECT id, a, ROW_NUMBER() OVER (ORDER BY a) AS rn, \
+                   RANK() OVER (ORDER BY a) AS r, COUNT(*) OVER (ORDER BY a) AS n FROM sorted";
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let root = lower(&plan).unwrap();
         assert_eq!(count::<PhysicalWindow>(&root), 1);
-        // A `BoundedWindowAggExec` over a merge of partitions emits as it reads
-        // its input.
-        assert_windows_with_config(
-            "SELECT ROW_NUMBER() OVER () AS rn FROM t1",
-            test_session_config(),
-            false,
-        )
-        .await;
+        let exec =
+            Arc::new(crate::bridge::PipelineRootExec::try_new(root, plan).unwrap());
+        let output = datafusion_physical_plan::collect(exec, ctx.task_ctx())
+            .await
+            .unwrap();
+        let mut ids = vec![];
+        let mut numbers = vec![];
+        for batch in &output {
+            let id = batch.column(0).as_primitive::<Int64Type>();
+            let rn = batch.column(2).as_primitive::<UInt64Type>();
+            let r = batch.column(3).as_primitive::<UInt64Type>();
+            let n = batch.column(4).as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                // The row number of a row is among those of its peers: from
+                // its rank to the number of rows up to its last peer.
+                let number = rn.value(row);
+                assert!(r.value(row) <= number && number <= n.value(row) as u64);
+                ids.push(id.value(row));
+                numbers.push(number);
+            }
+        }
+        ids.sort_unstable();
+        numbers.sort_unstable();
+        assert_eq!(ids, (0..5000).collect::<Vec<_>>());
+        assert_eq!(numbers, (1..=5000).collect::<Vec<_>>());
+        // A `BoundedWindowAggExec` over a merge of partitions, which emits as
+        // it reads its input in DataFusion.
+        assert_windows("SELECT ROW_NUMBER() OVER () AS rn FROM t1").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn windows_of_expressions_that_can_fail_are_native() {
         // Arguments that can fail, a `FILTER`, and an average of decimals,
-        // which fails where it does not fit its type.
+        // which fails where it does not fit its type: the native window
+        // evaluates them on whole window partitions.
         for sql in [
             "SELECT id, SUM(10 / (a + 51)) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
             "SELECT id, SUM(a) FILTER (WHERE a > 0) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
+            "SELECT id, COUNT(b) FILTER (WHERE b % 3 = 0) OVER (ORDER BY id ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS n FROM t1",
             "SELECT id, AVG(g) OVER (PARTITION BY e ORDER BY id ROWS UNBOUNDED PRECEDING) AS a FROM t1",
-        ] {
-            assert_windows_with_config(sql, test_session_config(), false).await;
-        }
-        // Infallible arithmetic stays native.
-        assert_windows(
             "SELECT id, SUM(a * 2 + 1) OVER (PARTITION BY d ORDER BY id) AS s FROM t1",
-        )
-        .await;
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY 100 / (a + 51) ORDER BY 10 / (b + 1), id) AS rn FROM t1",
+        ] {
+            assert_windows(sql).await;
+        }
     }
 
     /// A user-defined window function that returns its argument, and fails on
@@ -2441,44 +2292,78 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn user_defined_window_functions_are_left_to_datafusion() -> Result<()> {
+    async fn user_defined_window_functions_are_native() -> Result<()> {
         use crate::bridge::PipelineRootExec;
         use crate::test_utils::run_sql;
         let config = || test_session_config().with_batch_size(2);
-        // DataFusion sorts the rows, and then evaluates the functions on the
-        // sorted batches as it reads them: the limit stops it before the
-        // first value that fails. The native window would evaluate all rows
-        // of the window partition.
+        // User-defined window functions and aggregates (also under the name of
+        // one of DataFusion's) are evaluated like DataFusion's.
         for sql in [
-            "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
-            // A user-defined function registered under the name of one of
-            // DataFusion's.
-            "SELECT x, lag(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
-            "SELECT x, checked_sum(x) OVER (ORDER BY x) AS s FROM t ORDER BY x LIMIT 1",
+            "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t WHERE x < 10",
+            "SELECT x, lag(x) OVER (ORDER BY x DESC) AS c FROM t WHERE x < 10",
+            "SELECT x, checked_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) AS s FROM t WHERE x < 10",
+            "SELECT x, checked_sum(x) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS s FROM t WHERE x < 8",
         ] {
             let root =
                 assert_native_parity_with_setup(sql, config(), checked_setup).await;
-            assert_eq!(count::<PhysicalWindow>(&root), 0, "query: {sql}");
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "query: {sql}");
         }
-        // Without a limit, both fail.
-        for sql in [
-            "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t",
-            "SELECT x, checked_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) AS s FROM t",
+        // DataFusion sorts the rows, and then evaluates the functions on the
+        // sorted batches as it reads them: the limit stops it before the first
+        // value that fails. The native window evaluates all rows of the window
+        // partition it reads, and may fail: whether an error is raised for rows
+        // beyond a limit is the engine's own. Without a limit, both fail.
+        for (sql, datafusion_fails) in [
+            (
+                "SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
+                false,
+            ),
+            (
+                "SELECT x, lag(x) OVER (ORDER BY x) AS c FROM t ORDER BY x LIMIT 1",
+                false,
+            ),
+            (
+                "SELECT x, checked_sum(x) OVER (ORDER BY x) AS s FROM t ORDER BY x LIMIT 1",
+                false,
+            ),
+            ("SELECT x, checked(x) OVER (ORDER BY x) AS c FROM t", true),
+            (
+                "SELECT x, checked_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) AS s FROM t",
+                true,
+            ),
         ] {
             let ctx = datafusion_context(config());
             checked_setup(&ctx).await?;
-            let error = run_sql(&ctx, sql).await.expect_err("DataFusion fails");
-            assert!(error.to_string().contains(CHECKED_FAILURE), "{error}");
+            let expected = run_sql(&ctx, sql).await;
+            assert_eq!(expected.is_err(), datafusion_fails, "query: {sql}");
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let root = lower(&plan)?;
-            assert_eq!(count::<PhysicalWindow>(&root), 0, "query: {sql}");
-            let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
-            let error = datafusion_physical_plan::collect(exec, ctx.task_ctx())
-                .await
-                .expect_err("the pipeline engine fails");
-            assert!(error.to_string().contains(CHECKED_FAILURE), "{error}");
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "query: {sql}");
+            let exec: Arc<dyn ExecutionPlan> =
+                Arc::new(PipelineRootExec::try_new(root, plan)?);
+            let actual =
+                datafusion_physical_plan::collect(Arc::clone(&exec), ctx.task_ctx())
+                    .await;
+            match (expected, actual) {
+                (Ok(expected), Ok(batches)) => {
+                    let actual = crate::test_utils::EngineOutput {
+                        schema: exec.schema(),
+                        plan: exec,
+                        batches,
+                        ordered: expected.ordered,
+                    };
+                    let compared = crate::test_utils::compare_outputs(&expected, &actual);
+                    assert!(compared.is_ok(), "query: {sql}: {compared:?}");
+                }
+                (_, Err(error)) => {
+                    assert!(error.to_string().contains(CHECKED_FAILURE), "{error}");
+                }
+                (Err(error), Ok(_)) => {
+                    panic!("query: {sql}: only DataFusion fails: {error}")
+                }
+            }
         }
-        // DataFusion's functions stay native, also with these batches.
+        // DataFusion's functions, also with these batches.
         let root = assert_native_parity_with_setup(
             "SELECT x, row_number() OVER (ORDER BY x) AS r, sum(x) OVER (ORDER BY x) AS s FROM t ORDER BY x LIMIT 3",
             config(),
@@ -2489,51 +2374,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn datafusion_functions_that_cannot_fail_are_recognized() {
-        // All of DataFusion's window functions only fail on invalid literal
-        // arguments.
-        for udwf in datafusion::functions_window::all_default_window_functions() {
-            assert!(
-                is_builtin(udwf.name(), udwf.inner(), &INFALLIBLE_WINDOW_FUNCTIONS),
-                "{}",
-                udwf.name()
-            );
-        }
-        let aggregates =
-            datafusion::functions_aggregate::all_default_aggregate_functions();
-        let recognized = aggregates
-            .iter()
-            .filter(|udaf| {
-                is_builtin(udaf.name(), udaf.inner(), &INFALLIBLE_AGGREGATE_FUNCTIONS)
-            })
-            .map(|udaf| udaf.name())
-            .collect::<Vec<_>>();
-        let mut expected = INFALLIBLE_AGGREGATE_FUNCTIONS
-            .map(|(name, _)| name)
-            .to_vec();
-        expected.sort_unstable();
-        let mut recognized = recognized;
-        recognized.sort_unstable();
-        assert_eq!(recognized, expected);
-        assert!(
-            aggregates
-                .iter()
-                .any(|udaf| { is_builtin(udaf.name(), udaf.inner(), &[("avg", "Avg")]) })
-        );
-        // Other functions under these names are not.
-        for name in ["row_number", "lag", "nth_value"] {
-            let udwf = Checked::udwf(name);
-            assert!(!is_builtin(
-                name,
-                udwf.inner(),
-                &INFALLIBLE_WINDOW_FUNCTIONS
-            ));
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn narrow_dictionaries_are_left_to_datafusion() {
+    async fn narrow_dictionaries_are_native() {
         let setup = async |ctx: &SessionContext| {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Int64, false),
@@ -2569,13 +2411,14 @@ mod tests {
             ctx.register_table("dict", Arc::new(MemTable::try_new(schema, partitions)?))?;
             Ok(())
         };
-        let root = assert_native_parity_with_setup(
+        for sql in [
             "SELECT id, s, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM dict",
-            test_session_config(),
-            setup,
-        )
-        .await;
-        assert_eq!(count::<PhysicalWindow>(&root), 0);
+            "SELECT id, s, FIRST_VALUE(s) OVER (PARTITION BY id % 3 ORDER BY id) AS f FROM dict",
+        ] {
+            let root =
+                assert_native_parity_with_setup(sql, test_session_config(), setup).await;
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "query: {sql}");
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -2911,19 +2754,35 @@ mod tests {
             assert_eq!(count::<PhysicalWindow>(&root), 1, "{mode:?}");
         }
         // In a single partition, the rows are emitted in the order of the
-        // input: the native window does not reproduce it if it does not start
-        // with the partition keys.
-        for (mode, keys, native) in [
-            (Some(InputOrderMode::Sorted), vec!["d", "id"], 1),
-            (Some(InputOrderMode::Linear), vec!["id"], 0),
+        // input, also if it does not start with the partition keys: the native
+        // window sorts the rows it evaluated again, by the order of its input.
+        for (mode, keys) in [
+            (Some(InputOrderMode::Sorted), vec!["d", "id"]),
+            (Some(InputOrderMode::Linear), vec!["id"]),
+            (None, vec!["d", "id"]),
         ] {
             let make = || {
                 let coalesced = Arc::new(CoalescePartitionsExec::new(t1_scan()?));
                 row_number_plan(sort_exec(coalesced, &keys, false)?, mode.clone())
             };
             let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), true).await;
-            assert_eq!(count::<PhysicalWindow>(&root), native, "{mode:?}");
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "{mode:?}");
         }
+        // Also in an order of other keys, under a limit, which takes the rows
+        // of that order.
+        let make = || {
+            let coalesced = Arc::new(CoalescePartitionsExec::new(t1_scan()?));
+            let sorted = sort_exec(coalesced, &["e", "id"], false)?;
+            let window = row_number_plan(sorted, Some(InputOrderMode::Linear))?;
+            let limit = datafusion_physical_plan::limit::GlobalLimitExec::new(
+                window,
+                10,
+                Some(25),
+            );
+            Ok::<_, DataFusionError>(Arc::new(limit) as Arc<dyn ExecutionPlan>)
+        };
+        let root = assert_lowered_plan_byte_eq(make, lower, task_ctx(), true).await;
+        assert_eq!(count::<PhysicalWindow>(&root), 1);
         Ok(())
     }
 
@@ -3202,7 +3061,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn streaming_windows_are_left_to_datafusion() -> Result<()> {
+    async fn windows_over_streams_that_never_end_are_left_to_datafusion() -> Result<()> {
         use crate::bridge::PipelineRootExec;
         use datafusion_physical_plan::InputOrderMode;
         use datafusion_physical_plan::limit::GlobalLimitExec;
@@ -3213,7 +3072,9 @@ mod tests {
         // `BoundedWindowAggExec` emits rows as it reads its input: over a
         // repartitioning or a merge of partitions in no particular order, and
         // over a sort of an input that is sorted already, which DataFusion
-        // passes through.
+        // passes through. Over inputs that never end, the native window, which
+        // reads all of its input first, would emit nothing: such windows are
+        // left to DataFusion. Over finite inputs, they are native.
         let plans = |fail: bool| -> Result<Vec<Arc<dyn ExecutionPlan>>> {
             let repartitioned = Arc::new(RepartitionExec::try_new(
                 one_batch_stream(2, fail, false)?,
@@ -3282,9 +3143,11 @@ mod tests {
             Arc::new(GlobalLimitExec::new(merged, 0, Some(1)))
         };
         for (index, (expected_plan, plan)) in pairs(true)?.enumerate() {
-            // An input that fails after its first batch: under a limit,
+            // A finite input that fails after its first batch: under a limit,
             // DataFusion returns a row of the first batch (or fails, over a
             // repartitioning, as `InputOrderMode::Linear` waits for more rows).
+            // The native window reads all of its input, and fails: whether an
+            // error is raised for rows beyond a limit is the engine's own.
             let rows = |batches: Vec<RecordBatch>| {
                 batches.iter().map(RecordBatch::num_rows).sum::<usize>()
             };
@@ -3292,25 +3155,26 @@ mod tests {
                 datafusion_physical_plan::collect(limited(expected_plan), task_ctx())
                     .await
                     .map(rows);
+            match &expected {
+                Ok(rows) => assert_eq!(*rows, 1, "plan {index}"),
+                Err(error) => {
+                    assert_eq!(index, 0);
+                    assert!(error.to_string().contains(STREAM_FAILURE));
+                }
+            }
             let plan = limited(plan);
             let root = lower(&plan)?;
-            assert_eq!(count::<PhysicalWindow>(&root), 0, "plan {index}");
+            assert_eq!(count::<PhysicalWindow>(&root), 1, "plan {index}");
             let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
-            let actual = datafusion_physical_plan::collect(exec, task_ctx())
+            let error = datafusion_physical_plan::collect(exec, task_ctx())
                 .await
-                .map(rows);
-            match (expected, actual) {
-                (Ok(expected), Ok(actual)) => assert_eq!((expected, actual), (1, 1)),
-                (Err(expected), Err(actual)) if index == 0 => {
-                    assert!(expected.to_string().contains(STREAM_FAILURE));
-                    assert!(actual.to_string().contains(STREAM_FAILURE));
-                }
-                outcomes => panic!("plan {index}: {outcomes:?}"),
-            }
+                .expect_err("the native window reads all of its input");
+            assert!(error.to_string().contains(STREAM_FAILURE), "plan {index}");
         }
         // A merge of sorted partitions that preserves their order waits for
-        // the first rows of all of them: the window is native, and emits
-        // nothing while an input of the sorts does not end, like DataFusion's.
+        // the first rows of all of them: DataFusion's window emits nothing
+        // while an input of the sorts does not end (an input that never ends
+        // is left to DataFusion).
         let merged = |input| -> Result<Arc<dyn ExecutionPlan>> {
             let union = sorted_union(input)?;
             let ordering = union.output_ordering().cloned().unwrap();
@@ -3325,7 +3189,7 @@ mod tests {
         assert!(emits_nothing(expected_plan, task_ctx()).await);
         let plan = merged(one_batch_stream(1, false, false)?)?;
         let root = lower(&plan)?;
-        assert_eq!(count::<PhysicalWindow>(&root), 1);
+        assert_eq!(count::<PhysicalWindow>(&root), 0);
         let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
         assert!(emits_nothing(exec, task_ctx()).await);
         // ... and over finite inputs, it returns the rows of DataFusion's.
@@ -3382,8 +3246,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_over_partitions_that_end_early_are_left_to_datafusion() -> Result<()>
-    {
+    async fn windows_over_partitions_that_end_early_are_native_over_finite_inputs()
+    -> Result<()> {
         use crate::bridge::PipelineRootExec;
         use datafusion_physical_plan::limit::GlobalLimitExec;
         let task_ctx = || {
@@ -3393,8 +3257,10 @@ mod tests {
         // repartitioning by `v`: the filter ends a partition once it emitted
         // its row, whether the other partition ended or not. The only batch
         // of the input has rows with `v = 1` only, in one partition, so that
-        // the window emits that row while the other partition waits for the
-        // input, which never ends or fails later.
+        // DataFusion's window emits that row while the other partition waits
+        // for the input, which never ends or fails later: such inputs are left
+        // to DataFusion. Over a finite input, the window is native, with or
+        // without the fetch.
         let window = |input: Arc<dyn ExecutionPlan>, fetch, bounded| {
             let schema = input.schema();
             let v = col("v", &schema)?;
@@ -3437,21 +3303,23 @@ mod tests {
                 let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
                 assert_eq!(rows(exec).await, expected, "{tail:?}");
             }
-            // Without a fetch, every partition of the filter reads all of its
-            // partition of the repartitioning: the window is native, and
-            // returns DataFusion's rows.
-            let finite = || {
-                let batch = values_chunk((0..300).map(|v| v % 50)).into_record_batch()?;
-                let scan = MemorySourceConfig::try_new_exec(
-                    &[vec![batch]],
-                    values_schema(),
-                    None,
-                )?;
-                window(scan, None, bounded)
-            };
-            let root =
-                assert_lowered_plan_byte_eq(finite, lower, task_ctx(), false).await;
-            assert_eq!(count::<PhysicalWindow>(&root), 1);
+            // Over a finite input, the window is native, and returns
+            // DataFusion's rows.
+            for fetch in [None, Some(1000)] {
+                let finite = || {
+                    let batch =
+                        values_chunk((0..300).map(|v| v % 50)).into_record_batch()?;
+                    let scan = MemorySourceConfig::try_new_exec(
+                        &[vec![batch]],
+                        values_schema(),
+                        None,
+                    )?;
+                    window(scan, fetch, bounded)
+                };
+                let root =
+                    assert_lowered_plan_byte_eq(finite, lower, task_ctx(), false).await;
+                assert_eq!(count::<PhysicalWindow>(&root), 1, "fetch {fetch:?}");
+            }
         }
         Ok(())
     }
@@ -3506,12 +3374,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_of_independent_partitions_are_left_to_datafusion() {
+    async fn windows_of_independent_partitions_are_native() {
         // A `Partitioned` hash join emits its rows partitioned by its keys, so
         // the window by these keys sorts every partition of the join without
-        // repartitioning it: every window partition reads the rows of its
-        // partition of the join only, and could emit them while another one
-        // waits for its input.
+        // repartitioning it: in DataFusion, every window partition reads the
+        // rows of its partition of the join only, and may emit them while
+        // another one waits for its input. The native window reads all of its
+        // (finite) input first, and returns the same rows.
         let mut config = test_session_config();
         let optimizer = &mut config.options_mut().optimizer;
         optimizer.hash_join_single_partition_threshold = 0;
@@ -3519,7 +3388,7 @@ mod tests {
         assert_windows_with_config(
             "SELECT t1.id, ROW_NUMBER() OVER (PARTITION BY t1.a ORDER BY t1.id, t2.name, t2.w) AS rn FROM t1 JOIN t2 ON t1.a = t2.k",
             config,
-            false,
+            true,
         )
         .await;
         // Over a repartitioning (through a projection), the window is native.
