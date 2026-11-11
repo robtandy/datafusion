@@ -34,12 +34,16 @@
 //! 3. the rows are the same:
 //!    * as a multiset if the query has no top-level `ORDER BY` (see
 //!      [`has_top_level_order_by`]);
-//!    * in order if it has one, except that the rows that tie on the
-//!      `ORDER BY` keys may come in any order among themselves. Under
-//!      `ORDER BY … LIMIT`, if the `LIMIT` cuts some of the rows that tie
-//!      with the last row, the last rows may be any of the rows that tie
-//!      with it, with their multiplicities; the same holds for the first
-//!      rows and the `OFFSET`;
+//!    * in order if it has one: the result must be the rows that the query
+//!      returns from an order of all its rows in which a row is only out of
+//!      DataFusion's order relative to rows that it ties with. Rows tie if
+//!      their `ORDER BY` keys are equal, floating-point keys within twice the
+//!      tolerance (as the keys of each engine may be off by the tolerance).
+//!      Ties are not transitive: rows that tie with a row may not tie with
+//!      each other. So rows that tie may come in any order among themselves,
+//!      and under `ORDER BY … LIMIT`, the last rows may be other rows that
+//!      tie with them (with their multiplicities), as may, under `OFFSET`,
+//!      the first rows;
 //!    * their values are compared by meaning, not by representation: batch
 //!      boundaries, dictionary and run-end encoding, views, offsets and the
 //!      bytes under nulls do not matter;
@@ -47,18 +51,19 @@
 //!      are equal within a relative tolerance:
 //!      [`ComparisonOptions::DEFAULT_FLOAT_TOLERANCE`] (`1e-9`) by default,
 //!      see [`ComparisonOptions::with_float_tolerance`]. `NaN` equals `NaN`
-//!      and `-0.0` equals `0.0`, but `NULL` only equals `NULL`. `ORDER BY`
-//!      keys that are equal within twice the tolerance tie, as the keys of
-//!      each engine may be off by the tolerance.
+//!      and `-0.0` equals `0.0`, but `NULL` only equals `NULL`.
 //!
 //! To know which rows tie and which rows `LIMIT` and `OFFSET` cut, DataFusion
 //! also runs the query without its `LIMIT` and `OFFSET`, with the values of
 //! its `ORDER BY` keys after its output columns (also of the keys that the
 //! query does not select), and both results are compared with these sorted
-//! rows, its [`SortedReference`] (see [`result_order`]). The rows that tie on
-//! the keys before a volatile key (e.g. `random()`) may come in any order. If
-//! the sorted rows cannot be computed (e.g. for a `LIMIT` that is not a
-//! literal), the rows are compared in their exact order.
+//! rows, its [`SortedReference`] (see [`result_order`]). The keys from the
+//! first key whose values depend on a volatile function (e.g. `random()`,
+//! also through the columns of a subquery) are not compared, as their values
+//! change from one run to the next: the rows that tie on the keys before it
+//! may come in any order. If the sorted rows cannot be computed (e.g. for a
+//! `LIMIT` that is not a constant), the rows are compared in their exact
+//! order.
 //!
 //! Queries must still define their results: no `LIMIT` without `ORDER BY`,
 //! and no aggregates that depend on the order of their input without an
@@ -119,7 +124,7 @@
 //! mod test_utils;
 //! ```
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -140,17 +145,18 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_row::{RowConverter, SortField};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
-use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, internal_err, not_impl_err,
+    Column, DFSchema, DataFusionError, Result, ScalarValue, internal_err, not_impl_err,
 };
 use datafusion_expr::logical_plan::{
-    FetchType, Projection, SkipType, Sort, SubqueryAlias,
+    Distinct, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
 };
-use datafusion_expr::{Expr, LogicalPlan};
+use datafusion_expr::{ColumnarValue, Expr, LogicalPlan};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
 
@@ -783,9 +789,10 @@ pub struct SortedReference {
     /// The number of output columns of `batches`.
     pub columns: usize,
     /// The `ORDER BY` keys whose values follow the output columns
-    /// (displayed): all of them, up to the first volatile key (e.g.
-    /// `random()`), as the rows that tie on the keys before it may come in
-    /// any order.
+    /// (displayed): all of them, up to the first key whose values depend on
+    /// a volatile function (e.g. `random()`, also through the columns of a
+    /// subquery), as the rows that tie on the keys before it may come in any
+    /// order.
     pub keys: Vec<String>,
     /// The number of sorted rows that the query skips (`OFFSET`).
     pub skip: usize,
@@ -811,7 +818,7 @@ async fn sorted_reference(
     ctx: &SessionContext,
     plan: &LogicalPlan,
 ) -> Result<SortedReference> {
-    let (reference, keys, window) = reference_plan(plan)?;
+    let (reference, keys, window) = reference_plan(plan, &ctx.state())?;
     let output = plan.schema().fields();
     let fields = reference.schema().fields();
     if fields.len() != output.len() + keys.len()
@@ -865,20 +872,27 @@ fn key_column(i: usize) -> String {
 /// `ORDER BY` (see [`has_top_level_order_by`]): `plan` without the limits
 /// above its top-level sort, with the values of the `ORDER BY` keys after its
 /// output columns. Also returns the keys (displayed), and the window of the
-/// sorted rows that `plan` returns.
-fn reference_plan(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<String>, Window)> {
+/// sorted rows that `plan` returns. `state` evaluates the expressions of the
+/// limits.
+fn reference_plan(
+    plan: &LogicalPlan,
+    state: &SessionState,
+) -> Result<(LogicalPlan, Vec<String>, Window)> {
     match plan {
         LogicalPlan::Sort(sort) => {
-            // The values of a volatile key cannot be computed again.
+            // The values of a key that depends on a volatile function, also
+            // through the columns of the input of the sort (e.g. `r` in
+            // `SELECT r FROM (SELECT random() AS r) ORDER BY r`), cannot be
+            // computed again.
+            let volatile = volatile_columns(&sort.input);
+            let schema = sort.input.schema();
             let keys = sort
                 .expr
                 .iter()
                 .map(|sort_expr| &sort_expr.expr)
-                .take_while(|key| !key.is_volatile())
+                .take_while(|key| !depends_on_volatile(key, schema, &volatile))
                 .collect::<Vec<_>>();
-            let mut exprs = sort
-                .input
-                .schema()
+            let mut exprs = schema
                 .columns()
                 .into_iter()
                 .map(Expr::Column)
@@ -902,21 +916,34 @@ fn reference_plan(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<String>, Windo
             Ok((sorted, keys, window))
         }
         LogicalPlan::Limit(limit) => {
-            let (input, keys, window) = reference_plan(&limit.input)?;
+            let (input, keys, window) = reference_plan(&limit.input, state)?;
+            // The limits may be constant expressions, e.g. `LIMIT 1 + 1`.
+            let evaluate = |expr: &Option<Box<Expr>>| {
+                expr.as_deref()
+                    .map(|expr| {
+                        Ok::<_, DataFusionError>(Box::new(constant(state, expr)?))
+                    })
+                    .transpose()
+            };
+            let limit = Limit {
+                skip: evaluate(&limit.skip)?,
+                fetch: evaluate(&limit.fetch)?,
+                input: Arc::clone(&limit.input),
+            };
             let (SkipType::Literal(skip), FetchType::Literal(fetch)) =
                 (limit.get_skip_type()?, limit.get_fetch_type()?)
             else {
-                return not_impl_err!("a LIMIT or an OFFSET that is not a literal");
+                return not_impl_err!("a LIMIT or an OFFSET that is not a constant");
             };
             Ok((input, keys, window.then(skip, fetch)))
         }
         LogicalPlan::SubqueryAlias(alias) => {
-            let (input, keys, window) = reference_plan(&alias.input)?;
+            let (input, keys, window) = reference_plan(&alias.input, state)?;
             let alias = SubqueryAlias::try_new(Arc::new(input), alias.alias.clone())?;
             Ok((LogicalPlan::SubqueryAlias(alias), keys, window))
         }
         LogicalPlan::Projection(projection) => {
-            let (input, keys, window) = reference_plan(&projection.input)?;
+            let (input, keys, window) = reference_plan(&projection.input, state)?;
             let mut exprs = projection.expr.clone();
             for i in 0..keys.len() {
                 let (qualifier, field) = input
@@ -929,6 +956,145 @@ fn reference_plan(plan: &LogicalPlan) -> Result<(LogicalPlan, Vec<String>, Windo
         }
         _ => internal_err!("the query has no top-level ORDER BY"),
     }
+}
+
+/// The value of `expr`, a constant expression, evaluated by `state`, as an
+/// `Int64` literal.
+fn constant(state: &SessionState, expr: &Expr) -> Result<Expr> {
+    if let Expr::Literal(ScalarValue::Int64(_), _) = expr {
+        return Ok(expr.clone());
+    }
+    let expr = state.create_physical_expr(expr.clone(), &DFSchema::empty())?;
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
+    let batch =
+        RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)?;
+    let value = match expr.evaluate(&batch)? {
+        ColumnarValue::Scalar(value) => value,
+        ColumnarValue::Array(array) => ScalarValue::try_from_array(array.as_ref(), 0)?,
+    };
+    Ok(Expr::Literal(value.cast_to(&DataType::Int64)?, None))
+}
+
+/// Whether the values of each output column of `plan` depend on a volatile
+/// function (e.g. `random()`): running `plan` again may give other values.
+fn volatile_columns(plan: &LogicalPlan) -> Vec<bool> {
+    let width = plan.schema().fields().len();
+    let columns = match plan {
+        LogicalPlan::Projection(projection) => {
+            let (input, schema) = (
+                volatile_columns(&projection.input),
+                projection.input.schema(),
+            );
+            projection
+                .expr
+                .iter()
+                .map(|expr| depends_on_volatile(expr, schema, &input))
+                .collect()
+        }
+        LogicalPlan::SubqueryAlias(alias) => volatile_columns(&alias.input),
+        LogicalPlan::Aggregate(aggregate) => {
+            let (input, schema) =
+                (volatile_columns(&aggregate.input), aggregate.input.schema());
+            aggregate
+                .group_expr
+                .iter()
+                .chain(&aggregate.aggr_expr)
+                .map(|expr| depends_on_volatile(expr, schema, &input))
+                .collect()
+        }
+        LogicalPlan::Window(window) => {
+            let (input, schema) =
+                (volatile_columns(&window.input), window.input.schema());
+            let window_columns = window
+                .window_expr
+                .iter()
+                .map(|expr| depends_on_volatile(expr, schema, &input))
+                .collect::<Vec<_>>();
+            input.into_iter().chain(window_columns).collect()
+        }
+        LogicalPlan::Union(union) => {
+            let inputs = union
+                .inputs
+                .iter()
+                .map(|input| volatile_columns(input))
+                .collect::<Vec<_>>();
+            (0..width)
+                .map(|i| inputs.iter().any(|input| input.get(i).is_none_or(|&v| v)))
+                .collect()
+        }
+        // Nodes whose output columns are columns of their inputs.
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Repartition(_)
+        | LogicalPlan::Distinct(Distinct::All(_))
+        | LogicalPlan::Join(_) => {
+            let inputs = plan
+                .inputs()
+                .into_iter()
+                .map(|input| (input.schema(), volatile_columns(input)))
+                .collect::<Vec<_>>();
+            plan.schema()
+                .iter()
+                .map(|(qualifier, field)| {
+                    let column = Column::new(qualifier.cloned(), field.name());
+                    inputs
+                        .iter()
+                        .find_map(|(schema, volatile)| {
+                            schema.maybe_index_of_column(&column).map(|i| volatile[i])
+                        })
+                        .unwrap_or(true)
+                })
+                .collect()
+        }
+        LogicalPlan::TableScan(_) | LogicalPlan::EmptyRelation(_) => vec![false; width],
+        _ => vec![has_volatile_expressions(plan); width],
+    };
+    if columns.len() == width {
+        columns
+    } else {
+        vec![has_volatile_expressions(plan); width]
+    }
+}
+
+/// Whether the values of `expr` over rows of `schema`, whose columns are
+/// `volatile` (see [`volatile_columns`]), depend on a volatile function.
+fn depends_on_volatile(expr: &Expr, schema: &DFSchema, volatile: &[bool]) -> bool {
+    calls_volatile_function(expr)
+        || expr.column_refs().into_iter().any(|column| {
+            schema
+                .maybe_index_of_column(column)
+                .is_none_or(|i| volatile[i])
+        })
+}
+
+/// Whether `expr` calls a volatile function, also in its subqueries.
+fn calls_volatile_function(expr: &Expr) -> bool {
+    expr.exists(|expr| {
+        Ok(expr.is_volatile_node()
+            || match expr {
+                Expr::ScalarSubquery(subquery) => {
+                    has_volatile_expressions(&subquery.subquery)
+                }
+                Expr::Exists(exists) => {
+                    has_volatile_expressions(&exists.subquery.subquery)
+                }
+                Expr::InSubquery(in_subquery) => {
+                    has_volatile_expressions(&in_subquery.subquery.subquery)
+                }
+                Expr::SetComparison(comparison) => {
+                    has_volatile_expressions(&comparison.subquery.subquery)
+                }
+                _ => false,
+            })
+    })
+    .unwrap_or(true)
+}
+
+/// Whether an expression of `plan` or of its inputs calls a volatile function.
+fn has_volatile_expressions(plan: &LogicalPlan) -> bool {
+    plan.exists(|node| Ok(node.expressions().iter().any(calls_volatile_function)))
+        .unwrap_or(true)
 }
 
 /// Compare the output of DataFusion (`expected`) with the output of the
@@ -992,7 +1158,7 @@ pub fn compare_results(
                 ));
             }
             let sorted = reference
-                .reference_rows(2.0 * tolerance)
+                .sorted_rows()
                 .map_err(|e| format!("cannot read the sorted reference: {e}"))?;
             let names = (columns.as_str(), reference.keys.join(", "));
             let names = (names.0, names.1.as_str());
@@ -1101,25 +1267,20 @@ fn schema_difference(expected: &Schema, actual: &Schema) -> String {
     )
 }
 
-/// The rows of a [`SortedReference`] that results are compared with.
-struct ReferenceRows {
-    /// The output columns of the sorted rows that the query returns.
-    rows: Vec<Row>,
-    /// The values of the keys of these rows.
-    keys: Vec<Row>,
-    /// The output columns of the sorted rows that tie with the first row
-    /// that the query returns, if the `OFFSET` skips some of them: the first
-    /// rows of a result may be any of them.
-    first_ties: Option<Vec<Row>>,
-    /// The same for the last row that the query returns, if the `LIMIT` cuts
-    /// some of the rows that tie with it.
-    last_ties: Option<Vec<Row>>,
+/// The rows of a [`SortedReference`], read for comparisons.
+struct SortedRows {
+    /// The output columns of all sorted rows.
+    values: Vec<Row>,
+    /// The classes of the sorted rows: the ranges of rows whose keys are
+    /// exactly equal, and their keys.
+    classes: Vec<(Range<usize>, Row)>,
+    /// The sorted rows that the query returns.
+    window: Range<usize>,
 }
 
 impl SortedReference {
-    /// The rows that results are compared with, where keys that are equal
-    /// within `tie_tolerance` tie.
-    fn reference_rows(&self, tie_tolerance: f64) -> Result<ReferenceRows> {
+    /// All sorted rows, in classes of rows whose keys are exactly equal.
+    fn sorted_rows(&self) -> Result<SortedRows> {
         let width = self.columns + self.keys.len();
         if let Some(batch) = self
             .batches
@@ -1131,182 +1292,264 @@ impl SortedReference {
                 batch.num_columns()
             );
         }
-        let sorted = BatchRows::new(&self.batches);
-        let (values, keys) = (0..self.columns, self.columns..width);
-        let len = sorted.len();
+        let row = |batch: &RecordBatch, row: usize, columns: Range<usize>| {
+            columns
+                .map(|column| Value::try_new(batch.column(column).as_ref(), row))
+                .collect::<Result<Row>>()
+        };
+        let mut values = vec![];
+        let mut classes: Vec<(Range<usize>, Row)> = vec![];
+        for batch in &self.batches {
+            for i in 0..batch.num_rows() {
+                let keys = row(batch, i, self.columns..width)?;
+                let position = values.len();
+                match classes.last_mut() {
+                    Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
+                        range.end = position + 1;
+                    }
+                    _ => classes.push((position..position + 1, keys)),
+                }
+                values.push(row(batch, i, 0..self.columns)?);
+            }
+        }
+        let len = values.len();
         let start = self.skip.min(len);
         let end = self
             .fetch
             .map_or(len, |fetch| start.saturating_add(fetch).min(len));
-        let ties = |a: usize, b: usize| -> Result<bool> {
-            let (a, b) = (sorted.row(a, keys.clone())?, sorted.row(b, keys.clone())?);
-            Ok(rows_equal(&a, &b, tie_tolerance))
-        };
-        // The output columns of the sorted rows that tie with `row`.
-        let group = |row: usize| -> Result<Vec<Row>> {
-            let (mut first, mut last) = (row, row);
-            while first > 0 && ties(first - 1, first)? {
-                first -= 1;
-            }
-            while last + 1 < len && ties(last, last + 1)? {
-                last += 1;
-            }
-            (first..=last)
-                .map(|row| sorted.row(row, values.clone()))
-                .collect()
-        };
-        let skips_ties = start > 0 && start < end && ties(start - 1, start)?;
-        let cuts_ties = start < end && end < len && ties(end - 1, end)?;
-        Ok(ReferenceRows {
-            rows: (start..end)
-                .map(|row| sorted.row(row, values.clone()))
-                .collect::<Result<_>>()?,
-            keys: (start..end)
-                .map(|row| sorted.row(row, keys.clone()))
-                .collect::<Result<_>>()?,
-            first_ties: skips_ties.then(|| group(start)).transpose()?,
-            last_ties: cuts_ties.then(|| group(end - 1)).transpose()?,
+        Ok(SortedRows {
+            values,
+            classes,
+            window: start..end,
         })
     }
 }
 
-/// Random access to the rows of batches.
-struct BatchRows<'a> {
-    batches: &'a [RecordBatch],
-    /// The number of rows of the batches up to each batch (included).
-    ends: Vec<usize>,
+/// The sorted rows of one [`Shape`], by class, and the rows of a result
+/// assigned to each of these classes.
+#[derive(Default)]
+struct ShapeClasses {
+    /// The classes with rows of the shape, in their order, and these rows.
+    classes: Vec<(usize, Vec<usize>)>,
+    /// The rows of the result assigned to each class.
+    assigned: Vec<Vec<usize>>,
+    /// The first class with rows that are not assigned yet.
+    first_open: usize,
 }
 
-impl<'a> BatchRows<'a> {
-    fn new(batches: &'a [RecordBatch]) -> Self {
-        let mut end = 0;
-        let ends = batches
-            .iter()
-            .map(|batch| {
-                end += batch.num_rows();
-                end
-            })
-            .collect();
-        Self { batches, ends }
-    }
-
-    fn len(&self) -> usize {
-        self.ends.last().copied().unwrap_or(0)
-    }
-
-    /// The values of the columns `columns` of row `row`.
-    fn row(&self, row: usize, columns: Range<usize>) -> Result<Row> {
-        let batch = self.ends.partition_point(|&end| end <= row);
-        let first = batch
-            .checked_sub(1)
-            .map_or(0, |previous| self.ends[previous]);
-        let batch = &self.batches[batch];
-        columns
-            .map(|column| Value::try_new(batch.column(column).as_ref(), row - first))
-            .collect()
-    }
-}
-
-/// Compare the rows `result` of `names.1` with the rows `reference` of the
-/// sorted reference `names.0`, see [`ResultOrder::Sorted`]: the rows that tie
-/// on the keys of the reference may come in any order among themselves, and
-/// the rows that tie with a row that the `LIMIT` or the `OFFSET` cuts next to
-/// may be any of the sorted rows that tie with it.
+/// Compare the rows `result` of `names.1` with the sorted rows of `names.0`,
+/// see [`ResultOrder::Sorted`]: `result` must be the rows that the query
+/// returns from an order of all sorted rows in which rows are only out of
+/// their sorted order relative to rows that they tie with.
+///
+/// The rows of `result` are assigned, in order, to the first class of sorted
+/// rows with their values that keeps `result` in order. Then the rows that
+/// the `OFFSET` skips (the first sorted rows that `result` does not have)
+/// must not be ordered after rows of `result` that they do not tie with, nor
+/// the rows that the `LIMIT` cuts before them.
 fn compare_sorted(
     (reference_name, result_name): (&str, &str),
     result: &[Row],
-    reference: &ReferenceRows,
+    sorted: &SortedRows,
     (columns, keys): (&str, &str),
     tolerance: f64,
 ) -> std::result::Result<(), String> {
-    if result.len() != reference.rows.len() {
+    let window = sorted.window.clone();
+    if result.len() != window.len() {
         return Err(format!(
-            "{result_name} returned {}, but the query returns {} of {reference_name}",
+            "{result_name} returned {}, but the query returns {} of the sorted rows of \
+             {reference_name}",
             count_rows(result.len()),
-            count_rows(reference.rows.len())
+            count_rows(window.len())
         ));
     }
-    let (ordering, on_keys) = if keys.is_empty() {
-        (
-            "the first ORDER BY key is volatile, so the rows may come in any order"
-                .to_string(),
-            "on the ORDER BY keys, the first of which is volatile".to_string(),
-        )
+    // The keys of each engine may be off by the tolerance. Ties are not
+    // transitive: two rows that tie with a row may not tie with each other.
+    let tie_tolerance = 2.0 * tolerance;
+    let ties = |a: usize, b: usize| {
+        a == b || rows_equal(&sorted.classes[a].1, &sorted.classes[b].1, tie_tolerance)
+    };
+    let display = |row: &Row| {
+        row.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let rule = if keys.is_empty() {
+        "all rows tie, as the first ORDER BY key is volatile".to_string()
     } else {
-        (
-            format!(
-                "the result is ordered by ({keys}), rows that tie on these keys may \
-                 come in any order"
-            ),
-            format!("on the ORDER BY keys ({keys})"),
+        format!(
+            "rows tie if their ORDER BY keys ({keys}) are equal, floating-point keys \
+             within twice the tolerance"
         )
     };
-    let runs = tie_runs(&reference.keys, 2.0 * tolerance);
-    let last = runs.len().saturating_sub(1);
-    for (i, run) in runs.into_iter().enumerate() {
-        let (rows, differ, these_tie) = if run.len() == 1 {
-            (format!("row {}", run.start), "differs", "this row ties")
-        } else {
-            (
-                format!("rows {}..{}", run.start, run.end),
-                "differ",
-                "these rows tie",
-            )
+    let differs = |i: usize| {
+        format!(
+            "row {i} of {result_name} differs: it is not among the sorted rows of \
+             {reference_name} that the query may return (with their \
+             multiplicities)\ncolumns: ({columns})\n  row {i}: ({})\n  sorted row {} of \
+             {reference_name}: ({})",
+            display(&result[i]),
+            window.start + i,
+            display(&sorted.values[window.start + i])
+        )
+    };
+
+    // The sorted rows of each shape, by class.
+    let mut shapes: HashMap<Shape<'_>, ShapeClasses> = HashMap::new();
+    for (class, (range, _)) in sorted.classes.iter().enumerate() {
+        for row in range.clone() {
+            let shape = shapes.entry(Shape(&sorted.values[row])).or_default();
+            match shape.classes.last_mut() {
+                Some((last, rows)) if *last == class => rows.push(row),
+                _ => {
+                    shape.classes.push((class, vec![row]));
+                    shape.assigned.push(vec![]);
+                }
+            }
+        }
+    }
+
+    // The class of each row of the result so far, and the first row of the
+    // result of each class.
+    let mut class_of = Vec::with_capacity(result.len());
+    let mut first_row_of = BTreeMap::new();
+    for (i, row) in result.iter().enumerate() {
+        let Some(shape) = shapes.get_mut(&Shape(row)) else {
+            return Err(differs(i));
         };
-        let actual = &result[run.clone()];
-        let cut = match (&reference.first_ties, &reference.last_ties) {
-            (_, Some(ties)) if i == last => {
-                Some((ties, "last", "after which the LIMIT cuts the sorted rows"))
-            }
-            (Some(ties), _) if i == 0 => {
-                Some((ties, "first", "before which the OFFSET skips sorted rows"))
-            }
-            _ => None,
+        let floats = row.iter().any(Value::has_floats);
+        let is_full = |shape: &ShapeClasses, e: usize| {
+            shape.assigned[e].len() == shape.classes[e].1.len()
         };
-        if let Some((ties, which, cut)) = cut {
-            // Any of the sorted rows that tie with the row next to the cut,
-            // with their multiplicities.
-            let unexpected = multiset_difference(ties, actual, tolerance).unexpected;
-            if !unexpected.is_empty() {
-                let all = (0..ties.len()).collect::<Vec<_>>();
-                return Err(format!(
-                    "{rows} of {result_name} {differ}: {these_tie} with the {which} row \
-                     of the result {on_keys}, {cut}, so they may be any {} of the {} \
-                     sorted rows of {reference_name} that tie with it (with their \
-                     multiplicities)\ncolumns: ({columns}){}{}",
-                    count_rows(run.len()),
-                    ties.len(),
-                    list_rows(
-                        &format!(
-                            "{} of {result_name} not among them",
-                            count_rows(unexpected.len())
-                        ),
-                        actual,
-                        &unexpected,
-                        Some(run.start)
-                    ),
-                    list_rows(
-                        &format!("the sorted rows of {reference_name} that tie with it"),
-                        ties,
-                        &all,
-                        None
-                    )
-                ));
+        while shape.first_open < shape.classes.len() && is_full(shape, shape.first_open) {
+            shape.first_open += 1;
+        }
+        let mut out_of_order = None;
+        let mut chosen = None;
+        for e in shape.first_open..shape.classes.len() {
+            let (class, rows) = &shape.classes[e];
+            if is_full(shape, e)
+                || (floats
+                    && !rows
+                        .iter()
+                        .any(|&r| rows_equal(&sorted.values[r], row, tolerance)))
+            {
+                continue;
             }
-        } else {
-            let expected = &reference.rows[run.clone()];
-            let difference = multiset_difference(expected, actual, tolerance);
-            if !difference.is_empty() {
-                return Err(format!(
-                    "{rows} of {result_name} {differ} ({ordering})\n{}",
-                    difference.describe(
-                        columns,
-                        (reference_name, result_name),
-                        (expected, actual),
-                        run.start
-                    )
-                ));
+            // The earlier rows of the result that the query orders after this
+            // row must tie with it.
+            match first_row_of
+                .range(class + 1..)
+                .find(|&(&later, _)| !ties(*class, later))
+            {
+                Some((&later, &earlier)) => {
+                    out_of_order.get_or_insert((*class, later, earlier));
+                }
+                None => {
+                    chosen = Some(e);
+                    break;
+                }
             }
+        }
+        let Some(e) = chosen else {
+            let Some((class, later, earlier)) = out_of_order else {
+                return Err(differs(i));
+            };
+            return Err(format!(
+                "row {i} of {result_name} is out of order: the query orders it before row \
+                 {earlier}, and their keys do not tie ({rule})\ncolumns: ({columns})\n  \
+                 row {earlier}: ({}), keys: ({})\n  row {i}: ({}), keys: ({})",
+                display(&result[earlier]),
+                display(&sorted.classes[later].1),
+                display(row),
+                display(&sorted.classes[class].1)
+            ));
+        };
+        shape.assigned[e].push(i);
+        let class = shape.classes[e].0;
+        class_of.push(class);
+        first_row_of.entry(class).or_insert(i);
+    }
+
+    // A class may have several rows with close floating-point values: they are
+    // matched exactly.
+    for shape in shapes.values() {
+        for ((_, rows), assigned) in shape.classes.iter().zip(&shape.assigned) {
+            if assigned.is_empty() || !result[assigned[0]].iter().any(Value::has_floats) {
+                continue;
+            }
+            let floats = |rows: &[Row], indices: &[usize]| {
+                indices
+                    .iter()
+                    .map(|&i| {
+                        let mut floats = vec![];
+                        for value in &rows[i] {
+                            value.collect_floats(&mut floats);
+                        }
+                        floats
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (_, unmatched) = match_floats(
+                &floats(&sorted.values, rows),
+                &floats(result, assigned),
+                tolerance,
+            );
+            if let Some(i) = unmatched.iter().map(|&u| assigned[u]).min() {
+                return Err(differs(i));
+            }
+        }
+    }
+
+    // An order of all sorted rows: the rows that the OFFSET skips (the first
+    // sorted rows that the result does not have), the rows of the result, and
+    // the rows that the LIMIT cuts. A skipped row must tie with the rows of the
+    // result that the query orders before it, and a cut row with those that
+    // the query orders after it.
+    let mut unused = sorted
+        .classes
+        .iter()
+        .map(|(range, _)| range.len())
+        .collect::<Vec<_>>();
+    for &class in &class_of {
+        unused[class] -= 1;
+    }
+    let mut skip = window.start;
+    for (class, &count) in unused.iter().enumerate() {
+        let skipped = count.min(skip);
+        skip -= skipped;
+        if skipped > 0
+            && let Some((&earlier, &row)) = first_row_of
+                .range(..class)
+                .find(|&(&earlier, _)| !ties(earlier, class))
+        {
+            return Err(format!(
+                "row {row} of {result_name} is not among the rows that the query \
+                 returns: the OFFSET skips sorted rows of {reference_name} that the \
+                 query orders after it, and whose keys do not tie with its keys \
+                 ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
+                 the skipped rows: ({})",
+                display(&result[row]),
+                display(&sorted.classes[earlier].1),
+                display(&sorted.classes[class].1)
+            ));
+        }
+        if count > skipped
+            && let Some((&later, &row)) = first_row_of
+                .range(class + 1..)
+                .find(|&(&later, _)| !ties(class, later))
+        {
+            return Err(format!(
+                "row {row} of {result_name} is not among the rows that the query \
+                 returns: the LIMIT cuts sorted rows of {reference_name} that the query \
+                 orders before it, and whose keys do not tie with its keys \
+                 ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
+                 the cut rows: ({})",
+                display(&result[row]),
+                display(&sorted.classes[later].1),
+                display(&sorted.classes[class].1)
+            ));
         }
     }
     Ok(())
@@ -1339,23 +1582,6 @@ fn compare_in_exact_order(
             row
         )
     ))
-}
-
-/// The ranges of the runs of consecutive rows whose `keys` are equal within
-/// `tolerance`.
-fn tie_runs(keys: &[Row], tolerance: f64) -> Vec<Range<usize>> {
-    let mut runs = vec![];
-    let mut start = 0;
-    for (i, pair) in keys.windows(2).enumerate() {
-        if !rows_equal(&pair[0], &pair[1], tolerance) {
-            runs.push(start..i + 1);
-            start = i + 1;
-        }
-    }
-    if !keys.is_empty() {
-        runs.push(start..keys.len());
-    }
-    runs
 }
 
 /// The rows of a result, see [`Value`].
@@ -3027,11 +3253,14 @@ mod tests {
         let err = same_results(expected(), swapped(), &by_k).unwrap_err();
         assert!(
             err.starts_with(
-                "row 0 of the pipeline engine differs (the result is ordered by (k)"
+                "row 1 of the pipeline engine is out of order: the query orders it \
+                 before row 0, and their keys do not tie (rows tie if their ORDER BY \
+                 keys (k) are equal, floating-point keys within twice the tolerance)"
             ),
             "{err}"
         );
-        assert!(err.contains("row 0: (2, \"b\")"), "{err}");
+        assert!(err.contains("row 0: (2, \"b\"), keys: (2)"), "{err}");
+        assert!(err.contains("row 1: (1, \"a\"), keys: (1)"), "{err}");
         let in_order = vec![kv_batch(&rows[..1]), kv_batch(&[]), kv_batch(&rows[1..])];
         same_results(expected(), in_order, &by_k).unwrap();
 
@@ -3062,9 +3291,7 @@ mod tests {
         let by_kv = sorted_by(&ties(), &["k", "v"], 0, None);
         let err = same_results(ties(), other_order(), &by_kv).unwrap_err();
         assert!(
-            err.starts_with(
-                "row 0 of the pipeline engine differs (the result is ordered by (k, v)"
-            ),
+            err.starts_with("row 1 of the pipeline engine is out of order"),
             "{err}"
         );
         // The rows that tie stay among the rows they tie with...
@@ -3075,7 +3302,11 @@ mod tests {
             (2, "d"),
             (2, "e"),
         ])];
-        assert!(same_results(ties(), moved, &by_k).is_err());
+        let err = same_results(ties(), moved, &by_k).unwrap_err();
+        assert!(
+            err.starts_with("row 2 of the pipeline engine is out of order"),
+            "{err}"
+        );
         // ...and they are compared as a multiset.
         let other_rows = vec![kv_batch(&[
             (1, "a"),
@@ -3086,11 +3317,17 @@ mod tests {
         ])];
         let err = same_results(ties(), other_rows, &by_k).unwrap_err();
         assert!(
-            err.starts_with("rows 0..2 of the pipeline engine differ"),
+            err.starts_with(
+                "row 1 of the pipeline engine differs: it is not among the sorted rows \
+                 of DataFusion that the query may return (with their multiplicities)"
+            ),
             "{err}"
         );
-        assert!(err.contains("row 1: (1, \"b\")"), "{err}");
         assert!(err.contains("row 1: (1, \"x\")"), "{err}");
+        assert!(
+            err.contains("sorted row 1 of DataFusion: (1, \"b\")"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3129,31 +3366,36 @@ mod tests {
             // DataFusion's result may be any of them too.
             same_results(vec![kv_batch(&actual)], expected(), &limit_3).unwrap();
         }
-        for (actual, unexpected) in [
+        for (actual, row) in [
             // A row that ties with the last row twice.
             ([(1, "a"), (2, "b"), (2, "b")], "row 2: (2, \"b\")"),
-            // A row that does not tie with it.
+            // Rows that are not sorted rows.
             ([(1, "a"), (2, "x"), (2, "b")], "row 1: (2, \"x\")"),
             ([(1, "a"), (2, "b"), (3, "e")], "row 2: (3, \"e\")"),
         ] {
             let err =
                 same_results(expected(), vec![kv_batch(&actual)], &limit_3).unwrap_err();
+            let position = &row[..5];
             assert!(
-                err.starts_with(
-                    "rows 1..3 of the pipeline engine differ: these rows tie with the \
-                     last row of the result on the ORDER BY keys (k), after which the \
-                     LIMIT cuts the sorted rows, so they may be any 2 rows of the 3 \
-                     sorted rows of DataFusion that tie with it"
-                ),
+                err.starts_with(&format!("{position} of the pipeline engine differs")),
                 "{err}"
             );
-            assert!(
-                err.contains(&format!(
-                    "1 row of the pipeline engine not among them:\n  {unexpected}"
-                )),
-                "{err}"
-            );
+            assert!(err.contains(row), "{err}");
         }
+        // A sorted row that does not tie with the cut rows.
+        let sorted = [kv_batch(&[(1, "a"), (2, "b"), (3, "c")])];
+        let limit_2 = sorted_by(&sorted, &["k"], 0, Some(2));
+        let after_the_cut = vec![kv_batch(&[(1, "a"), (3, "c")])];
+        let err = same_results(two(), after_the_cut, &limit_2).unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 1 of the pipeline engine is not among the rows that the query \
+                 returns: the LIMIT cuts sorted rows of DataFusion that the query orders \
+                 before it, and whose keys do not tie with its keys"
+            ),
+            "{err}"
+        );
+        assert!(err.contains("keys of the cut rows: (2)"), "{err}");
         // The rows before them are compared as usual.
         let other_first = vec![kv_batch(&[(1, "z"), (2, "b"), (2, "c")])];
         let err = same_results(expected(), other_first, &limit_3).unwrap_err();
@@ -3182,6 +3424,31 @@ mod tests {
                 same_results(expected(), vec![kv_batch(&actual)], &offset_1).is_err()
             );
         }
+        // A sorted row after the rows that the query returns, which does not
+        // tie with them.
+        let after_the_cut = vec![kv_batch(&[(1, "b"), (3, "d")])];
+        let err = same_results(expected(), after_the_cut, &offset_1).unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 1 of the pipeline engine is not among the rows that the query \
+                 returns: the LIMIT cuts sorted rows"
+            ),
+            "{err}"
+        );
+        // A sorted row that the OFFSET skips, which does not tie with them.
+        let ascending = [kv_batch(&[(1, "a"), (2, "b"), (3, "c")])];
+        let offset_2 = sorted_by(&ascending, &["k"], 2, None);
+        let skipped = vec![kv_batch(&[(2, "b")])];
+        let err =
+            same_results(vec![kv_batch(&[(3, "c")])], skipped, &offset_2).unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 0 of the pipeline engine is not among the rows that the query \
+                 returns: the OFFSET skips sorted rows of DataFusion that the query \
+                 orders after it, and whose keys do not tie with its keys"
+            ),
+            "{err}"
+        );
         // The LIMIT and the OFFSET cut the same rows that tie.
         let sorted = [kv_batch(&[(5, "a"), (5, "b"), (5, "c"), (5, "d")])];
         let middle = sorted_by(&sorted, &["k"], 1, Some(2));
@@ -3201,11 +3468,11 @@ mod tests {
         let err = same_results(vec![v_batch(&rows)], vec![v_batch(&reversed)], &by_k)
             .unwrap_err();
         assert!(
-            err.starts_with(
-                "row 0 of the pipeline engine differs (the result is ordered by (m.k)"
-            ),
+            err.starts_with("row 1 of the pipeline engine is out of order"),
             "{err}"
         );
+        assert!(err.contains("ORDER BY keys (m.k)"), "{err}");
+        assert!(err.contains("row 0: (\"c\"), keys: (3)"), "{err}");
 
         // Rows that tie on the key, which is not selected.
         let ties = [(1, "a"), (1, "b"), (2, "c")];
@@ -3216,7 +3483,7 @@ mod tests {
         let err =
             same_results(vec![v_batch(&ties)], vec![v_batch(&moved)], &by_k).unwrap_err();
         assert!(
-            err.starts_with("rows 0..2 of the pipeline engine differ"),
+            err.starts_with("row 2 of the pipeline engine is out of order"),
             "{err}"
         );
 
@@ -3232,7 +3499,7 @@ mod tests {
         ] {
             let err =
                 same_results(expected(), vec![v_batch(&actual)], &limit_3).unwrap_err();
-            assert!(err.contains("not among them"), "{err}");
+            assert!(err.contains("of the pipeline engine differs"), "{err}");
         }
     }
 
@@ -3245,7 +3512,10 @@ mod tests {
         same_results(sorted.to_vec(), other_order(), &volatile).unwrap();
         let other_rows = vec![kv_batch(&[(3, "c"), (1, "a"), (2, "x")])];
         let err = same_results(sorted.to_vec(), other_rows, &volatile).unwrap_err();
-        assert!(err.contains("the first ORDER BY key is volatile"), "{err}");
+        assert!(
+            err.starts_with("row 2 of the pipeline engine differs"),
+            "{err}"
+        );
         // Under a LIMIT, the rows may be any of the sorted rows.
         let limit_2 = sorted_by(&sorted, &[], 0, Some(2));
         let expected = vec![kv_batch(&[(1, "a"), (2, "b")])];
@@ -3455,25 +3725,114 @@ mod tests {
         assert!(err.contains("row 1: (1.0, 3.5)"), "{err}");
 
         // ORDER BY keys that are equal within the tolerance tie.
-        let keyed = |rows: &[(f64, &str)]| {
-            vec![batch_of(vec![
-                (
-                    "s",
-                    Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0)))
-                        as ArrayRef,
-                ),
-                (
-                    "v",
-                    Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
-                ),
-            ])]
-        };
+        let keyed = |rows: &[(f64, &str)]| vec![sv_batch(rows)];
         let expected = keyed(&[(1.0, "a"), (close, "b"), (2.0, "c")]);
         let by_s = sorted_by(&expected, &["s"], 0, None);
         let swapped = keyed(&[(1.0, "b"), (close, "a"), (2.0, "c")]);
         same_results(expected.clone(), swapped, &by_s).unwrap();
         let other_order = keyed(&[(2.0, "c"), (1.0, "b"), (close, "a")]);
         assert!(same_results(expected, other_order, &by_s).is_err());
+    }
+
+    /// A batch of `(s DOUBLE, v VARCHAR)` rows.
+    fn sv_batch(rows: &[(f64, &str)]) -> RecordBatch {
+        batch_of(vec![
+            (
+                "s",
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0)))
+                    as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.1))),
+            ),
+        ])
+    }
+
+    /// The keys of `CLOSE_ROWS`: each ties with the next one (they are equal
+    /// within twice the tolerance), but not with the one after.
+    const CLOSE_KEYS: [f64; 4] = [1.0, 1.0 + 1.5e-9, 1.0 + 3e-9, 1.0 + 4.5e-9];
+
+    /// The rows `order` of `CLOSE_KEYS` with the names `a`, `b`, `c`, `d`.
+    fn close_rows(order: &[usize]) -> Vec<RecordBatch> {
+        let names = ["a", "b", "c", "d"];
+        let rows = order
+            .iter()
+            .map(|&i| (CLOSE_KEYS[i], names[i]))
+            .collect::<Vec<_>>();
+        vec![sv_batch(&rows)]
+    }
+
+    #[test]
+    fn same_results_do_not_chain_the_ties_of_close_floats() {
+        let sorted = close_rows(&[0, 1, 2, 3]);
+        let by_s = sorted_by(&sorted, &["s"], 0, None);
+        // Rows that tie may be out of their sorted order...
+        for order in [[1, 0, 2, 3], [1, 0, 3, 2], [0, 2, 1, 3], [0, 1, 3, 2]] {
+            same_results(sorted.clone(), close_rows(&order), &by_s)
+                .unwrap_or_else(|e| panic!("{order:?}: {e}"));
+        }
+        // ...but not relative to rows that they do not tie with, although
+        // each ties with the next.
+        for (order, row) in [
+            ([3, 2, 1, 0], 2),
+            ([2, 1, 0, 3], 2),
+            ([0, 3, 1, 2], 2),
+            ([1, 2, 0, 3], 2),
+        ] {
+            let err =
+                same_results(sorted.clone(), close_rows(&order), &by_s).unwrap_err();
+            assert!(
+                err.starts_with(&format!(
+                    "row {row} of the pipeline engine is out of order"
+                )),
+                "{order:?}: {err}"
+            );
+        }
+
+        // Under LIMIT 1, the first row may be one that ties with the first
+        // sorted row, but not another.
+        let limit_1 = sorted_by(&sorted, &["s"], 0, Some(1));
+        same_results(close_rows(&[0]), close_rows(&[1]), &limit_1).unwrap();
+        for row in [2, 3] {
+            let err =
+                same_results(close_rows(&[0]), close_rows(&[row]), &limit_1).unwrap_err();
+            assert!(
+                err.starts_with(
+                    "row 0 of the pipeline engine is not among the rows that the query \
+                     returns: the LIMIT cuts sorted rows of DataFusion that the query \
+                     orders before it"
+                ),
+                "{row}: {err}"
+            );
+            // DataFusion's result is compared with its sorted rows too.
+            assert!(
+                same_results(close_rows(&[row]), close_rows(&[0]), &limit_1).is_err()
+            );
+        }
+        // Under LIMIT 2, the last row may be one that ties with all rows
+        // before the LIMIT.
+        let limit_2 = sorted_by(&sorted, &["s"], 0, Some(2));
+        same_results(close_rows(&[0, 1]), close_rows(&[1, 0]), &limit_2).unwrap();
+        same_results(close_rows(&[0, 1]), close_rows(&[0, 2]), &limit_2).unwrap();
+        assert!(
+            same_results(close_rows(&[0, 1]), close_rows(&[1, 2]), &limit_2).is_err()
+        );
+        // Under OFFSET 3, the last row.
+        let offset_3 = sorted_by(&sorted, &["s"], 3, None);
+        same_results(close_rows(&[3]), close_rows(&[2]), &offset_3).unwrap();
+        for row in [0, 1] {
+            let err = same_results(close_rows(&[3]), close_rows(&[row]), &offset_3)
+                .unwrap_err();
+            assert!(
+                err.starts_with(
+                    "row 0 of the pipeline engine is not among the rows that the query \
+                     returns: the OFFSET skips sorted rows of DataFusion that the query \
+                     orders after it"
+                ),
+                "{row}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -3753,10 +4112,32 @@ mod tests {
                 "SELECT a, MAX(c) FROM t1 GROUP BY a ORDER BY MAX(c) DESC LIMIT 3",
                 Some(("max(t1.c)", 2, 0, Some(3), 102)),
             ),
-            // A volatile key, and the keys after it, cannot be compared.
+            // A volatile key, and the keys after it, cannot be compared...
             (
                 "SELECT id FROM t1 ORDER BY a, random(), id",
                 Some(("t1.a", 1, 0, None, 5000)),
+            ),
+            // ...also through the columns of a subquery.
+            (
+                "SELECT id FROM (SELECT id, random() AS r FROM t1) s ORDER BY r LIMIT 3",
+                Some(("", 1, 0, Some(3), 5000)),
+            ),
+            (
+                "SELECT id FROM (SELECT id, a, random() + 1 AS r FROM t1) s ORDER BY a, r, id",
+                Some(("s.a", 1, 0, None, 5000)),
+            ),
+            (
+                "SELECT id FROM (SELECT id, random() AS r FROM t1) s ORDER BY id DESC",
+                Some(("s.id", 1, 0, None, 5000)),
+            ),
+            (
+                "SELECT id FROM (SELECT id, random() AS r FROM t1) ORDER BY r",
+                Some(("", 1, 0, None, 5000)),
+            ),
+            // Constant expressions in LIMIT and OFFSET.
+            (
+                "SELECT id FROM t1 ORDER BY id LIMIT 1 + 1 OFFSET 2 * 3",
+                Some(("t1.id", 1, 6, Some(2), 5000)),
             ),
             // Through subqueries and nested limits.
             (
@@ -3811,22 +4192,19 @@ mod tests {
         else {
             panic!("not sorted");
         };
-        let rows = reference.reference_rows(0.0)?;
-        let ids = rows
-            .keys
+        let rows = reference.sorted_rows()?;
+        assert_eq!(rows.window, 0..3);
+        let ids = rows.classes[..3]
             .iter()
-            .map(|key| key[0].to_string())
+            .map(|(range, keys)| (range.clone(), keys[0].to_string()))
             .collect::<Vec<_>>();
-        assert_eq!(ids, ["4999", "4998", "4997"].map(String::from));
-        assert!(rows.first_ties.is_none() && rows.last_ties.is_none());
+        let expected = [(0..1, "4999"), (1..2, "4998"), (2..3, "4997")];
+        assert_eq!(ids, expected.map(|(range, id)| (range, id.to_string())));
 
-        // A LIMIT that is not a literal.
-        let df = ctx.sql("SELECT id FROM t1 ORDER BY id LIMIT 1 + 1").await?;
+        // A LIMIT that is not a constant.
+        let df = ctx.sql("SELECT id FROM t1 ORDER BY id LIMIT $1").await?;
         let order = result_order(&ctx, df.logical_plan()).await;
-        assert!(
-            matches!(&order, ResultOrder::Exact(reason) if reason.contains("not a literal")),
-            "{order:?}"
-        );
+        assert!(matches!(&order, ResultOrder::Exact(_)), "{order:?}");
         Ok(())
     }
 
@@ -3954,6 +4332,68 @@ mod tests {
         }
     }
 
+    /// A setup with the rows of `CLOSE_KEYS` in the session of DataFusion,
+    /// and in the session of the pipeline engine with their keys in the other
+    /// order.
+    fn reversed_close_rows() -> impl AsyncFn(&SessionContext) -> Result<()> {
+        let reversed = (0..4)
+            .map(|i| (CLOSE_KEYS[3 - i], ["a", "b", "c", "d"][i]))
+            .collect::<Vec<_>>();
+        per_engine_tables(close_rows(&[0, 1, 2, 3]).remove(0), sv_batch(&reversed))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[should_panic(
+        expected = "Results differ: row 2 of the pipeline engine is out of order"
+    )]
+    async fn assert_same_results_panics_on_rows_out_of_order_by_close_floats() {
+        let setup = reversed_close_rows();
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT v FROM m ORDER BY s",
+            &setup,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[should_panic(
+        expected = "Results differ: row 0 of the pipeline engine is not among the rows that the query returns: the LIMIT cuts"
+    )]
+    async fn assert_same_results_panics_on_another_first_row_by_close_floats() {
+        let setup = reversed_close_rows();
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT v FROM m ORDER BY s LIMIT 1",
+            &setup,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_evaluate_constant_limits() {
+        // Rows that tie, in other orders in the tables of both engines.
+        let setup = per_engine_tables(
+            kv_batch(&[(5, "a"), (5, "b"), (5, "c")]),
+            kv_batch(&[(5, "c"), (5, "b"), (5, "a")]),
+        );
+        for sql in [
+            "SELECT k, v FROM m ORDER BY k LIMIT 1 + 1",
+            "SELECT v FROM m ORDER BY k LIMIT 3 - 1 OFFSET 2 - 1",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_any_order_by_volatile_columns() {
+        for sql in [
+            "SELECT id FROM (SELECT id, random() AS r FROM t1) s ORDER BY r LIMIT 3",
+            "SELECT id FROM (SELECT id, random() AS r FROM t1) ORDER BY r LIMIT 3",
+            "SELECT id, d FROM (SELECT id, d, random() AS r FROM t1) s ORDER BY d, r LIMIT 10",
+        ] {
+            assert_same_results_as_datafusion(sql).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(expected = "Results differ: row 1 of the pipeline engine differs")]
     async fn assert_same_results_panics_on_a_corrupted_row_under_a_limit() {
@@ -3970,9 +4410,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[should_panic(
-        expected = "1 row of the pipeline engine not among them:\n  row 2: (2, \"b\")"
-    )]
+    #[should_panic(expected = "Results differ: row 2 of the pipeline engine differs")]
     async fn assert_same_results_panics_on_a_tied_row_twice_under_a_limit() {
         let setup = per_engine_tables(
             kv_batch(&[(1, "a"), (2, "b"), (2, "c"), (2, "d")]),
@@ -3987,7 +4425,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[should_panic(
-        expected = "Results differ: row 0 of the pipeline engine differs (the result is ordered by (m.k)"
+        expected = "Results differ: row 1 of the pipeline engine is out of order"
     )]
     async fn assert_same_results_panics_on_rows_out_of_the_order_of_keys_not_selected() {
         let setup = per_engine_tables(
