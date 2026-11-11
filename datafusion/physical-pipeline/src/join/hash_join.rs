@@ -756,9 +756,19 @@ impl PhysicalHashJoin {
             return Ok(Some(lit(false)));
         }
         let null_keys_match = spec.null_equality == NullEquality::NullEqualsNull;
-        // The distinct keys of a build side of few of them, for `IN` lists.
-        let distinct_keys = if table.num_distinct_keys()
+        // The distinct keys of a build side of few of them, for `IN` lists (not
+        // gathered if their fixed-width values alone take too many bytes).
+        let num_distinct_keys = table.num_distinct_keys();
+        let fixed_width = spec
+            .key_schema
+            .fields()
+            .iter()
+            .map(|field| field.data_type().primitive_width().unwrap_or(0))
+            .sum::<usize>();
+        let distinct_keys = if num_distinct_keys
             <= options.hash_join_inlist_pushdown_max_distinct_values
+            && num_distinct_keys.saturating_mul(fixed_width)
+                <= options.hash_join_inlist_pushdown_max_size
         {
             let keys = table.distinct_keys()?;
             let size = keys
