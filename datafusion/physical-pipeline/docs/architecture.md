@@ -608,7 +608,10 @@ of a table from its files, but a schema given when the table is registered may
 have other types, into which the scan casts the values of the files, and fails
 on those that it cannot cast, on rows that a dynamic filter prunes in only one
 of the engines: such scans, and scans of files whose metadata is not cached,
-may fail. The scans of CSV files may fail to parse any of their values.
+may fail. So may the scans with custom readers of their files or custom
+providers of their schemas, and the scans of files with explicit schemas (in
+which the reader reads them) of other types than those of the table. The scans
+of CSV files may fail to parse any of their values.
 
 All window queries of the stress corpus run on native windows but the two
 whose windows are stacked on windows of other partitions or orders, which
