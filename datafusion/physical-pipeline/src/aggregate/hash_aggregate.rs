@@ -3515,15 +3515,16 @@ mod tests {
 
     /// A benchmark of top-k aggregations, not a test: the pipeline engine and
     /// DataFusion, interleaved, over `TOP_K_ROWS` (10,500,000) rows of a
-    /// single partition of 8,192-row batches, `TOP_K_ROUNDS` (5) times, on 1
-    /// target partition: `shuffled` keys `k` and values `v` of linear
-    /// congruential generators (`(i * 1664525 + 1013904223) & 0xffffffff`),
-    /// and `sorted` ones (`i`), whose best rows come first for ascending
-    /// orders (and last for descending ones), with 1,000 groups `g` of
-    /// `k % 1000`. Prints the median and best times of each engine, and
-    /// whether the pipeline engine lowered the top-k aggregation. Run it with
-    /// `cargo test --profile release-nonlto -p datafusion-physical-pipeline
-    /// --lib top_k_aggregations_benchmark -- --ignored --nocapture`.
+    /// single partition of 8,192-row batches, `TOP_K_ROUNDS` (5) times, on
+    /// `TOP_K_PARTITIONS` (1) target partitions: `shuffled` keys `k` and
+    /// values `v` of linear congruential generators (`(i * 1664525 +
+    /// 1013904223) & 0xffffffff`), and `sorted` ones (`i`), whose best rows
+    /// come first for ascending orders (and last for descending ones), with
+    /// 1,000 groups `g` of `k % 1000`. Prints the median and best times of
+    /// each engine, and whether the pipeline engine lowered the top-k
+    /// aggregation. Run it with `cargo test --profile release-nonlto -p
+    /// datafusion-physical-pipeline --lib top_k_aggregations_benchmark --
+    /// --ignored --nocapture`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "a benchmark"]
     async fn top_k_aggregations_benchmark() -> Result<()> {
@@ -3543,6 +3544,7 @@ mod tests {
                 .unwrap_or(default)
         };
         let (rows, rounds) = (env("TOP_K_ROWS", 10_500_000), env("TOP_K_ROUNDS", 5));
+        let partitions = env("TOP_K_PARTITIONS", 1);
         let schema = Arc::new(Schema::new(vec![
             Field::new("k", DataType::Int64, false),
             Field::new("v", DataType::Int64, false),
@@ -3576,7 +3578,7 @@ mod tests {
         )?;
         let sorted = table(|i| i, |i| i)?;
         let config = test_session_config()
-            .with_target_partitions(1)
+            .with_target_partitions(partitions)
             .with_batch_size(8_192);
         let engines = [
             ("pipeline", pipeline_context(config.clone())),
