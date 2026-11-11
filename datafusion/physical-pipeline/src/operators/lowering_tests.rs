@@ -111,3 +111,210 @@ pub(crate) async fn assert_resources_exhausted(ctx: &SessionContext, sql: &str) 
         ),
     }
 }
+
+/// Assert that the plan that `make_plan` makes returns the same rows through
+/// the pipeline engine (lowered with the options and the runtime of a
+/// session configured with `config`) as on DataFusion, compared in their
+/// canonical forms (in their order if `ordered`), and that the pipeline
+/// engine runs all of it natively. Returns the operator tree of the pipeline
+/// engine.
+pub(crate) async fn assert_plan_lowered<F>(
+    make_plan: F,
+    config: SessionConfig,
+    ordered: bool,
+) -> Arc<dyn PhysicalOperator>
+where
+    F: Fn() -> Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+{
+    use crate::test_utils::{EngineOutput, datafusion_context};
+    use datafusion_physical_plan::collect;
+
+    let ctx = datafusion_context(config);
+    let output =
+        |plan: Arc<dyn datafusion_physical_plan::ExecutionPlan>, batches| EngineOutput {
+            schema: plan.schema(),
+            plan,
+            batches,
+            ordered,
+        };
+    let plan = make_plan();
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+    let expected = output(plan, batches);
+    let state = ctx.state();
+    let root: Arc<dyn datafusion_physical_plan::ExecutionPlan> =
+        crate::planner::create_pipeline_plan_with_runtime(
+            make_plan(),
+            state.config_options(),
+            state.runtime_env(),
+        )
+        .unwrap();
+    let batches = collect(Arc::clone(&root), ctx.task_ctx()).await.unwrap();
+    let operator = Arc::clone(
+        root.downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan")
+            .operator(),
+    );
+    let actual = output(root, batches);
+    if let Err(message) = compare_outputs(&expected, &actual) {
+        panic!(
+            "Results differ: {message}\nlowered: {}",
+            format_operator_tree(&operator)
+        );
+    }
+    let bridged = bridged_plans(&operator);
+    assert!(
+        bridged.is_empty(),
+        "Parts of the plan are left to DataFusion: {:?}\nlowered: {}",
+        bridged.iter().map(|plan| plan.name()).collect::<Vec<_>>(),
+        format_operator_tree(&operator)
+    );
+    operator
+}
+
+/// The native lowering of the nodes that only distribute the rows of their
+/// inputs, and of the merges of sorted partitions, see `planner.rs`.
+mod merges_and_redistributions {
+    use super::*;
+
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::datasource::MemTable;
+    use datafusion_common::{ScalarValue, SplitPoint};
+    use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_expr::{SortExpr, col as logical_col};
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, RangePartitioning};
+    use datafusion_physical_plan::repartition::RepartitionExec;
+    use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion_physical_plan::{ExecutionPlan, Partitioning};
+
+    use crate::sort::{PhysicalSort, PhysicalTopK};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new("w", DataType::Int64, true),
+        ]))
+    }
+
+    /// The rows `values`, sorted by `v`.
+    fn batch(values: std::ops::Range<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(values.clone())),
+                Arc::new(Int64Array::from_iter(
+                    values.map(|v| (v % 7 != 3).then_some(v % 11)),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Three partitions, every one sorted by `v`.
+    fn sorted_partitions() -> Vec<Vec<RecordBatch>> {
+        vec![
+            vec![batch(0..3000), batch(3000..3100)],
+            vec![],
+            vec![batch(1000..1500), batch(9000..9500)],
+        ]
+    }
+
+    fn ordering() -> LexOrdering {
+        LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("v", &schema()).unwrap(),
+        )])
+        .unwrap()
+    }
+
+    /// The sorted partitions, scanned with their ordering.
+    fn sorted_scan() -> Arc<dyn ExecutionPlan> {
+        let source = MemorySourceConfig::try_new(&sorted_partitions(), schema(), None)
+            .unwrap()
+            .try_with_sort_information(vec![ordering()])
+            .unwrap();
+        datafusion_datasource::source::DataSourceExec::from_data_source(source)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_sorted_partitions_are_sorts() {
+        // A table of sorted partitions: DataFusion merges them.
+        let setup = async |ctx: &SessionContext| {
+            let table =
+                MemTable::try_new(schema(), sorted_partitions())?.with_sort_order(vec![
+                    vec![SortExpr::new(logical_col("v"), true, false)],
+                ]);
+            ctx.register_table("sorted", Arc::new(table))?;
+            Ok(())
+        };
+        for (sql, sorts, topks) in [
+            ("SELECT * FROM sorted ORDER BY v", 1, 0),
+            ("SELECT v, w FROM sorted WHERE w > 3 ORDER BY v", 1, 0),
+            ("SELECT * FROM sorted ORDER BY v LIMIT 10", 0, 1),
+            ("SELECT * FROM sorted ORDER BY v LIMIT 10 OFFSET 3000", 0, 1),
+        ] {
+            let root = assert_lowered(sql, test_session_config(), &setup).await;
+            assert_eq!(count::<PhysicalSort>(&root), sorts, "{sql}");
+            assert_eq!(count::<PhysicalTopK>(&root), topks, "{sql}");
+        }
+        // A merge of the sorted partitions of a scan, with a fetch.
+        for fetch in [None, Some(1), Some(4000)] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering(), sorted_scan())
+                        .with_fetch(fetch),
+                )
+            };
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(
+                count::<PhysicalSort>(&root) + count::<PhysicalTopK>(&root),
+                1,
+                "{fetch:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repartitionings_that_preserve_the_order_or_by_range_are_removed() {
+        let v = col("v", &schema()).unwrap();
+        let range = RangePartitioning::try_new(
+            ordering(),
+            vec![
+                SplitPoint::new(vec![ScalarValue::Int64(Some(1200))]),
+                SplitPoint::new(vec![ScalarValue::Int64(Some(5000))]),
+            ],
+        )
+        .unwrap();
+        for (partitioning, preserve_order) in [
+            (Partitioning::RoundRobinBatch(4), true),
+            (Partitioning::Hash(vec![Arc::clone(&v)], 5), true),
+            (Partitioning::Range(range.clone()), false),
+            (Partitioning::Range(range), true),
+        ] {
+            let repartition = || -> Arc<dyn ExecutionPlan> {
+                let repartition =
+                    RepartitionExec::try_new(sorted_scan(), partitioning.clone())
+                        .unwrap();
+                Arc::new(if preserve_order {
+                    repartition.with_preserve_order()
+                } else {
+                    repartition
+                })
+            };
+            let root =
+                assert_plan_lowered(repartition, test_session_config(), false).await;
+            assert!(
+                root.is::<crate::sources::MemoryScanSource>(),
+                "{partitioning}"
+            );
+            // And merged.
+            if preserve_order {
+                let merged = || -> Arc<dyn ExecutionPlan> {
+                    Arc::new(SortPreservingMergeExec::new(ordering(), repartition()))
+                };
+                let root = assert_plan_lowered(merged, test_session_config(), true).await;
+                assert_eq!(count::<PhysicalSort>(&root), 1, "{partitioning}");
+            }
+        }
+    }
+}

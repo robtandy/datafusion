@@ -573,6 +573,9 @@ impl Lowering<'_> {
             if let Some(sort) = self.try_lower_merge_of_window(plan)? {
                 return Ok(sort);
             }
+            if let Some(sort) = self.try_lower_merge(plan)? {
+                return Ok(sort);
+            }
             if let Some(aggregate) = self.try_lower_aggregate(plan)? {
                 return Ok(aggregate);
             }
@@ -896,6 +899,30 @@ impl Lowering<'_> {
         Ok(Some(Arc::new(sort)))
     }
 
+    /// Lower a `SortPreservingMergeExec` of partitions that are sorted
+    /// otherwise than by a `SortExec` below it (e.g. of the sorted files of a
+    /// scan, possibly through a `BufferExec`, or of a `PartialSortExec`) to the
+    /// sort of its input, with its fetch: the pipeline engine does not keep
+    /// the rows of the partitions apart, and sorting them merges them. It is
+    /// lowered as the merge of the sort of every partition, with
+    /// [`Self::try_lower_sort`], which does not lower the sorts of inputs that
+    /// never end, nor by keys that the native sort orders otherwise.
+    fn try_lower_merge(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        let sort = SortExec::new(merge.expr().clone(), Arc::clone(merge.input()))
+            .with_preserve_partitioning(true);
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(
+            SortPreservingMergeExec::new(merge.expr().clone(), Arc::new(sort))
+                .with_fetch(merge.fetch()),
+        );
+        self.try_lower_sort(&sorted)
+    }
+
     /// Lower a nested loop join or a cross join with
     /// [`PhysicalNestedLoopJoin::try_lower`] or
     /// [`PhysicalCrossJoin::try_lower`], for a runtime whose memory pool has
@@ -1046,8 +1073,8 @@ fn bridge(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn PhysicalOperator> {
 ///
 /// * a `CoalescePartitionsExec` without a fetch (with a fetch it is a limit;
 ///   without input partitions, DataFusion fails to execute it);
-/// * a `RepartitionExec` (round robin or by hash) that does not preserve the
-///   order, of at least one partition;
+/// * a `RepartitionExec` that only distributes the rows of its input (see
+///   [`redistributes_rows`]), of at least one partition;
 /// * a `CoalesceBatchesExec` without a fetch.
 fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     let input = plan.children().into_iter().next()?;
@@ -1078,12 +1105,17 @@ fn scheduled_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPl
 }
 
 /// Whether `repartition` only distributes the rows of its input over its
-/// partitions: round robin or by hash, without preserving the order.
+/// partitions: round robin, by hash or by range, without preserving the
+/// order, or preserving the order of every partition of several partitions
+/// (whose order the native operators that read them do not depend on: they
+/// merge, sort or partition the rows themselves).
 fn redistributes_rows(repartition: &RepartitionExec) -> bool {
-    !repartition.preserve_order()
+    (!repartition.preserve_order() || repartition.partitioning().partition_count() > 1)
         && matches!(
             repartition.partitioning(),
-            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(..)
+            Partitioning::RoundRobinBatch(_)
+                | Partitioning::Hash(..)
+                | Partitioning::Range(_)
         )
 }
 
