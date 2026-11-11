@@ -2693,8 +2693,10 @@ fn source_may_fail(plan: &Arc<dyn ExecutionPlan>, runtime: Option<&RuntimeEnv>) 
 /// of `coerce_int96` (see `Int96Coercer`), from which the scan casts them into
 /// the unit of the table, which may overflow. A file with an explicit schema
 /// (`PartitionedFile::arrow_schema`) is read in that schema, with these
-/// coercions, if it fits the Parquet schema of the file (which the reader
-/// checks, as `ArrowReaderMetadata::try_new` does, and fails otherwise). (Not its coercion of strings into
+/// coercions, but it may constrain the values of the file otherwise than its
+/// own types (e.g. fixed-size lists for lists of any length), which the reader
+/// only checks as it decodes them: only files whose explicit schemas have
+/// their own types are judged to be read without failing. (Not its coercion of strings into
 /// dictionaries: such files may fail.) The schema of a table that DataFusion
 /// inferred from its files has their types, but a schema given when the table
 /// was registered may have others, into which the scan casts the values of the
@@ -2761,15 +2763,22 @@ fn reads_files_of_the_types_of_their_table(
         // Parquet schema of the file: a file whose explicit schema does not fit
         // its Parquet schema fails to be read.
         use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-        let mut options = ArrowReaderOptions::new();
-        if let Some(schema) = &file.arrow_schema {
-            options = options.with_schema(Arc::clone(schema));
-        }
+        let options = ArrowReaderOptions::new();
         let Ok(reader_metadata) =
             ArrowReaderMetadata::try_new(Arc::clone(metadata), options.clone())
         else {
             return false;
         };
+        // An explicit schema of other types than those the reader derives from
+        // the file (or without nulls where the file may have some) may impose
+        // constraints on the values that the reader only checks as it decodes
+        // them, e.g. fixed-size lists for lists: only explicit schemas of the
+        // types of the file are judged not to fail.
+        if let Some(explicit) = &file.arrow_schema
+            && !has_the_types_of(explicit, reader_metadata.schema())
+        {
+            return false;
+        }
         let file_schema = reader_metadata.schema().as_ref().clone();
         let coerced = apply_file_schema_type_coercions(table, &file_schema);
         let mut changed = coerced.is_some();
@@ -2809,6 +2818,17 @@ fn reads_files_of_the_types_of_their_table(
         .iter()
         .flat_map(|group| group.iter())
         .all(has_the_types_of_the_table)
+}
+
+/// Whether the fields of `schema` are the fields of `of`, in the same order,
+/// of the same types, and without nulls only where `of` has none.
+fn has_the_types_of(schema: &Schema, of: &Schema) -> bool {
+    schema.fields().len() == of.fields().len()
+        && schema.fields().iter().zip(of.fields()).all(|(field, of)| {
+            field.name() == of.name()
+                && field.data_type() == of.data_type()
+                && (field.is_nullable() || !of.is_nullable())
+        })
 }
 
 /// The parts that may fail (see [`failures`]) of the native operators that
@@ -6318,11 +6338,144 @@ mod tests {
         Ok(())
     }
 
+    /// Assert that `sql`, a TopK over a scan of Parquet files in `ctx`
+    /// (configured with `config`), with the explicit schema `schema` for every
+    /// file of the scans of the plan of DataFusion
+    /// (`PartitionedFile::arrow_schema`), succeeds in DataFusion, produces the
+    /// same rows through the pipeline engine, and stays in DataFusion there.
+    async fn assert_topk_over_explicit_file_schemas_stays_in_datafusion(
+        ctx: &SessionContext,
+        config: &SessionConfig,
+        sql: &str,
+        schema: &SchemaRef,
+    ) -> Result<()> {
+        use datafusion_datasource::file_groups::FileGroup;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        // A new plan for every execution, whose TopK counts the partitions that
+        // complete its filter.
+        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let plan = plan.transform_up(|node| {
+                let Some(config) = node
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+                else {
+                    return Ok(Transformed::no(node));
+                };
+                let file_groups = config
+                    .file_groups
+                    .iter()
+                    .map(|group| {
+                        FileGroup::new(
+                            group
+                                .iter()
+                                .map(|file| {
+                                    file.clone().with_arrow_schema(Arc::clone(schema))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let config = FileScanConfigBuilder::from(config.clone())
+                    .with_file_groups(file_groups)
+                    .build();
+                Ok(Transformed::yes(
+                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
+                ))
+            })?;
+            Ok(plan.data)
+        };
+        let plan = make_plan().await?;
+        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("DataFusion fails: {e}\n{sql}"));
+        let root = create_pipeline_plan_with_runtime(
+            make_plan().await?,
+            config.options(),
+            &ctx.runtime_env(),
+        )?;
+        let tree = format_operator_tree(root.operator());
+        let topks = count::<PhysicalTopK>(root.operator());
+        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
+            .await
+            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
+        let output = |batches| crate::test_utils::EngineOutput {
+            schema: plan.schema(),
+            plan: Arc::clone(&plan),
+            batches,
+            ordered: true,
+        };
+        compare_outputs(&output(expected), &output(actual))
+            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
+        assert_eq!(topks, 0, "{tree}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_over_files_whose_explicit_schemas_constrain_their_values_stay_in_datafusion()
+    -> Result<()> {
+        // A table `k INT, v INT[2], s VARCHAR` of two Parquet files of lists of
+        // integers, whose explicit schemas (`PartitionedFile::arrow_schema`) are
+        // the schema of the table: 100 rows `k = 0` of lists of 2 integers, and
+        // 10 rows `k = 1` of lists of 3. The reader reads the lists as lists of
+        // exactly 2 integers, which it checks only as it decodes them: it fails
+        // to read the second file, which DataFusion's scan prunes with the
+        // filter of the TopK, so the TopK stays in DataFusion.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("p");
+        let lists = |k: i32, length: usize, rows: usize| -> Result<RecordBatch> {
+            let list =
+                arrow::array::ListArray::from_iter_primitive::<
+                    arrow::datatypes::Int32Type,
+                    _,
+                    _,
+                >((0..rows).map(|_| Some((0..length as i32).map(Some))));
+            Ok(RecordBatch::try_from_iter([
+                (
+                    "k",
+                    Arc::new(Int32Array::from(vec![k; rows])) as arrow::array::ArrayRef,
+                ),
+                ("v", Arc::new(list) as _),
+                (
+                    "s",
+                    Arc::new(arrow::array::StringViewArray::from(vec!["foo"; rows])) as _,
+                ),
+            ])?)
+        };
+        for (file, batch) in [lists(0, 2, 100)?, lists(1, 3, 10)?]
+            .into_iter()
+            .enumerate()
+        {
+            write_parquet(
+                &path.join(format!("{file}.parquet")),
+                batch.schema(),
+                &[batch],
+                None,
+            )?;
+        }
+        let path = path.to_str().unwrap();
+        let item = Arc::new(Field::new("item", DataType::Int32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::FixedSizeList(item, 2), false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let config = test_session_config()
+            .with_target_partitions(1)
+            .with_batch_size(64);
+        let ctx = datafusion_context(config.clone());
+        ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
+            .await?;
+        let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
+        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
+            &ctx, &config, sql, &schema,
+        )
+        .await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_over_files_with_explicit_schemas_that_the_scan_casts_stay_in_datafusion()
     -> Result<()> {
-        use datafusion_datasource::file_groups::FileGroup;
-        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
         // The files of `topks_over_int96_files_that_the_scan_casts_stay_in_datafusion`
         // (INT96 timestamps at the epoch, and on the Julian day 3,000,000), of
         // a table of timestamps in nanoseconds, without `coerce_int96`, but
@@ -6351,74 +6504,19 @@ mod tests {
         let ctx = datafusion_context(config.clone());
         ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
             .await?;
-        // The plan of DataFusion, with the explicit schema of every file (a new
-        // plan for every execution, whose TopK counts the partitions that
-        // complete its filter).
         let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let plan = plan.transform_up(|node| {
-                let Some(config) = node
-                    .downcast_ref::<DataSourceExec>()
-                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let file_groups = config
-                    .file_groups
-                    .iter()
-                    .map(|group| {
-                        FileGroup::new(
-                            group
-                                .iter()
-                                .map(|file| {
-                                    file.clone()
-                                        .with_arrow_schema(Arc::clone(&reader_schema))
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect();
-                let config = FileScanConfigBuilder::from(config.clone())
-                    .with_file_groups(file_groups)
-                    .build();
-                Ok(Transformed::yes(
-                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
-                ))
-            })?;
-            Ok(plan.data)
-        };
-        let plan = make_plan().await?;
-        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .expect("DataFusion prunes the second file");
-        let root = create_pipeline_plan_with_runtime(
-            make_plan().await?,
-            config.options(),
-            &ctx.runtime_env(),
-        )?;
-        let tree = format_operator_tree(root.operator());
-        let topks = count::<PhysicalTopK>(root.operator());
-        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
-        let output = |batches| crate::test_utils::EngineOutput {
-            schema: plan.schema(),
-            plan: Arc::clone(&plan),
-            batches,
-            ordered: true,
-        };
-        compare_outputs(&output(expected), &output(actual))
-            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
-        assert_eq!(topks, 0, "{tree}");
-        Ok(())
+        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
+            &ctx,
+            &config,
+            sql,
+            &reader_schema,
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn topks_over_files_whose_explicit_schemas_do_not_fit_stay_in_datafusion()
     -> Result<()> {
-        use datafusion_datasource::file_groups::FileGroup;
-        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
         // A table `k INT, v INT, s VARCHAR` of two Parquet files, whose
         // explicit schemas (`PartitionedFile::arrow_schema`) are the schema of
         // the table: 100 rows `(0, 100, 'foo')`, and 10 rows `(1, 'bad_integer',
@@ -6463,65 +6561,10 @@ mod tests {
         ctx.register_parquet("p", path, ParquetReadOptions::default().schema(&schema))
             .await?;
         let sql = "SELECT k, v FROM p WHERE s LIKE '%foo%' ORDER BY k LIMIT 1";
-        // The plan of DataFusion, with the explicit schema of every file (a new
-        // plan for every execution, whose TopK counts the partitions that
-        // complete its filter).
-        let make_plan = async || -> Result<Arc<dyn ExecutionPlan>> {
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let plan = plan.transform_up(|node| {
-                let Some(config) = node
-                    .downcast_ref::<DataSourceExec>()
-                    .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-                else {
-                    return Ok(Transformed::no(node));
-                };
-                let file_groups = config
-                    .file_groups
-                    .iter()
-                    .map(|group| {
-                        FileGroup::new(
-                            group
-                                .iter()
-                                .map(|file| {
-                                    file.clone().with_arrow_schema(Arc::clone(&schema))
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect();
-                let config = FileScanConfigBuilder::from(config.clone())
-                    .with_file_groups(file_groups)
-                    .build();
-                Ok(Transformed::yes(
-                    DataSourceExec::from_data_source(config) as Arc<dyn ExecutionPlan>
-                ))
-            })?;
-            Ok(plan.data)
-        };
-        let plan = make_plan().await?;
-        let expected = collect(Arc::clone(&plan), ctx.task_ctx())
-            .await
-            .expect("DataFusion prunes the second file");
-        let root = create_pipeline_plan_with_runtime(
-            make_plan().await?,
-            config.options(),
-            &ctx.runtime_env(),
-        )?;
-        let tree = format_operator_tree(root.operator());
-        let topks = count::<PhysicalTopK>(root.operator());
-        let actual = collect(root as Arc<dyn ExecutionPlan>, ctx.task_ctx())
-            .await
-            .unwrap_or_else(|e| panic!("the pipeline engine fails: {e}\n{tree}"));
-        let output = |batches| crate::test_utils::EngineOutput {
-            schema: plan.schema(),
-            plan: Arc::clone(&plan),
-            batches,
-            ordered: true,
-        };
-        compare_outputs(&output(expected), &output(actual))
-            .unwrap_or_else(|message| panic!("Results differ: {message}\n{tree}"));
-        assert_eq!(topks, 0, "{tree}");
-        Ok(())
+        assert_topk_over_explicit_file_schemas_stays_in_datafusion(
+            &ctx, &config, sql, &schema,
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
