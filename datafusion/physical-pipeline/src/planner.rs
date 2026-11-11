@@ -210,6 +210,7 @@ use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
+use crate::operators::recursive_cte::{PhysicalRecursiveCte, WorkTableScanSource};
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
@@ -577,6 +578,11 @@ impl Lowering<'_> {
         if let Some(subquery) = self.try_lower_scalar_subquery(plan)? {
             return Ok(subquery);
         }
+        if let Some(cte) =
+            PhysicalRecursiveCte::try_lower(plan, |term| self.lower_in(term, false))?
+        {
+            return Ok(Arc::new(cte));
+        }
         // A limit with a fetch stops its pipeline once it has its rows.
         let early_stop = self.early_stop.get() || plan.fetch().is_some();
         if let Some(limit) =
@@ -598,6 +604,9 @@ impl Lowering<'_> {
         }
         if let Some(scan) = try_create_scan_source(plan)? {
             return Ok(scan);
+        }
+        if let Some(scan) = WorkTableScanSource::try_lower(plan)? {
+            return Ok(Arc::new(scan));
         }
         if let Some(input) = redistributed_input(plan) {
             let lowered = self.lower(input)?;
@@ -7254,13 +7263,10 @@ mod tests {
             "{plan}"
         );
 
-        // A bridged plan is shown below its bridge: a recursive query, which
+        // A bridged plan is shown below its bridge: a `generate_series`, which
         // has no native operator yet.
-        let explained = explain(
-            "EXPLAIN WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r \
-             WHERE n < 3) SELECT n * 2 AS m FROM r",
-        )
-        .await;
+        let explained =
+            explain("EXPLAIN SELECT value * 2 AS m FROM generate_series(1, 3)").await;
         let plan = plan_of(&explained, "physical_plan");
         assert!(
             plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"),
@@ -7271,7 +7277,7 @@ mod tests {
             "{plan}"
         );
         assert!(
-            plan.contains("\n        RecursiveQueryExec: name=r"),
+            plan.contains("\n        LazyMemoryExec: partitions=1, batch_generators="),
             "{plan}"
         );
 
@@ -7311,15 +7317,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_selects_the_metrics_of_every_operator() {
-        // A native sort of a bridged plan (a recursive query, which has no
+        // A native sort of a bridged plan (a `generate_series`, which has no
         // native operator yet), whose nodes have metrics too.
-        let query = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r \
-                     WHERE n < 3) SELECT n FROM r ORDER BY n DESC";
+        let query =
+            "SELECT value FROM generate_series(1, 3) WHERE value > 1 ORDER BY value DESC";
         let analyzed = async |options: &str| {
             let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
             let plan = plan_of(&explained, "Plan with Metrics").to_string();
             assert!(plan.contains("PhysicalSort"), "{plan}");
-            assert!(plan.contains("RecursiveQueryExec"), "{plan}");
+            assert!(plan.contains("LazyMemoryExec"), "{plan}");
             plan
         };
         // Without metrics, of the native operators and of the bridged nodes.
@@ -7359,7 +7365,7 @@ mod tests {
         let explained = explain(&sql).await;
         for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
             let plan = plan_of(&explained, rendering);
-            for node in ["PhysicalSort", "RecursiveQueryExec"] {
+            for node in ["PhysicalSort", "LazyMemoryExec"] {
                 let line = plan
                     .lines()
                     .find(|line| line.trim_start().starts_with(node))
