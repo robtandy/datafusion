@@ -51,7 +51,8 @@
 //!   lowered from a `HashJoinExec` creates the DataFusion streams of that
 //!   probe input too, without polling them, to raise the same errors (e.g.
 //!   of a scan of an object store that is not registered), unless creating
-//!   them cannot fail (e.g. of scans of memory or of local files, see
+//!   them cannot fail (e.g. of scans of memory, or of local files in a
+//!   runtime with the local file system, see
 //!   [`PhysicalHashJoin::create_probe_streams`]).
 //! * **Probe** (the join as operator, pipeline 0): all threads of the probe
 //!   pipeline pull chunks directly from the probe side and probe the shared
@@ -232,10 +233,9 @@ pub struct PhysicalHashJoin {
     /// join creates them too (see [`Self::create_probe_streams`]), to raise
     /// the same errors.
     probe_plan: Option<Arc<dyn ExecutionPlan>>,
-    /// Whether creating the streams of `probe_plan` cannot fail (see
-    /// [`probe_streams_cannot_fail`]), if the local file system is registered
-    /// in the runtime (which it is by default): the join then creates none.
-    probe_streams_cannot_fail: bool,
+    /// When creating the streams of `probe_plan` can fail (see
+    /// [`probe_stream_failures`]): the join creates none where it cannot.
+    probe_stream_failures: ProbeStreamFailures,
     /// The dynamic filters of the `HashJoinExec` the join was lowered from
     /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
     /// its probe side read: the join sets them to the bounds of its build keys
@@ -598,7 +598,7 @@ impl PhysicalHashJoin {
             children: vec![build, probe],
             spec,
             probe_plan: None,
-            probe_streams_cannot_fail: true,
+            probe_stream_failures: ProbeStreamFailures::Never,
             dynamic_filters: vec![],
         })
     }
@@ -934,7 +934,7 @@ impl PhysicalHashJoin {
         Ok(Some(Self {
             children,
             spec,
-            probe_streams_cannot_fail: probe_streams_cannot_fail(join.right()),
+            probe_stream_failures: probe_stream_failures(join.right()),
             probe_plan: Some(Arc::clone(join.right())),
             dynamic_filters,
         }))
@@ -955,20 +955,24 @@ impl PhysicalHashJoin {
     /// still reads.
     ///
     /// The streams of probe inputs whose streams are created without failing
-    /// (see [`probe_streams_cannot_fail`]), e.g. of scans of memory and of
-    /// local files, are not created (nor is the input copied): with the local
-    /// file system registered in the runtime, creating them would not fail.
+    /// (see [`probe_stream_failures`]) are not created (nor is the input
+    /// copied): e.g. of scans of memory, and of scans of local files if the
+    /// local file system is registered in the runtime (which it is by
+    /// default).
     fn create_probe_streams(&self, ctx: &ExecutionContext) -> Result<()> {
         let Some(probe) = &self.probe_plan else {
             return Ok(());
         };
-        if self.probe_streams_cannot_fail
-            && ctx
+        let cannot_fail = match self.probe_stream_failures {
+            ProbeStreamFailures::Never => true,
+            ProbeStreamFailures::WithoutLocalFileSystem => ctx
                 .task_ctx
                 .runtime_env()
                 .object_store(ObjectStoreUrl::local_filesystem())
-                .is_ok()
-        {
+                .is_ok(),
+            ProbeStreamFailures::Possible => false,
+        };
+        if cannot_fail {
             return Ok(());
         }
         let probe = reset_plan_states(Arc::clone(probe))?;
@@ -1832,38 +1836,71 @@ fn probe_streams_can_be_replayed(plan: &Arc<dyn ExecutionPlan>) -> bool {
     reset_plan_states(Arc::clone(plan)).is_ok_and(|copy| replayed(plan, &copy))
 }
 
-/// Whether creating the streams of all partitions of `plan`, the probe input of
-/// a `HashJoinExec`, cannot fail (so that a native join need not create them,
-/// see [`PhysicalHashJoin::create_probe_streams`]):
+/// When creating the streams of the probe input of a `HashJoinExec` can fail
+/// (see [`probe_stream_failures`]), which decides whether a native join creates
+/// them (see [`PhysicalHashJoin::create_probe_streams`]), and whether it has a
+/// pipeline that creates them as soon as the execution starts (see
+/// [`ProbeStreamsInit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProbeStreamFailures {
+    /// Creating them cannot fail: the join creates none, and has no pipeline
+    /// that would.
+    Never,
+    /// Creating them can only fail if the local file system is not registered
+    /// in the runtime (it is by default): the join creates them if it is not,
+    /// in a pipeline that depends on nothing, so that it fails as soon as the
+    /// execution starts, like DataFusion, also while its build side waits for
+    /// a pipeline breaker that never completes.
+    WithoutLocalFileSystem,
+    /// Creating them may fail: the join creates them as soon as the execution
+    /// starts.
+    Possible,
+}
+
+/// When creating the streams of all partitions of `plan`, the probe input of a
+/// `HashJoinExec`, can fail (so that a native join need not create them where
+/// they cannot, see [`PhysicalHashJoin::create_probe_streams`]):
 ///
-/// * its leaves are scans of memory, generators or no rows, or Parquet (without
-///   virtual columns or decryption) and CSV scans of the local file system,
-///   whose object store is registered by default (unlike, e.g., the store of a
-///   scan of `s3://`, which may not be);
-/// * its other nodes create their streams without failing, but for failing to
-///   create the streams of their inputs: projections, filters,
-///   repartitionings, coalescings of partitions, hash joins (of valid
-///   partitionings, without a prepared build), nested loop and cross joins,
-///   aggregations, sorts, merges, unions, limits and cooperative nodes.
+/// * [never](ProbeStreamFailures::Never) if its leaves are scans of memory,
+///   generators or no rows, and its other nodes create their streams without
+///   failing, but for failing to create the streams of their inputs:
+///   projections, filters, repartitionings, coalescings of partitions, hash
+///   joins (of valid partitionings, without a prepared build), nested loop and
+///   cross joins, aggregations, sorts, merges, unions, limits and cooperative
+///   nodes;
+/// * [only without the local file
+///   system](ProbeStreamFailures::WithoutLocalFileSystem) if, in addition,
+///   some of its leaves are Parquet (without virtual columns or decryption) or
+///   CSV scans of the local file system, whose object store is registered by
+///   default (unlike, e.g., the store of a scan of `s3://`, which may not be);
+/// * [possibly](ProbeStreamFailures::Possible) otherwise, e.g. for a window,
+///   which is not known to create its streams without failing.
 ///
 /// Creating the streams of such inputs reads nothing, but creating the streams
 /// of a copy of a deep input (as the joins below a join, in a chain of joins)
 /// starts the tasks that, e.g., coalesce partitions, which read until they are
-/// dropped: not creating them saves that work, the copy, and the pipeline that
-/// creates them.
-fn probe_streams_cannot_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
+/// dropped: not creating them saves that work and the copy (and, if creating
+/// them can never fail, the pipeline that creates them).
+fn probe_stream_failures(plan: &Arc<dyn ExecutionPlan>) -> ProbeStreamFailures {
     let children = plan.children();
     if children.is_empty() {
-        return plan.is::<EmptyExec>()
+        let source = plan
+            .downcast_ref::<DataSourceExec>()
+            .map(DataSourceExec::data_source);
+        return if plan.is::<EmptyExec>()
             || plan.is::<PlaceholderRowExec>()
             || plan.is::<LazyMemoryExec>()
-            || plan.downcast_ref::<DataSourceExec>().is_some_and(|scan| {
-                let source = scan.data_source();
-                source.is::<MemorySourceConfig>()
-                    || source
-                        .downcast_ref::<FileScanConfig>()
-                        .is_some_and(local_scan_streams_cannot_fail)
-            });
+            || source.is_some_and(|source| source.is::<MemorySourceConfig>())
+        {
+            ProbeStreamFailures::Never
+        } else if source
+            .and_then(|source| source.downcast_ref::<FileScanConfig>())
+            .is_some_and(local_scan_streams_cannot_fail)
+        {
+            ProbeStreamFailures::WithoutLocalFileSystem
+        } else {
+            ProbeStreamFailures::Possible
+        };
     }
     let partitions =
         |plan: &Arc<dyn ExecutionPlan>| plan.output_partitioning().partition_count();
@@ -1893,7 +1930,14 @@ fn probe_streams_cannot_fail(plan: &Arc<dyn ExecutionPlan>) -> bool {
                     PartitionMode::Auto => false,
                 }
         });
-    cannot_fail && children.into_iter().all(probe_streams_cannot_fail)
+    if !cannot_fail {
+        return ProbeStreamFailures::Possible;
+    }
+    children
+        .into_iter()
+        .map(probe_stream_failures)
+        .max()
+        .unwrap_or(ProbeStreamFailures::Never)
 }
 
 /// Whether the streams of the scan of files `config` cannot fail to be
@@ -3119,8 +3163,12 @@ impl PhysicalOperator for PhysicalHashJoin {
             )?;
             // The probe streams of a join lowered from a `HashJoinExec` are
             // created as soon as the execution starts, in a pipeline that
-            // depends on nothing (unless creating them cannot fail).
-            if self.probe_plan.is_some() && !self.probe_streams_cannot_fail {
+            // depends on nothing (unless creating them cannot fail). Whether
+            // the runtime has the local file system, which scans of local
+            // files need, is only known then.
+            if self.probe_plan.is_some()
+                && self.probe_stream_failures != ProbeStreamFailures::Never
+            {
                 let init_pipeline =
                     build.create_union_pipeline(&build_pipeline, false)?;
                 build.set_source(
@@ -3242,13 +3290,15 @@ impl PhysicalOperator for JoinHashTableBuild {
 
 /// The source of a pipeline of the build meta pipeline of a
 /// [`PhysicalHashJoin`] lowered from a `HashJoinExec` whose probe streams may
-/// fail to be created (see [`probe_streams_cannot_fail`]), which depends on
+/// fail to be created (see [`probe_stream_failures`]), which depends on
 /// nothing, so that it runs as soon as the execution starts. It produces no
 /// rows: its sink, the join, creates the streams of its DataFusion probe
 /// input when it creates the local sink state of the pipeline (see
 /// [`PhysicalHashJoin::create_probe_streams`]), as `HashJoinExec::execute`
 /// does right away, also when the build pipelines wait for pipeline breakers
-/// of the build side.
+/// of the build side. (A join whose probe streams can only fail without the
+/// local file system in the runtime checks the runtime then, and creates them
+/// only if it has none.)
 #[derive(Debug)]
 struct ProbeStreamsInit {
     schema: SchemaRef,
@@ -7378,28 +7428,36 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn probe_streams_that_cannot_fail_are_not_created() -> Result<()> {
         // The probe inputs whose streams are created without failing: scans of
-        // memory, of no rows and of local files, below nodes that create their
-        // streams without failing.
+        // memory and of no rows, and, if the runtime has the local file
+        // system, of local files, below nodes that create their streams
+        // without failing.
+        use ProbeStreamFailures::{Never, Possible, WithoutLocalFileSystem};
         let dir = tempfile::tempdir()?;
         write_parquet_table_p(dir.path())?;
         let ctx = datafusion_context(test_session_config());
         register_tables_p_and_b(&ctx, dir.path()).await?;
-        for (sql, cannot_fail) in [
-            ("SELECT k FROM b", true),
-            ("SELECT k, d FROM p WHERE s <> 's1'", true),
+        for (sql, failures) in [
+            ("SELECT k FROM b", Never),
+            ("SELECT k, d FROM p WHERE s <> 's1'", WithoutLocalFileSystem),
             (
                 "SELECT p.k, COUNT(*) FROM p JOIN b ON p.k = b.k GROUP BY p.k ORDER BY p.k",
-                true,
+                WithoutLocalFileSystem,
             ),
-            ("SELECT k FROM b UNION ALL SELECT k FROM p", true),
-            ("SELECT k FROM p ORDER BY k LIMIT 10", true),
+            (
+                "SELECT k FROM b UNION ALL SELECT k FROM p",
+                WithoutLocalFileSystem,
+            ),
+            (
+                "SELECT k FROM p ORDER BY k LIMIT 10",
+                WithoutLocalFileSystem,
+            ),
             // A window, which is not known to create its streams without failing.
-            ("SELECT k, ROW_NUMBER() OVER (ORDER BY k) FROM p", false),
+            ("SELECT k, ROW_NUMBER() OVER (ORDER BY k) FROM p", Possible),
         ] {
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             assert_eq!(
-                probe_streams_cannot_fail(&plan),
-                cannot_fail,
+                probe_stream_failures(&plan),
+                failures,
                 "{sql}\n{}",
                 displayable(plan.as_ref()).indent(true)
             );
@@ -7410,31 +7468,35 @@ mod tests {
             schema: int32_k_schema(),
             delay: Duration::ZERO,
         };
-        for (name, plan, cannot_fail) in [
+        for (name, plan, failures) in [
             (
                 "scan of an unregistered store",
                 unregistered_csv_scan()?,
-                false,
+                Possible,
             ),
             (
                 "JSON scan",
                 unregistered_store_scan(int32_k_schema())?,
-                false,
+                Possible,
             ),
-            ("scan of a local file", missing_csv_scan()?, true),
-            ("streaming table", partition_plan(empty_after)?, false),
+            (
+                "scan of a local file",
+                missing_csv_scan()?,
+                WithoutLocalFileSystem,
+            ),
+            ("streaming table", partition_plan(empty_after)?, Possible),
             (
                 "coalescing of no partitions",
                 Arc::new(CoalescePartitionsExec::new(no_partitions)) as _,
-                false,
+                Possible,
             ),
             (
                 "empty",
                 Arc::new(EmptyExec::new(int32_k_schema())) as _,
-                true,
+                Never,
             ),
         ] {
-            assert_eq!(probe_streams_cannot_fail(&plan), cannot_fail, "{name}");
+            assert_eq!(probe_stream_failures(&plan), failures, "{name}");
         }
 
         // A join of scans of memory has no pipeline that creates its probe
@@ -7447,16 +7509,7 @@ mod tests {
         // a scan of local files fails: the native join creates them, and fails
         // like DataFusion, also without build rows (and without reading its
         // probe side).
-        let registry = DefaultObjectStoreRegistry::new();
-        registry.deregister_store(ObjectStoreUrl::local_filesystem().as_ref())?;
-        let runtime = RuntimeEnvBuilder::new()
-            .with_object_store_registry(Arc::new(registry))
-            .build_arc()?;
-        let task_ctx = Arc::new(
-            TaskContext::default()
-                .with_session_config(test_session_config())
-                .with_runtime(runtime),
-        );
+        let task_ctx = task_ctx_without_local_file_system()?;
         let make_plan =
             || join_on_k(int32_k_scan(vec![])?, missing_csv_scan()?, JoinType::Inner);
         let error = collect(make_plan()?, Arc::clone(&task_ctx))
@@ -7477,6 +7530,103 @@ mod tests {
             native.to_string().contains("No suitable object store"),
             "{native}"
         );
+        Ok(())
+    }
+
+    /// A task context whose runtime has no local file system (`file://`):
+    /// creating the streams of a scan of local files fails.
+    fn task_ctx_without_local_file_system() -> Result<Arc<TaskContext>> {
+        let registry = DefaultObjectStoreRegistry::new();
+        registry.deregister_store(ObjectStoreUrl::local_filesystem().as_ref())?;
+        let runtime = RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(registry))
+            .build_arc()?;
+        Ok(Arc::new(
+            TaskContext::default()
+                .with_session_config(test_session_config())
+                .with_runtime(runtime),
+        ))
+    }
+
+    /// A Parquet scan of `k` of a local file that does not exist: its stream
+    /// is created, but reading it fails.
+    fn missing_parquet_scan() -> Result<Arc<dyn ExecutionPlan>> {
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(ParquetSource::new(int32_k_schema())),
+        )
+        .with_file(PartitionedFile::new("/does/not/exist/data.parquet", 10))
+        .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_probe_streams_fail_at_once_without_the_local_file_system() -> Result<()>
+    {
+        // A join whose build side is a native join whose own build side never
+        // produces anything, and whose probe side is a scan of a local file,
+        // in a runtime without the local file system. DataFusion creates the
+        // stream of the probe side right away, and fails at once: so does the
+        // native join, in the pipeline that depends on nothing (its build
+        // pipelines wait for the nested build side, forever), which it has
+        // although its probe streams cannot fail with the local file system,
+        // the default.
+        type MakeScan = fn() -> Result<Arc<dyn ExecutionPlan>>;
+        let scans: [(&str, MakeScan); 2] =
+            [("CSV", missing_csv_scan), ("Parquet", missing_parquet_scan)];
+        // A hang fails the test (instead of hanging the suite).
+        let timeout = Duration::from_secs(10);
+        for (name, scan) in scans {
+            let make_plan = || {
+                let nested = join_on_k(
+                    pending_plan(int32_k_schema(), 1)?,
+                    int32_k_scan(vec![Some(1)])?,
+                    JoinType::RightSemi,
+                )?;
+                join_on_k(nested, scan()?, JoinType::Inner)
+            };
+            let without_files = task_ctx_without_local_file_system()?;
+            let expected = collect(make_plan()?, Arc::clone(&without_files));
+            let error = tokio::time::timeout(timeout, expected)
+                .await
+                .unwrap_or_else(|_| panic!("{name}: DataFusion does not fail at once"))
+                .expect_err("DataFusion fails");
+            assert!(error.to_string().contains(UNREGISTERED_STORE), "{error}");
+
+            let plan = make_plan()?;
+            let root = lower(&plan)?;
+            let exec = Arc::new(PipelineRootExec::try_new(Arc::clone(&root), plan)?);
+            let native = tokio::time::timeout(timeout, collect(exec, without_files))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{name}: the pipeline engine waits for the build side")
+                })
+                .expect_err("the pipeline engine fails");
+            assert!(native.to_string().contains(UNREGISTERED_STORE), "{native}");
+            let join = root
+                .downcast_ref::<PhysicalHashJoin>()
+                .expect("a native join");
+            assert!(join.build_side().is::<PhysicalHashJoin>(), "{name}");
+            assert_eq!(
+                join.probe_stream_failures,
+                ProbeStreamFailures::WithoutLocalFileSystem,
+                "{name}"
+            );
+            let pipelines = format_pipelines(&root)?;
+            assert!(
+                pipelines
+                    .lines()
+                    .any(|line| line.ends_with(": ProbeStreamsInit -> PhysicalHashJoin")),
+                "{name}: {pipelines}"
+            );
+
+            // With the local file system, creating the stream does not fail,
+            // and the probe side is not read: neither engine completes.
+            assert_pending(collect(make_plan()?, task_ctx())).await;
+            let plan = make_plan()?;
+            let exec = Arc::new(PipelineRootExec::try_new(lower(&plan)?, plan)?);
+            assert_pending(collect(exec, task_ctx())).await;
+        }
         Ok(())
     }
 
