@@ -1375,6 +1375,25 @@ fn updates_like_datafusion(
     {
         return false;
     }
+    // Its `min` and `max` of values that it does not compare by a total order
+    // (see `compares_totally`) keep values that depend on its batches: their
+    // accumulators compare the extreme of a batch (`min_batch`) with their
+    // state, as do those of every group (`GroupsAccumulatorAdapter`), but the
+    // groups accumulator of structs, which compares them row by row. The
+    // native operator's chunks are not DataFusion's batches: e.g. a batch of
+    // `{a: 2}` in 2,048 rows, `{a: NULL}`, `{a: 1}` and `{a: NULL}` after, of
+    // which DataFusion's minimum is `{a: 1}` (`{a: NULL}` is equal to both),
+    // and that of chunks of 2,048 rows `{a: 2}`.
+    if matches!(name, "min" | "max")
+        && aggregate.expressions().iter().any(|argument| {
+            !argument.data_type(&input.schema()).is_ok_and(|data_type| {
+                compares_totally(&data_type)
+                    || (grouped && matches!(data_type, DataType::Struct(_)))
+            })
+        })
+    {
+        return false;
+    }
     if !single_partition {
         return true;
     }
@@ -1912,10 +1931,18 @@ fn materializes_safely(
         bound
             .is_some_and(|bound| i32::try_from(bound.saturating_mul(sets.max(1))).is_ok())
     };
-    // The built-in aggregates collect at most a value of every input row of a
-    // group into their lists (e.g. `array_agg`, or the states of `median` and
-    // of a `count` of distinct values).
-    let elements_fit = |_: &DataType| fits(max_rows());
+    // The lists that the built-in aggregates make of the values of their rows
+    // hold at most a value of every input row of a group (e.g. `array_agg`,
+    // or the states of `median` and of a `count` of distinct values). The
+    // lists that they keep of their input (e.g. the `first_value` of lists,
+    // or the lists in an `array_agg` of them) hold at most an element for every
+    // byte of their input, if their elements take a byte each.
+    let made = |_: &DataType| fits(max_rows());
+    let values = std::cell::OnceCell::new();
+    let kept = |element: &DataType| {
+        has_a_byte_per_value(element)
+            && *values.get_or_init(|| fits(max_values_bytes(aggregate, input, max_rows)))
+    };
     let max_bytes = || -> Option<usize> {
         match builtin_name(aggregate.fun())? {
             // Values of their arguments (and of their order), of at most
@@ -1948,9 +1975,43 @@ fn materializes_safely(
     let Ok(states) = aggregate.state_fields() else {
         return false;
     };
+    // The values that it keeps: of the types of its arguments and its order.
+    let schema = input.schema();
+    let order = aggregate.order_bys().iter().map(|sort| &sort.expr);
+    let kept_types = aggregate
+        .expressions()
+        .iter()
+        .chain(order)
+        .filter_map(|expr| expr.data_type(&schema).ok())
+        .collect::<Vec<_>>();
     std::iter::once(aggregate.field())
         .chain(states)
-        .all(|field| !may_overflow_offsets(field.data_type(), &elements_fit, &bytes_fit))
+        .all(|field| {
+            let data_type = field.data_type();
+            let top: &dyn Fn(&DataType) -> bool = match kept_types.contains(data_type) {
+                true => &kept,
+                false => &made,
+            };
+            !may_overflow_offsets(data_type, top, &kept, &bytes_fit)
+        })
+}
+
+/// Whether every value of `data_type` takes at least a byte of the memory of
+/// its array (of its values, offsets, views or keys), so that the elements of
+/// lists of them are at most the bytes of the lists: not booleans (bits),
+/// nulls, runs, or values of no width.
+fn has_a_byte_per_value(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null | DataType::Boolean | DataType::RunEndEncoded(_, _) => false,
+        DataType::FixedSizeBinary(width) => *width > 0,
+        DataType::FixedSizeList(field, size) => {
+            *size > 0 && has_a_byte_per_value(field.data_type())
+        }
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| has_a_byte_per_value(field.data_type())),
+        _ => true,
+    }
 }
 
 /// Whether DataFusion cannot fail to store or materialize the group keys of
@@ -1959,9 +2020,9 @@ fn materializes_safely(
 /// that fails to grow beyond them (e.g. the groups of a `count` of distinct
 /// strings, which it aggregates by their strings first). The keys keep at
 /// most the bytes of their values (see [`max_expr_bytes`]), for every grouping
-/// set, and at most an element of lists for every byte (but of booleans and
-/// nulls), or of an array of the values of a row (`make_array`), one for
-/// every value.
+/// set, and at most an element of lists for every byte (see
+/// [`has_a_byte_per_value`]), or of an array of the values of a row
+/// (`make_array`), one for every value.
 fn keys_materialize_safely(raw: &AggregateExec) -> bool {
     let schema = raw.input().schema();
     let sets = raw.group_expr().groups().len().max(1);
@@ -1969,7 +2030,7 @@ fn keys_materialize_safely(raw: &AggregateExec) -> bool {
         let Ok(data_type) = expr.data_type(&schema) else {
             return false;
         };
-        if !may_overflow_offsets(&data_type, &|_| false, &|| false) {
+        if !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false) {
             return true;
         }
         let fits = |bound: Option<usize>| {
@@ -1981,7 +2042,7 @@ fn keys_materialize_safely(raw: &AggregateExec) -> bool {
             && function.name() == "make_array"
             && function.args().iter().all(|argument| {
                 argument.data_type(&schema).is_ok_and(|data_type| {
-                    !may_overflow_offsets(&data_type, &|_| false, &|| false)
+                    !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false)
                 })
             })
         {
@@ -1992,10 +2053,9 @@ fn keys_materialize_safely(raw: &AggregateExec) -> bool {
         }
         let bytes_fit =
             fits(max_expr_bytes(expr, raw.input(), &|| max_rows(raw.input())));
-        let elements_fit = |element: &DataType| {
-            !matches!(element, DataType::Boolean | DataType::Null) && bytes_fit
-        };
-        !may_overflow_offsets(&data_type, &elements_fit, &|| bytes_fit)
+        let elements_fit =
+            |element: &DataType| has_a_byte_per_value(element) && bytes_fit;
+        !may_overflow_offsets(&data_type, &elements_fit, &elements_fit, &|| bytes_fit)
     })
 }
 
@@ -2011,7 +2071,12 @@ fn max_values_bytes(
     let order = aggregate.order_bys().iter().map(|sort| &sort.expr);
     let mut bytes = 0_usize;
     for expr in aggregate.expressions().iter().chain(order) {
-        if !may_overflow_offsets(&expr.data_type(&schema).ok()?, &|_| false, &|| false) {
+        if !may_overflow_offsets(
+            &expr.data_type(&schema).ok()?,
+            &|_| false,
+            &|_| false,
+            &|| false,
+        ) {
             continue;
         }
         bytes = bytes.checked_add(max_expr_bytes(expr, input, max_rows)?)?;
@@ -2052,7 +2117,7 @@ fn max_expr_bytes(
         let schema = plan.schema();
         values.into_iter().try_fold(0_usize, |bytes, value| {
             let data_type = value.data_type(&schema).ok()?;
-            if !may_overflow_offsets(&data_type, &|_| false, &|| false) {
+            if !may_overflow_offsets(&data_type, &|_| false, &|_| false, &|| false) {
                 return Some(bytes);
             }
             bytes.checked_add(max_expr_bytes(value, plan, max_rows)?)
@@ -2074,15 +2139,22 @@ fn max_expr_bytes(
 /// groups of a stage) may overflow: those of strings and binaries, which
 /// count the bytes of their values, unless `bytes_fit()`, and those of lists
 /// and maps, which count their elements, unless `elements_fit(element type)`
-/// (at the top: the elements of nested lists, or of large lists, are not
-/// bounded).
+/// (of the lists at the top) or `nested_elements_fit(element type)` (of the
+/// lists in values, or in large lists).
 fn may_overflow_offsets(
     data_type: &DataType,
     elements_fit: &dyn Fn(&DataType) -> bool,
+    nested_elements_fit: &dyn Fn(&DataType) -> bool,
     bytes_fit: &dyn Fn() -> bool,
 ) -> bool {
-    let nested =
-        |data_type: &DataType| may_overflow_offsets(data_type, &|_| false, bytes_fit);
+    let nested = |data_type: &DataType| {
+        may_overflow_offsets(
+            data_type,
+            nested_elements_fit,
+            nested_elements_fit,
+            bytes_fit,
+        )
+    };
     match data_type {
         DataType::Utf8 | DataType::Binary => !bytes_fit(),
         DataType::List(field) | DataType::ListView(field) | DataType::Map(field, _) => {
@@ -2092,10 +2164,20 @@ fn may_overflow_offsets(
         | DataType::LargeListView(field)
         | DataType::FixedSizeList(field, _) => nested(field.data_type()),
         DataType::Struct(fields) => fields.iter().any(|field| {
-            may_overflow_offsets(field.data_type(), elements_fit, bytes_fit)
+            may_overflow_offsets(
+                field.data_type(),
+                elements_fit,
+                nested_elements_fit,
+                bytes_fit,
+            )
         }),
         DataType::Union(fields, _) => fields.iter().any(|(_, field)| {
-            may_overflow_offsets(field.data_type(), elements_fit, bytes_fit)
+            may_overflow_offsets(
+                field.data_type(),
+                elements_fit,
+                nested_elements_fit,
+                bytes_fit,
+            )
         }),
         DataType::Dictionary(_, values) => nested(values),
         DataType::RunEndEncoded(_, values) => nested(values.data_type()),

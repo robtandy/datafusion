@@ -4297,7 +4297,8 @@ mod tests {
                 for (sql, in_order) in [
                     ("SELECT k, MIN(v) FROM t GROUP BY k", true),
                     ("SELECT k, MAX(v) FROM t GROUP BY k", true),
-                    ("SELECT MIN(v), MAX(v) FROM t", true),
+                    // (Without groups, see
+                    // `ungrouped_minima_and_maxima_of_values_without_a_total_order_are_left_to_datafusion`.)
                     // Of values that DataFusion compares by a total order.
                     ("SELECT k, MIN(k), MAX(k) FROM t GROUP BY k", false),
                 ] {
@@ -4311,6 +4312,198 @@ mod tests {
                             .await;
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ungrouped_minima_and_maxima_of_values_without_a_total_order_are_left_to_datafusion()
+    -> Result<()> {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Fields;
+        // The review of e5834101a: DataFusion's accumulators of `min` and `max`
+        // without groups compare the extreme of a batch with their state (see
+        // `updates_like_datafusion`), so that their values of structs, which
+        // they do not compare by a total order, depend on the batches. One
+        // batch of 8,192 rows, `a = 2` in the first 2,048 rows, `a = 1` in row
+        // 2,049, and NULL in the others: DataFusion's minimum is `{a: 1}`
+        // (`{a: NULL}` is equal to both), that of the native chunks of 2,048
+        // rows was `{a: 2}`, also on one thread; and the maximum of the rows
+        // with 1 and 2 swapped. They are left to DataFusion; with groups, whose
+        // accumulator of structs compares the rows one by one, they are
+        // aggregated in order.
+        let fields = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Struct(fields.clone()), true),
+        ]));
+        for (first, then) in [(2, 1), (1, 2)] {
+            let a = Int64Array::from_iter((0..8_192).map(|i| {
+                if i < 2_048 {
+                    Some(first)
+                } else if i == 2_049 {
+                    Some(then)
+                } else {
+                    None
+                }
+            }));
+            let v = StructArray::new(fields.clone(), vec![Arc::new(a) as ArrayRef], None);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1; 8_192])), Arc::new(v)],
+            )?;
+            let setup = mem_table_setup(Arc::clone(&schema), vec![vec![batch]]);
+            for target_partitions in [1, 4, 16] {
+                for trusted in [false, true] {
+                    let mut config = test_session_config()
+                        .with_target_partitions(target_partitions)
+                        .with_repartition_aggregations(false);
+                    if trusted {
+                        config = trusting(config);
+                    }
+                    let sql = "SELECT MIN(v), MAX(v) FROM t";
+                    assert_left_to_datafusion(sql, config.clone(), &setup).await?;
+                    let sql = "SELECT k, MIN(v), MAX(v) FROM t GROUP BY k";
+                    assert!(
+                        planned_aggregations(sql, &config, &setup).await? > 0,
+                        "{sql}"
+                    );
+                    assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A table of two rows, of keys 1 and 2, of lists `v` of `len` values of
+    /// `data_type` (NULLs, or integers), of `partitions` partitions.
+    fn lists_of_two_rows(
+        data_type: &DataType,
+        len: usize,
+        partitions: usize,
+    ) -> Result<(SchemaRef, Vec<Vec<RecordBatch>>)> {
+        use arrow::array::{ListArray, NullArray};
+        use arrow::buffer::OffsetBuffer;
+        let field = Arc::new(Field::new_list_field(data_type.clone(), true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::List(Arc::clone(&field)), true),
+        ]));
+        let row = |k: i64| -> Result<RecordBatch> {
+            let values: ArrayRef = match data_type {
+                DataType::Null => Arc::new(NullArray::new(len)),
+                _ => Arc::new(Int64Array::from_iter_values(0..len as i64)),
+            };
+            let list = ListArray::new(
+                Arc::clone(&field),
+                OffsetBuffer::from_lengths([len]),
+                values,
+                None,
+            );
+            Ok(RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![k])), Arc::new(list)],
+            )?)
+        };
+        let (one, two) = (row(1)?, row(2)?);
+        let table = match partitions {
+            1 => vec![vec![one, two]],
+            _ => vec![vec![one], vec![two]],
+        };
+        Ok((schema, table))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lists_of_values_that_may_not_fit_32_bit_offsets_are_aggregated_like_datafusion()
+    -> Result<()> {
+        use crate::operator::PhysicalOperator;
+        // The review of e5834101a: the lists that an aggregate keeps of its
+        // input (e.g. the `first_value` of lists) are not bounded by its rows,
+        // but by the bytes of their elements, which nulls do not take (see
+        // `has_a_byte_per_value`, and
+        // `huge_lists_of_groups_fail_to_be_materialized_like_datafusion`): they
+        // are aggregated like DataFusion, in order over one partition, and by
+        // DataFusion over two. Lists of integers stay as they are.
+        let sql = "SELECT k, FIRST_VALUE(v ORDER BY k) FROM t GROUP BY k";
+        for (data_type, bounded) in [(DataType::Null, false), (DataType::Int64, true)] {
+            for partitions in [1, 2] {
+                let (schema, table) = lists_of_two_rows(&data_type, 3, partitions)?;
+                let setup = mem_table_setup(schema, table);
+                for target_partitions in [1, 4] {
+                    let config = test_session_config()
+                        .with_target_partitions(target_partitions)
+                        .with_repartition_aggregations(false);
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let plan = aggregation(&plan).expect("an aggregation");
+                    let lowered = PhysicalHashAggregate::try_lower(&plan, lower)?;
+                    let case = format!("{data_type} over {partitions} partitions");
+                    match (bounded, partitions) {
+                        (false, 2) => {
+                            assert!(lowered.is_none(), "{case}");
+                            assert_left_to_datafusion(sql, config.clone(), &setup)
+                                .await?;
+                            continue;
+                        }
+                        (false, _) => assert!(
+                            lowered.is_some_and(|lowered| !lowered.parallel_sink()),
+                            "{case}"
+                        ),
+                        (true, _) => assert!(lowered.is_some(), "{case}"),
+                    }
+                    assert_aggregate_parity_with_setup(sql, config, &setup).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "takes minutes"]
+    async fn huge_lists_of_groups_fail_to_be_materialized_like_datafusion() -> Result<()>
+    {
+        use std::panic::AssertUnwindSafe;
+
+        use futures::FutureExt;
+        // The review of e5834101a: two rows of lists of 2^30 NULLs, in two
+        // partitions on 4 threads without repartitioning (and in one): the
+        // first values of both groups make a list of 2^31 elements, which
+        // DataFusion fails to materialize, with a panic. The native operator
+        // materialized those of every radix partition on their own, and
+        // succeeded. Now DataFusion aggregates the two partitions, and the
+        // native operator the one in a single table, whose accumulators panic
+        // like DataFusion's.
+        let sql = "SELECT k, FIRST_VALUE(v ORDER BY k) FROM t GROUP BY k";
+        for (partitions, target_partitions) in [(2, 4), (1, 1)] {
+            let (schema, table) =
+                lists_of_two_rows(&DataType::Null, 1 << 30, partitions)?;
+            let setup = mem_table_setup(schema, table);
+            let config = test_session_config()
+                .with_target_partitions(target_partitions)
+                .with_repartition_aggregations(false);
+            for ctx in [
+                datafusion_context(config.clone()),
+                crate::test_utils::pipeline_context(config.clone()),
+            ] {
+                setup(&ctx).await?;
+                let result =
+                    AssertUnwindSafe(async { ctx.sql(sql).await?.collect().await })
+                        .catch_unwind()
+                        .await;
+                let Err(panic) = result else {
+                    panic!("{sql} did not panic");
+                };
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied());
+                assert_eq!(
+                    message,
+                    Some("offset overflow: 2147483648 does not fit in i32"),
+                    "{sql}"
+                );
             }
         }
         Ok(())
