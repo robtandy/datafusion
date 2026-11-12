@@ -222,6 +222,7 @@ use crate::operator::{
     downcast_state,
 };
 use crate::operators::analyze::{AnalyzeRendering, AnalyzedInput, PhysicalAnalyze};
+use crate::operators::asof_join::PhysicalAsOfJoin;
 use crate::operators::async_func::PhysicalAsyncFunc;
 use crate::operators::caching::CachingOperator;
 use crate::operators::data_sink::PhysicalDataSink;
@@ -634,6 +635,15 @@ impl Lowering<'_> {
                 && let Some(join) = self.try_lower_loop_join(&join)?
             {
                 return Ok(join);
+            }
+            // The left input of an ASOF join is its probe side, its right
+            // input its build side, which reads all of its input.
+            if let Some(join) = PhysicalAsOfJoin::try_lower(
+                plan,
+                |left| self.lower_in(left, self.early_stop.get()),
+                |right| self.lower_in(right, false),
+            )? {
+                return Ok(Arc::new(join));
             }
         }
         // The materialized CTEs that the subqueries of a scalar subquery scan

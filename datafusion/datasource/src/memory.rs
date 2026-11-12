@@ -13,24 +13,33 @@ use std::sync::Arc;
 use crate::sink::DataSink;
 use crate::source::{DataSource, DataSourceExec};
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt64Array,
+};
+use arrow::compute::kernels::zip::zip;
+use arrow::compute::{and, filter_record_batch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
-    Result, ScalarValue, assert_or_internal_err, plan_err, project_schema,
+    Result, ScalarValue, assert_or_internal_err, internal_datafusion_err, internal_err,
+    plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
+use datafusion_expr::SortExpr;
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::memory::MemoryStream;
 use datafusion_physical_plan::projection::{
     all_alias_free_columns, new_projections_for_columns,
 };
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    ColumnarValue, DisplayAs, DisplayFormatType, Partitioning, PhysicalExpr,
-    SendableRecordBatchStream, Statistics, common,
+    ChildrenPropertiesMode, ColumnarValue, DisplayAs, DisplayFormatType, ExecutionPlan,
+    Partitioning, PhysicalExpr, PlanProperties, ReplaceChildrenOptions,
+    SendableRecordBatchStream, Statistics, apply_expression_roots, common,
 };
 
 use async_trait::async_trait;
@@ -38,6 +47,7 @@ use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
 use futures::StreamExt;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use tokio::sync::RwLock;
 
 /// Data source configuration for reading in-memory batches of data
@@ -993,6 +1003,560 @@ impl DataSink for MemSink {
 
         Ok(row_count as u64)
     }
+}
+
+/// Combine the predicates into one mask over the rows of `batch`. The mask is
+/// true for a row that every predicate matches. `None` means there is no
+/// `WHERE` clause, which matches every row.
+fn evaluate_predicates(
+    predicates: &[Arc<dyn PhysicalExpr>],
+    batch: &RecordBatch,
+) -> Result<Option<BooleanArray>> {
+    let mut combined_mask: Option<BooleanArray> = None;
+
+    for predicate in predicates {
+        let result = predicate.evaluate(batch)?;
+        let array = result.into_array(batch.num_rows())?;
+        let bool_array = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                internal_datafusion_err!("Filter did not evaluate to boolean")
+            })?
+            .clone();
+
+        combined_mask = Some(match combined_mask {
+            Some(existing) => and(&existing, &bool_array)?,
+            None => bool_array,
+        });
+    }
+
+    Ok(combined_mask)
+}
+
+/// Schema of the single `count` column that a DML plan emits.
+fn dml_count_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::UInt64,
+        false,
+    )]))
+}
+
+/// Properties of a DML plan: one partition, one final batch.
+fn dml_plan_properties(schema: &SchemaRef) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
+        EquivalenceProperties::new(Arc::clone(schema)),
+        Partitioning::UnknownPartitioning(1),
+        EmissionType::Final,
+        Boundedness::Bounded,
+    ))
+}
+
+/// A single row holding the number of rows the statement changed.
+fn count_batch(schema: SchemaRef, rows_affected: u64) -> Result<RecordBatch> {
+    let count_array = UInt64Array::from(vec![rows_affected]);
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![Arc::new(count_array) as ArrayRef],
+    )?)
+}
+
+/// Render the predicates as a comma separated list.
+fn format_predicates(predicates: &[Arc<dyn PhysicalExpr>]) -> String {
+    predicates
+        .iter()
+        .map(|predicate| predicate.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Deletes the matching rows of the partitions of a [`MemTable`] when it runs,
+/// and emits the count.
+///
+/// The provider hook that builds this node changes no row, so `EXPLAIN DELETE`
+/// prints the plan and the table keeps its rows. Each run of the plan applies
+/// the delete once, as [`DataSinkExec`] does for an `INSERT`.
+///
+/// [`MemTable`]: <https://docs.rs/datafusion/latest/datafusion/datasource/memory/struct.MemTable.html>
+/// [`DataSinkExec`]: crate::sink::DataSinkExec
+#[derive(Debug)]
+pub struct MemDeleteExec {
+    /// Partitions of the target table, shared with the [`MemTable`].
+    partitions: Vec<PartitionData>,
+    /// Declared sort order of the target table. A delete clears it.
+    sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
+    /// Predicates of the `WHERE` clause. An empty list matches every row.
+    predicates: Vec<Arc<dyn PhysicalExpr>>,
+    /// Single `count` column of the output.
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl MemDeleteExec {
+    /// Delete the rows of `partitions` that match all `predicates` (all rows
+    /// if there is none), and clear the declared sort order `sort_order` of
+    /// the table.
+    pub fn new(
+        partitions: Vec<PartitionData>,
+        sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
+        predicates: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let schema = dml_count_schema();
+        let properties = dml_plan_properties(&schema);
+
+        Self {
+            partitions,
+            sort_order,
+            predicates,
+            schema,
+            properties,
+        }
+    }
+
+    /// The partitions of the target table.
+    pub fn partitions(&self) -> &[PartitionData] {
+        &self.partitions
+    }
+
+    /// The declared sort order of the target table, which a delete clears.
+    pub fn sort_order(&self) -> &Arc<Mutex<Vec<Vec<SortExpr>>>> {
+        &self.sort_order
+    }
+
+    /// The predicates of the `WHERE` clause; none matches every row.
+    pub fn predicates(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.predicates
+    }
+}
+
+impl DisplayAs for MemDeleteExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "MemDeleteExec")?;
+                if !self.predicates.is_empty() {
+                    write!(f, ": predicate=[{}]", format_predicates(&self.predicates))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for MemDeleteExec {
+    fn name(&self) -> &str {
+        "MemDeleteExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        _: Vec<Arc<dyn ExecutionPlan>>,
+        _: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!(
+                "MemDeleteExec has one partition, but partition {partition} was requested"
+            );
+        }
+
+        let partitions = self.partitions.clone();
+        let sort_order = Arc::clone(&self.sort_order);
+        let predicates = self.predicates.clone();
+        let schema = self.schema();
+
+        let stream = futures::stream::once(async move {
+            let rows_affected =
+                delete_rows(&partitions, &sort_order, &predicates).await?;
+            count_batch(schema, rows_affected)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(&self.predicates, f)
+    }
+}
+
+/// Delete the matching rows of every partition and return how many it removed.
+async fn delete_rows(
+    partitions: &[PartitionData],
+    sort_order: &Mutex<Vec<Vec<SortExpr>>>,
+    predicates: &[Arc<dyn PhysicalExpr>],
+) -> Result<u64> {
+    // The surviving rows hold no known order.
+    *sort_order.lock() = vec![];
+
+    let mut total_deleted: u64 = 0;
+
+    for partition_data in partitions {
+        let mut partition = partition_data.write().await;
+        let mut new_batches = Vec::with_capacity(partition.len());
+
+        for batch in partition.iter() {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let (delete_count, keep_mask) = match evaluate_predicates(predicates, batch)?
+            {
+                Some(mask) => {
+                    // Count the rows the mask selects, which are the rows to delete.
+                    let count = mask.iter().filter(|v| v == &Some(true)).count();
+                    // Keep the rows for which the predicate is false or NULL,
+                    // which follows SQL three-valued logic.
+                    let keep: BooleanArray =
+                        mask.iter().map(|v| Some(v != Some(true))).collect();
+                    (count, keep)
+                }
+                None => {
+                    // No `WHERE` clause deletes every row.
+                    (
+                        batch.num_rows(),
+                        BooleanArray::from(vec![false; batch.num_rows()]),
+                    )
+                }
+            };
+
+            total_deleted += delete_count as u64;
+
+            let filtered_batch = filter_record_batch(batch, &keep_mask)?;
+            if filtered_batch.num_rows() > 0 {
+                new_batches.push(filtered_batch);
+            }
+        }
+
+        *partition = new_batches;
+    }
+
+    Ok(total_deleted)
+}
+
+/// Updates the matching rows of the partitions of a [`MemTable`] when it runs,
+/// and emits the count.
+///
+/// The provider hook that builds this node changes no row, so `EXPLAIN UPDATE`
+/// prints the plan and the table keeps its rows. Each run of the plan applies
+/// the update once, as [`DataSinkExec`] does for an `INSERT`.
+///
+/// [`MemTable`]: <https://docs.rs/datafusion/latest/datafusion/datasource/memory/struct.MemTable.html>
+/// [`DataSinkExec`]: crate::sink::DataSinkExec
+#[derive(Debug)]
+pub struct MemUpdateExec {
+    /// Partitions of the target table, shared with the [`MemTable`].
+    partitions: Vec<PartitionData>,
+    /// Declared sort order of the target table. An update clears it.
+    sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
+    /// Schema of the target table.
+    table_schema: SchemaRef,
+    /// One entry for each field of the target table, in field order. A `Some`
+    /// entry holds the expression of the `SET` clause for that field.
+    set_exprs: Vec<Option<Arc<dyn PhysicalExpr>>>,
+    /// Predicates of the `WHERE` clause. An empty list matches every row.
+    predicates: Vec<Arc<dyn PhysicalExpr>>,
+    /// Single `count` column of the output.
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl MemUpdateExec {
+    /// Update the rows of `partitions` (of a table with the schema
+    /// `table_schema`) that match all `predicates` (all rows if there is
+    /// none): every field with a `Some` entry of `set_exprs` (one entry for
+    /// every field, in field order) gets the value of the expression. Clears
+    /// the declared sort order `sort_order` of the table.
+    pub fn new(
+        partitions: Vec<PartitionData>,
+        sort_order: Arc<Mutex<Vec<Vec<SortExpr>>>>,
+        table_schema: SchemaRef,
+        set_exprs: Vec<Option<Arc<dyn PhysicalExpr>>>,
+        predicates: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        let schema = dml_count_schema();
+        let properties = dml_plan_properties(&schema);
+
+        Self {
+            partitions,
+            sort_order,
+            table_schema,
+            set_exprs,
+            predicates,
+            schema,
+            properties,
+        }
+    }
+
+    /// The partitions of the target table.
+    pub fn partitions(&self) -> &[PartitionData] {
+        &self.partitions
+    }
+
+    /// The declared sort order of the target table, which an update clears.
+    pub fn sort_order(&self) -> &Arc<Mutex<Vec<Vec<SortExpr>>>> {
+        &self.sort_order
+    }
+
+    /// The schema of the target table.
+    pub fn table_schema(&self) -> &SchemaRef {
+        &self.table_schema
+    }
+
+    /// One entry for every field of the target table, in field order: the
+    /// expression of its `SET` clause, if any.
+    pub fn set_exprs(&self) -> &[Option<Arc<dyn PhysicalExpr>>] {
+        &self.set_exprs
+    }
+
+    /// The predicates of the `WHERE` clause; none matches every row.
+    pub fn predicates(&self) -> &[Arc<dyn PhysicalExpr>] {
+        &self.predicates
+    }
+
+    /// Render the `SET` clauses as `column=expression`, in field order.
+    fn format_set_exprs(&self) -> String {
+        self.table_schema
+            .fields()
+            .iter()
+            .zip(&self.set_exprs)
+            .filter_map(|(field, set_expr)| {
+                set_expr
+                    .as_ref()
+                    .map(|expr| format!("{}={}", field.name(), expr))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl DisplayAs for MemUpdateExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(f, "MemUpdateExec: set=[{}]", self.format_set_exprs())?;
+                if !self.predicates.is_empty() {
+                    write!(f, ", predicate=[{}]", format_predicates(&self.predicates))?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for MemUpdateExec {
+    fn name(&self) -> &str {
+        "MemUpdateExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        _: Vec<Arc<dyn ExecutionPlan>>,
+        _: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!(
+                "MemUpdateExec has one partition, but partition {partition} was requested"
+            );
+        }
+
+        let partitions = self.partitions.clone();
+        let sort_order = Arc::clone(&self.sort_order);
+        let table_schema = Arc::clone(&self.table_schema);
+        let set_exprs = self.set_exprs.clone();
+        let predicates = self.predicates.clone();
+        let schema = self.schema();
+
+        let stream = futures::stream::once(async move {
+            let rows_affected = update_rows(
+                &partitions,
+                &sort_order,
+                &table_schema,
+                &set_exprs,
+                &predicates,
+            )
+            .await?;
+            count_batch(schema, rows_affected)
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        match apply_expression_roots(self.set_exprs.iter().flatten(), f)? {
+            TreeNodeRecursion::Stop => Ok(TreeNodeRecursion::Stop),
+            TreeNodeRecursion::Continue | TreeNodeRecursion::Jump => {
+                apply_expression_roots(&self.predicates, f)
+            }
+        }
+    }
+}
+
+/// Apply the `SET` clauses to the matching rows of every partition and return
+/// how many rows changed.
+async fn update_rows(
+    partitions: &[PartitionData],
+    sort_order: &Mutex<Vec<Vec<SortExpr>>>,
+    table_schema: &SchemaRef,
+    set_exprs: &[Option<Arc<dyn PhysicalExpr>>],
+    predicates: &[Arc<dyn PhysicalExpr>],
+) -> Result<u64> {
+    // The new values hold no known order.
+    *sort_order.lock() = vec![];
+
+    let mut total_updated: u64 = 0;
+
+    for partition_data in partitions {
+        let mut partition = partition_data.write().await;
+        let mut new_batches = Vec::with_capacity(partition.len());
+
+        for batch in partition.iter() {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let (update_count, update_mask) =
+                match evaluate_predicates(predicates, batch)? {
+                    Some(mask) => {
+                        // Count the rows the mask selects, which are the rows to update.
+                        let count = mask.iter().filter(|v| v == &Some(true)).count();
+                        // Only true, never NULL, selects a row for update.
+                        let normalized: BooleanArray =
+                            mask.iter().map(|v| Some(v == Some(true))).collect();
+                        (count, normalized)
+                    }
+                    None => {
+                        // No `WHERE` clause updates every row.
+                        (
+                            batch.num_rows(),
+                            BooleanArray::from(vec![true; batch.num_rows()]),
+                        )
+                    }
+                };
+
+            total_updated += update_count as u64;
+
+            if update_count == 0 {
+                new_batches.push(batch.clone());
+                continue;
+            }
+
+            let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+
+            for (index, field) in table_schema.fields().iter().enumerate() {
+                let column_name = field.name();
+                let original_column =
+                    batch.column_by_name(column_name).ok_or_else(|| {
+                        internal_datafusion_err!(
+                            "Column '{column_name}' not found in batch"
+                        )
+                    })?;
+
+                let new_column = match set_exprs.get(index).and_then(|e| e.as_ref()) {
+                    Some(set_expr) => {
+                        // `evaluate_selection` evaluates the matching rows only,
+                        // which keeps an error such as a divide by zero away from
+                        // the rows the statement does not touch. It returns NULL
+                        // for the other rows, and `zip` puts the originals back.
+                        let new_values =
+                            set_expr.evaluate_selection(batch, &update_mask)?;
+                        let new_array = new_values.into_array(batch.num_rows())?;
+
+                        // Convert to &dyn Array, which implements Datum
+                        let new_arr: &dyn Array = new_array.as_ref();
+                        let orig_arr: &dyn Array = original_column.as_ref();
+                        zip(&update_mask, &new_arr, &orig_arr)?
+                    }
+                    None => Arc::clone(original_column),
+                };
+
+                new_columns.push(new_column);
+            }
+
+            let updated_batch =
+                RecordBatch::try_new(Arc::clone(table_schema), new_columns)?;
+            new_batches.push(updated_batch);
+        }
+
+        *partition = new_batches;
+    }
+
+    Ok(total_updated)
 }
 
 #[cfg(test)]

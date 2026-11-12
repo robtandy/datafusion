@@ -238,6 +238,36 @@ impl AsOfJoinExec {
         })
     }
 
+    /// The left input, every row of which the join emits once.
+    pub fn left(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.left
+    }
+
+    /// The right input, whose closest eligible row the join selects for every
+    /// left row.
+    pub fn right(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.right
+    }
+
+    /// The equality keys: pairs of expressions of the left and of the right
+    /// input.
+    pub fn on(&self) -> &[(PhysicalExprRef, PhysicalExprRef)] {
+        &self.on
+    }
+
+    /// The ordered comparison of a left and a right expression that selects
+    /// the closest eligible right row.
+    pub fn match_condition(&self) -> &AsOfMatchExpr {
+        &self.match_condition
+    }
+
+    /// The indices, in the join's own schema (the left columns followed by
+    /// the right columns), of the columns that the join emits, if it does not
+    /// emit all of them.
+    pub fn projection(&self) -> Option<&[usize]> {
+        self.projection.as_deref()
+    }
+
     /// Returns this join emitting only the columns in `projection`, in that order.
     /// The indices address the join's own schema, before any projection.
     pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {

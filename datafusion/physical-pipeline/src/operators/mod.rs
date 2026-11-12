@@ -6,6 +6,7 @@
 
 pub mod adaptive_filter;
 pub mod analyze;
+pub mod asof_join;
 pub mod async_func;
 pub mod caching;
 pub mod data_sink;
