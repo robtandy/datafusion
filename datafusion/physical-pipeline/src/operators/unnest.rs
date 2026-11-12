@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, AsArray, FixedSizeListArray, Int64Array, LargeListArray,
     LargeListViewArray, ListArray, ListViewArray, PrimitiveArray, RecordBatch, Scalar,
-    StructArray, new_null_array,
+    StructArray, UInt32Array, new_empty_array,
 };
 use arrow::compute::kernels::length::length;
 use arrow::compute::kernels::zip::zip;
@@ -49,11 +49,14 @@ use crate::operator::{
 /// chunks, and emits their rows in chunks of at most
 /// [`DEFAULT_VECTOR_SIZE`] rows. If the number of rows that every row expands
 /// into is known in advance (no column is unnested more than one level deep),
-/// the rows of a chunk are unnested a few at a time, so that every step
-/// unnests at most about [`DEFAULT_VECTOR_SIZE`] rows (but a single row that
-/// expands into more); otherwise all rows of the chunk are unnested at once.
-/// The memory of the unnested rows is reserved in the memory pool of the
-/// session until they are emitted.
+/// the rows of a chunk are unnested in windows of at most
+/// [`DEFAULT_VECTOR_SIZE`] rows, also those of a row that expands into many
+/// rows; otherwise all rows of the chunk are unnested at once, level by
+/// level, as DataFusion does. The memory of the indices that the rows are
+/// taken with, and an estimate of the memory of the rows, are reserved in the
+/// memory pool of the session before they are allocated, and the memory of
+/// the unnested rows until they are emitted: an unnest fails with
+/// `ResourcesExhausted` before it allocates what the pool cannot hold.
 #[derive(Debug)]
 pub struct PhysicalUnnest {
     /// The input, the only child.
@@ -152,13 +155,19 @@ impl PhysicalUnnest {
 struct Unnesting {
     /// The rows of the chunk.
     input: RecordBatch,
-    /// The next row of `input` to unnest.
-    row: usize,
-    /// The numbers of rows into which the rows of `input` expand, if known.
+    /// If no column is unnested more than one level deep: the numbers of
+    /// rows into which the rows of `input` expand, which are unnested in
+    /// windows of at most [`DEFAULT_VECTOR_SIZE`] rows (see
+    /// [`PhysicalUnnest::next_window`]), from the row `offset` of the
+    /// expansion of the row `row` of `input` on.
     lengths: Option<Int64Array>,
-    /// The unnested rows that are not emitted yet, and the first of them.
+    row: usize,
+    offset: i64,
+    /// Otherwise: whether all rows of `input` are unnested (at once), the
+    /// unnested rows that are not emitted yet, and the first of them.
+    unnested: bool,
     output: Option<RecordBatch>,
-    offset: usize,
+    emitted: usize,
 }
 
 /// The state of a thread of a [`PhysicalUnnest`]: the chunk it unnests, and
@@ -228,90 +237,204 @@ impl PhysicalOperator for PhysicalUnnest {
                 let lengths = self.output_lengths(&batch)?;
                 state.unnesting.insert(Unnesting {
                     input: batch,
-                    row: 0,
                     lengths,
-                    output: None,
+                    row: 0,
                     offset: 0,
+                    unnested: false,
+                    output: None,
+                    emitted: 0,
                 })
             }
         };
-        loop {
-            if let Some(batch) = &unnesting.output {
-                let rows = batch.num_rows() - unnesting.offset;
-                let len = rows.min(DEFAULT_VECTOR_SIZE);
-                *output =
-                    DataChunk::from_record_batch(batch.slice(unnesting.offset, len));
-                unnesting.offset += len;
-                if unnesting.offset == batch.num_rows() {
-                    unnesting.output = None;
-                    state.reservation.free();
-                }
-                if unnesting.output.is_some()
-                    || unnesting.row < unnesting.input.num_rows()
-                {
+        if unnesting.lengths.is_some() {
+            if let Some(window) = self.next_window(unnesting, &state.reservation)? {
+                *output = DataChunk::from_record_batch(window);
+                if unnesting.row < unnesting.input.num_rows() {
                     return Ok(OperatorResult::HaveMoreOutput);
                 }
-                state.unnesting = None;
-                return Ok(OperatorResult::NeedMoreInput);
             }
-            let remaining = unnesting.input.num_rows() - unnesting.row;
-            if remaining == 0 {
-                state.unnesting = None;
-                return Ok(OperatorResult::NeedMoreInput);
-            }
-            // The next rows of the chunk, about `DEFAULT_VECTOR_SIZE` rows
-            // once unnested if the lengths are known (at least one row).
-            let rows = match &unnesting.lengths {
-                Some(lengths) => rows_expanding_into(
-                    &lengths.values()[unnesting.row..],
-                    DEFAULT_VECTOR_SIZE,
-                ),
-                None => remaining,
-            };
-            let rows_to_unnest = unnesting.input.slice(unnesting.row, rows);
-            let lengths = unnesting
-                .lengths
-                .as_ref()
-                .map(|lengths| lengths.slice(unnesting.row, rows));
-            unnesting.row += rows;
+            state.unnesting = None;
+            return Ok(OperatorResult::NeedMoreInput);
+        }
+        if !unnesting.unnested {
+            unnesting.unnested = true;
+            // Reserves the memory of every level before it allocates it.
+            let reservation = &state.reservation;
             let unnested = unnest_batch(
-                &rows_to_unnest,
+                &unnesting.input,
                 &self.schema,
                 &self.lists,
                 &self.structs,
                 &self.options,
-                lengths.as_ref(),
+                &mut |bytes| reservation.try_grow(bytes),
             )?;
-            if let Some(batch) = unnested {
-                state
-                    .reservation
-                    .try_resize(batch.get_array_memory_size())?;
-                unnesting.output = Some(batch);
-                unnesting.offset = 0;
+            reservation.try_resize(
+                unnested
+                    .as_ref()
+                    .map_or(0, RecordBatch::get_array_memory_size),
+            )?;
+            unnesting.output = unnested;
+        }
+        if let Some(batch) = &unnesting.output {
+            let len = (batch.num_rows() - unnesting.emitted).min(DEFAULT_VECTOR_SIZE);
+            *output = DataChunk::from_record_batch(batch.slice(unnesting.emitted, len));
+            unnesting.emitted += len;
+            if unnesting.emitted < batch.num_rows() {
+                return Ok(OperatorResult::HaveMoreOutput);
             }
         }
+        state.unnesting = None;
+        state.reservation.free();
+        Ok(OperatorResult::NeedMoreInput)
     }
 }
 
-/// The number of the first rows of `lengths` (the numbers of rows into which
-/// rows expand) that expand into at most `rows` rows, but at least one.
-fn rows_expanding_into(lengths: &[i64], rows: usize) -> usize {
-    let limit = rows as i64;
-    let mut expanded = 0i64;
-    for (row, &length) in lengths.iter().enumerate() {
-        if row > 0 && expanded + length > limit {
-            return row;
+impl PhysicalUnnest {
+    /// The next window of the rows into which the rows of `unnesting` expand,
+    /// if no column is unnested more than one level deep: at most
+    /// [`DEFAULT_VECTOR_SIZE`] rows, which may expand several rows of the
+    /// input, or a part of the expansion of a row (a row that expands into
+    /// many rows is unnested in several windows). `None` if no row is left.
+    ///
+    /// The memory of the indices that the window takes its rows with, and an
+    /// estimate of the memory of its rows, are reserved in `reservation`
+    /// before they are allocated; then the memory of the rows of the window,
+    /// which the operator emits.
+    fn next_window(
+        &self,
+        unnesting: &mut Unnesting,
+        reservation: &MemoryReservation,
+    ) -> Result<Option<RecordBatch>> {
+        let Some(lengths) = &unnesting.lengths else {
+            return internal_err!("PhysicalUnnest unnests windows of known lengths");
+        };
+        let input = &unnesting.input;
+        // The parts of the expansions of the rows of the window: the row,
+        // and the rows of its expansion.
+        let mut spans = vec![];
+        let mut rows = 0;
+        while unnesting.row < input.num_rows() && rows < DEFAULT_VECTOR_SIZE {
+            let length = lengths.value(unnesting.row);
+            let take =
+                (length - unnesting.offset).min((DEFAULT_VECTOR_SIZE - rows) as i64);
+            if take > 0 {
+                spans.push((unnesting.row, unnesting.offset, unnesting.offset + take));
+                rows += take as usize;
+                unnesting.offset += take;
+            }
+            if unnesting.offset >= length {
+                unnesting.row += 1;
+                unnesting.offset = 0;
+            }
         }
-        expanded += length;
+        if rows == 0 {
+            return Ok(None);
+        }
+        let repeated = (0..input.num_columns())
+            .filter(|&column| {
+                !self
+                    .lists
+                    .iter()
+                    .any(|list| list.index_in_input_schema == column)
+            })
+            .map(|column| input.column(column))
+            .collect::<Vec<_>>();
+        let values = self
+            .lists
+            .iter()
+            .map(|list| list_values(input.column(list.index_in_input_schema)))
+            .collect::<Result<Vec<_>>>()?;
+        let estimate = size_of::<i64>() * rows * (1 + self.lists.len())
+            + repeated
+                .iter()
+                .copied()
+                .chain(values.iter())
+                .map(|array| bytes_per_row(array) * rows)
+                .sum::<usize>();
+        reservation.try_resize(estimate)?;
+
+        // The rows of the columns that are not unnested, repeated.
+        let mut indices = UInt32Array::builder(rows);
+        for &(row, from, to) in &spans {
+            for _ in from..to {
+                indices.append_value(row as u32);
+            }
+        }
+        let indices = indices.finish();
+        // The values of every unnested list, padded with nulls.
+        let mut unnests = Vec::with_capacity(self.lists.len());
+        for (list, values) in self.lists.iter().zip(&values) {
+            let array = input.column(list.index_in_input_schema);
+            let mut positions = PrimitiveArray::<Int64Type>::builder(rows);
+            for &(row, from, to) in &spans {
+                let (start, end) = match array.is_null(row) {
+                    true => (0, 0),
+                    false => list_offsets(array, row)?,
+                };
+                for offset in from..to {
+                    if start + offset < end {
+                        positions.append_value(start + offset);
+                    } else {
+                        positions.append_null();
+                    }
+                }
+            }
+            unnests.push(take(values.as_ref(), &positions.finish(), None)?);
+        }
+        let mut columns = Vec::with_capacity(self.schema.fields().len());
+        for (index, column) in input.columns().iter().enumerate() {
+            let mut replaced = false;
+            for (list, unnest) in self.lists.iter().zip(&unnests) {
+                if list.index_in_input_schema == index {
+                    columns.push(Arc::clone(unnest));
+                    replaced = true;
+                }
+            }
+            if !replaced {
+                columns.push(take(column.as_ref(), &indices, None)?);
+            }
+        }
+        let window = flatten_structs(&columns, &self.schema, &self.structs)?;
+        reservation.try_resize(window.get_array_memory_size())?;
+        Ok(Some(window))
     }
-    lengths.len()
+}
+
+/// The memory of `array` per row, rounded up.
+fn bytes_per_row(array: &ArrayRef) -> usize {
+    array.get_array_memory_size().div_ceil(array.len().max(1))
+}
+
+/// The values of the lists of the list array `list`.
+fn list_values(list: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match list.data_type() {
+        DataType::List(_) => Arc::clone(list.as_list::<i32>().values()),
+        DataType::LargeList(_) => Arc::clone(list.as_list::<i64>().values()),
+        DataType::FixedSizeList(_, _) => Arc::clone(list.as_fixed_size_list().values()),
+        DataType::ListView(_) => Arc::clone(list.as_list_view::<i32>().values()),
+        DataType::LargeListView(_) => Arc::clone(list.as_list_view::<i64>().values()),
+        other => return exec_err!("Invalid unnest datatype {other}"),
+    })
+}
+
+/// The offsets of the first value of the list of the row `row` of the list
+/// array `list`, and after its last value.
+fn list_offsets(list: &ArrayRef, row: usize) -> Result<(i64, i64)> {
+    Ok(match list.data_type() {
+        DataType::List(_) => list.as_list::<i32>().value_range(row),
+        DataType::LargeList(_) => list.as_list::<i64>().value_range(row),
+        DataType::FixedSizeList(_, _) => list.as_fixed_size_list().value_range(row),
+        DataType::ListView(_) => list.as_list_view::<i32>().value_range(row),
+        DataType::LargeListView(_) => list.as_list_view::<i64>().value_range(row),
+        other => return exec_err!("Invalid unnest datatype {other}"),
+    })
 }
 
 /// Unnest the rows of `batch` into rows of `schema`: the list columns
 /// `lists`, level by level from the deepest, and then the struct columns
-/// `structs`. `lengths` are the numbers of rows into which the rows expand,
-/// if known (see [`PhysicalUnnest::output_lengths`]). Returns `None` if the
-/// rows expand into no row.
+/// `structs`. Returns `None` if the rows expand into no row. `reserve`
+/// reserves the memory of every level before it is allocated (see
+/// [`unnest_level`]).
 ///
 /// This is the unnesting of DataFusion's `UnnestExec` (`build_batch`).
 fn unnest_batch(
@@ -320,9 +443,11 @@ fn unnest_batch(
     lists: &[ListUnnest],
     structs: &HashSet<usize>,
     options: &UnnestOptions,
-    lengths: Option<&PrimitiveArray<Int64Type>>,
+    reserve: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Option<RecordBatch>> {
     if lists.is_empty() {
+        // The fields of the structs, with the nulls of their structs.
+        reserve(batch.num_rows().div_ceil(8) * schema.fields().len())?;
         return flatten_structs(batch.columns(), schema, structs).map(Some);
     }
     let depth = lists.iter().map(|list| list.depth).max().unwrap_or(1);
@@ -331,10 +456,8 @@ fn unnest_batch(
     let mut columns = batch.columns().to_vec();
     let mut unnested: HashMap<ListUnnest, ArrayRef> = HashMap::with_capacity(lists.len());
     for level in (1..=depth).rev() {
-        // The lengths are only known in advance for a single level.
-        let lengths = if depth == 1 { lengths } else { None };
         let Some(repeated) =
-            unnest_level(&columns, lists, &mut unnested, level, options, lengths)?
+            unnest_level(&columns, lists, &mut unnested, level, options, reserve)?
         else {
             return Ok(None);
         };
@@ -385,7 +508,7 @@ fn unnest_level(
     unnested: &mut HashMap<ListUnnest, ArrayRef>,
     level: usize,
     options: &UnnestOptions,
-    lengths: Option<&PrimitiveArray<Int64Type>>,
+    reserve: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Option<Vec<ArrayRef>>> {
     let mut arrays = vec![];
     let mut unnests = vec![];
@@ -406,12 +529,9 @@ fn unnest_level(
         arrays.push(array);
         unnests.push(*list);
     }
-    let lengths = match lengths {
-        Some(lengths) => lengths.clone(),
-        None => longest_lengths(&arrays, options)?
-            .as_primitive::<Int64Type>()
-            .clone(),
-    };
+    let lengths = longest_lengths(&arrays, options)?
+        .as_primitive::<Int64Type>()
+        .clone();
     let total = if lengths.is_empty() {
         0
     } else {
@@ -422,26 +542,42 @@ fn unnest_level(
     if total == 0 {
         return Ok(None);
     }
+    // A column that a level below unnests, or that no level unnests, is
+    // repeated; the others are replaced by their unnests (they are not read
+    // again).
+    let repeated = (0..columns.len())
+        .map(|index| {
+            let needed_below = lists
+                .iter()
+                .any(|list| list.index_in_input_schema == index && list.depth < level);
+            let unnested_column =
+                lists.iter().any(|list| list.index_in_input_schema == index);
+            needed_below || !unnested_column
+        })
+        .collect::<Vec<_>>();
+    // The indices of the level, and the arrays it takes with them.
+    let values = arrays.iter().map(list_values).collect::<Result<Vec<_>>>()?;
+    reserve(
+        size_of::<i64>() * total * (1 + arrays.len())
+            + columns
+                .iter()
+                .zip(&repeated)
+                .filter(|(_, repeated)| **repeated)
+                .map(|(column, _)| column)
+                .chain(&values)
+                .map(|array| bytes_per_row(array) * total)
+                .sum::<usize>(),
+    )?;
     for (array, list) in arrays.iter().zip(&unnests) {
         unnested.insert(*list, unnest_list(array, &lengths, total)?);
     }
     let indices = repeated_indices(&lengths, total);
     columns
         .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            // A column that a level below unnests, or that no level unnests,
-            // is repeated; the others are replaced by their unnests.
-            let needed_below = lists
-                .iter()
-                .any(|list| list.index_in_input_schema == index && list.depth < level);
-            let unnested_column =
-                lists.iter().any(|list| list.index_in_input_schema == index);
-            if needed_below || !unnested_column {
-                Ok(take(column.as_ref(), &indices, None)?)
-            } else {
-                Ok(new_null_array(column.data_type(), column.len()))
-            }
+        .zip(repeated)
+        .map(|(column, repeated)| match repeated {
+            true => Ok(take(column.as_ref(), &indices, None)?),
+            false => Ok(new_empty_array(column.data_type())),
         })
         .collect::<Result<Vec<_>>>()
         .map(Some)
@@ -495,7 +631,7 @@ fn unnest_list(
         for row in 0..list.len() {
             let mut values = 0;
             if !list.is_null(row) {
-                let (start, end) = list.offsets(row);
+                let (start, end) = list.value_range(row);
                 values = end - start;
                 for index in start..end {
                     indices.append_value(index);
@@ -525,7 +661,7 @@ trait ListOffsets: Array {
 
     /// The offsets of the first value of the list of `row`, and after its
     /// last value.
-    fn offsets(&self, row: usize) -> (i64, i64);
+    fn value_range(&self, row: usize) -> (i64, i64);
 }
 
 impl ListOffsets for ListArray {
@@ -533,7 +669,7 @@ impl ListOffsets for ListArray {
         ListArray::values(self)
     }
 
-    fn offsets(&self, row: usize) -> (i64, i64) {
+    fn value_range(&self, row: usize) -> (i64, i64) {
         let offsets = self.value_offsets();
         (offsets[row].into(), offsets[row + 1].into())
     }
@@ -544,7 +680,7 @@ impl ListOffsets for LargeListArray {
         LargeListArray::values(self)
     }
 
-    fn offsets(&self, row: usize) -> (i64, i64) {
+    fn value_range(&self, row: usize) -> (i64, i64) {
         let offsets = self.value_offsets();
         (offsets[row], offsets[row + 1])
     }
@@ -555,7 +691,7 @@ impl ListOffsets for FixedSizeListArray {
         FixedSizeListArray::values(self)
     }
 
-    fn offsets(&self, row: usize) -> (i64, i64) {
+    fn value_range(&self, row: usize) -> (i64, i64) {
         let start = self.value_offset_at(row) as i64;
         (start, start + self.value_length() as i64)
     }
@@ -566,7 +702,7 @@ impl ListOffsets for ListViewArray {
         ListViewArray::values(self)
     }
 
-    fn offsets(&self, row: usize) -> (i64, i64) {
+    fn value_range(&self, row: usize) -> (i64, i64) {
         let offset = self.value_offsets()[row] as i64;
         (offset, offset + self.value_sizes()[row] as i64)
     }
@@ -577,7 +713,7 @@ impl ListOffsets for LargeListViewArray {
         LargeListViewArray::values(self)
     }
 
-    fn offsets(&self, row: usize) -> (i64, i64) {
+    fn value_range(&self, row: usize) -> (i64, i64) {
         let offset = self.value_offsets()[row];
         (offset, offset + self.value_sizes()[row])
     }
@@ -870,15 +1006,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rows_are_unnested_a_few_at_a_time() {
-        assert_eq!(rows_expanding_into(&[1, 1, 1], 2), 2);
-        assert_eq!(rows_expanding_into(&[5, 1, 1], 2), 1);
-        assert_eq!(rows_expanding_into(&[0, 0, 3], 2), 2);
-        assert_eq!(rows_expanding_into(&[1, 1], 2048), 2);
-        assert_eq!(rows_expanding_into(&[3000], 2048), 1);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn unnested_rows_reserve_memory() -> Result<()> {
         let sql = "SELECT id, unnest(values) AS v FROM big";
@@ -887,6 +1014,98 @@ mod tests {
         let root = lowered(&ctx, sql).await?;
         assert_eq!(count::<PhysicalUnnest>(&root), 1);
         assert_resources_exhausted(&ctx, sql).await;
+        Ok(())
+    }
+
+    /// `nulls`: a row whose list `l` has 1,000,000 nulls, and whose list of
+    /// lists `ll` has a list of 1,000,000 nulls. Its arrays hold almost no
+    /// memory, its unnests are 1,000,000 rows.
+    fn register_lists_of_nulls(ctx: &SessionContext) -> Result<()> {
+        use arrow::array::{ListArray, NullArray};
+        use arrow::buffer::OffsetBuffer;
+
+        let nulls = 1_000_000;
+        let null_field = Arc::new(Field::new_list_field(DataType::Null, true));
+        let l = ListArray::new(
+            Arc::clone(&null_field),
+            OffsetBuffer::from_lengths([nulls]),
+            Arc::new(NullArray::new(nulls)),
+            None,
+        );
+        let inner_field = Arc::new(Field::new_list_field(l.data_type().clone(), true));
+        let ll = ListArray::new(
+            Arc::clone(&inner_field),
+            OffsetBuffer::from_lengths([1]),
+            Arc::new(l.clone()),
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("l", l.data_type().clone(), true),
+            Field::new("ll", ll.data_type().clone(), true),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(l), Arc::new(ll)])?;
+        assert!(batch.get_array_memory_size() < 1024);
+        ctx.register_table(
+            "nulls",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_indices_of_unnests_reserve_memory_before_they_are_allocated()
+    -> Result<()> {
+        // A list of a million nulls holds almost no memory, but its unnest
+        // takes its rows with indices of a million entries (in windows of
+        // `DEFAULT_VECTOR_SIZE` rows, also of a single row): their memory is
+        // reserved before they are allocated, in one level or in several.
+        for sql in [
+            "SELECT unnest(l) AS v FROM nulls",
+            "SELECT unnest(unnest(ll)) AS v FROM nulls",
+        ] {
+            let ctx = pipeline_context_with_memory_limit(1024);
+            register_lists_of_nulls(&ctx)?;
+            let root = lowered(&ctx, sql).await?;
+            assert_eq!(count::<PhysicalUnnest>(&root), 1, "{sql}");
+            assert_resources_exhausted(&ctx, sql).await;
+            // Without a limit, the rows of the unnest (the projection below
+            // it, of lists of nulls, which the native projection does not
+            // gather, is left to DataFusion).
+            let counted = format!("SELECT COUNT(*) AS n FROM ({sql})");
+            let (expected, actual) = crate::test_utils::run_engines(
+                &counted,
+                test_session_config(),
+                async |ctx: &SessionContext| register_lists_of_nulls(ctx),
+            )
+            .await?;
+            if let Err(message) = crate::test_utils::compare_outputs(&expected, &actual) {
+                panic!("{counted}: {message}");
+            }
+            let root = actual
+                .plan
+                .downcast_ref::<crate::bridge::PipelineRootExec>()
+                .unwrap()
+                .operator();
+            assert_eq!(count::<PhysicalUnnest>(root), 1, "{sql}");
+        }
+        // The windows of a single row hold at most `DEFAULT_VECTOR_SIZE` rows.
+        let ctx = crate::test_utils::pipeline_context(test_session_config());
+        register_lists_of_nulls(&ctx)?;
+        let batches = ctx
+            .sql("SELECT unnest(l) AS v FROM nulls")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1_000_000
+        );
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= DEFAULT_VECTOR_SIZE)
+        );
         Ok(())
     }
 }
