@@ -16,6 +16,7 @@ use arrow::array::{
 use arrow::compute::kernels::sort::SortOptions;
 use arrow::compute::{concat, concat_batches, filter_record_batch, take};
 use arrow::datatypes::SchemaRef;
+use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::{JoinType, Result, internal_datafusion_err, internal_err};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::Operator;
@@ -43,7 +44,8 @@ use crate::sources::batches::{batch_overhead, chunk_memory};
 ///
 /// The build input sinks into the join, which sorts the build rows with a
 /// key that is not null by their keys (in the order of `make_comparator`,
-/// which is the order in which Arrow's comparison kernels compare). The
+/// with the floats of the keys of both sides, also nested ones, normalized:
+/// `-0.0` is `0.0`, as DataFusion compares them). The
 /// build rows that a probe row joins with are then a prefix of them (for `<`
 /// and `<=`) or a suffix (for `>` and `>=`), which a binary search finds:
 /// every thread of the probe side emits the pairs of the rows of its chunks
@@ -361,11 +363,14 @@ impl PhysicalOperator for PhysicalRangeJoin {
             Some(more) => state.reservation.try_grow(more)?,
             None => state.reservation.shrink(estimate - size),
         }
-        // The keys of the chunk, as large as the chunk at most.
-        let keys = self
-            .build_key
-            .evaluate(&batch)?
-            .into_array(batch.num_rows())?;
+        // The keys of the chunk, as large as the chunk at most (with `-0.0`
+        // as `0.0`, which DataFusion compares as equal).
+        let keys = normalize_floats(
+            &self
+                .build_key
+                .evaluate(&batch)?
+                .into_array(batch.num_rows())?,
+        );
         if !batch
             .columns()
             .iter()
@@ -470,10 +475,12 @@ impl PhysicalOperator for PhysicalRangeJoin {
             Some(pending) => pending,
             None => {
                 let probe = input.compact()?;
-                let keys = self
-                    .probe_key
-                    .evaluate(&probe)?
-                    .into_array(probe.num_rows())?;
+                let keys = normalize_floats(
+                    &self
+                        .probe_key
+                        .evaluate(&probe)?
+                        .into_array(probe.num_rows())?,
+                );
                 let ranges = self.ranges(&build, &keys)?;
                 // The build rows that the probe rows joined with.
                 let joined = ranges.iter().filter(|(start, end)| start < end);
@@ -761,6 +768,24 @@ mod tests {
              ON s.a < t.a - 50",
             "SELECT t1.id, t2.k FROM t1 JOIN t2 ON t1.c > t2.w",
             "SELECT t2.k, t1.id FROM t2 JOIN t1 ON t2.name <= t1.d",
+            // `-0.0` equals `0.0`, for every comparison, also of nested
+            // floats.
+            "SELECT l.i, r.j FROM (VALUES (1, CAST(-0.0 AS DOUBLE)), (2, 0.0), (3, 1.0)) \
+             AS l(i, x) JOIN (VALUES (1, CAST(0.0 AS DOUBLE)), (2, CAST(-0.0 AS DOUBLE)), \
+             (3, -1.0)) AS r(j, y) ON l.x < r.y",
+            "SELECT l.i, r.j FROM (VALUES (1, CAST(-0.0 AS DOUBLE)), (2, 0.0), (3, 1.0)) \
+             AS l(i, x) JOIN (VALUES (1, CAST(0.0 AS DOUBLE)), (2, CAST(-0.0 AS DOUBLE)), \
+             (3, -1.0)) AS r(j, y) ON l.x <= r.y",
+            "SELECT l.i, r.j FROM (VALUES (1, CAST(-0.0 AS DOUBLE)), (2, 0.0), (3, 1.0)) \
+             AS l(i, x) LEFT JOIN (VALUES (1, CAST(0.0 AS DOUBLE)), \
+             (2, CAST(-0.0 AS DOUBLE)), (3, -1.0)) AS r(j, y) ON l.x > r.y",
+            "SELECT l.i, r.j FROM (VALUES (1, CAST(-0.0 AS DOUBLE)), (2, 0.0), (3, 1.0)) \
+             AS l(i, x) FULL JOIN (VALUES (1, CAST(0.0 AS DOUBLE)), \
+             (2, CAST(-0.0 AS DOUBLE)), (3, -1.0)) AS r(j, y) ON l.x >= r.y",
+            "SELECT l.i, r.j FROM (VALUES (1, named_struct('f', CAST(-0.0 AS DOUBLE))), \
+             (2, named_struct('f', 0.0))) AS l(i, x) JOIN (VALUES \
+             (1, named_struct('f', CAST(0.0 AS DOUBLE))), \
+             (2, named_struct('f', CAST(-0.0 AS DOUBLE)))) AS r(j, y) ON l.x < r.y",
         ] {
             for target_partitions in [1, 4] {
                 let config = config.clone().with_target_partitions(target_partitions);
