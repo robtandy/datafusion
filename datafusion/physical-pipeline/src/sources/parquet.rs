@@ -121,12 +121,15 @@ const MIN_UNIT_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
 ///   folds into it (see [`Self::try_with_filter`]): then the scan produces
 ///   the output of the `FilterExec`;
 /// * the conjuncts of the predicate of its [`ParquetSource`]: the dynamic
-///   filters of the TopKs and hash joins above it, and the filters that
-///   DataFusion pushed into it to prune its files, row groups and pages.
-///   No row has to be filtered by them (the nodes above evaluate them too,
-///   or drop the rows that they reject), so the scan only evaluates them
-///   where that pays off. With `pushdown_filters`, DataFusion relies on the
-///   scan to apply its static conjuncts, which it then always does.
+///   filters of the hash joins above it, and the filters that DataFusion
+///   pushed into it to prune its files, row groups and pages. No row has to
+///   be filtered by them (the nodes above evaluate them too, or drop the rows
+///   that they reject), so the scan only evaluates them where that pays off.
+///   The dynamic filters of the TopKs and aggregations above it, which these
+///   tighten from the rows of the scan, only prune (see
+///   [`ConjunctMeter::tightens`]). With `pushdown_filters`, DataFusion relies
+///   on the scan to apply its static conjuncts, which it then always does:
+///   in the row filter, or natively, as the conjuncts of a folded filter.
 ///
 /// The scan evaluates a conjunct in the row filter of the Parquet decoder,
 /// or natively on the decoded chunks. The row filter decodes the columns of
@@ -1359,6 +1362,20 @@ impl ConjunctMeter {
         self.set_placement(placement);
     }
 
+    /// Whether the conjunct is a dynamic filter that its node is still
+    /// tightening, from the rows that the scan produces: the threshold of a
+    /// TopK, or the bounds of a `MIN` or `MAX` aggregation above it (the
+    /// dynamic filters of the hash joins above a scan are complete before it
+    /// starts). Its node tightens it as it receives rows, once per buffer or
+    /// batch of rows: filtering the rows of the scan with it would delay that
+    /// (by the rows that the filter rejects), and the pruning of the files,
+    /// row groups and pages that it gives. So it only prunes.
+    fn tightens(&self) -> bool {
+        self.expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .is_some_and(|filter| !filter.is_complete())
+    }
+
     /// Whether the row filter of a version applies the conjunct to every row
     /// (see [`RowFilterState::version_filter`]): a folded or exact conjunct
     /// in the row filter, and a pinned one.
@@ -1905,7 +1922,10 @@ impl RowFilterState {
         // change after.
         let epoch = self.epoch.load(Ordering::Relaxed);
         let in_row_filter = (0..self.meters.len())
-            .filter(|&candidate| self.meters[candidate].placement() == IN_ROW_FILTER)
+            .filter(|&candidate| {
+                self.meters[candidate].placement() == IN_ROW_FILTER
+                    && !self.meters[candidate].tightens()
+            })
             .collect::<Vec<_>>();
         if in_row_filter.is_empty() || !self.reads_with_row_filter(unit) {
             return self.native_version(scan, ctx);
@@ -2001,9 +2021,11 @@ impl RowFilterState {
             .iter()
             .chain(&others)
             .map(|&candidate| {
+                // A dynamic filter that is being tightened only prunes.
+                let meter = &self.meters[candidate];
                 RowFilterExpr::new_arc(
                     Arc::clone(&predicate.candidates[candidate].expr),
-                    Some(Arc::clone(&self.meters[candidate])),
+                    (!meter.tightens()).then(|| Arc::clone(meter)),
                     applied.contains(&candidate),
                 )
             })
@@ -3759,6 +3781,36 @@ mod tests {
         // Every decision bumps the epoch, so that the threads build their row
         // filters again.
         assert!(epoch.load(Ordering::Relaxed) >= 8);
+    }
+
+    #[test]
+    fn dynamic_filters_that_are_tightened_only_prune() {
+        // The dynamic filter of a TopK or an aggregation above the scan,
+        // which their nodes tighten from the rows of the scan, is not
+        // evaluated by the row filter until it is complete (as the dynamic
+        // filters of hash joins are when their probe sides start).
+        let key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&key)],
+            lit(true),
+        ));
+        let dynamic = RowFilterConjunct {
+            expr: Arc::clone(&filter) as Arc<dyn PhysicalExpr>,
+            kind: ConjunctKind::Optional,
+            columns: vec![0],
+        };
+        let meter =
+            ConjunctMeter::new(&dynamic, Arc::new(AtomicU64::new(0)), Count::new());
+        assert!(meter.tightens());
+        filter.mark_complete();
+        assert!(!meter.tightens());
+        // Other conjuncts are never tightened.
+        let meter = ConjunctMeter::new(
+            &candidate(ConjunctKind::Optional),
+            Arc::new(AtomicU64::new(0)),
+            Count::new(),
+        );
+        assert!(!meter.tightens());
     }
 
     #[test]
