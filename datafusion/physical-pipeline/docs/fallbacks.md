@@ -128,9 +128,10 @@ accounting of all native operators):
   operators read all of their input first), and by keys that the native sort
   orders otherwise (unions); and the merges of sorted partitions that never
   end whose partitions the planner cannot split (see
-  [partial sorts](#partial-sorts)), or whose partitions scan a materialized
-  CTE around them (`PhysicalStreamingMerge` runs every partition in an
-  execution of its own);
+  [partial sorts](#partial-sorts)). `PhysicalStreamingMerge` runs every
+  partition in an execution of its own: the partitions that scan a
+  materialized CTE around the merge are lowered again by every execution of
+  the merge, with scans of the rows of its body;
 - aggregations by groups that their input clusters
   (`group_clustering_mode`), and the other aggregations that
   `PhysicalHashAggregate::try_lower` refuses;
@@ -152,8 +153,8 @@ receives them, in a single pipeline:
   of every partition: it is lowered as the `PhysicalUnion` of a
   `PhysicalPartialSort` of every partition, with the fetch, of the plans of
   the partitions of its input. These are the partitions of scans of in-memory
-  batches, of files (a plan for every file group) and of streaming tables,
-  and of the unions above them, and of the nodes that compute every
+  batches, of files (a plan for every file group), of streaming tables and
+  of the generators of a `LazyMemoryExec`, and of the unions above them, and of the nodes that compute every
   partition of the same partition of their input (projections, filters,
   `LocalLimitExec`s, sorts, aggregations and windows of every partition, and
   the nodes that only change the size of batches).

@@ -1217,11 +1217,11 @@ impl Lowering<'_> {
     /// (see [`partitions_of`]), every one sorted, through the repartitionings
     /// that keep the order of every partition (which only distribute sorted
     /// rows); to the native operators of its single partition if there is
-    /// one (with a limit for its fetch). Returns `Ok(None)` for any other
-    /// node, and for inputs whose partitions the planner does not split, or
-    /// whose native operators read the materialized CTEs around them (which
-    /// the merge, which runs every input in an execution of its own, does not
-    /// see).
+    /// one (with a limit for its fetch). The inputs that scan materialized
+    /// CTEs around the merge read their rows (see
+    /// [`PhysicalStreamingMerge::with_outer_ctes`]). Returns `Ok(None)` for
+    /// any other node, and for inputs whose partitions the planner does not
+    /// split.
     fn try_lower_streaming_merge(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1280,15 +1280,24 @@ impl Lowering<'_> {
                 None => input,
             }));
         }
-        if inputs.iter().any(reads_materialized_ctes) {
-            return Ok(None);
+        // The materialized CTEs around the merge that its inputs scan.
+        let mut outer_ctes = vec![];
+        for partition in &partitions {
+            for (id, cte) in self.materialized_ctes.scanned_by(partition)? {
+                if !outer_ctes.iter().any(|(outer, _)| *outer == id) {
+                    outer_ctes.push((id, cte));
+                }
+            }
         }
-        let merge = PhysicalStreamingMerge::try_new(
+        let mut merge = PhysicalStreamingMerge::try_new(
             std::mem::take(&mut inputs),
             plan.schema(),
             merge.expr().clone(),
             merge.fetch(),
         )?;
+        if !outer_ctes.is_empty() {
+            merge = merge.with_outer_ctes(partitions, outer_ctes);
+        }
         Ok(Some(Arc::new(merge)))
     }
 
@@ -1493,12 +1502,6 @@ fn redistributes_rows(repartition: &RepartitionExec) -> bool {
 #[expect(deprecated)]
 fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
-}
-
-/// Whether the operator tree `operator` scans a materialized CTE.
-fn reads_materialized_ctes(operator: &Arc<dyn PhysicalOperator>) -> bool {
-    operator.is::<MaterializedCteScan>()
-        || operator.children().iter().any(reads_materialized_ctes)
 }
 
 /// Whether `plan`, a node whose input is removed (see

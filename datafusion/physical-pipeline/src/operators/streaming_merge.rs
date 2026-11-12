@@ -5,6 +5,7 @@
 //! [`PhysicalStreamingMerge`]: the merge of sorted partitions that never end
 //! (a `SortPreservingMergeExec` of unbounded inputs).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -15,6 +16,8 @@ use arrow::row::{RowConverter, Rows, SortField};
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::execution_plan::reset_plan_states;
 use futures::StreamExt;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
@@ -23,7 +26,9 @@ use crate::operator::{
     ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
     SourceResult, TaskInterrupt, downcast_state_mut,
 };
+use crate::operators::materialized_cte::OuterCte;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::planner::lower_execution_plan_with_cte_rows;
 use crate::sort::memory_size;
 use crate::sources::batches::batch_overhead;
 
@@ -48,6 +53,10 @@ pub struct PhysicalStreamingMerge {
     schema: SchemaRef,
     expr: LexOrdering,
     fetch: Option<usize>,
+    /// The DataFusion plans of the inputs, if they scan materialized CTEs
+    /// around the merge, `outer_ctes` (see [`Self::with_outer_ctes`]).
+    plans: Vec<Arc<dyn ExecutionPlan>>,
+    outer_ctes: Vec<(u64, OuterCte)>,
 }
 
 impl PhysicalStreamingMerge {
@@ -66,7 +75,51 @@ impl PhysicalStreamingMerge {
             schema,
             expr,
             fetch,
+            plans: vec![],
+            outer_ctes: vec![],
         })
+    }
+
+    /// This merge, whose inputs (the native operators of `plans`) scan the
+    /// materialized CTEs around it, `outer_ctes` (by the ids of their
+    /// buffers): an execution of an input, apart from the execution of the
+    /// merge, does not see the rows of their bodies, so every execution of
+    /// the merge lowers `plans` again, with scans of the rows of the bodies
+    /// (see [`OuterCte`]), which the execution of the merge computed before.
+    pub(crate) fn with_outer_ctes(
+        mut self,
+        plans: Vec<Arc<dyn ExecutionPlan>>,
+        outer_ctes: Vec<(u64, OuterCte)>,
+    ) -> Self {
+        self.plans = plans;
+        self.outer_ctes = outer_ctes;
+        self
+    }
+
+    /// The inputs that an execution of the merge executes, in the execution
+    /// of `ctx`.
+    fn inputs(&self, ctx: &ExecutionContext) -> Result<Vec<Arc<dyn PhysicalOperator>>> {
+        if self.outer_ctes.is_empty() {
+            return Ok(self.children.clone());
+        }
+        let rows = self
+            .outer_ctes
+            .iter()
+            .map(|(id, cte)| Ok((*id, cte.rows(ctx)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let options = ctx.task_ctx.session_config().options();
+        self.plans
+            .iter()
+            .map(|plan| {
+                let plan = reset_plan_states(Arc::clone(plan))?;
+                lower_execution_plan_with_cte_rows(
+                    &plan,
+                    options.as_ref(),
+                    ctx.task_ctx.runtime_env().as_ref(),
+                    &rows,
+                )
+            })
+            .collect()
     }
 
     /// The row converter of the keys `expr` of rows with the schema `schema`.
@@ -153,7 +206,7 @@ impl PhysicalOperator for PhysicalStreamingMerge {
     ) -> Result<Box<dyn LocalSourceState>> {
         // The source is not parallel: a single thread merges the inputs.
         let inputs = self
-            .children
+            .inputs(ctx)?
             .iter()
             .map(|input| {
                 let stream = Executor::execute_stream(
@@ -549,6 +602,122 @@ mod tests {
             rows += batch.num_rows();
         }
         Ok(())
+    }
+
+    /// A generator of the values `next, next + step, ...` (sorted), in
+    /// batches of 7 rows, that never ends.
+    #[derive(Debug, Clone, Copy)]
+    struct Counter {
+        next: i64,
+        step: i64,
+    }
+
+    impl std::fmt::Display for Counter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "counter: next={}, step={}", self.next, self.step)
+        }
+    }
+
+    impl datafusion_physical_plan::memory::LazyBatchGenerator for Counter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn boundedness(&self) -> datafusion_physical_plan::execution_plan::Boundedness {
+            datafusion_physical_plan::execution_plan::Boundedness::Unbounded {
+                requires_infinite_memory: false,
+            }
+        }
+
+        fn generate_next_batch(&mut self) -> Result<Option<RecordBatch>> {
+            let values = (0..7)
+                .map(|i| self.next + i * self.step)
+                .collect::<Vec<_>>();
+            self.next += 7 * self.step;
+            Ok(Some(RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int64Array::from(values))],
+            )?))
+        }
+
+        fn reset_state(
+            &self,
+        ) -> Arc<
+            parking_lot::RwLock<dyn datafusion_physical_plan::memory::LazyBatchGenerator>,
+        > {
+            Arc::new(parking_lot::RwLock::new(*self))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_generators_that_never_end_are_native() {
+        // Two generators of sorted values that never end, merged.
+        for fetch in [4, 100] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                let generators = [(0, 2), (1, 2)]
+                    .map(|(next, step)| {
+                        Arc::new(parking_lot::RwLock::new(Counter { next, step }))
+                            as Arc<
+                                parking_lot::RwLock<
+                                    dyn datafusion_physical_plan::memory::LazyBatchGenerator,
+                                >,
+                            >
+                    })
+                    .to_vec();
+                let mut exec = datafusion_physical_plan::memory::LazyMemoryExec::try_new(
+                    schema(),
+                    generators,
+                )
+                .unwrap();
+                exec.add_ordering(ordering().iter().cloned());
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering(), Arc::new(exec))
+                        .with_fetch(Some(fetch)),
+                )
+            };
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(count::<PhysicalStreamingMerge>(&root), 1, "{fetch}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_inputs_that_scan_the_materialized_ctes_around_them_are_native() {
+        use datafusion_physical_plan::materialized_cte::{
+            MaterializedCteBuffer, MaterializedCteExec, MaterializedCteScanExec,
+        };
+        // A stream that never ends, merged with the scan of a materialized
+        // CTE around the merge (which an execution of its own scans).
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let body = datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+                &[vec![
+                    RecordBatch::try_new(
+                        schema(),
+                        vec![Arc::new(Int64Array::from(vec![1, 5, 9]))],
+                    )
+                    .unwrap(),
+                ]],
+                schema(),
+                None,
+            )
+            .unwrap();
+            let buffer = Arc::new(MaterializedCteBuffer::new(7, "c"));
+            let scan = MaterializedCteScanExec::new(7, "c", schema(), 1)
+                .bind(Arc::clone(&buffer));
+            let union = datafusion_physical_plan::union::UnionExec::try_new(vec![
+                endless_table(1),
+                Arc::new(scan),
+            ])
+            .unwrap();
+            let merge =
+                SortPreservingMergeExec::new(ordering(), union).with_fetch(Some(5));
+            Arc::new(MaterializedCteExec::new(body, Arc::new(merge), buffer))
+        };
+        let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+        assert_eq!(count::<PhysicalStreamingMerge>(&root), 1);
+        assert_eq!(
+            count::<crate::operators::materialized_cte::PhysicalMaterializedCte>(&root),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

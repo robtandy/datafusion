@@ -24,6 +24,7 @@ use datafusion_physical_plan::buffer::BufferExec;
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::LocalLimitExec;
+use datafusion_physical_plan::memory::LazyMemoryExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
@@ -342,7 +343,8 @@ pub(crate) fn first_rows_of_merged_partitions(
 /// with the rows of its partition, in their order: of a scan of in-memory
 /// batches (every partition with its batches), of a scan of files (every
 /// partition with its file group), of a streaming table (every partition
-/// with its stream), and of the unions of them and of the nodes above them
+/// with its stream), of the generators of a `LazyMemoryExec` (every partition
+/// with its generator), and of the unions of them and of the nodes above them
 /// that compute every partition of the same partition of their input
 /// (projections, filters, limits, sorts, aggregations and windows of every
 /// partition, and the nodes that only change the size of batches). `None`
@@ -374,6 +376,24 @@ pub(crate) fn partitions_of(
             return Ok(Some(partitions));
         }
         return Ok(None);
+    }
+    if let Some(lazy) = plan.downcast_ref::<LazyMemoryExec>() {
+        // Every generator is a partition (which the native source projects
+        // to the schema of the scan by the names of its columns).
+        let ordering = plan.output_ordering().cloned();
+        let partitions = lazy
+            .generators()
+            .iter()
+            .map(|generator| {
+                let mut exec =
+                    LazyMemoryExec::try_new(plan.schema(), vec![Arc::clone(generator)])?;
+                if let Some(ordering) = &ordering {
+                    exec.add_ordering(ordering.iter().cloned());
+                }
+                Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(partitions));
     }
     if let Some(streaming) = plan.downcast_ref::<StreamingTableExec>() {
         let partitions = streaming
