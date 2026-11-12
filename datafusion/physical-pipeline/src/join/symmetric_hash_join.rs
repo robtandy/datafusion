@@ -127,16 +127,17 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 
 use super::merge_join::{
-    EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, compact_to_keep, comparable_type,
-    evaluate_keys, filter_mask, is_smaller, key_memory, matchable_rows, probe_role,
-    without_reordering,
+    EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput,
+    NestedPlan, OUTPUT, PAIR_INDEX_BYTES, PART_BYTES, StoredRows, compact_to_keep,
+    comparable_type, evaluate_keys, filter_mask, is_smaller, key_memory, matchable_rows,
+    probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
     SourceResult, TaskInterrupt, downcast_state,
 };
+use crate::operators::materialized_cte::MaterializedCtes;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::sort::memory_size;
 
@@ -152,9 +153,29 @@ use crate::sort::memory_size;
 /// join implements: joins whose keys have different types on the two sides,
 /// or whose keys the row format does not support.
 ///
+///
+/// The inputs that the join reads in executions of their own (see
+/// `NestedInput`) must not scan materialized CTEs around the join: the
+/// planner lowers the joins of the continuations of such CTEs with their rows
+/// (see `try_lower_with_ctes`).
+///
 /// [`PhysicalHashJoin`]: crate::join::PhysicalHashJoin
 pub fn try_lower<F>(
     plan: &Arc<dyn ExecutionPlan>,
+    lower_input: F,
+) -> Result<Option<Arc<dyn PhysicalOperator>>>
+where
+    F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
+{
+    try_lower_with_ctes(plan, &MaterializedCtes::default(), lower_input)
+}
+
+/// [`try_lower`] in the continuations of the materialized CTEs `ctes`: the
+/// executions of their own of the inputs that never end (see [`NestedPlan`])
+/// read the rows of those that they scan.
+pub(crate) fn try_lower_with_ctes<F>(
+    plan: &Arc<dyn ExecutionPlan>,
+    ctes: &MaterializedCtes,
     mut lower_input: F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
@@ -186,11 +207,13 @@ where
             }),
             _ => None,
         };
-        return lower_symmetric(&equi_join, sorted, &mut lower_input);
+        return lower_symmetric(&equi_join, sorted, ctes, &mut lower_input);
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
     let build_right = unbounded[0] || (!unbounded[1] && is_smaller(&right, &left));
+    // The CTEs around the join, before those in the inputs are lowered.
+    let nested_plans = [NestedPlan::of(&left, ctes)?, NestedPlan::of(&right, ctes)?];
     let (build, probe) = match build_right {
         true => (&right, &left),
         false => (&left, &right),
@@ -212,6 +235,7 @@ where
     Ok(Some(Arc::new(PhysicalSymmetricHashJoin {
         children: vec![left, right],
         spec,
+        nested_plans,
     })))
 }
 
@@ -232,6 +256,7 @@ pub(crate) struct SortedInputs<'a> {
 pub(crate) fn lower_symmetric<F>(
     join: &EquiJoin<'_>,
     sorted: Option<SortedInputs<'_>>,
+    ctes: &MaterializedCtes,
     lower_input: &mut F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
@@ -254,7 +279,10 @@ where
         spec.sorted_filter = Some(sorted_filter);
     }
     let mut children = Vec::with_capacity(2);
-    for input in &inputs {
+    let mut nested_plans = [None, None];
+    for (input, nested_plan) in inputs.iter().zip(&mut nested_plans) {
+        // The CTEs around the join, before those in the input are lowered.
+        *nested_plan = NestedPlan::of(input, ctes)?;
         let lowered = lower_input(input, InputRole::Streamed)?;
         if lowered.schema() != input.schema() {
             return internal_err!(
@@ -266,7 +294,11 @@ where
         }
         children.push(lowered);
     }
-    Ok(Some(Arc::new(PhysicalSymmetricHashJoin { children, spec })))
+    Ok(Some(Arc::new(PhysicalSymmetricHashJoin {
+        children,
+        spec,
+        nested_plans,
+    })))
 }
 
 /// The plan that produces the rows of `input`, an input of a symmetric join
@@ -309,6 +341,10 @@ pub struct PhysicalSymmetricHashJoin {
     /// The left and the right input.
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: SymmetricJoinSpec,
+    /// The plans of the inputs, if they scan materialized CTEs around the
+    /// join, which the executions of their own of the inputs lower again
+    /// (see [`NestedPlan`]).
+    nested_plans: [Option<NestedPlan>; 2],
 }
 
 /// Everything about a symmetric hash join that does not depend on its
@@ -1807,8 +1843,8 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
         };
         let run = SymmetricRun {
             inputs: [
-                NestedInput::start(self.left(), ctx)?,
-                NestedInput::start(self.right(), ctx)?,
+                NestedInput::start(self.left(), self.nested_plans[0].as_ref(), ctx)?,
+                NestedInput::start(self.right(), self.nested_plans[1].as_ref(), ctx)?,
             ],
             tables: [
                 SideTable::new(self.left().schema()),
@@ -1900,7 +1936,7 @@ pub(crate) mod tests {
     use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
         ALL_JOIN_TYPES, BuiltPartition, PeakPool, SlicedRows, count_native_rows,
-        data_batch, data_schema, dictionary_probe_rows, dictionary_schema,
+        cte_join_of, data_batch, data_schema, dictionary_probe_rows, dictionary_schema,
         dictionary_view_rows, empty_dictionary_cases, fanout_rows, fanout_schema,
         gather_cases, join_filter, keyed_rows, limited_single_thread_ctx,
         limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
@@ -1908,9 +1944,11 @@ pub(crate) mod tests {
         union_key_layouts, union_key_matches, with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
+    use crate::operators::lowering_tests::assert_plan_lowered;
     use crate::operators::union::test_support::count;
     use crate::test_utils::{
-        EngineOutput, compare_outputs, run_engines, test_table_t1, test_table_t2,
+        EngineOutput, compare_outputs, run_engines, test_session_config, test_table_t1,
+        test_table_t2,
     };
 
     /// A stream of `batches`, which then ends, or never produces anything
@@ -2682,9 +2720,9 @@ pub(crate) mod tests {
             StreamJoinPartitionMode::SinglePartition,
         )?);
         assert!(
-            try_lower(&plan, |input, _| crate::planner::lower_execution_plan(
-                input
-            ))?
+            try_lower(&plan, |input, _| {
+                crate::planner::lower_execution_plan(input)
+            })?
             .is_none()
         );
         Ok(())
@@ -5021,5 +5059,49 @@ pub(crate) mod tests {
             "the query allocated {allocated} bytes"
         );
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inputs_that_scan_ctes_around_the_join_read_their_rows() {
+        // A symmetric join in the continuation of a materialized CTE of `[1,
+        // 2]`, of a union of the CTE and a stream of `[3]` (that never ends),
+        // and of a stream of `[1, 2, 3]`: the join reads both inputs in
+        // executions of their own (see `NestedInput`), which lower them again
+        // with scans of the rows of the CTE, which the execution of the join
+        // computed: it returns the rows of DataFusion, three.
+        let make_plan = || {
+            cte_join_of(
+                |scan| scan,
+                |union, stream| {
+                    let left: Arc<dyn ExecutionPlan> =
+                        Arc::new(CoalescePartitionsExec::new(union));
+                    let on = vec![(
+                        col("k", &left.schema()).unwrap(),
+                        col("k", &stream.schema()).unwrap(),
+                    )];
+                    Arc::new(
+                        SymmetricHashJoinExec::try_new(
+                            left,
+                            stream,
+                            on,
+                            None,
+                            &JoinType::Inner,
+                            NullEquality::NullEqualsNothing,
+                            None,
+                            None,
+                            StreamJoinPartitionMode::SinglePartition,
+                        )
+                        .unwrap(),
+                    )
+                },
+            )
+        };
+        let root = assert_plan_lowered(make_plan, test_session_config(), false).await;
+        assert_eq!(
+            count::<PhysicalSymmetricHashJoin>(&root),
+            1,
+            "{}",
+            format_operator_tree(&root)
+        );
     }
 }

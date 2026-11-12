@@ -160,6 +160,7 @@ use datafusion_physical_expr::{
 };
 use datafusion_physical_expr_common::utils::evaluate_expressions_to_arrays;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::SortMergeJoinExec;
 use datafusion_physical_plan::joins::utils::{
@@ -189,8 +190,10 @@ use crate::operator::{
 };
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
+use crate::operators::materialized_cte::{MaterializedCtes, OuterCte};
 use crate::operators::projection::PhysicalProjection;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::planner::lower_execution_plan_with_cte_rows;
 use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
 use crate::sort::{RunKeys, RunMerger, SortKeys, SortedRun, memory_size};
 
@@ -231,9 +234,29 @@ pub enum InputRole {
 /// whose keys or columns the native joins cannot store or sort (e.g. keys of
 /// unions), and null-aware joins of two inputs that never end, which neither
 /// of them can be collected for first.
+///
+/// The inputs that the join reads in executions of their own (see
+/// `NestedInput`) must not scan materialized CTEs around the join: the
+/// planner lowers the joins of the continuations of such CTEs with their rows
+/// (see `try_lower_with_ctes`).
 pub fn try_lower<F>(
     plan: &Arc<dyn ExecutionPlan>,
     ordered: bool,
+    lower_input: F,
+) -> Result<Option<Arc<dyn PhysicalOperator>>>
+where
+    F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
+{
+    try_lower_with_ctes(plan, ordered, &MaterializedCtes::default(), lower_input)
+}
+
+/// [`try_lower`] in the continuations of the materialized CTEs `ctes`: the
+/// executions of their own of the inputs that never end (see [`NestedPlan`])
+/// read the rows of those that they scan.
+pub(crate) fn try_lower_with_ctes<F>(
+    plan: &Arc<dyn ExecutionPlan>,
+    ordered: bool,
+    ctes: &MaterializedCtes,
     mut lower_input: F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
@@ -248,7 +271,7 @@ where
         let Some(spec) = MergeJoinSpec::of(join)? else {
             return Ok(None);
         };
-        let join = lower_merge_join(join, spec, &mut lower_input)?;
+        let join = lower_merge_join(join, spec, ctes, &mut lower_input)?;
         return Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>));
     }
     let left = without_reordering(join.left())?;
@@ -273,10 +296,15 @@ where
             let Some(spec) = MergeJoinSpec::of(join)? else {
                 return Ok(None);
             };
-            let join = lower_merge_join(join, spec, &mut lower_input)?;
+            let join = lower_merge_join(join, spec, ctes, &mut lower_input)?;
             return Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>));
         }
-        return symmetric_hash_join::lower_symmetric(&equi_join, None, &mut lower_input);
+        return symmetric_hash_join::lower_symmetric(
+            &equi_join,
+            None,
+            ctes,
+            &mut lower_input,
+        );
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
@@ -296,7 +324,7 @@ where
         return Ok(None);
     };
     if unbounded.contains(&true) {
-        let join = lower_merge_join(join, spec, &mut lower_input)?;
+        let join = lower_merge_join(join, spec, ctes, &mut lower_input)?;
         return Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>));
     }
     let (left, right) = match build_right {
@@ -620,16 +648,21 @@ fn emits_both_inputs(join_type: JoinType) -> bool {
 fn lower_merge_join<F>(
     join: &SortMergeJoinExec,
     spec: MergeJoinSpec,
+    ctes: &MaterializedCtes,
     lower_input: &mut F,
 ) -> Result<Option<PhysicalMergeJoin>>
 where
     F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
     let mut children = Vec::with_capacity(2);
-    for (side, input) in [
+    let mut nested_plans = [None, None];
+    for (index, (side, input)) in [
         (JoinSide::Left, join.left()),
         (JoinSide::Right, join.right()),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let child = match input.boundedness().is_unbounded() {
             false => {
                 // The sorts read all of their input.
@@ -637,7 +670,10 @@ where
                     lower_input(&without_reordering(input)?, InputRole::Collected)?;
                 sorted_input(join, side, input, lowered)?
             }
-            true => ordered_input(input, lower_input)?,
+            true => ordered_input(input, ctes, lower_input)?.map(|(child, plan)| {
+                nested_plans[index] = plan;
+                child
+            }),
         };
         let Some(child) = child else {
             return Ok(None);
@@ -656,6 +692,7 @@ where
         children: vec![left, right],
         spec,
         streams_buffered,
+        nested_plans,
     }))
 }
 
@@ -678,6 +715,7 @@ fn merge_join_of_inputs(
         children: vec![left, right],
         spec,
         streams_buffered: false,
+        nested_plans: [None, None],
     }))
 }
 
@@ -701,6 +739,11 @@ fn sorted_input(
     Ok(Some(Arc::new(MergeJoinSort::try_new(lowered, ordering)?)))
 }
 
+/// An input that never ends of a merge join, lowered (see [`ordered_input`]),
+/// and its plan if it scans materialized CTEs around the join (see
+/// [`NestedPlan`]).
+type OrderedInput = (Arc<dyn PhysicalOperator>, Option<NestedPlan>);
+
 /// `input`, an input of a sort-merge join that never ends, lowered with
 /// `lower_input` to the rows of `input` in its order, on a single thread: a
 /// stream that never ends is sorted already (DataFusion cannot sort it, nor
@@ -708,20 +751,25 @@ fn sorted_input(
 /// removed (see [`without_reordering`]); if they merged several sorted
 /// partitions, the input is merged by a `SortPreservingMergeExec` (in order)
 /// instead. `Ok(None)` if `input` has no order, or its partitions are not
-/// sorted by it.
+/// sorted by it. With the lowered input, its plan if it scans materialized
+/// CTEs of `ctes` (those around the join), which an execution of its own of
+/// the input lowers again (see [`NestedPlan`]).
 fn ordered_input<F>(
     input: &Arc<dyn ExecutionPlan>,
+    ctes: &MaterializedCtes,
     lower_input: &mut F,
-) -> Result<Option<Arc<dyn PhysicalOperator>>>
+) -> Result<Option<OrderedInput>>
 where
     F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
     let Some(ordered) = ordered_plan(input)? else {
         return Ok(None);
     };
+    // The CTEs around the join, before those in the input are lowered.
+    let plan = NestedPlan::of(&ordered, ctes)?;
     let lowered = lower_input(&ordered, InputRole::Streamed)?;
     check_lowered_input(input, &lowered)?;
-    Ok(Some(lowered))
+    Ok(Some((lowered, plan)))
 }
 
 /// The plan that produces the rows of `input` in its order, on a single
@@ -2843,6 +2891,55 @@ impl PhysicalExpr for ComparableUnions {
 // hash join
 // ---------------------------------------------------------------------------
 
+/// The plan of an input of a join that an execution of its own reads (see
+/// [`NestedInput`]), which scans materialized CTEs around the join,
+/// `outer_ctes` (by the ids of their buffers): such an execution does not see
+/// the rows of their bodies, which the execution of the join computed, so
+/// every execution of the join lowers the plan again, with scans of these
+/// rows (as `PhysicalStreamingMerge::with_outer_ctes` does), instead of the
+/// operators that it was lowered to (which scan the bodies).
+#[derive(Debug, Clone)]
+pub(crate) struct NestedPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    outer_ctes: Vec<(u64, OuterCte)>,
+}
+
+impl NestedPlan {
+    /// The plan `plan` of an input of a join that an execution of its own
+    /// reads, if it scans materialized CTEs of `ctes` (those around the join).
+    pub(crate) fn of(
+        plan: &Arc<dyn ExecutionPlan>,
+        ctes: &MaterializedCtes,
+    ) -> Result<Option<Self>> {
+        let outer_ctes = ctes.scanned_by(plan)?;
+        Ok((!outer_ctes.is_empty()).then(|| Self {
+            plan: Arc::clone(plan),
+            outer_ctes,
+        }))
+    }
+
+    /// The native operators of the plan, in the execution of `ctx` (of the
+    /// join), whose scans of the CTEs read their rows: in pipelines without
+    /// caches, as the joins lower their inputs that never end (see
+    /// [`InputRole::Streamed`]).
+    fn lower(&self, ctx: &ExecutionContext) -> Result<Arc<dyn PhysicalOperator>> {
+        let rows = self
+            .outer_ctes
+            .iter()
+            .map(|(id, cte)| Ok((*id, cte.rows(ctx)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        let options = ctx.task_ctx.session_config().options();
+        let plan = reset_plan_states(Arc::clone(&self.plan))?;
+        lower_execution_plan_with_cte_rows(
+            &plan,
+            options.as_ref(),
+            ctx.task_ctx.runtime_env().as_ref(),
+            &rows,
+            true,
+        )
+    }
+}
+
 /// An input of a join that the join reads as a stream: its operator tree is
 /// executed by an [`Executor`] of its own (on the threads of the session, with
 /// the memory pool of the session), and the join reads its rows as they come,
@@ -2864,13 +2961,20 @@ pub(crate) struct NestedInput {
 
 impl NestedInput {
     /// Execute `input`, in the execution of `ctx`: the execution starts when
-    /// the input is first polled, and is cancelled when it is dropped.
+    /// the input is first polled, and is cancelled when it is dropped. If
+    /// `input` scans materialized CTEs around the join, its `plan` is lowered
+    /// again, with scans of their rows (see [`NestedPlan`]).
     pub(crate) fn start(
         input: &Arc<dyn PhysicalOperator>,
+        plan: Option<&NestedPlan>,
         ctx: &ExecutionContext,
     ) -> Result<Self> {
+        let input = match plan {
+            Some(plan) => plan.lower(ctx)?,
+            None => Arc::clone(input),
+        };
         let stream = Executor::execute_stream(
-            Arc::clone(input),
+            input,
             Arc::clone(&ctx.task_ctx),
             ctx.num_threads.max(1),
         )?;
@@ -3209,6 +3313,9 @@ pub struct PhysicalMergeJoin {
     /// never ends, see [`NestedInput`]), as the streamed rows need its rows,
     /// rather than collecting all of its rows as a sink first.
     streams_buffered: bool,
+    /// The plans of the inputs that executions of their own read, if they
+    /// scan materialized CTEs around the join (see [`NestedPlan`]).
+    nested_plans: [Option<NestedPlan>; 2],
 }
 
 /// Everything about a merge join that does not depend on its inputs, only on
@@ -3534,6 +3641,7 @@ impl PhysicalMergeJoin {
             children: vec![left, right],
             spec,
             streams_buffered: false,
+            nested_plans: [None, None],
         })
     }
 
@@ -3595,6 +3703,24 @@ impl PhysicalMergeJoin {
         match self.spec.streamed {
             JoinSide::Left => self.right(),
             _ => self.left(),
+        }
+    }
+
+    /// The plan of the streamed input, if an execution of its own lowers it
+    /// again (see [`NestedPlan`]).
+    fn streamed_plan(&self) -> Option<&NestedPlan> {
+        match self.spec.streamed {
+            JoinSide::Left => self.nested_plans[0].as_ref(),
+            _ => self.nested_plans[1].as_ref(),
+        }
+    }
+
+    /// The plan of the buffered input, if an execution of its own lowers it
+    /// again (see [`NestedPlan`]).
+    fn buffered_plan(&self) -> Option<&NestedPlan> {
+        match self.spec.streamed {
+            JoinSide::Left => self.nested_plans[1].as_ref(),
+            _ => self.nested_plans[0].as_ref(),
         }
     }
 
@@ -5786,7 +5912,7 @@ impl PhysicalOperator for PhysicalMergeJoin {
         let reservation =
             MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
         let window = BufferedWindow {
-            input: NestedInput::start(self.buffered_input(), ctx)?,
+            input: NestedInput::start(self.buffered_input(), self.buffered_plan(), ctx)?,
             rows,
             converter,
             last_key: None,
@@ -5855,7 +5981,11 @@ impl PhysicalOperator for PhysicalMergeJoin {
             let state =
                 self.stream_state(ctx, Buffered::Streamed(self.buffered_window(ctx)?))?;
             let streams = MergedStreams {
-                streamed: NestedInput::start(self.streamed_input(), ctx)?,
+                streamed: NestedInput::start(
+                    self.streamed_input(),
+                    self.streamed_plan(),
+                    ctx,
+                )?,
                 chunk: None,
                 state,
             };
@@ -6012,9 +6142,11 @@ pub(crate) mod tests {
     use crate::bridge::{PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
     use crate::explain::{format_operator_tree, format_pipelines};
+    use crate::operators::lowering_tests::assert_plan_lowered;
     use crate::operators::union::test_support::{TestSource, count};
     use crate::test_utils::{
         EngineOutput, compare_outputs, register_test_tables, run_engines,
+        test_session_config,
     };
 
     pub(crate) const ALL_JOIN_TYPES: [JoinType; 10] = [
@@ -7655,6 +7787,139 @@ pub(crate) mod tests {
                 })
                 .is_ok_and(|recursion| recursion != TreeNodeRecursion::Stop);
             assert!(streams, "{context}: bridged {}\n{tree}", plan.name());
+        }
+    }
+
+    /// The schema `{k: Int64}` of the rows of [`cte_join_of`].
+    fn cte_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]))
+    }
+
+    /// The rows of `keys` (with the schema of [`cte_schema`]).
+    fn cte_rows(keys: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(cte_schema(), vec![Arc::new(Int64Array::from(keys))])
+            .unwrap()
+    }
+
+    /// A stream, sorted by `k`, of the rows of `keys` (which does not end
+    /// for the planners, but ends).
+    fn cte_stream(keys: Vec<i64>) -> Arc<dyn ExecutionPlan> {
+        let partition = StreamPartition {
+            schema: cte_schema(),
+            batches: vec![cte_rows(keys)],
+            forever: false,
+        };
+        let order = LexOrdering::new([PhysicalSortExpr::new(
+            col("k", &cte_schema()).unwrap(),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        Arc::new(
+            StreamingTableExec::try_new(
+                cte_schema(),
+                vec![Arc::new(partition)],
+                None,
+                [order],
+                true,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A materialized CTE of the rows `[1, 2]` whose continuation is the
+    /// join that `join` makes of the scans of the CTE that `scan` makes (an
+    /// input that scans the CTE, with the rows of a stream of `[3]`) and of a
+    /// stream of `[1, 2, 3]`, all sorted by `k`.
+    pub(crate) fn cte_join_of(
+        scan: impl Fn(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+        join: impl Fn(
+            Arc<dyn ExecutionPlan>,
+            Arc<dyn ExecutionPlan>,
+        ) -> Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion_physical_plan::materialized_cte::{
+            MaterializedCteBuffer, MaterializedCteExec, MaterializedCteScanExec,
+        };
+        use datafusion_physical_plan::union::UnionExec;
+        let body = MemorySourceConfig::try_new_exec(
+            &[vec![cte_rows(vec![1, 2])]],
+            cte_schema(),
+            None,
+        )
+        .unwrap();
+        let buffer = Arc::new(MaterializedCteBuffer::new(7, "c"));
+        let cte_scan = MaterializedCteScanExec::new(7, "c", cte_schema(), 1)
+            .bind(Arc::clone(&buffer));
+        let union =
+            UnionExec::try_new(vec![scan(Arc::new(cte_scan)), cte_stream(vec![3])])
+                .unwrap();
+        let continuation = join(union, cte_stream(vec![1, 2, 3]));
+        Arc::new(MaterializedCteExec::new(body, continuation, buffer))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_joins_of_inputs_that_scan_ctes_around_them_read_their_rows() {
+        // A sort-merge join of one partition, of inputs that never end, in the
+        // continuation of a materialized CTE of `[1, 2]`: of a merge of the
+        // sorted partitions of a union of the CTE (sorted) and a stream of
+        // `[3]`, and of a stream of `[1, 2, 3]`, on either side. The streaming
+        // merge join reads its buffered input in an execution of its own (see
+        // `NestedInput`), which lowers the input again with scans of the rows
+        // of the CTE, which the execution of the join computed: it returns the
+        // rows of DataFusion, three.
+        let order = || {
+            LexOrdering::new([PhysicalSortExpr::new(
+                col("k", &cte_schema()).unwrap(),
+                SortOptions::default(),
+            )])
+            .unwrap()
+        };
+        for scanned_left in [true, false] {
+            let make_plan = || {
+                cte_join_of(
+                    |scan| Arc::new(SortExec::new(order(), scan)),
+                    |union, stream| {
+                        let merged: Arc<dyn ExecutionPlan> =
+                            Arc::new(SortPreservingMergeExec::new(order(), union));
+                        let (left, right) = match scanned_left {
+                            true => (merged, stream),
+                            false => (stream, merged),
+                        };
+                        let on = vec![(
+                            col("k", &left.schema()).unwrap(),
+                            col("k", &right.schema()).unwrap(),
+                        )];
+                        Arc::new(
+                            SortMergeJoinExec::try_new(
+                                left,
+                                right,
+                                on,
+                                None,
+                                JoinType::Inner,
+                                vec![SortOptions::default()],
+                                NullEquality::NullEqualsNothing,
+                            )
+                            .unwrap(),
+                        )
+                    },
+                )
+            };
+            let root = assert_plan_lowered(make_plan, test_session_config(), false).await;
+            let tree = format_operator_tree(&root);
+            assert_eq!(
+                count::<PhysicalMergeJoin>(&root),
+                1,
+                "{scanned_left}\n{tree}"
+            );
+            let join = root
+                .downcast_ref::<crate::operators::materialized_cte::PhysicalMaterializedCte>()
+                .and_then(|cte| cte.children().iter().find_map(|child| {
+                    child.downcast_ref::<PhysicalMergeJoin>()
+                }));
+            if let Some(join) = join {
+                assert!(join.streams_buffered_input(), "{scanned_left}\n{tree}");
+            }
         }
     }
 

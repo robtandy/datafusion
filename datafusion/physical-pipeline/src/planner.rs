@@ -1112,9 +1112,12 @@ impl Lowering<'_> {
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
         let key = Arc::as_ptr(plan).cast::<()>().addr();
         let ordered = self.ordered_joins.borrow().contains(&key);
-        merge_join::try_lower(plan, ordered, |input, role| {
-            self.lower_join_input_as(input, role)
-        })
+        merge_join::try_lower_with_ctes(
+            plan,
+            ordered,
+            &self.materialized_ctes,
+            |input, role| self.lower_join_input_as(input, role),
+        )
     }
 
     /// Lower `input`, an input of a native join that reads it as `role` says
@@ -1181,9 +1184,11 @@ impl Lowering<'_> {
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
-        symmetric_hash_join::try_lower(plan, |input, role| {
-            self.lower_join_input_as(input, role)
-        })
+        symmetric_hash_join::try_lower_with_ctes(
+            plan,
+            &self.materialized_ctes,
+            |input, role| self.lower_join_input_as(input, role),
+        )
     }
 
     /// Lower a window (a `WindowAggExec` or a `BoundedWindowAggExec`, with the
