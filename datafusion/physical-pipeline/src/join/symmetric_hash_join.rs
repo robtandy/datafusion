@@ -715,8 +715,13 @@ struct SideTable {
     /// For every batch of `rows`, if the join determines rows by their order:
     /// the values of the order of its rows, in the row format.
     sort_rows: VecDeque<Rows>,
-    /// For every batch of `rows`: the memory that it reserved.
+    /// For every batch of `rows`: the memory of the batch, and of the values
+    /// of the order of its rows.
     batch_bytes: VecDeque<usize>,
+    /// The sum of `batch_bytes`.
+    batches_bytes: usize,
+    /// The bytes of the keys of `heads` (each a copy of its own).
+    key_bytes: usize,
 }
 
 impl SideTable {
@@ -732,12 +737,229 @@ impl SideTable {
             variable_bytes: VecDeque::new(),
             sort_rows: VecDeque::new(),
             batch_bytes: VecDeque::new(),
+            batches_bytes: 0,
+            key_bytes: 0,
         }
     }
 
     /// The position after the last row.
     fn end(&self) -> usize {
         self.base + self.rows.len()
+    }
+
+    /// The memory of the table, as allocated: of its batches (and of the
+    /// values of the order of their rows), of its hash table (its buckets and
+    /// its keys) and of the structures of its rows (their capacities, which
+    /// dropping rows does not free, see [`Self::shrink`]).
+    fn memory(&self) -> usize {
+        self.batches_bytes
+            + self.key_bytes
+            + self.heads.allocation_size()
+            + self.previous.capacity() * size_of::<usize>()
+            + self.matched.capacity() * size_of::<bool>()
+            + self.variable_bytes.capacity() * size_of::<[u32; 2]>()
+            + self.sort_rows.capacity() * size_of::<Rows>()
+            + self.batch_bytes.capacity() * size_of::<usize>()
+            + self.rows.structure_bytes(0)
+    }
+
+    /// An upper bound of the memory of the table while it appends (see
+    /// [`Self::append`]) a batch of `rows` rows whose batch (and the values of
+    /// the order of its rows) take `bytes` bytes, with keys of `key_bytes`
+    /// bytes at most: its structures grow to hold them, with the old ones
+    /// while they grow.
+    fn memory_appending(&self, rows: usize, bytes: usize, key_bytes: usize) -> usize {
+        let heads = self.heads.allocation_size();
+        let heads = match self.heads.len() + rows > self.heads.capacity() {
+            // The buckets double (at least) as they grow: the old ones are at
+            // most half the new ones as they move.
+            true => {
+                let grown =
+                    (2 * heads).max(hash_map_bytes_holding(self.heads.len() + rows));
+                grown + grown / 2
+            }
+            false => heads,
+        };
+        let rows_of = |len: usize, capacity: usize, size: usize| {
+            deque_bytes_appending(len, capacity, rows, size)
+        };
+        self.batches_bytes
+            + bytes
+            + self.key_bytes
+            + key_bytes
+            + heads
+            + rows_of(
+                self.previous.len(),
+                self.previous.capacity(),
+                size_of::<usize>(),
+            )
+            + rows_of(
+                self.matched.len(),
+                self.matched.capacity(),
+                size_of::<bool>(),
+            )
+            + rows_of(
+                self.variable_bytes.len(),
+                self.variable_bytes.capacity(),
+                size_of::<[u32; 2]>(),
+            )
+            + deque_bytes_appending(
+                self.sort_rows.len(),
+                self.sort_rows.capacity(),
+                1,
+                size_of::<Rows>(),
+            )
+            + deque_bytes_appending(
+                self.batch_bytes.len(),
+                self.batch_bytes.capacity(),
+                1,
+                size_of::<usize>(),
+            )
+            + self.rows.structure_bytes(1)
+    }
+
+    /// Append `batch`, whose keys are `keys` (of which those of the rows of
+    /// `matchable` can match, all if `None`), the bytes of the values of its
+    /// rows of their own `variable_bytes`, and the values of the order of its
+    /// rows `sort_rows` (if the join determines rows by them).
+    fn append(
+        &mut self,
+        batch: RecordBatch,
+        keys: &Rows,
+        matchable: Option<&NullBuffer>,
+        variable_bytes: Vec<[u32; 2]>,
+        sort_rows: Option<Rows>,
+    ) {
+        let rows = batch.num_rows();
+        let first = self.end();
+        self.previous.reserve(rows);
+        self.matched.reserve(rows);
+        self.variable_bytes.reserve(rows);
+        for row in 0..rows {
+            let position = first + row;
+            let previous = match matchable.is_none_or(|valid| valid.is_valid(row)) {
+                true => {
+                    let key = keys.row(row);
+                    match self.heads.get_mut(key.as_ref()) {
+                        Some(head) => std::mem::replace(head, position),
+                        None => {
+                            // Only the keys that are new to the table are
+                            // copied into it.
+                            self.key_bytes += key.as_ref().len();
+                            self.heads.insert(key.as_ref().into(), position);
+                            NO_ROW
+                        }
+                    }
+                }
+                false => NO_ROW,
+            };
+            self.previous.push_back(previous);
+        }
+        self.matched.extend(std::iter::repeat_n(false, rows));
+        self.variable_bytes.extend(variable_bytes);
+        let bytes = memory_size(&batch) + sort_rows.as_ref().map_or(0, Rows::size);
+        self.batches_bytes += bytes;
+        self.batch_bytes.push_back(bytes);
+        self.sort_rows.extend(sort_rows);
+        self.rows.push(batch);
+    }
+
+    /// Drop the first `batches` batches, with the keys of the hash table whose
+    /// rows they all are: `keys` encodes the keys of the rows of a batch (and
+    /// reserves them while they are looked up).
+    fn drop_batches(
+        &mut self,
+        batches: usize,
+        mut keys: impl FnMut(&RecordBatch) -> Result<(Rows, MemoryReservation)>,
+    ) -> Result<()> {
+        let starts = self.rows.batch_starts();
+        let rows = starts.get(batches).copied().unwrap_or(self.rows.len());
+        for (batch, &start) in self.rows.batches()[..batches].iter().zip(starts) {
+            let (keys, _reservation) = keys(batch)?;
+            for row in 0..batch.num_rows() {
+                let key = keys.row(row);
+                let position = self.base + start + row;
+                if self.heads.get(key.as_ref()) == Some(&position) {
+                    self.heads.remove(key.as_ref());
+                    self.key_bytes -= key.as_ref().len();
+                }
+            }
+        }
+        self.rows = self.rows.without_first_batches(batches);
+        self.base += rows;
+        self.previous.drain(..rows);
+        self.matched.drain(..rows);
+        self.variable_bytes.drain(..rows);
+        let sort_rows = batches.min(self.sort_rows.len());
+        self.sort_rows.drain(..sort_rows);
+        self.batches_bytes -= self.batch_bytes.drain(..batches).sum::<usize>();
+        Ok(())
+    }
+
+    /// About the buckets of the hash table (each with an entry and a control
+    /// byte).
+    fn heads_buckets(&self) -> usize {
+        self.heads.allocation_size() / (HEAD_BYTES + 1)
+    }
+
+    /// The memory that [`Self::shrink`] allocates: of the smaller structures,
+    /// while they take the entries of the larger ones.
+    fn shrink_bytes(&self) -> usize {
+        let deque = |len: usize, capacity: usize, size: usize| match is_oversized(
+            len, capacity,
+        ) {
+            true => 2 * len * size,
+            false => 0,
+        };
+        let heads = match is_oversized(self.heads.len(), self.heads_buckets()) {
+            true => hash_map_bytes_holding(2 * self.heads.len()),
+            false => 0,
+        };
+        heads
+            + deque(
+                self.previous.len(),
+                self.previous.capacity(),
+                size_of::<usize>(),
+            )
+            + deque(
+                self.matched.len(),
+                self.matched.capacity(),
+                size_of::<bool>(),
+            )
+            + deque(
+                self.variable_bytes.len(),
+                self.variable_bytes.capacity(),
+                size_of::<[u32; 2]>(),
+            )
+            + deque(
+                self.sort_rows.len(),
+                self.sort_rows.capacity(),
+                size_of::<Rows>(),
+            )
+            + deque(
+                self.batch_bytes.len(),
+                self.batch_bytes.capacity(),
+                size_of::<usize>(),
+            )
+    }
+
+    /// Free the capacity of the structures that hold far fewer entries than
+    /// they can (once rows were dropped, see [`is_oversized`]): they shrink to
+    /// twice their entries.
+    fn shrink(&mut self) {
+        if is_oversized(self.heads.len(), self.heads_buckets()) {
+            self.heads.shrink_to(2 * self.heads.len());
+        }
+        fn shrink_deque<T>(deque: &mut VecDeque<T>) {
+            if is_oversized(deque.len(), deque.capacity()) {
+                deque.shrink_to(2 * deque.len());
+            }
+        }
+        shrink_deque(&mut self.previous);
+        shrink_deque(&mut self.matched);
+        shrink_deque(&mut self.variable_bytes);
+        shrink_deque(&mut self.sort_rows);
+        shrink_deque(&mut self.batch_bytes);
     }
 
     /// The first row at or after the position `from` whose value of the order
@@ -1045,39 +1267,22 @@ impl PhysicalSymmetricHashJoin {
             Some(pruning) => Some(pruning.sort_rows(side, &batch)?),
             None => None,
         };
-        let is_matchable =
-            |row: usize| matchable.as_ref().is_none_or(|valid| valid.is_valid(row));
+        // The tables are reserved as they are (see `SideTable::memory`): as the
+        // table grows to hold the rows, and then as it holds them.
+        let other = run.tables[1 - side].memory();
         let table = &mut run.tables[side];
         let first = table.end();
-        // Only the keys that are new to the table are copied into it.
-        let mut key_bytes = 0;
-        for row in 0..num_rows {
-            let position = first + row;
-            let previous = match is_matchable(row) {
-                true => {
-                    let key = keys.row(row);
-                    match table.heads.get_mut(key.as_ref()) {
-                        Some(head) => std::mem::replace(head, position),
-                        None => {
-                            key_bytes += key_entry_bytes(key.as_ref());
-                            table.heads.insert(key.as_ref().into(), position);
-                            NO_ROW
-                        }
-                    }
-                }
-                false => NO_ROW,
-            };
-            table.previous.push_back(previous);
-        }
-        table.matched.extend(std::iter::repeat_n(false, num_rows));
-        table.variable_bytes.extend(variable_bytes);
-        let bytes = memory_size(&batch)
-            + sort_rows.as_ref().map_or(0, Rows::size)
-            + num_rows * (size_of::<usize>() + size_of::<bool>() + size_of::<[u32; 2]>());
-        run.reservation.try_grow(bytes + key_bytes)?;
-        table.batch_bytes.push_back(bytes);
-        table.sort_rows.extend(sort_rows);
-        table.rows.push(batch.clone());
+        let bytes = memory_size(&batch) + sort_rows.as_ref().map_or(0, Rows::size);
+        run.reservation
+            .try_resize(other + table.memory_appending(num_rows, bytes, keys.size()))?;
+        table.append(
+            batch.clone(),
+            &keys,
+            matchable.as_ref(),
+            variable_bytes,
+            sort_rows,
+        );
+        run.reservation.try_resize(other + table.memory())?;
         Ok(ChunkJoin {
             side,
             batch,
@@ -1357,44 +1562,36 @@ impl PhysicalSymmetricHashJoin {
         } = run;
         let table = &mut tables[side];
         let emitted = table.emitted - table.base;
-        let starts = table.rows.batch_starts();
-        let batches = table.rows.batches();
-        let dropped = batches
+        let dropped = table
+            .rows
+            .batches()
             .iter()
-            .zip(starts)
+            .zip(table.rows.batch_starts())
             .take_while(|(batch, start)| *start + batch.num_rows() <= emitted)
             .count();
         if dropped == 0 {
             return Ok(());
         }
-        let rows = starts.get(dropped).copied().unwrap_or(table.rows.len());
-        // The keys whose last row is dropped: their rows are all dropped.
-        let mut released = 0;
-        for (batch, start) in batches[..dropped].iter().zip(starts) {
-            // The keys, evaluated again and encoded, are reserved while they
-            // are looked up.
+        // The keys whose last row is dropped: their rows are all dropped. The
+        // keys, evaluated again and encoded, are reserved while they are
+        // looked up.
+        table.drop_batches(dropped, |batch| {
             let arrays = evaluate_keys(self.spec.keys(side), batch)?;
             let evaluated = reservation.new_empty();
             evaluated.try_grow(key_memory(&arrays, batch))?;
-            let keys = converter.convert_columns(&arrays)?;
-            for row in 0..batch.num_rows() {
-                let key = keys.row(row);
-                let position = table.base + start + row;
-                if table.heads.get(key.as_ref()) == Some(&position) {
-                    table.heads.remove(key.as_ref());
-                    released += key_entry_bytes(key.as_ref());
-                }
-            }
+            Ok((converter.convert_columns(&arrays)?, evaluated))
+        })?;
+        // The structures that the dropped rows leave mostly empty shrink, if
+        // the pool holds the smaller ones while they take the entries; the
+        // tables are reserved as they are then.
+        if reservation.try_grow(table.shrink_bytes()).is_ok() {
+            table.shrink();
         }
-        table.rows = table.rows.without_first_batches(dropped);
-        table.base += rows;
-        table.previous.drain(..rows);
-        table.matched.drain(..rows);
-        table.variable_bytes.drain(..rows);
-        let sort_rows = dropped.min(table.sort_rows.len());
-        table.sort_rows.drain(..sort_rows);
-        released += table.batch_bytes.drain(..dropped).sum::<usize>();
-        reservation.shrink(released);
+        reservation.try_resize(tables.iter().map(SideTable::memory).sum())?;
+        debug_assert_eq!(
+            reservation.size(),
+            tables.iter().map(SideTable::memory).sum::<usize>()
+        );
         Ok(())
     }
 
@@ -1478,9 +1675,48 @@ impl PhysicalSymmetricHashJoin {
     }
 }
 
-/// The memory of the entry of a key in the hash table of a [`SideTable`].
-fn key_entry_bytes(key: &[u8]) -> usize {
-    key.len() + size_of::<(Box<[u8]>, usize)>()
+/// The bytes of an entry of the hash table of a [`SideTable`] (the key in it
+/// takes bytes of its own, see [`SideTable::key_bytes`]).
+const HEAD_BYTES: usize = size_of::<(Box<[u8]>, usize)>();
+
+/// A structure of a [`SideTable`] whose capacity is more than this many
+/// entries, and more than four times its entries, shrinks (see
+/// [`SideTable::shrink`]).
+const SHRUNK_CAPACITY: usize = 1024;
+
+/// Whether a structure of `len` entries of `capacity` shrinks.
+fn is_oversized(len: usize, capacity: usize) -> bool {
+    capacity > SHRUNK_CAPACITY && capacity > 4 * len
+}
+
+/// The bytes that the hash table of a [`SideTable`] allocates once it grew to
+/// hold `entries` entries: its buckets (7 of every 8 of them hold an entry
+/// at most), with a control byte each, and a group of control bytes more (and
+/// their alignment).
+fn hash_map_bytes_holding(entries: usize) -> usize {
+    let buckets = match entries {
+        0 => return 0,
+        1..4 => 4,
+        4..8 => 8,
+        _ => (entries * 8 / 7).next_power_of_two(),
+    };
+    buckets * (HEAD_BYTES + 1) + 32
+}
+
+/// The bytes that a deque of `len` entries of `size` bytes whose capacity is
+/// `capacity` allocates while it grows to hold `added` entries more: it
+/// doubles its capacity (at least), with the old entries while they move.
+fn deque_bytes_appending(
+    len: usize,
+    capacity: usize,
+    added: usize,
+    size: usize,
+) -> usize {
+    let capacity = match len + added > capacity {
+        true => (2 * capacity).max(len + added).max(8) + capacity,
+        false => capacity,
+    };
+    capacity * size
 }
 
 /// The left and the right rows of pairs of rows of the input `side` and of
@@ -1595,6 +1831,7 @@ pub(crate) mod tests {
 
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use arrow::array::TimestampNanosecondArray;
     use arrow::array::UnionArray;
@@ -1608,6 +1845,7 @@ pub(crate) mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::{DataFusionError, internal_datafusion_err};
     use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_execution::memory_pool::MemoryPool;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
     use datafusion_expr::ColumnarValue;
@@ -1637,9 +1875,10 @@ pub(crate) mod tests {
     use crate::bridge::{PipelineRootExec, bridged_plans};
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::join::PhysicalHashJoin;
+    use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
-        ALL_JOIN_TYPES, data_batch, data_schema, join_filter, limited_task_ctx, num_rows,
-        run_native, with_timeout,
+        ALL_JOIN_TYPES, PeakPool, data_batch, data_schema, dictionary_view_rows,
+        join_filter, limited_task_ctx, num_rows, run_native, with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4224,6 +4463,133 @@ pub(crate) mod tests {
         if let Err(message) = compare_outputs(&expected, &actual) {
             panic!("Results differ: {message}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keys_of_dictionaries_of_shared_views_are_reserved_before_they_are_encoded()
+    -> Result<()> {
+        // A symmetric join of streams of the rows of `dictionary_view_rows`, in
+        // a pool of 8 MiB: the join reserves the encoding of their keys (128
+        // MiB) before it encodes them, which the pool refuses. The query runs
+        // on the thread of the test (a runtime of the current thread runs all
+        // its tasks there), which allocates far fewer bytes meanwhile than the
+        // encoding takes.
+        let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+            let batch = dictionary_view_rows(side);
+            let schema = batch.schema();
+            let partition = BatchesPartition {
+                schema: Arc::clone(&schema),
+                batches: vec![batch],
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    [],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (left, right) = (stream("l"), stream("r"));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&plan)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        allocations::reset_peak();
+        let before = allocations::held();
+        let err = run_native(&root, plan, limited_task_ctx(8 << 20)?)
+            .await
+            .unwrap_err();
+        let allocated = allocations::peak() - before;
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("PhysicalSymmetricHashJoin"),
+            "{err}"
+        );
+        assert!(
+            allocated < 16 << 20,
+            "the query allocated {allocated} bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tables_pruned_to_a_row_free_their_capacity() -> Result<()> {
+        // Streams of 100,000 rows (a batch) and then a row, of distinct keys
+        // that never match, sorted by their times, joined with `lt = rt`, which
+        // then produce nothing, forever. The left times are the ids, the right
+        // ones 0, but for the last right row (100,000): the join keeps the
+        // left rows until that row, a window of 100,000 rows, and drops all
+        // of them then but the last one (a batch of its own). The structures
+        // of the table (the hash table of 100,000 keys, ...) shrink, and the
+        // join reserves what they allocate: while it waits for more rows, the
+        // bytes that the query holds (on the thread of the test, as a runtime
+        // of the current thread runs all its tasks there) are about those
+        // that it reserves, and few (and while it held the window, it reserved
+        // it).
+        let stream = |side: &str,
+                      key: fn(i64) -> Option<i32>,
+                      time: fn(i64) -> Option<i64>| {
+            let text = |_| String::new();
+            let mut batches = timed_batches(side, 0..100_000, key, time, text, 100_000);
+            batches.extend(timed_batches(side, 100_000..100_001, key, Some, text, 1));
+            timed_stream(side, batches, true, true)
+        };
+        let plan = timed_join(
+            stream("l", |id| Some(id as i32), Some),
+            stream("r", |id| Some(id as i32 + 1_000_000), |_| Some(0)),
+            JoinType::Inner,
+            Some(time_filter(|lt, rt| binary(lt, Operator::Eq, rt))),
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+        let root = lower(&plan)?;
+        let join = root.downcast_ref::<PhysicalSymmetricHashJoin>().unwrap();
+        assert!(join.determines_rows_by_order());
+        let pool = Arc::new(PeakPool::new(1 << 30));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+            .build_arc()?;
+        let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let exec = PipelineRootExec::try_new(root, plan)?;
+        allocations::reset_peak();
+        let before = allocations::held();
+        let mut output = exec.execute(0, ctx)?;
+        // The join reads all rows, and waits for more.
+        let next = tokio::time::timeout(Duration::from_secs(2), output.next()).await;
+        assert!(next.is_err(), "the join produced {next:?}");
+        let held = allocations::held() - before;
+        let reserved = pool.reserved() as isize;
+        let most_held = allocations::peak() - before;
+        let most_reserved = pool.peak.load(Ordering::Relaxed) as isize;
+        // The window of 100,000 rows was reserved as long as it was held.
+        assert!(
+            most_held < most_reserved + (1 << 20),
+            "the query held {most_held} bytes at most, and reserved {most_reserved}"
+        );
+        assert!(
+            held < reserved + (1 << 20),
+            "the query holds {held} bytes, and reserves {reserved}"
+        );
+        assert!(reserved < 1 << 20, "the join reserves {reserved} bytes");
         Ok(())
     }
 }

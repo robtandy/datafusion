@@ -1050,6 +1050,17 @@ impl StoredRows {
         &self.batches
     }
 
+    /// The memory of the structures of the rows (not of their batches), with
+    /// `added` batches more (and the old structures while they grow).
+    pub(crate) fn structure_bytes(&self, added: usize) -> usize {
+        let capacity = self.batches.capacity().max(self.starts.capacity());
+        let capacity = match self.batches.len() + added > capacity {
+            true => (2 * capacity).max(self.batches.len() + added).max(4) + capacity,
+            false => capacity,
+        };
+        capacity * (size_of::<RecordBatch>() + size_of::<usize>())
+    }
+
     /// The rows without the first `batches` batches, at positions decreased
     /// by the rows of these batches.
     pub(crate) fn without_first_batches(&self, batches: usize) -> Self {
@@ -1186,8 +1197,8 @@ pub(crate) fn computed_key_bytes(keys: &[ArrayRef], batch: &RecordBatch) -> usiz
 
 /// The memory that evaluating and encoding the keys `keys` of the rows of
 /// `batch` takes: of the computed keys (see [`computed_key_bytes`]), and
-/// about that of their encoding in the row format (see [`encoded_bytes`]),
-/// to reserve before they are encoded.
+/// (an upper bound of) that of their encoding in the row format (see
+/// [`encoded_bytes`]), to reserve before they are encoded.
 pub(crate) fn key_memory(keys: &[ArrayRef], batch: &RecordBatch) -> usize {
     computed_key_bytes(keys, batch)
         + keys
@@ -1195,24 +1206,16 @@ pub(crate) fn key_memory(keys: &[ArrayRef], batch: &RecordBatch) -> usize {
             .map(|key| encoded_bytes(key.as_ref()))
             .sum::<usize>()
         + (batch.num_rows() + 1) * size_of::<usize>()
+        + size_of::<Rows>()
 }
 
 /// About (an upper bound of) the bytes that the row format takes to encode
-/// the values of `array`: the bytes of its values, those that views refer to
-/// too (which the encoding copies, even if the views share them), in blocks
-/// of 32 bytes with a byte of their own, and a few bytes for every row.
+/// the values of `array`: those of the values of every row (see
+/// [`encoded_row_bytes`]), and those of the values nested in it, which it
+/// encodes first (of the fields of a struct, the elements of a list, the
+/// values of a dictionary or of runs, the children of a union).
 fn encoded_bytes(array: &dyn Array) -> usize {
-    let values = match array.data_type() {
-        DataType::Utf8View => array
-            .as_string_view()
-            .lengths()
-            .map(|length| length as usize)
-            .sum(),
-        DataType::BinaryView => array
-            .as_binary_view()
-            .lengths()
-            .map(|length| length as usize)
-            .sum(),
+    let nested = match array.data_type() {
         DataType::Struct(_) => array
             .as_struct()
             .columns()
@@ -1225,9 +1228,234 @@ fn encoded_bytes(array: &dyn Array) -> usize {
         | DataType::LargeListView(_)
         | DataType::FixedSizeList(_, _)
         | DataType::Map(_, _) => encoded_bytes(list_ranges(array).0),
-        _ => nested_row_bytes(array).iter().sum(),
+        DataType::Dictionary(_, _) => {
+            encoded_bytes(array.as_any_dictionary().values().as_ref())
+        }
+        DataType::RunEndEncoded(run_ends, _) => {
+            encoded_bytes(run_values(array, run_ends.data_type()).0.as_ref())
+        }
+        DataType::Union(fields, _) => {
+            let union = array.as_union();
+            fields
+                .iter()
+                .map(|(type_id, _)| encoded_bytes(union.child(type_id).as_ref()))
+                .sum()
+        }
+        _ => 0,
     };
-    values + values / 32 + array.len() * size_of::<u64>()
+    encoded_row_bytes(array).iter().sum::<usize>() + nested
+}
+
+/// The bytes that the row format takes to encode the value of every row of
+/// `array`, as `RowConverter` computes them: it encodes the value of every row
+/// in full, also the values nested in it that rows share (that views refer
+/// to, of a dictionary key, of a run). A value of its own length (a string, a
+/// binary, a list, a run) takes blocks of 8 bytes (of 32 bytes after the first
+/// 32 bytes) with a byte of their own each.
+fn encoded_row_bytes(array: &dyn Array) -> Vec<usize> {
+    let rows = array.len();
+    let lengths = |lengths: Vec<usize>| -> Vec<usize> {
+        lengths
+            .into_iter()
+            .enumerate()
+            .map(|(row, length)| match array.is_valid(row) {
+                true => padded_bytes(length),
+                false => 1,
+            })
+            .collect()
+    };
+    match array.data_type() {
+        DataType::Boolean | DataType::Null => vec![2; rows],
+        DataType::FixedSizeBinary(width) => vec![1 + *width as usize; rows],
+        DataType::Utf8 => {
+            let strings = array.as_string::<i32>();
+            lengths(
+                (0..rows)
+                    .map(|row| strings.value_length(row) as usize)
+                    .collect(),
+            )
+        }
+        DataType::LargeUtf8 => {
+            let strings = array.as_string::<i64>();
+            lengths(
+                (0..rows)
+                    .map(|row| strings.value_length(row) as usize)
+                    .collect(),
+            )
+        }
+        DataType::Binary => {
+            let binaries = array.as_binary::<i32>();
+            lengths(
+                (0..rows)
+                    .map(|row| binaries.value_length(row) as usize)
+                    .collect(),
+            )
+        }
+        DataType::LargeBinary => {
+            let binaries = array.as_binary::<i64>();
+            lengths(
+                (0..rows)
+                    .map(|row| binaries.value_length(row) as usize)
+                    .collect(),
+            )
+        }
+        DataType::Utf8View => lengths(
+            array
+                .as_string_view()
+                .lengths()
+                .map(|length| length as usize)
+                .collect(),
+        ),
+        DataType::BinaryView => lengths(
+            array
+                .as_binary_view()
+                .lengths()
+                .map(|length| length as usize)
+                .collect(),
+        ),
+        DataType::Struct(_) => {
+            let mut bytes = vec![1; rows];
+            for column in array.as_struct().columns() {
+                for (bytes, column) in
+                    bytes.iter_mut().zip(encoded_row_bytes(column.as_ref()))
+                {
+                    *bytes += column;
+                }
+            }
+            bytes
+        }
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Map(_, _) => {
+            let (values, ranges) = list_ranges(array);
+            let elements = encoded_row_bytes(values);
+            ranges
+                .into_iter()
+                .enumerate()
+                .map(|(row, (start, end))| {
+                    let padded = elements
+                        .get(start..end)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&element| padded_bytes(element))
+                        .sum::<usize>();
+                    match array.is_valid(row) {
+                        true => 1 + padded,
+                        false => 1,
+                    }
+                })
+                .collect()
+        }
+        DataType::FixedSizeList(_, _) => {
+            let (values, ranges) = list_ranges(array);
+            let elements = encoded_row_bytes(values);
+            ranges
+                .into_iter()
+                .enumerate()
+                .map(|(row, (start, end))| match array.is_valid(row) {
+                    true => {
+                        1 + elements
+                            .get(start..end)
+                            .unwrap_or_default()
+                            .iter()
+                            .sum::<usize>()
+                    }
+                    false => 1,
+                })
+                .collect()
+        }
+        DataType::Dictionary(_, values_type) => {
+            let dictionary = array.as_any_dictionary();
+            let values = encoded_row_bytes(dictionary.values().as_ref());
+            let null = null_row_bytes(values_type);
+            dictionary
+                .normalized_keys()
+                .into_iter()
+                .enumerate()
+                .map(|(row, key)| match array.is_valid(row) {
+                    true => values.get(key).copied().unwrap_or(null),
+                    false => null,
+                })
+                .collect()
+        }
+        DataType::RunEndEncoded(run_ends, _) => {
+            let (values, physical) = run_values(array, run_ends.data_type());
+            let values = encoded_row_bytes(values.as_ref());
+            physical
+                .into_iter()
+                .map(|index| padded_bytes(values.get(index).copied().unwrap_or_default()))
+                .collect()
+        }
+        DataType::Union(fields, _) => {
+            let union = array.as_union();
+            let children = fields
+                .iter()
+                .map(|(type_id, _)| {
+                    (type_id, encoded_row_bytes(union.child(type_id).as_ref()))
+                })
+                .collect::<Vec<_>>();
+            (0..rows)
+                .map(|row| {
+                    let type_id = union.type_id(row);
+                    let child = children
+                        .iter()
+                        .find(|(id, _)| *id == type_id)
+                        .and_then(|(_, bytes)| {
+                            bytes.get(union.value_offset(row)).copied()
+                        })
+                        .unwrap_or_default();
+                    1 + child
+                })
+                .collect()
+        }
+        data_type => match data_type.primitive_width() {
+            Some(width) => vec![1 + width; rows],
+            // Not a layout of the row format: as much as the values take
+            // (gathered), in blocks.
+            None => nested_row_bytes(array)
+                .into_iter()
+                .map(|bytes| padded_bytes(bytes) + size_of::<u64>())
+                .collect(),
+        },
+    }
+}
+
+/// The bytes that the row format takes to encode a value of `length` bytes
+/// of its own length (a string, a list, ...): blocks of 8 bytes (of 32 bytes
+/// after the first 32 bytes) with a byte of their own each, and a byte.
+fn padded_bytes(length: usize) -> usize {
+    match length {
+        0..=32 => 1 + length.div_ceil(8) * 9,
+        _ => 4 + length.div_ceil(32) * 33,
+    }
+}
+
+/// The bytes that the row format takes to encode a NULL of `data_type`.
+fn null_row_bytes(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Boolean | DataType::Null => 2,
+        DataType::FixedSizeBinary(width) => 1 + *width as usize,
+        DataType::Struct(fields) => {
+            1 + fields
+                .iter()
+                .map(|field| null_row_bytes(field.data_type()))
+                .sum::<usize>()
+        }
+        DataType::Dictionary(_, values) => null_row_bytes(values),
+        DataType::RunEndEncoded(_, values) => {
+            padded_bytes(null_row_bytes(values.data_type()))
+        }
+        DataType::Union(fields, _) => {
+            1 + fields
+                .iter()
+                .map(|(_, field)| null_row_bytes(field.data_type()))
+                .max()
+                .unwrap_or_default()
+        }
+        data_type => data_type.primitive_width().map_or(1, |width| 1 + width),
+    }
 }
 
 /// The rows whose keys `keys` can match a key of the other input: `None` if
@@ -5784,13 +6012,13 @@ pub(crate) mod tests {
     /// A memory pool of `limit` bytes that remembers the most bytes that were
     /// reserved at once.
     #[derive(Debug)]
-    struct PeakPool {
+    pub(crate) struct PeakPool {
         pool: GreedyMemoryPool,
-        peak: AtomicUsize,
+        pub(crate) peak: AtomicUsize,
     }
 
     impl PeakPool {
-        fn new(limit: usize) -> Self {
+        pub(crate) fn new(limit: usize) -> Self {
             Self {
                 pool: GreedyMemoryPool::new(limit),
                 peak: AtomicUsize::new(0),
@@ -7221,6 +7449,177 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// 128 rows of the `side` input (`<side>id`, `<side>k`) whose keys are a
+    /// dictionary of views, of a value of 1 MiB that they all have: the row
+    /// format encodes it for every row (about 128 MiB).
+    pub(crate) fn dictionary_view_rows(side: &str) -> RecordBatch {
+        let value = "x".repeat(1 << 20);
+        let values = StringViewArray::from(vec![value.as_str()]);
+        let keys = arrow::array::DictionaryArray::new(
+            Int32Array::from(vec![0; 128]),
+            Arc::new(values),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), keys.data_type().clone(), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..128)),
+                Arc::new(keys),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn encodings_of_keys_take_no_more_than_their_reservation() -> Result<()> {
+        // The memory that the joins reserve before they encode keys (see
+        // `key_memory`) is not less than the encoding takes, also where the
+        // row format encodes values that rows share for every row (of
+        // dictionaries and runs of views), and for short values (in blocks of
+        // 8 bytes with a byte of their own).
+        let strings = |lengths: Range<usize>| -> Vec<String> {
+            lengths.map(|length| "x".repeat(length)).collect()
+        };
+        let short = StringViewArray::from_iter_values(strings(0..70));
+        let item = Arc::new(Field::new_list_field(short.data_type().clone(), false));
+        let lists = ListArray::new(
+            item,
+            arrow::buffer::OffsetBuffer::from_lengths([0, 1, 5, 64]),
+            Arc::new(short.clone()),
+            None,
+        );
+        let runs = RunArray::<Int32Type>::try_new(
+            &Int32Array::from(vec![64, 128]),
+            &StringViewArray::from_iter_values(["a".repeat(1024), "b".repeat(33)]),
+        )?;
+        let words =
+            arrow::array::DictionaryArray::<arrow::datatypes::Int8Type>::from_iter(
+                (0..100)
+                    .map(|i| ["", "a", "bb", "thirty-three bytes of a short str"][i % 4]),
+            );
+        let fields = Fields::from(vec![
+            Field::new("w", words.data_type().clone(), false),
+            Field::new("i", DataType::Int64, false),
+        ]);
+        let structs = StructArray::new(
+            fields,
+            vec![
+                Arc::new(words.clone()),
+                Arc::new(Int64Array::from_iter_values(0..100)),
+            ],
+            Some(NullBuffer::from_iter((0..100).map(|i| i % 3 != 0))),
+        );
+        let nulls = arrow::array::DictionaryArray::new(
+            Int32Array::from(vec![Some(0), None, Some(0)]),
+            Arc::new(StringViewArray::from(vec!["x".repeat(100)])),
+        );
+        let floats = FixedSizeListArray::from_iter_primitive::<Float64Type, _, _>(
+            (0..50).map(|i| Some(vec![Some(f64::from(i)); 3])),
+            3,
+        );
+        let keys: Vec<(&str, ArrayRef)> = vec![
+            (
+                "dictionary of a view of 1 MiB",
+                Arc::clone(dictionary_view_rows("l").column(1)),
+            ),
+            (
+                "strings of 0 to 69 bytes",
+                Arc::new(StringArray::from_iter_values(strings(0..70))),
+            ),
+            ("views of 0 to 69 bytes", Arc::new(short)),
+            ("lists of views", Arc::new(lists)),
+            ("runs of views", Arc::new(runs)),
+            ("structs of a dictionary", Arc::new(structs)),
+            ("dictionary with NULL keys", Arc::new(nulls)),
+            ("fixed size lists of floats", Arc::new(floats)),
+        ];
+        for (name, key) in keys {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "k",
+                    key.data_type().clone(),
+                    true,
+                )])),
+                vec![Arc::clone(&key)],
+            )?;
+            let reserved = key_memory(&[Arc::clone(&key)], &batch);
+            let encoded =
+                RowConverter::new(vec![SortField::new(key.data_type().clone())])?
+                    .convert_columns(&[key])?
+                    .size();
+            assert!(reserved >= encoded, "{name}: {reserved} < {encoded}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keys_of_dictionaries_of_shared_views_are_reserved_before_they_are_encoded()
+    -> Result<()> {
+        // A merge join of streams of the rows of `dictionary_view_rows`, in a
+        // pool of 8 MiB: the join reserves the encoding of their keys (128
+        // MiB) before it encodes them, which the pool refuses. The query runs
+        // on the thread of the test (a runtime of the current thread runs all
+        // its tasks there), which allocates far fewer bytes meanwhile than the
+        // encoding takes.
+        let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+            let batch = dictionary_view_rows(side);
+            let schema = batch.schema();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                col(&format!("{side}k"), &schema).unwrap(),
+                SortOptions::default(),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: Arc::clone(&schema),
+                batches: vec![batch],
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (left, right) = (stream("l"), stream("r"));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )?);
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        assert_streaming_merge_join(&root, "dictionary keys");
+        allocations::reset_peak();
+        let before = allocations::held();
+        let err = run_native(&root, plan, limited_task_ctx(8 << 20)?)
+            .await
+            .unwrap_err();
+        let allocated = allocations::peak() - before;
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("PhysicalMergeJoin"), "{err}");
+        assert!(
+            allocated < 16 << 20,
+            "the query allocated {allocated} bytes"
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordered_joins_of_streams_of_list_zeros_that_never_end_emit_their_rows()
     -> Result<()> {
@@ -8018,5 +8417,95 @@ pub(crate) mod tests {
             assert_eq!(root.schema(), plan.schema());
         }
         Ok(())
+    }
+}
+
+/// The allocator of the tests of the crate: the system's, which counts the
+/// bytes that every thread holds, for the tests of the memory that operators
+/// allocate before they reserve it (of a query that runs on the thread of its
+/// test: a runtime of the current thread runs all its tasks there).
+#[cfg(test)]
+pub(crate) mod allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct Counting;
+
+    thread_local! {
+        /// The bytes that the thread allocated and that were not freed on it.
+        static HELD: Cell<isize> = const { Cell::new(0) };
+        /// The most bytes that the thread held since [`reset_peak`].
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn count(bytes: isize) {
+        // A thread whose thread locals are gone (as it ends) counts nothing.
+        let _ = HELD.try_with(|held| {
+            let now = held.get() + bytes;
+            held.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+
+    // SAFETY: the memory is that of the system allocator, which the methods
+    // call with their arguments.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: as `GlobalAlloc::alloc`.
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                count(layout.size() as isize);
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: as `GlobalAlloc::alloc_zeroed`.
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                count(layout.size() as isize);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: as `GlobalAlloc::dealloc`.
+            unsafe { System.dealloc(ptr, layout) };
+            count(-(layout.size() as isize));
+        }
+
+        unsafe fn realloc(
+            &self,
+            ptr: *mut u8,
+            layout: Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            // SAFETY: as `GlobalAlloc::realloc`.
+            let new = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new.is_null() {
+                count(new_size as isize - layout.size() as isize);
+            }
+            new
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// The bytes that the current thread allocated and that were not freed on
+    /// it.
+    pub(crate) fn held() -> isize {
+        HELD.with(Cell::get)
+    }
+
+    /// Count the most bytes that the current thread holds from now on.
+    pub(crate) fn reset_peak() {
+        let held = held();
+        PEAK.with(|peak| peak.set(held));
+    }
+
+    /// The most bytes that the current thread held since [`reset_peak`].
+    pub(crate) fn peak() -> isize {
+        PEAK.with(Cell::get)
     }
 }
