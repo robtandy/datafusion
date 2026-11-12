@@ -195,7 +195,7 @@ use crate::operators::projection::PhysicalProjection;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::planner::lower_execution_plan_with_cte_rows;
 use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
-use crate::sort::{RunKeys, RunMerger, SortKeys, SortedRun, memory_size};
+use crate::sort::{RunMerger, SortKeys, SortedRun, memory_size};
 
 // ---------------------------------------------------------------------------
 // Lowering
@@ -1730,35 +1730,6 @@ fn scalar_rows_bytes(scalar: &ScalarValue, rows: usize) -> usize {
     scalar.size().saturating_mul(rows)
 }
 
-/// The memory that evaluating and encoding the values of the expressions
-/// `exprs` for the rows of `batch` takes, as [`key_memory`] of their arrays,
-/// without the arrays of the expressions of a single value (e.g. literals),
-/// whose rows take the bytes of the value each (see [`scalar_rows_bytes`]),
-/// and the bytes of their encoding (see [`encoded_bytes`]) of it.
-fn expression_memory(
-    exprs: &[PhysicalExprRef],
-    batch: &RecordBatch,
-) -> Result<(usize, usize)> {
-    let rows = batch.num_rows();
-    let mut arrays = vec![];
-    let (mut scalars, mut encoded) = (0, 0);
-    for expr in exprs {
-        match expr.evaluate(batch)? {
-            ColumnarValue::Array(array) => {
-                encoded += encoded_bytes(array.as_ref());
-                arrays.push(array);
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let row = scalar.to_array_of_size(1)?;
-                let row_encoded = encoded_bytes(row.as_ref()).saturating_mul(rows);
-                scalars += scalar_rows_bytes(&scalar, rows) + row_encoded;
-                encoded += row_encoded;
-            }
-        }
-    }
-    Ok((key_memory(&arrays, batch) + scalars, encoded))
-}
-
 /// `array` with its unions (also those nested in it) replaced by structs of
 /// the type id and of the children of their values (`{type_id, c<id>, ...}`:
 /// the value of the child of the type id, NULLs of the other children), NULL
@@ -2774,7 +2745,7 @@ impl PhysicalExpr for NormalizedFloats {
     }
 
     /// A single value (e.g. a literal) stays one (to be made an array once it
-    /// is reserved, see `expression_memory`).
+    /// is reserved, see `SortKeys::sort`).
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         Ok(match self.expr.evaluate(batch)? {
             ColumnarValue::Scalar(scalar) => {
@@ -2853,7 +2824,7 @@ impl PhysicalExpr for ComparableUnions {
     }
 
     /// A single value (e.g. a literal) stays one (to be made an array once it
-    /// is reserved, see `expression_memory`).
+    /// is reserved, see `SortKeys::sort`).
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         Ok(match self.expr.evaluate(batch)? {
             ColumnarValue::Scalar(scalar) => {
@@ -3076,44 +3047,16 @@ impl MergeJoinSort {
             return Ok(());
         }
         let batches = std::mem::take(&mut local.batches);
-        // The working memory of the sort, reserved while it sorts: the keys
-        // that it evaluates (if computed), their encoding and its sorted copy,
-        // and the sorted copy of the rows (the run).
-        // The keys of a single value (e.g. literals) are bounded without
-        // their arrays for all rows (see `expression_memory`).
-        let exprs = self
-            .keys
-            .ordering()
-            .iter()
-            .map(|sort_expr| Arc::clone(&sort_expr.expr))
-            .collect::<Vec<_>>();
-        let mut working = 0;
-        for batch in &batches {
-            // The keys and their encoding, its sorted copy, and the sorted copy
-            // of the rows.
-            let (keys, encoded) = expression_memory(&exprs, batch)?;
-            working += keys + encoded + memory_size(batch);
-        }
-        let sorting = reservation.new_empty();
-        sorting.try_grow(working)?;
-        let runs = self.keys.sort(&self.schema, &batches, None)?;
-        reservation.try_grow(runs.iter().map(run_memory_size).sum())?;
-        drop(sorting);
+        // The sort reserves its working memory while it sorts (the keys that
+        // it evaluates and encodes, and the sorted copies of the keys and the
+        // rows), and the memory of the runs.
+        let runs = self.keys.sort(&self.schema, &batches, None, reservation)?;
         drop(batches);
         reservation.shrink(std::mem::take(&mut local.bytes));
         local.rows = 0;
         local.runs.extend(runs);
         Ok(())
     }
-}
-
-/// The bytes of a sorted run: its rows and its keys.
-fn run_memory_size(run: &SortedRun) -> usize {
-    let keys = match run.keys() {
-        RunKeys::Rows(rows) => rows.size(),
-        RunKeys::Column(column) => column.values().get_array_memory_size(),
-    };
-    memory_size(run.batch()) + keys
 }
 
 /// The global sink state of a [`MergeJoinSort`].

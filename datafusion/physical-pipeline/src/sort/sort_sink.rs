@@ -28,6 +28,11 @@
 //! can be among the first `fetch` rows of the merge. (A sort with a fetch is
 //! usually lowered to a [`PhysicalTopK`](super::PhysicalTopK), which keeps
 //! even fewer rows.)
+//!
+//! The buffered chunks are reserved in the memory pool of the session as
+//! they arrive, what sorting them allocates before it allocates it, and the
+//! runs until the merger emitted their rows (see [`super`]): the sort fails
+//! with `ResourcesExhausted` when the pool cannot hold them.
 
 use std::sync::Arc;
 
@@ -35,12 +40,13 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
+use super::{SortKeys, SortPlan, SortedOutput, buffered_memory, next_sorted_chunk};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -131,24 +137,34 @@ impl PhysicalSort {
         self.fetch
     }
 
-    /// Sort the rows buffered in `state` into a run.
-    fn sort_buffered_rows(&self, state: &mut SortLocalState) -> Result<()> {
+    /// Sort the rows buffered in `state` into a run. The memory of the run is
+    /// reserved in `global` instead of the memory of the rows.
+    fn sort_buffered_rows(
+        &self,
+        global: &SortSinkState,
+        state: &mut SortLocalState,
+    ) -> Result<()> {
         let batches = std::mem::take(&mut state.batches);
         state.rows = 0;
-        state.bytes = 0;
-        state
-            .runs
-            .extend(self.keys.sort(&self.schema, &batches, self.fetch)?);
+        let bytes = std::mem::take(&mut state.bytes);
+        let runs =
+            self.keys
+                .sort(&self.schema, &batches, self.fetch, &global.reservation)?;
+        drop(batches);
+        global.reservation.shrink(bytes);
+        state.runs.extend(runs);
         Ok(())
     }
 }
 
 /// The global sink state of a [`PhysicalSort`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SortSinkState {
     /// The sorted runs of the threads that completed.
     runs: Mutex<Vec<SortedRun>>,
     output: SortedOutput,
+    /// The memory of the rows that all threads buffered and of their runs.
+    reservation: MemoryReservation,
 }
 
 impl GlobalSinkState for SortSinkState {}
@@ -160,7 +176,7 @@ struct SortLocalState {
     batches: Vec<RecordBatch>,
     /// The number of rows of `batches`.
     rows: usize,
-    /// The estimated memory size of `batches`.
+    /// The memory of `batches` (see [`buffered_memory`]), which is reserved.
     bytes: usize,
     /// The sorted runs of the thread.
     runs: Vec<SortedRun>,
@@ -204,9 +220,15 @@ impl PhysicalOperator for PhysicalSort {
 
     fn get_global_sink_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSinkState>> {
-        Ok(Arc::new(SortSinkState::default()))
+        let reservation =
+            MemoryConsumer::new(self.name()).register(ctx.task_ctx.memory_pool());
+        Ok(Arc::new(SortSinkState {
+            runs: Mutex::default(),
+            output: SortedOutput::default(),
+            reservation,
+        }))
     }
 
     fn get_local_sink_state(
@@ -221,20 +243,23 @@ impl PhysicalOperator for PhysicalSort {
         &self,
         _ctx: &ExecutionContext,
         input: &DataChunk,
-        _gstate: &dyn GlobalSinkState,
+        gstate: &dyn GlobalSinkState,
         lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         if self.fetch == Some(0) {
             return Ok(SinkResult::Finished);
         }
+        let global = downcast_state::<SortSinkState>(gstate.as_any(), self.name())?;
         let state =
             downcast_state_mut::<SortLocalState>(lstate.as_any_mut(), self.name())?;
         let batch = input.compact()?;
+        let bytes = buffered_memory(&batch);
+        global.reservation.try_grow(bytes)?;
         state.rows += batch.num_rows();
-        state.bytes += memory_size(&batch);
+        state.bytes += bytes;
         state.batches.push(batch);
         if state.rows >= self.run_rows || state.bytes >= self.run_bytes {
-            self.sort_buffered_rows(state)?;
+            self.sort_buffered_rows(global, state)?;
         }
         Ok(SinkResult::NeedMoreInput)
     }
@@ -248,7 +273,7 @@ impl PhysicalOperator for PhysicalSort {
         let global = downcast_state::<SortSinkState>(gstate.as_any(), self.name())?;
         let state =
             downcast_state_mut::<SortLocalState>(lstate.as_any_mut(), self.name())?;
-        self.sort_buffered_rows(state)?;
+        self.sort_buffered_rows(global, state)?;
         global.runs.lock().append(&mut state.runs);
         Ok(())
     }
@@ -262,7 +287,7 @@ impl PhysicalOperator for PhysicalSort {
         let runs = std::mem::take(&mut *global.runs.lock());
         let merger = RunMerger::new(Arc::clone(&self.schema), runs, self.fetch);
         let empty = merger.remaining_rows() == 0;
-        global.output.set(merger);
+        global.output.set(merger, &global.reservation);
         Ok(if empty {
             SinkFinalize::NoOutputPossible
         } else {
@@ -551,6 +576,37 @@ mod tests {
             let rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
             assert_eq!(rows, fetch.unwrap_or(6000));
             assert!(output.iter().all(|batch| batch.num_columns() == 0));
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sorts_reserve_their_rows_in_the_memory_pool() -> Result<()> {
+        use crate::operators::lowering_tests::{
+            assert_exhausted, task_context_with_memory_limit,
+        };
+        use crate::sort::test_support::assert_memory_freed;
+        // 100,000 rows of an `Int64` column: 800 KB.
+        let n = 100_000;
+        for run_rows in [SORT_RUN_ROWS, 1000] {
+            let root = || {
+                let input = Arc::new(TestSource::new(scrambled_chunks(n, 2048)));
+                Arc::new(
+                    sort(input, false, None).with_run_limits(run_rows, SORT_RUN_BYTES),
+                )
+            };
+            // 256 KiB do not hold the rows (or their runs): the sort fails.
+            let ctx = task_context_with_memory_limit(256 << 10);
+            let result = Executor::collect(root(), Arc::clone(&ctx), 4).await;
+            let error = result.as_ref().map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains("PhysicalSort"), "{error}");
+            assert_exhausted(result);
+            assert_memory_freed(ctx.memory_pool().as_ref()).await;
+            // 16 MiB do: the sort returns all rows, and frees their memory.
+            let ctx = task_context_with_memory_limit(16 << 20);
+            let output = Executor::collect(root(), Arc::clone(&ctx), 4).await?;
+            assert_eq!(values(&output), (0..n).collect::<Vec<_>>());
+            assert_eq!(ctx.memory_pool().reserved(), 0, "runs of {run_rows} rows");
         }
         Ok(())
     }

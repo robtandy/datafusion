@@ -44,6 +44,11 @@
 //! floats compare in their total order (`-0.0` before `0.0`, `NaN` last).
 //! Which of the rows that tie with its last row it keeps, and in which order
 //! it emits rows with equal keys, is its own.
+//!
+//! The buffered rows and the top-ks of the threads are reserved in the memory
+//! pool of the session, and what reducing them allocates before it allocates
+//! it (see [`SortKeys::sort`]): the TopK fails with `ResourcesExhausted` when
+//! the pool cannot hold them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,6 +60,7 @@ use arrow_row::OwnedRow;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, ScalarValue, internal_err};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr::expressions::{
     BinaryExpr, DynamicFilterPhysicalExpr, is_not_null, is_null, lit,
@@ -64,7 +70,9 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, memory_size, next_sorted_chunk};
+use super::{
+    SortKeys, SortPlan, SortedOutput, buffered_memory, memory_size, next_sorted_chunk,
+};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -246,19 +254,28 @@ impl PhysicalTopK {
     }
 
     /// Sort the runs and the buffered rows of `state` and keep the first `k`
-    /// rows. If that gives a tighter threshold, publish it.
+    /// rows. If that gives a tighter threshold, publish it. The memory of the
+    /// rows that are kept is reserved in `global` instead of the memory of
+    /// the runs and the buffered rows.
     fn reduce(&self, global: &TopKSinkState, state: &mut TopKLocalState) -> Result<()> {
         if state.buffer.is_empty() {
             return Ok(());
         }
         let mut batches = Vec::with_capacity(state.buffer.len() + state.top.len());
+        let reserved = state.buffered_memory
+            + state.top.iter().map(SortedRun::memory_size).sum::<usize>();
         batches.extend(state.top.drain(..).map(SortedRun::into_batch));
         batches.append(&mut state.buffer);
         state.buffered_rows = 0;
         state.buffered_bytes = 0;
-        state.top = self.keys.sort(&self.schema, &batches, Some(self.k))?;
-        state.top_bytes = state.top.iter().map(|run| memory_size(run.batch())).sum();
+        state.buffered_memory = 0;
+        let top =
+            self.keys
+                .sort(&self.schema, &batches, Some(self.k), &global.reservation)?;
         drop(batches);
+        global.reservation.shrink(reserved);
+        state.top = top;
+        state.top_bytes = state.top.iter().map(|run| memory_size(run.batch())).sum();
 
         // The `k`-th row is the last row of the last run.
         let rows = state.top.iter().map(SortedRun::num_rows).sum::<usize>();
@@ -447,7 +464,7 @@ struct Threshold {
 }
 
 /// The global sink state of a [`PhysicalTopK`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TopKSinkState {
     /// The top-ks of the threads that completed.
     runs: Mutex<Vec<SortedRun>>,
@@ -457,6 +474,9 @@ struct TopKSinkState {
     /// notice a new threshold with an atomic load.
     generation: AtomicUsize,
     output: SortedOutput,
+    /// The memory of the rows that all threads buffered and of their
+    /// top-ks.
+    reservation: MemoryReservation,
 }
 
 impl GlobalSinkState for TopKSinkState {}
@@ -476,6 +496,8 @@ struct TopKLocalState {
     buffered_rows: usize,
     /// The estimated memory size of `buffer`.
     buffered_bytes: usize,
+    /// The memory of `buffer` (see [`buffered_memory`]), which is reserved.
+    buffered_memory: usize,
     /// The tightest threshold the thread knows.
     threshold: Option<Arc<Threshold>>,
     /// The generation of the global threshold the thread knows.
@@ -520,9 +542,17 @@ impl PhysicalOperator for PhysicalTopK {
 
     fn get_global_sink_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSinkState>> {
-        Ok(Arc::new(TopKSinkState::default()))
+        let reservation =
+            MemoryConsumer::new(self.name()).register(ctx.task_ctx.memory_pool());
+        Ok(Arc::new(TopKSinkState {
+            runs: Mutex::default(),
+            threshold: Mutex::default(),
+            generation: AtomicUsize::new(0),
+            output: SortedOutput::default(),
+            reservation,
+        }))
     }
 
     fn get_local_sink_state(
@@ -560,6 +590,9 @@ impl PhysicalOperator for PhysicalTopK {
                 _ => {}
             }
         }
+        let memory = buffered_memory(&batch);
+        global.reservation.try_grow(memory)?;
+        state.buffered_memory += memory;
         state.buffered_rows += batch.num_rows();
         state.buffered_bytes += memory_size(&batch);
         state.buffer.push(batch);
@@ -597,7 +630,7 @@ impl PhysicalOperator for PhysicalTopK {
             dynamic_filter.filter.mark_complete();
         }
         let rows = merger.remaining_rows();
-        global.output.set(merger);
+        global.output.set(merger, &global.reservation);
         Ok(if rows == 0 {
             SinkFinalize::NoOutputPossible
         } else {
@@ -690,6 +723,34 @@ mod tests {
             .chunks(size)
             .map(|values| values_chunk(values.iter().copied()))
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_reserve_their_rows_in_the_memory_pool() -> Result<()> {
+        use crate::executor::Executor;
+        use crate::operators::lowering_tests::{
+            assert_exhausted, task_context_with_memory_limit,
+        };
+        use crate::sort::test_support::assert_memory_freed;
+        // The first 50,000 of 100,000 rows of an `Int64` column: 400 KB.
+        let n = 100_000;
+        let root = || {
+            let input = Arc::new(TestSource::new(scrambled_chunks(n, 2048)));
+            Arc::new(topk(input, false, 50_000))
+        };
+        // 256 KiB do not hold the rows that the TopK keeps: it fails.
+        let ctx = task_context_with_memory_limit(256 << 10);
+        let result = Executor::collect(root(), Arc::clone(&ctx), 4).await;
+        let error = result.as_ref().map(|_| ()).unwrap_err().to_string();
+        assert!(error.contains("PhysicalTopK"), "{error}");
+        assert_exhausted(result);
+        assert_memory_freed(ctx.memory_pool().as_ref()).await;
+        // 16 MiB do: the TopK returns its rows, and frees their memory.
+        let ctx = task_context_with_memory_limit(16 << 20);
+        let output = Executor::collect(root(), Arc::clone(&ctx), 4).await?;
+        assert_eq!(values(&output), (0..50_000).collect::<Vec<_>>());
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
