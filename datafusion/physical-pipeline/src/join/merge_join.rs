@@ -3512,6 +3512,7 @@ impl PhysicalMergeJoin {
             state,
         } = &mut *source;
         let mut chunks = 0;
+        let mut parts = 0;
         loop {
             if let Buffered::Streamed(window) = &state.buffered {
                 let mut window = window.lock();
@@ -3555,6 +3556,14 @@ impl PhysicalMergeJoin {
             let (batch, result) = self.join_streamed_chunk(ctx, input, state)?;
             match result {
                 OperatorResult::NeedMoreInput => *chunk = None,
+                // The parts of the chunk without output count towards the call
+                // too: the chunk is joined further in the next call.
+                OperatorResult::HaveMoreOutput if batch.is_none() => {
+                    parts += 1;
+                    if parts == STREAMED_CHUNKS_PER_CALL {
+                        return Ok(SourceResult::Blocked(TaskInterrupt::yield_now()));
+                    }
+                }
                 OperatorResult::HaveMoreOutput => {}
                 OperatorResult::Finished => return Ok(SourceResult::Finished),
                 OperatorResult::Blocked(interrupt) => {
@@ -5339,8 +5348,9 @@ struct MergedStreams {
 
 /// A join that reads its streamed input as a stream (see
 /// [`PhysicalMergeJoin::reads_streamed_input`]) reads at most this many
-/// chunks of streamed rows without output in a call of `get_data` before it
-/// lets the other tasks run.
+/// chunks of streamed rows without output (and joins at most this many parts
+/// of a chunk without output) in a call of `get_data` before it lets the
+/// other tasks run.
 const STREAMED_CHUNKS_PER_CALL: usize = 16;
 
 impl GlobalSourceState for UnmatchedScanState {
@@ -5749,7 +5759,9 @@ impl PhysicalOperator for PhysicalMergeJoin {
 pub(crate) mod tests {
     use super::*;
 
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use datafusion_common_runtime::SpawnedTask;
     use std::time::Duration;
 
     use arrow::array::{
@@ -9682,6 +9694,152 @@ pub(crate) mod tests {
                 panic!("Results differ: {message}\n{context}");
             }
         }
+        Ok(())
+    }
+
+    /// The schema of the rows `(<side>id, <side>k, <side>x)` of the joins of
+    /// many pairs that their filter rejects (see [`rejecting_filter`]).
+    pub(crate) fn fanout_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+            Field::new(format!("{side}x"), DataType::Int64, false),
+        ]))
+    }
+
+    /// `rows` rows of the `side` input, all of the key 1 and of `x` 0.
+    pub(crate) fn fanout_rows(side: &str, rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            fanout_schema(side),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                Arc::new(Int32Array::from(vec![1; rows])),
+                Arc::new(Int64Array::from(vec![0; rows])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The filter `lx < rx`, which rejects all pairs of [`fanout_rows`].
+    pub(crate) fn rejecting_filter() -> JoinFilter {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lx", DataType::Int64, false),
+            Field::new("rx", DataType::Int64, false),
+        ]));
+        let expression = Arc::new(BinaryExpr::new(
+            col("lx", &schema).unwrap(),
+            Operator::Lt,
+            col("rx", &schema).unwrap(),
+        ));
+        JoinFilter::new(
+            expression,
+            vec![
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Right,
+                },
+            ],
+            schema,
+        )
+    }
+
+    /// Execute `root`, lowered from `plan`, in a task of the runtime of the
+    /// current thread, while the test waits for a timer of 10 ms, and then
+    /// abort it: the time that the timer took to fire, and whether the task
+    /// was cancelled (dropped before it ended).
+    pub(crate) async fn time_beside(
+        root: Arc<dyn PhysicalOperator>,
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<(Duration, bool)> {
+        /// Sets its flag when it is dropped.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(PipelineRootExec::try_new(root, plan)?);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(Arc::clone(&dropped));
+        let query_ended = Arc::clone(&ended);
+        let query = SpawnedTask::spawn(async move {
+            let _guard = guard;
+            let result = collect(exec, task_ctx()).await;
+            query_ended.store(true, Ordering::Relaxed);
+            result
+        });
+        let start = datafusion_common::instant::Instant::now();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let waited = start.elapsed();
+        // Abort the query: the runtime drops it when it runs it next.
+        drop(query);
+        for _ in 0..100 {
+            if dropped.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let cancelled = dropped.load(Ordering::Relaxed) && !ended.load(Ordering::Relaxed);
+        Ok((waited, cancelled))
+    }
+
+    #[tokio::test]
+    async fn merges_without_output_let_other_tasks_run() -> Result<()> {
+        // A merge join of sorted streams of 4,000 rows of one key each, with a
+        // filter that rejects all of their 16,000,000 pairs (joined in parts of
+        // 2,048 of them, a part a call of the operator, after a number of
+        // which the executor yields): the other tasks of the runtime of the
+        // current thread run (a timer of 10 ms fires about in time), and the
+        // join is cancelled when they abort it.
+        let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+            let schema = fanout_schema(side);
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                col(&format!("{side}k"), &schema).unwrap(),
+                SortOptions::default(),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: Arc::clone(&schema),
+                batches: vec![fanout_rows(side, 4000)],
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (left, right) = (stream("l"), stream("r"));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(rejecting_filter()),
+            JoinType::Inner,
+            vec![SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+        )?);
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        assert_streaming_merge_join(&root, "a rejecting filter");
+        let (waited, cancelled) = time_beside(root, plan).await?;
+        assert!(
+            waited < Duration::from_secs(1),
+            "a timer of 10 ms fired after {waited:?}"
+        );
+        assert!(cancelled);
         Ok(())
     }
 

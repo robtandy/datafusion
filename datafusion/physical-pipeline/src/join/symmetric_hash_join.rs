@@ -1001,6 +1001,12 @@ const NO_ROW: usize = usize::MAX;
 /// output in a call of `get_data` before it lets the other tasks run.
 const CHUNKS_PER_CALL: usize = 16;
 
+/// The join joins at most this many parts of the candidates of its chunks
+/// that produce no output (each of at most [`DEFAULT_VECTOR_SIZE`] candidate
+/// pairs, see [`PhysicalSymmetricHashJoin::next_chunk_output`]) in a call of
+/// `get_data` before it lets the other tasks run.
+const PARTS_PER_CALL: usize = 16;
+
 /// The bytes of the index of a final row, and of its mark.
 const FINAL_ROW_INDEX_BYTES: usize = size_of::<Option<usize>>() + 1;
 
@@ -1607,8 +1613,15 @@ impl PhysicalSymmetricHashJoin {
         run: &mut SymmetricRun,
     ) -> Result<SourceResult> {
         let mut chunks = 0;
+        let mut parts = 0;
         loop {
             if let Some(job) = &mut run.job {
+                // The parts of the candidates of a chunk without output (e.g.
+                // whose pairs the filter rejects all) count towards the call
+                // too: the chunk is joined further in the next call.
+                if parts == PARTS_PER_CALL {
+                    return Ok(SourceResult::Blocked(TaskInterrupt::yield_now()));
+                }
                 let output =
                     self.next_chunk_output(job, &mut run.tables, &run.reservation)?;
                 if job.is_done() {
@@ -1619,6 +1632,7 @@ impl PhysicalSymmetricHashJoin {
                 if let Some(batch) = output {
                     return Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)));
                 }
+                parts += 1;
                 continue;
             }
             if let Some(batch) = self.next_determined_output(run)? {
@@ -1880,10 +1894,10 @@ pub(crate) mod tests {
     use crate::join::merge_join::tests::{
         ALL_JOIN_TYPES, BuiltPartition, PeakPool, data_batch, data_schema,
         dictionary_batches, dictionary_layouts, dictionary_probe_rows, dictionary_schema,
-        dictionary_view_rows, empty_dictionary_cases, join_filter, keyed_rows,
-        layout_type, limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
-        reference_join_of_rows, run_native, union_key_layouts, union_key_matches,
-        with_timeout,
+        dictionary_view_rows, empty_dictionary_cases, fanout_rows, fanout_schema,
+        join_filter, keyed_rows, layout_type, limited_task_ctx, num_rows, payload_schema,
+        reference_join_of_keys, reference_join_of_rows, rejecting_filter, run_native,
+        time_beside, union_key_layouts, union_key_matches, with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4812,6 +4826,56 @@ pub(crate) mod tests {
                 panic!("Results differ: {message}\n{context}");
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn joins_without_output_let_other_tasks_run() -> Result<()> {
+        // A symmetric join of streams of 4,000 rows of one key each, with a
+        // filter that rejects all of their 16,000,000 pairs (joined in parts of
+        // 2,048 of them): the join yields after a few parts without output,
+        // so that the other tasks of the runtime of the current thread run (a
+        // timer of 10 ms fires about in time), and the join is cancelled when
+        // they abort it.
+        let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+            let partition = BatchesPartition {
+                schema: fanout_schema(side),
+                batches: vec![fanout_rows(side, 4000)],
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    fanout_schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (left, right) = (stream("l"), stream("r"));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(rejecting_filter()),
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&plan)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        let (waited, cancelled) = time_beside(root, plan).await?;
+        assert!(
+            waited < Duration::from_secs(1),
+            "a timer of 10 ms fired after {waited:?}"
+        );
+        assert!(cancelled);
         Ok(())
     }
 }
