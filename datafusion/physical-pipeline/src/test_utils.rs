@@ -87,7 +87,8 @@
 //!
 //! The rows that the nested `ORDER BY … LIMIT`s of a query (below its
 //! top-level sort, also in subqueries) return may also be other rows that tie
-//! at their windows. If the results differ, DataFusion also runs the query
+//! at their windows, and the rows that its `DISTINCT ON`s return for each
+//! group may be any rows that tie for the first row of the group. If the results differ, DataFusion also runs the query
 //! for other rows of its nested limits, and the result of the pipeline engine
 //! may be any of these results (see [`alternative_outcomes`]). If the query
 //! only has projections, filters, sorts, subquery aliases and inner joins
@@ -851,18 +852,165 @@ fn lineage_column(i: usize) -> String {
     format!("__test_utils_lineage_{i}")
 }
 
-/// A nested `ORDER BY … LIMIT` of a query (see [`nested_limits`]).
+/// A node of a query whose rows may be other rows that tie (see
+/// [`nested_limits`]): a nested `ORDER BY … LIMIT`, or a `DISTINCT ON`, which
+/// returns one row of each group, among the rows that tie for its first row.
 struct NestedLimit {
     /// Its plan, in the plan of the query.
     plan: LogicalPlan,
-    /// Its sorted reference, whose sorted rows it returns.
-    reference: SortedReference,
-    /// Its sorted rows.
-    sorted: SortedRows,
+    kind: NestedKind,
+}
+
+/// The kind of a [`NestedLimit`], and the rows that it may return.
+enum NestedKind {
+    /// A nested `ORDER BY … LIMIT`: its sorted reference, whose sorted rows it
+    /// returns, and these sorted rows.
+    Limit {
+        reference: SortedReference,
+        sorted: SortedRows,
+    },
+    /// A `DISTINCT ON`: the rows of its input (its output columns, then the
+    /// values of its `ON` expressions), in the order of its `ORDER BY`, the
+    /// rows that may be the row of each group (positions), the sort options
+    /// of its `ON` expressions in its `ORDER BY` (if any), and the rows that
+    /// DataFusion returns.
+    DistinctOn {
+        rows: RecordBatch,
+        groups: Vec<Vec<usize>>,
+        order: Option<Vec<SortOptions>>,
+        own: Vec<usize>,
+    },
+}
+
+/// The name of the column of the values of the `j`th `ON` expression of a
+/// `DISTINCT ON`, see [`NestedLimit::rows`].
+fn on_column(j: usize) -> String {
+    format!("__test_utils_distinct_on_{j}")
 }
 
 impl NestedLimit {
-    /// The fields of the output schema of the limit, with their qualifiers.
+    /// The nested limit or the `DISTINCT ON` `plan` of a query, planned by
+    /// `ctx`, with the rows that it may return within the tolerance
+    /// `tolerance`.
+    async fn new(
+        ctx: &SessionContext,
+        plan: LogicalPlan,
+        tolerance: f64,
+    ) -> Result<Self> {
+        let LogicalPlan::Distinct(Distinct::On(distinct)) = &plan else {
+            let reference = sorted_reference(ctx, &plan, tolerance).await?;
+            let sorted = reference.sorted_rows(tolerance)?;
+            return Ok(Self {
+                plan,
+                kind: NestedKind::Limit { reference, sorted },
+            });
+        };
+        // The rows of its input with their output columns, the values of its
+        // `ON` expressions, and the values of the rest of its `ORDER BY`.
+        let sort_expr = distinct.sort_expr.clone().unwrap_or_default();
+        let on = distinct.on_expr.len();
+        let column = |name: &str| Expr::Column(Column::from_name(name));
+        let mut exprs = distinct
+            .select_expr
+            .iter()
+            .enumerate()
+            .map(|(i, expr)| expr.clone().unalias().alias(format!("c{i}")))
+            .collect::<Vec<_>>();
+        let width = exprs.len();
+        let mut order = vec![];
+        for (j, expr) in distinct.on_expr.iter().enumerate() {
+            exprs.push(expr.clone().unalias().alias(on_column(j)));
+            let (asc, nulls_first) = sort_expr
+                .get(j)
+                .map_or((true, false), |sort| (sort.asc, sort.nulls_first));
+            order.push(SortExpr::new(column(&on_column(j)), asc, nulls_first));
+        }
+        let mut rest = vec![];
+        for (l, sort) in sort_expr.iter().enumerate().skip(on) {
+            let name = format!("__test_utils_distinct_order_{l}");
+            exprs.push(sort.expr.clone().unalias().alias(&name));
+            order.push(SortExpr::new(column(&name), sort.asc, sort.nulls_first));
+            rest.push(SortOptions {
+                descending: !sort.asc,
+                nulls_first: sort.nulls_first,
+            });
+        }
+        let input = Projection::try_new(exprs, Arc::clone(&distinct.input))?;
+        let sorted = LogicalPlan::Sort(Sort {
+            expr: order,
+            input: Arc::new(LogicalPlan::Projection(input)),
+            fetch: None,
+        });
+        let batches = ctx
+            .execute_logical_plan(sorted.clone())
+            .await?
+            .collect()
+            .await?;
+        let schema = batches.first().map_or_else(
+            || Arc::new(sorted.schema().as_arrow().clone()),
+            RecordBatch::schema,
+        );
+        let rows = concat_batches(&schema, &batches)?;
+        let values = |row: usize, columns: Range<usize>| {
+            columns
+                .map(|column| Value::try_new(rows.column(column).as_ref(), row))
+                .collect::<Result<Row>>()
+        };
+        // The groups of rows of equal values of the `ON` expressions, and the
+        // rows of each group that may be first, as they tie on the rest of the
+        // `ORDER BY`.
+        let (mut groups, mut own) = (vec![], vec![]);
+        let mut start = 0;
+        while start < rows.num_rows() {
+            let keys = values(start, width..width + on)?;
+            let mut end = start + 1;
+            while end < rows.num_rows()
+                && rows_equal(&values(end, width..width + on)?, &keys, 0.0)
+            {
+                end += 1;
+            }
+            let later = (start..end)
+                .map(|row| values(row, width + on..rows.num_columns()))
+                .collect::<Result<Vec<_>>>()?;
+            let (classes, tied) = classes_and_ties(&later, &rest, tolerance);
+            let classes = classes
+                .into_iter()
+                .map(|class| (class.rows, class.keys))
+                .collect::<Vec<_>>();
+            let first = bounds(&classes, &tied);
+            groups.push(
+                classes
+                    .iter()
+                    .zip(first)
+                    .filter(|(_, (first, _))| *first == 0)
+                    .flat_map(|((rows, _), _)| rows.clone())
+                    .map(|row| start + row)
+                    .collect(),
+            );
+            own.push(start);
+            start = end;
+        }
+        let order = distinct.sort_expr.as_ref().map(|_| {
+            sort_expr[..on.min(sort_expr.len())]
+                .iter()
+                .map(|sort| SortOptions {
+                    descending: !sort.asc,
+                    nulls_first: sort.nulls_first,
+                })
+                .collect()
+        });
+        Ok(Self {
+            plan,
+            kind: NestedKind::DistinctOn {
+                rows,
+                groups,
+                order,
+                own,
+            },
+        })
+    }
+
+    /// The fields of the output schema of the node, with their qualifiers.
     fn fields(&self) -> Vec<(Option<TableReference>, FieldRef)> {
         self.plan
             .schema()
@@ -871,32 +1019,150 @@ impl NestedLimit {
             .collect()
     }
 
-    /// The output columns of the sorted rows `rows` (positions).
+    /// The fields of the rows of [`NestedLimit::columns`].
+    fn row_fields(&self) -> Vec<(Option<TableReference>, FieldRef)> {
+        let mut fields = self.fields();
+        if let NestedKind::DistinctOn { rows, .. } = &self.kind {
+            fields.extend(
+                rows.schema()
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name().starts_with("__test_utils_distinct_on_"))
+                    .map(|field| (None, Arc::clone(field))),
+            );
+        }
+        fields
+    }
+
+    /// The output columns of the rows `rows` (positions), followed by the
+    /// values of the `ON` expressions of a `DISTINCT ON`.
     fn columns(&self, rows: &[usize]) -> Result<Vec<ArrayRef>> {
         let positions = positions_array(rows)?;
-        let batch = self
-            .reference
-            .batches
-            .first()
-            .ok_or_else(|| DataFusionError::Internal("no sorted rows".to_string()))?;
-        Ok(batch.columns()[..self.reference.columns]
+        let (batch, width) = match &self.kind {
+            NestedKind::Limit { reference, .. } => (
+                reference.batches.first().ok_or_else(|| {
+                    DataFusionError::Internal("no sorted rows".to_string())
+                })?,
+                reference.columns,
+            ),
+            NestedKind::DistinctOn { rows, .. } => (rows, self.row_fields().len()),
+        };
+        Ok(batch.columns()[..width]
             .iter()
             .map(|column| take(column, &positions, None))
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// The sorted rows `rows` (positions), as a plan of the output schema of
-    /// the limit, followed by their positions in the column `lineage`.
+    /// The rows of `table` (of the columns of [`NestedLimit::columns`], then
+    /// of the column `lineage`), as a plan of the output schema of the node,
+    /// followed by the lineage: in the order of the `ON` expressions of a
+    /// `DISTINCT ON` with an `ORDER BY`.
+    fn plan_over(
+        &self,
+        table: Arc<dyn TableProvider>,
+        lineage: Option<&str>,
+    ) -> Result<LogicalPlan> {
+        let mut fields = self.row_fields();
+        if let Some(lineage) = lineage {
+            fields.push((None, Arc::new(Field::new(lineage, DataType::UInt32, false))));
+        }
+        let rows = rows_plan(table, &fields)?;
+        let NestedKind::DistinctOn { order, .. } = &self.kind else {
+            return Ok(rows);
+        };
+        let rows = match order {
+            Some(order) => LogicalPlan::Sort(Sort {
+                expr: order
+                    .iter()
+                    .enumerate()
+                    .map(|(j, options)| {
+                        SortExpr::new(
+                            Expr::Column(Column::from_name(on_column(j))),
+                            !options.descending,
+                            options.nulls_first,
+                        )
+                    })
+                    .collect(),
+                input: Arc::new(rows),
+                fetch: None,
+            }),
+            None => rows,
+        };
+        // Without the values of the `ON` expressions.
+        let mut exprs = self
+            .fields()
+            .iter()
+            .map(|(qualifier, field)| {
+                Expr::Column(Column::new(qualifier.clone(), field.name()))
+            })
+            .collect::<Vec<_>>();
+        if let Some(lineage) = lineage {
+            exprs.push(Expr::Column(Column::from_name(lineage)));
+        }
+        Ok(LogicalPlan::Projection(Projection::try_new(
+            exprs,
+            Arc::new(rows),
+        )?))
+    }
+
+    /// The rows `rows` (positions), as a plan of the output schema of the
+    /// node, followed by their positions in the column `lineage`.
     fn rows(&self, rows: &[usize], lineage: Option<&str>) -> Result<LogicalPlan> {
         let mut columns = self.columns(rows)?;
-        let mut fields = self.fields();
+        let mut fields = self.row_fields();
         if let Some(lineage) = lineage {
             columns.push(Arc::new(positions_array(rows)?));
             fields.push((None, Arc::new(Field::new(lineage, DataType::UInt32, false))));
         }
         let batch = rows_batch(columns, &fields)?;
         let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-        rows_plan(Arc::new(table), &fields)
+        self.plan_over(Arc::new(table), lineage)
+    }
+
+    /// The rows that DataFusion returns (positions).
+    fn own(&self) -> Vec<usize> {
+        match &self.kind {
+            NestedKind::Limit { sorted, .. } => sorted.window.clone().collect(),
+            NestedKind::DistinctOn { own, .. } => own.clone(),
+        }
+    }
+
+    /// The rows that the node may return (positions).
+    fn candidates(&self) -> Vec<usize> {
+        match &self.kind {
+            NestedKind::Limit { sorted, .. } => candidates(sorted).0,
+            NestedKind::DistinctOn { groups, .. } => {
+                groups.iter().flatten().copied().collect()
+            }
+        }
+    }
+
+    /// Up to `max` choices of the rows that the node may return (each the
+    /// positions of the rows, in their order), of the rows `pool` only (all
+    /// rows if `None`), but for the rows that DataFusion returns.
+    fn choices(&self, pool: Option<&BTreeSet<usize>>, max: usize) -> Vec<Vec<usize>> {
+        let own = self.own();
+        let allowed = |row: &usize| pool.is_none_or(|pool| pool.contains(row));
+        match &self.kind {
+            NestedKind::Limit { sorted, .. } => match pool {
+                None => window_choices(sorted, max),
+                Some(pool) => pool
+                    .iter()
+                    .copied()
+                    .combinations(sorted.window.len())
+                    .take(100_000)
+                    .filter(|choice| *choice != own && is_window_choice(sorted, choice))
+                    .take(max)
+                    .collect(),
+            },
+            NestedKind::DistinctOn { groups, .. } => groups
+                .iter()
+                .map(|group| group.iter().copied().filter(allowed).collect::<Vec<_>>())
+                .multi_cartesian_product()
+                .filter(|choice| *choice != own)
+                .take(max)
+                .collect(),
+        }
     }
 }
 
@@ -936,17 +1202,9 @@ pub async fn alternative_outcomes(
     let tolerance = options.float_tolerance;
     let mut nested = vec![];
     for limit in nested_limits(plan) {
-        let Ok(reference) = sorted_reference(ctx, &limit, tolerance).await else {
-            continue;
-        };
-        let Ok(sorted) = reference.sorted_rows(tolerance) else {
-            continue;
-        };
-        nested.push(NestedLimit {
-            plan: limit,
-            reference,
-            sorted,
-        });
+        if let Ok(limit) = NestedLimit::new(ctx, limit, tolerance).await {
+            nested.push(limit);
+        }
     }
     if nested.is_empty() {
         return vec![];
@@ -1006,7 +1264,7 @@ async fn slot_choices(
     let mut slots = vec![];
     let mut tables = vec![];
     for limit in nested {
-        let fields = limit.fields();
+        let fields = limit.row_fields();
         let empty = rows_batch(limit.columns(&[])?, &fields)?;
         let slot = Arc::new(Slot {
             schema: empty.schema(),
@@ -1014,7 +1272,7 @@ async fn slot_choices(
         });
         let partition = Arc::clone(&slot) as Arc<dyn PartitionStream>;
         let table = StreamingTable::try_new(empty.schema(), vec![partition])?;
-        tables.push(rows_plan(Arc::new(table), &fields)?);
+        tables.push(limit.plan_over(Arc::new(table), None)?);
         slots.push((slot, fields));
     }
     let replaced = replace_nested_limits(plan, &mut |i, _| tables.get(i).cloned())?;
@@ -1023,8 +1281,8 @@ async fn slot_choices(
     let per_limit = nested
         .iter()
         .map(|limit| {
-            std::iter::once(limit.sorted.window.clone().collect())
-                .chain(window_choices(&limit.sorted, MAX_CHOICE_RUNS))
+            std::iter::once(limit.own())
+                .chain(limit.choices(None, MAX_CHOICE_RUNS))
                 .collect::<Vec<Vec<usize>>>()
         })
         .collect::<Vec<_>>();
@@ -1080,7 +1338,7 @@ async fn lineage_choices(
 ) -> Option<Vec<Vec<Vec<usize>>>> {
     let candidates = nested
         .iter()
-        .map(|limit| candidates(&limit.sorted).0)
+        .map(NestedLimit::candidates)
         .collect::<Vec<_>>();
     let mut replacements = vec![];
     for (i, (limit, candidates)) in nested.iter().zip(&candidates).enumerate() {
@@ -1163,10 +1421,9 @@ async fn lineage_choices(
         .zip(shown.iter().zip(&silent))
         .map(|(limit, (shown, silent))| {
             let pool = shown.iter().chain(silent).copied().collect::<BTreeSet<_>>();
-            pool.into_iter()
-                .combinations(limit.sorted.window.len())
-                .take(4096)
-                .filter(|choice| is_window_choice(&limit.sorted, choice))
+            std::iter::once(limit.own())
+                .filter(|own| own.iter().all(|row| pool.contains(row)))
+                .chain(limit.choices(Some(&pool), 4096))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1288,10 +1545,11 @@ fn replace_nested_limits(
     Ok(plan
         .clone()
         .transform_down_with_subqueries(|node| {
-            if !limits_a_sort(&node) {
+            let distinct_on = matches!(node, LogicalPlan::Distinct(Distinct::On(_)));
+            if !limits_a_sort(&node) && !distinct_on {
                 return Ok(Transformed::no(node));
             }
-            if top_level > 0 {
+            if top_level > 0 && !distinct_on {
                 top_level -= 1;
                 return Ok(Transformed::no(node));
             }
@@ -7796,6 +8054,77 @@ mod tests {
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_other_rows_that_tie_in_distinct_on() {
+        // `DISTINCT ON` returns one row of each group, which may be any of the
+        // rows that tie for the first row of the group.
+        let setup = per_engine_tables(
+            kv_int_batch(&[(0, 1), (0, 2), (1, 5), (1, 6), (1, 4)]),
+            kv_int_batch(&[(1, 4), (1, 6), (0, 2), (0, 1), (1, 5)]),
+        );
+        for sql in [
+            "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k LIMIT 1",
+            "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k DESC",
+            "SELECT DISTINCT ON (k) k, v FROM m",
+            "SELECT v FROM (SELECT DISTINCT ON (k) k, v FROM m ORDER BY k) s ORDER BY v",
+            "SELECT sum(v) AS total FROM (SELECT DISTINCT ON (k) k, v FROM m) s",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn alternative_outcomes_of_distinct_on_are_rows_that_tie_for_first()
+    -> Result<()> {
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", kv_int_batch(&[(0, 1), (0, 2), (1, 5)]))?;
+        let options = ComparisonOptions::default();
+        let kv = |rows: &[(i32, i32)]| output(vec![kv_int_batch(rows)], true);
+        for (sql, rows, valid) in [
+            (
+                "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k",
+                vec![(0, 2), (1, 5)],
+                true,
+            ),
+            (
+                "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k",
+                vec![(0, 3), (1, 5)],
+                false,
+            ),
+            (
+                "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k",
+                vec![(1, 5), (0, 2)],
+                false,
+            ),
+            // `v` decides which row of the group is first.
+            (
+                "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k, v",
+                vec![(0, 2), (1, 5)],
+                false,
+            ),
+            (
+                "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k, v DESC",
+                vec![(0, 2), (1, 5)],
+                true,
+            ),
+        ] {
+            let plan = ctx.sql(sql).await?.logical_plan().clone();
+            let result = kv(&rows);
+            let datafusion = ctx.sql(sql).await?;
+            let expected = run_dataframe(&ctx, datafusion).await?;
+            let order = result_order(&ctx, &plan, &options).await;
+            let accepted = compare_results(&expected, &result, &order, &options).is_ok()
+                || alternative_outcomes(&ctx, &plan, &options, &result)
+                    .await
+                    .iter()
+                    .any(|(expected, order)| {
+                        compare_results(expected, &result, order, &options).is_ok()
+                    });
+            assert_eq!(accepted, valid, "{sql}: {rows:?}");
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
