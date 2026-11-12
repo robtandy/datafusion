@@ -101,14 +101,16 @@ use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
+use datafusion_common::float_semantics::normalize_floats;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, ScalarValue, internal_err,
     plan_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_expr::Operator;
 use datafusion_expr::interval_arithmetic::Interval;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal, NegativeExpr};
 use datafusion_physical_expr::intervals::cp_solver::{
     ExprIntervalGraph, PropagationResult,
 };
@@ -520,6 +522,18 @@ impl SortedFilter {
         if !check_support(filter.expression(), filter.schema()) {
             return Ok(None);
         }
+        // The values are compared with `-0.0` as `+0.0` (see `Pruning`), but
+        // interval arithmetic orders `-0.0` before `+0.0`: an expression that
+        // turns a zero into `-0.0` (a negation, a product or a quotient, or the
+        // literal) would make it rule out rows that the filter matches.
+        let floats = filter
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| field.data_type().is_floating());
+        if floats && may_negate_zeros(filter.expression()) {
+            return Ok(None);
+        }
         let mut exprs = Vec::with_capacity(2);
         for (side, (schema, order)) in [JoinSide::Left, JoinSide::Right]
             .into_iter()
@@ -601,6 +615,24 @@ fn filter_expression(
         .data()?;
     let contains = |expr: &PhysicalExprRef| has_subexpression(expr, &converted);
     Ok((complete && contains(filter.expression())).then_some(converted))
+}
+
+/// Whether `expr` may evaluate to `-0.0` for operands that are `+0.0`: it has a
+/// negation, a product, a quotient or a literal `-0.0`.
+fn may_negate_zeros(expr: &PhysicalExprRef) -> bool {
+    let negates = expr.is::<NegativeExpr>()
+        || expr.downcast_ref::<BinaryExpr>().is_some_and(|binary| {
+            matches!(binary.op(), Operator::Multiply | Operator::Divide)
+        })
+        || expr
+            .downcast_ref::<Literal>()
+            .is_some_and(|literal| match literal.value() {
+                ScalarValue::Float16(Some(value)) => value.is_sign_negative(),
+                ScalarValue::Float32(Some(value)) => value.is_sign_negative(),
+                ScalarValue::Float64(Some(value)) => value.is_sign_negative(),
+                _ => false,
+            });
+    negates || expr.children().into_iter().any(may_negate_zeros)
 }
 
 /// Whether `expr` is `subexpression`, or has it below it.
@@ -778,7 +810,9 @@ impl ChunkJoin {
 }
 
 /// The determination of the rows of a symmetric join by the order of its
-/// inputs, in an execution (see [`SortedFilter`]).
+/// inputs, in an execution (see [`SortedFilter`]). The values of the orders
+/// and the bounds are compared with `-0.0` as `+0.0`, as the comparisons of
+/// the filter do (see `normalize_floats`).
 struct Pruning {
     filter: SortedFilter,
     /// Encode the values of the order of the left and of the right input
@@ -810,7 +844,9 @@ impl Pruning {
     /// rows before them); remembers the value of the last row.
     fn sort_rows(&mut self, side: usize, batch: &RecordBatch) -> Result<Rows> {
         let order = &self.filter.sides[side].order;
-        let values = order.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        // `-0.0` is `+0.0`, as the comparisons of the filter take it.
+        let values =
+            normalize_floats(&order.expr.evaluate(batch)?.into_array(batch.num_rows())?);
         let rows = self.converters[side].convert_columns(&[Arc::clone(&values)])?;
         let after_last = match (&self.last[side], rows.num_rows()) {
             (Some((_, last)), 1..) => last.row() <= rows.row(0),
@@ -868,7 +904,8 @@ impl Pruning {
         if bound.is_null() || is_nan(bound) {
             return Ok(from);
         }
-        let bound = self.converters[side].convert_columns(&[bound.to_array()?])?;
+        let bound = normalize_floats(&bound.to_array()?);
+        let bound = self.converters[side].convert_columns(&[bound])?;
         Ok(table.first_not_before(from, bound.row(0)))
     }
 
@@ -1497,14 +1534,16 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::TimestampNanosecondArray;
-    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{
+        Array, AsArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+    };
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, TimeUnit};
     use datafusion::catalog::streaming::StreamingTable;
@@ -3118,6 +3157,209 @@ mod tests {
         let root = crate::planner::lower_execution_plan(&plan)?;
         let actual = run_native(&root, plan, task_ctx()).await?;
         assert_eq!(num_rows(&actual.batches), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn signed_zeros_are_equal_times() -> Result<()> {
+        // The filter compares `-0.0` as `+0.0`: a left time `-0.0` matches the
+        // right times `+0.0` that come after it, in batches of their own, also
+        // once the bounds of the right times determine rows (DataFusion's hash
+        // join is the reference).
+        let left = || {
+            timed_batches(
+                "l",
+                0..1,
+                |_| Some(1),
+                |_| Some(-0.0),
+                |id| id.to_string(),
+                1,
+            )
+        };
+        let right = || {
+            timed_batches(
+                "r",
+                0..3,
+                |_| Some(1),
+                |_| Some(0.0),
+                |id| id.to_string(),
+                1,
+            )
+        };
+        let filters = [
+            (
+                "lt = rt",
+                time_filter(|lt, rt| binary(lt, Operator::Eq, rt)),
+            ),
+            (
+                "lt >= rt AND lt <= rt",
+                time_filter(|lt, rt| {
+                    binary(
+                        binary(Arc::clone(&lt), Operator::GtEq, Arc::clone(&rt)),
+                        Operator::And,
+                        binary(lt, Operator::LtEq, rt),
+                    )
+                }),
+            ),
+        ];
+        for (name, filter) in filters {
+            for join_type in [JoinType::Inner, JoinType::Left, JoinType::Full] {
+                let context = format!("{join_type} {name}");
+                let bounded = |side: &str, batches: Vec<RecordBatch>| {
+                    MemorySourceConfig::try_new_exec(&[batches], timed_schema(side), None)
+                        .unwrap() as Arc<dyn ExecutionPlan>
+                };
+                let reference = hash_join(
+                    bounded("l", left()),
+                    bounded("r", right()),
+                    join_type,
+                    Some(filter.clone()),
+                    NullEquality::NullEqualsNothing,
+                )?;
+                let expected = EngineOutput {
+                    schema: reference.schema(),
+                    batches: with_timeout(collect(Arc::clone(&reference), task_ctx()))
+                        .await?,
+                    plan: reference,
+                    ordered: false,
+                };
+                assert_eq!(num_rows(&expected.batches), 3, "{context}");
+                let plan = timed_join(
+                    timed_stream("l", left(), true, false),
+                    timed_stream("r", right(), true, false),
+                    join_type,
+                    Some(filter.clone()),
+                    NullEquality::NullEqualsNothing,
+                    true,
+                )?;
+                let root = lower(&plan)?;
+                let tree = format_operator_tree(&root);
+                let join = root
+                    .downcast_ref::<PhysicalSymmetricHashJoin>()
+                    .unwrap_or_else(|| panic!("{context}\n{tree}"));
+                assert!(join.determines_rows_by_order(), "{context}\n{tree}");
+                let actual = run_native(&root, plan, task_ctx()).await?;
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\n{context}\n{tree}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows of the `side` input of the joins of skewed lists: 100 rows of
+    /// the key 1 (`<side>k`) whose lists (`<side>l`) are empty, but for the
+    /// first one, of 128 Ki values (1 MiB).
+    pub(crate) fn skewed_list_batch(side: &str) -> RecordBatch {
+        let item = Arc::new(Field::new_list_field(DataType::Int64, false));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+            Field::new(format!("{side}l"), DataType::List(Arc::clone(&item)), false),
+        ]));
+        let big = 128 * 1024;
+        let offsets = std::iter::once(0)
+            .chain(std::iter::repeat_n(big, 100))
+            .collect::<Vec<i32>>();
+        let values = Int64Array::from_iter_values(0..i64::from(big));
+        let lists = ListArray::new(
+            item,
+            arrow::buffer::OffsetBuffer::new(offsets.into()),
+            Arc::new(values),
+            None,
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from(vec![1; 100])),
+                Arc::new(lists),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The big lists of the output of a join of skewed lists (of either input),
+    /// in every batch of `batches`.
+    pub(crate) fn big_lists(batches: &[RecordBatch]) -> Vec<usize> {
+        batches
+            .iter()
+            .map(|batch| {
+                ["ll", "rl"]
+                    .into_iter()
+                    .map(|name| {
+                        let lists = batch.column_by_name(name).unwrap().as_list::<i32>();
+                        (0..lists.len())
+                            .filter(|&row| lists.value_length(row) > 0)
+                            .count()
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn skewed_lists_are_reserved_by_the_row() -> Result<()> {
+        // The first of the 100 rows of either input has a list of 1 MiB, and
+        // all rows match the 100 rows of the other input: the 199 pairs with
+        // a big list have 200 MiB of lists, whichever input's rows come first
+        // (and are probed by the rows of the other one). The join reserves the
+        // bytes of every row that it gathers, so that a part has one pair with
+        // a big list at most: a pool of 2.5 MiB holds the tables (2 MiB), but
+        // not a part with a big list; one of 6 MiB holds both, also without
+        // the limit.
+        let plan = |limit: Option<usize>| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+                let batch = skewed_list_batch(side);
+                let partition = BatchesPartition {
+                    schema: batch.schema(),
+                    batches: vec![batch.clone()],
+                    forever: limit.is_some(),
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        batch.schema(),
+                        vec![Arc::new(partition)],
+                        None,
+                        vec![],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let join = symmetric_join(
+                stream("l"),
+                stream("r"),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+            )?;
+            Ok(match limit {
+                Some(limit) => Arc::new(GlobalLimitExec::new(join, 0, Some(limit))),
+                None => join,
+            })
+        };
+        let limited = plan(Some(1))?;
+        let root = crate::planner::lower_execution_plan(&limited)?;
+        let err = run_native(&root, limited, limited_task_ctx(5 << 19)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let limited = plan(Some(1))?;
+        let root = crate::planner::lower_execution_plan(&limited)?;
+        let output = run_native(&root, limited, limited_task_ctx(6 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 1);
+        let all = plan(None)?;
+        let root = lower(&all)?;
+        let output = run_native(&root, all, limited_task_ctx(6 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 10_000);
+        let big = big_lists(&output.batches);
+        assert_eq!(big.iter().sum::<usize>(), 200);
+        assert!(big.iter().all(|&big| big <= 2), "{big:?}");
         Ok(())
     }
 }

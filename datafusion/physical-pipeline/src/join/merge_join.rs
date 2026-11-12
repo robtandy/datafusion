@@ -121,7 +121,7 @@ use std::task::{Context, Poll};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
-    new_empty_array, new_null_array,
+    make_array, new_empty_array, new_null_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{SortOptions, interleave, prep_null_mask_filter, take};
@@ -1215,9 +1215,9 @@ enum VariableWidth {
     Offsets32,
     /// Strings or binaries with offsets of 64 bits: the bytes of every value.
     Offsets64,
-    /// Other values (e.g. lists or structs): the average bytes of the rows of
-    /// their batch.
-    Average,
+    /// Other values (e.g. lists or structs): the bytes of the values of every
+    /// row, with those nested in them (see [`nested_row_bytes`]).
+    Nested,
 }
 
 impl GatherWidths {
@@ -1298,7 +1298,7 @@ fn value_width(data_type: &DataType) -> (usize, Option<VariableWidth>) {
         }
         data_type => match data_type.primitive_width() {
             Some(width) => (width + 1, None),
-            None => (1, Some(VariableWidth::Average)),
+            None => (0, Some(VariableWidth::Nested)),
         },
     }
 }
@@ -1358,16 +1358,182 @@ fn add_value_bytes(
                 add(row, usize::try_from(ends[1] - ends[0]).unwrap_or_default());
             }
         }
-        (VariableWidth::Average, _) => {
-            let total = array
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| array.get_array_memory_size());
-            let average = total.div_ceil(array.len().max(1));
-            for row in 0..array.len() {
-                add(row, average);
+        (VariableWidth::Nested, _) => {
+            for (row, bytes) in nested_row_bytes(array.as_ref()).into_iter().enumerate() {
+                add(row, bytes);
             }
         }
+    }
+}
+
+/// The bytes that gathering every row of `array` takes: its values, with the
+/// values nested in it (of the range of a list, the fields of a struct, the
+/// value of a dictionary key, ...), its offsets and its validity. Exact for
+/// the values of fixed width, strings, binaries, lists, maps, structs,
+/// dictionaries and unions; for other types (e.g. run-end encoded values),
+/// every row may take as many bytes as the whole array, an upper bound.
+fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
+    let rows = array.len();
+    // The bytes of the rows of a list whose ranges of `values` are delimited
+    // by `offsets` (the ranges of `starts` and `ends`).
+    fn ranges<O: Copy + TryInto<usize>>(
+        starts: impl Iterator<Item = O>,
+        ends: impl Iterator<Item = O>,
+        values: &dyn Array,
+        fixed: usize,
+    ) -> Vec<usize> {
+        let mut sums = vec![0];
+        for bytes in nested_row_bytes(values) {
+            sums.push(sums[sums.len() - 1] + bytes);
+        }
+        let at = |offset: O| {
+            let offset = offset.try_into().unwrap_or(usize::MAX).min(sums.len() - 1);
+            sums[offset]
+        };
+        starts
+            .zip(ends)
+            .map(|(start, end)| fixed + at(end).saturating_sub(at(start)))
+            .collect()
+    }
+    let validity = 1;
+    match array.data_type() {
+        DataType::Utf8
+        | DataType::Binary
+        | DataType::LargeUtf8
+        | DataType::LargeBinary => {
+            let (fixed, width) = value_width(array.data_type());
+            let mut bytes = vec![[0; 2]; rows];
+            if let Some(width) = width {
+                add_value_bytes(&make_array(array.to_data()), width, 0, &mut bytes);
+            }
+            bytes
+                .iter()
+                .map(|bytes| fixed + bytes[0] as usize)
+                .collect()
+        }
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            let offsets = list.value_offsets();
+            let fixed = size_of::<i32>() + validity;
+            ranges(
+                offsets.iter().copied(),
+                offsets.iter().skip(1).copied(),
+                list.values().as_ref(),
+                fixed,
+            )
+        }
+        DataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            let offsets = list.value_offsets();
+            let fixed = size_of::<i64>() + validity;
+            ranges(
+                offsets.iter().copied(),
+                offsets.iter().skip(1).copied(),
+                list.values().as_ref(),
+                fixed,
+            )
+        }
+        DataType::Map(_, _) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let fixed = size_of::<i32>() + validity;
+            ranges(
+                offsets.iter().copied(),
+                offsets.iter().skip(1).copied(),
+                map.entries(),
+                fixed,
+            )
+        }
+        DataType::ListView(_) => {
+            let list = array.as_list_view::<i32>();
+            let ends = list
+                .value_offsets()
+                .iter()
+                .zip(list.value_sizes())
+                .map(|(offset, size)| offset + size);
+            let fixed = 2 * size_of::<i32>() + validity;
+            ranges(
+                list.value_offsets().iter().copied(),
+                ends,
+                list.values().as_ref(),
+                fixed,
+            )
+        }
+        DataType::LargeListView(_) => {
+            let list = array.as_list_view::<i64>();
+            let ends = list
+                .value_offsets()
+                .iter()
+                .zip(list.value_sizes())
+                .map(|(offset, size)| offset + size);
+            let fixed = 2 * size_of::<i64>() + validity;
+            ranges(
+                list.value_offsets().iter().copied(),
+                ends,
+                list.values().as_ref(),
+                fixed,
+            )
+        }
+        DataType::FixedSizeList(_, _) => {
+            let list = array.as_fixed_size_list();
+            let size = usize::try_from(list.value_length()).unwrap_or_default();
+            let starts = (0..rows).map(|row| row * size);
+            ranges(
+                starts.clone(),
+                starts.map(|start| start + size),
+                list.values().as_ref(),
+                validity,
+            )
+        }
+        DataType::Struct(_) => {
+            let mut bytes = vec![validity; rows];
+            for column in array.as_struct().columns() {
+                for (row, column_bytes) in
+                    nested_row_bytes(column.as_ref()).into_iter().enumerate()
+                {
+                    if let Some(bytes) = bytes.get_mut(row) {
+                        *bytes += column_bytes;
+                    }
+                }
+            }
+            bytes
+        }
+        DataType::Dictionary(key, _) => {
+            let dictionary = array.as_any_dictionary();
+            let values = nested_row_bytes(dictionary.values().as_ref());
+            let key = key.primitive_width().unwrap_or(size_of::<u64>()) + validity;
+            dictionary
+                .normalized_keys()
+                .into_iter()
+                .map(|value| key + values.get(value).copied().unwrap_or_default())
+                .collect()
+        }
+        DataType::Union(fields, _) => {
+            let union = array.as_union();
+            let children = fields
+                .iter()
+                .map(|(type_id, _)| {
+                    (type_id, nested_row_bytes(union.child(type_id).as_ref()))
+                })
+                .collect::<Vec<_>>();
+            let offset = union.offsets().map_or(0, |_| size_of::<i32>());
+            (0..rows)
+                .map(|row| {
+                    let type_id = union.type_id(row);
+                    let child_row = union.value_offset(row);
+                    let child = children
+                        .iter()
+                        .find(|(id, _)| *id == type_id)
+                        .and_then(|(_, bytes)| bytes.get(child_row).copied())
+                        .unwrap_or_default();
+                    size_of::<i8>() + offset + child
+                })
+                .collect()
+        }
+        data_type => match value_width(data_type) {
+            (fixed, None) => vec![fixed; rows],
+            (_, Some(_)) => vec![array.get_array_memory_size(); rows],
+        },
     }
 }
 
@@ -4276,6 +4442,53 @@ pub(crate) mod tests {
                 .iter()
                 .all(|batch| batch.num_rows() <= PART_BYTES / 1024 + 1)
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn skewed_lists_are_reserved_by_the_row() -> Result<()> {
+        // As the symmetric join's: the first of the 100 rows of either input
+        // has a list of 1 MiB, and all rows match the 100 rows of the other
+        // input. The merge join reserves the bytes of every row that it
+        // gathers, in batches with one pair with a big list at most: a pool of
+        // 768 KiB does not hold a batch with one, one of 6 MiB does.
+        use crate::join::symmetric_hash_join::tests::{big_lists, skewed_list_batch};
+        let join = || -> Result<Arc<dyn PhysicalOperator>> {
+            let source = |side: &str| -> Arc<dyn PhysicalOperator> {
+                let batch = skewed_list_batch(side);
+                Arc::new(TestSource::with_schema(
+                    batch.schema(),
+                    vec![DataChunk::from_record_batch(batch)],
+                ))
+            };
+            let (left, right) = (source("l"), source("r"));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(PhysicalMergeJoin::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Inner,
+                &[SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+                false,
+                None,
+            )?))
+        };
+        let err = with_timeout(Executor::collect(join()?, limited_task_ctx(3 << 18)?, 4))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let batches =
+            with_timeout(Executor::collect(join()?, limited_task_ctx(6 << 20)?, 4))
+                .await?;
+        assert_eq!(num_rows(&batches), 10_000);
+        let big = big_lists(&batches);
+        assert_eq!(big.iter().sum::<usize>(), 200);
+        assert!(big.iter().all(|&big| big <= 2), "{big:?}");
         Ok(())
     }
 
