@@ -5230,8 +5230,10 @@ pub(crate) mod tests {
                             .unwrap(),
                         )
                     };
-                // One row a batch, and all in one.
-                for split in [true, false] {
+                // One row a batch, and all in one; with a buffered input that
+                // never ends (read as a stream), or one that ends (collected and
+                // sorted), against the streamed rows of a stream.
+                for (split, mixed) in [(true, false), (false, false), (true, true)] {
                     let batches = |side: &str, all: &[(f64, i32)]| match split {
                         true => all
                             .iter()
@@ -5279,10 +5281,18 @@ pub(crate) mod tests {
                         plan: reference,
                         ordered: false,
                     };
-                    let (left, right) = (
-                        stream("l", batches("l", left_rows)),
-                        stream("r", batches("r", right_rows)),
-                    );
+                    let streamed_side = SortMergeJoinExec::probe_side(&join_type);
+                    let input = |side: &str, all: &[(f64, i32)]| {
+                        let buffered = match streamed_side {
+                            JoinSide::Left => side == "r",
+                            _ => side == "l",
+                        };
+                        match mixed && buffered {
+                            true => bounded(side, all),
+                            false => stream(side, batches(side, all)),
+                        }
+                    };
+                    let (left, right) = (input("l", left_rows), input("r", right_rows));
                     let on = on(&left, &right)?;
                     let plan: Arc<dyn ExecutionPlan> =
                         Arc::new(SortMergeJoinExec::try_new(
@@ -5295,7 +5305,16 @@ pub(crate) mod tests {
                             NullEquality::NullEqualsNothing,
                         )?);
                     let root = lower_join(&plan, false)?;
-                    assert_streaming_merge_join(&root, &context);
+                    let context = format!("{context}, mixed: {mixed}, split: {split}");
+                    match mixed {
+                        true => {
+                            let join = root
+                                .downcast_ref::<PhysicalMergeJoin>()
+                                .unwrap_or_else(|| panic!("{context}"));
+                            assert!(!join.streams_buffered_input(), "{context}");
+                        }
+                        false => assert_streaming_merge_join(&root, &context),
+                    }
                     let actual = run_native(&root, Arc::clone(&plan), task_ctx())
                         .await
                         .unwrap_or_else(|e| panic!("{context}: {e}"));
@@ -5306,7 +5325,7 @@ pub(crate) mod tests {
                         );
                     }
                     // In the order of the streamed rows (by their ids).
-                    let streamed = match SortMergeJoinExec::probe_side(&join_type) {
+                    let streamed = match streamed_side {
                         JoinSide::Left => "lid",
                         _ => "rid",
                     };
