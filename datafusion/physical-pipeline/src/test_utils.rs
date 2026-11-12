@@ -39,10 +39,14 @@
 //!      DataFusion's order relative to rows that it ties with. The keys are
 //!      compared in their order (lexicographically, also the elements of
 //!      lists and the fields of structs): rows tie if their `ORDER BY` keys
-//!      are equal up to their first floating-point value, and these values
-//!      are equal within twice the tolerance, whatever their later keys. As
-//!      the keys of each engine may be off by the tolerance, either row may
-//!      have the smaller value. Ties are not transitive: rows that tie with a
+//!      are equal up to their first floating-point value that may vary
+//!      within the tolerance, and these values are equal within twice the
+//!      tolerance, whatever their later keys. As the keys of each engine may
+//!      be off by the tolerance, either row may have the smaller value.
+//!      Floating-point values that the tolerance does not let vary (zeros,
+//!      infinities and `NaN`s, or any value with a tolerance of `0`) are
+//!      compared like other values: rows that are equal on them are ordered
+//!      by their later keys. Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
 //!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
 //!      may be other rows that tie with them (with their multiplicities), as
@@ -961,7 +965,7 @@ fn returnable_rows(
                 .iter()
                 .map(|column| Value::try_new(column.as_ref(), row))
                 .collect::<Result<Row>>()?;
-            Ok(decision_keys(&keys).0)
+            Ok(decision_keys(&keys, &|_| true).0)
         })
         .collect::<Result<Vec<_>>>()?;
     let shapes = keys[window.clone()]
@@ -1438,8 +1442,9 @@ pub fn compare_results(
                     expected.schema.fields().len()
                 ));
             }
+            // The keys of each engine may be off by the tolerance.
             let sorted = reference
-                .sorted_rows()
+                .sorted_rows(2.0 * tolerance)
                 .map_err(|e| format!("cannot read the sorted reference: {e}"))?;
             let names = (columns.as_str(), reference.keys.join(", "));
             let names = (names.0, names.1.as_str());
@@ -1553,8 +1558,8 @@ struct SortedRows {
     /// reason.
     uncomputed: Vec<(Range<usize>, String)>,
     /// The classes of the sorted rows: the ranges of rows whose keys are
-    /// exactly equal up to their first floating-point value, and these keys
-    /// (see [`decision_keys`]).
+    /// exactly equal up to their first floating-point value that may vary,
+    /// and these keys (see [`decision_keys`]).
     classes: Vec<(Range<usize>, Row)>,
     /// For each class, whether its rows have keys after these keys.
     truncated: Vec<bool>,
@@ -1590,28 +1595,34 @@ impl SortedRows {
 
 /// The keys of a row (the values of its `ORDER BY` keys, `keys`) that decide
 /// its order relative to rows of other keys, and whether `keys` has values
-/// after them: the keys up to their first floating-point value (included), in
-/// the order in which they are compared (lexicographically, also the
-/// elements of lists and the fields of structs).
+/// after them: the keys up to their first floating-point value that may vary
+/// (`may_vary`, included), in the order in which they are compared
+/// (lexicographically, also the elements of lists and the fields of
+/// structs).
 ///
 /// The floating-point values of each engine may be off by the tolerance: of
 /// two rows whose keys are exactly equal before their first floating-point
-/// values, and whose first floating-point values are close, either may be
-/// first, whatever their later keys.
-fn decision_keys(keys: &[Value]) -> (Row, bool) {
+/// values that may vary, and whose first such values are close, either may be
+/// first, whatever their later keys. Floating-point values that the tolerance
+/// does not let vary (see [`may_vary`]) are compared like other values.
+fn decision_keys(keys: &[Value], may_vary: &dyn Fn(f64) -> bool) -> (Row, bool) {
     /// Push the values of `values` up to their first floating-point value
-    /// (included) to `prefix`. Returns `None` if they have none, or whether
-    /// they have values after it.
-    fn push_prefix(values: &[Value], prefix: &mut Vec<Value>) -> Option<bool> {
+    /// that may vary (included) to `prefix`. Returns `None` if they have none,
+    /// or whether they have values after it.
+    fn push_prefix(
+        values: &[Value],
+        may_vary: &dyn Fn(f64) -> bool,
+        prefix: &mut Vec<Value>,
+    ) -> Option<bool> {
         for (i, value) in values.iter().enumerate() {
             let found = match value {
-                Value::Float(_) => {
+                Value::Float(float) => {
                     prefix.push(value.clone());
-                    Some(false)
+                    may_vary(*float).then_some(false)
                 }
                 Value::List(elements) | Value::Struct(elements) => {
                     let mut inner = vec![];
-                    let found = push_prefix(elements, &mut inner);
+                    let found = push_prefix(elements, may_vary, &mut inner);
                     prefix.push(match value {
                         Value::List(_) => Value::List(inner),
                         _ => Value::Struct(inner),
@@ -1630,14 +1641,27 @@ fn decision_keys(keys: &[Value]) -> (Row, bool) {
         None
     }
     let mut prefix = vec![];
-    let truncated = push_prefix(keys, &mut prefix).unwrap_or(false);
+    let truncated = push_prefix(keys, may_vary, &mut prefix).unwrap_or(false);
     (prefix, truncated)
+}
+
+/// Whether the floating-point value `value` is equal within the relative
+/// tolerance `tolerance` to other values (see [`floats_equal`]), so that the
+/// value of another engine may be smaller or larger. Zeros, infinities and
+/// `NaN`s are not (zeros unless `tolerance` is at least 1), nor is any value
+/// if `tolerance` is smaller than the distance to its neighbors (e.g. `0`).
+fn may_vary(value: f64, tolerance: f64) -> bool {
+    value.is_finite()
+        && [value.next_up(), value.next_down()]
+            .into_iter()
+            .any(|other| floats_equal(value, other, tolerance))
 }
 
 impl SortedReference {
     /// All sorted rows, in classes of rows whose keys are exactly equal up to
-    /// their first floating-point value.
-    fn sorted_rows(&self) -> Result<SortedRows> {
+    /// their first floating-point value that may vary within the tolerance
+    /// `tie_tolerance` (see [`decision_keys`]).
+    fn sorted_rows(&self, tie_tolerance: f64) -> Result<SortedRows> {
         let width = self.columns + self.keys.len();
         if let Some(batch) = self
             .batches
@@ -1659,8 +1683,9 @@ impl SortedReference {
         let mut truncated = vec![];
         for batch in &self.batches {
             for i in 0..batch.num_rows() {
+                let keys = row(batch, i, self.columns..width)?;
                 let (keys, truncates) =
-                    decision_keys(&row(batch, i, self.columns..width)?);
+                    decision_keys(&keys, &|value| may_vary(value, tie_tolerance));
                 let position = values.len();
                 match classes.last_mut() {
                     Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
@@ -1703,10 +1728,11 @@ impl SortedReference {
 
 /// For each class of sorted rows, the other classes whose keys tie with its
 /// keys (in their order). The keys of the classes are their
-/// [`decision_keys`], which have at most one floating-point value. Only keys
-/// with the same [`Shape`] can tie (their values but their floating-point
-/// values are equal): their floating-point values are compared within
-/// `tie_tolerance`.
+/// [`decision_keys`]: only their last floating-point value may vary within
+/// `tie_tolerance`. Only keys with the same [`Shape`] can tie (their values
+/// but their floating-point values are equal): their floating-point values
+/// are compared within `tie_tolerance` (values that may not vary are only
+/// equal to equal values, see [`may_vary`]).
 // The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
 // for memory accounting with the `arrow-buffer/pool` feature (enabled by
 // `--all-features`): it affects neither their equality nor their hashing. Not
@@ -1769,7 +1795,8 @@ fn float_bits(row: &[Value]) -> Vec<u64> {
 /// their sorted order relative to rows that they tie with.
 ///
 /// The sorted rows are divided into classes of rows whose keys are exactly
-/// equal up to their first floating-point value (their [`decision_keys`]).
+/// equal up to their first floating-point value that may vary within the
+/// tolerance (their [`decision_keys`]).
 /// The rows of a class may be at the positions of its rows, and of the rows
 /// of the classes that it ties with. A maximum matching of the rows of
 /// `result` to the sorted rows with their values (within the tolerance) at
@@ -1826,7 +1853,8 @@ fn compare_sorted(
     } else {
         format!(
             "rows tie if their ORDER BY keys ({keys}) are equal up to their first \
-             floating-point value, and these values are equal within twice the \
+             floating-point value that may vary within the tolerance (not a zero, an \
+             infinity or NaN), and these values are equal within twice the \
              tolerance, whatever their later keys"
         )
     };
@@ -4093,7 +4121,8 @@ mod tests {
                 "row 0 of the pipeline engine is out of order: the sorted rows of \
                  DataFusion with its values may not be at its position (rows tie if \
                  their ORDER BY keys (k) are equal up to their first floating-point \
-                 value, and these values are equal within twice the tolerance, whatever \
+                 value that may vary within the tolerance (not a zero, an infinity or \
+                 NaN), and these values are equal within twice the tolerance, whatever \
                  their later keys)"
             ),
             "{err}"
@@ -4643,7 +4672,7 @@ mod tests {
                 "row 0 of the pipeline engine is out of order: the sorted rows of \
                  DataFusion with its values may not be at its position (rows tie if \
                  their ORDER BY keys (k, s) are equal up to their first floating-point \
-                 value"
+                 value that may vary"
             ),
             "{err}"
         );
@@ -5397,7 +5426,8 @@ mod tests {
         else {
             panic!("not sorted");
         };
-        let rows = reference.sorted_rows()?;
+        let tolerance = ComparisonOptions::DEFAULT_FLOAT_TOLERANCE;
+        let rows = reference.sorted_rows(2.0 * tolerance)?;
         assert_eq!(rows.window, 0..3);
         let ids = rows.classes[..3]
             .iter()
@@ -5501,6 +5531,85 @@ mod tests {
             "{err}"
         );
         Ok(())
+    }
+
+    /// The order of `sql` over the table `m` of `batch`.
+    async fn order_of(batch: RecordBatch, sql: &str) -> Result<ResultOrder> {
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", batch)?;
+        let df = ctx.sql(sql).await?;
+        Ok(result_order(&ctx, df.logical_plan()).await)
+    }
+
+    #[tokio::test]
+    async fn same_results_order_rows_by_later_keys_after_floats_that_cannot_vary()
+    -> Result<()> {
+        let m = || ids(&[1, 2]).remove(0);
+        // Zeros, infinities and NaNs are only equal to equal values: the later
+        // key `id` decides the order, with and without LIMIT 1.
+        for float in ["0", "'-0'", "'Infinity'", "'-Infinity'", "'NaN'"] {
+            let sql = format!("SELECT id FROM m ORDER BY CAST({float} AS DOUBLE), id");
+            let order = order_of(m(), &sql).await?;
+            assert!(matches!(order, ResultOrder::Sorted(_)), "{sql}: {order:?}");
+            same_results(ids(&[1, 2]), ids(&[1, 2]), &order).unwrap();
+            let err = same_results(ids(&[1, 2]), ids(&[2, 1]), &order).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+            let sql = format!("{sql} LIMIT 1");
+            let order = order_of(m(), &sql).await?;
+            same_results(ids(&[1]), ids(&[1]), &order).unwrap();
+            let err = same_results(ids(&[1]), ids(&[2]), &order).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+        }
+        // Without a tolerance, no value may vary, but within the tolerance the
+        // values of either row may be smaller.
+        let exact = ComparisonOptions::default().with_float_tolerance(0.0);
+        for sql in [
+            "SELECT id FROM m ORDER BY CAST(1 AS DOUBLE), id",
+            "SELECT id FROM m ORDER BY CAST(1 AS DOUBLE), id LIMIT 1",
+        ] {
+            let order = order_of(m(), sql).await?;
+            let (expected, actual) = if sql.ends_with("LIMIT 1") {
+                (ids(&[1]), ids(&[2]))
+            } else {
+                (ids(&[1, 2]), ids(&[2, 1]))
+            };
+            let err = same_results_with(expected.clone(), actual.clone(), &order, exact)
+                .unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+            same_results(expected, actual, &order).unwrap();
+        }
+        // The keys after a float that cannot vary are shown.
+        let order =
+            order_of(m(), "SELECT id FROM m ORDER BY CAST(0 AS DOUBLE), id").await?;
+        let err = same_results(ids(&[1, 2]), ids(&[2, 1]), &order).unwrap_err();
+        assert!(err.contains("row 0: (2), keys: (0.0, 2)"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_order_rows_by_later_keys_after_floats_that_cannot_vary()
+     {
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_batch("m", ids(&[2, 1, 3]).remove(0))?;
+            Ok(())
+        };
+        for sql in [
+            "SELECT id FROM m ORDER BY CAST(0 AS DOUBLE), id",
+            "SELECT id FROM m ORDER BY CAST(0 AS DOUBLE), id LIMIT 1",
+            "SELECT id FROM m ORDER BY CAST('NaN' AS DOUBLE), id DESC LIMIT 2",
+            "SELECT id FROM m ORDER BY CAST('Infinity' AS DOUBLE), id OFFSET 1",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, setup).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
