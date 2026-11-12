@@ -490,9 +490,10 @@ mod tests {
         ]))
     }
 
-    /// A partition of batches of `pairs_schema` that never ends.
+    /// A partition of batches of `pairs_schema` that never ends (unless
+    /// `ends`, in a table that DataFusion considers unbounded all the same).
     #[derive(Debug)]
-    struct EndlessPairs(Vec<RecordBatch>);
+    struct EndlessPairs(Vec<RecordBatch>, bool);
 
     impl PartitionStream for EndlessPairs {
         fn schema(&self) -> &SchemaRef {
@@ -501,8 +502,11 @@ mod tests {
         }
 
         fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok))
-                .chain(futures::stream::pending());
+            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok));
+            let batches = match self.1 {
+                true => batches.boxed(),
+                false => batches.chain(futures::stream::pending()).boxed(),
+            };
             Box::pin(RecordBatchStreamAdapter::new(pairs_schema(), batches))
         }
     }
@@ -535,7 +539,7 @@ mod tests {
                         .unwrap()
                     })
                     .collect();
-                Arc::new(EndlessPairs(batches)) as Arc<dyn PartitionStream>
+                Arc::new(EndlessPairs(batches, false)) as Arc<dyn PartitionStream>
             })
             .collect();
         let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
@@ -718,6 +722,237 @@ mod tests {
             count::<crate::operators::materialized_cte::PhysicalMaterializedCte>(&root),
             1
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partial_sorts_of_repartitionings_of_unbounded_streams() -> Result<()> {
+        // Two streams (of an unbounded table), of the prefixes 100..103 and
+        // 0..3, every group with `b = 0..100`; repartitioned by a hash of
+        // `b` into four partitions (keeping their order), whose partial
+        // sorts keep their first row; merged with a fetch of 4: the rows of
+        // the prefix 0. (The streams end: DataFusion's merges of the
+        // partitions of a repartitioning wait for whole batches of streams
+        // that stay pending, the native merges do not.)
+        let make_plan = |ends: bool| -> Arc<dyn ExecutionPlan> {
+            let schema = pairs_schema();
+            let stream = |prefixes: std::ops::Range<i64>| -> Arc<dyn PartitionStream> {
+                let batches = prefixes
+                    .map(|a| {
+                        RecordBatch::try_new(
+                            pairs_schema(),
+                            vec![
+                                Arc::new(Int64Array::from(vec![a; 100])),
+                                Arc::new(Int64Array::from_iter_values(0..100)),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                Arc::new(EndlessPairs(batches, ends))
+            };
+            let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+            let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+            let table = StreamingTableExec::try_new(
+                Arc::clone(&schema),
+                vec![stream(100..103), stream(0..3)],
+                None,
+                [LexOrdering::new(vec![a.clone()]).unwrap()],
+                true,
+                None,
+            )
+            .unwrap();
+            let hash = Partitioning::Hash(vec![col("b", &schema).unwrap()], 4);
+            let repartition = RepartitionExec::try_new(Arc::new(table), hash)
+                .unwrap()
+                .with_preserve_order();
+            let ordering = LexOrdering::new(vec![a, b]).unwrap();
+            let sort =
+                datafusion_physical_plan::sorts::partial_sort::PartialSortExec::new(
+                    ordering.clone(),
+                    Arc::new(repartition),
+                    1,
+                )
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(1));
+            Arc::new(
+                SortPreservingMergeExec::new(ordering, Arc::new(sort))
+                    .with_fetch(Some(4)),
+            )
+        };
+        let lowered =
+            assert_plan_lowered(|| make_plan(true), test_session_config(), true);
+        let root = tokio::time::timeout(Duration::from_secs(30), lowered)
+            .await
+            .expect("the merge ends once every partition has its row");
+        assert_eq!(count::<PhysicalStreamingMerge>(&root), 1);
+        // Of streams that never end, the native merge emits the rows of the
+        // groups as they complete: the partial sorts end with their rows.
+        let ctx = datafusion_context(test_session_config());
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            make_plan(false),
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert!(bridged_plans(root.operator()).is_empty());
+        let run = datafusion_physical_plan::collect(root, ctx.task_ctx());
+        let output = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("the partial sorts end with their rows")?;
+        let prefixes = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prefixes, vec![0; 4]);
+        Ok(())
+    }
+
+    /// [`endless_table`], whose streams end (in a table that DataFusion
+    /// considers unbounded all the same).
+    fn ending_table(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let streams = (0..partitions)
+            .map(|partition| {
+                let values = (partition as i64..1000).step_by(partitions);
+                let a = values.clone().collect::<Vec<_>>();
+                let b = values.map(|value| value % 3).collect::<Vec<_>>();
+                let batches = a
+                    .chunks(7)
+                    .zip(b.chunks(7))
+                    .map(|(a, b)| {
+                        RecordBatch::try_new(
+                            pairs_schema(),
+                            vec![
+                                Arc::new(Int64Array::from(a.to_vec())),
+                                Arc::new(Int64Array::from(b.to_vec())),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                Arc::new(EndlessPairs(batches, true)) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let table = StreamingTableExec::try_new(
+            pairs_schema(),
+            streams,
+            None,
+            [ordering()],
+            true,
+            None,
+        )
+        .unwrap();
+        Arc::new(table)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_through_repartitionings_below_projections_and_unions() {
+        // Repartitionings that keep the order of their partitions, below a
+        // projection and below a union, of streams that never end.
+        let repartitioned = |table: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                RepartitionExec::try_new(table, Partitioning::RoundRobinBatch(4))
+                    .unwrap()
+                    .with_preserve_order(),
+            )
+        };
+        let projected = |input: Arc<dyn ExecutionPlan>| -> Arc<dyn ExecutionPlan> {
+            let schema = input.schema();
+            let a = vec![(col("a", &schema).unwrap(), "a".to_owned())];
+            Arc::new(
+                datafusion_physical_plan::projection::ProjectionExec::try_new(a, input)
+                    .unwrap(),
+            )
+        };
+        for (union, fetch) in [(false, 10), (true, 10), (true, 300)] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                let input = match union {
+                    false => projected(repartitioned(ending_table(1))),
+                    true => datafusion_physical_plan::union::UnionExec::try_new(vec![
+                        projected(repartitioned(ending_table(1))),
+                        projected(repartitioned(ending_table(2))),
+                    ])
+                    .unwrap(),
+                };
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering(), input)
+                        .with_fetch(Some(fetch)),
+                )
+            };
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(
+                count::<PhysicalStreamingMerge>(&root),
+                usize::from(union),
+                "{union}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn all_partitions_of_a_merge_read_one_materialization() -> Result<()> {
+        use datafusion_physical_plan::materialized_cte::{
+            MaterializedCteBuffer, MaterializedCteExec, MaterializedCteScanExec,
+        };
+        // Two scans of a materialized `random()` around the merge, and a
+        // stream of `0, 1, ...` that never ends: both scans read one value.
+        let ctx = datafusion_context(test_session_config());
+        let body = ctx
+            .sql("SELECT CAST(random() * 500 AS BIGINT) AS a")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let buffer = Arc::new(MaterializedCteBuffer::new(8, "c"));
+        let scan = || -> Arc<dyn ExecutionPlan> {
+            Arc::new(
+                MaterializedCteScanExec::new(8, "c", schema(), 1)
+                    .bind(Arc::clone(&buffer)),
+            )
+        };
+        let union = datafusion_physical_plan::union::UnionExec::try_new(vec![
+            scan(),
+            endless_table(1),
+            scan(),
+        ])?;
+        let merge = SortPreservingMergeExec::new(ordering(), union).with_fetch(Some(600));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(MaterializedCteExec::new(body, Arc::new(merge), buffer));
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            plan,
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert!(bridged_plans(root.operator()).is_empty());
+        assert_eq!(count::<PhysicalStreamingMerge>(root.operator()), 1);
+        let output = datafusion_physical_plan::collect(root, ctx.task_ctx()).await?;
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        // The values `0..598` of the stream, and the value of the CTE (below
+        // 500) twice: one value three times, the others once.
+        assert_eq!(values.len(), 600);
+        let mut counts = std::collections::BTreeMap::<i64, usize>::new();
+        for value in values {
+            *counts.entry(value).or_default() += 1;
+        }
+        let repeated = counts
+            .values()
+            .filter(|&&count| count > 1)
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, vec![&3], "{counts:?}");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

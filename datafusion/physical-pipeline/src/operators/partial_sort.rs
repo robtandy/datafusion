@@ -44,6 +44,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut, operator_key,
 };
+use crate::operators::streaming_merge::PhysicalStreamingMerge;
 use crate::operators::topk_of_partitions::{
     PhysicalPartialSortOfPartitions, PhysicalTopKOfPartitions,
 };
@@ -154,8 +155,37 @@ impl PhysicalPartialSort {
             )
             && let Some(fetch) = sort.fetch().filter(|&fetch| fetch > 0)
         {
-            let input = lower_input(repartition.input())?;
             let partitioning = repartition.partitioning().clone();
+            let unbounded = repartition.input().boundedness().is_unbounded();
+            // The partitions of an input of several partitions that never
+            // ends, merged in their order, which the repartitioning keeps:
+            // their rows, routed, keep it in every partition, which is
+            // sorted as its rows arrive.
+            if repartition.input().output_partitioning().partition_count() > 1
+                && unbounded
+                && let Some(ordering) = repartition.input().output_ordering().cloned()
+                && let Some(partitions) = merge_partitions_of(repartition.input())?
+            {
+                let inputs = partitions
+                    .iter()
+                    .map(&mut lower_input)
+                    .collect::<Result<Vec<_>>>()?;
+                let merged = PhysicalStreamingMerge::try_new(
+                    inputs,
+                    repartition.input().schema(),
+                    ordering,
+                    None,
+                )?;
+                let sort = PhysicalPartialSortOfPartitions::try_new(
+                    Arc::new(merged),
+                    partitioning,
+                    sort.expr().clone(),
+                    sort.common_prefix_length(),
+                    fetch,
+                )?;
+                return Ok(Some(Arc::new(sort)));
+            }
+            let input = lower_input(repartition.input())?;
             // The rows that the repartitioning of a single partition routes
             // to a partition keep their order, sorted by the prefix: every
             // partition is sorted as they arrive, in a single pipeline.
@@ -174,9 +204,10 @@ impl PhysicalPartialSort {
             }
             // The rows of a repartitioning of several partitions arrive in
             // no order: every partition keeps its first rows by a TopK,
-            // once the input ended. An input that never ends is sorted as
-            // a single partition (the partitions of the pipeline engine).
-            if repartition.input().boundedness().is_unbounded() {
+            // once the input ended. An input that never ends, whose
+            // partitions the planner cannot merge, is sorted as a single
+            // partition (the partitions of the pipeline engine).
+            if unbounded {
                 return Self::sort_of(
                     input,
                     sort.expr().clone(),
@@ -460,6 +491,58 @@ pub(crate) fn partitions_of(
 #[expect(deprecated)]
 fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+}
+
+/// The plans of partitions of `plan` whose merge, in their order, is the
+/// merge of the partitions of `plan` (which `SortPreservingMergeExec` merges):
+/// those of [`partitions_of`], and through the repartitionings that keep the
+/// order of their partitions (whose rows the merge merges, wherever they
+/// are), also below the unions, and the nodes that compute every row of
+/// their output of a row of their input (projections, filters, unnests,
+/// async functions and the nodes that only change the size of batches) above
+/// them. `None` if the planner cannot split `plan` into them.
+pub(crate) fn merge_partitions_of(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
+        && (repartition.preserve_order()
+            || repartition.input().output_partitioning().partition_count() <= 1)
+    {
+        return merge_partitions_of(repartition.input());
+    }
+    if plan.is::<UnionExec>() {
+        let mut partitions = vec![];
+        for input in plan.children() {
+            let Some(of_input) = merge_partitions_of(input)? else {
+                return Ok(None);
+            };
+            partitions.extend(of_input);
+        }
+        return Ok(Some(partitions));
+    }
+    let of_every_row = plan.is::<ProjectionExec>()
+        || (plan.is::<FilterExec>() && plan.fetch().is_none())
+        || plan.is::<UnnestExec>()
+        || plan.is::<AsyncFuncExec>()
+        || (is_coalesce_batches(plan) && plan.fetch().is_none())
+        || plan.is::<CooperativeExec>()
+        || plan.is::<BufferExec>();
+    if of_every_row
+        && let [input] = plan.children()[..]
+        && let Some(partitions) = merge_partitions_of(input)?
+    {
+        return partitions
+            .into_iter()
+            .map(|partition| {
+                Arc::clone(plan).replace_children(
+                    vec![partition],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some);
+    }
+    partitions_of(plan)
 }
 
 /// The scans of the partitions of `config`, whose output schema is

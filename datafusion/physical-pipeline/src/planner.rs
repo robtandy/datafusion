@@ -260,7 +260,7 @@ use crate::operators::materialized_cte::{
     hoist_materialized_ctes,
 };
 use crate::operators::partial_sort::{
-    PhysicalPartialSort, first_rows_of_merged_partitions, partitions_of,
+    PhysicalPartialSort, first_rows_of_merged_partitions, merge_partitions_of,
 };
 use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::piecewise_merge_join::nested_loop_join_of;
@@ -1232,16 +1232,10 @@ impl Lowering<'_> {
         if !merge.input().boundedness().is_unbounded() {
             return Ok(None);
         }
-        let mut input = merge.input();
-        while let Some(repartition) = input.downcast_ref::<RepartitionExec>()
-            && (repartition.preserve_order()
-                || repartition.input().output_partitioning().partition_count() == 1)
-        {
-            input = repartition.input();
-        }
+        let input = merge.input();
         // A merge with a fetch stops once it has its rows.
         let early_stop = self.early_stop.get() || merge.fetch().is_some();
-        let Some(partitions) = partitions_of(input)? else {
+        let Some(partitions) = merge_partitions_of(input)? else {
             // The partial sorts with a fetch of partitions that the planner
             // does not split (e.g. of a repartitioning, see
             // `PhysicalPartialSort::try_lower`) emit at most their fetch of

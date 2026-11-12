@@ -128,7 +128,9 @@ accounting of all native operators):
   operators read all of their input first), and by keys that the native sort
   orders otherwise (unions); and the merges of sorted partitions that never
   end whose partitions the planner cannot split (see
-  [partial sorts](#partial-sorts)). `PhysicalStreamingMerge` runs every
+  [partial sorts](#partial-sorts); a merge reads the partitions of the inputs
+  of the repartitionings that keep their order, also below unions and the
+  nodes that compute every row of a row of their input, e.g. projections). `PhysicalStreamingMerge` runs every
   partition in an execution of its own: the partitions that scan a
   materialized CTE around the merge are lowered again by every execution of
   the merge, with scans of the rows of its body;
@@ -164,10 +166,14 @@ receives them, in a single pipeline:
   of a single partition, the rows of every partition keep their order: a
   `PhysicalPartialSortOfPartitions` sorts every partition as its rows arrive
   (it streams, also over inputs that never end, and ends once every
-  partition emitted its rows). Of an input of several partitions, whose rows
-  arrive in no order, a `PhysicalTopKOfPartitions` keeps the first rows of
-  every partition once its input ended (an input that never ends is sorted
-  as a single partition). A merge of these partial sorts (which emit at most
+  partition emitted its rows). Of an input of several partitions that never
+  ends, the `PhysicalStreamingMerge` of its partitions (in their order,
+  which the repartitioning keeps) is the input of a
+  `PhysicalPartialSortOfPartitions`; of an input of several partitions that
+  ends, whose rows arrive in no order, a `PhysicalTopKOfPartitions` keeps
+  the first rows of every partition once its input ended (an input that
+  never ends whose partitions the planner cannot split is sorted as a single
+  partition). A merge of these partial sorts (which emit at most
   their fetch of every partition) is the native sort of their rows, also
   over inputs that never end.
 - The partitions of other inputs (e.g. of a round robin repartitioning, whose
