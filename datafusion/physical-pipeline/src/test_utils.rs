@@ -84,6 +84,13 @@
 //! `LIMIT` that is not a constant), the rows are compared in their exact
 //! order.
 //!
+//! The rows that the nested `ORDER BY … LIMIT`s of a query (below its
+//! top-level sort, also in subqueries) return may also be other rows that tie
+//! at their windows. If the results differ, DataFusion also runs the query
+//! with other choices of these rows (up to 64 for each nested limit), and the
+//! result of the pipeline engine may be any of these results (see
+//! [`alternative_outcomes`]).
+//!
 //! Queries must still define their results: no `LIMIT` without `ORDER BY`,
 //! and no aggregates that depend on the order of their input without an
 //! `ORDER BY` (`ARRAY_AGG`, `STRING_AGG`, `FIRST_VALUE`, ...).
@@ -170,7 +177,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use datafusion_common::tree_node::TreeNode;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, internal_err,
     not_impl_err,
@@ -181,6 +188,7 @@ use datafusion_expr::logical_plan::{
 use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
+use itertools::Itertools;
 
 /// The configuration of both sessions used by the harness.
 pub fn test_session_config() -> SessionConfig {
@@ -704,6 +712,11 @@ pub struct EngineOutcomes {
     pub pipeline: Result<EngineOutput>,
     /// How the rows of the result are ordered, see [`result_order`].
     pub order: ResultOrder,
+    /// Other outputs of DataFusion that the query may return, with the order
+    /// of their rows: for other rows that its nested `ORDER BY … LIMIT`s may
+    /// return, see [`alternative_outcomes`]. Only computed if the output of
+    /// the pipeline engine differs from the output of DataFusion.
+    pub alternatives: Vec<(EngineOutput, ResultOrder)>,
 }
 
 impl EngineOutcomes {
@@ -720,7 +733,28 @@ impl EngineOutcomes {
     ) -> std::result::Result<(), String> {
         match (&self.datafusion, &self.pipeline) {
             (Ok(expected), Ok(actual)) => {
-                compare_results(expected, actual, &self.order, options)
+                let difference = compare_results(expected, actual, &self.order, options);
+                match difference {
+                    Err(difference)
+                        if !self.alternatives.iter().any(|(expected, order)| {
+                            compare_results(expected, actual, order, options).is_ok()
+                        }) =>
+                    {
+                        Err(if self.alternatives.is_empty() {
+                            difference
+                        } else {
+                            format!(
+                                "{difference}
+(nor is the result of the pipeline \
+                                 engine one of the {} other results of the query for \
+                                 other rows that tie at the windows of its nested ORDER \
+                                 BY … LIMITs)",
+                                self.alternatives.len()
+                            )
+                        })
+                    }
+                    _ => Ok(()),
+                }
             }
             (Err(_), Err(_)) => Ok(()),
             _ if options.allow_error_differences => Ok(()),
@@ -779,11 +813,228 @@ where
         )));
     }
     let order = result_order(&datafusion, &plan, options).await;
+    let alternatives = match (&datafusion_outcome, &pipeline_outcome) {
+        (Ok(expected), Ok(actual))
+            if compare_results(expected, actual, &order, options).is_err() =>
+        {
+            alternative_outcomes(&datafusion, &plan, options).await
+        }
+        _ => vec![],
+    };
     Ok(EngineOutcomes {
         datafusion: datafusion_outcome,
         pipeline: pipeline_outcome,
         order,
+        alternatives,
     })
+}
+
+/// The maximum number of other choices of the rows that a nested
+/// `ORDER BY … LIMIT` returns, for which [`alternative_outcomes`] runs a
+/// query.
+const MAX_ALTERNATIVES: usize = 64;
+
+/// Other outputs of DataFusion for `plan`, planned by `ctx`, with the order of
+/// their rows, to be compared with `options`: the outputs of the query if its
+/// nested `ORDER BY … LIMIT`s (below its top-level sort, see
+/// [`nested_limits`]) returned other rows that tie at their windows, up to
+/// [`MAX_ALTERNATIVES`] choices of rows for each of them (see
+/// [`window_choices`]). The query runs with the chosen rows in place of each
+/// nested limit, the other nested limits returning their own rows.
+pub async fn alternative_outcomes(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    options: &ComparisonOptions,
+) -> Vec<(EngineOutput, ResultOrder)> {
+    let tolerance = options.float_tolerance;
+    let mut alternatives = vec![];
+    for limit in nested_limits(plan) {
+        let Ok(reference) = sorted_reference(ctx, &limit, tolerance).await else {
+            continue;
+        };
+        let Ok(sorted) = reference.sorted_rows(tolerance) else {
+            continue;
+        };
+        let Some(batch) = reference.batches.first() else {
+            continue;
+        };
+        for choice in window_choices(&sorted, MAX_ALTERNATIVES) {
+            let alternative = async {
+                let positions = choice
+                    .iter()
+                    .map(|&row| u32::try_from(row))
+                    .collect::<std::result::Result<UInt32Array, _>>()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let columns = batch.columns()[..reference.columns]
+                    .iter()
+                    .map(|column| take(column, &positions, None))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let rows = rows_plan(columns, limit.schema())?;
+                let replaced = plan
+                    .clone()
+                    .transform_up_with_subqueries(|node| {
+                        Ok(if node == limit {
+                            Transformed::yes(rows.clone())
+                        } else {
+                            Transformed::no(node)
+                        })
+                    })?
+                    .data;
+                let output =
+                    run_dataframe(ctx, DataFrame::new(ctx.state(), replaced.clone()))
+                        .await?;
+                let order = result_order(ctx, &replaced, options).await;
+                Ok::<_, DataFusionError>((output, order))
+            };
+            if let Ok(alternative) = alternative.await {
+                alternatives.push(alternative);
+            }
+        }
+    }
+    alternatives
+}
+
+/// The nested `ORDER BY … LIMIT`s of `plan`: its limits over sorts (through
+/// projections, subquery aliases and limits) and its sorts with a fetch,
+/// below its top-level sort (see [`has_top_level_order_by`]), also in
+/// subqueries, but not inside each other.
+fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
+    // A limit over a sort, or a sort with a fetch.
+    let limits_a_sort = |node: &LogicalPlan| match node {
+        LogicalPlan::Sort(sort) => sort.fetch.is_some(),
+        LogicalPlan::Limit(limit) => {
+            let mut input = limit.input.as_ref();
+            loop {
+                match input {
+                    LogicalPlan::Sort(_) => break true,
+                    LogicalPlan::Projection(_)
+                    | LogicalPlan::SubqueryAlias(_)
+                    | LogicalPlan::Limit(_) => input = input.inputs()[0],
+                    _ => break false,
+                }
+            }
+        }
+        _ => false,
+    };
+    // The sorted reference of the query compares its top-level sort and the
+    // limits above it.
+    let mut below = plan;
+    if has_top_level_order_by(plan) {
+        while let LogicalPlan::Projection(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Limit(_) = below
+        {
+            below = below.inputs()[0];
+        }
+        if let LogicalPlan::Sort(sort) = below {
+            below = sort.input.as_ref();
+        }
+    }
+    let mut limits = vec![];
+    let _ = below.apply_with_subqueries(|node| {
+        Ok(if limits_a_sort(node) {
+            limits.push(node.clone());
+            TreeNodeRecursion::Jump
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    limits
+}
+
+/// The rows of `columns` (the columns of the schema `schema`, which may have
+/// qualifiers), as a plan.
+fn rows_plan(columns: Vec<ArrayRef>, schema: &DFSchema) -> Result<LogicalPlan> {
+    let fields = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| field.as_ref().clone().with_name(format!("c{i}")))
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+    let scan =
+        LogicalPlanBuilder::scan(SORTED_ROWS, provider_as_source(Arc::new(table)), None)?
+            .build()?;
+    let exprs = schema
+        .iter()
+        .enumerate()
+        .map(|(i, (qualifier, field))| {
+            Expr::Column(Column::new(Some(SORTED_ROWS), format!("c{i}")))
+                .alias_qualified(qualifier.cloned(), field.name())
+        })
+        .collect();
+    Ok(LogicalPlan::Projection(Projection::try_new(
+        exprs,
+        Arc::new(scan),
+    )?))
+}
+
+/// Up to `max` other choices of the sorted rows `sorted` that a query may
+/// return than the rows of its window (each the positions of the rows, in
+/// their order): orders of all sorted rows in which rows are only out of
+/// their sorted order relative to rows that they tie with may put other rows
+/// at the positions of the window, see [`ResultOrder::Sorted`]. The rows that
+/// the `OFFSET` skips are the first rows of the other positions.
+fn window_choices(sorted: &SortedRows, max: usize) -> Vec<Vec<usize>> {
+    let window = sorted.window.clone();
+    let mut class_of = vec![0; sorted.values.len()];
+    for (class, (rows, _)) in sorted.classes.iter().enumerate() {
+        class_of[rows.clone()].fill(class);
+    }
+    let ties = |a: usize, b: usize| {
+        class_of[a] == class_of[b]
+            || sorted.tied[class_of[a]].binary_search(&class_of[b]).is_ok()
+    };
+    // The rows that may be at the positions of the window, but for the rows
+    // of the window that tie with no other one of them.
+    let bounds = bounds(&sorted.classes, &sorted.tied);
+    let candidates = (0..sorted.values.len())
+        .filter(|&row| {
+            let (first, last) = bounds[class_of[row]];
+            sorted.values[row].is_some() && first < window.end && last >= window.start
+        })
+        .collect::<Vec<_>>();
+    let (fixed, free): (Vec<usize>, Vec<usize>) = candidates.iter().partition(|&&row| {
+        window.contains(&row)
+            && candidates.iter().all(|&other| {
+                other == row || window.contains(&other) || !ties(row, other)
+            })
+    });
+    let mut choices = vec![];
+    for chosen in free
+        .iter()
+        .copied()
+        .combinations(window.len() - fixed.len())
+        .take(100_000)
+    {
+        let mut choice = fixed.iter().copied().chain(chosen).collect::<Vec<_>>();
+        choice.sort_unstable();
+        if choice.iter().copied().eq(window.clone()) {
+            continue;
+        }
+        // The skipped rows, before the chosen rows, and the cut rows, after
+        // them, must tie with the chosen rows that they are out of order with.
+        let skipped = (0..sorted.values.len())
+            .filter(|row| choice.binary_search(row).is_err())
+            .take(window.start)
+            .collect::<Vec<_>>();
+        let valid = choice.iter().all(|&row| {
+            skipped.iter().all(|&other| other < row || ties(row, other))
+                && (0..row).all(|other| {
+                    choice.binary_search(&other).is_ok()
+                        || skipped.binary_search(&other).is_ok()
+                        || ties(row, other)
+                })
+        });
+        if valid {
+            choices.push(choice);
+            if choices.len() == max {
+                break;
+            }
+        }
+    }
+    choices
 }
 
 /// How the rows of the result of a query are ordered, see [`result_order`].
@@ -3886,7 +4137,6 @@ mod tests {
     };
     use arrow::buffer::{NullBuffer, ScalarBuffer};
     use arrow::datatypes::{Fields, Int8Type, UnionFields};
-    use itertools::Itertools;
 
     fn int_batch(values: &[Option<i32>]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
@@ -6020,6 +6270,7 @@ mod tests {
             datafusion,
             pipeline,
             order: ResultOrder::Unordered,
+            alternatives: vec![],
         };
         let strict = ComparisonOptions::default();
         let lenient = strict.with_allow_error_differences(true);
@@ -6879,6 +7130,44 @@ mod tests {
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_other_rows_of_nested_limits() {
+        // The rows tie on `k`, in other orders in the tables of both engines: the
+        // nested ORDER BY … LIMIT of each engine returns another row.
+        let rows = |rows: &[(i64, f64)]| {
+            k_id_batch(&rows.iter().map(|&(id, k)| (k, id)).collect::<Vec<_>>())
+        };
+        let setup =
+            per_engine_tables(rows(&[(1, 0.5), (2, 0.5)]), rows(&[(2, 0.5), (1, 0.5)]));
+        for sql in [
+            "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1) s ORDER BY id",
+            "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1) s WHERE id > 0",
+            "SELECT sum(id) AS total FROM (SELECT id FROM m ORDER BY k LIMIT 1) s",
+            "SELECT id FROM m WHERE id IN (SELECT id FROM m ORDER BY k LIMIT 1)",
+            "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1 OFFSET 1) s ORDER BY id",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[should_panic(expected = "nor is the result of the pipeline engine one of the 1 \
+                               other results of the query")]
+    async fn assert_same_results_panics_on_rows_that_nested_limits_cannot_return() {
+        // The nested limit may return the row of `id = 1` or of `id = 2`, but not
+        // of `id = 3`, whose key does not tie with theirs (in the table of the
+        // pipeline engine, it is the only row of the smallest key).
+        let setup = per_engine_tables(
+            k_id_batch(&[(0.5, 1), (0.5, 2), (0.7, 3)]),
+            k_id_batch(&[(0.7, 1), (0.7, 2), (0.5, 3)]),
+        );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1) s ORDER BY id",
+            &setup,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
