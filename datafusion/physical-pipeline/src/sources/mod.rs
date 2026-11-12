@@ -84,6 +84,7 @@ pub mod explain;
 pub mod file;
 pub mod lazy_memory;
 pub mod memory;
+pub mod memory_dml;
 pub mod parquet;
 pub mod streaming;
 
@@ -93,6 +94,7 @@ pub use explain::ExplainSource;
 pub use file::FileScanSource;
 pub use lazy_memory::LazyMemorySource;
 pub use memory::MemoryScanSource;
+pub use memory_dml::MemoryDmlSource;
 pub use parquet::ParquetScanSource;
 pub use streaming::StreamingTableSource;
 

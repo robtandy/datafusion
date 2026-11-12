@@ -45,6 +45,8 @@
 //! | `MaterializedCteExec`, `MaterializedCteScanExec`                                   | [`PhysicalMaterializedCte`], [`MaterializedCteScan`] |
 //! | `PartitionedTopKExec`                                                              | [`PhysicalPartitionedTopK`]                        |
 //! | `PiecewiseMergeJoinExec`                                                           | [`PhysicalNestedLoopJoin`]                         |
+//! | `AsOfJoinExec`                                                                     | [`PhysicalAsOfJoin`]                               |
+//! | `MemDeleteExec`, `MemUpdateExec`                                                   | [`MemoryDmlSource`]                                |
 //! | `SortPreservingMergeExec` of other sorted partitions                               | [`PhysicalSort`] or [`PhysicalTopK`]               |
 //! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                 | removed                                            |
 //! | `CooperativeExec`, `BufferExec`                                                    | removed                                            |
@@ -269,7 +271,7 @@ use crate::operators::unnest::PhysicalUnnest;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
 use crate::sources::{
-    EmptyScanSource, ExplainSource, FileScanSource, LazyMemorySource,
+    EmptyScanSource, ExplainSource, FileScanSource, LazyMemorySource, MemoryDmlSource,
     StreamingTableSource, try_create_scan_source,
 };
 use crate::window::PhysicalWindow;
@@ -757,6 +759,9 @@ impl Lowering<'_> {
             return Ok(Arc::new(scan));
         }
         if let Some(source) = LazyMemorySource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        if let Some(source) = MemoryDmlSource::try_lower(plan) {
             return Ok(Arc::new(source));
         }
         if let Some(source) = StreamingTableSource::try_lower(plan) {
