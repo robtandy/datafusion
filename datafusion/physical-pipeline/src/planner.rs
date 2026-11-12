@@ -33,13 +33,30 @@
 //! | `NestedLoopJoinExec`                                                               | [`PhysicalNestedLoopJoin`]                         |
 //! | `CrossJoinExec`                                                                    | [`PhysicalCrossJoin`]                              |
 //! | `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch         | [`PhysicalLimit`]                                  |
+//! | `CoalesceBatchesExec` with a fetch, of a single partition                         | [`PhysicalLimit`]                                  |
 //! | `UnionExec`, `InterleaveExec`                                                      | [`PhysicalUnion`]                                  |
 //! | `PlaceholderRowExec`                                                               | [`PhysicalPlaceholderRow`]                         |
 //! | `FilterExec`                                                                       | [`PhysicalFilter`] in a [`CachingOperator`]        |
 //! | `ProjectionExec`                                                                   | [`PhysicalProjection`]                             |
 //! | `ScalarSubqueryExec` (of uncorrelated scalar subqueries)                           | [`PhysicalScalarSubquery`]                         |
 //! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                               | the sources of [`try_create_scan_source`]          |
+//! | `DataSourceExec` (of other files: JSON, Avro, Arrow IPC, ...)                      | [`FileScanSource`]                                 |
+//! | `LazyMemoryExec`, `StreamingTableExec`, `ExplainExec`                              | [`LazyMemorySource`], [`StreamingTableSource`], [`ExplainSource`] |
+//! | `AnalyzeExec` (of the native plan of the query)                                   | [`PhysicalAnalyze`]                                |
+//! | `UnnestExec`, `AsyncFuncExec`, `PartialSortExec`                                   | [`PhysicalUnnest`], [`PhysicalAsyncFunc`], [`PhysicalPartialSort`] |
+//! | `DataSinkExec`                                                                     | [`PhysicalDataSink`]                               |
+//! | `MaterializedCteExec`, `MaterializedCteScanExec`                                   | [`PhysicalMaterializedCte`], [`MaterializedCteScan`] |
+//! | `PartitionedTopKExec`                                                              | [`PhysicalPartitionedTopK`]                        |
+//! | `PiecewiseMergeJoinExec`                                                           | [`PhysicalRangeJoin`]                              |
+//! | `AsOfJoinExec`                                                                     | [`PhysicalAsOfJoin`]                               |
+//! | `MemDeleteExec`, `MemUpdateExec`                                                   | [`MemoryDmlSource`]                                |
+//! | `SortPreservingMergeExec` of other sorted partitions                               | [`PhysicalSort`] or [`PhysicalTopK`]               |
+//! | `SortPreservingMergeExec` of inputs that never end                                 | [`PhysicalStreamingMerge`]                         |
 //! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                 | removed                                            |
+//! | `CooperativeExec`, `BufferExec`                                                    | removed                                            |
+//!
+//! `docs/fallbacks.md` lists every `ExecutionPlan` of DataFusion with the
+//! native operators that execute it, and the nodes that stay in DataFusion.
 //!
 //! The nodes that only distribute rows over partitions or change the size of
 //! batches are removed: all threads of a pipeline read the chunks of its
@@ -127,8 +144,9 @@
 //! DataFusion still executes
 //!
 //! * the nodes that no native operator implements yet (e.g. recursive queries,
-//!   and user-defined `ExecutionPlan`s), and the nodes that the native
-//!   operators refuse themselves (see their `try_lower` functions);
+//!   and user-defined `ExecutionPlan`s, see `docs/fallbacks.md`), and the
+//!   nodes that the native operators refuse themselves (see their `try_lower`
+//!   functions);
 //! * the windows and loop joins of sessions whose memory pool has a limit
 //!   (see above);
 //! * the sorts, windows, aggregations and joins of values that address more
@@ -210,7 +228,9 @@ use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::analyze::AnalyzeExec;
+use datafusion_physical_plan::buffer::BufferExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::explain::ExplainExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::joins::utils::{ColumnIndex, build_join_schema};
@@ -240,16 +260,35 @@ use crate::operator::{
     LocalSinkState, LocalSourceState, OperatorResult, OperatorState, PhysicalOperator,
     SinkFinalize, SinkResult, SourceResult, downcast_state,
 };
+use crate::operators::analyze::{AnalyzeRendering, AnalyzedInput, PhysicalAnalyze};
+use crate::operators::asof_join::PhysicalAsOfJoin;
+use crate::operators::async_func::PhysicalAsyncFunc;
 use crate::operators::caching::CachingOperator;
+use crate::operators::data_sink::PhysicalDataSink;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::limit::PhysicalLimit;
+use crate::operators::materialized_cte::{
+    MaterializedCteScan, MaterializedCtes, PhysicalMaterializedCte,
+    hoist_materialized_ctes,
+};
+use crate::operators::partial_sort::{
+    PhysicalPartialSort, first_rows_of_merged_partitions, merge_partitions_of,
+};
+use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
+use crate::operators::piecewise_merge_join::nested_loop_join_of;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
+use crate::operators::range_join::PhysicalRangeJoin;
 use crate::operators::recursive_cte::{PhysicalRecursiveCte, WorkTableScanSource};
+use crate::operators::streaming_merge::PhysicalStreamingMerge;
 use crate::operators::union::PhysicalUnion;
+use crate::operators::unnest::PhysicalUnnest;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
-use crate::sources::{EmptyScanSource, try_create_scan_source};
+use crate::sources::{
+    EmptyScanSource, ExplainSource, FileScanSource, LazyMemorySource, MemoryDmlSource,
+    StreamingTableSource, try_create_scan_source,
+};
 use crate::window::PhysicalWindow;
 
 /// A [`QueryPlanner`] that executes queries with the pipeline engine.
@@ -331,12 +370,25 @@ impl PipelineQueryPlanner {
             session.config_options(),
             session.runtime_env(),
         )?;
-        // Shown with the metrics of its operators that the statement selects.
+        // Shown with the metrics of its operators that the statement selects,
+        // and rendered by `PhysicalAnalyze` with the metric types and the
+        // statistics registry of DataFusion's `AnalyzeExec`.
         let input: Arc<dyn ExecutionPlan> = match logical_plan {
-            LogicalPlan::Analyze(statement) => Arc::new(AnalyzedPipelineExec::new(
-                root,
-                MetricSelection::of_analyze(statement, session.config_options()),
-            )),
+            LogicalPlan::Analyze(statement) => {
+                let options = session.config_options();
+                let analyzed = Arc::new(AnalyzedPipelineExec::new(
+                    root,
+                    MetricSelection::of_analyze(statement, options),
+                ));
+                let level = statement
+                    .analyze_level
+                    .unwrap_or(options.explain.analyze_level);
+                let registry = session.statistics_registry().cloned().unwrap_or_default();
+                Arc::new(AnalyzedInput::new(
+                    analyzed,
+                    AnalyzeRendering::new(level.included_types(), registry),
+                ))
+            }
             _ => root,
         };
         Arc::clone(&plan).replace_children(vec![input], recompute())
@@ -491,6 +543,26 @@ pub fn lower_execution_plan_with_runtime(
     Lowering::new(options, Some(runtime)).lower(plan)
 }
 
+/// Like [`lower_execution_plan_with_runtime`], but the scans of the
+/// materialized CTEs of `cte_rows` (by the ids of their buffers) read these
+/// rows: the rows of the CTEs around a plan that an execution lowers again
+/// (the recursive term of a recursive query, see
+/// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte),
+/// or an input of a streaming merge, see
+/// [`PhysicalStreamingMerge::with_outer_ctes`]), in a pipeline that may stop
+/// before its input ends if `early_stop` (see `Lowering::lower_in`).
+pub(crate) fn lower_execution_plan_with_cte_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
+    runtime: &RuntimeEnv,
+    cte_rows: &std::collections::HashMap<u64, Arc<Vec<arrow::array::RecordBatch>>>,
+    early_stop: bool,
+) -> Result<Arc<dyn PhysicalOperator>> {
+    let mut lowering = Lowering::new(options, Some(runtime));
+    lowering.materialized_ctes = MaterializedCtes::with_rows(cte_rows.clone());
+    lowering.lower_in(plan, early_stop)
+}
+
 /// Options for which the lowering lowers what it lowers for every session:
 /// DataFusion's sort concatenates the batches of a partition, which can
 /// overflow 32-bit offsets, while they occupy fewer bytes than
@@ -514,6 +586,9 @@ struct Lowering<'a> {
     /// fetch or an aggregation with a soft limit, or in the subquery of a
     /// scalar subquery, which fails at its second row.
     early_stop: Cell<bool>,
+    /// The materialized CTEs whose continuations are being lowered, which
+    /// their scans read.
+    materialized_ctes: MaterializedCtes,
     /// The dynamic filters of the hash joins whose probe sides are being
     /// lowered, routed to the scans below them (see
     /// [`Self::try_lower_hash_join`]).
@@ -530,6 +605,7 @@ impl<'a> Lowering<'a> {
             options,
             runtime,
             early_stop: Cell::new(false),
+            materialized_ctes: MaterializedCtes::default(),
             join_filters: RefCell::new(vec![]),
             ordered_joins: RefCell::new(HashSet::new()),
         }
@@ -613,6 +689,17 @@ impl Lowering<'_> {
             if let Some(join) = self.try_lower_merge_of_sort_merge_join(plan)? {
                 return Ok(join);
             }
+            if let Some(merge) = self.try_lower_streaming_merge(plan)? {
+                return Ok(merge);
+            }
+            if let Some(sort) = self.try_lower_merge(plan)? {
+                return Ok(sort);
+            }
+            if let Some(topk) = PhysicalPartitionedTopK::try_lower(plan, |sort| {
+                self.try_lower_sort(sort)
+            })? {
+                return Ok(Arc::new(topk));
+            }
             if let Some(aggregate) = self.try_lower_aggregate(plan)? {
                 return Ok(aggregate);
             }
@@ -628,14 +715,58 @@ impl Lowering<'_> {
             if let Some(join) = self.try_lower_loop_join(plan)? {
                 return Ok(join);
             }
+            // The buffered input of a range join is its build side, which
+            // reads all of its input, its streamed input its probe side.
+            if let Some(join) = PhysicalRangeJoin::try_lower(
+                plan,
+                |build| self.lower_in(build, false),
+                |probe| self.lower_in(probe, self.early_stop.get()),
+            )? {
+                return Ok(Arc::new(join));
+            }
+            if let Some(join) = nested_loop_join_of(plan)?
+                && let Some(join) = self.try_lower_loop_join(&join)?
+            {
+                return Ok(join);
+            }
+            // The left input of an ASOF join is its probe side, its right
+            // input its build side, which reads all of its input.
+            if let Some(join) = PhysicalAsOfJoin::try_lower(
+                plan,
+                |left| self.lower_in(left, self.early_stop.get()),
+                |right| self.lower_in(right, false),
+            )? {
+                return Ok(Arc::new(join));
+            }
+        }
+        // The materialized CTEs that the subqueries of a scalar subquery scan
+        // run before them.
+        if let Some(hoisted) = hoist_materialized_ctes(plan)? {
+            return self.lower_natively(&hoisted);
         }
         if let Some(subquery) = self.try_lower_scalar_subquery(plan)? {
             return Ok(subquery);
         }
+        // The body of a materialized CTE reads all of its input.
+        if let Some(cte) = PhysicalMaterializedCte::try_lower(
+            plan,
+            &self.materialized_ctes,
+            |body| self.lower_in(body, false),
+            |continuation| self.lower(continuation),
+        )? {
+            return Ok(Arc::new(cte));
+        }
+        if let Some(scan) = MaterializedCteScan::try_lower(plan, &self.materialized_ctes)
+        {
+            return Ok(Arc::new(scan));
+        }
         if let Some(cte) =
             PhysicalRecursiveCte::try_lower(plan, |term| self.lower_in(term, false))?
         {
-            return Ok(Arc::new(cte));
+            // The materialized CTEs around the query that its recursive term
+            // scans, whose rows every iteration reads.
+            let outer_ctes = self.materialized_ctes.scanned_by(cte.recursive_plan())?;
+            return Ok(Arc::new(cte.with_outer_ctes(outer_ctes)));
         }
         // A limit with a fetch stops its pipeline once it has its rows.
         let early_stop = self.early_stop.get() || plan.fetch().is_some();
@@ -653,11 +784,71 @@ impl Lowering<'_> {
         if let Some(filter) = plan.downcast_ref::<FilterExec>() {
             return self.lower_filter(plan, filter);
         }
+        if let Some(functions) =
+            PhysicalAsyncFunc::try_lower(plan, |input| self.lower(input))?
+        {
+            return Ok(Arc::new(functions));
+        }
+        if let Some(unnest) = PhysicalUnnest::try_lower(plan, |input| self.lower(input))?
+        {
+            return Ok(Arc::new(unnest));
+        }
+        // A partial sort with a fetch stops its pipeline once it has its rows.
+        if let Some(sort) =
+            PhysicalPartialSort::try_lower(plan, &self.materialized_ctes, |input| {
+                self.lower_in(input, early_stop)
+            })?
+        {
+            return Ok(sort);
+        }
+        // A sink reads all of its input.
+        if let Some(sink) =
+            PhysicalDataSink::try_lower(plan, |input| self.lower_in(input, false))?
+        {
+            return Ok(Arc::new(sink));
+        }
         if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
             return self.lower_projection(plan, projection);
         }
         if let Some(scan) = self.lower_scan(plan)? {
             return Ok(scan);
+        }
+        if let Some(analyze) =
+            PhysicalAnalyze::try_lower(plan, self.options, self.runtime)?
+        {
+            return Ok(Arc::new(analyze));
+        }
+        if let Some(explain) = ExplainSource::try_lower(plan)? {
+            return Ok(Arc::new(explain));
+        }
+        if let Some(scan) = FileScanSource::try_lower(plan)? {
+            return Ok(Arc::new(scan));
+        }
+        if let Some(source) = LazyMemorySource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        if let Some(source) = MemoryDmlSource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        if let Some(source) = StreamingTableSource::try_lower(plan) {
+            return Ok(Arc::new(source));
+        }
+        // The pipeline engine schedules its tasks cooperatively and pushes
+        // the chunks of its sources itself.
+        if let Some(input) = scheduled_input(plan) {
+            return self.lower(input);
+        }
+        // A `CoalesceBatchesExec` with a fetch of a single partition is a limit
+        // of that partition (of several partitions, it limits every one).
+        if is_coalesce_batches(plan)
+            && let Some(fetch) = plan.fetch()
+            && let [input] = plan.children()[..]
+            && input.output_partitioning().partition_count() == 1
+        {
+            let input = self.lower_in(input, true)?;
+            let limit =
+                PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true);
+            return Ok(Arc::new(limit));
         }
         if let Some(scan) = WorkTableScanSource::try_lower(plan)? {
             return Ok(Arc::new(scan));
@@ -1104,6 +1295,115 @@ impl Lowering<'_> {
         Ok(Some(Arc::new(sort)))
     }
 
+    /// Lower a `SortPreservingMergeExec` of partitions that are sorted
+    /// otherwise than by a `SortExec` below it (e.g. of the sorted files of a
+    /// scan, possibly through a `BufferExec`, or of a `PartialSortExec`) to the
+    /// sort of its input, with its fetch: the pipeline engine does not keep
+    /// the rows of the partitions apart, and sorting them merges them. It is
+    /// lowered as the merge of the sort of every partition, with
+    /// [`Self::try_lower_sort`], which does not lower the sorts of inputs that
+    /// never end, nor by keys that the native sort orders otherwise.
+    ///
+    /// A merge of `PartialSortExec`s that keep the first rows of every
+    /// partition is lowered as the TopK of their input if it keeps at most
+    /// these rows (see [`first_rows_of_merged_partitions`]).
+    fn try_lower_merge(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        // The merge of partial sorts that keep the first rows of every
+        // partition, of at most these rows, is the TopK of their input.
+        let (input, ordering) = match first_rows_of_merged_partitions(merge) {
+            Some((input, ordering)) => (input, ordering.clone()),
+            None => (merge.input(), merge.expr().clone()),
+        };
+        let sort =
+            SortExec::new(ordering, Arc::clone(input)).with_preserve_partitioning(true);
+        let sorted: Arc<dyn ExecutionPlan> = Arc::new(
+            SortPreservingMergeExec::new(merge.expr().clone(), Arc::new(sort))
+                .with_fetch(merge.fetch()),
+        );
+        self.try_lower_sort(&sorted)
+    }
+
+    /// Lower a `SortPreservingMergeExec` of inputs that never end (which the
+    /// native sort, which reads all of its input first, does not sort) to a
+    /// [`PhysicalStreamingMerge`] of the native operators of its partitions
+    /// (see [`partitions_of`]), every one sorted, through the repartitionings
+    /// that keep the order of every partition (which only distribute sorted
+    /// rows); to the native operators of its single partition if there is
+    /// one (with a limit for its fetch). The inputs that scan materialized
+    /// CTEs around the merge read their rows (see
+    /// [`PhysicalStreamingMerge::with_outer_ctes`]). Returns `Ok(None)` for
+    /// any other node, and for inputs whose partitions the planner does not
+    /// split.
+    fn try_lower_streaming_merge(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        if !merge.input().boundedness().is_unbounded() {
+            return Ok(None);
+        }
+        let input = merge.input();
+        // The inputs never end: their pipelines may never complete a cache
+        // (see `Self::lower_in`), so that their rows reach the merge as they
+        // arrive.
+        let early_stop = true;
+        let Some(partitions) = merge_partitions_of(input)? else {
+            // The partial sorts with a fetch of partitions that the planner
+            // does not split (e.g. of a repartitioning, see
+            // `PhysicalPartialSort::try_lower`) emit at most their fetch of
+            // every partition, and then end: the native sort of their rows
+            // merges them.
+            if let Some(sort) = input.downcast_ref::<datafusion_physical_plan::sorts::partial_sort::PartialSortExec>()
+                && sort.fetch().is_some()
+            {
+                let input = self.lower_in(input, early_stop)?;
+                let sorted: Arc<dyn PhysicalOperator> = match merge.fetch() {
+                    Some(fetch) if fetch > 0 => Arc::new(PhysicalTopK::try_new(
+                        input,
+                        merge.expr().clone(),
+                        fetch,
+                    )?),
+                    fetch => Arc::new(PhysicalSort::try_new(
+                        input,
+                        merge.expr().clone(),
+                        fetch,
+                    )?),
+                };
+                return Ok(Some(sorted));
+            }
+            return Ok(None);
+        };
+        let mut inputs = partitions
+            .iter()
+            .map(|partition| self.lower_in(partition, early_stop))
+            .collect::<Result<Vec<_>>>()?;
+        if let [input] = inputs.as_slice() {
+            let input = Arc::clone(input);
+            return Ok(Some(match merge.fetch() {
+                Some(fetch) => Arc::new(
+                    PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true),
+                ),
+                None => input,
+            }));
+        }
+        let merge = PhysicalStreamingMerge::try_new(
+            std::mem::take(&mut inputs),
+            plan.schema(),
+            merge.expr().clone(),
+            merge.fetch(),
+        )?
+        .with_outer_ctes_of(partitions, &self.materialized_ctes)?;
+        Ok(Some(Arc::new(merge)))
+    }
+
     /// Lower a nested loop join or a cross join with
     /// [`PhysicalNestedLoopJoin::try_lower`] or
     /// [`PhysicalCrossJoin::try_lower`], for a runtime whose memory pool has
@@ -1254,8 +1554,8 @@ fn bridge(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn PhysicalOperator> {
 ///
 /// * a `CoalescePartitionsExec` without a fetch (with a fetch it is a limit;
 ///   without input partitions, DataFusion fails to execute it);
-/// * a `RepartitionExec` (round robin or by hash) that does not preserve the
-///   order, of at least one partition;
+/// * a `RepartitionExec` that only distributes the rows of its input (see
+///   [`redistributes_rows`]), of at least one partition;
 /// * a `CoalesceBatchesExec` without a fetch.
 fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     let input = plan.children().into_iter().next()?;
@@ -1274,13 +1574,29 @@ fn redistributed_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Executi
     None
 }
 
+/// The input of `plan`, if `plan` only changes how its input is scheduled,
+/// without changing its rows: a `CooperativeExec`, which makes the tasks of
+/// its input yield, or a `BufferExec`, which polls its input ahead of its
+/// consumer.
+fn scheduled_input(plan: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
+    if let Some(cooperative) = plan.downcast_ref::<CooperativeExec>() {
+        return Some(cooperative.input());
+    }
+    plan.downcast_ref::<BufferExec>().map(BufferExec::input)
+}
+
 /// Whether `repartition` only distributes the rows of its input over its
-/// partitions: round robin or by hash, without preserving the order.
+/// partitions: round robin, by hash or by range, without preserving the
+/// order, or preserving the order of every partition of several partitions
+/// (whose order the native operators that read them do not depend on: they
+/// merge, sort or partition the rows themselves).
 fn redistributes_rows(repartition: &RepartitionExec) -> bool {
-    !repartition.preserve_order()
+    (!repartition.preserve_order() || repartition.partitioning().partition_count() > 1)
         && matches!(
             repartition.partitioning(),
-            Partitioning::RoundRobinBatch(_) | Partitioning::Hash(..)
+            Partitioning::RoundRobinBatch(_)
+                | Partitioning::Hash(..)
+                | Partitioning::Range(_)
         )
 }
 
@@ -2657,7 +2973,6 @@ mod tests {
     use datafusion_physical_plan::aggregates::PhysicalGroupBy;
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion_physical_plan::limit::GlobalLimitExec;
-    use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
     use datafusion_physical_plan::{PhysicalExpr, collect, displayable};
 
     use crate::bridge::bridged_plans;
@@ -2886,14 +3201,13 @@ mod tests {
 
     #[test]
     fn unsupported_plans_are_bridged() -> Result<()> {
+        // A user-defined plan.
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let scan: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?;
-        let ordering =
-            LexOrdering::new(vec![PhysicalSortExpr::new_default(col("a", &schema)?)])
-                .unwrap();
         let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(PartialSortExec::new(ordering, scan, 1));
+            Arc::new(datafusion_physical_plan::test::exec::MockExec::new(
+                vec![],
+                Arc::clone(&schema),
+            ));
         let operator = lower_execution_plan(&plan)?;
         let bridge = operator.downcast_ref::<BridgeOperator>().unwrap();
         assert!(Arc::ptr_eq(bridge.plan(), &plan));
@@ -4917,10 +5231,7 @@ mod tests {
             .operator
             .downcast_ref::<PhysicalProjection>()
             .expect("native");
-        let bridge = projection.children()[0]
-            .downcast_ref::<BridgeOperator>()
-            .expect("a bridge");
-        assert!(!is_coalesce_batches(bridge.plan()));
+        assert!(projection.children()[0].is::<StreamingTableSource>());
         // So it is without a part that may fail above it.
         let make_plan = || {
             let source = batch_plan(zeros.clone(), AfterBatch::Fail).unwrap();
@@ -4934,10 +5245,7 @@ mod tests {
         let root =
             assert_plan_outcome(make_plan, config.clone(), Some(INJECTED_FAILURE)).await;
         let projection = root.downcast_ref::<PhysicalProjection>().expect("native");
-        let bridge = projection.children()[0]
-            .downcast_ref::<BridgeOperator>()
-            .expect("a bridge");
-        assert!(!is_coalesce_batches(bridge.plan()));
+        assert!(projection.children()[0].is::<StreamingTableSource>());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5466,10 +5774,10 @@ mod tests {
                 .operator
                 .downcast_ref::<PhysicalProjection>()
                 .expect("native");
-            let bridge = projection.children()[0]
-                .downcast_ref::<BridgeOperator>()
-                .expect("a bridge");
-            assert!(!bridge.plan().is::<RepartitionExec>(), "{partitioning}");
+            assert!(
+                projection.children()[0].is::<StreamingTableSource>(),
+                "{partitioning}"
+            );
         }
     }
 
@@ -8021,7 +8329,13 @@ mod tests {
     /// The output of `sql`, an `EXPLAIN`, with the pipeline engine: the plan of
     /// every plan type.
     async fn explain(sql: &str) -> Vec<(String, String)> {
-        let ctx = pipeline_context(test_session_config());
+        explain_with(sql, test_session_config()).await
+    }
+
+    /// The plans of the `EXPLAIN` `sql`, run in a session of the pipeline
+    /// engine configured with `config`.
+    async fn explain_with(sql: &str, config: SessionConfig) -> Vec<(String, String)> {
+        let ctx = pipeline_context(config);
         register_view_tables(&ctx).unwrap();
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         batches
@@ -8097,23 +8411,21 @@ mod tests {
             "{plan}"
         );
 
-        // A bridged plan is shown below its bridge: a `generate_series`, which
-        // has no native operator yet.
-        let explained =
-            explain("EXPLAIN SELECT value * 2 AS m FROM generate_series(1, 3)").await;
+        // A bridged plan is shown below its bridge: an aggregation by groups
+        // that its input clusters (sorted by them), which the native
+        // aggregation refuses.
+        let explained = explain(
+            "EXPLAIN SELECT a, COUNT(*) AS n FROM \
+             (SELECT a FROM t1 ORDER BY a LIMIT 100) GROUP BY a",
+        )
+        .await;
         let plan = plan_of(&explained, "physical_plan");
         assert!(
             plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"),
             "{plan}"
         );
-        assert!(
-            plan.contains("\n    BridgeOperator, pipelines=[0]\n      RepartitionExec: "),
-            "{plan}"
-        );
-        assert!(
-            plan.contains("\n        LazyMemoryExec: partitions=1, batch_generators="),
-            "{plan}"
-        );
+        assert!(plan.contains("BridgeOperator, pipelines=[0]\n"), "{plan}");
+        assert!(plan.contains("AggregateExec: "), "{plan}");
 
         // `EXPLAIN VERBOSE` also shows the plans of DataFusion that the plan
         // of the pipeline engine was lowered from.
@@ -8151,15 +8463,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_selects_the_metrics_of_every_operator() {
-        // A native sort of a bridged plan (a `generate_series`, which has no
-        // native operator yet), whose nodes have metrics too.
-        let query =
-            "SELECT value FROM generate_series(1, 3) WHERE value > 1 ORDER BY value DESC";
+        // A native sort of a bridged plan (an aggregation by groups that its
+        // input clusters, sorted by them, which the native aggregation
+        // refuses), whose nodes have metrics too.
+        let query = "SELECT a, n FROM (SELECT a, COUNT(*) AS n FROM \
+                     (SELECT a FROM t1 WHERE id > 1 ORDER BY a LIMIT 100) GROUP BY a) \
+                     ORDER BY n DESC";
         let analyzed = async |options: &str| {
             let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
             let plan = plan_of(&explained, "Plan with Metrics").to_string();
             assert!(plan.contains("PhysicalSort"), "{plan}");
-            assert!(plan.contains("LazyMemoryExec"), "{plan}");
+            assert!(plan.contains("AggregateExec"), "{plan}");
             plan
         };
         // Without metrics, of the native operators and of the bridged nodes.
@@ -8199,7 +8513,7 @@ mod tests {
         let explained = explain(&sql).await;
         for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
             let plan = plan_of(&explained, rendering);
-            for node in ["PhysicalSort", "LazyMemoryExec"] {
+            for node in ["PhysicalSort", "AggregateExec"] {
                 let line = plan
                     .lines()
                     .find(|line| line.trim_start().starts_with(node))

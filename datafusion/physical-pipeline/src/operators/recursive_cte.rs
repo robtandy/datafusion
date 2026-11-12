@@ -175,7 +175,10 @@ use crate::operator::{
     LocalSourceState, OperatorMetrics, PhysicalOperator, SinkFinalize, SinkResult,
     SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
+use crate::operators::materialized_cte::OuterCte;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::planner::lower_execution_plan_with_cte_rows;
+#[cfg(test)]
 use crate::planner::lower_execution_plan_with_runtime;
 
 /// A recursive query (`WITH RECURSIVE`), DataFusion's `RecursiveQueryExec`.
@@ -198,6 +201,10 @@ pub struct PhysicalRecursiveCte {
     /// recursive term share state with `recursive_plan` (see
     /// [`shares_state`]), so that they run one at a time.
     turns: Arc<futures::lock::Mutex<()>>,
+    /// The materialized CTEs around the query that its recursive term scans,
+    /// by the ids of their buffers: the scans of every iteration read their
+    /// rows (see [`OuterCte`]).
+    outer_ctes: Vec<(u64, OuterCte)>,
 }
 
 impl PhysicalRecursiveCte {
@@ -255,7 +262,22 @@ impl PhysicalRecursiveCte {
             children: vec![static_term, recursive_term],
             recursive_plan,
             turns: Arc::default(),
+            outer_ctes: vec![],
         }))
+    }
+
+    /// This query, whose iterations read the rows of `outer_ctes`, the
+    /// materialized CTEs around the query that its recursive term scans (by
+    /// the ids of their buffers, see [`OuterCte`]).
+    pub(crate) fn with_outer_ctes(mut self, outer_ctes: Vec<(u64, OuterCte)>) -> Self {
+        self.outer_ctes = outer_ctes;
+        self
+    }
+
+    /// The DataFusion plan of the recursive term, which every iteration
+    /// lowers.
+    pub(crate) fn recursive_plan(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.recursive_plan
     }
 
     /// The name of the CTE.
@@ -286,17 +308,21 @@ impl PhysicalRecursiveCte {
     /// [`Iterations`]), reset (see `reset_plan_states`) and lowered for the
     /// session of `task_ctx`. Its scans of the working table read the working
     /// table of the CTE, wherever they are: natively, or in the plans that
-    /// DataFusion executes (see [`PipelineWorkTableExec`]).
+    /// DataFusion executes (see [`PipelineWorkTableExec`]). Its scans of the
+    /// materialized CTEs around the query read their rows, `cte_rows`.
     fn lower_recursive_term(
         plan: &Arc<dyn ExecutionPlan>,
         task_ctx: &TaskContext,
+        cte_rows: &HashMap<u64, Arc<Vec<RecordBatch>>>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         let plan = reset_plan_states(Arc::clone(plan))?;
         let options = task_ctx.session_config().options();
-        lower_execution_plan_with_runtime(
+        lower_execution_plan_with_cte_rows(
             &plan,
             options.as_ref(),
             task_ctx.runtime_env().as_ref(),
+            cte_rows,
+            false,
         )
     }
 
@@ -330,8 +356,15 @@ impl PhysicalRecursiveCte {
         );
         let (collector, metrics) = (Arc::clone(&state.collector), ctx.metrics(self));
         let num_threads = state.num_threads;
+        // The rows of the materialized CTEs around the query, which the
+        // execution of the query computed before it started.
+        let cte_rows = self
+            .outer_ctes
+            .iter()
+            .map(|(id, cte)| Ok((*id, cte.rows(ctx)?)))
+            .collect::<Result<HashMap<_, _>>>()?;
         let executor = move || {
-            let term = Self::lower_recursive_term(&plan, &task_ctx)?;
+            let term = Self::lower_recursive_term(&plan, &task_ctx, &cte_rows)?;
             let sink: Arc<dyn PhysicalOperator> =
                 Arc::new(RecursiveTermSink::try_new(term, collector, metrics)?);
             Executor::try_new(sink, task_ctx, num_threads)
@@ -2197,6 +2230,7 @@ mod tests {
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operators::union::test_support::count;
     use crate::planner::lower_execution_plan;
+    use crate::sources::LazyMemorySource;
     use crate::test_utils::{
         EngineOutput, compare_outputs, datafusion_context, pipeline_context, run_sql,
         test_session_config,
@@ -2681,23 +2715,23 @@ mod tests {
 
     /// The recursive queries of `cte_materialized.slt` (whose results do not
     /// depend on the values of `random()`), and whether the recursion is
-    /// native: DataFusion executes the `MaterializedCteExec`s (which the
-    /// planner does not lower yet) with their whole subtrees, so the
-    /// recursions in their bodies and continuations are only compared.
+    /// native: the planner lowers the `MaterializedCteExec`s, and every
+    /// iteration of a recursive term that scans a CTE around the query reads
+    /// the rows of its body, which the query computed once.
     const CTE_MATERIALIZED_SLT_QUERIES: &[(&str, bool)] = &[
         // a recursive CTE that is also materialized
         (
             "WITH RECURSIVE r AS MATERIALIZED ( \
                SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) \
              SELECT count(*) FROM r a, r b",
-            false,
+            true,
         ),
         // a recursive CTE that reads a materialized CTE of the same block
         (
             "WITH RECURSIVE m AS MATERIALIZED (SELECT 3 AS lim), \
                r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r, m WHERE n < m.lim) \
              SELECT n FROM r",
-            false,
+            true,
         ),
         // a volatile CTE declared outside the recursive CTE, read by its
         // recursive term: evaluated once if materialized, else in every
@@ -2707,7 +2741,7 @@ mod tests {
                r AS (SELECT 1 AS n, x FROM m \
                  UNION ALL SELECT n + 1, m.x FROM r, m WHERE n < 4) \
              SELECT count(DISTINCT x) FROM r",
-            false,
+            true,
         ),
         (
             "WITH RECURSIVE m AS NOT MATERIALIZED (SELECT random() AS x), \
@@ -2808,7 +2842,7 @@ mod tests {
             "WITH RECURSIVE r AS MATERIALIZED ( \
                SELECT random() AS x, 1 AS n UNION ALL SELECT x, n + 1 FROM r WHERE n < 3) \
              SELECT count(DISTINCT x) FROM (SELECT x FROM r UNION ALL SELECT x FROM r)",
-            false,
+            true,
         ),
         (
             "WITH RECURSIVE r AS NOT MATERIALIZED ( \
@@ -3449,9 +3483,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_iteration_runs_a_fresh_copy_of_the_recursive_term() {
-        // The generator of a `generate_series` (which DataFusion executes)
-        // produces its rows once: the second iteration would join with none
-        // of them if it ran the plan of the first one again.
+        // The generator of a `generate_series` (which a `LazyMemorySource`
+        // reads) produces its rows once: the second iteration would join with
+        // none of them if it ran the plan of the first one again.
         for sql in [
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + g.value FROM t \
              CROSS JOIN generate_series(1, 2) g WHERE n < 6) SELECT * FROM t",
@@ -3462,7 +3496,8 @@ mod tests {
             let root =
                 assert_native_recursion(sql, test_session_config(), async |_| Ok(()))
                     .await;
-            assert!(!bridged_plans(&root).is_empty(), "{sql}");
+            assert!(bridged_plans(&root).is_empty(), "{sql}");
+            assert!(count::<LazyMemorySource>(&root) > 0, "{sql}");
         }
     }
 

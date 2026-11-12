@@ -77,15 +77,26 @@ use crate::operator::{
     SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
 
+pub(crate) mod batches;
 pub mod csv;
 pub mod empty;
+pub mod explain;
+pub mod file;
+pub mod lazy_memory;
 pub mod memory;
+pub mod memory_dml;
 pub mod parquet;
+pub mod streaming;
 
 pub use csv::CsvScanSource;
 pub use empty::EmptyScanSource;
+pub use explain::ExplainSource;
+pub use file::FileScanSource;
+pub use lazy_memory::LazyMemorySource;
 pub use memory::MemoryScanSource;
+pub use memory_dml::MemoryDmlSource;
 pub use parquet::ParquetScanSource;
+pub use streaming::StreamingTableSource;
 
 /// Convert a DataFusion scan into a native pipeline source.
 ///
