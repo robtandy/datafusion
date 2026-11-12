@@ -2197,6 +2197,7 @@ mod tests {
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operators::union::test_support::count;
     use crate::planner::lower_execution_plan;
+    use crate::sources::LazyMemorySource;
     use crate::test_utils::{
         EngineOutput, compare_outputs, datafusion_context, pipeline_context, run_sql,
         test_session_config,
@@ -3449,9 +3450,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_iteration_runs_a_fresh_copy_of_the_recursive_term() {
-        // The generator of a `generate_series` (which DataFusion executes)
-        // produces its rows once: the second iteration would join with none
-        // of them if it ran the plan of the first one again.
+        // The generator of a `generate_series` (which a `LazyMemorySource`
+        // reads) produces its rows once: the second iteration would join with
+        // none of them if it ran the plan of the first one again.
         for sql in [
             "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n + g.value FROM t \
              CROSS JOIN generate_series(1, 2) g WHERE n < 6) SELECT * FROM t",
@@ -3462,7 +3463,8 @@ mod tests {
             let root =
                 assert_native_recursion(sql, test_session_config(), async |_| Ok(()))
                     .await;
-            assert!(!bridged_plans(&root).is_empty(), "{sql}");
+            assert!(bridged_plans(&root).is_empty(), "{sql}");
+            assert!(count::<LazyMemorySource>(&root) > 0, "{sql}");
         }
     }
 

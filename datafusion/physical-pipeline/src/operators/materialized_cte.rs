@@ -18,6 +18,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_plan::materialized_cte::{
     MaterializedCteExec, MaterializedCteScanExec,
 };
+use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::{ExecutionPlan, displayable};
 use parking_lot::Mutex;
@@ -125,6 +126,23 @@ fn scanned_ctes(plan: &Arc<dyn ExecutionPlan>) -> Result<HashSet<u64>> {
     Ok(ids)
 }
 
+/// Whether the recursive term of a recursive query in `plan` scans the
+/// materialized CTE `id`.
+fn scanned_by_recursive_terms(plan: &Arc<dyn ExecutionPlan>, id: u64) -> Result<bool> {
+    let mut scanned = false;
+    plan.apply(|node| {
+        if let Some(query) = node.downcast_ref::<RecursiveQueryExec>() {
+            scanned |= scanned_ctes(query.recursive_term())?.contains(&id);
+        }
+        Ok(if scanned {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(scanned)
+}
+
 /// Computes the body of a materialized CTE once, and then runs the rest of
 /// the query (the continuation), whose scans of the CTE
 /// ([`MaterializedCteScan`]s) read the rows of the body, as
@@ -157,7 +175,12 @@ impl PhysicalMaterializedCte {
     ///
     /// A scan of the CTE that is left to DataFusion (e.g. below a
     /// user-defined node) runs the body itself: such a CTE is not lowered
-    /// (`Ok(None)`), so that DataFusion runs its body once. Returns `Ok(None)`
+    /// (`Ok(None)`), so that DataFusion runs its body once. So is a CTE that
+    /// the recursive term of a recursive query in its continuation scans:
+    /// every iteration of a native recursive query lowers its recursive term
+    /// again, apart from the CTEs around it (see
+    /// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte)),
+    /// and leaves the scans of these CTEs to DataFusion. Returns `Ok(None)`
     /// for any other node, without lowering anything.
     pub(crate) fn try_lower<B, C>(
         plan: &Arc<dyn ExecutionPlan>,
@@ -176,6 +199,9 @@ impl PhysicalMaterializedCte {
             return internal_err!("MaterializedCteExec has a body and a continuation");
         };
         let id = cte.buffer().id();
+        if scanned_by_recursive_terms(continuation, id)? {
+            return Ok(None);
+        }
         let body = Arc::new(MaterializedCteBody::new(lower_body(cte.body())?));
         let outer = ctes.bodies.borrow_mut().insert(id, Arc::clone(&body));
         let continuation = lower_continuation(continuation);

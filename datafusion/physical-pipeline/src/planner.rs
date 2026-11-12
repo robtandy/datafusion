@@ -8102,7 +8102,23 @@ mod tests {
     /// The output of `sql`, an `EXPLAIN`, with the pipeline engine: the plan of
     /// every plan type.
     async fn explain(sql: &str) -> Vec<(String, String)> {
-        let ctx = pipeline_context(test_session_config());
+        explain_with(sql, test_session_config()).await
+    }
+
+    /// The configuration of the tests, in which equi-joins are sort-merge
+    /// joins, which have no native operator yet
+    /// ([#60](https://github.com/robtandy/datafusion/issues/60)): the
+    /// pipeline engine leaves them to DataFusion.
+    fn with_sort_merge_joins() -> SessionConfig {
+        let mut config = test_session_config();
+        config.options_mut().optimizer.prefer_hash_join = false;
+        config
+    }
+
+    /// The plans of the `EXPLAIN` `sql`, run in a session of the pipeline
+    /// engine configured with `config`.
+    async fn explain_with(sql: &str, config: SessionConfig) -> Vec<(String, String)> {
+        let ctx = pipeline_context(config);
         register_view_tables(&ctx).unwrap();
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         batches
@@ -8178,23 +8194,20 @@ mod tests {
             "{plan}"
         );
 
-        // A bridged plan is shown below its bridge: a `generate_series`, which
+        // A bridged plan is shown below its bridge: a sort-merge join, which
         // has no native operator yet.
-        let explained =
-            explain("EXPLAIN SELECT value * 2 AS m FROM generate_series(1, 3)").await;
+        let explained = explain_with(
+            "EXPLAIN SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.id = t2.k",
+            with_sort_merge_joins(),
+        )
+        .await;
         let plan = plan_of(&explained, "physical_plan");
         assert!(
             plan.starts_with("PipelineRootExec: pipelines=1, bridged_plans=1\n"),
             "{plan}"
         );
-        assert!(
-            plan.contains("\n    BridgeOperator, pipelines=[0]\n      RepartitionExec: "),
-            "{plan}"
-        );
-        assert!(
-            plan.contains("\n        LazyMemoryExec: partitions=1, batch_generators="),
-            "{plan}"
-        );
+        assert!(plan.contains("BridgeOperator, pipelines=[0]\n"), "{plan}");
+        assert!(plan.contains("SortMergeJoinExec: "), "{plan}");
 
         // `EXPLAIN VERBOSE` also shows the plans of DataFusion that the plan
         // of the pipeline engine was lowered from.
@@ -8232,15 +8245,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_selects_the_metrics_of_every_operator() {
-        // A native sort of a bridged plan (a `generate_series`, which has no
+        // A native sort of a bridged plan (a sort-merge join, which has no
         // native operator yet), whose nodes have metrics too.
-        let query =
-            "SELECT value FROM generate_series(1, 3) WHERE value > 1 ORDER BY value DESC";
+        let query = "SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.id = t2.k \
+                     WHERE t1.id > 1 ORDER BY t2.w DESC";
         let analyzed = async |options: &str| {
-            let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
+            let sql = format!("EXPLAIN ({options}) {query}");
+            let explained = explain_with(&sql, with_sort_merge_joins()).await;
             let plan = plan_of(&explained, "Plan with Metrics").to_string();
             assert!(plan.contains("PhysicalSort"), "{plan}");
-            assert!(plan.contains("LazyMemoryExec"), "{plan}");
+            assert!(plan.contains("SortMergeJoinExec"), "{plan}");
             plan
         };
         // Without metrics, of the native operators and of the bridged nodes.
@@ -8277,10 +8291,10 @@ mod tests {
         // operators and the nodes of the bridged plan.
         let sql =
             format!("EXPLAIN (ANALYZE, VERBOSE, METRICS 'rows', TIMING OFF) {query}");
-        let explained = explain(&sql).await;
+        let explained = explain_with(&sql, with_sort_merge_joins()).await;
         for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
             let plan = plan_of(&explained, rendering);
-            for node in ["PhysicalSort", "LazyMemoryExec"] {
+            for node in ["PhysicalSort", "SortMergeJoinExec"] {
                 let line = plan
                     .lines()
                     .find(|line| line.trim_start().starts_with(node))
