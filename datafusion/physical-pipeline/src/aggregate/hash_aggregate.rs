@@ -22,6 +22,7 @@ use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion_common::{Result, ScalarValue, config_err, internal_err};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::AggregateUDF;
 use datafusion_functions_aggregate::{
     approx_distinct, array_agg, average, bit_and_or_xor, bool_and_or, count, first_last,
@@ -45,6 +46,9 @@ use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
+};
+use crate::sort::{
+    KERNEL_SORT_BYTES_PER_ROW, ReservedMemory, buffered_memory, memory_size,
 };
 
 /// A hash aggregation: a pipeline breaker that consumes the rows of its input
@@ -522,27 +526,57 @@ pub(crate) fn rebuilt_literal(argument: &Arc<dyn PhysicalExpr>) -> Option<&Scala
 #[derive(Debug, Default)]
 pub(crate) struct InputBuffer {
     batches: Vec<RecordBatch>,
+    /// The memory of `batches` (see [`buffered_memory`]), which is reserved.
+    memory: usize,
 }
 
 impl InputBuffer {
-    pub(crate) fn push(&mut self, batch: RecordBatch) {
+    /// Buffer `batch`, reserving its memory in `reservation`.
+    pub(crate) fn push(
+        &mut self,
+        batch: RecordBatch,
+        reservation: &MemoryReservation,
+    ) -> Result<()> {
         if batch.num_rows() > 0 {
+            let memory = buffered_memory(&batch);
+            reservation.try_grow(memory)?;
+            self.memory += memory;
             self.batches.push(batch);
         }
+        Ok(())
     }
 
     /// Take the buffered rows (with schema `schema`), sorted by `order`, in
     /// batches of at most [`DEFAULT_VECTOR_SIZE`] rows.
+    ///
+    /// `working` takes over the memory of the buffered rows, and reserves what
+    /// sorting them allocates before it is allocated: their concatenation, the
+    /// sort keys and their order, and the sorted rows, which the returned
+    /// batches hold until they are dropped.
     pub(crate) fn take_sorted(
         &mut self,
         schema: &SchemaRef,
         order: &LexOrdering,
+        working: &mut ReservedMemory<'_>,
     ) -> Result<Vec<RecordBatch>> {
         let batches = std::mem::take(&mut self.batches);
+        working.adopt(std::mem::take(&mut self.memory));
         if batches.is_empty() {
             return Ok(vec![]);
         }
-        let num_rows = batches.iter().map(RecordBatch::num_rows).sum();
+        let num_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let rows = batches.iter().map(memory_size).sum::<usize>();
+        // The concatenation and the sorted copy of the rows, the sort keys
+        // (the keys of a single value as large as the value for every row, the
+        // other ones as large as the rows), and what sorting them allocates.
+        let keys = order
+            .iter()
+            .map(|sort| match sort.expr.downcast_ref::<Literal>() {
+                Some(literal) => literal.value().size().saturating_mul(num_rows),
+                None => 0,
+            })
+            .sum::<usize>();
+        working.try_grow(3 * rows + keys + num_rows * KERNEL_SORT_BYTES_PER_ROW)?;
         let columns = (0..schema.fields().len())
             .map(|i| {
                 let arrays = batches
@@ -1512,11 +1546,18 @@ impl PhysicalOperator for PhysicalHashAggregate {
     ) -> Result<Arc<dyn GlobalSinkState>> {
         // Whether the threads update the dynamic filter of the aggregation.
         let filters = filters_enabled(ctx);
+        let reservation =
+            MemoryConsumer::new(self.name()).register(ctx.task_ctx.memory_pool());
         if self.spec.is_ungrouped() {
             let batch_size = ctx.task_ctx.session_config().batch_size();
-            UngroupedAggregate::global_sink_state(&self.spec, filters, batch_size)
+            UngroupedAggregate::global_sink_state(
+                &self.spec,
+                filters,
+                batch_size,
+                reservation,
+            )
         } else {
-            RadixHashAggregate::global_sink_state(filters)
+            RadixHashAggregate::global_sink_state(filters, reservation)
         }
     }
 
@@ -1611,12 +1652,12 @@ impl PhysicalOperator for PhysicalHashAggregate {
     fn get_local_source_state(
         &self,
         _ctx: &ExecutionContext,
-        _gstate: &dyn GlobalSourceState,
+        gstate: &dyn GlobalSourceState,
     ) -> Result<Box<dyn LocalSourceState>> {
         if self.spec.is_ungrouped() {
             UngroupedAggregate::local_source_state()
         } else {
-            RadixHashAggregate::local_source_state()
+            RadixHashAggregate::local_source_state(gstate)
         }
     }
 

@@ -32,12 +32,19 @@
 //! bounds than those it knows updates them, and the filter, at most once per
 //! batch of rows, as the partitions of DataFusion's `AggregateStream` do after
 //! every batch.
+//!
+//! The memory of the accumulators (e.g. the values of an `ARRAY_AGG`) is
+//! reserved in the memory pool of the session as they grow, after every
+//! batch, as DataFusion's `AggregateStream` reserves it, and so are the
+//! buffered rows of an aggregation that sorts its input: the aggregation fails
+//! with `ResourcesExhausted` when the pool cannot hold them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::RecordBatch;
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::Accumulator;
 use datafusion_physical_plan::filter::batch_filter;
 use parking_lot::Mutex;
@@ -49,6 +56,7 @@ use crate::operator::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, SinkFinalize,
     SourceResult, downcast_state, downcast_state_mut,
 };
+use crate::sort::{ReservedMemory, buffered_memory, resize_share};
 
 /// The name of the operator, for error messages.
 const OPERATOR: &str = "PhysicalHashAggregate";
@@ -59,21 +67,34 @@ pub(crate) struct UngroupedAggregate;
 
 /// The global sink state: the accumulators the threads combine into, and
 /// the output row once finalized.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct UngroupedSinkState {
-    accumulators: Mutex<Option<Vec<Box<dyn Accumulator>>>>,
+    accumulators: Mutex<Combined>,
     output: Mutex<Option<RecordBatch>>,
     /// The bounds of the `MIN` and `MAX` aggregates of all threads, if the
     /// threads update the dynamic filter of the aggregation.
     bounds: Option<SharedBounds>,
+    /// The memory of the accumulators and the buffered rows of all threads,
+    /// of the accumulators they combine into, and of the output row.
+    reservation: MemoryReservation,
 }
 
 impl GlobalSinkState for UngroupedSinkState {}
+
+/// The accumulators that the threads combine into.
+#[derive(Debug, Default)]
+struct Combined {
+    accumulators: Option<Vec<Box<dyn Accumulator>>>,
+    /// The memory of `accumulators`, which is reserved.
+    memory: usize,
+}
 
 /// The thread-local sink state.
 #[derive(Debug)]
 struct UngroupedLocalState {
     accumulators: Vec<Box<dyn Accumulator>>,
+    /// The memory of `accumulators`, which is reserved.
+    memory: usize,
     /// The input rows, if they must be sorted before they are aggregated.
     buffer: InputBuffer,
     /// What the thread knows of the bounds of all threads, if the threads
@@ -85,6 +106,19 @@ struct UngroupedLocalState {
 impl LocalSinkState for UngroupedLocalState {}
 
 impl UngroupedLocalState {
+    /// Update the accumulators of the thread with the rows of `batch`, and
+    /// reserve the memory that they hold in `reservation`.
+    fn update(
+        &mut self,
+        spec: &AggregateSpec,
+        batch: &RecordBatch,
+        reservation: &MemoryReservation,
+    ) -> Result<()> {
+        update(spec, &mut self.accumulators, batch)?;
+        let memory = accumulators_memory(&self.accumulators);
+        resize_share(reservation, &mut self.memory, memory)
+    }
+
     /// Update the bounds of all threads and the dynamic filter of the
     /// aggregation `spec`, if its threads update it, with the bounds of the
     /// accumulators of the thread, which aggregated `rows` more rows (see
@@ -122,19 +156,23 @@ impl GlobalSourceState for UngroupedSourceState {
 impl UngroupedAggregate {
     /// The global sink state of an execution of `spec`, whose threads update
     /// its dynamic filter, if it has one, if `filters` (see
-    /// `filters_enabled`), at most once per `batch_size` rows.
+    /// `filters_enabled`), at most once per `batch_size` rows, and reserve
+    /// their memory in `reservation`.
     pub(crate) fn global_sink_state(
         spec: &AggregateSpec,
         filters: bool,
         batch_size: usize,
+        reservation: MemoryReservation,
     ) -> Result<Arc<dyn GlobalSinkState>> {
         let bounds = match (&spec.dynamic_filter, filters) {
             (Some(filter), true) => filter.shared_bounds(batch_size),
             _ => None,
         };
         Ok(Arc::new(UngroupedSinkState {
+            accumulators: Mutex::default(),
+            output: Mutex::default(),
             bounds,
-            ..UngroupedSinkState::default()
+            reservation,
         }))
     }
 
@@ -143,8 +181,16 @@ impl UngroupedAggregate {
         gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
+        let accumulators = update_accumulators(spec)?;
+        let mut memory = 0;
+        resize_share(
+            &global.reservation,
+            &mut memory,
+            accumulators_memory(&accumulators),
+        )?;
         Ok(Box::new(UngroupedLocalState {
-            accumulators: update_accumulators(spec)?,
+            accumulators,
+            memory,
             buffer: InputBuffer::default(),
             bounds: global.bounds.as_ref().map(SharedBounds::thread_bounds),
         }))
@@ -158,12 +204,11 @@ impl UngroupedAggregate {
     ) -> Result<()> {
         let local =
             downcast_state_mut::<UngroupedLocalState>(lstate.as_any_mut(), OPERATOR)?;
-        if spec.input_order.is_some() {
-            local.buffer.push(batch);
-            return Ok(());
-        }
-        update(spec, &mut local.accumulators, &batch)?;
         let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
+        if spec.input_order.is_some() {
+            return local.buffer.push(batch, &global.reservation);
+        }
+        local.update(spec, &batch, &global.reservation)?;
         local.update_bounds(spec, global, batch.num_rows(), false)
     }
 
@@ -176,25 +221,46 @@ impl UngroupedAggregate {
         let local =
             downcast_state_mut::<UngroupedLocalState>(lstate.as_any_mut(), OPERATOR)?;
         if let Some(order) = &spec.input_order {
-            for batch in local.buffer.take_sorted(&spec.input_schema, order)? {
-                update(spec, &mut local.accumulators, &batch)?;
+            // The buffered and the sorted rows, freed once they are aggregated.
+            let mut sorting = ReservedMemory::new(&global.reservation);
+            let sorted =
+                local
+                    .buffer
+                    .take_sorted(&spec.input_schema, order, &mut sorting)?;
+            for batch in sorted {
+                local.update(spec, &batch, &global.reservation)?;
             }
         }
         // The last bounds of the thread, for the threads that are still
         // aggregating.
         local.update_bounds(spec, global, 0, true)?;
-        let mut accumulators = global.accumulators.lock();
+        let mut combined = global.accumulators.lock();
+        let Combined {
+            accumulators,
+            memory,
+        } = &mut *combined;
         if accumulators.is_none() {
             if spec.single_stage {
+                // The accumulators of the thread, with their memory.
                 *accumulators = Some(std::mem::take(&mut local.accumulators));
+                *memory = std::mem::take(&mut local.memory);
                 return Ok(());
             }
-            *accumulators = Some(merge_accumulators(spec)?);
+            let merged = merge_accumulators(spec)?;
+            resize_share(&global.reservation, memory, accumulators_memory(&merged))?;
+            *accumulators = Some(merged);
         }
-        match accumulators.as_mut() {
-            Some(accumulators) => merge(accumulators, &mut local.accumulators),
-            None => internal_err!("{OPERATOR} has no accumulators to combine into"),
-        }
+        let Some(accumulators) = accumulators.as_mut() else {
+            return internal_err!("{OPERATOR} has no accumulators to combine into");
+        };
+        merge(accumulators, &mut local.accumulators)?;
+        resize_share(
+            &global.reservation,
+            memory,
+            accumulators_memory(accumulators),
+        )?;
+        // The accumulators of the thread are dropped with its state.
+        resize_share(&global.reservation, &mut local.memory, 0)
     }
 
     pub(crate) fn finalize(
@@ -202,7 +268,11 @@ impl UngroupedAggregate {
         gstate: &dyn GlobalSinkState,
     ) -> Result<SinkFinalize> {
         let global = downcast_state::<UngroupedSinkState>(gstate.as_any(), OPERATOR)?;
-        let mut accumulators = match global.accumulators.lock().take() {
+        let Combined {
+            accumulators,
+            mut memory,
+        } = std::mem::take(&mut *global.accumulators.lock());
+        let mut accumulators = match accumulators {
             Some(accumulators) => accumulators,
             None => merge_accumulators(spec)?,
         };
@@ -211,6 +281,9 @@ impl UngroupedAggregate {
             .map(|accumulator| accumulator.evaluate()?.to_array())
             .collect::<Result<Vec<_>>>()?;
         let output = RecordBatch::try_new(Arc::clone(&spec.schema), columns)?;
+        // The output row replaces the accumulators, which are dropped.
+        drop(accumulators);
+        resize_share(&global.reservation, &mut memory, buffered_memory(&output))?;
         *global.output.lock() = Some(output);
         Ok(SinkFinalize::Ready)
     }
@@ -276,6 +349,14 @@ fn update(
         accumulator.update_batch(&values)?;
     }
     Ok(())
+}
+
+/// The memory that `accumulators` hold.
+fn accumulators_memory(accumulators: &[Box<dyn Accumulator>]) -> usize {
+    accumulators
+        .iter()
+        .map(|accumulator| accumulator.size())
+        .sum()
 }
 
 /// Merge the states of the accumulators `local` into `global`.

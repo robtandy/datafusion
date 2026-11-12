@@ -920,12 +920,26 @@ impl<'a> ReservedMemory<'a> {
         Self { reservation, bytes }
     }
 
+    /// Take over `bytes` that are reserved in the reservation already (e.g.
+    /// the memory of the input of the computation, which it frees).
+    pub(crate) fn adopt(&mut self, bytes: usize) {
+        self.bytes += bytes;
+    }
+
     /// Reserve `bytes` more bytes. Fails with `ResourcesExhausted` if the
     /// memory pool cannot hold them.
     pub(crate) fn try_grow(&mut self, bytes: usize) -> Result<()> {
         self.reservation.try_grow(bytes)?;
         self.bytes += bytes;
         Ok(())
+    }
+
+    /// Free `bytes` of the memory of the computation (e.g. of what it
+    /// allocated and dropped already).
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.reservation.shrink(bytes);
+        self.bytes -= bytes;
     }
 
     /// End the computation, keeping `bytes` of its memory reserved (e.g. the
@@ -946,6 +960,24 @@ impl Drop for ReservedMemory<'_> {
     fn drop(&mut self) {
         self.reservation.shrink(self.bytes);
     }
+}
+
+/// Resize the share `reserved` of `reservation` (which may be shared by
+/// several threads, each of which tracks its share) to `bytes`: reserve the
+/// difference, which fails with `ResourcesExhausted` if the memory pool
+/// cannot hold it, or free it.
+pub(crate) fn resize_share(
+    reservation: &MemoryReservation,
+    reserved: &mut usize,
+    bytes: usize,
+) -> Result<()> {
+    if bytes > *reserved {
+        reservation.try_grow(bytes - *reserved)?;
+    } else {
+        reservation.shrink(*reserved - bytes);
+    }
+    *reserved = bytes;
+    Ok(())
 }
 
 /// `bytes` in the proportion `part / whole`, e.g. the memory of `part` of
