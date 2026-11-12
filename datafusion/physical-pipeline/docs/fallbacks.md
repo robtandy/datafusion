@@ -51,7 +51,7 @@ schedules its tasks cooperatively).
 | `NestedLoopJoinExec`                                       | `PhysicalNestedLoopJoin`                                                                                                                                                                                       |
 | `PartialSortExec`                                          | `PhysicalPartialSort` (with a fetch of several partitions, one for every partition, in a `PhysicalUnion`; of an input of several pipelines, a `PhysicalSort` or a `PhysicalTopK`, see [below](#partial-sorts)) |
 | `PartitionedTopKExec`                                      | `PhysicalPartitionedTopK` over a `PhysicalSort`                                                                                                                                                                |
-| `PiecewiseMergeJoinExec`                                   | `PhysicalNestedLoopJoin` (the join of its range predicate)                                                                                                                                                     |
+| `PiecewiseMergeJoinExec`                                   | `PhysicalRangeJoin` (the build rows sorted by their keys, which every probe row finds by a binary search)                                                                                                      |
 | `PlaceholderRowExec`                                       | `PhysicalPlaceholderRow`                                                                                                                                                                                       |
 | `ProjectionExec`                                           | `PhysicalProjection`                                                                                                                                                                                           |
 | `RecursiveQueryExec`, `WorkTableExec`                      | `PhysicalRecursiveCte`, `WorkTableScanSource` ([#61](https://github.com/robtandy/datafusion/issues/61))                                                                                                        |
@@ -59,7 +59,7 @@ schedules its tasks cooperatively).
 | `ScalarSubqueryExec`                                       | `PhysicalScalarSubquery`                                                                                                                                                                                       |
 | `SortExec`                                                 | `PhysicalSort`, or `PhysicalTopK` with a fetch                                                                                                                                                                 |
 | `SortMergeJoinExec`, `SymmetricHashJoinExec`               | not yet: native merge and symmetric joins are [#60](https://github.com/robtandy/datafusion/issues/60)                                                                                                          |
-| `SortPreservingMergeExec`                                  | `PhysicalSort` or `PhysicalTopK` of the merged partitions (a merge of sorted rows is their sort)                                                                                                               |
+| `SortPreservingMergeExec`                                  | `PhysicalSort` or `PhysicalTopK` of the merged partitions (a merge of sorted rows is their sort); of inputs that never end, `PhysicalStreamingMerge` of the native operators of every partition                |
 | `StreamingTableExec` (`information_schema`, `StreamTable`) | `StreamingTableSource`                                                                                                                                                                                         |
 | `UnionExec`, `InterleaveExec`                              | `PhysicalUnion`                                                                                                                                                                                                |
 | `UnnestExec`                                               | `PhysicalUnnest`                                                                                                                                                                                               |
@@ -122,12 +122,15 @@ conditions belong to the operators, and to the issues that own them (e.g.
 [#63](https://github.com/robtandy/datafusion/issues/63) for the memory
 accounting of all native operators):
 
-- windows, nested loop joins and cross joins (and the piecewise merge joins
-  that are nested loop joins) in sessions whose memory pool has a limit: they
-  do not reserve the memory of their rows yet;
-- sorts, merges of sorted partitions, windows and partitioned TopKs of inputs
-  that never end (their native operators read all of their input first), and
-  by keys that the native sort orders otherwise (unions);
+- windows, nested loop joins and cross joins in sessions whose memory pool has
+  a limit: they do not reserve the memory of their rows yet;
+- sorts, windows and partitioned TopKs of inputs that never end (their native
+  operators read all of their input first), and by keys that the native sort
+  orders otherwise (unions); and the merges of sorted partitions that never
+  end whose partitions the planner cannot split (see
+  [partial sorts](#partial-sorts)), or whose partitions scan a materialized
+  CTE around them (`PhysicalStreamingMerge` runs every partition in an
+  execution of its own);
 - aggregations by groups that their input clusters
   (`group_clustering_mode`), and the other aggregations that
   `PhysicalHashAggregate::try_lower` refuses;
@@ -187,6 +190,12 @@ runs out (they do not spill):
   sorts them; and `PhysicalDataSink` the rows that wait for its writer;
 - `MaterializedCteBody` reserves the rows of the body of a CTE until the
   execution ends;
+- `PhysicalRangeJoin` reserves the rows of its build input and their keys as
+  they arrive, and their concatenations and order before it allocates them,
+  and the build rows that it emits once it probed all rows;
+  `PhysicalStreamingMerge` reserves the batch of every input whose rows it
+  merges, and their keys; `MaterializedCteScan` reserves its list of the
+  batches of the body and of their chunks;
 - `PhysicalPartitionedTopK` holds no rows (the `PhysicalSort` below it does,
   which, like the other native sorts, does not reserve its memory yet), but
   reserves the keys of the last row it ranked, and, before it allocates them,
