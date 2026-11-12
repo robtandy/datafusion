@@ -43,7 +43,9 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut, operator_key,
 };
-use crate::operators::topk_of_partitions::PhysicalTopKOfPartitions;
+use crate::operators::topk_of_partitions::{
+    PhysicalPartialSortOfPartitions, PhysicalTopKOfPartitions,
+};
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::PipelineGraph;
 use crate::sort::{PhysicalSort, PhysicalTopK};
@@ -151,9 +153,40 @@ impl PhysicalPartialSort {
             )
             && let Some(fetch) = sort.fetch().filter(|&fetch| fetch > 0)
         {
+            let input = lower_input(repartition.input())?;
+            let partitioning = repartition.partitioning().clone();
+            // The rows that the repartitioning of a single partition routes
+            // to a partition keep their order, sorted by the prefix: every
+            // partition is sorted as they arrive, in a single pipeline.
+            if repartition.input().output_partitioning().partition_count() <= 1 {
+                let sort: Arc<dyn PhysicalOperator> =
+                    Arc::new(PhysicalPartialSortOfPartitions::try_new(
+                        Arc::clone(&input),
+                        partitioning.clone(),
+                        sort.expr().clone(),
+                        sort.common_prefix_length(),
+                        fetch,
+                    )?);
+                if pipelines_of(&sort).is_ok_and(|pipelines| pipelines == 1) {
+                    return Ok(Some(sort));
+                }
+            }
+            // The rows of a repartitioning of several partitions arrive in
+            // no order: every partition keeps its first rows by a TopK,
+            // once the input ended. An input that never ends is sorted as
+            // a single partition (the partitions of the pipeline engine).
+            if repartition.input().boundedness().is_unbounded() {
+                return Self::sort_of(
+                    input,
+                    sort.expr().clone(),
+                    sort.common_prefix_length(),
+                    sort.fetch(),
+                )
+                .map(Some);
+            }
             let topk = PhysicalTopKOfPartitions::try_new(
-                lower_input(repartition.input())?,
-                repartition.partitioning().clone(),
+                input,
+                partitioning,
                 sort.expr().clone(),
                 fetch,
             )?;
@@ -209,7 +242,10 @@ impl PhysicalPartialSort {
     }
 
     /// The ranges of the rows of `batch` with the same prefix, in order.
-    fn prefix_ranges(&self, batch: &RecordBatch) -> Result<Vec<std::ops::Range<usize>>> {
+    pub(crate) fn prefix_ranges(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<Vec<std::ops::Range<usize>>> {
         let keys = self.expr[..self.common_prefix_length]
             .iter()
             .map(|expr| expr.evaluate_to_sort_column(batch))
@@ -219,7 +255,11 @@ impl PhysicalPartialSort {
 
     /// Whether the first row of `next` has the prefix of the last row of
     /// `previous`.
-    fn same_prefix(&self, previous: &RecordBatch, next: &RecordBatch) -> Result<bool> {
+    pub(crate) fn same_prefix(
+        &self,
+        previous: &RecordBatch,
+        next: &RecordBatch,
+    ) -> Result<bool> {
         let last = previous.slice(previous.num_rows() - 1, 1);
         let first = next.slice(0, 1);
         for expr in &self.expr[..self.common_prefix_length] {
@@ -240,7 +280,7 @@ impl PhysicalPartialSort {
     /// The memory that sorting `rows` (see [`Self::sort`]) holds and
     /// allocates at most: the rows, their concatenation, their sort keys and
     /// sort indices, and the sorted rows.
-    fn sort_memory(&self, rows: &[RecordBatch]) -> usize {
+    pub(crate) fn sort_memory(&self, rows: &[RecordBatch]) -> usize {
         let memory = rows
             .iter()
             .map(RecordBatch::get_array_memory_size)
@@ -251,7 +291,11 @@ impl PhysicalPartialSort {
 
     /// `rows` (of complete groups), sorted by all keys, at most `limit` of
     /// them.
-    fn sort(&self, rows: &[RecordBatch], limit: Option<usize>) -> Result<RecordBatch> {
+    pub(crate) fn sort(
+        &self,
+        rows: &[RecordBatch],
+        limit: Option<usize>,
+    ) -> Result<RecordBatch> {
         let schema = self.children[0].schema();
         let batch = concat_batches(&schema, rows)?;
         let keys = self
@@ -427,7 +471,7 @@ fn memory_partitions(
 
 /// The number of pipelines that contain `operator` in the pipelines of the
 /// operator tree of which it is the root.
-fn pipelines_of(operator: &Arc<dyn PhysicalOperator>) -> Result<usize> {
+pub(crate) fn pipelines_of(operator: &Arc<dyn PhysicalOperator>) -> Result<usize> {
     let sink = Arc::new(PlaceholderSink {
         children: vec![Arc::clone(operator)],
     });

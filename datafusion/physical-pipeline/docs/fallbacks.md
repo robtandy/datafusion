@@ -158,10 +158,17 @@ receives them, in a single pipeline:
   `LocalLimitExec`s, sorts, aggregations and windows of every partition, and
   the nodes that only change the size of batches).
 - The partitions of a hash or range `RepartitionExec` below such a partial
-  sort are the rows that an execution of its input routes to them: a
-  `PhysicalTopKOfPartitions` of its input routes every row once, with
-  DataFusion's `BatchPartitioner` (also by volatile keys), and keeps the
-  first rows of every partition.
+  sort are the rows that an execution of its input routes to them, once,
+  with DataFusion's `BatchPartitioner` (also by volatile keys). Of an input
+  of a single partition, the rows of every partition keep their order: a
+  `PhysicalPartialSortOfPartitions` sorts every partition as its rows arrive
+  (it streams, also over inputs that never end, and ends once every
+  partition emitted its rows). Of an input of several partitions, whose rows
+  arrive in no order, a `PhysicalTopKOfPartitions` keeps the first rows of
+  every partition once its input ended (an input that never ends is sorted
+  as a single partition). A merge of these partial sorts (which emit at most
+  their fetch of every partition) is the native sort of their rows, also
+  over inputs that never end.
 - The partitions of other inputs (e.g. of a round robin repartitioning, whose
   partitions depend on the batches in which DataFusion reads its rows, or of
   a join) are not kept apart: the partial sort keeps the first rows of all of
@@ -205,7 +212,9 @@ runs out (they do not spill):
   and the build rows that it emits once it probed all rows;
   `PhysicalStreamingMerge` reserves the batch of every input whose rows it
   merges, and their keys; `PhysicalTopKOfPartitions` the rows that every
-  partition holds, and what sorting them allocates, before it sorts them; `MaterializedCteScan` reserves its list of the
+  partition holds, and what sorting them allocates, before it sorts them,
+  and `PhysicalPartialSortOfPartitions` the groups that it buffers and the
+  sorted rows that it did not emit yet; `MaterializedCteScan` reserves its list of the
   batches of the body and of their chunks;
 - `PhysicalPartitionedTopK` holds no rows (the `PhysicalSort` below it does,
   which, like the other native sorts, does not reserve its memory yet), but

@@ -1239,11 +1239,34 @@ impl Lowering<'_> {
         {
             input = repartition.input();
         }
-        let Some(partitions) = partitions_of(input)? else {
-            return Ok(None);
-        };
         // A merge with a fetch stops once it has its rows.
         let early_stop = self.early_stop.get() || merge.fetch().is_some();
+        let Some(partitions) = partitions_of(input)? else {
+            // The partial sorts with a fetch of partitions that the planner
+            // does not split (e.g. of a repartitioning, see
+            // `PhysicalPartialSort::try_lower`) emit at most their fetch of
+            // every partition, and then end: the native sort of their rows
+            // merges them.
+            if let Some(sort) = input.downcast_ref::<datafusion_physical_plan::sorts::partial_sort::PartialSortExec>()
+                && sort.fetch().is_some()
+            {
+                let input = self.lower_in(input, early_stop)?;
+                let sorted: Arc<dyn PhysicalOperator> = match merge.fetch() {
+                    Some(fetch) if fetch > 0 => Arc::new(PhysicalTopK::try_new(
+                        input,
+                        merge.expr().clone(),
+                        fetch,
+                    )?),
+                    fetch => Arc::new(PhysicalSort::try_new(
+                        input,
+                        merge.expr().clone(),
+                        fetch,
+                    )?),
+                };
+                return Ok(Some(sorted));
+            }
+            return Ok(None);
+        };
         let mut inputs = partitions
             .iter()
             .map(|partition| self.lower_in(partition, early_stop))

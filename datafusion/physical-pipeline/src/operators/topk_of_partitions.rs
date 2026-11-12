@@ -6,6 +6,7 @@
 //! or range repartitioning (a `PartialSortExec` with a fetch of the
 //! partitions of a `RepartitionExec`).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,10 +22,12 @@ use parking_lot::Mutex;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
-    ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
-    LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
+    ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
+    LocalSinkState, LocalSourceState, OperatorFinalizeResult, OperatorResult,
+    OperatorState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
     downcast_state, downcast_state_mut,
 };
+use crate::operators::partial_sort::PhysicalPartialSort;
 use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// Keeps the first `fetch` rows by `expr` of every partition of the hash or
@@ -332,6 +335,313 @@ impl PhysicalOperator for PhysicalTopKOfPartitions {
     }
 }
 
+/// Sorts the rows of every partition of the hash or range repartitioning
+/// `partitioning` of its input, a single partition sorted by the first
+/// `common_prefix_length` keys of `expr`, keeping the first `fetch` rows of
+/// every partition, as a `PartialSortExec` with a fetch does of every
+/// partition of a `RepartitionExec` of a single partition: the rows that the
+/// repartitioning routes to a partition keep their order, sorted by the
+/// prefix.
+///
+/// It streams, also over inputs that never end: it routes the rows of every
+/// chunk once (with DataFusion's `BatchPartitioner`), buffers the rows of
+/// the last group of every partition (with the same prefix) until a row of
+/// another prefix arrives, and emits the rows of the groups that are
+/// complete, sorted (see [`PhysicalPartialSort`]), until every partition
+/// emitted its first `fetch` rows. It is not parallel: a single thread sees
+/// the chunks of its input in their order. The rows that it buffers and has
+/// not emitted yet, and what sorting a group allocates, are reserved in the
+/// memory pool of the session.
+#[derive(Debug)]
+pub struct PhysicalPartialSortOfPartitions {
+    /// The sort of the rows of a partition, over the input.
+    sort: PhysicalPartialSort,
+    partitioning: Partitioning,
+    fetch: usize,
+}
+
+impl PhysicalPartialSortOfPartitions {
+    /// Sort the rows of every partition of `partitioning` of `input`, sorted
+    /// by the first `common_prefix_length` keys of `expr`, by `expr`,
+    /// keeping their first `fetch` rows.
+    pub fn try_new(
+        input: Arc<dyn PhysicalOperator>,
+        partitioning: Partitioning,
+        expr: LexOrdering,
+        common_prefix_length: usize,
+        fetch: usize,
+    ) -> Result<Self> {
+        if !matches!(
+            partitioning,
+            Partitioning::Hash(..) | Partitioning::Range(_)
+        ) {
+            return internal_err!(
+                "PhysicalPartialSortOfPartitions sorts the rows of a hash or range repartitioning, got {partitioning}"
+            );
+        }
+        Ok(Self {
+            sort: PhysicalPartialSort::try_new(input, expr, common_prefix_length, None)?,
+            partitioning,
+            fetch,
+        })
+    }
+
+    /// Add `rows`, routed to `partition`, to its last group: the groups that
+    /// they complete are sorted, cut to the rows that the partition may
+    /// still emit, and queued in `state`.
+    fn add(
+        &self,
+        state: &mut SortState,
+        partition: usize,
+        rows: RecordBatch,
+    ) -> Result<()> {
+        let fetch = self.fetch;
+        let Some(group) = state.partitions.get_mut(partition) else {
+            return internal_err!("{} routed rows to partition {partition}", self.name());
+        };
+        if group.emitted == fetch {
+            return Ok(());
+        }
+        let ranges = self.sort.prefix_ranges(&rows)?;
+        let Some(last) = ranges.last().cloned() else {
+            return Ok(());
+        };
+        let continues = match group.rows.last() {
+            Some(previous) => self.sort.same_prefix(previous, &rows)?,
+            None => true,
+        };
+        if ranges.len() == 1 && continues {
+            group.memory += batch_memory(&rows);
+            group.rows.push(rows);
+            return Ok(());
+        }
+        // The groups before the last group of the chunk are complete.
+        let mut complete = std::mem::take(&mut group.rows);
+        if last.start > 0 {
+            complete.push(rows.slice(0, last.start));
+        }
+        let rest = rows.slice(last.start, last.len());
+        let held = std::mem::replace(&mut group.memory, batch_memory(&rest));
+        group.rows.push(rest);
+        let limit = fetch - group.emitted;
+        state
+            .reservation
+            .try_grow(self.sort.sort_memory(&complete))?;
+        let sorted = self.sort.sort(&complete, Some(limit))?;
+        let sorted_memory = self.sort.sort_memory(&complete) + held;
+        state
+            .reservation
+            .shrink(sorted_memory.min(state.reservation.size()));
+        let group = &mut state.partitions[partition];
+        group.emitted += sorted.num_rows();
+        if group.emitted == fetch {
+            group.memory = 0;
+            group.rows.clear();
+        }
+        state.queue(sorted)
+    }
+
+    /// Emit the next chunk of the queued rows into `output`. Returns whether
+    /// queued rows are left.
+    fn emit(state: &mut SortState, output: &mut DataChunk) -> bool {
+        let Some(front) = state.output.front_mut() else {
+            return false;
+        };
+        let len = front.num_rows().min(DEFAULT_VECTOR_SIZE);
+        *output = DataChunk::from_record_batch(front.slice(0, len));
+        if len == front.num_rows() {
+            let emitted = state
+                .output
+                .pop_front()
+                .map_or(0, |batch| batch_memory(&batch));
+            state
+                .reservation
+                .shrink(emitted.min(state.reservation.size()));
+        } else {
+            *front = front.slice(len, front.num_rows() - len);
+        }
+        !state.output.is_empty()
+    }
+}
+
+/// The last group of a partition of a [`PhysicalPartialSortOfPartitions`],
+/// and the number of rows that the partition emitted.
+#[derive(Default)]
+struct PartitionGroup {
+    rows: Vec<RecordBatch>,
+    memory: usize,
+    emitted: usize,
+}
+
+/// The state of the thread of a [`PhysicalPartialSortOfPartitions`].
+struct SortState {
+    partitioner: BatchPartitioner,
+    partitions: Vec<PartitionGroup>,
+    /// The sorted rows of complete groups that are not emitted yet.
+    output: VecDeque<RecordBatch>,
+    /// Whether the chunk that the operator is called with was consumed.
+    consumed: bool,
+    reservation: MemoryReservation,
+}
+
+impl OperatorState for SortState {}
+
+impl SortState {
+    /// Queue `sorted`, reserving its memory.
+    fn queue(&mut self, sorted: RecordBatch) -> Result<()> {
+        if sorted.num_rows() > 0 {
+            self.reservation.try_grow(batch_memory(&sorted))?;
+            self.output.push_back(sorted);
+        }
+        Ok(())
+    }
+
+    /// Whether every partition emitted its rows.
+    fn done(&self, fetch: usize) -> bool {
+        self.output.is_empty()
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.emitted == fetch)
+    }
+}
+
+impl PhysicalOperator for PhysicalPartialSortOfPartitions {
+    fn name(&self) -> &str {
+        "PhysicalPartialSortOfPartitions"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.sort.schema()
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        self.sort.children()
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "PhysicalPartialSortOfPartitions: partitioning={}, {}, fetch={}",
+            self.partitioning,
+            self.sort.description(),
+            self.fetch
+        )
+    }
+
+    fn parallel_operator(&self) -> bool {
+        false
+    }
+
+    fn get_operator_state(
+        &self,
+        ctx: &ExecutionContext,
+        _gstate: &dyn GlobalOperatorState,
+    ) -> Result<Box<dyn OperatorState>> {
+        let reservation = MemoryConsumer::new("PhysicalPartialSortOfPartitions")
+            .register(ctx.task_ctx.memory_pool());
+        Ok(Box::new(SortState {
+            partitioner: BatchPartitioner::try_new(
+                self.partitioning.clone(),
+                Time::new(),
+                0,
+                1,
+            )?,
+            partitions: (0..self.partitioning.partition_count())
+                .map(|_| PartitionGroup::default())
+                .collect(),
+            output: VecDeque::new(),
+            consumed: false,
+            reservation,
+        }))
+    }
+
+    fn execute(
+        &self,
+        _ctx: &ExecutionContext,
+        input: &DataChunk,
+        output: &mut DataChunk,
+        _gstate: &dyn GlobalOperatorState,
+        lstate: &mut dyn OperatorState,
+    ) -> Result<OperatorResult> {
+        let state = downcast_state_mut::<SortState>(lstate.as_any_mut(), self.name())?;
+        if !state.consumed {
+            state.consumed = true;
+            // The rows of the chunk, and their partitions, as large as the
+            // chunk at most, which the partitions hold.
+            state.reservation.try_grow(2 * chunk_memory(input))?;
+            let batch = input.compact()?;
+            let mut routed = vec![];
+            for part in state.partitioner.partition_iter(batch)? {
+                let (partition, rows) = part?;
+                if rows.num_rows() > 0 {
+                    routed.push((partition, rows));
+                }
+            }
+            state.reservation.shrink(2 * chunk_memory(input));
+            let held = routed
+                .iter()
+                .map(|(_, rows)| batch_memory(rows))
+                .sum::<usize>();
+            state.reservation.try_grow(held)?;
+            for (partition, rows) in routed {
+                self.add(state, partition, rows)?;
+            }
+            // The memory of the groups, and of the queued rows.
+            let memory = state
+                .partitions
+                .iter()
+                .map(|group| group.memory)
+                .sum::<usize>()
+                + state.output.iter().map(batch_memory).sum::<usize>();
+            state.reservation.try_resize(memory)?;
+        }
+        if Self::emit(state, output) {
+            return Ok(OperatorResult::HaveMoreOutput);
+        }
+        state.consumed = false;
+        if state.done(self.fetch) {
+            return Ok(OperatorResult::Finished);
+        }
+        Ok(OperatorResult::NeedMoreInput)
+    }
+
+    fn requires_final_execute(&self) -> bool {
+        true
+    }
+
+    fn final_execute(
+        &self,
+        _ctx: &ExecutionContext,
+        output: &mut DataChunk,
+        _gstate: &dyn GlobalOperatorState,
+        lstate: &mut dyn OperatorState,
+    ) -> Result<OperatorFinalizeResult> {
+        let state = downcast_state_mut::<SortState>(lstate.as_any_mut(), self.name())?;
+        // The last groups are complete once the input ends.
+        for partition in 0..state.partitions.len() {
+            let group = &mut state.partitions[partition];
+            if group.rows.is_empty() || group.emitted == self.fetch {
+                continue;
+            }
+            let rows = std::mem::take(&mut group.rows);
+            let held = std::mem::take(&mut group.memory);
+            let limit = self.fetch - group.emitted;
+            state.reservation.try_grow(self.sort.sort_memory(&rows))?;
+            let sorted = self.sort.sort(&rows, Some(limit))?;
+            state.reservation.shrink(
+                (self.sort.sort_memory(&rows) + held).min(state.reservation.size()),
+            );
+            state.partitions[partition].emitted += sorted.num_rows();
+            state.queue(sorted)?;
+        }
+        if Self::emit(state, output) {
+            return Ok(OperatorFinalizeResult::HaveMoreOutput);
+        }
+        state.reservation.free();
+        Ok(OperatorFinalizeResult::Finished)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +712,133 @@ mod tests {
             assert_eq!(count::<PhysicalTopKOfPartitions>(&root), 1, "{fetch}");
         }
         Ok(())
+    }
+
+    /// A partition of batches of `(a, b)` rows, that never ends if
+    /// `endless`.
+    #[derive(Debug)]
+    struct Pairs(Vec<RecordBatch>, bool);
+
+    fn pairs_schema() -> SchemaRef {
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("b", arrow::datatypes::DataType::Int64, false),
+        ]))
+    }
+
+    impl datafusion_physical_plan::streaming::PartitionStream for Pairs {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: std::sync::LazyLock<SchemaRef> =
+                std::sync::LazyLock::new(pairs_schema);
+            &SCHEMA
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<datafusion_execution::TaskContext>,
+        ) -> datafusion_execution::SendableRecordBatchStream {
+            use futures::StreamExt;
+            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok));
+            let batches = match self.1 {
+                true => batches.chain(futures::stream::pending()).boxed(),
+                false => batches.boxed(),
+            };
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    pairs_schema(),
+                    batches,
+                ),
+            )
+        }
+    }
+
+    /// The partial sort by `a` (the prefix) and `b`, with a fetch of
+    /// `fetch`, of the three partitions of a hash repartitioning by `b` of a
+    /// stream (that never ends if `endless`) of the rows `a = v / 10` (sorted)
+    /// and `b = v * 7 % 10` of the values `v` below 1000, merged (with a
+    /// fetch of `merge_fetch`) if `merged`.
+    fn partial_sort_of_a_stream(
+        fetch: usize,
+        endless: bool,
+        merged: bool,
+        merge_fetch: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = pairs_schema();
+        let batches = (0..1000)
+            .collect::<Vec<i64>>()
+            .chunks(7)
+            .map(|values| {
+                let a = values.iter().map(|v| v / 10).collect::<Vec<_>>();
+                let b = values.iter().map(|v| v * 7 % 10).collect::<Vec<_>>();
+                RecordBatch::try_new(
+                    pairs_schema(),
+                    vec![
+                        Arc::new(arrow::array::Int64Array::from(a)),
+                        Arc::new(arrow::array::Int64Array::from(b)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+        let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+        let stream = datafusion_physical_plan::streaming::StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Pairs(batches, endless))],
+            None,
+            [LexOrdering::new(vec![a.clone()]).unwrap()],
+            endless,
+            None,
+        )
+        .unwrap();
+        let hash = Partitioning::Hash(vec![col("b", &schema).unwrap()], 3);
+        let repartition = RepartitionExec::try_new(Arc::new(stream), hash).unwrap();
+        let ordering = LexOrdering::new(vec![a, b]).unwrap();
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(
+            PartialSortExec::new(ordering.clone(), Arc::new(repartition), 1)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(fetch)),
+        );
+        match merged {
+            false => sort,
+            true => Arc::new(
+                SortPreservingMergeExec::new(ordering, sort).with_fetch(merge_fetch),
+            ),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_partitions_of_a_stream_are_sorted_as_they_arrive() {
+        // Of a stream that ends.
+        for (fetch, merged, merge_fetch) in [
+            (2, false, None),
+            (25, false, None),
+            (2, true, None),
+            (5, true, Some(12)),
+            (5000, false, None),
+        ] {
+            let make_plan =
+                || partial_sort_of_a_stream(fetch, false, merged, merge_fetch);
+            let root =
+                assert_plan_lowered(make_plan, test_session_config(), merged).await;
+            assert_eq!(
+                count::<PhysicalPartialSortOfPartitions>(&root),
+                1,
+                "{fetch}"
+            );
+        }
+        // Of a stream that never ends: every partition ends once it emitted
+        // its rows (DataFusion's partial sorts end too).
+        for (fetch, merged, merge_fetch) in [(2, true, Some(6)), (3, true, None)] {
+            let make_plan = || partial_sort_of_a_stream(fetch, true, merged, merge_fetch);
+            let root =
+                assert_plan_lowered(make_plan, test_session_config(), merged).await;
+            assert_eq!(
+                count::<PhysicalPartialSortOfPartitions>(&root),
+                1,
+                "{fetch}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
