@@ -7,11 +7,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array};
 use arrow::compute::{cast, take_record_batch};
 use arrow::datatypes::{FieldRef, SchemaRef};
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::sorts::partitioned_topk::{
@@ -38,7 +39,11 @@ use crate::operator::{
 /// order: the operator is not parallel, and ranks the rows as they pass,
 /// like a window over sorted rows, keeping those of a rank of at most
 /// `fetch`. It holds no rows itself (the native sort holds them, see
-/// [`crate::sort`]).
+/// [`crate::sort`]), but the keys of the last row it ranked, and, while it
+/// ranks the rows of a chunk, their keys in the row format, the indices and
+/// the ranks of the rows that it keeps, and these rows: it reserves them in
+/// the memory pool of the session before it allocates them (an estimate of
+/// the keys, which it then corrects).
 #[derive(Debug)]
 pub struct PhysicalPartitionedTopK {
     /// The sorted input, the only child.
@@ -121,9 +126,39 @@ struct RankingState {
     row_number: u64,
     rank: u64,
     dense_rank: u64,
+    reservation: MemoryReservation,
 }
 
 impl OperatorState for RankingState {}
+
+impl RankingState {
+    /// The memory of the keys of the last row.
+    fn last_memory(&self) -> usize {
+        self.last.as_ref().map_or(0, |(partition, order)| {
+            partition.row().as_ref().len() + order.row().as_ref().len()
+        })
+    }
+}
+
+/// The memory that the values of `arrays` occupy (of their slices only).
+fn arrays_memory(arrays: &[ArrayRef]) -> usize {
+    arrays
+        .iter()
+        .map(|array| {
+            array
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| array.get_array_memory_size())
+        })
+        .sum()
+}
+
+/// An upper bound of the memory of the row format of `arrays` (of `rows`
+/// rows): a variable-length value takes at most twice its bytes, plus a few
+/// bytes, and every row an offset.
+fn row_format_estimate(arrays: &[ArrayRef], rows: usize) -> usize {
+    2 * arrays_memory(arrays) + rows * (arrays.len() * 40 + size_of::<usize>())
+}
 
 impl PhysicalOperator for PhysicalPartitionedTopK {
     fn name(&self) -> &str {
@@ -163,9 +198,11 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
 
     fn get_operator_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         _gstate: &dyn GlobalOperatorState,
     ) -> Result<Box<dyn OperatorState>> {
+        let reservation = MemoryConsumer::new("PhysicalPartitionedTopK")
+            .register(ctx.task_ctx.memory_pool());
         Ok(Box::new(RankingState {
             partition_keys: self.converter(&self.expr[..self.partition_prefix_len])?,
             order_keys: self.converter(&self.expr[self.partition_prefix_len..])?,
@@ -173,6 +210,7 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
             row_number: 0,
             rank: 0,
             dense_rank: 0,
+            reservation,
         }))
     }
 
@@ -191,21 +229,42 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
                 .map(|key| key.expr.evaluate(&batch)?.into_array(batch.num_rows()))
                 .collect()
         };
-        let partitions = state
-            .partition_keys
-            .convert_columns(&evaluate(&self.expr[..self.partition_prefix_len])?)?;
-        let orders = state
-            .order_keys
-            .convert_columns(&evaluate(&self.expr[self.partition_prefix_len..])?)?;
-        let mut kept = vec![];
-        let mut ranks = vec![];
-        for row in 0..batch.num_rows() {
+        let partition_keys = evaluate(&self.expr[..self.partition_prefix_len])?;
+        let order_keys = evaluate(&self.expr[self.partition_prefix_len..])?;
+        let num_rows = batch.num_rows();
+        // The keys in the row format (an estimate), the indices and the
+        // ranks of the rows that are kept, and these rows (at most all rows
+        // of the chunk, and their ranks), before they are allocated.
+        let keys = row_format_estimate(&partition_keys, num_rows)
+            + row_format_estimate(&order_keys, num_rows);
+        let kept_rows = num_rows * (size_of::<u32>() + 2 * size_of::<u64>())
+            + crate::sort::memory_size(&batch);
+        let last = state.last_memory();
+        state.reservation.try_resize(last + keys + kept_rows)?;
+        let partitions = state.partition_keys.convert_columns(&partition_keys)?;
+        let orders = state.order_keys.convert_columns(&order_keys)?;
+        drop((partition_keys, order_keys));
+        state
+            .reservation
+            .try_resize(last + partitions.size() + orders.size() + kept_rows)?;
+        let mut kept = Vec::with_capacity(num_rows);
+        let mut ranks = Vec::with_capacity(num_rows);
+        for row in 0..num_rows {
             let partition = partitions.row(row);
             let order = orders.row(row);
-            let (same_partition, same_order) = match &state.last {
+            // Compared with the previous row: of the chunk, or the last row
+            // of the previous chunk.
+            let previous = match row {
+                0 => state
+                    .last
+                    .as_ref()
+                    .map(|(partition, order)| (partition.row(), order.row())),
+                _ => Some((partitions.row(row - 1), orders.row(row - 1))),
+            };
+            let (same_partition, same_order) = match previous {
                 Some((last_partition, last_order)) => {
-                    let same_partition = last_partition.row() == partition;
-                    (same_partition, same_partition && last_order.row() == order)
+                    let same_partition = last_partition == partition;
+                    (same_partition, same_partition && last_order == order)
                 }
                 None => (false, false),
             };
@@ -219,7 +278,6 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
                 state.rank = state.row_number;
                 state.dense_rank += 1;
             }
-            state.last = Some((partition.owned(), order.owned()));
             let rank = match self.fn_kind {
                 WindowFnKind::RowNumber => state.row_number,
                 WindowFnKind::Rank => state.rank,
@@ -230,6 +288,18 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
                 ranks.push(rank);
             }
         }
+        // The keys of the last row, which the next chunk compares with, and
+        // the indices, ranks and rows of this chunk; the keys of this chunk
+        // in the row format are released.
+        if num_rows > 0 {
+            state.last = Some((
+                partitions.row(num_rows - 1).owned(),
+                orders.row(num_rows - 1).owned(),
+            ));
+        }
+        let last = state.last_memory();
+        drop((partitions, orders));
+        state.reservation.try_resize(last + kept_rows)?;
         let rows = take_record_batch(&batch, &UInt32Array::from(kept))?;
         let mut columns = rows.columns().to_vec();
         if let Some(field) = &self.ranking_field {
@@ -238,11 +308,17 @@ impl PhysicalOperator for PhysicalPartitionedTopK {
         }
         let options =
             arrow::array::RecordBatchOptions::new().with_row_count(Some(rows.num_rows()));
-        *output = DataChunk::from_record_batch(RecordBatch::try_new_with_options(
+        let rows = RecordBatch::try_new_with_options(
             Arc::clone(&self.schema),
             columns,
             &options,
-        )?);
+        )?;
+        // The kept rows, until the next chunk (the indices and ranks are
+        // released).
+        state
+            .reservation
+            .try_resize(last + crate::sort::memory_size(&rows))?;
+        *output = DataChunk::from_record_batch(rows);
         Ok(OperatorResult::NeedMoreInput)
     }
 }
@@ -253,8 +329,93 @@ mod tests {
 
     use datafusion::prelude::SessionContext;
 
+    use arrow::array::{AsArray, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Int32Type, Schema};
+    use datafusion_common::DataFusionError;
+    use datafusion_execution::TaskContext;
+    use datafusion_execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion_physical_expr::expressions::col;
+
+    use crate::executor::Executor;
     use crate::operators::lowering_tests::{assert_lowered, count};
+    use crate::sources::MemoryScanSource;
     use crate::test_utils::{register_test_tables, test_session_config};
+
+    /// The `ROW_NUMBER() <= 1` of the rows of partitions `p` (of keys of
+    /// 100 KB) ordered by `o`, over rows already sorted by `p` and `o`.
+    fn topk_of_large_keys() -> Result<Arc<dyn PhysicalOperator>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Utf8, false),
+            Field::new("o", DataType::Int32, false),
+        ]));
+        let keys = (0..20)
+            .flat_map(|key| {
+                std::iter::repeat_n(format!("{key:02}{}", "x".repeat(100_000)), 3)
+            })
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int32Array::from_iter_values((0..60).map(|i| i % 3))),
+            ],
+        )?;
+        let source =
+            MemoryScanSource::try_new(&[vec![batch]], Arc::clone(&schema), None, None)?
+                .with_preserve_order(true);
+        let expr = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("p", &schema)?),
+            PhysicalSortExpr::new_default(col("o", &schema)?),
+        ])
+        .unwrap();
+        Ok(Arc::new(PhysicalPartitionedTopK {
+            children: vec![Arc::new(source)],
+            schema,
+            expr,
+            partition_prefix_len: 1,
+            fetch: 1,
+            fn_kind: WindowFnKind::RowNumber,
+            ranking_field: None,
+        }))
+    }
+
+    fn task_context(memory: usize) -> Arc<TaskContext> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(memory)))
+            .build_arc()
+            .unwrap();
+        Arc::new(TaskContext::default().with_runtime(runtime))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_keys_and_the_kept_rows_reserve_memory() -> Result<()> {
+        let error = Executor::collect(topk_of_large_keys()?, task_context(1), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        // In a pool that holds them, the first row of every partition, and
+        // nothing stays reserved.
+        let ctx = task_context(100 << 20);
+        let output =
+            Executor::collect(topk_of_large_keys()?, Arc::clone(&ctx), 4).await?;
+        let orders = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(orders, vec![0; 20]);
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn partitioned_topks_are_native() {
