@@ -149,6 +149,9 @@ accounting of all native operators):
 - `LocalLimitExec`s of several partitions (and `CoalesceBatchesExec`s with a
   fetch, which DataFusion does not plan any more, of several partitions) that
   a merge with a fetch does not make redundant: they limit every partition;
+- `PartialSortExec`s with a fetch of several partitions, which keep the first
+  rows of every partition, unless a merge above them keeps at most these rows
+  (the merge is then the native TopK of their input);
 - the sorts, windows, aggregations and joins of values that address more than
   their memory, and the filters and projections of rows that the native
   operators cannot gather (see the module documentation of `planner.rs`).
@@ -159,14 +162,17 @@ The operators that this document adds reserve the memory that they hold in
 the memory pool of the session, and fail with `ResourcesExhausted` when it
 runs out (they do not spill):
 
-- the sources (`LazyMemorySource`, `StreamingTableSource`, `ExplainSource`)
-  reserve the batch that a thread emits; `FileScanSource` reads with the
-  `Morselizer` of its files, as the other file scans do, and
+- the sources (`LazyMemorySource`, `StreamingTableSource`, `ExplainSource`
+  and `FileScanSource`) reserve the batch that a thread emits, and
   `PhysicalAnalyze` holds no rows (it counts the rows of its plan);
-- `PhysicalAsyncFunc` reserves the rows of the chunk it evaluates, and their
-  results, `PhysicalUnnest` the unnested rows it did not emit yet,
-  `PhysicalPartialSort` the rows of the groups it buffers and sorts, and
-  `PhysicalDataSink` the rows that wait for its writer;
+- `PhysicalAsyncFunc` reserves the rows of the chunk it evaluates, and an
+  estimate of their results before it evaluates them; `PhysicalUnnest`
+  reserves the indices that it takes the rows of an unnest with, and an
+  estimate of these rows, before it allocates them (it unnests a single level
+  in windows of at most 2048 rows, also of a row that expands into many
+  rows), and the rows it did not emit yet; `PhysicalPartialSort` reserves the
+  rows of the groups it buffers, and what sorting them allocates, before it
+  sorts them; and `PhysicalDataSink` the rows that wait for its writer;
 - `MaterializedCteBody` reserves the rows of the body of a CTE until the
   execution ends;
 - `PhysicalPartitionedTopK` holds no rows (the `PhysicalSort` below it does,
