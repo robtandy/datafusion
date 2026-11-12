@@ -25,6 +25,9 @@
 //! | `AggregateExec(Final \| FinalPartitioned) -> ... -> AggregateExec(Partial)`        | [`PhysicalHashAggregate`]                          |
 //! | `AggregateExec(Single \| SinglePartitioned)`                                       | [`PhysicalHashAggregate`]                          |
 //! | `HashJoinExec` (`CollectLeft` or `Partitioned`)                                    | [`PhysicalHashJoin`]                               |
+//! | `SortMergeJoinExec`                                                                | [`PhysicalHashJoin`], or [`PhysicalMergeJoin`]     |
+//! | `SortPreservingMergeExec` of the sorted partitions of a `SortMergeJoinExec`        | the [`PhysicalMergeJoin`] of the join              |
+//! | `SymmetricHashJoinExec`                                                            | [`PhysicalSymmetricHashJoin`], or a hash join      |
 //! | `WindowAggExec`, `BoundedWindowAggExec` (with the sorts and repartitionings below) | [`PhysicalWindow`]                                 |
 //! | `SortPreservingMergeExec` of the partitions of a window                            | [`PhysicalSort`] of the [`PhysicalWindow`]         |
 //! | `NestedLoopJoinExec`                                                               | [`PhysicalNestedLoopJoin`]                         |
@@ -91,9 +94,15 @@
 //! exhausted): they are only lowered for sessions whose memory pool has no
 //! limit, see [`lower_execution_plan_with_runtime`].
 //!
+//! A sort-merge join is a hash join unless a node above it relies on its order:
+//! a `SortPreservingMergeExec` that merges its sorted partitions (through
+//! projections and filters, e.g. of `ORDER BY key NULLS FIRST`), which the
+//! merge join replaces, or the nodes above a join of a single partition (see
+//! [`merge_join::try_lower`] and `Lowering::try_lower_merge_of_sort_merge_join`).
+//!
 //! Every native operator documents (in its `try_lower` or `supports_*`
-//! function) which nodes it lowers; any other node, such as a sort-merge join,
-//! a recursive query or a custom node, is executed by DataFusion: it is
+//! function) which nodes it lowers; any other node, such as a recursive query
+//! or a custom node, is executed by DataFusion: it is
 //! wrapped, with its whole subtree, in a [`BridgeOperator`], so that every
 //! plan can be executed. Native operators above a bridged plan read its output
 //! as the source of their pipeline.
@@ -134,10 +143,10 @@
 //!
 //! DataFusion still executes
 //!
-//! * the nodes that no native operator implements yet (e.g. sort-merge and
-//!   symmetric hash joins, recursive queries, and user-defined
-//!   `ExecutionPlan`s, see `docs/fallbacks.md`), and the nodes that the
-//!   native operators refuse themselves (see their `try_lower` functions);
+//! * the nodes that no native operator implements yet (e.g. recursive queries,
+//!   and user-defined `ExecutionPlan`s, see `docs/fallbacks.md`), and the
+//!   nodes that the native operators refuse themselves (see their `try_lower`
+//!   functions);
 //! * the windows and loop joins of sessions whose memory pool has a limit
 //!   (see above);
 //! * the sorts, windows, aggregations and joins of values that address more
@@ -184,8 +193,11 @@
 //! ```
 //!
 //! [`PhysicalTopK`]: crate::sort::PhysicalTopK
+//! [`PhysicalMergeJoin`]: crate::join::PhysicalMergeJoin
+//! [`PhysicalSymmetricHashJoin`]: crate::join::PhysicalSymmetricHashJoin
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -240,9 +252,9 @@ use crate::aggregate::PhysicalHashAggregate;
 use crate::bridge::{BridgeOperator, PipelineRootExec};
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::explain::{AnalyzedPipelineExec, MetricSelection};
-use crate::join::PhysicalHashJoin;
 use crate::join::hash_join::JoinFilterTarget;
 use crate::join::nested_loop::{PhysicalCrossJoin, PhysicalNestedLoopJoin};
+use crate::join::{PhysicalHashJoin, merge_join, symmetric_hash_join};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
     LocalSinkState, LocalSourceState, OperatorResult, OperatorState, PhysicalOperator,
@@ -581,6 +593,10 @@ struct Lowering<'a> {
     /// lowered, routed to the scans below them (see
     /// [`Self::try_lower_hash_join`]).
     join_filters: RefCell<Vec<ScanJoinFilter>>,
+    /// The sort-merge joins whose order a merge above them relies on (by the
+    /// address of their node), which are lowered to merge joins: see
+    /// [`Self::try_lower_merge_of_sort_merge_join`].
+    ordered_joins: RefCell<HashSet<usize>>,
 }
 
 impl<'a> Lowering<'a> {
@@ -591,6 +607,7 @@ impl<'a> Lowering<'a> {
             early_stop: Cell::new(false),
             materialized_ctes: MaterializedCtes::default(),
             join_filters: RefCell::new(vec![]),
+            ordered_joins: RefCell::new(HashSet::new()),
         }
     }
 }
@@ -669,6 +686,9 @@ impl Lowering<'_> {
             if let Some(sort) = self.try_lower_merge_of_window(plan)? {
                 return Ok(sort);
             }
+            if let Some(join) = self.try_lower_merge_of_sort_merge_join(plan)? {
+                return Ok(join);
+            }
             if let Some(merge) = self.try_lower_streaming_merge(plan)? {
                 return Ok(merge);
             }
@@ -684,6 +704,12 @@ impl Lowering<'_> {
                 return Ok(aggregate);
             }
             if let Some(join) = self.try_lower_hash_join(plan)? {
+                return Ok(join);
+            }
+            if let Some(join) = self.try_lower_sort_merge_join(plan)? {
+                return Ok(join);
+            }
+            if let Some(join) = self.try_lower_symmetric_hash_join(plan)? {
                 return Ok(join);
             }
             if let Some(join) = self.try_lower_loop_join(plan)? {
@@ -1072,6 +1098,97 @@ impl Lowering<'_> {
         }
         let filters = filters.into_iter().map(|filter| filter.filter).collect();
         Ok(Some(Arc::new(JoinFilteredScan::new(source, filters))))
+    }
+
+    /// Lower a sort-merge join with [`merge_join::try_lower`]: to a
+    /// [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin) if a merge above
+    /// it relies on its order (see
+    /// [`Self::try_lower_merge_of_sort_merge_join`]) or if it has a single
+    /// partition with an order, and to a [`PhysicalHashJoin`] otherwise. Its
+    /// inputs are lowered as the join reads them, see [`Self::lower_join_input_as`].
+    fn try_lower_sort_merge_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let key = Arc::as_ptr(plan).cast::<()>().addr();
+        let ordered = self.ordered_joins.borrow().contains(&key);
+        merge_join::try_lower_with_ctes(
+            plan,
+            ordered,
+            &self.materialized_ctes,
+            |input, role| self.lower_join_input_as(input, role),
+        )
+    }
+
+    /// Lower `input`, an input of a native join that reads it as `role` says
+    /// (see [`Self::lower_in`]): in a pipeline that runs until its input ends
+    /// if the join collects all of its rows, in the pipeline of the join (which
+    /// may stop early with it) if it is the probe side of a hash join, and as
+    /// in a pipeline that may stop early if the join reads its rows as they
+    /// come (an input that never ends, whose rows no cache may hold back).
+    fn lower_join_input_as(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+        role: merge_join::InputRole,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let early_stop = match role {
+            merge_join::InputRole::Collected => false,
+            merge_join::InputRole::Pipelined => self.early_stop.get(),
+            merge_join::InputRole::Streamed => true,
+        };
+        self.lower_in(input, early_stop)
+    }
+
+    /// Lower a `SortPreservingMergeExec` that merges the sorted partitions of
+    /// a sort-merge join (through projections and filters, see
+    /// [`merge_join::ordered_join_below`]) to its input, in which the join is
+    /// a [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin), whose rows the
+    /// native operators above it emit in order, on a single thread (and to a
+    /// limit of its input, in its order, for a merge with a fetch). Merging the
+    /// sorted partitions of the join is emitting the rows of the merge join in
+    /// order.
+    ///
+    /// Only if the input of the merge is lowered to the rows of a merge join
+    /// in its order (see [`merge_join::emits_merge_join_order`]).
+    fn try_lower_merge_of_sort_merge_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(join) = merge_join::ordered_join_below(plan)? else {
+            return Ok(None);
+        };
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        let key = Arc::as_ptr(join).cast::<()>().addr();
+        self.ordered_joins.borrow_mut().insert(key);
+        let early_stop = self.early_stop.get() || merge.fetch().is_some();
+        let input = self.lower_in(merge.input(), early_stop)?;
+        if !merge_join::emits_merge_join_order(&input) {
+            return Ok(None);
+        }
+        Ok(Some(match merge.fetch() {
+            Some(fetch) => Arc::new(
+                PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true),
+            ),
+            None => input,
+        }))
+    }
+
+    /// Lower a symmetric hash join with [`symmetric_hash_join::try_lower`]: to
+    /// a [`PhysicalHashJoin`] that builds on an input that ends, or to a
+    /// [`PhysicalSymmetricHashJoin`](crate::join::PhysicalSymmetricHashJoin) of
+    /// two inputs that never end, which reads both of them as streams (see
+    /// [`Self::lower_join_input_as`]).
+    fn try_lower_symmetric_hash_join(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        symmetric_hash_join::try_lower_with_ctes(
+            plan,
+            &self.materialized_ctes,
+            |input, role| self.lower_join_input_as(input, role),
+        )
     }
 
     /// Lower a window (a `WindowAggExec` or a `BoundedWindowAggExec`, with the
@@ -8220,16 +8337,6 @@ mod tests {
         explain_with(sql, test_session_config()).await
     }
 
-    /// The configuration of the tests, in which equi-joins are sort-merge
-    /// joins, which have no native operator yet
-    /// ([#60](https://github.com/robtandy/datafusion/issues/60)): the
-    /// pipeline engine leaves them to DataFusion.
-    fn with_sort_merge_joins() -> SessionConfig {
-        let mut config = test_session_config();
-        config.options_mut().optimizer.prefer_hash_join = false;
-        config
-    }
-
     /// The plans of the `EXPLAIN` `sql`, run in a session of the pipeline
     /// engine configured with `config`.
     async fn explain_with(sql: &str, config: SessionConfig) -> Vec<(String, String)> {
@@ -8309,11 +8416,12 @@ mod tests {
             "{plan}"
         );
 
-        // A bridged plan is shown below its bridge: a sort-merge join, which
-        // has no native operator yet.
-        let explained = explain_with(
-            "EXPLAIN SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.id = t2.k",
-            with_sort_merge_joins(),
+        // A bridged plan is shown below its bridge: an aggregation by groups
+        // that its input clusters (sorted by them), which the native
+        // aggregation refuses.
+        let explained = explain(
+            "EXPLAIN SELECT a, COUNT(*) AS n FROM \
+             (SELECT a FROM t1 ORDER BY a LIMIT 100) GROUP BY a",
         )
         .await;
         let plan = plan_of(&explained, "physical_plan");
@@ -8322,7 +8430,7 @@ mod tests {
             "{plan}"
         );
         assert!(plan.contains("BridgeOperator, pipelines=[0]\n"), "{plan}");
-        assert!(plan.contains("SortMergeJoinExec: "), "{plan}");
+        assert!(plan.contains("AggregateExec: "), "{plan}");
 
         // `EXPLAIN VERBOSE` also shows the plans of DataFusion that the plan
         // of the pipeline engine was lowered from.
@@ -8360,16 +8468,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn explain_analyze_selects_the_metrics_of_every_operator() {
-        // A native sort of a bridged plan (a sort-merge join, which has no
-        // native operator yet), whose nodes have metrics too.
-        let query = "SELECT t1.id, t2.w FROM t1 JOIN t2 ON t1.id = t2.k \
-                     WHERE t1.id > 1 ORDER BY t2.w DESC";
+        // A native sort of a bridged plan (an aggregation by groups that its
+        // input clusters, sorted by them, which the native aggregation
+        // refuses), whose nodes have metrics too.
+        let query = "SELECT a, n FROM (SELECT a, COUNT(*) AS n FROM \
+                     (SELECT a FROM t1 WHERE id > 1 ORDER BY a LIMIT 100) GROUP BY a) \
+                     ORDER BY n DESC";
         let analyzed = async |options: &str| {
-            let sql = format!("EXPLAIN ({options}) {query}");
-            let explained = explain_with(&sql, with_sort_merge_joins()).await;
+            let explained = explain(&format!("EXPLAIN ({options}) {query}")).await;
             let plan = plan_of(&explained, "Plan with Metrics").to_string();
             assert!(plan.contains("PhysicalSort"), "{plan}");
-            assert!(plan.contains("SortMergeJoinExec"), "{plan}");
+            assert!(plan.contains("AggregateExec"), "{plan}");
             plan
         };
         // Without metrics, of the native operators and of the bridged nodes.
@@ -8406,10 +8515,10 @@ mod tests {
         // operators and the nodes of the bridged plan.
         let sql =
             format!("EXPLAIN (ANALYZE, VERBOSE, METRICS 'rows', TIMING OFF) {query}");
-        let explained = explain_with(&sql, with_sort_merge_joins()).await;
+        let explained = explain(&sql).await;
         for rendering in ["Plan with Metrics", "Plan with Full Metrics"] {
             let plan = plan_of(&explained, rendering);
-            for node in ["PhysicalSort", "SortMergeJoinExec"] {
+            for node in ["PhysicalSort", "AggregateExec"] {
                 let line = plan
                     .lines()
                     .find(|line| line.trim_start().starts_with(node))
