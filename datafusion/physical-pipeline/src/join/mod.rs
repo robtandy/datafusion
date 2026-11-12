@@ -12,10 +12,18 @@
 //!   built by all threads into one shared table and probed by all threads
 //!   without shuffling either side.
 //! * [`nested_loop`]: nested loop and cross joins.
+//! * [`merge_join`]: [`PhysicalMergeJoin`], DataFusion's `SortMergeJoinExec`
+//!   where its order is required (otherwise a [`PhysicalHashJoin`]).
+//! * [`symmetric_hash_join`]: [`PhysicalSymmetricHashJoin`], DataFusion's
+//!   `SymmetricHashJoinExec` of two inputs that never end.
 
 pub mod hash_join;
 pub mod hash_table;
+pub mod merge_join;
 pub mod nested_loop;
+pub mod symmetric_hash_join;
 
 pub use hash_join::PhysicalHashJoin;
 pub use hash_table::{JoinHashTable, JoinHashTableBuilder};
+pub use merge_join::PhysicalMergeJoin;
+pub use symmetric_hash_join::PhysicalSymmetricHashJoin;
