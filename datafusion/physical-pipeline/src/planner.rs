@@ -36,7 +36,19 @@
 //! | `ProjectionExec`                                                                   | [`PhysicalProjection`]                             |
 //! | `ScalarSubqueryExec` (of uncorrelated scalar subqueries)                           | [`PhysicalScalarSubquery`]                         |
 //! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                               | the sources of [`try_create_scan_source`]          |
+//! | `DataSourceExec` (of other files: JSON, Avro, Arrow IPC, ...)                      | [`FileScanSource`]                                 |
+//! | `LazyMemoryExec`, `StreamingTableExec`, `ExplainExec`                              | [`LazyMemorySource`], [`StreamingTableSource`], [`ExplainSource`] |
+//! | `UnnestExec`, `AsyncFuncExec`, `PartialSortExec`                                   | [`PhysicalUnnest`], [`PhysicalAsyncFunc`], [`PhysicalPartialSort`] |
+//! | `DataSinkExec`                                                                     | [`PhysicalDataSink`]                               |
+//! | `MaterializedCteExec`, `MaterializedCteScanExec`                                   | [`PhysicalMaterializedCte`], [`MaterializedCteScan`] |
+//! | `PartitionedTopKExec`                                                              | [`PhysicalPartitionedTopK`]                        |
+//! | `PiecewiseMergeJoinExec`                                                           | [`PhysicalNestedLoopJoin`]                         |
+//! | `SortPreservingMergeExec` of other sorted partitions                               | [`PhysicalSort`] or [`PhysicalTopK`]               |
 //! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                 | removed                                            |
+//! | `CooperativeExec`, `BufferExec`                                                    | removed                                            |
+//!
+//! `docs/fallbacks.md` lists every `ExecutionPlan` of DataFusion with the
+//! native operators that execute it, and the nodes that stay in DataFusion.
 //!
 //! The nodes that only distribute rows over partitions or change the size of
 //! batches are removed: all threads of a pipeline read the chunks of its
@@ -110,8 +122,8 @@
 //!
 //! * the nodes that no native operator implements yet (e.g. sort-merge and
 //!   symmetric hash joins, recursive queries, and user-defined
-//!   `ExecutionPlan`s), and the nodes that the native operators refuse
-//!   themselves (see their `try_lower` functions);
+//!   `ExecutionPlan`s, see `docs/fallbacks.md`), and the nodes that the
+//!   native operators refuse themselves (see their `try_lower` functions);
 //! * the windows and loop joins of sessions whose memory pool has a limit
 //!   (see above);
 //! * the sorts, windows, aggregations and joins of values that address more
