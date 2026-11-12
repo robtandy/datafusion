@@ -75,11 +75,15 @@
 //!
 //! A `WorkTableExec` that DataFusion executes reads the working table of
 //! DataFusion's `RecursiveQueryExec`, which a [`PhysicalRecursiveCte`] does
-//! not fill: [`PhysicalRecursiveCte::try_lower`] leaves a recursive query to
-//! DataFusion if a node that reads its working table is executed by
-//! DataFusion (bridged, e.g. below a node that no native operator
-//! implements), or if the columns of a scan of its working table are not
-//! columns of the query.
+//! not fill. So [`PhysicalRecursiveCte::try_lower`] replaces the
+//! `WorkTableExec`s of the recursive term by [`PipelineWorkTableExec`]s,
+//! DataFusion `ExecutionPlan`s that the planner lowers to
+//! [`WorkTableScanSource`]s, and which read the working table of the CTE in
+//! the same way where DataFusion executes them: in the plans of the
+//! `BridgeOperator`s of the recursive term (e.g. a node that no native
+//! operator implements, or a cross join that the planner leaves to DataFusion
+//! in a session with a memory limit). The recursion itself always runs
+//! natively, whatever DataFusion executes in its terms.
 //!
 //! # Memory
 //!
@@ -93,28 +97,44 @@
 //! pool cannot grant it. The rows of a term are released once the iteration
 //! that read them completed, so a recursion holds at most the rows of two
 //! consecutive terms (and its hash table), however many iterations it runs.
+//!
+//! The memory of the rows is the memory that their batches retain
+//! (`RetainedMemory`): all of their buffers, also those of the arrays that
+//! they are zero-copy slices of (e.g. a row that a limit slices from a batch
+//! of a table retains the whole batch), each counted once for all the batches
+//! that share it (e.g. the chunks that a scan slices from one batch, or a
+//! column that the recursive term passes on to the next term).
 
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::instant::Instant;
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{Result, internal_datafusion_err, internal_err};
-use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
-use datafusion_physical_plan::execution_plan::reset_plan_states;
+use datafusion_physical_plan::coop::cooperative;
+use datafusion_physical_plan::execution_plan::{
+    Boundedness, EmissionType, SchedulingType, reset_plan_states,
+};
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::work_table::WorkTableExec;
-use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan,
+    ExecutionPlanProperties, PlanProperties, ReplaceChildrenOptions,
+};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
 
-use crate::bridge::bridged_plans;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::executor::Executor;
 use crate::operator::{
@@ -124,7 +144,6 @@ use crate::operator::{
 };
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::planner::lower_execution_plan_with_runtime;
-use crate::sort::memory_size;
 
 /// A recursive query (`WITH RECURSIVE`), DataFusion's `RecursiveQueryExec`.
 ///
@@ -139,8 +158,8 @@ pub struct PhysicalRecursiveCte {
     /// The static term, and the recursive term as it was lowered with the
     /// query (for `EXPLAIN`: every iteration lowers it again).
     children: Vec<Arc<dyn PhysicalOperator>>,
-    /// The DataFusion plan of the recursive term, which every iteration
-    /// resets and lowers.
+    /// The DataFusion plan of the recursive term, with
+    /// [`PipelineWorkTableExec`]s, which every iteration resets and lowers.
     recursive_plan: Arc<dyn ExecutionPlan>,
 }
 
@@ -150,13 +169,18 @@ impl PhysicalRecursiveCte {
     /// term (in pipelines that run until their input ends: the CTE reads all
     /// of their rows). Returns `Ok(None)` for any other node.
     ///
+    /// The `WorkTableExec`s of the recursive term that scan the working table
+    /// of the query are replaced by [`PipelineWorkTableExec`]s first (see
+    /// `with_pipeline_work_tables`), which `lower_term` lowers to
+    /// [`WorkTableScanSource`]s, and which read the working table of the CTE
+    /// where DataFusion executes them too.
+    ///
     /// DataFusion executes the first partition of every term, which plans
     /// have exactly one of: a recursive query whose terms have other numbers
     /// of partitions, or other data types than the query, is left to
-    /// DataFusion. So is a query whose working table the native operator
-    /// cannot fill (see the [module documentation](self#the-working-table)):
-    /// one with a scan of its working table that DataFusion executes, or
-    /// whose columns are not columns of the query.
+    /// DataFusion. So is a query with a scan of its working table whose
+    /// columns are not columns of the query (which only a plan built by hand
+    /// can have, see `work_table_projection`).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_term: F,
@@ -184,17 +208,15 @@ impl PhysicalRecursiveCte {
         {
             return Ok(None);
         }
+        let recursive_plan = with_pipeline_work_tables(exec.recursive_term(), name)?;
         let static_term = lower_term(exec.static_term())?;
-        let recursive_term = lower_term(exec.recursive_term())?;
-        if bridges_work_table(&recursive_term, name) {
-            return Ok(None);
-        }
+        let recursive_term = lower_term(&recursive_plan)?;
         Ok(Some(Self {
             name: name.to_owned(),
             schema,
             is_distinct: exec.is_distinct(),
             children: vec![static_term, recursive_term],
-            recursive_plan: Arc::clone(exec.recursive_term()),
+            recursive_plan,
         }))
     }
 
@@ -223,33 +245,20 @@ impl PhysicalRecursiveCte {
 
     /// A fresh copy of the recursive term for an iteration: its DataFusion
     /// plan, reset (see `reset_plan_states`) and lowered for the session of
-    /// `task_ctx`.
-    ///
-    /// [`Self::try_lower`] checked that the lowering of the query, for the
-    /// session it was planned for (or for any session), lowers the scans of
-    /// the working table natively. The session of the execution lowers them
-    /// natively too, unless it lowers fewer nodes than the lowering of the
-    /// query (e.g. a plan lowered for a session without a memory limit and
-    /// executed in one with a limit): the iteration then fails, as DataFusion
-    /// would read a working table that the CTE does not fill.
+    /// `task_ctx`. Its scans of the working table read the working table of
+    /// the CTE, wherever they are: natively, or in the plans that DataFusion
+    /// executes (see [`PipelineWorkTableExec`]).
     fn lower_recursive_term(
         &self,
         task_ctx: &TaskContext,
     ) -> Result<Arc<dyn PhysicalOperator>> {
         let plan = reset_plan_states(Arc::clone(&self.recursive_plan))?;
         let options = task_ctx.session_config().options();
-        let term = lower_execution_plan_with_runtime(
+        lower_execution_plan_with_runtime(
             &plan,
             options.as_ref(),
             task_ctx.runtime_env().as_ref(),
-        )?;
-        if bridges_work_table(&term, &self.name) {
-            return internal_err!(
-                "The recursive term of {} reads its working table in DataFusion",
-                self.description()
-            );
-        }
-        Ok(term)
+        )
     }
 
     /// Start the next iteration, over `working_table`: returns the future
@@ -327,15 +336,49 @@ fn work_table_scans<'a>(
     }
 }
 
-/// Whether DataFusion executes a scan of the working table of the recursive
-/// query `name` in the operator tree `operator`: in one of the plans that it
-/// bridges (see [`bridged_plans`]).
-fn bridges_work_table(operator: &Arc<dyn PhysicalOperator>, name: &str) -> bool {
-    bridged_plans(operator).iter().any(|plan| {
-        let mut scans = vec![];
-        work_table_scans(plan, name, &mut scans);
-        !scans.is_empty()
-    })
+/// `plan` (a DataFusion plan) with [`PipelineWorkTableExec`]s in place of its
+/// scans of the working table of the recursive query `name` (see
+/// [`work_table_scans`]), which read the working table of a
+/// [`PhysicalRecursiveCte`] instead of the one of DataFusion's
+/// `RecursiveQueryExec`: natively (lowered to [`WorkTableScanSource`]s), and
+/// also where DataFusion executes them, in a plan that a `BridgeOperator`
+/// executes. The nodes above them are rebuilt (as DataFusion's
+/// `RecursiveQueryExec` rebuilds them when it binds its `WorkTableExec`s).
+fn with_pipeline_work_tables(
+    plan: &Arc<dyn ExecutionPlan>,
+    name: &str,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(scan) = plan.downcast_ref::<WorkTableExec>() {
+        return Ok(if scan.name() == name {
+            Arc::new(PipelineWorkTableExec::new(name, plan.schema()))
+        } else {
+            Arc::clone(plan)
+        });
+    }
+    // The recursive term (the second child) of a recursive query of the same
+    // name scans the working table of that query.
+    let shadows = plan
+        .downcast_ref::<RecursiveQueryExec>()
+        .is_some_and(|query| query.name() == name);
+    let children = plan.children();
+    let mut replaced = false;
+    let mut new_children = Vec::with_capacity(children.len());
+    for (index, child) in children.into_iter().enumerate() {
+        let new_child = if shadows && index == 1 {
+            Arc::clone(child)
+        } else {
+            with_pipeline_work_tables(child, name)?
+        };
+        replaced |= !Arc::ptr_eq(&new_child, child);
+        new_children.push(new_child);
+    }
+    if !replaced {
+        return Ok(Arc::clone(plan));
+    }
+    Arc::clone(plan).replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 /// The columns of the working table (with schema `table`, the schema of the
@@ -689,7 +732,8 @@ impl WorkTables {
 
 /// The rows of a term of a recursion (of the static term or of an
 /// iteration), with the schema of the query: emitted by the CTE, and the
-/// working table of the next iteration. Its memory is released with it.
+/// working table of the next iteration. The memory that they retain is
+/// released with it.
 #[derive(Debug)]
 struct WorkingTable {
     schema: SchemaRef,
@@ -698,15 +742,16 @@ struct WorkingTable {
     /// `(batch, offset, rows)`.
     blocks: Vec<(usize, usize, usize)>,
     rows: usize,
-    /// The memory of the rows.
-    _reservation: MemoryReservation,
+    /// The memory that the recursion retains, which `batches` are part of.
+    memory: Arc<RetainedMemory>,
 }
 
 impl WorkingTable {
+    /// The table of `batches`, whose memory `memory` retains.
     fn new(
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
-        reservation: MemoryReservation,
+        memory: Arc<RetainedMemory>,
     ) -> Self {
         let mut blocks = vec![];
         let mut rows = 0;
@@ -722,7 +767,7 @@ impl WorkingTable {
             batches,
             blocks,
             rows,
-            _reservation: reservation,
+            memory,
         }
     }
 
@@ -736,6 +781,79 @@ impl WorkingTable {
             batch.slice(offset, rows)
         })
     }
+
+    /// The columns `projection` of the rows of block `index`, and the number
+    /// of these rows, if there is such a block.
+    fn scan(&self, index: usize, projection: &[usize]) -> Option<(Vec<ArrayRef>, usize)> {
+        let batch = self.block(index)?;
+        let columns = projection
+            .iter()
+            .map(|&column| Arc::clone(batch.column(column)))
+            .collect();
+        Some((columns, batch.num_rows()))
+    }
+}
+
+impl Drop for WorkingTable {
+    fn drop(&mut self) {
+        // Before the buffers of the batches may be dropped.
+        self.memory.release(&self.batches);
+    }
+}
+
+/// The memory that the rows of a recursion retain: the rows of its last term
+/// and those that the current iteration collected (or more, until the
+/// tables of the terms before are dropped).
+///
+/// A batch retains all of its buffers, also the buffers of the arrays that
+/// its columns are slices of (which may be much larger than the rows of the
+/// batch, e.g. a row sliced from a batch of a table), and batches may share
+/// buffers (e.g. the slices of a batch, or a column that the recursive term
+/// passes on to the next term). So the memory of the buffers is reserved in
+/// full, and once for all the batches that share them (DataFusion's
+/// [`RecordBatchMemoryTracker`]): a buffer is released once no batch of the
+/// recursion retains it any more.
+#[derive(Debug)]
+struct RetainedMemory {
+    /// The buffers of the retained batches, and the reservation of their
+    /// memory.
+    buffers: Mutex<(RecordBatchMemoryTracker, MemoryReservation)>,
+}
+
+impl RetainedMemory {
+    fn new(reservation: MemoryReservation) -> Self {
+        Self {
+            buffers: Mutex::new((RecordBatchMemoryTracker::new(), reservation)),
+        }
+    }
+
+    /// Retain `batch`: reserve the memory of its buffers that no retained
+    /// batch retains yet. Fails with `ResourcesExhausted` (without retaining
+    /// it) if the memory pool cannot grant it.
+    fn retain(&self, batch: &RecordBatch) -> Result<()> {
+        let (tracker, reservation) = &mut *self.buffers.lock();
+        let added = tracker.count_batch(batch);
+        if let Err(error) = reservation.try_grow(added) {
+            tracker.uncount_batch(batch);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The recursion does not retain `batches` any more: release the memory
+    /// of their buffers that no other retained batch retains.
+    fn release(&self, batches: &[RecordBatch]) {
+        let (tracker, reservation) = &mut *self.buffers.lock();
+        for batch in batches {
+            tracker.uncount_batch(batch);
+        }
+        reservation.resize(tracker.memory_usage());
+    }
+
+    /// The memory reserved for the retained batches.
+    fn reserved(&self) -> usize {
+        self.buffers.lock().1.size()
+    }
 }
 
 /// Collects the rows of the terms of a recursion: the global state of the
@@ -744,15 +862,15 @@ impl WorkingTable {
 ///
 /// Every thread collects the rows it sinks (relabeled with the schema of the
 /// query), after it removed the rows that the recursion collected before
-/// (for `UNION`), and reserves their memory. The rows of the threads that
-/// completed are combined, until the CTE takes all of them, once the term is
-/// complete.
+/// (for `UNION`), and reserves the memory that they retain (see
+/// [`RetainedMemory`]). The rows of the threads that completed are combined,
+/// until the CTE takes all of them, once the term is complete.
 struct Collector {
     schema: SchemaRef,
     /// The rows of the threads that completed.
     batches: Mutex<Vec<RecordBatch>>,
-    /// The memory of the rows collected since they were last taken.
-    reservation: MemoryReservation,
+    /// The memory that the rows of the recursion retain.
+    memory: Arc<RetainedMemory>,
     /// For `UNION`: all rows that the recursion collected.
     distinct: Option<Mutex<DistinctRows>>,
 }
@@ -761,7 +879,7 @@ impl fmt::Debug for Collector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Collector")
             .field("batches", &self.batches.lock().len())
-            .field("reserved", &self.reservation.size())
+            .field("reserved", &self.memory.reserved())
             .field("distinct", &self.distinct.is_some())
             .finish()
     }
@@ -800,10 +918,11 @@ impl Collector {
         } else {
             None
         };
+        let reservation = MemoryConsumer::new(consumer).register(pool);
         Ok(Self {
             schema,
             batches: Mutex::new(vec![]),
-            reservation: MemoryConsumer::new(consumer).register(pool),
+            memory: Arc::new(RetainedMemory::new(reservation)),
             distinct,
         })
     }
@@ -827,7 +946,7 @@ impl Collector {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        self.reservation.try_grow(memory_size(&batch))?;
+        self.memory.retain(&batch)?;
         local.batches.push(batch);
         Ok(())
     }
@@ -843,14 +962,13 @@ impl Collector {
     }
 
     /// Take the rows collected since they were last taken, once all threads
-    /// combined them, with their memory.
+    /// combined them: their memory is retained until the table is dropped.
     fn take(&self) -> Arc<WorkingTable> {
         let batches = std::mem::take(&mut *self.batches.lock());
-        let reservation = self.reservation.split(self.reservation.size());
         Arc::new(WorkingTable::new(
             Arc::clone(&self.schema),
             batches,
-            reservation,
+            Arc::clone(&self.memory),
         ))
     }
 }
@@ -1016,18 +1134,23 @@ impl WorkTableScanSource {
         }
     }
 
-    /// Lower a DataFusion `WorkTableExec` to a [`WorkTableScanSource`] with
-    /// the same schema. Returns `Ok(None)` for any other node.
+    /// Lower a [`PipelineWorkTableExec`] or a DataFusion `WorkTableExec` to a
+    /// [`WorkTableScanSource`] with the same schema. Returns `Ok(None)` for
+    /// any other node.
     ///
     /// It scans the working table of the [`PhysicalRecursiveCte`] of its name
     /// that runs it, so that it only runs in the recursive term of one (see
     /// [`PhysicalRecursiveCte::try_lower`]), as a `WorkTableExec` only runs in
     /// the recursive term of a `RecursiveQueryExec`.
     pub fn try_lower(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Self>> {
-        let Some(scan) = plan.downcast_ref::<WorkTableExec>() else {
+        let name = if let Some(scan) = plan.downcast_ref::<PipelineWorkTableExec>() {
+            scan.cte_name()
+        } else if let Some(scan) = plan.downcast_ref::<WorkTableExec>() {
+            scan.name()
+        } else {
             return Ok(None);
         };
-        Ok(Some(Self::new(scan.name(), plan.schema())))
+        Ok(Some(Self::new(name, plan.schema())))
     }
 
     /// The name of the recursive query whose working table it scans.
@@ -1081,25 +1204,8 @@ impl PhysicalOperator for WorkTableScanSource {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
-        let Some(table) = ctx
-            .task_ctx
-            .session_config()
-            .get_extension::<WorkTables>()
-            .and_then(|tables| tables.table(&self.name))
-        else {
-            return internal_err!(
-                "{} runs outside of the recursive term of its recursive query",
-                self.description()
-            );
-        };
-        let Some(projection) = work_table_projection(&self.schema, &table.schema) else {
-            return internal_err!(
-                "The columns of {} are not columns of its recursive query: {:?} vs {:?}",
-                self.description(),
-                self.schema,
-                table.schema
-            );
-        };
+        let (table, projection) =
+            scanned_work_table(&self.name, &self.schema, &ctx.task_ctx)?;
         Ok(Arc::new(WorkTableScanState {
             table,
             projection,
@@ -1115,23 +1221,171 @@ impl PhysicalOperator for WorkTableScanSource {
     ) -> Result<SourceResult> {
         let state = downcast_state::<WorkTableScanState>(gstate.as_any(), self.name())?;
         let block = state.next_block.fetch_add(1, Ordering::Relaxed);
-        let Some(batch) = state.table.block(block) else {
+        let Some((columns, rows)) = state.table.scan(block, &state.projection) else {
             return Ok(SourceResult::Finished);
         };
         let chunk = if self.schema.fields().is_empty() {
-            DataChunk::try_new_without_columns(
-                Arc::clone(&self.schema),
-                batch.num_rows(),
-            )?
+            DataChunk::try_new_without_columns(Arc::clone(&self.schema), rows)?
         } else {
-            let columns = state
-                .projection
-                .iter()
-                .map(|&column| Arc::clone(batch.column(column)))
-                .collect();
             DataChunk::try_new(Arc::clone(&self.schema), columns, None)?
         };
         Ok(SourceResult::Chunk(chunk))
+    }
+}
+
+/// The working table that a scan of the working table of the recursive query
+/// `name`, with the fields of `schema`, reads in an execution with the task
+/// context `task_ctx` (see the [module documentation](self#the-working-table)),
+/// and the columns of the table that it reads.
+fn scanned_work_table(
+    name: &str,
+    schema: &Schema,
+    task_ctx: &TaskContext,
+) -> Result<(Arc<WorkingTable>, Vec<usize>)> {
+    let Some(table) = task_ctx
+        .session_config()
+        .get_extension::<WorkTables>()
+        .and_then(|tables| tables.table(name))
+    else {
+        return internal_err!(
+            "A scan of the working table of {name} runs outside of the recursive term of \
+             its recursive query"
+        );
+    };
+    let Some(projection) = work_table_projection(schema, &table.schema) else {
+        return internal_err!(
+            "The columns of a scan of the working table of {name} are not columns of its \
+             recursive query: {schema:?} vs {:?}",
+            table.schema
+        );
+    };
+    Ok((table, projection))
+}
+
+/// A scan of the working table of a [`PhysicalRecursiveCte`] as a DataFusion
+/// [`ExecutionPlan`]: it takes the place of the `WorkTableExec`s of the
+/// recursive term of the CTE (see [`PhysicalRecursiveCte::try_lower`]), so
+/// that the nodes of the recursive term that DataFusion executes (in the plans
+/// of `BridgeOperator`s, e.g. a node that no native operator implements, or
+/// that the planner leaves to DataFusion in sessions with a memory limit) read
+/// the working table of the CTE too, rather than the one of DataFusion's
+/// `RecursiveQueryExec`, which the CTE does not fill.
+///
+/// The planner lowers it to a [`WorkTableScanSource`]. Where DataFusion
+/// executes it, it streams the rows of the working table that a
+/// [`WorkTableScanSource`] with its schema scans, which it finds in the task
+/// context of its execution in the same way (a `BridgeOperator` executes its
+/// plan with the task context of its pipeline).
+#[derive(Debug)]
+pub struct PipelineWorkTableExec {
+    /// The name of the CTE.
+    name: String,
+    properties: Arc<PlanProperties>,
+}
+
+impl PipelineWorkTableExec {
+    /// A scan of the working table of the recursive query `name`, of the
+    /// columns of the fields of `schema`: like a `WorkTableExec` with schema
+    /// `schema`.
+    pub fn new(name: impl Into<String>, schema: SchemaRef) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        )
+        .with_scheduling_type(SchedulingType::Cooperative);
+        Self {
+            name: name.into(),
+            properties: Arc::new(properties),
+        }
+    }
+
+    /// The name of the recursive query whose working table it scans.
+    pub fn cte_name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl DisplayAs for PipelineWorkTableExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "PipelineWorkTableExec: name={}", self.name)
+            }
+            DisplayFormatType::TreeRender => write!(f, "name={}", self.name),
+        }
+    }
+}
+
+impl ExecutionPlan for PipelineWorkTableExec {
+    fn name(&self) -> &str {
+        "PipelineWorkTableExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return internal_err!("PipelineWorkTableExec does not have children");
+        }
+        Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return internal_err!(
+                "PipelineWorkTableExec has a single partition, got partition {partition}"
+            );
+        }
+        let schema = self.schema();
+        let (table, projection) = scanned_work_table(&self.name, &schema, &context)?;
+        let batch_schema = Arc::clone(&schema);
+        let batches = (0..table.blocks.len()).map(move |block| {
+            let (columns, rows) = table
+                .scan(block, &projection)
+                .ok_or_else(|| internal_datafusion_err!("No block {block}"))?;
+            let options = RecordBatchOptions::new().with_row_count(Some(rows));
+            Ok(RecordBatch::try_new_with_options(
+                Arc::clone(&batch_schema),
+                columns,
+                &options,
+            )?)
+        });
+        let stream =
+            RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches));
+        Ok(Box::pin(cooperative(stream)))
     }
 }
 
@@ -1153,17 +1407,20 @@ mod tests {
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::memory_pool::GreedyMemoryPool;
     use datafusion_physical_plan::collect;
+    use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
     use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+    use datafusion_physical_plan::union::UnionExec;
+    use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
     use futures::StreamExt;
 
     use crate::PipelineQueryPlanner;
-    use crate::bridge::{BridgeOperator, PipelineRootExec};
+    use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::explain::{format_operator_tree, format_pipelines};
     use crate::operators::union::test_support::count;
     use crate::planner::lower_execution_plan;
     use crate::test_utils::{
-        EngineOutput, compare_outputs, datafusion_context, pipeline_context, run_engines,
-        run_sql, test_session_config,
+        EngineOutput, compare_outputs, datafusion_context, pipeline_context, run_sql,
+        test_session_config,
     };
 
     // ---------------------------------------------------------------------
@@ -1218,7 +1475,7 @@ mod tests {
     /// tree of the pipeline engine.
     ///
     /// The results are compared in canonical form (see
-    /// [`compare_outputs`]): the results of the queries are unambiguous.
+    /// [`assert_same_results_in`]).
     async fn assert_native_recursion<F>(
         sql: &str,
         config: SessionConfig,
@@ -1227,20 +1484,61 @@ mod tests {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        let (expected, actual) = with_timeout(run_engines(sql, config, setup))
-            .await
-            .unwrap_or_else(|e| {
-                panic!("Failed to run query on both engines: {e}\nquery: {sql}")
-            });
+        let datafusion = datafusion_context(config.clone());
+        assert_native_recursion_in(sql, datafusion, pipeline_context(config), setup).await
+    }
+
+    /// [`assert_native_recursion`], with the session `datafusion` of
+    /// DataFusion and the session `pipeline` of the pipeline engine.
+    async fn assert_native_recursion_in<F>(
+        sql: &str,
+        datafusion: SessionContext,
+        pipeline: SessionContext,
+        setup: F,
+    ) -> Arc<dyn PhysicalOperator>
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let (_, actual) = assert_same_results_in(sql, datafusion, pipeline, setup).await;
         let root = lowered(&actual);
+        assert_recursion_is_native(&root, sql);
+        root
+    }
+
+    /// Assert that `sql` returns the same results in the session `datafusion`
+    /// of DataFusion and in the session `pipeline` of the pipeline engine,
+    /// both set up with `setup`, and return their outputs.
+    ///
+    /// The results are compared in canonical form (see
+    /// [`compare_outputs`]): the results of the queries are unambiguous.
+    async fn assert_same_results_in<F>(
+        sql: &str,
+        datafusion: SessionContext,
+        pipeline: SessionContext,
+        setup: F,
+    ) -> (EngineOutput, EngineOutput)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        setup(&datafusion).await.expect("setup");
+        setup(&pipeline).await.expect("setup");
+        let outputs = with_timeout(async {
+            Ok::<_, DataFusionError>((
+                run_sql(&datafusion, sql).await?,
+                run_sql(&pipeline, sql).await?,
+            ))
+        })
+        .await;
+        let (expected, actual) = outputs.unwrap_or_else(|e| {
+            panic!("Failed to run query on both engines: {e}\nquery: {sql}")
+        });
         if let Err(message) = compare_outputs(&expected, &actual) {
             panic!(
                 "Results differ: {message}\nquery: {sql}\nlowered: {}",
-                format_operator_tree(&root)
+                format_operator_tree(&lowered(&actual))
             );
         }
-        assert_recursion_is_native(&root, sql);
-        root
+        (expected, actual)
     }
 
     /// The directory of the data files of the recursive queries of
@@ -1750,8 +2048,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn recursive_queries_whose_working_tables_datafusion_reads_are_left_to_it()
-    -> Result<()> {
+    async fn lowering_of_recursive_queries_built_by_hand() -> Result<()> {
         let ctx = datafusion_context(test_session_config());
         let state = ctx.state();
         let lower = |plan: &Arc<dyn ExecutionPlan>| {
@@ -1800,32 +2097,203 @@ mod tests {
         );
         let output = with_timeout(Executor::collect(root, ctx.task_ctx(), 4)).await?;
         assert_eq!(sorted_values(&output), vec![1, 2, 3]);
+        Ok(())
+    }
 
-        // Lowered for any session, cross joins are left to DataFusion (they
-        // do not reserve their memory): so is a recursive query whose working
-        // table is scanned below one, as DataFusion would read its working
-        // table, which the native operator does not fill.
-        let sql = "WITH RECURSIVE recursive_cte AS (SELECT 1 as val UNION ALL ( \
-                     WITH sub_cte AS (SELECT 2 as val) \
-                     SELECT 2 as val FROM recursive_cte CROSS JOIN sub_cte \
-                     WHERE recursive_cte.val < 2)) \
-                   SELECT * FROM recursive_cte";
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let root = lower_execution_plan(&plan)?;
-        assert_eq!(count::<PhysicalRecursiveCte>(&root), 0);
+    /// The numbers of [`PipelineWorkTableExec`]s and of `WorkTableExec`s in the
+    /// DataFusion plan `plan`.
+    fn work_table_scans_of(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+        let mut counts = (
+            usize::from(plan.is::<PipelineWorkTableExec>()),
+            usize::from(plan.is::<WorkTableExec>()),
+        );
+        for child in plan.children() {
+            let (native, datafusion) = work_table_scans_of(child);
+            counts.0 += native;
+            counts.1 += datafusion;
+        }
+        counts
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipeline_work_tables_take_the_place_of_the_scans_of_the_working_table()
+    -> Result<()> {
+        let n = || Field::new("n", DataType::Int64, true);
+        let scan = |name: &str| -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(WorkTableExec::new(
+                name.to_string(),
+                Arc::new(Schema::new(vec![n()])),
+                None,
+            )?))
+        };
+        // The scans of `t` in a union with a scan of `u`, and in a recursive
+        // query `t`, whose recursive term reads its own working table (as SQL
+        // scopes them, and as DataFusion binds them).
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(RecursiveQueryExec::try_new(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![n()])),
+            scan("t")?,
+            scan("t")?,
+            true,
+        )?);
+        let plan = UnionExec::try_new(vec![scan("t")?, scan("u")?, inner])?;
+        assert_eq!(work_table_scans_of(&plan), (0, 4));
+        let bound = with_pipeline_work_tables(&plan, "t")?;
+        assert_eq!(work_table_scans_of(&bound), (2, 2));
+        assert_eq!(bound.schema(), plan.schema());
+        let inner = recursive_query(&bound).expect("the inner recursive query");
+        let inner = inner.downcast_ref::<RecursiveQueryExec>().unwrap();
+        assert!(inner.static_term().is::<PipelineWorkTableExec>());
+        assert!(inner.recursive_term().is::<WorkTableExec>());
+        // Plans without scans of the working table are not rebuilt.
+        let unbound = with_pipeline_work_tables(&plan, "v")?;
+        assert!(Arc::ptr_eq(&unbound, &plan));
+
+        // A `PipelineWorkTableExec` is lowered to a scan of the working table.
+        let schema = Arc::new(Schema::new(vec![n()]));
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(PipelineWorkTableExec::new("t", Arc::clone(&schema)));
+        let source = WorkTableScanSource::try_lower(&exec)?.expect("a scan");
+        assert_eq!(source.name(), "t");
+        assert_eq!(source.schema(), schema);
+        // It has the properties of a `WorkTableExec`.
+        let datafusion = scan("t")?;
+        assert_eq!(exec.schema(), datafusion.schema());
+        assert_eq!(exec.output_partitioning().partition_count(), 1);
+        assert_eq!(exec.boundedness(), datafusion.boundedness());
+        assert_eq!(exec.pipeline_behavior(), datafusion.pipeline_behavior());
+        assert!(exec.children().is_empty());
+        assert_eq!(
+            datafusion_physical_plan::displayable(exec.as_ref())
+                .one_line()
+                .to_string()
+                .trim_end(),
+            "PipelineWorkTableExec: name=t"
+        );
+        let with_children = Arc::clone(&exec).replace_children(
+            vec![Arc::clone(&datafusion)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        );
+        assert!(with_children.is_err());
+        // It reads the working table of a recursive query that runs it: here
+        // there is none.
+        let ctx = datafusion_context(test_session_config());
+        let error = exec.execute(1, ctx.task_ctx()).err().expect("an error");
+        assert!(error.to_string().contains("single partition"), "{error}");
+        let error = exec.execute(0, ctx.task_ctx()).err().expect("an error");
         assert!(
-            bridged_plans(&root)
-                .iter()
-                .any(|plan| plan.is::<RecursiveQueryExec>()),
+            error.to_string().contains("outside of the recursive term"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    /// The recursive query of `cte.slt` (for issue 9680) whose recursive term
+    /// scans its working table below a cross join.
+    const CROSS_JOIN: &str = "WITH RECURSIVE recursive_cte AS (SELECT 1 as val UNION ALL ( \
+           WITH sub_cte AS (SELECT 2 as val) \
+           SELECT 2 as val FROM recursive_cte CROSS JOIN sub_cte \
+           WHERE recursive_cte.val < 2)) \
+         SELECT * FROM recursive_cte";
+
+    /// Whether the DataFusion plan `plan` has a [`PipelineWorkTableExec`].
+    fn scans_native_work_table(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.is::<PipelineWorkTableExec>()
+            || plan.children().into_iter().any(scans_native_work_table)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_nodes_that_datafusion_executes_read_the_working_table_of_the_cte()
+    -> Result<()> {
+        let ctx = datafusion_context(test_session_config());
+        // Lowered for any session, cross joins are left to DataFusion (they do
+        // not reserve their memory yet): DataFusion executes the cross join of
+        // the recursive term, whose scan of the working table reads the
+        // working table of the native CTE.
+        let plan = ctx.sql(CROSS_JOIN).await?.create_physical_plan().await?;
+        let root = lower_execution_plan(&plan)?;
+        assert_recursion_is_native(&root, CROSS_JOIN);
+        let cte = root
+            .downcast_ref::<PhysicalRecursiveCte>()
+            .expect("a native recursive query");
+        let bridged = bridged_plans(cte.recursive_term());
+        assert!(
+            bridged.iter().any(scans_native_work_table),
             "{}",
             format_operator_tree(&root)
         );
         let output = with_timeout(Executor::collect(root, ctx.task_ctx(), 4)).await?;
         assert_eq!(sorted_values(&output), vec![1, 2]);
-        // For a session without a memory limit, it is native.
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-        let root = lower(&plan)?;
-        assert_recursion_is_native(&root, sql);
+        Ok(())
+    }
+
+    /// A session of DataFusion and one of the pipeline engine with `config`;
+    /// the memory pool of the latter has a limit of 1 GiB.
+    fn sessions_with_a_memory_limit(
+        config: SessionConfig,
+    ) -> Result<(SessionContext, SessionContext)> {
+        let pool = Arc::new(GreedyMemoryPool::new(1 << 30));
+        Ok((
+            datafusion_context(config.clone()),
+            pipeline_context_with_pool(config, pool)?,
+        ))
+    }
+
+    /// Whether a recursive query of the DataFusion plan `plan` is below a node
+    /// that the planner leaves to DataFusion, with its whole subtree, in a
+    /// session whose memory pool has a limit: a nested loop join, a cross join
+    /// or a window (see `lower_execution_plan_with_runtime`).
+    fn is_below_node_of_unlimited_memory(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        fn has_recursive_query(plan: &Arc<dyn ExecutionPlan>) -> bool {
+            plan.is::<RecursiveQueryExec>()
+                || plan.children().into_iter().any(has_recursive_query)
+        }
+        let unlimited = plan.is::<CrossJoinExec>()
+            || plan.is::<NestedLoopJoinExec>()
+            || plan.is::<WindowAggExec>()
+            || plan.is::<BoundedWindowAggExec>();
+        (unlimited && has_recursive_query(plan))
+            || plan
+                .children()
+                .into_iter()
+                .any(is_below_node_of_unlimited_memory)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recursions_are_native_in_sessions_with_a_memory_limit() -> Result<()> {
+        // In a session whose memory pool has a limit, the planner leaves the
+        // windows, nested loop joins and cross joins to DataFusion (they do
+        // not reserve their memory yet), with their whole subtrees: also
+        // those of recursive terms that scan the working table, which read the
+        // working table of the native CTE. So the recursive queries of
+        // `cte.slt` are native but those below such nodes: the two inputs of
+        // the cross join of `SELECT * FROM my_cte t1, my_cte`.
+        let dir = tempfile::tempdir()?;
+        let dir = dir.path().to_str().unwrap().to_owned();
+        write_parquet_files(&dir).await?;
+        let setup = async |ctx: &SessionContext| register_cte_tables(ctx, &dir).await;
+        let mut native = 0;
+        for sql in CTE_SLT_QUERIES {
+            let (datafusion, pipeline) =
+                sessions_with_a_memory_limit(test_session_config())?;
+            let (expected, actual) =
+                assert_same_results_in(sql, datafusion, pipeline, &setup).await;
+            if !is_below_node_of_unlimited_memory(&expected.plan) {
+                assert_recursion_is_native(&lowered(&actual), sql);
+                native += 1;
+            }
+        }
+        assert_eq!(native, CTE_SLT_QUERIES.len() - 1);
+        // The cross join of the recursive term is left to DataFusion, and
+        // reads the working table of the native CTE.
+        let (datafusion, pipeline) = sessions_with_a_memory_limit(test_session_config())?;
+        let root =
+            assert_native_recursion_in(CROSS_JOIN, datafusion, pipeline, &setup).await;
+        assert!(
+            bridged_plans(&root).iter().any(scans_native_work_table),
+            "{}",
+            format_operator_tree(&root)
+        );
         Ok(())
     }
 
@@ -2110,15 +2578,19 @@ mod tests {
     // Memory
     // ---------------------------------------------------------------------
 
-    /// A session of the pipeline engine whose memory pool is `pool`.
-    fn pipeline_context_with_pool(pool: Arc<dyn MemoryPool>) -> Result<SessionContext> {
+    /// A session of the pipeline engine with `config`, whose memory pool is
+    /// `pool`.
+    fn pipeline_context_with_pool(
+        config: SessionConfig,
+        pool: Arc<dyn MemoryPool>,
+    ) -> Result<SessionContext> {
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(pool)
             .build_arc()?;
         let planner =
             PipelineQueryPlanner::new(Arc::new(DefaultPhysicalPlanner::default()));
         let state = SessionStateBuilder::new()
-            .with_config(test_session_config())
+            .with_config(config)
             .with_runtime_env(runtime)
             .with_default_features()
             .with_query_planner(Arc::new(planner))
@@ -2196,8 +2668,10 @@ mod tests {
                 "WITH RECURSIVE t(n) AS (SELECT v FROM numbers {union} \
                  SELECT n + 1 FROM t WHERE n < 0) SELECT count(*) FROM t"
             );
-            let ctx =
-                pipeline_context_with_pool(Arc::new(GreedyMemoryPool::new(256 << 10)))?;
+            let ctx = pipeline_context_with_pool(
+                test_session_config(),
+                Arc::new(GreedyMemoryPool::new(256 << 10)),
+            )?;
             register_numbers(&ctx, 100_000)?;
             let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
             let root = plan
@@ -2232,8 +2706,10 @@ mod tests {
                 "{error}"
             );
             // In a pool in which the rows fit, both engines return them.
-            let ctx =
-                pipeline_context_with_pool(Arc::new(GreedyMemoryPool::new(64 << 20)))?;
+            let ctx = pipeline_context_with_pool(
+                test_session_config(),
+                Arc::new(GreedyMemoryPool::new(64 << 20)),
+            )?;
             register_numbers(&ctx, 100_000)?;
             let actual = with_timeout(run_sql(&ctx, &sql)).await?;
             let ctx = datafusion_context(test_session_config());
@@ -2241,6 +2717,95 @@ mod tests {
             let expected = with_timeout(run_sql(&ctx, &sql)).await?;
             compare_outputs(&expected, &actual).map_err(DataFusionError::Internal)?;
         }
+        Ok(())
+    }
+
+    /// Register the table `big` of a single batch of the values `0..rows`
+    /// (`v BIGINT NOT NULL`), of which the scans slice their chunks.
+    fn register_big(ctx: &SessionContext, rows: i64) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+        )?;
+        ctx.register_table(
+            "big",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]])?),
+        )?;
+        Ok(())
+    }
+
+    /// Run `sql` over the table `big` of `rows` rows (see [`register_big`]) on
+    /// the pipeline engine, with a [`PeakPool`], and assert that it returns
+    /// the rows that DataFusion returns. Returns the memory that the rows of
+    /// the recursive query `t` reserved: now (after the query), and its peak.
+    async fn reserved_for_big_rows(sql: &str, rows: i64) -> Result<(usize, usize)> {
+        let pool = Arc::new(PeakPool::default());
+        let ctx =
+            pipeline_context_with_pool(test_session_config(), Arc::clone(&pool) as _)?;
+        register_big(&ctx, rows)?;
+        let actual = with_timeout(run_sql(&ctx, sql)).await?;
+        assert_recursion_is_native(&lowered(&actual), sql);
+        let ctx = datafusion_context(test_session_config());
+        register_big(&ctx, rows)?;
+        let expected = with_timeout(run_sql(&ctx, sql)).await?;
+        compare_outputs(&expected, &actual).map_err(DataFusionError::Internal)?;
+        Ok(pool.consumer("PhysicalRecursiveCte[t]"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recursions_reserve_the_buffers_that_their_rows_retain() -> Result<()> {
+        // A batch of 1,000,000 rows of 8 bytes.
+        let rows = 1_000_000;
+        let batch = 8 * rows as usize;
+
+        // A row that the limit slices from the batch retains all of it: the
+        // CTE reserves the whole batch, which does not fit in 64 KiB.
+        let one_row = "WITH RECURSIVE t(n) AS ((SELECT v FROM big LIMIT 1) UNION ALL \
+                       SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t";
+        let ctx = pipeline_context_with_pool(
+            test_session_config(),
+            Arc::new(GreedyMemoryPool::new(64 << 10)),
+        )?;
+        register_big(&ctx, rows)?;
+        let plan = ctx.sql(one_row).await?.create_physical_plan().await?;
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_recursion_is_native(root.operator(), one_row);
+        let error = with_timeout(collect(plan, ctx.task_ctx()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("PhysicalRecursiveCte[t]"),
+            "{error}"
+        );
+        let (reserved, peak) = reserved_for_big_rows(one_row, rows).await?;
+        assert!(peak >= batch && peak < batch + (64 << 10), "{peak} bytes");
+        assert_eq!(reserved, 0);
+
+        // The scan slices the chunks of the term from the same batch: they
+        // share its buffer, which the CTE reserves once.
+        let all_rows = "WITH RECURSIVE t(n) AS (SELECT v FROM big UNION ALL \
+                        SELECT n + 1 FROM t WHERE n < 0) SELECT count(*), sum(n) FROM t";
+        let (reserved, peak) = reserved_for_big_rows(all_rows, rows).await?;
+        assert!(peak >= batch && peak < batch + (64 << 10), "{peak} bytes");
+        assert_eq!(reserved, 0);
+
+        // The recursive term passes the strings of the static term (1,000 of
+        // 1,000 bytes) on: the terms share their buffers, which the CTE
+        // reserves once.
+        let strings = "WITH RECURSIVE t(n, s) AS (SELECT v, repeat('x', 1000) FROM big \
+                       UNION ALL SELECT n + 1000, s FROM t WHERE n < 5000) \
+                       SELECT count(*), sum(n), sum(length(s)) FROM t";
+        let (reserved, peak) = reserved_for_big_rows(strings, 1000).await?;
+        let strings = 1000 * 1000;
+        assert!(peak >= strings && peak < strings * 3 / 2, "{peak} bytes");
+        assert_eq!(reserved, 0);
         Ok(())
     }
 
@@ -2255,7 +2820,10 @@ mod tests {
                  SELECT count(*), sum(n), max(n) FROM t"
             );
             let pool = Arc::new(PeakPool::default());
-            let ctx = pipeline_context_with_pool(Arc::clone(&pool) as _)?;
+            let ctx = pipeline_context_with_pool(
+                test_session_config(),
+                Arc::clone(&pool) as _,
+            )?;
             register_numbers(&ctx, 4096)?;
             let actual = with_timeout(run_sql(&ctx, &sql)).await?;
             assert_recursion_is_native(&lowered(&actual), &sql);
@@ -2281,7 +2849,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dropping_the_output_ends_a_recursion() -> Result<()> {
         let pool = Arc::new(PeakPool::default());
-        let ctx = pipeline_context_with_pool(Arc::clone(&pool) as _)?;
+        let ctx =
+            pipeline_context_with_pool(test_session_config(), Arc::clone(&pool) as _)?;
         let sql = "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) \
                    SELECT * FROM t";
         let mut stream = ctx.sql(sql).await?.execute_stream().await?;
