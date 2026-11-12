@@ -105,6 +105,7 @@
 //! that share it (e.g. the chunks that a scan slices from one batch, or a
 //! column that the recursive term passes on to the next term).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,19 +114,28 @@ use arrow::array::{ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::instant::Instant;
-use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::utils::memory::RecordBatchMemoryTracker;
 use datafusion_common::{Result, internal_datafusion_err, internal_err};
+use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType, reset_plan_states,
 };
+use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
+use datafusion_physical_plan::joins::HashJoinExec;
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::work_table::WorkTableExec;
 use datafusion_physical_plan::{
@@ -243,16 +253,17 @@ impl PhysicalRecursiveCte {
         &self.children[1]
     }
 
-    /// A fresh copy of the recursive term for an iteration: its DataFusion
-    /// plan, reset (see `reset_plan_states`) and lowered for the session of
-    /// `task_ctx`. Its scans of the working table read the working table of
-    /// the CTE, wherever they are: natively, or in the plans that DataFusion
-    /// executes (see [`PipelineWorkTableExec`]).
+    /// A fresh copy of the recursive term for an iteration: `plan`, the
+    /// DataFusion plan of the recursive term of the execution (see
+    /// [`Iterations`]), reset (see `reset_plan_states`) and lowered for the
+    /// session of `task_ctx`. Its scans of the working table read the working
+    /// table of the CTE, wherever they are: natively, or in the plans that
+    /// DataFusion executes (see [`PipelineWorkTableExec`]).
     fn lower_recursive_term(
-        &self,
+        plan: &Arc<dyn ExecutionPlan>,
         task_ctx: &TaskContext,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        let plan = reset_plan_states(Arc::clone(&self.recursive_plan))?;
+        let plan = reset_plan_states(Arc::clone(plan))?;
         let options = task_ctx.session_config().options();
         lower_execution_plan_with_runtime(
             &plan,
@@ -271,13 +282,16 @@ impl PhysicalRecursiveCte {
         recursion: &mut Recursion,
         working_table: Arc<WorkingTable>,
     ) -> Result<BoxFuture<'static, ()>> {
-        let iterations = recursion
-            .iterations
-            .get_or_insert_with(|| Iterations::new(&self.name, &ctx.task_ctx));
+        let iterations = match recursion.iterations.take() {
+            Some(iterations) => iterations,
+            None => Iterations::try_new(&self.name, &ctx.task_ctx, &self.recursive_plan)?,
+        };
+        let iterations = recursion.iterations.insert(iterations);
         // The scans of the working table read the rows of the last term.
         *iterations.work_tables.table.lock() = Some(working_table);
         iterations.count += 1;
-        let term = self.lower_recursive_term(&iterations.task_ctx)?;
+        let term =
+            Self::lower_recursive_term(&iterations.recursive_plan, &iterations.task_ctx)?;
         let sink: Arc<dyn PhysicalOperator> = Arc::new(RecursiveTermSink::try_new(
             term,
             Arc::clone(&state.collector),
@@ -659,9 +673,13 @@ enum Phase {
     Done,
 }
 
-/// What the iterations of a [`PhysicalRecursiveCte`] run with.
+/// What the iterations of an execution of a [`PhysicalRecursiveCte`] run
+/// with.
 #[derive(Debug)]
 struct Iterations {
+    /// The DataFusion plan of the recursive term, with dynamic filters of
+    /// this execution (see [`with_own_dynamic_filters`]).
+    recursive_plan: Arc<dyn ExecutionPlan>,
     /// The task context of the executions of the iterations, with
     /// `work_tables` in its session config.
     task_ctx: Arc<TaskContext>,
@@ -672,11 +690,17 @@ struct Iterations {
 }
 
 impl Iterations {
-    /// The task context for the iterations of the CTE `name` in an execution
-    /// with the task context `task_ctx`: `task_ctx`, whose session config
-    /// also holds the working table of the CTE, in front of those of the
-    /// recursive queries around it (in the session config of `task_ctx`).
-    fn new(name: &str, task_ctx: &TaskContext) -> Self {
+    /// What the iterations of the CTE `name`, with the recursive term
+    /// `recursive_plan`, run with in an execution with the task context
+    /// `task_ctx`: a copy of `recursive_plan` with dynamic filters of their
+    /// own, and `task_ctx`, whose session config also holds the working table
+    /// of the CTE, in front of those of the recursive queries around it (in
+    /// the session config of `task_ctx`).
+    fn try_new(
+        name: &str,
+        task_ctx: &TaskContext,
+        recursive_plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Self> {
         let config = task_ctx.session_config();
         let work_tables = Arc::new(WorkTables {
             name: name.to_owned(),
@@ -694,12 +718,172 @@ impl Iterations {
             task_ctx.window_functions().clone(),
             task_ctx.runtime_env(),
         );
-        Self {
+        Ok(Self {
+            recursive_plan: with_own_dynamic_filters(recursive_plan)?,
             task_ctx: Arc::new(task_ctx),
             work_tables,
             count: 0,
-        }
+        })
     }
+}
+
+/// The new dynamic filters of a copy of a plan, by the `expression_id`s of the
+/// filters of the plan that they replace.
+type NewFilters = HashMap<u64, Arc<DynamicFilterPhysicalExpr>>;
+
+/// A copy of `plan` (a DataFusion plan) with dynamic filters of its own: every
+/// `DynamicFilterPhysicalExpr` that a node of `plan` produces (a hash join,
+/// an aggregation or a TopK, the nodes that produce them) is replaced by a new
+/// filter with the same children, in the node that produces it and in the
+/// nodes that read it (the predicates of `FilterExec`s and of Parquet scans,
+/// into which DataFusion pushes the filters).
+///
+/// The nodes of a plan share their dynamic filters with every execution of the
+/// plan, and `reset_plan_states` resets them in place, for the next execution:
+/// the iterations of concurrent executions of a recursive query (of one plan)
+/// would set and read each other's filters, e.g. the bounds of the build keys
+/// of a hash join in another iteration, with which the scan of its probe side
+/// would skip the rows of this one. So every execution of a
+/// [`PhysicalRecursiveCte`] runs a copy of its recursive term with filters of
+/// its own, which its iterations reset.
+///
+/// A node that reads a filter but that this cannot rebuild with another one
+/// keeps the filter of `plan`, which no execution sets any more (its producer
+/// sets a new one): it prunes nothing with it.
+fn with_own_dynamic_filters(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut filters = NewFilters::new();
+    plan.apply(|node| {
+        for produced in node.dynamic_expressions_produced() {
+            if let Some(filter) = produced.downcast_ref::<DynamicFilterPhysicalExpr>()
+                && let Some(id) = filter.expression_id()
+            {
+                filters.entry(id).or_insert_with(|| {
+                    let children = filter.children().into_iter().cloned().collect();
+                    Arc::new(DynamicFilterPhysicalExpr::new(children, lit(true)))
+                });
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if filters.is_empty() {
+        return Ok(Arc::clone(plan));
+    }
+    with_new_filters(plan, &filters)
+}
+
+/// `plan` with the new filters of `filters` in place of the filters that they
+/// replace, in the nodes that produce and read them (see
+/// [`with_own_dynamic_filters`]).
+fn with_new_filters(
+    plan: &Arc<dyn ExecutionPlan>,
+    filters: &NewFilters,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let children = plan.children();
+    let mut replaced = false;
+    let mut new_children = Vec::with_capacity(children.len());
+    for child in children {
+        let new_child = with_new_filters(child, filters)?;
+        replaced |= !Arc::ptr_eq(&new_child, child);
+        new_children.push(new_child);
+    }
+    let node = if replaced {
+        Arc::clone(plan).replace_children(
+            new_children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?
+    } else {
+        Arc::clone(plan)
+    };
+    let node = with_new_produced_filter(node, filters)?;
+    with_new_read_filters(node, filters)
+}
+
+/// `node` producing the new filter of `filters` in place of the filter that
+/// it produces, if it is a hash join, an aggregation or a TopK that produces
+/// one.
+// `with_dynamic_filter_expr` is deprecated: DataFusion only uses it to restore
+// the filters of the plans that it decodes, and this to copy plans.
+#[expect(deprecated)]
+fn with_new_produced_filter(
+    node: Arc<dyn ExecutionPlan>,
+    filters: &NewFilters,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let Some(filter) = node
+        .dynamic_expressions_produced()
+        .iter()
+        .find_map(|produced| filters.get(&produced.expression_id()?))
+        .cloned()
+    else {
+        return Ok(node);
+    };
+    if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+        return Ok(Arc::new(
+            join.builder().build()?.with_dynamic_filter_expr(filter)?,
+        ));
+    }
+    if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
+        return Ok(Arc::new(
+            aggregate.clone().with_dynamic_filter_expr(filter)?,
+        ));
+    }
+    if let Some(sort) = node.downcast_ref::<SortExec>() {
+        return Ok(Arc::new(sort.clone().with_dynamic_filter_expr(filter)?));
+    }
+    Ok(node)
+}
+
+/// `node` reading the new filters of `filters` in place of the filters that
+/// they replace, if it is a `FilterExec` or a scan of Parquet files that
+/// reads some of them.
+fn with_new_read_filters(
+    node: Arc<dyn ExecutionPlan>,
+    filters: &NewFilters,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(filter) = node.downcast_ref::<FilterExec>() {
+        return Ok(match with_new_filters_in(filter.predicate(), filters)? {
+            Some(predicate) => Arc::new(
+                FilterExecBuilder::from(filter)
+                    .with_predicate(predicate)
+                    .build()?,
+            ),
+            None => node,
+        });
+    }
+    if let Some(scan) = node.downcast_ref::<DataSourceExec>()
+        && let Some((config, source)) = scan.downcast_to_file_source::<ParquetSource>()
+        && let Some(predicate) = source.filter()
+        && let Some(predicate) = with_new_filters_in(&predicate, filters)?
+    {
+        let config = FileScanConfigBuilder::from(config.clone())
+            .with_source(Arc::new(source.with_predicate(predicate)))
+            .build();
+        return Ok(Arc::new(scan.clone().with_data_source(Arc::new(config))));
+    }
+    Ok(node)
+}
+
+/// `expr` with the new filters of `filters` in place of the filters that they
+/// replace, `None` if it reads none of them.
+fn with_new_filters_in(
+    expr: &Arc<dyn PhysicalExpr>,
+    filters: &NewFilters,
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+    let rewritten = Arc::clone(expr).transform_up(|expr| {
+        let new_filter = expr
+            .downcast_ref::<DynamicFilterPhysicalExpr>()
+            .and_then(|filter| filters.get(&filter.expression_id()?));
+        let Some(new_filter) = new_filter else {
+            return Ok(Transformed::no(expr));
+        };
+        // The children of a filter that was pushed through projections are
+        // the columns of the node that reads it: so are those of its copy.
+        let children = expr.children().into_iter().cloned().collect();
+        let new_filter: Arc<dyn PhysicalExpr> = Arc::clone(new_filter) as _;
+        Ok(Transformed::yes(new_filter.with_new_children(children)?))
+    })?;
+    Ok(rewritten.transformed.then_some(rewritten.data))
 }
 
 /// The working tables that the scans of the execution of an iteration read:
@@ -810,50 +994,83 @@ impl Drop for WorkingTable {
 /// batch, e.g. a row sliced from a batch of a table), and batches may share
 /// buffers (e.g. the slices of a batch, or a column that the recursive term
 /// passes on to the next term). So the memory of the buffers is reserved in
-/// full, and once for all the batches that share them (DataFusion's
-/// [`RecordBatchMemoryTracker`]): a buffer is released once no batch of the
-/// recursion retains it any more.
+/// full, and once for all the batches that share them, and so is the memory
+/// of the array objects (DataFusion's [`RecordBatchMemoryTracker`]): a
+/// buffer is released once no batch of the recursion retains it any more.
+/// Besides, every batch retains its own structure (see
+/// [`batch_structure_size`]), which arrays without buffers (e.g. of nulls)
+/// consist of alone.
 #[derive(Debug)]
 struct RetainedMemory {
-    /// The buffers of the retained batches, and the reservation of their
-    /// memory.
-    buffers: Mutex<(RecordBatchMemoryTracker, MemoryReservation)>,
+    state: Mutex<RetainedState>,
+}
+
+#[derive(Debug)]
+struct RetainedState {
+    /// The buffers and the array objects of the retained batches.
+    arrays: RecordBatchMemoryTracker,
+    /// The sizes of the structures of the retained batches.
+    structures: usize,
+    /// The memory of both.
+    reservation: MemoryReservation,
 }
 
 impl RetainedMemory {
     fn new(reservation: MemoryReservation) -> Self {
         Self {
-            buffers: Mutex::new((RecordBatchMemoryTracker::new(), reservation)),
+            state: Mutex::new(RetainedState {
+                arrays: RecordBatchMemoryTracker::new(),
+                structures: 0,
+                reservation,
+            }),
         }
     }
 
-    /// Retain `batch`: reserve the memory of its buffers that no retained
-    /// batch retains yet. Fails with `ResourcesExhausted` (without retaining
-    /// it) if the memory pool cannot grant it.
+    /// Retain `batch`: reserve the memory of its structure, and of its
+    /// buffers and array objects that no retained batch retains yet. Fails
+    /// with `ResourcesExhausted` (without retaining it) if the memory pool
+    /// cannot grant it.
     fn retain(&self, batch: &RecordBatch) -> Result<()> {
-        let (tracker, reservation) = &mut *self.buffers.lock();
-        let added = tracker.count_batch(batch);
-        if let Err(error) = reservation.try_grow(added) {
-            tracker.uncount_batch(batch);
+        let state = &mut *self.state.lock();
+        let structure = batch_structure_size(batch);
+        let added = state.arrays.count_batch_with_array_overhead(batch) + structure;
+        if let Err(error) = state.reservation.try_grow(added) {
+            state.arrays.uncount_batch_with_array_overhead(batch);
             return Err(error);
         }
+        state.structures += structure;
         Ok(())
     }
 
     /// The recursion does not retain `batches` any more: release the memory
-    /// of their buffers that no other retained batch retains.
+    /// of their structures, and of their buffers and array objects that no
+    /// other retained batch retains.
     fn release(&self, batches: &[RecordBatch]) {
-        let (tracker, reservation) = &mut *self.buffers.lock();
+        let state = &mut *self.state.lock();
         for batch in batches {
-            tracker.uncount_batch(batch);
+            state.arrays.uncount_batch_with_array_overhead(batch);
+            state.structures =
+                state.structures.saturating_sub(batch_structure_size(batch));
         }
-        reservation.resize(tracker.memory_usage());
+        let retained = state.arrays.memory_usage() + state.structures;
+        state.reservation.resize(retained);
     }
 
     /// The memory reserved for the retained batches.
     fn reserved(&self) -> usize {
-        self.buffers.lock().1.size()
+        self.state.lock().reservation.size()
     }
+}
+
+/// The memory of the structure of `batch` that the CTE retains with it,
+/// besides its arrays: the batch itself (in the vector of the batches of its
+/// term), its vector of columns, and the blocks of the working table that
+/// slice it.
+fn batch_structure_size(batch: &RecordBatch) -> usize {
+    let blocks = batch.num_rows().div_ceil(DEFAULT_VECTOR_SIZE).max(1);
+    size_of::<RecordBatch>()
+        + batch.num_columns() * size_of::<ArrayRef>()
+        + blocks * size_of::<(usize, usize, usize)>()
 }
 
 /// Collects the rows of the terms of a recursion: the global state of the
@@ -1404,6 +1621,7 @@ mod tests {
     use datafusion::physical_planner::DefaultPhysicalPlanner;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::DataFusionError;
+    use datafusion_common_runtime::SpawnedTask;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::memory_pool::GreedyMemoryPool;
     use datafusion_physical_plan::collect;
@@ -2560,6 +2778,136 @@ mod tests {
         }
     }
 
+    /// The `expression_id`s of the dynamic filters that the nodes of `plan`
+    /// produce, and of those that its scans read.
+    fn dynamic_filters_of(plan: &Arc<dyn ExecutionPlan>) -> Result<(Vec<u64>, Vec<u64>)> {
+        let (mut produced, mut read) = (vec![], vec![]);
+        plan.apply(|node| {
+            produced.extend(
+                node.dynamic_expressions_produced()
+                    .iter()
+                    .filter_map(|filter| filter.expression_id()),
+            );
+            if node.is::<DataSourceExec>() {
+                node.apply_expressions(&mut |root| {
+                    root.apply(|expr| {
+                        read.extend(expr.expression_id());
+                        Ok(TreeNodeRecursion::Continue)
+                    })
+                })?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok((produced, read))
+    }
+
+    /// Write the Parquet file `nums.parquet` of the values 1 to 10,000 (`k`)
+    /// into `dir`, and return a session of the pipeline engine with a table
+    /// `nums` of it, on 1 thread, which pushes filters into Parquet scans.
+    async fn nums_session(dir: &str) -> Result<SessionContext> {
+        execute(
+            &datafusion_context(test_session_config()),
+            &format!(
+                "COPY (SELECT value AS k FROM generate_series(1, 10000)) \
+                 TO '{dir}/nums.parquet' STORED AS PARQUET"
+            ),
+        )
+        .await?;
+        let mut config = test_session_config().with_target_partitions(1);
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        let ctx = pipeline_context(config);
+        execute(
+            &ctx,
+            &format!(
+                "CREATE EXTERNAL TABLE nums STORED AS PARQUET LOCATION '{dir}/nums.parquet'"
+            ),
+        )
+        .await?;
+        Ok(ctx)
+    }
+
+    /// A recursive query whose hash join sets its dynamic filter to the key of
+    /// the iteration, with which the scan of its probe side (of `nums`)
+    /// skips the other rows.
+    const JOIN_WITH_DYNAMIC_FILTER: &str = "WITH RECURSIVE w(n) AS (SELECT 1 \
+        UNION ALL SELECT t.k FROM w JOIN nums t ON t.k = w.n + 1 WHERE w.n < 50) \
+        SELECT * FROM w";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn copies_of_recursive_terms_have_dynamic_filters_of_their_own() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = nums_session(dir.path().to_str().unwrap()).await?;
+        // The plan of DataFusion that the pipeline engine lowers.
+        let plan = ctx
+            .sql(JOIN_WITH_DYNAMIC_FILTER)
+            .await?
+            .create_physical_plan()
+            .await?;
+        let plan = Arc::clone(
+            plan.downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .input(),
+        );
+        let query = recursive_query(&plan).expect("a recursive query");
+        let term = query
+            .downcast_ref::<RecursiveQueryExec>()
+            .unwrap()
+            .recursive_term();
+        // The hash join produces a filter that the scan of its probe side
+        // reads.
+        let (produced, read) = dynamic_filters_of(term)?;
+        assert_eq!(produced.len(), 1, "{produced:?}");
+        assert_eq!(read, produced);
+        // A copy produces and reads a new filter, and the plan is unchanged.
+        let copy = with_own_dynamic_filters(term)?;
+        let (copy_produced, copy_read) = dynamic_filters_of(&copy)?;
+        assert_eq!(copy_produced.len(), 1, "{copy_produced:?}");
+        assert_eq!(copy_read, copy_produced);
+        assert_ne!(copy_produced, produced);
+        assert_eq!(dynamic_filters_of(term)?, (produced.clone(), read));
+        assert_eq!(copy.schema(), term.schema());
+        // So does every copy.
+        let (other_produced, _) = dynamic_filters_of(&with_own_dynamic_filters(term)?)?;
+        assert!(other_produced != produced && other_produced != copy_produced);
+        // A plan without dynamic filters is its own copy.
+        let unfiltered = numbers_exec(1)?;
+        assert!(Arc::ptr_eq(
+            &with_own_dynamic_filters(&unfiltered)?,
+            &unfiltered
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_executions_of_a_plan_have_their_own_dynamic_filters() -> Result<()>
+    {
+        // The executions of one plan must not skip their rows with the keys of
+        // each other's iterations.
+        let dir = tempfile::tempdir()?;
+        let ctx = nums_session(dir.path().to_str().unwrap()).await?;
+        let sql = JOIN_WITH_DYNAMIC_FILTER;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_recursion_is_native(root.operator(), sql);
+        for _ in 0..4 {
+            let executions = (0..8)
+                .map(|_| {
+                    let (plan, task_ctx) = (Arc::clone(&plan), ctx.task_ctx());
+                    SpawnedTask::spawn(async move { collect(plan, task_ctx).await })
+                })
+                .collect::<Vec<_>>();
+            for execution in executions {
+                let batches = with_timeout(execution.join())
+                    .await
+                    .expect("the execution panicked")?;
+                assert_eq!(sorted_values(&batches), (1..=50).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_errors_of_an_iteration_fail_the_query() -> Result<()> {
         // The fourth iteration divides by zero.
@@ -2793,11 +3141,12 @@ mod tests {
         assert_eq!(reserved, 0);
 
         // The scan slices the chunks of the term from the same batch: they
-        // share its buffer, which the CTE reserves once.
+        // share its buffer, which the CTE reserves once (besides the ~489
+        // chunks themselves, see `batch_structure_size`), not 489 times.
         let all_rows = "WITH RECURSIVE t(n) AS (SELECT v FROM big UNION ALL \
                         SELECT n + 1 FROM t WHERE n < 0) SELECT count(*), sum(n) FROM t";
         let (reserved, peak) = reserved_for_big_rows(all_rows, rows).await?;
-        assert!(peak >= batch && peak < batch + (64 << 10), "{peak} bytes");
+        assert!(peak >= batch && peak < batch + (1 << 20), "{peak} bytes");
         assert_eq!(reserved, 0);
 
         // The recursive term passes the strings of the static term (1,000 of
@@ -2809,6 +3158,47 @@ mod tests {
         let (reserved, peak) = reserved_for_big_rows(strings, 1000).await?;
         let strings = 1000 * 1000;
         assert!(peak >= strings && peak < strings * 3 / 2, "{peak} bytes");
+        assert_eq!(reserved, 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recursions_reserve_the_batches_that_they_retain() -> Result<()> {
+        // 100,000 batches of a single null, which have no buffers: the CTE
+        // retains their array objects and the batches themselves (at least
+        // the 40 bytes of a `RecordBatch` each, 4 MB), which do not fit in
+        // 64 KiB.
+        let sql = "WITH RECURSIVE t(n) AS (SELECT NULL FROM generate_series(1, 100000) \
+                   UNION ALL SELECT n FROM t WHERE false) SELECT count(*) FROM t";
+        let config = test_session_config().with_batch_size(1);
+        let ctx = pipeline_context_with_pool(
+            config.clone(),
+            Arc::new(GreedyMemoryPool::new(64 << 10)),
+        )?;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_recursion_is_native(root.operator(), sql);
+        let error = with_timeout(collect(plan, ctx.task_ctx()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("PhysicalRecursiveCte[t]"),
+            "{error}"
+        );
+        // Without a limit, the CTE reserves them while it retains them.
+        let pool = Arc::new(PeakPool::default());
+        let ctx = pipeline_context_with_pool(config.clone(), Arc::clone(&pool) as _)?;
+        let actual = with_timeout(run_sql(&ctx, sql)).await?;
+        let expected = with_timeout(run_sql(&datafusion_context(config), sql)).await?;
+        compare_outputs(&expected, &actual).map_err(DataFusionError::Internal)?;
+        let (reserved, peak) = pool.consumer("PhysicalRecursiveCte[t]");
+        assert!(peak >= 100_000 * size_of::<RecordBatch>(), "{peak} bytes");
         assert_eq!(reserved, 0);
         Ok(())
     }
