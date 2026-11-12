@@ -771,8 +771,10 @@ fn check_lowered_input(
 /// If a key has floating point values, the keys come first, with `-0.0`
 /// sorted as `+0.0` (see [`NormalizedFloats`]): the merge compares the keys so,
 /// and the order of the input would separate them if a key follows a key with
-/// both zeros. `Ok(None)` if the order cannot be sorted natively (e.g. keys of
-/// unions, which the row format orders by their type first).
+/// both zeros. So do keys with unions, which the inputs are sorted by as
+/// DataFusion compares them (see [`ComparableUnions`]; the row format orders
+/// NULL unions by their types), and the unions of the order of the input.
+/// `Ok(None)` if the order cannot be sorted natively.
 fn sort_order<'a>(
     input: &Arc<dyn ExecutionPlan>,
     keys: impl Iterator<Item = &'a PhysicalExprRef>,
@@ -784,15 +786,36 @@ fn sort_order<'a>(
     let mut key_order = Vec::with_capacity(keys.len());
     for (&key, &options) in keys.iter().zip(options) {
         let data_type = key.data_type(&schema)?;
-        let key: PhysicalExprRef = if has_float_leaf(&data_type) {
+        let mut key = Arc::clone(key);
+        if has_float_leaf(&data_type) {
             normalized = true;
-            Arc::new(NormalizedFloats::new(Arc::clone(key)))
-        } else {
-            Arc::clone(key)
-        };
+            key = Arc::new(NormalizedFloats::new(key));
+        }
+        if has_union(&data_type) {
+            normalized = true;
+            key = Arc::new(ComparableUnions::new(key));
+        }
         key_order.push(PhysicalSortExpr::new(key, options));
     }
-    let input_order = input.output_ordering().cloned();
+    let input_order = match input.output_ordering() {
+        Some(order) => {
+            let order = order
+                .iter()
+                .map(|sort_expr| {
+                    let expr = match has_union(&sort_expr.expr.data_type(&schema)?) {
+                        true => {
+                            Arc::new(ComparableUnions::new(Arc::clone(&sort_expr.expr)))
+                                as PhysicalExprRef
+                        }
+                        false => Arc::clone(&sort_expr.expr),
+                    };
+                    Ok(PhysicalSortExpr::new(expr, sort_expr.options))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            LexOrdering::new(order)
+        }
+        None => None,
+    };
     let ordering = match (input_order, normalized) {
         (Some(order), false) => Some(order),
         (Some(order), true) => LexOrdering::new(key_order.into_iter().chain(order)),
@@ -2105,6 +2128,75 @@ impl PhysicalExpr for NormalizedFloats {
     }
 }
 
+/// The values of `expr` with their unions (also those nested in them) as
+/// DataFusion compares them as join keys (see [`comparable_unions`]): a
+/// [`PhysicalMergeJoin`] sorts its inputs by them, as it compares its keys.
+#[derive(Debug, Eq)]
+pub(crate) struct ComparableUnions {
+    expr: PhysicalExprRef,
+}
+
+impl ComparableUnions {
+    pub(crate) fn new(expr: PhysicalExprRef) -> Self {
+        Self { expr }
+    }
+}
+
+impl PartialEq for ComparableUnions {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr.eq(&other.expr)
+    }
+}
+
+impl Hash for ComparableUnions {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.expr.hash(state);
+    }
+}
+
+impl fmt::Display for ComparableUnions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "comparable_unions({})", self.expr)
+    }
+}
+
+impl PhysicalExpr for ComparableUnions {
+    fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
+        Ok(comparable_type(&self.expr.data_type(input_schema)?))
+    }
+
+    /// A union is NULL where the value of its child is.
+    fn nullable(&self, input_schema: &Schema) -> Result<bool> {
+        Ok(self.expr.nullable(input_schema)?
+            || matches!(self.expr.data_type(input_schema)?, DataType::Union(_, _)))
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        let values = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        Ok(ColumnarValue::Array(comparable_unions(&values)?))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.expr]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        match (children.pop(), children.is_empty()) {
+            (Some(expr), true) => Ok(Arc::new(Self { expr })),
+            _ => internal_err!("ComparableUnions has exactly one child"),
+        }
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "comparable_unions(")?;
+        self.expr.fmt_sql(f)?;
+        write!(f, ")")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The inputs of joins that are read as streams, shared with the symmetric
 // hash join
@@ -2825,6 +2917,17 @@ impl PhysicalMergeJoin {
         self.streams_buffered
     }
 
+    /// Whether the join reads its streamed input as a stream too, as the
+    /// source of its pipeline (rather than as an operator in the pipeline of
+    /// its streamed input): a null-aware join (`NOT IN`) that reads its
+    /// buffered input as a stream, so that it learns of a NULL buffered key,
+    /// which proves it empty, and ends, also while the streamed input has no
+    /// rows (as the source of its pipeline, it reads the buffered rows up to
+    /// the first one before it waits for streamed rows).
+    pub fn reads_streamed_input(&self) -> bool {
+        self.streams_buffered && self.spec.null_aware
+    }
+
     fn streamed_input(&self) -> &Arc<dyn PhysicalOperator> {
         match self.spec.streamed {
             JoinSide::Left => self.left(),
@@ -2854,6 +2957,165 @@ impl PhysicalMergeJoin {
 
     /// The buffered rows of the execution of `ctx` (for a join that reads its
     /// buffered input as a stream): its global operator state.
+    /// The state of the thread that joins the streamed rows with the buffered
+    /// rows `buffered`.
+    fn stream_state(
+        &self,
+        ctx: &ExecutionContext,
+        buffered: Buffered,
+    ) -> Result<StreamState> {
+        let reservation =
+            MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
+        Ok(StreamState {
+            buffered,
+            reservation,
+            progress: MergeProgress {
+                converter: self.spec.key_converter()?,
+                cursor: 0,
+                group: None,
+                chunk: None,
+                run: None,
+            },
+        })
+    }
+
+    /// Join the streamed rows of `input` (a chunk of the streamed input, the
+    /// same one until they are all joined) with the buffered rows of `state`:
+    /// the next output, if any, and how the join goes on (as the result of
+    /// [`PhysicalOperator::execute`]).
+    fn join_streamed_chunk(
+        &self,
+        ctx: &ExecutionContext,
+        input: &DataChunk,
+        state: &mut StreamState,
+    ) -> Result<(Option<RecordBatch>, OperatorResult)> {
+        if state.progress.chunk.is_none() {
+            state.progress.chunk =
+                Some(self.start_chunk(&state.progress, input, &state.reservation)?);
+        }
+        let batch = match &state.buffered {
+            Buffered::Sorted(buffered) => {
+                let buffered = Arc::clone(buffered);
+                self.next_output(
+                    &mut state.progress,
+                    &buffered,
+                    &|_, _| true,
+                    &state.reservation,
+                )?
+                .batch
+            }
+            Buffered::Streamed(window) => {
+                let window = Arc::clone(window);
+                match self.next_streaming_output(
+                    ctx,
+                    &mut state.progress,
+                    &window,
+                    &state.reservation,
+                )? {
+                    StreamingStep::Output(batch) => batch,
+                    StreamingStep::Yield => {
+                        let interrupt = TaskInterrupt::yield_now();
+                        return Ok((None, OperatorResult::Blocked(interrupt)));
+                    }
+                    StreamingStep::Finished => {
+                        state.progress.chunk = None;
+                        return Ok((None, OperatorResult::Finished));
+                    }
+                    StreamingStep::Wait => {
+                        let interrupt = TaskInterrupt::waker_registered();
+                        return Ok((None, OperatorResult::Blocked(interrupt)));
+                    }
+                }
+            }
+        };
+        if state
+            .progress
+            .chunk
+            .as_ref()
+            .is_some_and(StreamedChunk::is_done)
+        {
+            state.progress.chunk = None;
+            return Ok((batch, OperatorResult::NeedMoreInput));
+        }
+        Ok((batch, OperatorResult::HaveMoreOutput))
+    }
+
+    /// The next output of a join that reads its streamed input as a stream
+    /// too (see [`Self::reads_streamed_input`]): the join reads the buffered
+    /// rows up to the first one first (the NULLs come first), as they come,
+    /// and ends if its key is NULL (as a null-aware join is then empty), also
+    /// while the streamed input has no rows; it then joins the streamed rows,
+    /// chunk by chunk, as an operator in the pipeline of the streamed input
+    /// would. `Blocked` while neither input has rows (the waker of the task of
+    /// `ctx` is registered with both), and after
+    /// [`STREAMED_CHUNKS_PER_CALL`] chunks without output.
+    fn next_merged_output(
+        &self,
+        ctx: &ExecutionContext,
+        source: &Mutex<MergedStreams>,
+    ) -> Result<SourceResult> {
+        let mut source = source.lock();
+        let MergedStreams {
+            streamed,
+            chunk,
+            state,
+        } = &mut *source;
+        let mut chunks = 0;
+        loop {
+            if let Buffered::Streamed(window) = &state.buffered {
+                let mut window = window.lock();
+                while !window.rows.has_null_key
+                    && window.rows.rows.is_empty()
+                    && window.pending.is_none()
+                    && !window.input.is_done()
+                {
+                    if window.poll_more(ctx, &self.spec)?.is_pending() {
+                        break;
+                    }
+                }
+                if window.rows.has_null_key {
+                    return Ok(SourceResult::Finished);
+                }
+            }
+            let input = match chunk {
+                Some(input) => input,
+                None => {
+                    if chunks == STREAMED_CHUNKS_PER_CALL {
+                        return Ok(SourceResult::Blocked(TaskInterrupt::yield_now()));
+                    }
+                    match streamed.poll_next(ctx) {
+                        Poll::Ready(Ok(Some(batch))) => {
+                            chunks += 1;
+                            chunk.insert(DataChunk::from_record_batch(batch))
+                        }
+                        Poll::Ready(Ok(None)) => return Ok(SourceResult::Finished),
+                        Poll::Ready(Err(e)) => return Err(e),
+                        Poll::Pending => {
+                            let interrupt = TaskInterrupt::waker_registered();
+                            return Ok(SourceResult::Blocked(interrupt));
+                        }
+                    }
+                }
+            };
+            if input.is_empty() {
+                *chunk = None;
+                continue;
+            }
+            let (batch, result) = self.join_streamed_chunk(ctx, input, state)?;
+            match result {
+                OperatorResult::NeedMoreInput => *chunk = None,
+                OperatorResult::HaveMoreOutput => {}
+                OperatorResult::Finished => return Ok(SourceResult::Finished),
+                OperatorResult::Blocked(interrupt) => {
+                    return Ok(SourceResult::Blocked(interrupt));
+                }
+            }
+            if let Some(batch) = batch {
+                return Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)));
+            }
+        }
+    }
+
     fn buffered_window(
         &self,
         ctx: &ExecutionContext,
@@ -4539,11 +4801,31 @@ enum UnmatchedScanState {
         next: Mutex<usize>,
         reservation: MemoryReservation,
     },
+    /// Not a scan: the rows of a join that reads its streamed input as a
+    /// stream too, by a single thread (see
+    /// [`PhysicalMergeJoin::reads_streamed_input`]).
+    Merged(Box<Mutex<MergedStreams>>),
 }
+
+/// The streamed input of a join that reads it as a stream (see
+/// [`PhysicalMergeJoin::reads_streamed_input`]), its chunk being joined, and
+/// the state of the join.
+struct MergedStreams {
+    streamed: NestedInput,
+    chunk: Option<DataChunk>,
+    state: StreamState,
+}
+
+/// A join that reads its streamed input as a stream (see
+/// [`PhysicalMergeJoin::reads_streamed_input`]) reads at most this many
+/// chunks of streamed rows without output in a call of `get_data` before it
+/// lets the other tasks run.
+const STREAMED_CHUNKS_PER_CALL: usize = 16;
 
 impl GlobalSourceState for UnmatchedScanState {
     fn max_threads(&self) -> usize {
         match self {
+            Self::Merged(_) => 1,
             Self::Sorted { buffered, .. } => {
                 buffered.rows.len().div_ceil(DEFAULT_VECTOR_SIZE).max(1)
             }
@@ -4782,19 +5064,7 @@ impl PhysicalOperator for PhysicalMergeJoin {
                 Buffered::Streamed(Arc::clone(&state.window))
             }
         };
-        let reservation =
-            MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
-        Ok(Box::new(StreamState {
-            buffered,
-            reservation,
-            progress: MergeProgress {
-                converter: self.spec.key_converter()?,
-                cursor: 0,
-                group: None,
-                chunk: None,
-                run: None,
-            },
-        }))
+        Ok(Box::new(self.stream_state(ctx, buffered)?))
     }
 
     fn execute(
@@ -4806,66 +5076,20 @@ impl PhysicalOperator for PhysicalMergeJoin {
         lstate: &mut dyn OperatorState,
     ) -> Result<OperatorResult> {
         let state = downcast_state_mut::<StreamState>(lstate.as_any_mut(), self.name())?;
-        if state.progress.chunk.is_none() {
-            state.progress.chunk =
-                Some(self.start_chunk(&state.progress, input, &state.reservation)?);
-        }
-        let batch = match &state.buffered {
-            Buffered::Sorted(buffered) => {
-                let buffered = Arc::clone(buffered);
-                self.next_output(
-                    &mut state.progress,
-                    &buffered,
-                    &|_, _| true,
-                    &state.reservation,
-                )?
-                .batch
-            }
-            Buffered::Streamed(window) => {
-                let window = Arc::clone(window);
-                match self.next_streaming_output(
-                    ctx,
-                    &mut state.progress,
-                    &window,
-                    &state.reservation,
-                )? {
-                    StreamingStep::Output(batch) => batch,
-                    StreamingStep::Yield => {
-                        return Ok(OperatorResult::Blocked(TaskInterrupt::yield_now()));
-                    }
-                    StreamingStep::Finished => {
-                        state.progress.chunk = None;
-                        return Ok(OperatorResult::Finished);
-                    }
-                    StreamingStep::Wait => {
-                        return Ok(OperatorResult::Blocked(
-                            TaskInterrupt::waker_registered(),
-                        ));
-                    }
-                }
-            }
-        };
+        let (batch, result) = self.join_streamed_chunk(ctx, input, state)?;
         if let Some(batch) = batch {
             *output = DataChunk::from_record_batch(batch);
         }
-        if state
-            .progress
-            .chunk
-            .as_ref()
-            .is_some_and(StreamedChunk::is_done)
-        {
-            state.progress.chunk = None;
-            return Ok(OperatorResult::NeedMoreInput);
-        }
-        Ok(OperatorResult::HaveMoreOutput)
+        Ok(result)
     }
 
     // ---------------------------------------------------------------------
-    // Source: the buffered rows without a match (`Full` joins)
+    // Source: the buffered rows without a match (`Full` joins), or the rows
+    // of a join that reads its streamed input as a stream too
     // ---------------------------------------------------------------------
 
     fn is_source(&self) -> bool {
-        self.spec.emits_unmatched_buffered_rows()
+        self.spec.emits_unmatched_buffered_rows() || self.reads_streamed_input()
     }
 
     /// The rows of a buffered input read as a stream are read by a single
@@ -4878,6 +5102,18 @@ impl PhysicalOperator for PhysicalMergeJoin {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
+        if self.reads_streamed_input() {
+            let state =
+                self.stream_state(ctx, Buffered::Streamed(self.buffered_window(ctx)?))?;
+            let streams = MergedStreams {
+                streamed: NestedInput::start(self.streamed_input(), ctx)?,
+                chunk: None,
+                state,
+            };
+            return Ok(Arc::new(UnmatchedScanState::Merged(Box::new(Mutex::new(
+                streams,
+            )))));
+        }
         let reservation =
             MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
         Ok(Arc::new(match self.streams_buffered {
@@ -4902,6 +5138,9 @@ impl PhysicalOperator for PhysicalMergeJoin {
     ) -> Result<SourceResult> {
         let state = downcast_state::<UnmatchedScanState>(gstate.as_any(), self.name())?;
         let batch = match state {
+            UnmatchedScanState::Merged(source) => {
+                return self.next_merged_output(ctx, source);
+            }
             UnmatchedScanState::Sorted {
                 buffered,
                 next,
@@ -4940,6 +5179,11 @@ impl PhysicalOperator for PhysicalMergeJoin {
         current: &mut PipelineBuilder,
         meta: &mut MetaPipelineBuilder<'_>,
     ) -> Result<()> {
+        // A join that reads both inputs as streams is the source of its
+        // pipeline.
+        if self.reads_streamed_input() {
+            return meta.build_source(current);
+        }
         let this = meta.current_operator()?;
         // The join merges the streamed rows in the pipeline of the streamed
         // input.
@@ -6762,6 +7006,84 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn null_aware_joins_of_streams_end_at_a_null_buffered_key_without_streamed_rows()
+    -> Result<()> {
+        // The `NOT IN` of streams that never end: the streamed (left) one
+        // produces nothing, the buffered (right) one a NULL key, and then
+        // both produce nothing, forever. The NULL proves the result empty:
+        // the join, which reads both streams, learns of it though no streamed
+        // row ever comes, and ends at once, as DataFusion's does.
+        let stream = |side: &str, keys: Vec<Option<i32>>| -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Int32, true),
+            ]));
+            let batches = match keys.is_empty() {
+                true => vec![],
+                false => vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from_iter_values(0..keys.len() as i64)),
+                            Arc::new(Int32Array::from(keys)),
+                        ],
+                    )
+                    .unwrap(),
+                ],
+            };
+            let key = col(&format!("{side}k"), &schema).unwrap();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                key,
+                SortOptions::new(false, true),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: Arc::clone(&schema),
+                batches,
+                forever: true,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let left = stream("l", vec![]);
+            let right = stream("r", vec![None]);
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(
+                SortMergeJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    None,
+                    JoinType::LeftAnti,
+                    vec![SortOptions::new(false, true)],
+                    NullEquality::NullEqualsNothing,
+                )?
+                .with_null_aware(true)?,
+            ))
+        };
+        let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+        assert_eq!(num_rows(&expected), 0);
+        let plan = plan()?;
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        assert_streaming_merge_join(&root, "NOT IN");
+        let join = root.downcast_ref::<PhysicalMergeJoin>().unwrap();
+        assert!(join.reads_streamed_input());
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        assert_eq!(num_rows(&actual.batches), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordered_joins_of_streams_with_signed_zeros_match_them() -> Result<()> {
         // Streams sorted by `(a, b)`, a float and an integer, in which `-0.0`
         // comes before `+0.0`: their rows `(-0.0, 5)` and `(+0.0, 1)` are not
@@ -7899,6 +8221,83 @@ pub(crate) mod tests {
             (false, NullEquality::NullEqualsNothing) => 2,
             _ => 3,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_keys_of_inputs_that_end_are_sorted_as_datafusion_compares_them()
+    -> Result<()> {
+        // Sort-merge joins of inputs that end, sorted by their union keys (see
+        // `union_key_layouts`), whose order a merge of their partitions relies
+        // on: the merge join sorts its inputs by the keys as DataFusion
+        // compares them (with all NULL unions together), natively, and matches
+        // the rows of DataFusion's sort-merge join.
+        for (name, keys) in union_key_layouts() {
+            for null_equality in [
+                NullEquality::NullEqualsNull,
+                NullEquality::NullEqualsNothing,
+            ] {
+                for join_type in [JoinType::Inner, JoinType::Left] {
+                    let context = format!("{name} {null_equality:?} {join_type}");
+                    let expected =
+                        reference_join_of_keys(&keys, join_type, null_equality).await?;
+                    // Inputs sorted by their keys (as DataFusion sorts them).
+                    let bounded = |side: &str, keys: &ArrayRef| {
+                        let batch = keyed_rows(side, keys);
+                        let schema = batch.schema();
+                        let order = LexOrdering::new([PhysicalSortExpr::new(
+                            col(&format!("{side}k"), &schema).unwrap(),
+                            SortOptions::default(),
+                        )])
+                        .unwrap();
+                        let source =
+                            MemorySourceConfig::try_new(&[vec![batch]], schema, None)
+                                .unwrap()
+                                .try_with_sort_information(vec![order])
+                                .unwrap();
+                        datafusion_datasource::source::DataSourceExec::from_data_source(
+                            source,
+                        ) as Arc<dyn ExecutionPlan>
+                    };
+                    let (left, right) = (bounded("l", &keys[0]), bounded("r", &keys[1]));
+                    let on =
+                        vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                    let join: Arc<dyn ExecutionPlan> =
+                        Arc::new(SortMergeJoinExec::try_new(
+                            left,
+                            right,
+                            on,
+                            None,
+                            join_type,
+                            vec![SortOptions::default()],
+                            null_equality,
+                        )?);
+                    let order = LexOrdering::new([PhysicalSortExpr::new(
+                        col("lk", &join.schema())?,
+                        SortOptions::default(),
+                    )])
+                    .unwrap();
+                    let plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(SortPreservingMergeExec::new(order, join));
+                    let root = crate::planner::lower_execution_plan(&plan)?;
+                    let tree = format_operator_tree(&root);
+                    assert_eq!(count::<PhysicalMergeJoin>(&root), 1, "{context}\n{tree}");
+                    assert_eq!(count::<MergeJoinSort>(&root), 2, "{context}\n{tree}");
+                    assert!(
+                        bridged_plans(&root)
+                            .iter()
+                            .all(|plan| !plan.is::<SortMergeJoinExec>()),
+                        "{context}\n{tree}"
+                    );
+                    let actual = run_native(&root, plan, task_ctx())
+                        .await
+                        .unwrap_or_else(|e| panic!("{context}: {e}\n{tree}"));
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!("Results differ: {message}\n{context}\n{tree}");
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
