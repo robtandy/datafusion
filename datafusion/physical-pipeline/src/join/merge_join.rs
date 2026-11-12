@@ -2114,15 +2114,16 @@ impl PhysicalMergeJoin {
     /// Join the streamed rows of the current chunk of `progress` with the
     /// buffered rows of a buffered input that the join reads as a stream (see
     /// [`Self::next_output`]): read the buffered rows as the streamed rows need
-    /// them, waiting for the stream (`Pending`, the waker of the task of `ctx`
-    /// is registered with it) when it has none.
+    /// them, waiting for the stream when it has none, or yielding after
+    /// [`BUFFERED_BATCHES_PER_CALL`] batches of buffered rows without output.
     fn next_streaming_output(
         &self,
         ctx: &ExecutionContext,
         progress: &mut MergeProgress,
         window: &Mutex<BufferedWindow>,
-    ) -> Result<Poll<Option<RecordBatch>>> {
+    ) -> Result<StreamingStep> {
         let mut window = window.lock();
+        let mut batches = 0;
         loop {
             // The rows that no later streamed row matches are dropped.
             if progress
@@ -2142,13 +2143,29 @@ impl PhysicalMergeJoin {
                 })?
             };
             if output.batch.is_some() || !output.needs_buffered_rows {
-                return Ok(Poll::Ready(output.batch));
+                return Ok(StreamingStep::Output(output.batch));
+            }
+            if batches == BUFFERED_BATCHES_PER_CALL {
+                return Ok(StreamingStep::Yield);
             }
             if window.poll_more(ctx, &self.spec)?.is_pending() {
-                return Ok(Poll::Pending);
+                return Ok(StreamingStep::Wait);
             }
+            batches += 1;
         }
     }
+}
+
+/// What a merge join that reads its buffered input as a stream does next
+/// (see [`PhysicalMergeJoin::next_streaming_output`]).
+enum StreamingStep {
+    /// Emit the output of the streamed rows joined so far (`None`: none).
+    Output(Option<RecordBatch>),
+    /// Wait for the buffered input, which has no rows yet: the waker of the
+    /// task is registered with it.
+    Wait,
+    /// Let the other tasks run, after reading many buffered rows.
+    Yield,
 }
 
 /// The output of [`PhysicalMergeJoin::next_output`].
@@ -2328,6 +2345,11 @@ struct BufferedWindow {
     /// release them when the rows are dropped.
     batch_bytes: VecDeque<usize>,
 }
+
+/// A join that reads its buffered input as a stream reads at most this many
+/// batches of buffered rows without output in a call of `execute` before it
+/// lets the other tasks run.
+const BUFFERED_BATCHES_PER_CALL: usize = 16;
 
 /// The join drops the buffered rows that no later streamed row matches once
 /// there are this many of them, and at least as many as the rows it keeps.
@@ -2774,9 +2796,11 @@ impl PhysicalOperator for PhysicalMergeJoin {
             Buffered::Streamed(window) => {
                 let window = Arc::clone(window);
                 match self.next_streaming_output(ctx, &mut state.progress, &window)? {
-                    Poll::Ready(batch) => batch,
-                    // The buffered input has no rows yet.
-                    Poll::Pending => {
+                    StreamingStep::Output(batch) => batch,
+                    StreamingStep::Yield => {
+                        return Ok(OperatorResult::Blocked(TaskInterrupt::yield_now()));
+                    }
+                    StreamingStep::Wait => {
                         return Ok(OperatorResult::Blocked(
                             TaskInterrupt::waker_registered(),
                         ));
@@ -2908,6 +2932,7 @@ pub(crate) mod tests {
     use arrow::compute::concat_batches;
     use arrow::compute::{SortColumn, lexsort_to_indices, take_record_batch};
     use arrow::datatypes::{Field, TimeUnit};
+    use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_datasource::memory::MemorySourceConfig;
@@ -3978,6 +4003,66 @@ pub(crate) mod tests {
             );
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_joins_of_sorted_streams_of_queries_are_native() {
+        // Streams sorted by their keys (NULLs first) that never end, for
+        // DataFusion: it plans a sort-merge join of their sort-preserving
+        // repartitionings, whose partitions it merges for the `ORDER BY`.
+        let setup = async |ctx: &SessionContext| {
+            for (side, name, rows, skew) in [("l", "s1", 300, 0), ("r", "s2", 500, 3)] {
+                let stream = sorted_stream(side, rows, skew, 1, false);
+                let stream = stream.downcast_ref::<StreamingTableExec>().unwrap();
+                let table = StreamingTable::try_new(
+                    data_schema(side),
+                    stream.partitions().clone(),
+                )?
+                .with_infinite_table(true)
+                .with_sort_order(vec![
+                    datafusion_expr::col(format!("{side}k")).sort(true, true),
+                ]);
+                ctx.register_table(name, Arc::new(table))?;
+            }
+            Ok(())
+        };
+        for sql in [
+            "SELECT s1.lk, s1.lid, s2.rid FROM s1 JOIN s2 ON s1.lk = s2.rk ORDER BY s1.lk NULLS FIRST",
+            "SELECT s1.lk, s1.lid, s2.rid FROM s1 LEFT JOIN s2 ON s1.lk = s2.rk AND s1.lid < s2.rid ORDER BY s1.lk NULLS FIRST",
+            "SELECT s1.lk, s1.lid FROM s1 WHERE EXISTS (SELECT 1 FROM s2 WHERE s2.rk = s1.lk) ORDER BY s1.lk NULLS FIRST",
+        ] {
+            let (mut expected, mut actual) =
+                with_timeout(run_engines(sql, sort_merge_config(4), setup))
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let root = Arc::clone(
+                actual
+                    .plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .expect("a pipeline plan")
+                    .operator(),
+            );
+            let tree = format_operator_tree(&root);
+            expected.ordered = false;
+            actual.ordered = false;
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!("Results differ: {message}\nquery: {sql}\nlowered: {tree}");
+            }
+            let mut join = &root;
+            while !join.is::<PhysicalMergeJoin>() {
+                join = join
+                    .children()
+                    .first()
+                    .unwrap_or_else(|| panic!("no merge join: {sql}\n{tree}"));
+            }
+            assert_streaming_merge_join(join, sql);
+            let ordering = LexOrdering::new([PhysicalSortExpr::new(
+                Arc::new(Column::new("lk", 0)),
+                SortOptions::new(false, true),
+            )])
+            .unwrap();
+            assert_sorted(&actual.batches, &ordering, sql);
+        }
     }
 
     #[test]
