@@ -29,7 +29,7 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
     TaskInterrupt, downcast_state, downcast_state_mut,
 };
-use crate::sources::batches::chunk_memory;
+use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// The number of batches that may wait for the writer of a
 /// [`PhysicalDataSink`], besides one for every thread.
@@ -264,7 +264,9 @@ impl PhysicalOperator for PhysicalDataSink {
                 let estimate = chunk_memory(input);
                 state.reservation.try_grow(estimate)?;
                 let batch = input.compact()?;
-                let size = batch.get_array_memory_size();
+                // The arrays of the batch, and the batch itself (all that a
+                // batch without columns takes), which a memory table holds.
+                let size = batch.get_array_memory_size() + batch_overhead(&batch);
                 match size.checked_sub(estimate) {
                     Some(more) => state.reservation.try_grow(more)?,
                     None => state.reservation.shrink(estimate - size),
@@ -627,6 +629,41 @@ mod tests {
         let root = lowered(&ctx, sql).await?;
         assert_eq!(count::<PhysicalDataSink>(&root), 1);
         assert_resources_exhausted(&ctx, sql).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_batches_without_columns_that_a_memory_table_holds_reserve_memory()
+    -> Result<()> {
+        // 100,000 batches of a row without columns, which take memory of
+        // their own only, inserted into a memory table.
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(1));
+        let batch =
+            RecordBatch::try_new_with_options(Arc::clone(&schema), vec![], &options)?;
+        let input = datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch; 100_000]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let table = Arc::new(tokio::sync::RwLock::new(vec![]));
+        let sink = MemSink::try_new(vec![Arc::clone(&table)], schema)?;
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(DataSinkExec::new(input, Arc::new(sink), None));
+        let ctx = pipeline_context_with_memory_limit(1);
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            plan,
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert_eq!(count::<PhysicalDataSink>(root.operator()), 1);
+        let error = collect(root, ctx.task_ctx()).await.unwrap_err();
+        assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        assert!(table.read().await.is_empty());
         Ok(())
     }
 
