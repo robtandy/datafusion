@@ -842,6 +842,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_partitions_of_a_stream_that_never_ends_end_with_their_rows() {
+        // A stream of `(k, id)` = `(0, 0..100)`, then `(1, 0..100)`, which
+        // then stays pending, repartitioned by a hash of `id` into four
+        // partitions (keeping their order), whose partial sorts keep their
+        // first row: four rows, and the query ends.
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let schema = pairs_schema();
+            let batches = (0..2)
+                .map(|k| {
+                    RecordBatch::try_new(
+                        pairs_schema(),
+                        vec![
+                            Arc::new(arrow::array::Int64Array::from(vec![k; 100])),
+                            Arc::new(arrow::array::Int64Array::from_iter_values(0..100)),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let k = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+            let id = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+            let stream =
+                datafusion_physical_plan::streaming::StreamingTableExec::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Pairs(batches, true))],
+                    None,
+                    [LexOrdering::new(vec![k.clone()]).unwrap()],
+                    true,
+                    None,
+                )
+                .unwrap();
+            let hash = Partitioning::Hash(vec![col("b", &schema).unwrap()], 4);
+            let repartition = RepartitionExec::try_new(Arc::new(stream), hash)
+                .unwrap()
+                .with_preserve_order();
+            Arc::new(
+                PartialSortExec::new(
+                    LexOrdering::new(vec![k, id]).unwrap(),
+                    Arc::new(repartition),
+                    1,
+                )
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(1)),
+            )
+        };
+        let lowered = assert_plan_lowered(make_plan, test_session_config(), false);
+        let root = tokio::time::timeout(std::time::Duration::from_secs(30), lowered)
+            .await
+            .expect("the partial sorts end once every partition has its row");
+        assert_eq!(count::<PhysicalPartialSortOfPartitions>(&root), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_rows_of_the_partitions_reserve_memory() -> Result<()> {
         let make_plan = partial_sort_of_partitions(5, false, None).await?;
         let ctx = datafusion_context(test_session_config());
