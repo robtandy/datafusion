@@ -744,7 +744,8 @@ impl PhysicalHashJoin {
 
     /// The join, setting the dynamic filters `targets` too, each to the
     /// predicates of its probe keys, when its build side is finalized (see
-    /// [`Self::dynamic_filter_predicates`]), and marking them complete:
+    /// the [module documentation](self#dynamic-filters)), and marking them
+    /// complete:
     ///
     /// * a filter of all the keys is set like the filters of the
     ///   `HashJoinExec` the join was lowered from (with the lookup of the keys

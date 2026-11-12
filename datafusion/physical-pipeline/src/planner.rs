@@ -63,10 +63,10 @@
 //! filters, to the scans below its probe side that produce its probe keys
 //! unchanged: through projections, filters, sorts, unions, other joins and
 //! aggregations grouped by the keys, but never into the null side of an outer
-//! join, nor across a node that changes the values of the keys or limits its
-//! rows. The scans skip the rows that no build key matches, which the join
-//! would drop anyway, also several joins below it: see
-//! `Lowering::try_lower_hash_join`.
+//! join, nor across a node that changes the values of the keys, limits its
+//! rows or evaluates volatile expressions. The scans skip the rows that no
+//! build key matches, which the join would drop anyway, also several joins
+//! below it: see `Lowering::try_lower_hash_join`.
 //!
 //! Windows, nested loop joins and cross joins keep all of their rows in
 //! memory without reserving it in the memory pool, while the DataFusion nodes
@@ -196,6 +196,7 @@ use datafusion_expr::logical_plan::Explain;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::analyze::AnalyzeExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -776,7 +777,8 @@ impl Lowering<'_> {
     /// or semi join to the other) and aggregations grouped by the keys, but
     /// not into the null side of an outer join (whose columns the join fills
     /// with nulls for the rows of its other side without a match), nor across
-    /// a node that changes their values or limits its rows. Every such scan
+    /// a node that changes their values, limits its rows or evaluates volatile
+    /// expressions (which would be evaluated on fewer rows). Every such scan
     /// gets a filter of the keys it produces, over its own columns, which the
     /// join sets with its own (see [`PhysicalHashJoin::with_filter_targets`]),
     /// and is lowered with it (see [`Self::lower_scan`]): the scans then skip
@@ -1799,14 +1801,22 @@ struct ScanTarget {
 /// They are not followed through any other node, nor through nodes with a
 /// limit (whose rows other rows would replace), aggregations with a limit on
 /// their groups, windows (whose values are computed over other rows), or into
-/// scans with a limit.
+/// scans with a limit. Nor through (or into) nodes that evaluate volatile
+/// expressions (e.g. `random() < 0.5`, or a function that numbers its rows):
+/// removing rows below them would change how often these are evaluated, as
+/// reordering the conjuncts of a filter would, which the native filter does
+/// not do either (see
+/// [`AdaptiveFilter`](crate::operators::adaptive_filter::AdaptiveFilter)).
 fn scan_targets(
     plan: &Arc<dyn ExecutionPlan>,
     columns: Vec<Option<usize>>,
     deep: bool,
     targets: &mut Vec<ScanTarget>,
 ) {
-    if columns.iter().all(Option::is_none) || plan.fetch().is_some() {
+    if columns.iter().all(Option::is_none)
+        || plan.fetch().is_some()
+        || evaluates_volatile_expressions(plan)
+    {
         return;
     }
     if plan.is::<DataSourceExec>() {
@@ -1931,6 +1941,22 @@ fn scan_targets(
     }
     scan_targets(left, left_columns, true, targets);
     scan_targets(right, right_columns, true, targets);
+}
+
+/// Whether `plan` evaluates a volatile expression (e.g. `random()`): its own
+/// expressions (not those of its inputs), such as the predicate of a filter,
+/// the expressions of a projection, the keys and the filter of a join, or the
+/// projection and the predicate of a scan.
+fn evaluates_volatile_expressions(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut volatile = false;
+    let _ = plan.apply_expressions(&mut |expr| {
+        volatile = is_volatile(expr);
+        Ok(match volatile {
+            true => TreeNodeRecursion::Stop,
+            false => TreeNodeRecursion::Continue,
+        })
+    });
+    volatile
 }
 
 /// Whether removing the rows of the left and of the right input of a join of
@@ -9425,6 +9451,100 @@ mod join_filters {
             .map(|evaluated| evaluated.load(std::sync::atomic::Ordering::SeqCst))
             .collect::<Vec<_>>();
         assert_eq!(evaluated, vec![1000, 1000], "{sql}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn join_filters_do_not_change_how_often_volatile_expressions_are_evaluated()
+    -> Result<()> {
+        // Joins whose keys reach scans through nodes that evaluate the volatile
+        // `next_key()` (see `NextKey`) on every row: a filter of the 4,000 rows
+        // of the memory table `fact` below an aggregation, and the projection
+        // of the scan of the Parquet file `vpq` of 1,000 rows (with
+        // `pushdown_filters`, which would filter the rows of the file before
+        // its projection). The filters of the joins are not routed below these
+        // nodes, which would evaluate `next_key()` on fewer rows: both engines
+        // evaluate it on every row, and return the same results.
+        let dir = tempfile::tempdir()?;
+        let generator = datafusion_context(test_session_config());
+        let collect = async |sql: &str| generator.sql(sql).await?.collect().await;
+        let values = collect("SELECT value AS v FROM generate_series(0, 999)").await?;
+        let path = dir.path().join("vpq").join("part-0.parquet");
+        write_parquet(&path, values[0].schema(), &values, None)?;
+        let tables = [
+            (
+                "keys",
+                collect("SELECT value AS dk FROM generate_series(0, 99)").await?,
+            ),
+            (
+                "keys3",
+                collect("SELECT value AS dk FROM generate_series(0, 2)").await?,
+            ),
+            (
+                "fact",
+                collect("SELECT value % 100 AS fk FROM generate_series(0, 3999)").await?,
+            ),
+        ];
+        let counters = std::sync::Mutex::new(vec![]);
+        let setup = async |ctx: &SessionContext| {
+            let evaluated = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            counters
+                .lock()
+                .expect("counters")
+                .push(Arc::clone(&evaluated));
+            ctx.register_udf(datafusion_expr::ScalarUDF::new_from_impl(NextKey {
+                evaluated,
+                signature: datafusion_expr::Signature::nullary(
+                    datafusion_expr::Volatility::Volatile,
+                ),
+            }));
+            for (name, batches) in &tables {
+                let schema = batches[0].schema();
+                let table = MemTable::try_new(schema, vec![batches.clone()])?;
+                ctx.register_table(*name, Arc::new(table))?;
+            }
+            let path = dir.path().join("vpq");
+            ctx.register_parquet(
+                "vpq",
+                path.to_str().expect("a path"),
+                Default::default(),
+            )
+            .await?;
+            Ok(())
+        };
+        for (sql, column, evaluated) in [
+            (
+                "SELECT k.dk, a.n FROM keys3 k JOIN \
+                 (SELECT fk, COUNT(*) AS n FROM fact WHERE next_key() >= 0 GROUP BY fk) a \
+                 ON k.dk = a.fk",
+                "fk",
+                4000,
+            ),
+            (
+                "SELECT COUNT(*) AS n, MIN(x.r) >= 0 AS valid FROM keys k JOIN \
+                 (SELECT p.v, p.r FROM (SELECT v, next_key() AS r FROM vpq) p \
+                  CROSS JOIN (SELECT * FROM (VALUES (1), (2)) AS t(x)) t) x \
+                 ON k.dk = x.v",
+                "v",
+                1000,
+            ),
+        ] {
+            counters.lock().expect("counters").clear();
+            let mut config = semantics_config();
+            config.options_mut().execution.parquet.pushdown_filters = true;
+            let (actual, _) = assert_same_results(sql, config, setup).await;
+            let scans = scans(&actual);
+            let scan = scan_of(&scans, column, sql);
+            assert_eq!(scan.routed, Vec::<String>::new(), "{scan:?}\n{sql}");
+            assert_eq!(scan.filtered_with, Vec::<String>::new(), "{scan:?}\n{sql}");
+            let counts = counters
+                .lock()
+                .expect("counters")
+                .iter()
+                .map(|evaluated| evaluated.load(std::sync::atomic::Ordering::SeqCst))
+                .collect::<Vec<_>>();
+            assert_eq!(counts, vec![evaluated, evaluated], "{sql}");
+        }
         Ok(())
     }
 }

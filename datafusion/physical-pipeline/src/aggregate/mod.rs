@@ -72,9 +72,23 @@
 //! the values of an `ARRAY_AGG` without `ORDER BY`, which of the groups that
 //! tie a top-k aggregation keeps, and which groups a soft limit keeps.
 //!
+//! # Dynamic filters
+//!
+//! While it aggregates its input, the operator tightens the dynamic filters
+//! that the scans below it read, so that they skip the files, row groups and
+//! rows that cannot change its result (see `dynamic_filter`): the filter of
+//! the bounds of the `MIN` and `MAX` aggregates of an aggregation without
+//! `GROUP BY` that DataFusion's partial `AggregateExec` produces, which the
+//! threads set to their bounds as DataFusion's partitions do, and the filters
+//! that the operator publishes itself into its input, of the bounds of a
+//! single stage aggregation of `MIN` and `MAX` aggregates and of the cutoffs
+//! of the top-k aggregations, for which DataFusion produces none. Which rows
+//! the scans skip depends on the threads too, and is the engine's own.
+//!
 //! [`Accumulator`]: datafusion_expr::Accumulator
 //! [`GroupsAccumulator`]: datafusion_expr::GroupsAccumulator
 
+mod dynamic_filter;
 mod grouped_ht;
 mod hash_aggregate;
 mod radix_ht;
@@ -1302,8 +1316,8 @@ mod tests {
         // Three files of small row groups, scanned by the native
         // `ParquetScanSource`. DataFusion pushes a dynamic filter of the
         // ungrouped `MIN` and `MAX` aggregates into the scan, which it
-        // tightens as it aggregates; the native aggregation leaves it as it
-        // is, which filters nothing.
+        // tightens as it aggregates, and so does the native aggregation (see
+        // `dynamic_filter`, whose tests show how the scans prune with it).
         let dir = tempfile::tempdir()?;
         let batches = test_table_t1()?.into_iter().flatten().collect::<Vec<_>>();
         let properties = ::parquet::file::properties::WriterProperties::builder()
