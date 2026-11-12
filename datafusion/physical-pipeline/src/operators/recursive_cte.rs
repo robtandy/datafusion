@@ -116,7 +116,7 @@ use arrow::datatypes::{Schema, SchemaRef};
 use datafusion_common::instant::Instant;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::utils::memory::RecordBatchMemoryTracker;
-use datafusion_common::{Result, internal_datafusion_err, internal_err};
+use datafusion_common::{DataFusionError, Result, internal_datafusion_err, internal_err};
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
@@ -734,7 +734,8 @@ type NewFilters = HashMap<u64, Arc<DynamicFilterPhysicalExpr>>;
 /// A copy of `plan` (a DataFusion plan) with dynamic filters of its own: every
 /// `DynamicFilterPhysicalExpr` that a node of `plan` produces (a hash join,
 /// an aggregation or a TopK, the nodes that produce them) is replaced by a new
-/// filter with the same children, in the node that produces it and in the
+/// filter with the same children, in the node that produces it (an
+/// aggregation also with bounds of its own, see `with_own_bounds`) and in the
 /// nodes that read it (the predicates of `FilterExec`s and of Parquet scans,
 /// into which DataFusion pushes the filters).
 ///
@@ -770,34 +771,59 @@ fn with_own_dynamic_filters(
     if filters.is_empty() {
         return Ok(Arc::clone(plan));
     }
-    with_new_filters(plan, &filters)
+    Ok(with_new_filters(plan, &filters))
 }
 
 /// `plan` with the new filters of `filters` in place of the filters that they
 /// replace, in the nodes that produce and read them (see
 /// [`with_own_dynamic_filters`]).
+///
+/// A node that cannot be built again (with another filter, e.g. an
+/// aggregation that cannot have bounds of its own, or with other children,
+/// e.g. a hash join with a prepared build side) is kept as it is, rather than
+/// failing the query: the new filters that the readers of its filters read
+/// are then set by nothing, so they prune nothing, and a subtree that cannot
+/// be built again keeps the filters of `plan`, shared with its other
+/// executions.
 fn with_new_filters(
     plan: &Arc<dyn ExecutionPlan>,
     filters: &NewFilters,
-) -> Result<Arc<dyn ExecutionPlan>> {
+) -> Arc<dyn ExecutionPlan> {
+    let kept = |error: DataFusionError| {
+        log::debug!(
+            "{} keeps the dynamic filters of its plan: {error}",
+            plan.name()
+        );
+        Arc::clone(plan)
+    };
     let children = plan.children();
     let mut replaced = false;
     let mut new_children = Vec::with_capacity(children.len());
     for child in children {
-        let new_child = with_new_filters(child, filters)?;
+        let new_child = with_new_filters(child, filters);
         replaced |= !Arc::ptr_eq(&new_child, child);
         new_children.push(new_child);
     }
     let node = if replaced {
-        Arc::clone(plan).replace_children(
+        match Arc::clone(plan).replace_children(
             new_children,
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
-        )?
+        ) {
+            Ok(node) => node,
+            Err(error) => return kept(error),
+        }
     } else {
         Arc::clone(plan)
     };
-    let node = with_new_produced_filter(node, filters)?;
-    with_new_read_filters(node, filters)
+    with_new_produced_filter(Arc::clone(&node), filters)
+        .and_then(|node| with_new_read_filters(node, filters))
+        .unwrap_or_else(|error| {
+            log::debug!(
+                "{} keeps the dynamic filters of its plan: {error}",
+                node.name()
+            );
+            node
+        })
 }
 
 /// `node` producing the new filter of `filters` in place of the filter that
@@ -825,13 +851,42 @@ fn with_new_produced_filter(
     }
     if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
         return Ok(Arc::new(
-            aggregate.clone().with_dynamic_filter_expr(filter)?,
+            with_own_bounds(aggregate)?.with_dynamic_filter_expr(filter)?,
         ));
     }
     if let Some(sort) = node.downcast_ref::<SortExec>() {
         return Ok(Arc::new(sort.clone().with_dynamic_filter_expr(filter)?));
     }
     Ok(node)
+}
+
+/// A copy of `aggregate`, an aggregation that produces a dynamic filter, with
+/// bounds of its own: DataFusion's aggregation (when DataFusion executes it)
+/// sets the filter from the bounds of its aggregates (e.g. `v > <the largest
+/// v so far>` for `MAX(v)`), which its partitions share, and so would the
+/// copies of `aggregate` that share them. Only the aggregations without groups
+/// and limits of the first stage (of `MIN` and `MAX`) produce dynamic
+/// filters, which `AggregateExec::try_new` builds again with new bounds. Any
+/// other aggregation (which it would build otherwise) is an error: it is then
+/// kept as it is, with the filter of the plan (see [`with_new_filters`]).
+fn with_own_bounds(aggregate: &AggregateExec) -> Result<AggregateExec> {
+    let rebuilt = AggregateExec::try_new(
+        *aggregate.mode(),
+        aggregate.group_expr().clone(),
+        aggregate.aggr_expr().to_vec(),
+        aggregate.filter_expr().to_vec(),
+        Arc::clone(aggregate.input()),
+        aggregate.input_schema(),
+    )?;
+    if aggregate.limit_options().is_none()
+        && rebuilt.limit_options().is_none()
+        && rebuilt.schema() == aggregate.schema()
+        && !rebuilt.dynamic_expressions_produced().is_empty()
+    {
+        Ok(rebuilt)
+    } else {
+        internal_err!("{} cannot be built again", aggregate.name())
+    }
 }
 
 /// `node` reading the new filters of `filters` in place of the filters that
@@ -1618,12 +1673,16 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::functions_aggregate::min_max::max_udaf;
     use datafusion::physical_planner::DefaultPhysicalPlanner;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::DataFusionError;
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::memory_pool::GreedyMemoryPool;
+    use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
     use datafusion_physical_plan::collect;
     use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
     use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
@@ -2875,6 +2934,179 @@ mod tests {
             &with_own_dynamic_filters(&unfiltered)?,
             &unfiltered
         ));
+        Ok(())
+    }
+
+    /// A node that passes the rows of its input on, but cannot be built again
+    /// with another input (as a hash join with a prepared build side).
+    #[derive(Debug)]
+    struct Unrebuildable {
+        input: Arc<dyn ExecutionPlan>,
+    }
+
+    impl DisplayAs for Unrebuildable {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(f, "Unrebuildable")
+        }
+    }
+
+    impl ExecutionPlan for Unrebuildable {
+        fn name(&self) -> &str {
+            "Unrebuildable"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            internal_err!("Unrebuildable cannot be built again")
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[expect(deprecated)] // `with_dynamic_filter_expr`, to set up the filter
+    async fn nodes_that_cannot_be_rebuilt_keep_the_dynamic_filters_of_the_plan()
+    -> Result<()> {
+        // A hash join whose dynamic filter a `FilterExec` of its probe side
+        // reads, below a node that cannot be built again.
+        let build = numbers_exec(1)?;
+        let probe = numbers_exec(1)?;
+        let key = col("n", &probe.schema())?;
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&key)],
+            lit(true),
+        ));
+        let read: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(Arc::clone(&filter) as _, probe)?);
+        let probe: Arc<dyn ExecutionPlan> = Arc::new(Unrebuildable { input: read });
+        let join = HashJoinExec::try_new(
+            Arc::clone(&build),
+            probe,
+            vec![(col("n", &build.schema())?, key)],
+            None,
+            &datafusion_common::JoinType::Inner,
+            None,
+            datafusion_physical_plan::joins::PartitionMode::CollectLeft,
+            datafusion_common::NullEquality::NullEqualsNothing,
+            false,
+        )?
+        .with_dynamic_filter_expr(Arc::clone(&filter))?;
+        let join: Arc<dyn ExecutionPlan> = Arc::new(join);
+        let filters_of = |plan: &Arc<dyn ExecutionPlan>| {
+            let mut ids = (vec![], vec![]);
+            let _ = plan.apply(|node| {
+                ids.0.extend(
+                    node.dynamic_expressions_produced()
+                        .iter()
+                        .filter_map(|filter| filter.expression_id()),
+                );
+                if node.is::<FilterExec>() {
+                    let _ = node.apply_expressions(&mut |root| {
+                        root.apply(|expr| {
+                            ids.1.extend(expr.expression_id());
+                            Ok(TreeNodeRecursion::Continue)
+                        })
+                    });
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            ids
+        };
+        let (produced, read) = filters_of(&join);
+        assert_eq!(read, produced);
+        // The copy of the join produces a new filter, but the `FilterExec` is
+        // kept with the filter of the plan, which nothing sets any more: it
+        // filters nothing out.
+        let copy = with_own_dynamic_filters(&join)?;
+        let (copy_produced, copy_read) = filters_of(&copy);
+        assert_eq!(copy_produced.len(), 1);
+        assert_ne!(copy_produced, produced);
+        assert_eq!(copy_read, read);
+        let ctx = datafusion_context(test_session_config());
+        let output = collect(copy, ctx.task_ctx()).await?;
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn copies_of_aggregations_have_bounds_of_their_own() -> Result<()> {
+        // A partial `MAX(v)` over the values 0 to 99, whose dynamic filter
+        // DataFusion's aggregation sets to `v > <the largest value so far>`:
+        // the largest value is kept in bounds shared by its partitions.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let max = AggregateExprBuilder::new(max_udaf(), vec![col("v", &schema)?])
+            .schema(Arc::clone(&schema))
+            .alias("max(v)")
+            .build()?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(0..100))],
+        )?;
+        let input =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        let aggregate: Arc<dyn ExecutionPlan> = Arc::new(AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::default(),
+            vec![Arc::new(max)],
+            vec![None],
+            input,
+            schema,
+        )?);
+        let filter_of = |plan: &Arc<dyn ExecutionPlan>| -> Result<String> {
+            let [filter] = plan.dynamic_expressions_produced().try_into().unwrap();
+            let filter = filter.downcast_ref::<DynamicFilterPhysicalExpr>().unwrap();
+            Ok(filter.current()?.to_string())
+        };
+        let copy = with_own_dynamic_filters(&aggregate)?;
+        assert_eq!(copy.schema(), aggregate.schema());
+        // Every execution of the copy sets its own filter, from its own
+        // bounds...
+        let ctx = datafusion_context(test_session_config());
+        collect(Arc::clone(&copy), ctx.task_ctx()).await?;
+        assert_eq!(filter_of(&copy)?, "v@0 > 99");
+        assert_eq!(filter_of(&aggregate)?, "true");
+        // ...which an execution of the plan does not find set: it sets its
+        // filter too.
+        collect(Arc::clone(&aggregate), ctx.task_ctx()).await?;
+        assert_eq!(filter_of(&aggregate)?, "v@0 > 99");
         Ok(())
     }
 
