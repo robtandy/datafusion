@@ -26,7 +26,7 @@ use crate::operator::{
     ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
     SourceResult, TaskInterrupt, downcast_state_mut,
 };
-use crate::operators::materialized_cte::OuterCte;
+use crate::operators::materialized_cte::{MaterializedCtes, OuterCte};
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::planner::lower_execution_plan_with_cte_rows;
 use crate::sort::memory_size;
@@ -96,6 +96,28 @@ impl PhysicalStreamingMerge {
         self
     }
 
+    /// This merge, whose inputs are the native operators of `plans`, with the
+    /// materialized CTEs of `ctes` (those around the merge) that `plans`
+    /// scan, if any (see [`Self::with_outer_ctes`]).
+    pub(crate) fn with_outer_ctes_of(
+        self,
+        plans: Vec<Arc<dyn ExecutionPlan>>,
+        ctes: &MaterializedCtes,
+    ) -> Result<Self> {
+        let mut outer_ctes = vec![];
+        for plan in &plans {
+            for (id, cte) in ctes.scanned_by(plan)? {
+                if !outer_ctes.iter().any(|(outer, _)| *outer == id) {
+                    outer_ctes.push((id, cte));
+                }
+            }
+        }
+        Ok(match outer_ctes.is_empty() {
+            true => self,
+            false => self.with_outer_ctes(plans, outer_ctes),
+        })
+    }
+
     /// The inputs that an execution of the merge executes, in the execution
     /// of `ctx`.
     fn inputs(&self, ctx: &ExecutionContext) -> Result<Vec<Arc<dyn PhysicalOperator>>> {
@@ -112,11 +134,15 @@ impl PhysicalStreamingMerge {
             .iter()
             .map(|plan| {
                 let plan = reset_plan_states(Arc::clone(plan))?;
+                // As the planner lowers the inputs of a streaming merge (see
+                // `Lowering::try_lower_streaming_merge`): in pipelines without
+                // caches, which never end.
                 lower_execution_plan_with_cte_rows(
                     &plan,
                     options.as_ref(),
                     ctx.task_ctx.runtime_env().as_ref(),
                     &rows,
+                    true,
                 )
             })
             .collect()
@@ -953,6 +979,153 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(repeated, vec![&3], "{counts:?}");
         Ok(())
+    }
+
+    /// The materialized CTE `c` (with the id `id`) of `rows` of
+    /// `pairs_schema` (one partition), and the plan of its continuation that
+    /// `continuation` makes of a scan of it, sorted by `a`.
+    fn with_pairs_cte(
+        id: u64,
+        rows: (Vec<i64>, Vec<i64>),
+        continuation: impl FnOnce(Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion_physical_plan::materialized_cte::{
+            MaterializedCteBuffer, MaterializedCteExec, MaterializedCteScanExec,
+        };
+        let batch = RecordBatch::try_new(
+            pairs_schema(),
+            vec![
+                Arc::new(Int64Array::from(rows.0)),
+                Arc::new(Int64Array::from(rows.1)),
+            ],
+        )
+        .unwrap();
+        let body = datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            pairs_schema(),
+            None,
+        )
+        .unwrap();
+        let buffer = Arc::new(MaterializedCteBuffer::new(id, "c"));
+        let scan = Arc::new(
+            MaterializedCteScanExec::new(id, "c", pairs_schema(), 1)
+                .bind(Arc::clone(&buffer)),
+        );
+        let sorted = Arc::new(datafusion_physical_plan::sorts::sort::SortExec::new(
+            ordering(),
+            scan,
+        ));
+        Arc::new(MaterializedCteExec::new(body, continuation(sorted), buffer))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn partial_sorts_of_repartitionings_read_the_materialized_ctes_around_them() {
+        // A sorted materialized CTE, unioned with a stream (of an unbounded
+        // table), repartitioned by a hash of `b` into four partitions
+        // (keeping their order), whose partial sorts keep their first row,
+        // merged with a fetch of 4.
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            with_pairs_cte(9, (vec![0, 0, 0, 0, 1], vec![10, 11, 12, 13, 14]), |cte| {
+                let schema = pairs_schema();
+                let union = datafusion_physical_plan::union::UnionExec::try_new(vec![
+                    cte,
+                    ending_table(1),
+                ])
+                .unwrap();
+                let hash = Partitioning::Hash(vec![col("b", &schema).unwrap()], 4);
+                let repartition = RepartitionExec::try_new(union, hash)
+                    .unwrap()
+                    .with_preserve_order();
+                let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+                let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+                let ordering = LexOrdering::new(vec![a, b]).unwrap();
+                let sort =
+                    datafusion_physical_plan::sorts::partial_sort::PartialSortExec::new(
+                        ordering.clone(),
+                        Arc::new(repartition),
+                        1,
+                    )
+                    .with_preserve_partitioning(true)
+                    .with_fetch(Some(1));
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering, Arc::new(sort))
+                        .with_fetch(Some(4)),
+                )
+            })
+        };
+        let lowered = assert_plan_lowered(make_plan, test_session_config(), true);
+        let root = tokio::time::timeout(Duration::from_secs(30), lowered)
+            .await
+            .expect("the merge ends once every partition has its row");
+        assert_eq!(count::<PhysicalStreamingMerge>(&root), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inputs_lowered_again_for_the_ctes_around_a_merge_hold_back_no_rows() {
+        // A materialized CTE, merged (with a fetch of 1) with the rows of a
+        // filter, which emits every row on its own, of a stream that stays
+        // pending once it emitted its rows: the inputs of the merge, which
+        // every execution lowers again, cache no rows.
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            with_pairs_cte(10, (vec![5, 6], vec![0, 0]), |cte| {
+                let schema = pairs_schema();
+                let stream = merged_partial_sorts_input();
+                let predicate =
+                    Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+                        col("a", &schema).unwrap(),
+                        datafusion_expr::Operator::GtEq,
+                        datafusion_physical_expr::expressions::lit(0_i64),
+                    ));
+                let filter = datafusion_physical_plan::filter::FilterExec::try_new(
+                    predicate, stream,
+                )
+                .unwrap()
+                .with_batch_size(1)
+                .unwrap();
+                let union = datafusion_physical_plan::union::UnionExec::try_new(vec![
+                    cte,
+                    Arc::new(filter),
+                ])
+                .unwrap();
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering(), union).with_fetch(Some(1)),
+                )
+            })
+        };
+        let lowered = assert_plan_lowered(make_plan, test_session_config(), true);
+        let root = tokio::time::timeout(Duration::from_secs(30), lowered)
+            .await
+            .expect("the merge emits its row");
+        assert_eq!(count::<PhysicalStreamingMerge>(&root), 1);
+    }
+
+    /// A stream of `pairs_schema` (of an unbounded table) of 100 rows, sorted
+    /// by `a`, that stays pending once it emitted them.
+    fn merged_partial_sorts_input() -> Arc<dyn ExecutionPlan> {
+        let batches = (0..100)
+            .collect::<Vec<i64>>()
+            .chunks(10)
+            .map(|values| {
+                RecordBatch::try_new(
+                    pairs_schema(),
+                    vec![
+                        Arc::new(Int64Array::from(values.to_vec())),
+                        Arc::new(Int64Array::from(vec![0; values.len()])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let table = StreamingTableExec::try_new(
+            pairs_schema(),
+            vec![Arc::new(EndlessPairs(batches, false))],
+            None,
+            [ordering()],
+            true,
+            None,
+        )
+        .unwrap();
+        Arc::new(table)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

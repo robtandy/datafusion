@@ -533,18 +533,22 @@ pub fn lower_execution_plan_with_runtime(
 
 /// Like [`lower_execution_plan_with_runtime`], but the scans of the
 /// materialized CTEs of `cte_rows` (by the ids of their buffers) read these
-/// rows: the rows of the CTEs around a recursive query, whose recursive term
-/// every iteration lowers again (see
-/// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte)).
+/// rows: the rows of the CTEs around a plan that an execution lowers again
+/// (the recursive term of a recursive query, see
+/// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte),
+/// or an input of a streaming merge, see
+/// [`PhysicalStreamingMerge::with_outer_ctes`]), in a pipeline that may stop
+/// before its input ends if `early_stop` (see `Lowering::lower_in`).
 pub(crate) fn lower_execution_plan_with_cte_rows(
     plan: &Arc<dyn ExecutionPlan>,
     options: &ConfigOptions,
     runtime: &RuntimeEnv,
     cte_rows: &std::collections::HashMap<u64, Arc<Vec<arrow::array::RecordBatch>>>,
+    early_stop: bool,
 ) -> Result<Arc<dyn PhysicalOperator>> {
     let mut lowering = Lowering::new(options, Some(runtime));
     lowering.materialized_ctes = MaterializedCtes::with_rows(cte_rows.clone());
-    lowering.lower(plan)
+    lowering.lower_in(plan, early_stop)
 }
 
 /// Options for which the lowering lowers what it lowers for every session:
@@ -764,9 +768,11 @@ impl Lowering<'_> {
             return Ok(Arc::new(unnest));
         }
         // A partial sort with a fetch stops its pipeline once it has its rows.
-        if let Some(sort) = PhysicalPartialSort::try_lower(plan, |input| {
-            self.lower_in(input, early_stop)
-        })? {
+        if let Some(sort) =
+            PhysicalPartialSort::try_lower(plan, &self.materialized_ctes, |input| {
+                self.lower_in(input, early_stop)
+            })?
+        {
             return Ok(sort);
         }
         // A sink reads all of its input.
@@ -1233,8 +1239,10 @@ impl Lowering<'_> {
             return Ok(None);
         }
         let input = merge.input();
-        // A merge with a fetch stops once it has its rows.
-        let early_stop = self.early_stop.get() || merge.fetch().is_some();
+        // The inputs never end: their pipelines may never complete a cache
+        // (see `Self::lower_in`), so that their rows reach the merge as they
+        // arrive.
+        let early_stop = true;
         let Some(partitions) = merge_partitions_of(input)? else {
             // The partial sorts with a fetch of partitions that the planner
             // does not split (e.g. of a repartitioning, see
@@ -1274,24 +1282,13 @@ impl Lowering<'_> {
                 None => input,
             }));
         }
-        // The materialized CTEs around the merge that its inputs scan.
-        let mut outer_ctes = vec![];
-        for partition in &partitions {
-            for (id, cte) in self.materialized_ctes.scanned_by(partition)? {
-                if !outer_ctes.iter().any(|(outer, _)| *outer == id) {
-                    outer_ctes.push((id, cte));
-                }
-            }
-        }
-        let mut merge = PhysicalStreamingMerge::try_new(
+        let merge = PhysicalStreamingMerge::try_new(
             std::mem::take(&mut inputs),
             plan.schema(),
             merge.expr().clone(),
             merge.fetch(),
-        )?;
-        if !outer_ctes.is_empty() {
-            merge = merge.with_outer_ctes(partitions, outer_ctes);
-        }
+        )?
+        .with_outer_ctes_of(partitions, &self.materialized_ctes)?;
         Ok(Some(Arc::new(merge)))
     }
 

@@ -322,6 +322,7 @@ impl PhysicalRecursiveCte {
             options.as_ref(),
             task_ctx.runtime_env().as_ref(),
             cte_rows,
+            false,
         )
     }
 

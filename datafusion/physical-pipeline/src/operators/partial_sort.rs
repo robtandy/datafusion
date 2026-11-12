@@ -44,6 +44,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut, operator_key,
 };
+use crate::operators::materialized_cte::MaterializedCtes;
 use crate::operators::streaming_merge::PhysicalStreamingMerge;
 use crate::operators::topk_of_partitions::{
     PhysicalPartialSortOfPartitions, PhysicalTopKOfPartitions,
@@ -134,8 +135,9 @@ impl PhysicalPartialSort {
     /// [`PhysicalSort`]): DataFusion sorts the rows of such inputs, whose
     /// partitions interleave, by their prefix only if they all have the same
     /// prefix, so their partial sort is their sort.
-    pub fn try_lower<F>(
+    pub(crate) fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
+        ctes: &MaterializedCtes,
         mut lower_input: F,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>>
     where
@@ -170,12 +172,15 @@ impl PhysicalPartialSort {
                     .iter()
                     .map(&mut lower_input)
                     .collect::<Result<Vec<_>>>()?;
+                // Its inputs read the rows of the materialized CTEs around
+                // it that they scan.
                 let merged = PhysicalStreamingMerge::try_new(
                     inputs,
                     repartition.input().schema(),
                     ordering,
                     None,
-                )?;
+                )?
+                .with_outer_ctes_of(partitions, ctes)?;
                 let sort = PhysicalPartialSortOfPartitions::try_new(
                     Arc::new(merged),
                     partitioning,
