@@ -44,7 +44,7 @@
 //! | `DataSinkExec`                                                                     | [`PhysicalDataSink`]                               |
 //! | `MaterializedCteExec`, `MaterializedCteScanExec`                                   | [`PhysicalMaterializedCte`], [`MaterializedCteScan`] |
 //! | `PartitionedTopKExec`                                                              | [`PhysicalPartitionedTopK`]                        |
-//! | `PiecewiseMergeJoinExec`                                                           | [`PhysicalNestedLoopJoin`]                         |
+//! | `PiecewiseMergeJoinExec`                                                           | [`PhysicalRangeJoin`]                              |
 //! | `AsOfJoinExec`                                                                     | [`PhysicalAsOfJoin`]                               |
 //! | `MemDeleteExec`, `MemUpdateExec`                                                   | [`MemoryDmlSource`]                                |
 //! | `SortPreservingMergeExec` of other sorted partitions                               | [`PhysicalSort`] or [`PhysicalTopK`]               |
@@ -265,6 +265,7 @@ use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::piecewise_merge_join::nested_loop_join_of;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
+use crate::operators::range_join::PhysicalRangeJoin;
 use crate::operators::recursive_cte::{PhysicalRecursiveCte, WorkTableScanSource};
 use crate::operators::union::PhysicalUnion;
 use crate::operators::unnest::PhysicalUnnest;
@@ -662,6 +663,15 @@ impl Lowering<'_> {
             }
             if let Some(join) = self.try_lower_loop_join(plan)? {
                 return Ok(join);
+            }
+            // The buffered input of a range join is its build side, which
+            // reads all of its input, its streamed input its probe side.
+            if let Some(join) = PhysicalRangeJoin::try_lower(
+                plan,
+                |build| self.lower_in(build, false),
+                |probe| self.lower_in(probe, self.early_stop.get()),
+            )? {
+                return Ok(Arc::new(join));
             }
             if let Some(join) = nested_loop_join_of(plan)?
                 && let Some(join) = self.try_lower_loop_join(&join)?
