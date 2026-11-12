@@ -124,7 +124,7 @@
 //! mod test_utils;
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -1390,9 +1390,11 @@ fn float_bits(row: &[Value]) -> Vec<u64> {
 /// equal. The rows of a class may be at the positions of its rows, and of the
 /// rows of the classes that it ties with. A maximum matching of the rows of
 /// `result` to the sorted rows with their values (within the tolerance) at
-/// their positions assigns each row of `result` to a class; rows with equal
-/// values are then assigned in the order of their classes. Finally, a row of
-/// `result` must tie with the earlier rows of `result` that the query orders
+/// their positions must match all rows of `result`. The classes are divided
+/// into clusters, which ties do not cross: in a cluster whose classes all tie
+/// with each other, rows may be in any order, so the matching is an order.
+/// In other clusters, [`ClusterSearch`] searches an order in which every row
+/// of `result` ties with the earlier rows of `result` that the query orders
 /// after it, the rows that the `OFFSET` skips (the first sorted rows that
 /// `result` does not have) with the rows of `result` that the query orders
 /// before them, and the rows that the `LIMIT` cuts with those that it orders
@@ -1509,7 +1511,7 @@ fn compare_sorted(
     // A maximum matching of the rows of the result to the sorted rows.
     let mut supply = vec![1; result.len()];
     let mut demand = groups.iter().map(|group| group.2).collect::<Vec<_>>();
-    let flow = max_flow(&candidates, &mut supply, &mut demand);
+    max_flow(&candidates, &mut supply, &mut demand);
     if let Some(i) = supply.iter().position(|&rows| rows > 0) {
         let row = &result[i];
         let floats = row.iter().any(Value::has_floats);
@@ -1544,104 +1546,361 @@ fn compare_sorted(
             ),
         });
     }
-    let mut group_of_row = candidates
-        .iter()
-        .zip(&flow)
-        .map(|(candidate_groups, flow)| {
-            candidate_groups[flow.iter().position(|&rows| rows > 0).unwrap_or(0)]
-        })
-        .collect::<Vec<_>>();
-    // Rows with equal values are interchangeable: assign them in the order of
-    // their classes, so that they are not out of order among themselves.
-    let mut rows_of_values: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
-    for (i, row) in result.iter().enumerate() {
-        rows_of_values
-            .entry((Shape(row), float_bits(row)))
-            .or_default()
-            .push(i);
-    }
-    for rows in rows_of_values.values().filter(|rows| rows.len() > 1) {
-        let mut assigned = rows.iter().map(|&i| group_of_row[i]).collect::<Vec<_>>();
-        assigned.sort_by_key(|&group| (groups[group].0, group));
-        for (&i, group) in rows.iter().zip(assigned) {
-            group_of_row[i] = group;
-        }
-    }
-
-    // The class of each row of the result, and the first row of the result
-    // of each class.
-    let mut first_row_of = BTreeMap::new();
-    for (i, &group) in group_of_row.iter().enumerate() {
-        let class = groups[group].0;
-        // The earlier rows of the result that the query orders after this
-        // row must tie with it.
-        if let Some((&later, &earlier)) = first_row_of
-            .range(class + 1..)
-            .find(|&(&later, _)| !ties(class, later))
-        {
-            return Err(format!(
-                "row {i} of {result_name} is out of order: the query orders it before row \
-                 {earlier}, and their keys do not tie ({rule})\ncolumns: ({columns})\n  \
-                 row {earlier}: ({}), keys: ({})\n  row {i}: ({}), keys: ({})",
-                display(&result[earlier]),
-                display(&classes[later].1),
-                display(&result[i]),
-                display(&classes[class].1)
-            ));
-        }
-        first_row_of.entry(class).or_insert(i);
-    }
-
-    // An order of all sorted rows: the rows that the OFFSET skips (the first
-    // sorted rows that the result does not have), the rows of the result, and
-    // the rows that the LIMIT cuts. A skipped row must tie with the rows of the
-    // result that the query orders before it, and a cut row with those that
-    // the query orders after it.
-    let mut unused = classes
+    // In a cluster of classes that all tie with each other, the rows may be in
+    // any order: the matching is an order. In other clusters, whose ties are
+    // not transitive, search an order of the sorted rows of the cluster that
+    // has the rows of the result at its positions.
+    let sizes = classes
         .iter()
         .map(|(rows, _)| rows.len())
         .collect::<Vec<_>>();
-    for &group in &group_of_row {
-        unused[groups[group].0] -= 1;
-    }
-    let mut skip = window.start;
-    for (class, &count) in unused.iter().enumerate() {
-        let skipped = count.min(skip);
-        skip -= skipped;
-        if skipped > 0
-            && let Some((&earlier, &row)) = first_row_of
-                .range(..class)
-                .find(|&(&earlier, _)| !ties(earlier, class))
+    let mut budget = MAX_SEARCHED_STATES;
+    for cluster in clusters(&tied) {
+        let (first, end) = (
+            classes[cluster.start].0.start,
+            classes[cluster.end - 1].0.end,
+        );
+        let positions = window.start.max(first)..window.end.min(end);
+        if positions.is_empty()
+            || cluster
+                .clone()
+                .all(|class| tied[class].len() == cluster.len() - 1)
         {
-            return Err(format!(
+            continue;
+        }
+        let search = ClusterSearch {
+            skip: positions.start - first,
+            classes: cluster,
+            sizes: &sizes,
+            groups: &groups,
+            ties: &ties,
+        };
+        let rows = positions.start - window.start..positions.end - window.start;
+        let Err(failure) = search.run(rows, &candidates, &mut budget) else {
+            continue;
+        };
+        return Err(match failure {
+            ClusterFailure::Values(i) => format!(
+                "row {i} of {result_name} differs: it is not among the sorted rows of \
+                 {reference_name} that the query may return at its position (with \
+                 their multiplicities, and in an order in which rows are only out of \
+                 their sorted order relative to rows that they tie with)\ncolumns: \
+                 ({columns})\n  row {i}: ({})\n  sorted row {} of {reference_name}: \
+                 ({})",
+                display(&result[i]),
+                window.start + i,
+                display(&sorted.values[window.start + i])
+            ),
+            ClusterFailure::Order {
+                row,
+                class,
+                earlier,
+                later,
+            } => format!(
+                "row {row} of {result_name} is out of order: the query orders it before \
+                 row {earlier}, and their keys do not tie ({rule})\ncolumns: \
+                 ({columns})\n  row {earlier}: ({}), keys: ({})\n  row {row}: ({}), \
+                 keys: ({})",
+                display(&result[earlier]),
+                display(&classes[later].1),
+                display(&result[row]),
+                display(&classes[class].1)
+            ),
+            ClusterFailure::Skipped {
+                row,
+                class,
+                skipped,
+            } => format!(
                 "row {row} of {result_name} is not among the rows that the query \
                  returns: the OFFSET skips sorted rows of {reference_name} that the \
                  query orders after it, and whose keys do not tie with its keys \
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the skipped rows: ({})",
                 display(&result[row]),
-                display(&classes[earlier].1),
-                display(&classes[class].1)
-            ));
-        }
-        if count > skipped
-            && let Some((&later, &row)) = first_row_of
-                .range(class + 1..)
-                .find(|&(&later, _)| !ties(class, later))
-        {
-            return Err(format!(
+                display(&classes[class].1),
+                display(&classes[skipped].1)
+            ),
+            ClusterFailure::Cut { row, class, cut } => format!(
                 "row {row} of {result_name} is not among the rows that the query \
                  returns: the LIMIT cuts sorted rows of {reference_name} that the query \
                  orders before it, and whose keys do not tie with its keys \
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the cut rows: ({})",
                 display(&result[row]),
-                display(&classes[later].1),
-                display(&classes[class].1)
-            ));
-        }
+                display(&classes[class].1),
+                display(&classes[cut].1)
+            ),
+            ClusterFailure::GaveUp => format!(
+                "cannot compare the rows of {result_name} with the sorted rows of \
+                 {reference_name}: there are too many orders of rows whose ORDER BY \
+                 keys tie (more than {MAX_SEARCHED_STATES} states searched)"
+            ),
+        });
     }
     Ok(())
+}
+
+/// The number of states that [`ClusterSearch`] may search, for all clusters of
+/// a comparison, before it gives up.
+const MAX_SEARCHED_STATES: usize = 1_000_000;
+
+/// The clusters of classes (`tied`, see [`tied_classes`]): the ranges of
+/// classes whose keys only tie with the keys of classes of the same range. A
+/// row is never out of its sorted order relative to a row of another cluster.
+fn clusters(tied: &[Vec<usize>]) -> Vec<Range<usize>> {
+    let mut clusters = vec![];
+    let (mut start, mut reach) = (0, 0);
+    for (class, others) in tied.iter().enumerate() {
+        if class > reach {
+            clusters.push(start..class);
+            start = class;
+        }
+        reach = reach
+            .max(class)
+            .max(others.last().copied().unwrap_or(class));
+    }
+    if start < tied.len() {
+        clusters.push(start..tied.len());
+    }
+    clusters
+}
+
+/// Why no order of the sorted rows of a cluster has the rows of a result at
+/// its positions, see [`ClusterSearch`].
+enum ClusterFailure {
+    /// No sorted row with the values of this row of the result is left.
+    Values(usize),
+    /// Row `row` of the result, of class `class`, would come after row
+    /// `earlier`, of class `later`, which it does not tie with.
+    Order {
+        row: usize,
+        class: usize,
+        earlier: usize,
+        later: usize,
+    },
+    /// The OFFSET would skip rows of class `skipped` that the query orders
+    /// after row `row`, of class `class`.
+    Skipped {
+        row: usize,
+        class: usize,
+        skipped: usize,
+    },
+    /// The LIMIT would cut rows of class `cut` that the query orders before
+    /// row `row`, of class `class`.
+    Cut {
+        row: usize,
+        class: usize,
+        cut: usize,
+    },
+    /// The search took more states than its budget.
+    GaveUp,
+}
+
+/// The search of an order of the sorted rows of a cluster of classes, whose
+/// ties are not transitive, in which some rows of a result are at their
+/// positions, see [`compare_sorted`].
+struct ClusterSearch<'a> {
+    /// The classes of the cluster.
+    classes: Range<usize>,
+    /// The number of rows of the cluster that the OFFSET skips.
+    skip: usize,
+    /// The number of rows of each class.
+    sizes: &'a [usize],
+    /// The groups of sorted rows: their class, a row and their number of rows.
+    groups: &'a [(usize, usize, usize)],
+    /// Whether the keys of two classes tie.
+    ties: &'a dyn Fn(usize, usize) -> bool,
+}
+
+impl ClusterSearch<'_> {
+    /// Assign each of the rows `rows` of the result, in order, one of its
+    /// `candidates` (groups of sorted rows with its values that may be at its
+    /// position) with rows left, such that the row ties with the earlier rows
+    /// of the result of later classes. Then the rows of the cluster that the
+    /// OFFSET skips (the first rows that the result does not have) must tie
+    /// with the rows of the result of earlier classes, and the rows that the
+    /// LIMIT cuts with those of later classes.
+    ///
+    /// A depth-first search, which remembers the states (a number of rows
+    /// assigned and the rows left in their groups) that lead to no order, and
+    /// gives up after `budget` states. Returns the failure of the deepest dead
+    /// end if there is no order.
+    fn run(
+        &self,
+        rows: Range<usize>,
+        candidates: &[Vec<usize>],
+        budget: &mut usize,
+    ) -> std::result::Result<(), ClusterFailure> {
+        let rows = rows.collect::<Vec<_>>();
+        let start = self.classes.start;
+        // The groups that are candidates of the rows, the rows left in them,
+        // and the candidates of each row among them, by class.
+        let mut groups = vec![];
+        let mut left = vec![];
+        let mut local_of = HashMap::new();
+        let mut local_candidates = Vec::with_capacity(rows.len());
+        for &row in &rows {
+            let mut local = candidates[row]
+                .iter()
+                .map(|&group| {
+                    *local_of.entry(group).or_insert_with(|| {
+                        groups.push(group);
+                        left.push(self.groups[group].2);
+                        groups.len() - 1
+                    })
+                })
+                .collect::<Vec<_>>();
+            local.sort_by_key(|&candidate| groups[candidate]);
+            local_candidates.push(local);
+        }
+        let class_of = |local: usize| self.groups[groups[local]].0 - start;
+
+        let mut used = vec![0; self.classes.len()];
+        let mut first_row: Vec<Option<usize>> = vec![None; self.classes.len()];
+        // The group assigned at each depth, and whether it is the first row of
+        // its class.
+        let mut chosen: Vec<(usize, bool)> = Vec::with_capacity(rows.len());
+        let mut next = vec![0; rows.len()];
+        let mut dead_ends = HashSet::new();
+        let mut deepest: Option<(usize, ClusterFailure)> = None;
+        let record = |deepest: &mut Option<(usize, ClusterFailure)>,
+                      depth: usize,
+                      failure: ClusterFailure| {
+            if deepest.as_ref().is_none_or(|(deepest, _)| depth > *deepest) {
+                *deepest = Some((depth, failure));
+            }
+        };
+        let (mut depth, mut entered) = (0, true);
+        loop {
+            let mut backtrack = false;
+            if depth == rows.len() {
+                match self.check_cuts(&used, &first_row) {
+                    Ok(()) => return Ok(()),
+                    Err(failure) => record(&mut deepest, depth, failure),
+                }
+                backtrack = true;
+            } else {
+                if entered {
+                    if *budget == 0 {
+                        return Err(ClusterFailure::GaveUp);
+                    }
+                    *budget -= 1;
+                    next[depth] = 0;
+                    backtrack = dead_ends.contains(&(depth, left.clone()));
+                }
+                if !backtrack {
+                    let row = rows[depth];
+                    let mut any_left = false;
+                    let mut advanced = false;
+                    while let Some(&local) = local_candidates[depth].get(next[depth]) {
+                        next[depth] += 1;
+                        if left[local] == 0 {
+                            continue;
+                        }
+                        any_left = true;
+                        let class = class_of(local);
+                        // The earlier rows of the result of later classes
+                        // must tie with this row.
+                        if let Some(later) = (class + 1..used.len()).find(|&later| {
+                            used[later] > 0 && !(self.ties)(start + class, start + later)
+                        }) {
+                            let earlier =
+                                first_row[later].expect("a used class has rows");
+                            record(
+                                &mut deepest,
+                                depth,
+                                ClusterFailure::Order {
+                                    row,
+                                    class: start + class,
+                                    earlier,
+                                    later: start + later,
+                                },
+                            );
+                            continue;
+                        }
+                        left[local] -= 1;
+                        used[class] += 1;
+                        let first = first_row[class].is_none();
+                        if first {
+                            first_row[class] = Some(row);
+                        }
+                        chosen.push((local, first));
+                        advanced = true;
+                        break;
+                    }
+                    if advanced {
+                        depth += 1;
+                        entered = true;
+                        continue;
+                    }
+                    if !any_left {
+                        record(&mut deepest, depth, ClusterFailure::Values(row));
+                    }
+                    dead_ends.insert((depth, left.clone()));
+                    backtrack = true;
+                }
+            }
+            if backtrack {
+                if depth == 0 {
+                    let failure = deepest.map(|(_, failure)| failure);
+                    return Err(failure.unwrap_or(ClusterFailure::Values(rows[0])));
+                }
+                depth -= 1;
+                let (local, first) =
+                    chosen.pop().expect("a row is assigned at each depth");
+                let class = class_of(local);
+                left[local] += 1;
+                used[class] -= 1;
+                if first {
+                    first_row[class] = None;
+                }
+                entered = false;
+            }
+        }
+    }
+
+    /// Check the rows that the OFFSET skips and the rows that the LIMIT cuts,
+    /// given the rows of each class `used` by the result, and the first row of
+    /// the result of each class.
+    fn check_cuts(
+        &self,
+        used: &[usize],
+        first_row: &[Option<usize>],
+    ) -> std::result::Result<(), ClusterFailure> {
+        let start = self.classes.start;
+        let first = |local: usize| first_row[local].expect("a used class has rows");
+        let mut skip = self.skip;
+        for (local, &rows_used) in used.iter().enumerate() {
+            let class = start + local;
+            let unused = self.sizes[class] - rows_used;
+            let skipped = unused.min(skip);
+            skip -= skipped;
+            // The skipped rows come before the rows of the result, and the cut
+            // rows after them.
+            if skipped > 0
+                && let Some(earlier) = (0..local).find(|&earlier| {
+                    used[earlier] > 0 && !(self.ties)(start + earlier, class)
+                })
+            {
+                return Err(ClusterFailure::Skipped {
+                    row: first(earlier),
+                    class: start + earlier,
+                    skipped: class,
+                });
+            }
+            if unused > skipped
+                && let Some(later) = (local + 1..used.len())
+                    .find(|&later| used[later] > 0 && !(self.ties)(class, start + later))
+            {
+                return Err(ClusterFailure::Cut {
+                    row: first(later),
+                    class: start + later,
+                    cut: class,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Compare the rows of both engines in their exact order, see
@@ -2234,16 +2493,12 @@ fn close_values(values: &[f64], value: f64, tolerance: f64) -> Range<usize> {
 /// Push a maximum flow from the expected vectors, which supply `supply` rows
 /// each, through the `pairs` of vectors that are equal, to the actual
 /// vectors, which demand `demand` rows each. Leaves in `supply` and `demand`
-/// the rows that are not matched, and returns the rows through each pair.
+/// the rows that are not matched.
 ///
 /// A greedy flow is augmented along shortest paths (Edmonds-Karp): from an
 /// expected vector with supply, forward through pairs, and backward through
 /// pairs with flow, to an actual vector with demand.
-fn max_flow(
-    pairs: &[Vec<usize>],
-    supply: &mut [usize],
-    demand: &mut [usize],
-) -> Vec<Vec<usize>> {
+fn max_flow(pairs: &[Vec<usize>], supply: &mut [usize], demand: &mut [usize]) {
     // The flow through each pair, and the pairs into each actual vector.
     let mut flow = pairs
         .iter()
@@ -2290,7 +2545,7 @@ fn max_flow(
             }
         }
         let Some(end) = end else {
-            return flow;
+            return;
         };
         // The rows that the path can carry, then push them along it.
         let mut rows = demand[end];
@@ -3667,6 +3922,77 @@ mod tests {
         );
     }
 
+    /// `(x, y)` rows of the keys `x = 1 + t * [0, 1, 2, 3]`, with `t = 0.9e-9`,
+    /// which tie with the next two keys, and the payloads `y = 1 + t * y`,
+    /// which are equal within the tolerance to the payloads one `t` apart.
+    fn chained_rows(y: [i32; 4]) -> RecordBatch {
+        let t = 0.9e-9;
+        let rows = (0..4)
+            .map(|i| (1.0 + t * f64::from(i), 1.0 + t * f64::from(y[i as usize])))
+            .collect::<Vec<_>>();
+        xy_batch(&rows)
+    }
+
+    /// The payloads `y` of `chained_rows(y)`.
+    fn chained_payloads(y: [i32; 4]) -> Vec<RecordBatch> {
+        let y = y.map(|y| 1.0 + 0.9e-9 * f64::from(y));
+        vec![batch_of(vec![(
+            "y",
+            Arc::new(Float64Array::from(y.to_vec())) as ArrayRef,
+        )])]
+    }
+
+    #[test]
+    fn same_results_search_the_orders_of_rows_whose_ties_are_not_transitive() {
+        // Keys 1.5e-9 apart, which tie with the next one but not with the one
+        // after, and rows of the same value: under OFFSET 1, the query returns
+        // the rows of the last two keys, as the OFFSET may skip the first row,
+        // but not the last, which does not tie with the first.
+        let sorted = sv_batch(&[(1.0, "a"), (1.0 + 1.5e-9, "a"), (1.0 + 3e-9, "a")]);
+        let a = |rows: usize| vec![v_batch(&vec![(0, "a"); rows])];
+        for (skip, fetch, rows) in
+            [(1, None, 2), (1, Some(1), 1), (2, None, 1), (0, Some(2), 2)]
+        {
+            let order = hidden_key_order(&sorted, skip, fetch);
+            same_results(a(rows), a(rows), &order)
+                .unwrap_or_else(|e| panic!("{skip} {fetch:?}: {e}"));
+        }
+        // Rows of other values: under OFFSET 1, `b, c`, `c, b` and `a, c` are
+        // the last rows of orders in which rows are only out of their sorted
+        // order relative to rows that they tie with, but `c, a`, `a, b` and
+        // `b, a` are not.
+        let sorted = sv_batch(&[(1.0, "a"), (1.0 + 1.5e-9, "b"), (1.0 + 3e-9, "c")]);
+        let offset_1 = hidden_key_order(&sorted, 1, None);
+        let values = |values: [&str; 2]| vec![v_batch(&values.map(|value| (0, value)))];
+        for valid in [["b", "c"], ["c", "b"], ["a", "c"]] {
+            same_results(values(["b", "c"]), values(valid), &offset_1)
+                .unwrap_or_else(|e| panic!("{valid:?}: {e}"));
+        }
+        for invalid in [["c", "a"], ["a", "b"], ["b", "a"]] {
+            let result = same_results(values(["b", "c"]), values(invalid), &offset_1);
+            assert!(result.is_err(), "{invalid:?}");
+        }
+
+        // Payloads that are equal within the tolerance to the payloads of
+        // several rows: of the assignments of `[2, 3, 6, 1]` to the rows of
+        // `[5, 3, 1, 2]` at their positions, `[1, 3, 0, 2]` and `[3, 1, 0, 2]`
+        // are out of order, but `[2, 1, 0, 3]` is in order.
+        let order = hidden_key_order(&chained_rows([5, 3, 1, 2]), 0, None);
+        let expected = || chained_payloads([5, 3, 1, 2]);
+        same_results(expected(), chained_payloads([2, 3, 6, 1]), &order).unwrap();
+        // The only assignment of `[0, 1, 5, 3]`, `[2, 3, 0, 1]`, is out of
+        // order.
+        let err =
+            same_results(expected(), chained_payloads([0, 1, 5, 3]), &order).unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 2 of the pipeline engine is out of order: the query orders it \
+                 before row 1, and their keys do not tie"
+            ),
+            "{err}"
+        );
+    }
+
     #[test]
     fn same_results_accept_any_order_after_a_volatile_key() {
         // Without the values of a key (e.g. `random()`), all rows tie.
@@ -4578,6 +4904,31 @@ mod tests {
             xy_batch(&[(1.0, 1.0), (1.0 + 1.5e-9, 1.0 + 1.8e-9)]),
             xy_batch(&[(1.0, 1.0 + 0.9e-9), (1.0 + 1.5e-9, 1.0 - 0.9e-9)]),
         );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT y FROM m ORDER BY x",
+            &setup,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_search_the_orders_of_rows_whose_ties_are_not_transitive()
+     {
+        // Keys that tie with the next one but not with the one after, and rows
+        // of the same value.
+        let rows = sv_batch(&[(1.0, "a"), (1.0 + 1.5e-9, "a"), (1.0 + 3e-9, "a")]);
+        let setup = per_engine_tables(rows.clone(), rows);
+        for sql in [
+            "SELECT v FROM m ORDER BY s OFFSET 1",
+            "SELECT v FROM m ORDER BY s LIMIT 1 OFFSET 1",
+            "SELECT v FROM m ORDER BY s LIMIT 2",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+        // The payloads of the pipeline engine are only in order if they are
+        // assigned to the rows of DataFusion of other keys.
+        let setup =
+            per_engine_tables(chained_rows([5, 3, 1, 2]), chained_rows([2, 3, 6, 1]));
         assert_same_results_as_datafusion_with_setup(
             "SELECT y FROM m ORDER BY x",
             &setup,
