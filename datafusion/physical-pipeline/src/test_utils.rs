@@ -5849,6 +5849,60 @@ mod tests {
             let order = order_with(m(), sql, &coarse).await?;
             same_results_with(expected, actual, &order, coarse).unwrap();
         }
+        // Nor within `4e-8`: their neighbors of 1 are `6e-8` below and `1.2e-7`
+        // above (within twice the tolerance below, but the value of each engine
+        // may only be off by the tolerance).
+        let fine = ComparisonOptions::default().with_float_tolerance(4e-8);
+        for sql in [
+            "SELECT id FROM m ORDER BY CAST(1 AS REAL), id",
+            "SELECT id FROM m ORDER BY CAST(1 AS REAL), id LIMIT 1",
+        ] {
+            let order = order_with(m(), sql, &fine).await?;
+            let (expected, actual) = if sql.ends_with("LIMIT 1") {
+                (ids(&[1]), ids(&[2]))
+            } else {
+                (ids(&[1, 2]), ids(&[2, 1]))
+            };
+            same_results_with(expected.clone(), expected.clone(), &order, fine).unwrap();
+            let err = same_results_with(expected, actual, &order, fine).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+        }
+
+        // Distinct keys that cannot vary are in their order: `1.next_down()`
+        // and `1`, which are not within `8e-17` of their neighbors, but are
+        // within twice that tolerance of each other.
+        let below_one = 1.0f64.next_down();
+        let distinct = || float_kv_batch(&[(below_one, 1), (1.0, 2)], 0, 0.0);
+        let v = |values: &[i32]| {
+            vec![int_batch(
+                &values.iter().copied().map(Some).collect::<Vec<_>>(),
+            )]
+        };
+        let fine = ComparisonOptions::default().with_float_tolerance(8e-17);
+        for (sql, expected, actual) in [
+            (
+                "SELECT v FROM m ORDER BY k",
+                [1, 2].as_slice(),
+                [2, 1].as_slice(),
+            ),
+            ("SELECT v FROM m ORDER BY k LIMIT 1", &[1], &[2]),
+            ("SELECT v FROM m ORDER BY k DESC", &[2, 1], &[1, 2]),
+        ] {
+            let order = order_with(distinct(), sql, &fine).await?;
+            same_results_with(v(expected), v(expected), &order, fine).unwrap();
+            let err =
+                same_results_with(v(expected), v(actual), &order, fine).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+            // Within the default tolerance, they tie.
+            let order = order_of(distinct(), sql).await?;
+            same_results(v(expected), v(actual), &order).unwrap();
+        }
         // The keys after a float that cannot vary are shown.
         let order =
             order_of(m(), "SELECT id FROM m ORDER BY CAST(0 AS DOUBLE), id").await?;
