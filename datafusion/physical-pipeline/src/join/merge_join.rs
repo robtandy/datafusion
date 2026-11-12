@@ -1323,8 +1323,9 @@ fn interleave_dictionary<K: ArrowDictionaryKeyType>(
         .map(|dictionary| dictionary.values().as_ref())
         .collect::<Vec<_>>();
     let values = match values.is_empty() {
-        // All keys are NULL.
-        true => new_null_array(value_arrays[0].data_type(), 1),
+        // All keys are NULL: no values (not a NULL value, which can be big,
+        // e.g. of a fixed size list).
+        true => new_empty_array(value_arrays[0].data_type()),
         false => interleave_compact(&value_arrays, &values)?,
     };
     let keys = keys
@@ -9296,6 +9297,82 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// A case of the joins of right rows whose payloads the joins gather from
+    /// several stored batches (see [`gather_cases`]).
+    pub(crate) struct GatherCase {
+        pub(crate) name: String,
+        /// The type of the payloads.
+        pub(crate) payload: DataType,
+        /// The right rows, built as they are read.
+        pub(crate) rows: Arc<dyn Fn() -> Vec<RecordBatch> + Send + Sync>,
+        /// The rows of the join of them with the left rows of
+        /// [`dictionary_probe_rows`].
+        pub(crate) matches: usize,
+        /// The sizes of the pools to join them in.
+        pub(crate) pools: Vec<usize>,
+    }
+
+    /// The cases of the joins that gather payloads: dictionaries in every
+    /// layout of [`dictionary_layouts`] (of values that no row uses), and the
+    /// NULL keys of dictionaries without values of fixed size lists of
+    /// 1,000,000 integers (of which a NULL value takes 8 MB), in a pool of
+    /// 64 KiB.
+    pub(crate) fn gather_cases() -> Vec<GatherCase> {
+        let mut cases = dictionary_layouts()
+            .into_iter()
+            .map(|(name, wrap)| GatherCase {
+                name: name.to_string(),
+                payload: layout_type(wrap),
+                rows: Arc::new(move || dictionary_batches(wrap)),
+                matches: 200,
+                pools: vec![64 << 20, 3 << 20],
+            })
+            .collect::<Vec<_>>();
+        cases.push(GatherCase {
+            name: "NULL dictionaries of fixed size lists without values".to_string(),
+            payload: wide_list_dictionary_type(),
+            rows: Arc::new(null_wide_list_dictionaries),
+            matches: 4,
+            pools: vec![64 << 10],
+        });
+        cases
+    }
+
+    /// Dictionaries of fixed size lists of 1,000,000 integers (of which a NULL
+    /// value takes 8 MB).
+    fn wide_list_dictionary_type() -> DataType {
+        let item = Arc::new(Field::new_list_field(DataType::Int64, true));
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::FixedSizeList(item, 1_000_000)),
+        )
+    }
+
+    /// Two batches of a right row of the key 1 whose payload is a NULL key of a
+    /// dictionary of fixed size lists of 1,000,000 integers without values.
+    fn null_wide_list_dictionaries() -> Vec<RecordBatch> {
+        let DataType::Dictionary(_, values) = wide_list_dictionary_type() else {
+            unreachable!()
+        };
+        (0..2)
+            .map(|batch| {
+                let payload: ArrayRef = Arc::new(DictionaryArray::new(
+                    Int32Array::from(vec![None]),
+                    new_empty_array(&values),
+                ));
+                RecordBatch::try_new(
+                    payload_schema("r", payload.data_type()),
+                    vec![
+                        Arc::new(Int64Array::from(vec![batch])),
+                        Arc::new(Int32Array::from(vec![1])),
+                        payload,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     #[test]
     fn compact_interleaves_gather_the_values_of_interleave() -> Result<()> {
         // `interleave_compact` gathers the values that `interleave` does (but
@@ -9409,7 +9486,10 @@ pub(crate) mod tests {
         // their dictionaries that they use only (`interleave` copies all values
         // of all dictionaries), so that it allocates no more than it reserves
         // (on the thread of the test, as a runtime of the current thread runs
-        // all tasks of the query there), also in a pool of 3 MiB.
+        // all tasks of the query there), also in a pool of 3 MiB. So do the NULL
+        // keys of dictionaries without values of fixed size lists of 1,000,000
+        // integers, in a pool of 64 KiB: the join gathers no NULL value of 8 MB
+        // for them (see `gather_cases`).
         let order = |schema: &SchemaRef, side: &str| {
             LexOrdering::new([PhysicalSortExpr::new(
                 col(&format!("{side}k"), schema).unwrap(),
@@ -9417,18 +9497,18 @@ pub(crate) mod tests {
             )])
             .unwrap()
         };
-        for (name, wrap) in dictionary_layouts() {
-            for pool_size in [64 << 20, 3 << 20] {
-                let context = format!("{name} in a pool of {pool_size} bytes");
+        for case in gather_cases() {
+            for &pool_size in &case.pools {
+                let context = format!("{} in a pool of {pool_size} bytes", case.name);
                 let left: Arc<dyn PartitionStream> = Arc::new(StreamPartition {
                     schema: dictionary_schema("l"),
                     batches: vec![dictionary_probe_rows()],
                     forever: false,
                 });
-                let right_schema = payload_schema("r", &layout_type(wrap));
+                let right_schema = payload_schema("r", &case.payload);
                 let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
                     schema: Arc::clone(&right_schema),
-                    rows: Arc::new(move || dictionary_batches(wrap)),
+                    rows: Arc::clone(&case.rows),
                 });
                 let stream = |schema: SchemaRef, side: &str, partition| {
                     Arc::new(
@@ -9469,7 +9549,7 @@ pub(crate) mod tests {
                     .unwrap_or_else(|e| panic!("{context}: {e}"));
                 let allocated = allocations::peak() - before;
                 let reserved = pool.peak.load(Ordering::Relaxed) as isize;
-                assert_eq!(num_rows(&output.batches), 200, "{context}");
+                assert_eq!(num_rows(&output.batches), case.matches, "{context}");
                 assert!(
                     allocated < reserved + (512 << 10),
                     "{context}: the query allocated {allocated} bytes, and reserved {reserved}"

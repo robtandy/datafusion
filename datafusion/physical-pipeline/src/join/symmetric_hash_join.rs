@@ -1893,11 +1893,11 @@ pub(crate) mod tests {
     use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
         ALL_JOIN_TYPES, BuiltPartition, PeakPool, data_batch, data_schema,
-        dictionary_batches, dictionary_layouts, dictionary_probe_rows, dictionary_schema,
-        dictionary_view_rows, empty_dictionary_cases, fanout_rows, fanout_schema,
-        join_filter, keyed_rows, layout_type, limited_task_ctx, num_rows, payload_schema,
-        reference_join_of_keys, reference_join_of_rows, rejecting_filter, run_native,
-        time_beside, union_key_layouts, union_key_matches, with_timeout,
+        dictionary_probe_rows, dictionary_schema, dictionary_view_rows,
+        empty_dictionary_cases, fanout_rows, fanout_schema, gather_cases, join_filter,
+        keyed_rows, limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
+        reference_join_of_rows, rejecting_filter, run_native, time_beside,
+        union_key_layouts, union_key_matches, with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4697,7 +4697,10 @@ pub(crate) mod tests {
         // values of their dictionaries that they use only (`interleave` copies
         // all values of all dictionaries), so that it allocates no more than it
         // reserves (on the thread of the test, as a runtime of the current
-        // thread runs all tasks of the query there), also in a pool of 3 MiB.
+        // thread runs all tasks of the query there), also in a pool of 3 MiB. So
+        // do the NULL keys of dictionaries without values of fixed size lists of
+        // 1,000,000 integers, in a pool of 64 KiB: the join gathers no NULL value
+        // of 8 MB for them (see `gather_cases`).
         #[derive(Debug)]
         struct LatePartition;
         impl PartitionStream for LatePartition {
@@ -4714,9 +4717,9 @@ pub(crate) mod tests {
                 Box::pin(RecordBatchStreamAdapter::new(dictionary_schema("l"), rows))
             }
         }
-        for (name, wrap) in dictionary_layouts() {
-            for pool_size in [64 << 20, 3 << 20] {
-                let context = format!("{name} in a pool of {pool_size} bytes");
+        for case in gather_cases() {
+            for &pool_size in &case.pools {
+                let context = format!("{} in a pool of {pool_size} bytes", case.name);
                 let stream = |schema: SchemaRef, partition: Arc<dyn PartitionStream>| {
                     Arc::new(
                         StreamingTableExec::try_new(
@@ -4731,12 +4734,12 @@ pub(crate) mod tests {
                     ) as Arc<dyn ExecutionPlan>
                 };
                 let left = stream(dictionary_schema("l"), Arc::new(LatePartition));
-                let right_schema = payload_schema("r", &layout_type(wrap));
+                let right_schema = payload_schema("r", &case.payload);
                 let right = stream(
                     Arc::clone(&right_schema),
                     Arc::new(BuiltPartition {
                         schema: right_schema,
-                        rows: Arc::new(move || dictionary_batches(wrap)),
+                        rows: Arc::clone(&case.rows),
                     }),
                 );
                 let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
@@ -4766,7 +4769,7 @@ pub(crate) mod tests {
                     .unwrap_or_else(|e| panic!("{context}: {e}"));
                 let allocated = allocations::peak() - before;
                 let reserved = pool.peak.load(Ordering::Relaxed) as isize;
-                assert_eq!(num_rows(&output.batches), 200, "{context}");
+                assert_eq!(num_rows(&output.batches), case.matches, "{context}");
                 assert!(
                     allocated < reserved + (512 << 10),
                     "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
