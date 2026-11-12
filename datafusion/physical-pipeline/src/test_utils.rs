@@ -44,10 +44,9 @@
 //!      the keys of each engine may be off by the tolerance, either row may
 //!      have the smaller value. Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
-//!      order among themselves,
-//!      and under `ORDER BY … LIMIT`, the last rows may be other rows that
-//!      tie with them (with their multiplicities), as may, under `OFFSET`,
-//!      the first rows;
+//!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
+//!      may be other rows that tie with them (with their multiplicities), as
+//!      may, under `OFFSET`, the first rows;
 //!    * their values are compared by meaning, not by representation: batch
 //!      boundaries, dictionary and run-end encoding, views, offsets and the
 //!      bytes under nulls do not matter;
