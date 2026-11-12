@@ -529,6 +529,22 @@ pub fn lower_execution_plan_with_runtime(
     Lowering::new(options, Some(runtime)).lower(plan)
 }
 
+/// Like [`lower_execution_plan_with_runtime`], but the scans of the
+/// materialized CTEs of `cte_rows` (by the ids of their buffers) read these
+/// rows: the rows of the CTEs around a recursive query, whose recursive term
+/// every iteration lowers again (see
+/// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte)).
+pub(crate) fn lower_execution_plan_with_cte_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    options: &ConfigOptions,
+    runtime: &RuntimeEnv,
+    cte_rows: &std::collections::HashMap<u64, Arc<Vec<arrow::array::RecordBatch>>>,
+) -> Result<Arc<dyn PhysicalOperator>> {
+    let mut lowering = Lowering::new(options, Some(runtime));
+    lowering.materialized_ctes = MaterializedCtes::with_rows(cte_rows.clone());
+    lowering.lower(plan)
+}
+
 /// Options for which the lowering lowers what it lowers for every session:
 /// DataFusion's sort concatenates the batches of a partition, which can
 /// overflow 32-bit offsets, while they occupy fewer bytes than
@@ -712,7 +728,10 @@ impl Lowering<'_> {
         if let Some(cte) =
             PhysicalRecursiveCte::try_lower(plan, |term| self.lower_in(term, false))?
         {
-            return Ok(Arc::new(cte));
+            // The materialized CTEs around the query that its recursive term
+            // scans, whose rows every iteration reads.
+            let outer_ctes = self.materialized_ctes.scanned_by(cte.recursive_plan())?;
+            return Ok(Arc::new(cte.with_outer_ctes(outer_ctes)));
         }
         // A limit with a fetch stops its pipeline once it has its rows.
         let early_stop = self.early_stop.get() || plan.fetch().is_some();

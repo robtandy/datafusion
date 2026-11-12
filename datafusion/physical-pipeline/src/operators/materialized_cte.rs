@@ -18,7 +18,6 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_plan::materialized_cte::{
     MaterializedCteExec, MaterializedCteScanExec,
 };
-use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion_physical_plan::{ExecutionPlan, displayable};
 use parking_lot::Mutex;
@@ -34,10 +33,88 @@ use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// The bodies of the materialized CTEs whose continuations are being lowered,
 /// by the id of their buffer, which their scans read (see
-/// [`PhysicalMaterializedCte::try_lower`]).
+/// [`PhysicalMaterializedCte::try_lower`]), and the rows of the CTEs around
+/// the recursive term of a recursive query that an iteration lowers (see
+/// [`OuterCte`]).
 #[derive(Debug, Default)]
 pub(crate) struct MaterializedCtes {
     bodies: RefCell<HashMap<u64, Arc<MaterializedCteBody>>>,
+    rows: HashMap<u64, Arc<Vec<RecordBatch>>>,
+}
+
+impl MaterializedCtes {
+    /// The CTEs whose scans read `rows` (by the ids of the buffers of the
+    /// CTEs), and no other CTE yet.
+    pub(crate) fn with_rows(rows: HashMap<u64, Arc<Vec<RecordBatch>>>) -> Self {
+        Self {
+            bodies: RefCell::default(),
+            rows,
+        }
+    }
+
+    /// The CTEs of these that `plan` scans.
+    pub(crate) fn scanned_by(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Vec<(u64, OuterCte)>> {
+        let bodies = self.bodies.borrow();
+        Ok(scanned_ctes(plan)?
+            .into_iter()
+            .filter_map(|id| {
+                let cte = match (bodies.get(&id), self.rows.get(&id)) {
+                    (Some(body), _) => OuterCte::Body(Arc::clone(body)),
+                    (None, Some(rows)) => OuterCte::Rows(Arc::clone(rows)),
+                    (None, None) => return None,
+                };
+                Some((id, cte))
+            })
+            .collect())
+    }
+}
+
+/// A materialized CTE around a recursive query, which its recursive term
+/// scans: every iteration of a native recursive query lowers its recursive
+/// term again, apart from the query (see
+/// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte)),
+/// and its scans of such a CTE read the rows of the CTE, which the execution
+/// of the query computed once, before the query started.
+#[derive(Debug, Clone)]
+pub(crate) enum OuterCte {
+    /// The body of the CTE, which the execution of the query runs.
+    Body(Arc<MaterializedCteBody>),
+    /// The rows of the CTE, around a recursive query around the query.
+    Rows(Arc<Vec<RecordBatch>>),
+}
+
+impl OuterCte {
+    /// The rows of the CTE, in the execution of `ctx` (that of the query).
+    pub(crate) fn rows(&self, ctx: &ExecutionContext) -> Result<Arc<Vec<RecordBatch>>> {
+        match self {
+            Self::Body(_) => self.with_rows(ctx, |rows| Arc::new(rows.to_vec())),
+            Self::Rows(rows) => Ok(Arc::clone(rows)),
+        }
+    }
+
+    /// `f` of the rows of the CTE, in the execution of `ctx`.
+    fn with_rows<T>(
+        &self,
+        ctx: &ExecutionContext,
+        f: impl FnOnce(&[RecordBatch]) -> T,
+    ) -> Result<T> {
+        match self {
+            Self::Body(body) => {
+                let body = body.as_ref() as &dyn PhysicalOperator;
+                let Some(state) = ctx.global_sink_state(body) else {
+                    return internal_err!(
+                        "A materialized CTE is scanned before its body ran"
+                    );
+                };
+                let rows = downcast_state::<BodyRows>(state.as_any(), body.name())?;
+                Ok(f(&rows.batches.lock()))
+            }
+            Self::Rows(rows) => Ok(f(rows)),
+        }
+    }
 }
 
 /// `plan` (a `ScalarSubqueryExec`) below the materialized CTEs of its input
@@ -126,23 +203,6 @@ fn scanned_ctes(plan: &Arc<dyn ExecutionPlan>) -> Result<HashSet<u64>> {
     Ok(ids)
 }
 
-/// Whether the recursive term of a recursive query in `plan` scans the
-/// materialized CTE `id`.
-fn scanned_by_recursive_terms(plan: &Arc<dyn ExecutionPlan>, id: u64) -> Result<bool> {
-    let mut scanned = false;
-    plan.apply(|node| {
-        if let Some(query) = node.downcast_ref::<RecursiveQueryExec>() {
-            scanned |= scanned_ctes(query.recursive_term())?.contains(&id);
-        }
-        Ok(if scanned {
-            TreeNodeRecursion::Stop
-        } else {
-            TreeNodeRecursion::Continue
-        })
-    })?;
-    Ok(scanned)
-}
-
 /// Computes the body of a materialized CTE once, and then runs the rest of
 /// the query (the continuation), whose scans of the CTE
 /// ([`MaterializedCteScan`]s) read the rows of the body, as
@@ -175,13 +235,11 @@ impl PhysicalMaterializedCte {
     ///
     /// A scan of the CTE that is left to DataFusion (e.g. below a
     /// user-defined node) runs the body itself: such a CTE is not lowered
-    /// (`Ok(None)`), so that DataFusion runs its body once. So is a CTE that
-    /// the recursive term of a recursive query in its continuation scans:
-    /// every iteration of a native recursive query lowers its recursive term
-    /// again, apart from the CTEs around it (see
-    /// [`PhysicalRecursiveCte`](crate::operators::recursive_cte::PhysicalRecursiveCte)),
-    /// and leaves the scans of these CTEs to DataFusion. Returns `Ok(None)`
-    /// for any other node, without lowering anything.
+    /// (`Ok(None)`), so that DataFusion runs its body once. The scans of the
+    /// CTE in the recursive terms of recursive queries of the continuation,
+    /// which every iteration lowers again, read the rows of the body too
+    /// (see [`OuterCte`]). Returns `Ok(None)` for any other node, without
+    /// lowering anything.
     pub(crate) fn try_lower<B, C>(
         plan: &Arc<dyn ExecutionPlan>,
         ctes: &MaterializedCtes,
@@ -199,9 +257,6 @@ impl PhysicalMaterializedCte {
             return internal_err!("MaterializedCteExec has a body and a continuation");
         };
         let id = cte.buffer().id();
-        if scanned_by_recursive_terms(continuation, id)? {
-            return Ok(None);
-        }
         let body = Arc::new(MaterializedCteBody::new(lower_body(cte.body())?));
         let outer = ctes.bodies.borrow_mut().insert(id, Arc::clone(&body));
         let continuation = lower_continuation(continuation);
@@ -381,22 +436,31 @@ impl PhysicalOperator for MaterializedCteBody {
 /// chunks of at most [`DEFAULT_VECTOR_SIZE`] rows of them).
 #[derive(Debug)]
 pub struct MaterializedCteScan {
-    body: Arc<MaterializedCteBody>,
+    /// The body of the CTE, or its rows (of a CTE around a recursive query
+    /// whose recursive term an iteration lowered, see [`OuterCte`]).
+    rows: OuterCte,
     schema: SchemaRef,
 }
 
 impl MaterializedCteScan {
     /// Lower `plan` to a scan of the body of its CTE if it is a
     /// `MaterializedCteScanExec` of a CTE of `ctes` (whose continuation is
-    /// being lowered).
+    /// being lowered, or whose rows they hold).
     pub(crate) fn try_lower(
         plan: &Arc<dyn ExecutionPlan>,
         ctes: &MaterializedCtes,
     ) -> Option<Self> {
         let scan = plan.downcast_ref::<MaterializedCteScanExec>()?;
-        let body = Arc::clone(ctes.bodies.borrow().get(&scan.id())?);
+        let rows = match (
+            ctes.bodies.borrow().get(&scan.id()),
+            ctes.rows.get(&scan.id()),
+        ) {
+            (Some(body), _) => OuterCte::Body(Arc::clone(body)),
+            (None, Some(rows)) => OuterCte::Rows(Arc::clone(rows)),
+            (None, None) => return None,
+        };
         Some(Self {
-            body,
+            rows,
             schema: plan.schema(),
         })
     }
@@ -444,25 +508,21 @@ impl PhysicalOperator for MaterializedCteScan {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
-        let body = self.body.as_ref() as &dyn PhysicalOperator;
-        let Some(state) = ctx.global_sink_state(body) else {
-            return internal_err!("A materialized CTE is scanned before its body ran");
-        };
-        let rows = downcast_state::<BodyRows>(state.as_any(), self.name())?;
-        let batches = rows.batches.lock();
-        // The list of the batches and the chunks of the scan, before they
-        // are allocated.
-        let num_chunks = batches
-            .iter()
-            .map(|batch| batch.num_rows().div_ceil(DEFAULT_VECTOR_SIZE))
-            .sum::<usize>();
         let reservation = MemoryConsumer::new("MaterializedCteScan")
             .register(ctx.task_ctx.memory_pool());
-        reservation.try_grow(
-            batches.iter().map(batch_overhead).sum::<usize>()
-                + num_chunks * size_of::<(usize, usize)>(),
-        )?;
-        let batches = batches.clone();
+        let batches = self.rows.with_rows(ctx, |batches| {
+            // The list of the batches and the chunks of the scan, before
+            // they are allocated.
+            let num_chunks = batches
+                .iter()
+                .map(|batch| batch.num_rows().div_ceil(DEFAULT_VECTOR_SIZE))
+                .sum::<usize>();
+            reservation.try_grow(
+                batches.iter().map(batch_overhead).sum::<usize>()
+                    + num_chunks * size_of::<(usize, usize)>(),
+            )?;
+            Ok::<_, datafusion_common::DataFusionError>(batches.to_vec())
+        })??;
         let chunks = batches
             .iter()
             .enumerate()

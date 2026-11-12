@@ -112,10 +112,6 @@ user-defined plans to the pipeline engine.
 - A `MaterializedCteExec` one of whose scans stays in DataFusion (e.g. below
   a user-defined node): DataFusion runs the body of a CTE for such a scan,
   so the CTE stays in DataFusion, which runs its body once, for all scans.
-  So does a `MaterializedCteExec` that the recursive term of a recursive
-  query in its continuation scans: every iteration of a native recursive
-  query lowers its recursive term again, apart from the CTEs around it, and
-  leaves their scans to DataFusion.
 
 ## Conditions in which native operators refuse a node
 
