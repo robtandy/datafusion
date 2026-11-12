@@ -430,6 +430,127 @@ mod tests {
         assert_eq!(count::<PhysicalStreamingMerge>(&root), 0);
     }
 
+    fn pairs_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]))
+    }
+
+    /// A partition of batches of `pairs_schema` that never ends.
+    #[derive(Debug)]
+    struct EndlessPairs(Vec<RecordBatch>);
+
+    impl PartitionStream for EndlessPairs {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(pairs_schema);
+            &SCHEMA
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok))
+                .chain(futures::stream::pending());
+            Box::pin(RecordBatchStreamAdapter::new(pairs_schema(), batches))
+        }
+    }
+
+    /// The merge, with a fetch of `merge_fetch`, of the partial sorts by `a`
+    /// (the prefix) and `b`, with a fetch of `partial_fetch`, of the two
+    /// partitions of a streaming table that never end: partition `p` has the
+    /// rows of the values `v = p, p + 2, ...` below 1000, `a = v / 10` (sorted)
+    /// and `b = v * 7 % 10`, in batches of 7 rows.
+    fn merged_partial_sorts(
+        partial_fetch: Option<usize>,
+        merge_fetch: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = pairs_schema();
+        let streams = (0..2)
+            .map(|partition| {
+                let values = (partition..1000).step_by(2).collect::<Vec<i64>>();
+                let batches = values
+                    .chunks(7)
+                    .map(|values| {
+                        let a = values.iter().map(|v| v / 10).collect::<Vec<_>>();
+                        let b = values.iter().map(|v| v * 7 % 10).collect::<Vec<_>>();
+                        RecordBatch::try_new(
+                            pairs_schema(),
+                            vec![
+                                Arc::new(Int64Array::from(a)),
+                                Arc::new(Int64Array::from(b)),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                Arc::new(EndlessPairs(batches)) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+        let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+        let table = StreamingTableExec::try_new(
+            Arc::clone(&schema),
+            streams,
+            None,
+            [LexOrdering::new(vec![a.clone()]).unwrap()],
+            true,
+            None,
+        )
+        .unwrap();
+        let ordering = LexOrdering::new(vec![a, b]).unwrap();
+        let sort = datafusion_physical_plan::sorts::partial_sort::PartialSortExec::new(
+            ordering.clone(),
+            Arc::new(table),
+            1,
+        )
+        .with_preserve_partitioning(true)
+        .with_fetch(partial_fetch);
+        Arc::new(
+            SortPreservingMergeExec::new(ordering, Arc::new(sort))
+                .with_fetch(merge_fetch),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_partial_sorts_of_partitions_that_never_end_are_native()
+    -> Result<()> {
+        for (partial_fetch, merge_fetch) in
+            [(None, 2), (Some(1), 2), (Some(3), 5), (None, 500)]
+        {
+            let make_plan = || merged_partial_sorts(partial_fetch, Some(merge_fetch));
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(
+                count::<PhysicalStreamingMerge>(&root),
+                1,
+                "{partial_fetch:?}"
+            );
+            assert_eq!(
+                count::<crate::operators::partial_sort::PhysicalPartialSort>(&root),
+                2,
+                "{partial_fetch:?}"
+            );
+        }
+        // Without a fetch, the merge emits the rows of the groups that the
+        // partial sorts completed while their inputs never end.
+        let ctx = datafusion_context(test_session_config());
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            merged_partial_sorts(None, None),
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert!(bridged_plans(root.operator()).is_empty());
+        let mut stream = root.execute(0, ctx.task_ctx())?;
+        let mut rows = 0;
+        while rows < 900 {
+            let batch = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("the merge emits rows")
+                .expect("the merge does not end")?;
+            rows += batch.num_rows();
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn merges_emit_their_rows_before_their_inputs_end() -> Result<()> {
         // Without a fetch, the merge of inputs that never end (and so never
