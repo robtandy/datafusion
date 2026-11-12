@@ -704,7 +704,7 @@ impl MemorySourceConfig {
     pub fn try_from_proto(
         node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
         ctx: &datafusion_physical_plan::proto::ExecutionPlanDecodeCtx<'_>,
-    ) -> Result<Arc<dyn datafusion_physical_plan::ExecutionPlan>> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         use datafusion_common::internal_datafusion_err;
         use datafusion_common::utils::usize_from_wire;
         use datafusion_physical_expr_common::sort_expr::optional_ordering_try_from_proto;
