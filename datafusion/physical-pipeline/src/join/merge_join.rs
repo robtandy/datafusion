@@ -150,8 +150,8 @@ use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::float_semantics::{has_float_leaf, normalize_floats};
 use datafusion_common::{
-    DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_datafusion_err,
-    internal_err, not_impl_err, plan_err,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, ScalarValue,
+    internal_datafusion_err, internal_err, not_impl_err, plan_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::ColumnarValue;
@@ -1627,16 +1627,68 @@ pub(crate) fn filter_mask(
 
 /// The values of the join keys `keys` for the rows of `batch`, with `-0.0`
 /// replaced by `+0.0` (also nested), as DataFusion compares them as join
-/// keys.
+/// keys. The keys of a single value (e.g. literals) are arrays of it for all
+/// rows, whose memory is reserved in `reservation` before they are (see
+/// [`scalar_rows_bytes`]); the caller reserves the keys as they are then (see
+/// [`key_memory`]).
 pub(crate) fn evaluate_keys(
     keys: impl IntoIterator<Item = PhysicalExprRef>,
     batch: &RecordBatch,
+    reservation: &MemoryReservation,
 ) -> Result<Vec<ArrayRef>> {
-    let keys = keys.into_iter().collect::<Vec<_>>();
-    evaluate_expressions_to_arrays(&keys, batch)?
-        .iter()
-        .map(|key| comparable_unions(&normalize_floats(key)))
+    let rows = batch.num_rows();
+    let values = keys
+        .into_iter()
+        .map(|key| key.evaluate(batch))
+        .collect::<Result<Vec<_>>>()?;
+    reservation.try_grow(
+        values
+            .iter()
+            .map(|value| match value {
+                ColumnarValue::Scalar(scalar) => scalar_rows_bytes(scalar, rows),
+                ColumnarValue::Array(_) => 0,
+            })
+            .sum(),
+    )?;
+    values
+        .into_iter()
+        .map(|value| comparable_unions(&normalize_floats(&value.into_array(rows)?)))
         .collect()
+}
+
+/// An upper bound of the memory of an array of the value `scalar` for `rows`
+/// rows: the value for every row.
+fn scalar_rows_bytes(scalar: &ScalarValue, rows: usize) -> usize {
+    scalar.size().saturating_mul(rows)
+}
+
+/// The memory that evaluating and encoding the values of the expressions
+/// `exprs` for the rows of `batch` takes, as [`key_memory`] of their arrays,
+/// without the arrays of the expressions of a single value (e.g. literals),
+/// whose rows take the bytes of the value each (see [`scalar_rows_bytes`]),
+/// and the bytes of their encoding (see [`encoded_bytes`]) of it.
+fn expression_memory(
+    exprs: &[PhysicalExprRef],
+    batch: &RecordBatch,
+) -> Result<(usize, usize)> {
+    let rows = batch.num_rows();
+    let mut arrays = vec![];
+    let (mut scalars, mut encoded) = (0, 0);
+    for expr in exprs {
+        match expr.evaluate(batch)? {
+            ColumnarValue::Array(array) => {
+                encoded += encoded_bytes(array.as_ref());
+                arrays.push(array);
+            }
+            ColumnarValue::Scalar(scalar) => {
+                let row = scalar.to_array_of_size(1)?;
+                let row_encoded = encoded_bytes(row.as_ref()).saturating_mul(rows);
+                scalars += scalar_rows_bytes(&scalar, rows) + row_encoded;
+                encoded += row_encoded;
+            }
+        }
+    }
+    Ok((key_memory(&arrays, batch) + scalars, encoded))
 }
 
 /// `array` with its unions (also those nested in it) replaced by structs of
@@ -2832,15 +2884,20 @@ impl MergeJoinSort {
         // The working memory of the sort, reserved while it sorts: the keys
         // that it evaluates (if computed), their encoding and its sorted copy,
         // and the sorted copy of the rows (the run).
+        // The keys of a single value (e.g. literals) are bounded without
+        // their arrays for all rows (see `expression_memory`).
+        let exprs = self
+            .keys
+            .ordering()
+            .iter()
+            .map(|sort_expr| Arc::clone(&sort_expr.expr))
+            .collect::<Vec<_>>();
         let mut working = 0;
         for batch in &batches {
-            let keys = self.keys.evaluate(batch)?;
-            working += key_memory(&keys, batch)
-                + keys
-                    .iter()
-                    .map(|key| encoded_bytes(key.as_ref()))
-                    .sum::<usize>()
-                + memory_size(batch);
+            // The keys and their encoding, its sorted copy, and the sorted copy
+            // of the rows.
+            let (keys, encoded) = expression_memory(&exprs, batch)?;
+            working += keys + encoded + memory_size(batch);
         }
         let sorting = reservation.new_empty();
         sorting.try_grow(working)?;
@@ -3653,9 +3710,10 @@ impl PhysicalMergeJoin {
         // The computed keys are reserved while they are encoded, and the
         // encoded keys (with the other structures of the chunk) while the
         // chunk is joined.
-        let arrays = evaluate_keys(self.spec.streamed_keys(), &batch)?;
         let chunk_reservation = reservation.new_empty();
-        chunk_reservation.try_grow(key_memory(&arrays, &batch))?;
+        let arrays =
+            evaluate_keys(self.spec.streamed_keys(), &batch, &chunk_reservation)?;
+        chunk_reservation.try_resize(key_memory(&arrays, &batch))?;
         let matchable = matchable_rows(&arrays, self.spec.null_equality);
         let zero_runs = ZeroRuns::of(&self.spec, &arrays)?;
         let keys = progress.converter.convert_columns(&arrays)?;
@@ -4561,8 +4619,10 @@ impl BufferedWindow {
         let mut keys = self.converter.empty_rows(rows, 0);
         let mut positions = Vec::with_capacity(rows);
         for (index, batch) in pending.batches.iter().enumerate() {
-            let arrays = evaluate_keys(spec.buffered_keys(), batch)?;
+            let evaluated = self.reservation.new_empty();
+            let arrays = evaluate_keys(spec.buffered_keys(), batch, &evaluated)?;
             reservation.try_grow(key_memory(&arrays, batch))?;
+            drop(evaluated);
             self.converter.append(&mut keys, &arrays)?;
             positions.extend((0..batch.num_rows()).map(|row| (index, row)));
         }
@@ -4599,9 +4659,9 @@ impl BufferedWindow {
         spec: &MergeJoinSpec,
         batch: &RecordBatch,
     ) -> Result<(Vec<ArrayRef>, MemoryReservation)> {
-        let keys = evaluate_keys(spec.buffered_keys(), batch)?;
         let reservation = self.reservation.new_empty();
-        reservation.try_grow(key_memory(&keys, batch))?;
+        let keys = evaluate_keys(spec.buffered_keys(), batch, &reservation)?;
+        reservation.try_resize(key_memory(&keys, batch))?;
         Ok((keys, reservation))
     }
 
@@ -5560,11 +5620,11 @@ impl PhysicalOperator for PhysicalMergeJoin {
         if batch.num_rows() == 0 {
             return Ok(SinkResult::NeedMoreInput);
         }
-        let keys = evaluate_keys(self.spec.buffered_keys(), &batch)?;
         // The computed keys are reserved while they are encoded, and their
         // encoding until it is reserved with the rows.
         let evaluated = state.reservation.new_empty();
-        evaluated.try_grow(key_memory(&keys, &batch))?;
+        let keys = evaluate_keys(self.spec.buffered_keys(), &batch, &evaluated)?;
+        evaluated.try_resize(key_memory(&keys, &batch))?;
         // The bytes of the rows are counted with their scratch reserved.
         evaluated.try_grow(self.spec.gathered_scratch_bytes(&batch, false))?;
         let mut building = state.building.lock();
@@ -10056,6 +10116,66 @@ pub(crate) mod tests {
             "a timer of 10 ms fired after {waited:?}"
         );
         assert!(cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn literal_keys_are_reserved_before_their_rows_are() -> Result<()> {
+        // A merge join of 1,024 rows with a row on a literal key, a string of
+        // 16 KiB, and a sort of the 1,024 rows by it (and their ids): the keys
+        // of all rows (16 MB as values, and as much encoded) are reserved
+        // before they are arrays (the literal is a single value), so that in a
+        // pool of 256 KiB both fail with `ResourcesExhausted` before they
+        // allocate them (on the thread of the test, as a runtime of the current
+        // thread runs all tasks of the query there).
+        use crate::join::symmetric_hash_join::tests::{id_rows, wide_key};
+        let source = |batch: RecordBatch| -> Arc<dyn PhysicalOperator> {
+            Arc::new(TestSource::with_schema(
+                batch.schema(),
+                vec![DataChunk::from_record_batch(batch)],
+            ))
+        };
+        let join: Arc<dyn PhysicalOperator> = Arc::new(PhysicalMergeJoin::try_new(
+            source(id_rows("l", 1024)),
+            source(id_rows("r", 1)),
+            vec![(wide_key(), wide_key())],
+            None,
+            JoinType::Inner,
+            &[SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+            false,
+            None,
+        )?);
+        let batch = id_rows("l", 1024);
+        let id = col("lid", &batch.schema())?;
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new(wide_key(), SortOptions::default()),
+            PhysicalSortExpr::new(id, SortOptions::default()),
+        ])
+        .unwrap();
+        let sort: Arc<dyn PhysicalOperator> =
+            Arc::new(MergeJoinSort::try_new(source(batch), ordering)?);
+        for (name, operator) in [("PhysicalMergeJoin", join), ("MergeJoinSort", sort)] {
+            allocations::reset_peak();
+            let before = allocations::held();
+            let err = with_timeout(Executor::collect(
+                operator,
+                limited_task_ctx(256 << 10)?,
+                4,
+            ))
+            .await
+            .unwrap_err();
+            let allocated = allocations::peak() - before;
+            assert!(
+                matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{name}: {err}"
+            );
+            assert!(err.to_string().contains(name), "{name}: {err}");
+            assert!(
+                allocated < 1 << 20,
+                "{name}: the query allocated {allocated} bytes"
+            );
+        }
         Ok(())
     }
 

@@ -1260,9 +1260,9 @@ impl PhysicalSymmetricHashJoin {
         // The computed keys, and their encoding, are reserved before they are
         // encoded (see `key_memory`), and the encoded keys while the chunk is
         // joined.
-        let arrays = evaluate_keys(self.spec.keys(side), &batch)?;
         let reservation = run.reservation.new_empty();
-        reservation.try_grow(key_memory(&arrays, &batch))?;
+        let arrays = evaluate_keys(self.spec.keys(side), &batch, &reservation)?;
+        reservation.try_resize(key_memory(&arrays, &batch))?;
         let matchable = matchable_rows(&arrays, self.spec.null_equality);
         let keys = run.converter.convert_columns(&arrays)?;
         drop(arrays);
@@ -1587,9 +1587,9 @@ impl PhysicalSymmetricHashJoin {
         // keys, evaluated again and encoded, are reserved while they are
         // looked up.
         table.drop_batches(dropped, |batch| {
-            let arrays = evaluate_keys(self.spec.keys(side), batch)?;
             let evaluated = reservation.new_empty();
-            evaluated.try_grow(key_memory(&arrays, batch))?;
+            let arrays = evaluate_keys(self.spec.keys(side), batch, &evaluated)?;
+            evaluated.try_resize(key_memory(&arrays, batch))?;
             Ok((converter.convert_columns(&arrays)?, evaluated))
         })?;
         // The structures that the dropped rows leave mostly empty shrink, if
@@ -4903,6 +4903,64 @@ pub(crate) mod tests {
             "a timer of 10 ms fired after {waited:?}"
         );
         assert!(cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn literal_keys_are_reserved_before_their_rows_are() -> Result<()> {
+        // A symmetric join of 1,024 rows with a row on a literal key, a string
+        // of 16 KiB: the keys of all rows (16 MB as values, and as much
+        // encoded) are reserved before they are arrays (the literal is a
+        // single value), so that in a pool of 256 KiB the join fails with
+        // `ResourcesExhausted` before it allocates them (on the thread of the
+        // test, as a runtime of the current thread runs all tasks of the query
+        // there).
+        let stream = |batch: RecordBatch| {
+            let partition = BatchesPartition {
+                schema: batch.schema(),
+                batches: vec![batch.clone()],
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    batch.schema(),
+                    vec![Arc::new(partition)],
+                    None,
+                    vec![],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let join: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            stream(id_rows("l", 1024)),
+            stream(id_rows("r", 1)),
+            vec![(wide_key(), wide_key())],
+            None,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&join)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        allocations::reset_peak();
+        let before = allocations::held();
+        let err = run_native(&root, join, limited_task_ctx(256 << 10)?)
+            .await
+            .unwrap_err();
+        let allocated = allocations::peak() - before;
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("PhysicalSymmetricHashJoin"),
+            "{err}"
+        );
+        assert!(allocated < 1 << 20, "the query allocated {allocated} bytes");
         Ok(())
     }
 }
