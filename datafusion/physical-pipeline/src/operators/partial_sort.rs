@@ -430,13 +430,23 @@ impl PhysicalOperator for PlaceholderSink {
     }
 }
 
+/// The memory that buffering `batch` holds: its arrays, and the batch in the
+/// list of batches.
+fn batch_memory(batch: &RecordBatch) -> usize {
+    batch.get_array_memory_size() + batch_overhead(batch)
+}
+
 /// The state of the thread of a [`PhysicalPartialSort`].
 struct PartialSortState {
     /// The rows of the last group of rows with the same prefix, which may
     /// continue in the next chunk.
     group: Vec<RecordBatch>,
+    /// The memory of `group` (see [`batch_memory`]).
+    group_memory: usize,
     /// The sorted rows that are not emitted yet, and the first of them.
     sorted: Option<RecordBatch>,
+    /// The memory of `sorted`.
+    sorted_memory: usize,
     offset: usize,
     /// Whether the chunk that the operator is called with was consumed.
     consumed: bool,
@@ -457,13 +467,20 @@ impl PartialSortState {
     /// and the batches in the list of batches), and `extra` bytes, before the
     /// operator allocates them.
     fn reserve_with(&self, extra: usize) -> Result<()> {
-        let size = self
-            .group
-            .iter()
-            .chain(&self.sorted)
-            .map(|batch| batch.get_array_memory_size() + batch_overhead(batch))
-            .sum::<usize>();
-        self.reservation.try_resize(size + extra)
+        self.reservation
+            .try_resize(self.group_memory + self.sorted_memory + extra)
+    }
+
+    /// Buffer `batch`, which continues the last group.
+    fn push_group(&mut self, batch: RecordBatch) {
+        self.group_memory += batch_memory(&batch);
+        self.group.push(batch);
+    }
+
+    /// Take the rows of the last group.
+    fn take_group(&mut self) -> Vec<RecordBatch> {
+        self.group_memory = 0;
+        std::mem::take(&mut self.group)
     }
 
     /// Emit the next chunk of the sorted rows into `output`. Returns whether
@@ -479,6 +496,7 @@ impl PartialSortState {
             return true;
         }
         self.sorted = None;
+        self.sorted_memory = 0;
         false
     }
 
@@ -495,6 +513,7 @@ impl PartialSortState {
         };
         self.offset = 0;
         self.sorted = (sorted.num_rows() > 0).then_some(sorted);
+        self.sorted_memory = self.sorted.as_ref().map_or(0, batch_memory);
     }
 
     fn done(&self) -> bool {
@@ -539,7 +558,9 @@ impl PhysicalOperator for PhysicalPartialSort {
             .register(ctx.task_ctx.memory_pool());
         Ok(Box::new(PartialSortState {
             group: vec![],
+            group_memory: 0,
             sorted: None,
+            sorted_memory: 0,
             offset: 0,
             consumed: false,
             remaining: self.fetch,
@@ -574,14 +595,14 @@ impl PhysicalOperator for PhysicalPartialSort {
             };
             if ranges.len() == 1 && continues {
                 // The chunk continues the last group.
-                state.group.push(batch);
+                state.push_group(batch);
             } else {
                 // The groups before the last group of the chunk are complete.
-                let mut complete = std::mem::take(&mut state.group);
+                let mut complete = state.take_group();
                 if last.start > 0 {
                     complete.push(batch.slice(0, last.start));
                 }
-                state.group.push(batch.slice(last.start, last.len()));
+                state.push_group(batch.slice(last.start, last.len()));
                 if !complete.is_empty() {
                     state.reserve_with(self.sort_memory(&complete))?;
                     let sorted = self.sort(&complete, state.remaining)?;
@@ -616,13 +637,13 @@ impl PhysicalOperator for PhysicalPartialSort {
             downcast_state_mut::<PartialSortState>(lstate.as_any_mut(), self.name())?;
         // The last group is complete once the input ends.
         if !state.group.is_empty() && state.remaining != Some(0) {
-            let group = std::mem::take(&mut state.group);
+            let group = state.take_group();
             state.reserve_with(self.sort_memory(&group))?;
             let sorted = self.sort(&group, state.remaining)?;
             state.set_sorted(sorted);
             state.reserve()?;
         }
-        state.group.clear();
+        state.take_group();
         if state.emit(output) {
             return Ok(OperatorFinalizeResult::HaveMoreOutput);
         }
@@ -996,6 +1017,106 @@ mod tests {
         let single = partial_sort(vec![batch(vec![1, 1], vec![2, 1])], Some(1))?;
         assert!(pipelines_of(&single).is_ok_and(|pipelines| pipelines == 1));
         Ok(())
+    }
+
+    /// A partition of a streaming table, of `batches`.
+    #[derive(Debug)]
+    struct StreamPartition(Vec<RecordBatch>);
+
+    impl datafusion_physical_plan::streaming::PartitionStream for StreamPartition {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: std::sync::LazyLock<SchemaRef> =
+                std::sync::LazyLock::new(schema);
+            &SCHEMA
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<TaskContext>,
+        ) -> datafusion_execution::SendableRecordBatchStream {
+            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok));
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    schema(),
+                    batches,
+                ),
+            )
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetches_of_several_streams_limit_every_stream() -> Result<()> {
+        // Two partitions of a streaming table, with the same prefix: every
+        // partition keeps its first row, alone and below a merge that keeps
+        // more rows.
+        let make_plan = |merge_fetch: Option<Option<usize>>| -> Arc<dyn ExecutionPlan> {
+            let schema = schema();
+            let partitions = [vec![5, 9], vec![1, 3]]
+                .into_iter()
+                .map(|b| {
+                    let partition = StreamPartition(vec![batch(vec![0; b.len()], b)]);
+                    Arc::new(partition)
+                        as Arc<dyn datafusion_physical_plan::streaming::PartitionStream>
+                })
+                .collect();
+            let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+            let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+            let table = StreamingTableExec::try_new(
+                Arc::clone(&schema),
+                partitions,
+                None,
+                [LexOrdering::new(vec![a.clone()]).unwrap()],
+                false,
+                None,
+            )
+            .unwrap();
+            let ordering = LexOrdering::new(vec![a, b]).unwrap();
+            let sort: Arc<dyn ExecutionPlan> = Arc::new(
+                PartialSortExec::new(ordering.clone(), Arc::new(table), 1)
+                    .with_preserve_partitioning(true)
+                    .with_fetch(Some(1)),
+            );
+            match merge_fetch {
+                None => sort,
+                Some(fetch) => Arc::new(
+                    SortPreservingMergeExec::new(ordering, sort).with_fetch(fetch),
+                ),
+            }
+        };
+        for merge_fetch in [None, Some(None), Some(Some(2))] {
+            let root = assert_plan_lowered(
+                || make_plan(merge_fetch),
+                test_session_config(),
+                merge_fetch.is_some(),
+            )
+            .await;
+            assert_eq!(count::<PhysicalPartialSort>(&root), 2, "{merge_fetch:?}");
+        }
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        let merged = collect(make_plan(Some(Some(2))), ctx.task_ctx()).await?;
+        assert_eq!(rows(&merged), vec![(0, 1), (0, 5)]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_memory_of_a_group_of_many_batches_is_counted_as_they_arrive() {
+        // A group of 20,000 chunks of a row: the memory of the group is kept
+        // up to date as they arrive, not counted again for every chunk
+        // (which takes quadratic time).
+        let batches = (0..20_000)
+            .map(|i| batch(vec![1], vec![(i * 7919) % 20_000]))
+            .collect::<Vec<_>>();
+        let sort = partial_sort(batches, None).unwrap();
+        let run = Executor::collect(sort, Arc::new(TaskContext::default()), 4);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), run)
+            .await
+            .expect("a group of many chunks is sorted in linear time")
+            .unwrap();
+        let b = rows(&output)
+            .into_iter()
+            .map(|(_, b)| b)
+            .collect::<Vec<_>>();
+        assert_eq!(b, (0..20_000).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
