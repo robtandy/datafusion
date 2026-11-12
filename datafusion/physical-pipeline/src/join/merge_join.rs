@@ -121,7 +121,7 @@
 //!
 //! [`PhysicalSymmetricHashJoin`]: super::symmetric_hash_join::PhysicalSymmetricHashJoin
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -130,16 +130,19 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Int8Array, RecordBatch, RecordBatchOptions,
-    StructArray, UInt32Array, make_array, new_empty_array, new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, DictionaryArray,
+    GenericListArray, Int8Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    RecordBatchOptions, StructArray, UInt32Array, make_array, new_empty_array,
+    new_null_array,
 };
-use arrow::buffer::NullBuffer;
+use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::{
     SortOptions, interleave, interleave_record_batch, prep_null_mask_filter, take,
 };
 use arrow::datatypes::{
-    DataType, Field, FieldRef, Float16Type, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, Schema, SchemaRef, UnionMode,
+    ArrowDictionaryKeyType, ArrowNativeType, DataType, Field, FieldRef, Float16Type,
+    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
+    SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type, UnionMode,
 };
 use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use datafusion_common::cast::as_boolean_array;
@@ -1149,14 +1152,218 @@ impl StoredRows {
             .iter()
             .any(Option::is_none)
             .then(|| new_null_array(field.data_type(), 1));
-        let arrays = self
-            .batches
-            .iter()
-            .map(|batch| batch.column(column).as_ref())
-            .chain(nulls.as_deref())
-            .collect::<Vec<_>>();
-        Ok(interleave(&arrays, &located)?)
+        // The rows are gathered from the batches that they are in only (and
+        // their dictionaries, see `interleave_compact`).
+        let mut sources = vec![usize::MAX; self.batches.len() + 1];
+        let mut arrays = vec![];
+        let mut rows = Vec::with_capacity(located.len());
+        for (batch, row) in located {
+            if sources[batch] == usize::MAX {
+                sources[batch] = arrays.len();
+                let array = match (self.batches.get(batch), nulls.as_deref()) {
+                    (Some(batch), _) => batch.column(column).as_ref(),
+                    (None, Some(nulls)) => nulls,
+                    (None, None) => {
+                        return internal_err!(
+                            "A NULL row without the NULLs of the stored rows"
+                        );
+                    }
+                };
+                arrays.push(array);
+            }
+            rows.push((sources[batch], row));
+        }
+        interleave_compact(&arrays, &rows)
     }
+}
+
+/// Whether values of `data_type` are dictionaries, or have dictionaries
+/// inside them.
+fn has_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::RunEndEncoded(_, values) => has_dictionary(values.data_type()),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => has_dictionary(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| has_dictionary(field.data_type()))
+        }
+        DataType::Union(fields, _) => fields
+            .iter()
+            .any(|(_, field)| has_dictionary(field.data_type())),
+        _ => false,
+    }
+}
+
+/// The values of `arrays` at `indices` (an array of `arrays` and a row of
+/// it), as `interleave` gathers them, but with the values of dictionaries
+/// (also those in structs and lists) that the rows use only, once:
+/// `interleave` copies all values of the dictionaries of all `arrays` (unless
+/// it merges them), also those that no row uses, which the joins do not
+/// reserve (they reserve the values of the rows that they gather, see
+/// [`GatherWidths`]).
+fn interleave_compact(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    let Some(first) = arrays.first() else {
+        return internal_err!("Rows gathered from no arrays");
+    };
+    if indices.is_empty() || !has_dictionary(first.data_type()) {
+        return Ok(interleave(arrays, indices)?);
+    }
+    match first.data_type() {
+        DataType::Dictionary(key, _) => match key.as_ref() {
+            DataType::Int8 => interleave_dictionary::<Int8Type>(arrays, indices),
+            DataType::Int16 => interleave_dictionary::<Int16Type>(arrays, indices),
+            DataType::Int32 => interleave_dictionary::<Int32Type>(arrays, indices),
+            DataType::Int64 => interleave_dictionary::<Int64Type>(arrays, indices),
+            DataType::UInt8 => interleave_dictionary::<UInt8Type>(arrays, indices),
+            DataType::UInt16 => interleave_dictionary::<UInt16Type>(arrays, indices),
+            DataType::UInt32 => interleave_dictionary::<UInt32Type>(arrays, indices),
+            DataType::UInt64 => interleave_dictionary::<UInt64Type>(arrays, indices),
+            _ => Ok(interleave(arrays, indices)?),
+        },
+        DataType::Struct(fields) => {
+            let structs = arrays
+                .iter()
+                .map(|array| array.as_struct())
+                .collect::<Vec<_>>();
+            let columns = (0..fields.len())
+                .map(|column| {
+                    let children = structs
+                        .iter()
+                        .map(|array| array.column(column).as_ref())
+                        .collect::<Vec<_>>();
+                    interleave_compact(&children, indices)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                columns,
+                gathered_nulls(arrays, indices),
+            )?))
+        }
+        DataType::List(field) => interleave_compact_lists::<i32>(arrays, indices, field),
+        DataType::LargeList(field) => {
+            interleave_compact_lists::<i64>(arrays, indices, field)
+        }
+        // Other layouts with dictionaries are gathered as `interleave` does.
+        _ => Ok(interleave(arrays, indices)?),
+    }
+}
+
+/// [`interleave_compact`] of dictionaries with keys of type `K`: the values
+/// that the rows use, once (by the array and the key of every row), and the
+/// keys of the rows in them. As `interleave` if the keys cannot address them
+/// (which then merges the values that the rows use).
+fn interleave_dictionary<K: ArrowDictionaryKeyType>(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    let dictionaries = arrays
+        .iter()
+        .map(|array| array.as_dictionary::<K>())
+        .collect::<Vec<_>>();
+    let mut used = HashMap::<(usize, usize), usize>::new();
+    let mut values = vec![];
+    let mut keys = Vec::with_capacity(indices.len());
+    let mut valid = BooleanBufferBuilder::new(indices.len());
+    for &(array, row) in indices {
+        let dictionary_keys = dictionaries[array].keys();
+        match dictionary_keys.is_valid(row) {
+            true => {
+                let key = dictionary_keys.values()[row].as_usize();
+                let next = values.len();
+                let new = *used.entry((array, key)).or_insert(next);
+                if new == next {
+                    values.push((array, key));
+                }
+                keys.push(new);
+                valid.append(true);
+            }
+            false => {
+                keys.push(0);
+                valid.append(false);
+            }
+        }
+    }
+    if K::Native::from_usize(values.len()).is_none() {
+        return Ok(interleave(arrays, indices)?);
+    }
+    let value_arrays = dictionaries
+        .iter()
+        .map(|dictionary| dictionary.values().as_ref())
+        .collect::<Vec<_>>();
+    let values = match values.is_empty() {
+        // All keys are NULL.
+        true => new_null_array(value_arrays[0].data_type(), 1),
+        false => interleave_compact(&value_arrays, &values)?,
+    };
+    let keys = keys
+        .into_iter()
+        .map(|key| K::Native::from_usize(key).unwrap_or_default())
+        .collect::<Vec<_>>();
+    let nulls = NullBuffer::new(valid.finish());
+    let keys =
+        PrimitiveArray::<K>::new(keys.into(), (nulls.null_count() > 0).then_some(nulls));
+    Ok(Arc::new(DictionaryArray::<K>::try_new(keys, values)?))
+}
+
+/// [`interleave_compact`] of lists with offsets of type `O` (of items of
+/// `field`): the items of the lists of the rows, gathered so.
+fn interleave_compact_lists<O: OffsetSizeTrait>(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    field: &FieldRef,
+) -> Result<ArrayRef> {
+    let lists = arrays
+        .iter()
+        .map(|array| array.as_list::<O>())
+        .collect::<Vec<_>>();
+    let mut items = vec![];
+    let mut offsets = Vec::with_capacity(indices.len() + 1);
+    offsets.push(O::zero());
+    for &(array, row) in indices {
+        let list = lists[array];
+        if list.is_valid(row) {
+            let ends = &list.value_offsets()[row..row + 2];
+            items.extend(
+                (ends[0].as_usize()..ends[1].as_usize()).map(|item| (array, item)),
+            );
+        }
+        let Some(offset) = O::from_usize(items.len()) else {
+            return internal_err!("Gathered lists with too many items");
+        };
+        offsets.push(offset);
+    }
+    let values = lists
+        .iter()
+        .map(|list| list.values().as_ref())
+        .collect::<Vec<_>>();
+    let values = interleave_compact(&values, &items)?;
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        Arc::clone(field),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        gathered_nulls(arrays, indices),
+    )?))
+}
+
+/// The validity of the rows `indices` (an array of `arrays` and a row of it).
+fn gathered_nulls(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+) -> Option<NullBuffer> {
+    let nulls = NullBuffer::new(BooleanBuffer::collect_bool(indices.len(), |index| {
+        let (array, row) = indices[index];
+        arrays[array].is_valid(row)
+    }));
+    (nulls.null_count() > 0).then_some(nulls)
 }
 
 /// Whether the residual filter `filter` holds for the `num_rows` pairs of
@@ -7928,10 +8135,7 @@ pub(crate) mod tests {
     pub(crate) fn dictionary_view_rows(side: &str) -> RecordBatch {
         let value = "x".repeat(1 << 20);
         let values = StringViewArray::from(vec![value.as_str()]);
-        let keys = arrow::array::DictionaryArray::new(
-            Int32Array::from(vec![0; 128]),
-            Arc::new(values),
-        );
+        let keys = DictionaryArray::new(Int32Array::from(vec![0; 128]), Arc::new(values));
         let schema = Arc::new(Schema::new(vec![
             Field::new(format!("{side}id"), DataType::Int64, false),
             Field::new(format!("{side}k"), keys.data_type().clone(), false),
@@ -7960,7 +8164,7 @@ pub(crate) mod tests {
         let item = Arc::new(Field::new_list_field(short.data_type().clone(), false));
         let lists = ListArray::new(
             item,
-            arrow::buffer::OffsetBuffer::from_lengths([0, 1, 5, 64]),
+            OffsetBuffer::from_lengths([0, 1, 5, 64]),
             Arc::new(short.clone()),
             None,
         );
@@ -7968,11 +8172,9 @@ pub(crate) mod tests {
             &Int32Array::from(vec![64, 128]),
             &StringViewArray::from_iter_values(["a".repeat(1024), "b".repeat(33)]),
         )?;
-        let words =
-            arrow::array::DictionaryArray::<arrow::datatypes::Int8Type>::from_iter(
-                (0..100)
-                    .map(|i| ["", "a", "bb", "thirty-three bytes of a short str"][i % 4]),
-            );
+        let words = DictionaryArray::<Int8Type>::from_iter(
+            (0..100).map(|i| ["", "a", "bb", "thirty-three bytes of a short str"][i % 4]),
+        );
         let fields = Fields::from(vec![
             Field::new("w", words.data_type().clone(), false),
             Field::new("i", DataType::Int64, false),
@@ -7985,7 +8187,7 @@ pub(crate) mod tests {
             ],
             Some(NullBuffer::from_iter((0..100).map(|i| i % 3 != 0))),
         );
-        let nulls = arrow::array::DictionaryArray::new(
+        let nulls = DictionaryArray::new(
             Int32Array::from(vec![Some(0), None, Some(0)]),
             Arc::new(StringViewArray::from(vec!["x".repeat(100)])),
         );
@@ -8177,7 +8379,7 @@ pub(crate) mod tests {
             let item = Arc::new(Field::new_list_field(values.data_type().clone(), true));
             Arc::new(ListArray::new(
                 item,
-                arrow::buffer::OffsetBuffer::from_lengths(vec![1; values.len()]),
+                OffsetBuffer::from_lengths(vec![1; values.len()]),
                 values,
                 None,
             ))
@@ -8422,13 +8624,13 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A stream that produces the batch that `rows` builds as it is read (so
-    /// that it is allocated by the query, on the thread that reads it), and
-    /// then ends.
+    /// A stream that produces the batches that `rows` builds as it is read
+    /// (so that they are allocated by the query, on the thread that reads
+    /// them), and then ends.
     #[derive(Debug)]
-    struct BuiltPartition {
-        schema: SchemaRef,
-        rows: fn() -> RecordBatch,
+    pub(crate) struct BuiltPartition {
+        pub(crate) schema: SchemaRef,
+        pub(crate) rows: fn() -> Vec<RecordBatch>,
     }
 
     impl PartitionStream for BuiltPartition {
@@ -8438,9 +8640,13 @@ pub(crate) mod tests {
 
         fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
             let rows = self.rows;
+            let batches = futures::stream::once(async move {
+                futures::stream::iter(rows().into_iter().map(Ok))
+            })
+            .flatten();
             Box::pin(RecordBatchStreamAdapter::new(
                 Arc::clone(&self.schema),
-                futures::stream::once(async move { Ok(rows()) }),
+                batches,
             ))
         }
     }
@@ -8488,11 +8694,14 @@ pub(crate) mod tests {
         // current thread runs all tasks of the query there); in one of 12 MiB,
         // which holds the rows but not their copies, it fails with
         // `ResourcesExhausted` before it copies them.
-        fn released_run() -> RecordBatch {
-            wide_run_rows(|row| if row < 2048 { -0.0 } else { 0.0 }, |row| row % 2048)
+        fn released_run() -> Vec<RecordBatch> {
+            vec![wide_run_rows(
+                |row| if row < 2048 { -0.0 } else { 0.0 },
+                |row| row % 2048,
+            )]
         }
-        fn appended_run() -> RecordBatch {
-            wide_run_rows(|_| -0.0, |row| row)
+        fn appended_run() -> Vec<RecordBatch> {
+            vec![wide_run_rows(|_| -0.0, |row| row)]
         }
         let order = |side: &str| {
             let schema = wide_run_schema(side);
@@ -8508,7 +8717,7 @@ pub(crate) mod tests {
             ])
             .unwrap()
         };
-        let join_of = |rows: fn() -> RecordBatch| -> Result<Arc<dyn ExecutionPlan>> {
+        let join_of = |rows: fn() -> Vec<RecordBatch>| -> Result<Arc<dyn ExecutionPlan>> {
             let left_rows = RecordBatch::try_new(
                 wide_run_schema("l"),
                 vec![
@@ -8558,7 +8767,7 @@ pub(crate) mod tests {
             )?))
         };
         // The name of the run, its rows, and the rows that the join matches.
-        type Run = (&'static str, fn() -> RecordBatch, usize);
+        type Run = (&'static str, fn() -> Vec<RecordBatch>, usize);
         let runs: [Run; 2] = [
             ("released by its last row", released_run, 8),
             ("appended at the end", appended_run, 4),
@@ -8606,6 +8815,228 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The schema of the rows `(<side>id, <side>k, <side>d)` of the joins of
+    /// dictionaries: an id, a key and a dictionary of strings.
+    pub(crate) fn dictionary_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+            Field::new(
+                format!("{side}d"),
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]))
+    }
+
+    /// Two batches of 50 right rows of the key 1, each of which has a
+    /// dictionary of its own of the values `"a"` and a string of 1 MiB, but
+    /// whose rows all have `"a"`.
+    pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
+        // The string of 1 MiB, copied into the values only (not built first).
+        static BIG: [u8; 1 << 20] = [b'x'; 1 << 20];
+        let big = std::str::from_utf8(&BIG).unwrap();
+        (0..2)
+            .map(|batch| {
+                let values = StringArray::from(vec!["a", big]);
+                let dictionary =
+                    DictionaryArray::new(Int32Array::from(vec![0; 50]), Arc::new(values));
+                RecordBatch::try_new(
+                    dictionary_schema("r"),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(
+                            batch * 50..batch * 50 + 50,
+                        )),
+                        Arc::new(Int32Array::from(vec![1; 50])),
+                        Arc::new(dictionary),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// Two left rows of the key 1 (of a dictionary of `"b"`).
+    pub(crate) fn dictionary_probe_rows() -> RecordBatch {
+        let values = StringArray::from(vec!["b"]);
+        let dictionary =
+            DictionaryArray::new(Int32Array::from(vec![0; 2]), Arc::new(values));
+        RecordBatch::try_new(
+            dictionary_schema("l"),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..2)),
+                Arc::new(Int32Array::from(vec![1; 2])),
+                Arc::new(dictionary),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_interleaves_gather_the_values_of_interleave() -> Result<()> {
+        // `interleave_compact` gathers the values that `interleave` does (but
+        // with the values of dictionaries that the rows use only, once): of
+        // dictionaries (also with NULL keys and NULL rows, and with keys that
+        // cannot address the values that the rows use, as `interleave` gathers
+        // them then), of structs and of lists of them.
+        let dictionary = |values: Vec<&str>, keys: Vec<Option<i32>>| -> ArrayRef {
+            Arc::new(DictionaryArray::new(
+                Int32Array::from(keys),
+                Arc::new(StringArray::from(values)),
+            ))
+        };
+        let first = dictionary(
+            vec!["a", "b", "unused"],
+            vec![Some(0), Some(1), None, Some(0)],
+        );
+        let second = dictionary(vec!["unused", "c"], vec![Some(1), Some(1)]);
+        let nulls = new_null_array(first.data_type(), 1);
+        let indices = [(0, 1), (1, 0), (0, 2), (2, 0), (0, 0), (1, 1), (0, 3)];
+        let structs = |column: &ArrayRef, valid: Vec<bool>| -> ArrayRef {
+            let fields = Fields::from(vec![
+                Field::new("d", column.data_type().clone(), true),
+                Field::new("i", DataType::Int32, false),
+            ]);
+            let ints = Arc::new(Int32Array::from_iter_values(0..column.len() as i32));
+            Arc::new(StructArray::new(
+                fields,
+                vec![Arc::clone(column), ints],
+                Some(NullBuffer::from(valid)),
+            ))
+        };
+        let lists = |column: &ArrayRef| -> ArrayRef {
+            let item = Arc::new(Field::new_list_field(column.data_type().clone(), true));
+            let lengths = match column.len() {
+                4 => vec![2, 0, 2],
+                _ => vec![1, 1],
+            };
+            Arc::new(ListArray::new(
+                item,
+                OffsetBuffer::from_lengths(lengths),
+                Arc::clone(column),
+                None,
+            ))
+        };
+        // Dictionaries of the same 100 values (of arrays of their own) with
+        // keys of 8 bits: their 200 values cannot all be the values of one, but
+        // the 100 distinct ones (that `interleave` merges) can.
+        let narrow = || -> ArrayRef {
+            Arc::new(DictionaryArray::new(
+                Int8Array::from_iter_values(0..100),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|word| format!("w{word}")),
+                )),
+            ))
+        };
+        let wide = (0..200)
+            .map(|row| (row / 100, row % 100))
+            .collect::<Vec<_>>();
+        let first_structs = structs(&first, vec![true, true, false, true]);
+        let second_structs = structs(&second, vec![true, true]);
+        let null_structs = new_null_array(first_structs.data_type(), 1);
+        // The name of the case, the arrays, and the rows to gather.
+        type Case = (&'static str, Vec<ArrayRef>, Vec<(usize, usize)>);
+        let cases: Vec<Case> = vec![
+            (
+                "dictionaries",
+                vec![Arc::clone(&first), Arc::clone(&second), nulls],
+                indices.to_vec(),
+            ),
+            (
+                "structs",
+                vec![first_structs, second_structs, null_structs],
+                indices.to_vec(),
+            ),
+            (
+                "lists",
+                vec![lists(&first), lists(&second)],
+                vec![(0, 0), (1, 1), (0, 1), (0, 2), (1, 0)],
+            ),
+            ("keys that overflow", vec![narrow(), narrow()], wide),
+        ];
+        for (name, arrays, indices) in cases {
+            let arrays = arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>();
+            let compact = interleave_compact(&arrays, &indices)?;
+            let expected = interleave(&arrays, &indices)?;
+            assert_eq!(compact.as_ref(), expected.as_ref(), "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dictionaries_are_gathered_with_the_values_that_their_rows_use() -> Result<()>
+    {
+        // The right (buffered) stream produces two batches of 50 rows of the
+        // key 1 whose dictionaries have the values `"a"` and a string of 1 MiB
+        // (2 MiB in all, built as the stream is read), whose rows all have
+        // `"a"`, and the left stream two rows of the key 1: the merge join
+        // gathers the right rows of the 200 pairs from both batches, with the
+        // values of their dictionaries that they use only (`interleave` copies
+        // all values of all dictionaries), so that it allocates no more than
+        // it reserves (on the thread of the test, as a runtime of the current
+        // thread runs all tasks of the query there), also in a pool of 3 MiB.
+        let order = |side: &str| {
+            LexOrdering::new([PhysicalSortExpr::new(
+                col(&format!("{side}k"), &dictionary_schema(side)).unwrap(),
+                SortOptions::default(),
+            )])
+            .unwrap()
+        };
+        for pool_size in [64 << 20, 3 << 20] {
+            let left: Arc<dyn PartitionStream> = Arc::new(StreamPartition {
+                schema: dictionary_schema("l"),
+                batches: vec![dictionary_probe_rows()],
+                forever: false,
+            });
+            let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
+                schema: dictionary_schema("r"),
+                rows: dictionary_batches,
+            });
+            let stream = |side: &str, partition: Arc<dyn PartitionStream>| {
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        dictionary_schema(side),
+                        vec![partition],
+                        None,
+                        [order(side)],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            let (left, right) = (stream("l", left), stream("r", right));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Inner,
+                vec![SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+            )?);
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            assert_streaming_merge_join(&root, "dictionaries");
+            let pool = Arc::new(PeakPool::new(pool_size));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                .build_arc()?;
+            let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+            allocations::reset_peak();
+            let before = allocations::held();
+            let output = run_native(&root, plan, ctx).await?;
+            let allocated = allocations::peak() - before;
+            let reserved = pool.peak.load(Ordering::Relaxed) as isize;
+            assert_eq!(num_rows(&output.batches), 200);
+            assert!(
+                allocated < reserved + (512 << 10),
+                "the query allocated {allocated} bytes, and reserved {reserved}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ordered_joins_of_streams_of_list_zeros_that_never_end_emit_their_rows()
     -> Result<()> {
@@ -8627,7 +9058,7 @@ pub(crate) mod tests {
             let field = Arc::new(Field::new_list_field(inner.data_type().clone(), true));
             Arc::new(ListArray::new(
                 field,
-                arrow::buffer::OffsetBuffer::from_lengths([1]),
+                OffsetBuffer::from_lengths([1]),
                 inner,
                 None,
             ))
@@ -8648,7 +9079,7 @@ pub(crate) mod tests {
             let field = Arc::new(Field::new_list_field(DataType::Struct(fields), true));
             Arc::new(ListArray::new(
                 field,
-                arrow::buffer::OffsetBuffer::from_lengths([1]),
+                OffsetBuffer::from_lengths([1]),
                 Arc::new(values),
                 None,
             ))

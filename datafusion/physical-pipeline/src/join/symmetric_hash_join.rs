@@ -1878,9 +1878,11 @@ pub(crate) mod tests {
     use crate::join::PhysicalHashJoin;
     use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
-        ALL_JOIN_TYPES, PeakPool, data_batch, data_schema, dictionary_view_rows,
-        join_filter, keyed_rows, limited_task_ctx, num_rows, reference_join_of_keys,
-        run_native, union_key_layouts, union_key_matches, with_timeout,
+        ALL_JOIN_TYPES, BuiltPartition, PeakPool, data_batch, data_schema,
+        dictionary_batches, dictionary_probe_rows, dictionary_schema,
+        dictionary_view_rows, join_filter, keyed_rows, limited_task_ctx, num_rows,
+        reference_join_of_keys, run_native, union_key_layouts, union_key_matches,
+        with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4664,6 +4666,90 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dictionaries_are_gathered_with_the_values_that_their_rows_use() -> Result<()>
+    {
+        // The right stream produces two batches of 50 rows of the key 1 whose
+        // dictionaries have the values `"a"` and a string of 1 MiB (2 MiB in
+        // all, built as the stream is read), whose rows all have `"a"`, and the
+        // left stream, a little later, two rows of the key 1: the symmetric
+        // join gathers the right rows of the 200 pairs from both batches of its
+        // table, with the values of their dictionaries that they use only
+        // (`interleave` copies all values of all dictionaries), so that it
+        // allocates no more than it reserves (on the thread of the test, as a
+        // runtime of the current thread runs all tasks of the query there),
+        // also in a pool of 3 MiB.
+        #[derive(Debug)]
+        struct LatePartition;
+        impl PartitionStream for LatePartition {
+            fn schema(&self) -> &SchemaRef {
+                static SCHEMA: std::sync::OnceLock<SchemaRef> =
+                    std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| dictionary_schema("l"))
+            }
+            fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+                let rows = futures::stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(dictionary_probe_rows())
+                });
+                Box::pin(RecordBatchStreamAdapter::new(dictionary_schema("l"), rows))
+            }
+        }
+        for pool_size in [64 << 20, 3 << 20] {
+            let stream = |side: &str, partition: Arc<dyn PartitionStream>| {
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        dictionary_schema(side),
+                        vec![partition],
+                        None,
+                        [],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            let left = stream("l", Arc::new(LatePartition));
+            let right = stream(
+                "r",
+                Arc::new(BuiltPartition {
+                    schema: dictionary_schema("r"),
+                    rows: dictionary_batches,
+                }),
+            );
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+                None,
+                None,
+                StreamJoinPartitionMode::SinglePartition,
+            )?);
+            let root = lower(&plan)?;
+            assert!(root.is::<PhysicalSymmetricHashJoin>());
+            let pool = Arc::new(PeakPool::new(pool_size));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                .build_arc()?;
+            let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+            allocations::reset_peak();
+            let before = allocations::held();
+            let output = run_native(&root, plan, ctx).await?;
+            let allocated = allocations::peak() - before;
+            let reserved = pool.peak.load(Ordering::Relaxed) as isize;
+            assert_eq!(num_rows(&output.batches), 200);
+            assert!(
+                allocated < reserved + (512 << 10),
+                "the query allocated {allocated} bytes, and reserved {reserved}"
+            );
         }
         Ok(())
     }
