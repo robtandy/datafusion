@@ -1269,7 +1269,11 @@ impl PhysicalSymmetricHashJoin {
         let matchable_bytes = matchable.as_ref().map_or(0, |nulls| nulls.buffer().len());
         reservation.try_resize(keys.size() + matchable_bytes)?;
         let num_rows = batch.num_rows();
+        // The bytes of the rows are counted with their scratch reserved.
+        let scratch = run.reservation.new_empty();
+        scratch.try_grow(self.spec.widths[side].scratch_bytes(&batch))?;
         let variable_bytes = self.spec.widths[side].variable_bytes(&batch);
+        drop(scratch);
         let sort_rows = match &mut run.pruning {
             Some(pruning) => Some(pruning.sort_rows(side, &batch)?),
             None => None,
@@ -3815,10 +3819,12 @@ pub(crate) mod tests {
         // all rows match the 100 rows of the other input: the 199 pairs with
         // a big list have 200 MiB of lists, whichever input's rows come first
         // (and are probed by the rows of the other one). The join reserves the
-        // bytes of every row that it gathers, so that a part has one pair with
-        // a big list at most: a pool of 2.5 MiB holds the tables (2 MiB), but
-        // not a part with a big list; one of 6 MiB holds both, also without
-        // the limit.
+        // bytes of every row that it gathers (with the positions of the items
+        // of its lists that the gathering collects, 2 MiB for a big list), so
+        // that a part has one pair with a big list at most: a pool of 2.5 MiB
+        // holds the tables (2 MiB), but not a part with a big list; one of
+        // 10 MiB holds both (6 MiB for the pair of the two big lists), also
+        // without the limit.
         let plan = |limit: Option<usize>| -> Result<Arc<dyn ExecutionPlan>> {
             let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
                 let batch = skewed_list_batch(side);
@@ -3862,11 +3868,11 @@ pub(crate) mod tests {
         );
         let limited = plan(Some(1))?;
         let root = crate::planner::lower_execution_plan(&limited)?;
-        let output = run_native(&root, limited, limited_task_ctx(6 << 20)?).await?;
+        let output = run_native(&root, limited, limited_task_ctx(10 << 20)?).await?;
         assert_eq!(num_rows(&output.batches), 1);
         let all = plan(None)?;
         let root = lower(&all)?;
-        let output = run_native(&root, all, limited_task_ctx(6 << 20)?).await?;
+        let output = run_native(&root, all, limited_task_ctx(10 << 20)?).await?;
         assert_eq!(num_rows(&output.batches), 10_000);
         let big = big_lists(&output.batches);
         assert_eq!(big.iter().sum::<usize>(), 200);
@@ -4764,16 +4770,34 @@ pub(crate) mod tests {
                 let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
                 allocations::reset_peak();
                 let before = allocations::held();
-                let output = run_native(&root, plan, ctx)
-                    .await
-                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                let output = run_native(&root, plan, ctx).await;
                 let allocated = allocations::peak() - before;
                 let reserved = pool.peak.load(Ordering::Relaxed) as isize;
-                assert_eq!(num_rows(&output.batches), case.matches, "{context}");
-                assert!(
-                    allocated < reserved + (512 << 10),
-                    "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
-                );
+                match case.matches {
+                    Some(matches) => {
+                        let output = output.unwrap_or_else(|e| panic!("{context}: {e}"));
+                        assert_eq!(num_rows(&output.batches), matches, "{context}");
+                        assert!(
+                            allocated < reserved + (512 << 10),
+                            "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
+                        );
+                    }
+                    // Refused before the query allocates more than the pool.
+                    None => {
+                        let err = output.expect_err(&context);
+                        assert!(
+                            matches!(
+                                err.find_root(),
+                                DataFusionError::ResourcesExhausted(_)
+                            ),
+                            "{context}: {err}"
+                        );
+                        assert!(
+                            allocated < pool_size as isize,
+                            "{context}: the query allocated {allocated} bytes"
+                        );
+                    }
+                }
             }
         }
         Ok(())

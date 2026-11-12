@@ -130,11 +130,11 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    AnyDictionaryArray, Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder,
-    DictionaryArray, FixedSizeListArray, GenericListArray, GenericListViewArray,
-    Int8Array, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, RunArray, StructArray, UInt32Array, UnionArray, make_array,
-    new_empty_array, new_null_array,
+    AnyDictionaryArray, Array, ArrayData, ArrayRef, AsArray, BooleanArray,
+    BooleanBufferBuilder, DictionaryArray, FixedSizeListArray, GenericListArray,
+    GenericListViewArray, Int8Array, MapArray, OffsetSizeTrait, PrimitiveArray,
+    RecordBatch, RecordBatchOptions, RunArray, StructArray, UInt32Array, UnionArray,
+    make_array, new_empty_array, new_null_array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::{
@@ -1294,7 +1294,7 @@ fn interleave_dictionary<K: ArrowDictionaryKeyType>(
         .collect::<Vec<_>>();
     let mut used = HashMap::<(usize, usize), usize>::new();
     let mut values = vec![];
-    let mut keys = Vec::with_capacity(indices.len());
+    let mut keys = Vec::<K::Native>::with_capacity(indices.len());
     let mut valid = BooleanBufferBuilder::new(indices.len());
     for &(array, row) in indices {
         let dictionary_keys = dictionaries[array].keys();
@@ -1306,17 +1306,17 @@ fn interleave_dictionary<K: ArrowDictionaryKeyType>(
                 if new == next {
                     values.push((array, key));
                 }
+                let Some(new) = K::Native::from_usize(new) else {
+                    return Ok(interleave(arrays, indices)?);
+                };
                 keys.push(new);
                 valid.append(true);
             }
             false => {
-                keys.push(0);
+                keys.push(K::Native::default());
                 valid.append(false);
             }
         }
-    }
-    if K::Native::from_usize(values.len()).is_none() {
-        return Ok(interleave(arrays, indices)?);
     }
     let value_arrays = dictionaries
         .iter()
@@ -1328,10 +1328,6 @@ fn interleave_dictionary<K: ArrowDictionaryKeyType>(
         true => new_empty_array(value_arrays[0].data_type()),
         false => interleave_compact(&value_arrays, &values)?,
     };
-    let keys = keys
-        .into_iter()
-        .map(|key| K::Native::from_usize(key).unwrap_or_default())
-        .collect::<Vec<_>>();
     let nulls = NullBuffer::new(valid.finish());
     let keys =
         PrimitiveArray::<K>::new(keys.into(), (nulls.null_count() > 0).then_some(nulls));
@@ -2141,6 +2137,21 @@ impl GatherWidths {
         }
     }
 
+    /// An upper bound of the memory that [`Self::variable_bytes`] takes for
+    /// `batch` while it counts the bytes of its rows: of the bytes of the
+    /// values nested in them (see [`nested_scratch_bytes`]), column after
+    /// column, to reserve before.
+    pub(crate) fn scratch_bytes(&self, batch: &RecordBatch) -> usize {
+        self.variable
+            .iter()
+            .flatten()
+            .filter(|(_, width)| matches!(width, VariableWidth::Nested))
+            .filter_map(|&(column, _)| batch.columns().get(column))
+            .map(|array| nested_scratch_bytes(array.as_ref()))
+            .max()
+            .unwrap_or_default()
+    }
+
     /// For every row of `batch`, a batch of the input: the bytes of its values
     /// that have bytes of their own, for the filter and for the output.
     pub(crate) fn variable_bytes(&self, batch: &RecordBatch) -> Vec<[u32; 2]> {
@@ -2313,14 +2324,42 @@ fn add_value_bytes(
     }
 }
 
+/// An upper bound of the memory that [`nested_row_bytes`] takes for `array`
+/// while it counts the bytes of its rows: a few words for every value of
+/// `array`, and of the values nested in it (the bytes of every value, their
+/// sums for the ranges of lists, the values of the keys of dictionaries,
+/// ...).
+fn nested_scratch_bytes(array: &dyn Array) -> usize {
+    fn values(data: &ArrayData) -> usize {
+        data.len() + data.child_data().iter().map(values).sum::<usize>()
+    }
+    3 * size_of::<usize>() * values(&array.to_data())
+}
+
+/// The bytes of the position of a value that the gathering of rows collects
+/// (its array and its row): of an item of a list, of the value of a run, of a
+/// row of a child of a union (see [`interleave_compact`], the gathering
+/// kernels of arrow collect them too).
+const GATHER_POSITION_BYTES: usize = size_of::<(usize, usize)>();
+
+/// The bytes of the scratch of gathering a row of a dictionary (see
+/// [`interleave_dictionary`]): the entry of its value in the map of the
+/// values that the rows use (with its control byte, twice for the map while
+/// it grows), and the position of the value.
+const GATHER_KEY_BYTES: usize =
+    2 * (size_of::<((usize, usize), usize)>() + 1) + size_of::<(usize, usize)>();
+
 /// The bytes that gathering every row of `array` takes: its values, with the
 /// values nested in it (of the range of a list, the fields of a struct, the
 /// value of a dictionary key, the values of all children of a sparse union,
-/// which the gathering kernels copy, ...), its offsets and its validity.
-/// Exact for the values of fixed width, strings, binaries, lists, maps,
-/// structs, dictionaries and unions; for other types (e.g. run-end encoded
-/// values), every row may take as many bytes as the whole array, an upper
-/// bound.
+/// which the gathering kernels copy, ...), its offsets and its validity, and
+/// the scratch of gathering them (the positions of the items of lists, of
+/// the values of runs and of the children of unions, which the gathering
+/// kernels collect, see [`GATHER_POSITION_BYTES`], and of the keys of
+/// dictionaries, see [`GATHER_KEY_BYTES`]). Exact for the values of fixed
+/// width, strings, binaries, lists, maps, structs, dictionaries, unions and
+/// run-end encoded values; for other types, every row may take as many bytes
+/// as the whole array, an upper bound.
 fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
     let rows = array.len();
     // The bytes of the rows of a list whose ranges of `values` are delimited
@@ -2331,9 +2370,10 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
         values: &dyn Array,
         fixed: usize,
     ) -> Vec<usize> {
+        // Every item with its position.
         let mut sums = vec![0];
         for bytes in nested_row_bytes(values) {
-            sums.push(sums[sums.len() - 1] + bytes);
+            sums.push(sums[sums.len() - 1] + bytes + GATHER_POSITION_BYTES);
         }
         let at = |offset: O| {
             let offset = offset.try_into().unwrap_or(usize::MAX).min(sums.len() - 1);
@@ -2450,7 +2490,9 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
         DataType::Dictionary(key, _) => {
             let dictionary = array.as_any_dictionary();
             let values = nested_row_bytes(dictionary.values().as_ref());
-            let key = key.primitive_width().unwrap_or(size_of::<u64>()) + validity;
+            let key = key.primitive_width().unwrap_or(size_of::<u64>())
+                + validity
+                + GATHER_KEY_BYTES;
             dictionary_indices(dictionary)
                 .into_iter()
                 .map(|value| key + values.get(value).copied().unwrap_or_default())
@@ -2473,7 +2515,7 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
                             .iter()
                             .map(|(_, bytes)| bytes.get(row).copied().unwrap_or_default())
                             .sum::<usize>();
-                        size_of::<i8>() + values
+                        size_of::<i8>() + GATHER_POSITION_BYTES + values
                     })
                     .collect(),
                 // A dense union gathers the value of its type only.
@@ -2486,7 +2528,7 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
                             .find(|(id, _)| *id == type_id)
                             .and_then(|(_, bytes)| bytes.get(child_row).copied())
                             .unwrap_or_default();
-                        size_of::<i8>() + size_of::<i32>() + child
+                        size_of::<i8>() + size_of::<i32>() + GATHER_POSITION_BYTES + child
                     })
                     .collect(),
             }
@@ -2502,7 +2544,11 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
             let values = nested_row_bytes(values.as_ref());
             physical
                 .into_iter()
-                .map(|index| width + values.get(index).copied().unwrap_or_default())
+                .map(|index| {
+                    width
+                        + GATHER_POSITION_BYTES
+                        + values.get(index).copied().unwrap_or_default()
+                })
                 .collect()
         }
         data_type => match value_width(data_type) {
@@ -3243,6 +3289,16 @@ impl MergeJoinSpec {
         )
     }
 
+    /// The memory that [`Self::gathered_bytes`] takes for `batch` while it
+    /// counts the bytes of its rows (see [`GatherWidths::scratch_bytes`]).
+    fn gathered_scratch_bytes(&self, batch: &RecordBatch, streamed: bool) -> usize {
+        let side = match (self.streamed, streamed) {
+            (JoinSide::Left, true) | (JoinSide::Right, false) => 0,
+            _ => 1,
+        };
+        self.widths[side].scratch_bytes(batch)
+    }
+
     /// The bytes that the candidate pairs of the join gather of each row of
     /// `batch`, a batch of the streamed input (or of the buffered one if not
     /// `streamed`), for the filter (if any) and the output.
@@ -3604,6 +3660,8 @@ impl PhysicalMergeJoin {
         let zero_runs = ZeroRuns::of(&self.spec, &arrays)?;
         let keys = progress.converter.convert_columns(&arrays)?;
         drop(arrays);
+        // The bytes of the rows are counted with their scratch reserved.
+        chunk_reservation.try_grow(self.spec.gathered_scratch_bytes(&batch, true))?;
         let gathered = self.spec.gathered_bytes(&batch, true);
         chunk_reservation.try_resize(
             keys.size()
@@ -4519,7 +4577,11 @@ impl BufferedWindow {
         spec: &MergeJoinSpec,
     ) -> Result<()> {
         let bytes = memory_size(&batch);
+        // The bytes of the rows are counted with their scratch reserved.
+        let scratch = self.reservation.new_empty();
+        scratch.try_grow(spec.gathered_scratch_bytes(&batch, false))?;
         self.rows.append(&self.converter, batch, keys, spec)?;
+        drop(scratch);
         self.batch_bytes.push_back(bytes);
         self.batches_bytes += bytes;
         self.reserve(0)?;
@@ -5503,6 +5565,8 @@ impl PhysicalOperator for PhysicalMergeJoin {
         // encoding until it is reserved with the rows.
         let evaluated = state.reservation.new_empty();
         evaluated.try_grow(key_memory(&keys, &batch))?;
+        // The bytes of the rows are counted with their scratch reserved.
+        evaluated.try_grow(self.spec.gathered_scratch_bytes(&batch, false))?;
         let mut building = state.building.lock();
         let Some(build) = building.as_mut() else {
             return internal_err!(
@@ -6724,8 +6788,10 @@ pub(crate) mod tests {
         // As the symmetric join's: the first of the 100 rows of either input
         // has a list of 1 MiB, and all rows match the 100 rows of the other
         // input. The merge join reserves the bytes of every row that it
-        // gathers, in batches with one pair with a big list at most: a pool of
-        // 768 KiB does not hold a batch with one, one of 6 MiB does.
+        // gathers (with the positions of the items of its lists that the
+        // gathering collects, 2 MiB for a big list), in batches with one pair
+        // with a big list at most: a pool of 768 KiB does not hold a batch
+        // with one, one of 8 MiB does.
         use crate::join::symmetric_hash_join::tests::{big_lists, skewed_list_batch};
         let join = || -> Result<Arc<dyn PhysicalOperator>> {
             let source = |side: &str| -> Arc<dyn PhysicalOperator> {
@@ -6757,7 +6823,7 @@ pub(crate) mod tests {
             "{err}"
         );
         let batches =
-            with_timeout(Executor::collect(join()?, limited_task_ctx(6 << 20)?, 4))
+            with_timeout(Executor::collect(join()?, limited_task_ctx(8 << 20)?, 4))
                 .await?;
         assert_eq!(num_rows(&batches), 10_000);
         let big = big_lists(&batches);
@@ -9306,17 +9372,20 @@ pub(crate) mod tests {
         /// The right rows, built as they are read.
         pub(crate) rows: Arc<dyn Fn() -> Vec<RecordBatch> + Send + Sync>,
         /// The rows of the join of them with the left rows of
-        /// [`dictionary_probe_rows`].
-        pub(crate) matches: usize,
+        /// [`dictionary_probe_rows`], `None` if the join fails with
+        /// `ResourcesExhausted` (before it allocates more than the pool holds).
+        pub(crate) matches: Option<usize>,
         /// The sizes of the pools to join them in.
         pub(crate) pools: Vec<usize>,
     }
 
     /// The cases of the joins that gather payloads: dictionaries in every
-    /// layout of [`dictionary_layouts`] (of values that no row uses), and the
+    /// layout of [`dictionary_layouts`] (of values that no row uses), the
     /// NULL keys of dictionaries without values of fixed size lists of
     /// 1,000,000 integers (of which a NULL value takes 8 MB), in a pool of
-    /// 64 KiB.
+    /// 64 KiB, and fixed size lists of 100,000 NULL keys of dictionaries, whose
+    /// gathering takes the positions of the items (and the keys) as scratch,
+    /// more than a pool of 2 MiB holds.
     pub(crate) fn gather_cases() -> Vec<GatherCase> {
         let mut cases = dictionary_layouts()
             .into_iter()
@@ -9324,7 +9393,7 @@ pub(crate) mod tests {
                 name: name.to_string(),
                 payload: layout_type(wrap),
                 rows: Arc::new(move || dictionary_batches(wrap)),
-                matches: 200,
+                matches: Some(200),
                 pools: vec![64 << 20, 3 << 20],
             })
             .collect::<Vec<_>>();
@@ -9332,10 +9401,59 @@ pub(crate) mod tests {
             name: "NULL dictionaries of fixed size lists without values".to_string(),
             payload: wide_list_dictionary_type(),
             rows: Arc::new(null_wide_list_dictionaries),
-            matches: 4,
+            matches: Some(4),
             pools: vec![64 << 10],
         });
+        cases.push(GatherCase {
+            name: "fixed size lists of NULL dictionaries".to_string(),
+            payload: fixed_size_list_of_dictionaries_type(),
+            rows: Arc::new(fixed_size_lists_of_null_dictionaries),
+            matches: None,
+            pools: vec![2 << 20],
+        });
         cases
+    }
+
+    /// Fixed size lists of 100,000 dictionaries of strings.
+    fn fixed_size_list_of_dictionaries_type() -> DataType {
+        let dictionary =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        DataType::FixedSizeList(
+            Arc::new(Field::new_list_field(dictionary, true)),
+            100_000,
+        )
+    }
+
+    /// Two batches of a right row of the key 1 whose payload is a fixed size
+    /// list of 100,000 NULL keys of a dictionary without values.
+    fn fixed_size_lists_of_null_dictionaries() -> Vec<RecordBatch> {
+        let DataType::FixedSizeList(item, size) = fixed_size_list_of_dictionaries_type()
+        else {
+            unreachable!()
+        };
+        (0..2)
+            .map(|batch| {
+                let keys = DictionaryArray::new(
+                    Int32Array::new_null(100_000),
+                    Arc::new(StringArray::from(Vec::<&str>::new())),
+                );
+                let payload: ArrayRef = Arc::new(FixedSizeListArray::new(
+                    Arc::clone(&item),
+                    size,
+                    Arc::new(keys),
+                    None,
+                ));
+                RecordBatch::try_new(
+                    payload_schema("r", payload.data_type()),
+                    vec![
+                        Arc::new(Int64Array::from(vec![batch])),
+                        Arc::new(Int32Array::from(vec![1])),
+                        payload,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     /// Dictionaries of fixed size lists of 1,000,000 integers (of which a NULL
@@ -9544,16 +9662,34 @@ pub(crate) mod tests {
                 let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
                 allocations::reset_peak();
                 let before = allocations::held();
-                let output = run_native(&root, plan, ctx)
-                    .await
-                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                let output = run_native(&root, plan, ctx).await;
                 let allocated = allocations::peak() - before;
                 let reserved = pool.peak.load(Ordering::Relaxed) as isize;
-                assert_eq!(num_rows(&output.batches), case.matches, "{context}");
-                assert!(
-                    allocated < reserved + (512 << 10),
-                    "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
-                );
+                match case.matches {
+                    Some(matches) => {
+                        let output = output.unwrap_or_else(|e| panic!("{context}: {e}"));
+                        assert_eq!(num_rows(&output.batches), matches, "{context}");
+                        assert!(
+                            allocated < reserved + (512 << 10),
+                            "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
+                        );
+                    }
+                    // Refused before the query allocates more than the pool.
+                    None => {
+                        let err = output.expect_err(&context);
+                        assert!(
+                            matches!(
+                                err.find_root(),
+                                DataFusionError::ResourcesExhausted(_)
+                            ),
+                            "{context}: {err}"
+                        );
+                        assert!(
+                            allocated < pool_size as isize,
+                            "{context}: the query allocated {allocated} bytes"
+                        );
+                    }
+                }
             }
         }
         Ok(())
