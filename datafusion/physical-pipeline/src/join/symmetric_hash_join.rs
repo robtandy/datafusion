@@ -116,6 +116,7 @@ use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::{LexOrdering, PhysicalExprRef, PhysicalSortExpr};
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
 use datafusion_physical_plan::joins::utils::JoinFilter;
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
@@ -123,7 +124,7 @@ use parking_lot::Mutex;
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
     PAIR_INDEX_BYTES, PART_BYTES, StoredRows, evaluate_keys, filter_mask, is_smaller,
-    matchable_rows, ordered_plan, probe_role, without_reordering,
+    matchable_rows, probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -240,8 +241,8 @@ where
             [&join.left.schema(), &join.right.schema()],
             sorted.orders,
         )?
-        && let Some(left) = ordered_plan(sorted.inputs[0])?
-        && let Some(right) = ordered_plan(sorted.inputs[1])?
+        && let Some(left) = sorted_plan(sorted.inputs[0], sorted.orders[0])?
+        && let Some(right) = sorted_plan(sorted.inputs[1], sorted.orders[1])?
     {
         inputs = [left, right];
         spec.sorted_filter = Some(sorted_filter);
@@ -260,6 +261,35 @@ where
         children.push(lowered);
     }
     Ok(Some(Arc::new(PhysicalSymmetricHashJoin { children, spec })))
+}
+
+/// The plan that produces the rows of `input`, an input of a symmetric join
+/// whose plan reads it sorted by `order`, in that order on a single
+/// partition: `input` without the nodes that only sort or distribute its rows,
+/// whose partitions a `SortPreservingMergeExec` merges by `order` if it has
+/// several. `Ok(None)` if `input` declares another order. An input that
+/// declares no order at all is sorted by `order` as the plan says, as
+/// DataFusion's join takes it: the native join checks it as the rows come
+/// (see [`Pruning::sort_rows`]).
+fn sorted_plan(
+    input: &Arc<dyn ExecutionPlan>,
+    order: &LexOrdering,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let stripped = without_reordering(input)?;
+    let declared = stripped
+        .equivalence_properties()
+        .ordering_satisfy(order.clone())?;
+    let undeclared =
+        input.output_ordering().is_none() && stripped.output_ordering().is_none();
+    if !declared && !undeclared {
+        return Ok(None);
+    }
+    Ok(Some(
+        match stripped.output_partitioning().partition_count() > 1 {
+            true => Arc::new(SortPreservingMergeExec::new(order.clone(), stripped)),
+            false => stripped,
+        },
+    ))
 }
 
 /// A hash join that streams both of its inputs, with the semantics of
@@ -2837,7 +2867,9 @@ mod tests {
     async fn determined_rows_of_streams_of_timestamps_are_emitted() -> Result<()> {
         // As `determined_rows_of_streams_that_never_end_are_emitted`, with
         // ascending timestamps (in nanoseconds, of a time zone), as the rows
-        // of streams of events have.
+        // of streams of events have: of streams that declare their order, or
+        // that declare none, whose order the plan of the join says (the
+        // native join takes it, as DataFusion's join does).
         let schema = |side: &str| -> SchemaRef {
             Arc::new(Schema::new(vec![
                 Field::new(format!("{side}id"), DataType::Int64, false),
@@ -2849,7 +2881,15 @@ mod tests {
                 ),
             ]))
         };
-        let stream = |side: &str, key: fn(i64) -> i32| -> Arc<dyn ExecutionPlan> {
+        let time_order = |side: &str| {
+            let time = col(&format!("{side}time"), &schema(side)).unwrap();
+            LexOrdering::new([PhysicalSortExpr::new(
+                time,
+                SortOptions::new(false, false),
+            )])
+            .unwrap()
+        };
+        let stream = |side: &str, key: fn(i64) -> i32, declared: bool| {
             let batches = (0..5)
                 .map(|batch| {
                     let ids = (batch * 20..batch * 20 + 20).collect::<Vec<i64>>();
@@ -2876,79 +2916,208 @@ mod tests {
                 batches,
                 forever: true,
             };
-            let time = col(&format!("{side}time"), &schema(side)).unwrap();
-            let order = LexOrdering::new([PhysicalSortExpr::new(
-                time,
-                SortOptions::new(false, false),
-            )])
-            .unwrap();
+            let orders = match declared {
+                true => vec![time_order(side)],
+                false => vec![],
+            };
             Arc::new(
                 StreamingTableExec::try_new(
                     schema(side),
                     vec![Arc::new(partition)],
                     None,
-                    [order],
+                    orders,
                     true,
                     None,
                 )
                 .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        for join_type in [JoinType::Left, JoinType::LeftAnti, JoinType::LeftMark] {
+            for declared in [true, false] {
+                let context = format!("{join_type}, declared order: {declared}");
+                let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+                    let left = stream("l", |id| (id * 2) as i32, declared);
+                    let right = stream("r", |id| (id * 2 + 1) as i32, declared);
+                    let on =
+                        vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                    let filter_schema = Arc::new(Schema::new(vec![
+                        left.schema().field(2).clone(),
+                        right.schema().field(2).clone(),
+                    ]));
+                    let filter = JoinFilter::new(
+                        binary(
+                            col("ltime", &filter_schema)?,
+                            Operator::Gt,
+                            col("rtime", &filter_schema)?,
+                        ),
+                        vec![
+                            ColumnIndex {
+                                index: 2,
+                                side: JoinSide::Left,
+                            },
+                            ColumnIndex {
+                                index: 2,
+                                side: JoinSide::Right,
+                            },
+                        ],
+                        filter_schema,
+                    );
+                    let join = Arc::new(SymmetricHashJoinExec::try_new(
+                        left,
+                        right,
+                        on,
+                        Some(filter),
+                        &join_type,
+                        NullEquality::NullEqualsNothing,
+                        Some(time_order("l")),
+                        Some(time_order("r")),
+                        StreamJoinPartitionMode::SinglePartition,
+                    )?);
+                    Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
+                };
+                let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+                assert_eq!(num_rows(&expected), 1, "{context}");
+                let plan = plan()?;
+                let root = crate::planner::lower_execution_plan(&plan)?;
+                let tree = format_operator_tree(&root);
+                let join = root.children()[0]
+                    .downcast_ref::<PhysicalSymmetricHashJoin>()
+                    .unwrap_or_else(|| panic!("{context}\n{tree}"));
+                assert!(join.determines_rows_by_order(), "{context}\n{tree}");
+                let actual = run_native(&root, plan, task_ctx()).await?;
+                assert_eq!(num_rows(&actual.batches), 1, "{context}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_of_streams_sorted_descending_determine_their_rows() -> Result<()> {
+        // Streams sorted by descending times, NULLs first: the times still to
+        // come are not after the last one of their stream, so that with
+        // `lt < rt` the left rows whose times are not before the last right
+        // time are determined (and the other way round with `lt > rt`). The
+        // reference is DataFusion's hash join of the same rows.
+        let order = |side: &str| {
+            let time = col(&format!("{side}t"), &timed_schema(side)).unwrap();
+            LexOrdering::new([PhysicalSortExpr::new(time, SortOptions::new(true, true))])
+                .unwrap()
+        };
+        let rows = |side: &str, rows: i64, every: i64, key: fn(i64) -> Option<i32>| {
+            timed_batches(
+                side,
+                0..rows,
+                key,
+                |id| (id >= 3).then_some(((rows - id) / every) as f64),
+                |id| format!("{side}{id}"),
+                50,
             )
         };
-        let order = |plan: &Arc<dyn ExecutionPlan>| plan.output_ordering().cloned();
-        for join_type in [JoinType::Left, JoinType::LeftAnti, JoinType::LeftMark] {
-            let plan = || -> Result<Arc<dyn ExecutionPlan>> {
-                let left = stream("l", |id| (id * 2) as i32);
-                let right = stream("r", |id| (id * 2 + 1) as i32);
-                let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
-                let filter_schema = Arc::new(Schema::new(vec![
-                    left.schema().field(2).clone(),
-                    right.schema().field(2).clone(),
-                ]));
-                let filter = JoinFilter::new(
-                    binary(
-                        col("ltime", &filter_schema)?,
-                        Operator::Gt,
-                        col("rtime", &filter_schema)?,
-                    ),
-                    vec![
-                        ColumnIndex {
-                            index: 2,
-                            side: JoinSide::Left,
-                        },
-                        ColumnIndex {
-                            index: 2,
-                            side: JoinSide::Right,
-                        },
-                    ],
-                    filter_schema,
-                );
-                let (left_order, right_order) = (order(&left), order(&right));
-                let join = Arc::new(SymmetricHashJoinExec::try_new(
-                    left,
-                    right,
-                    on,
-                    Some(filter),
-                    &join_type,
-                    NullEquality::NullEqualsNothing,
-                    left_order,
-                    right_order,
-                    StreamJoinPartitionMode::SinglePartition,
-                )?);
-                Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
+        let stream = |side: &str, batches: Vec<RecordBatch>, forever: bool| {
+            let partition = BatchesPartition {
+                schema: timed_schema(side),
+                batches,
+                forever,
             };
-            let expected = with_timeout(collect(plan()?, task_ctx())).await?;
-            assert_eq!(num_rows(&expected), 1, "{join_type}");
-            let plan = plan()?;
-            let root = crate::planner::lower_execution_plan(&plan)?;
-            let join = root.children()[0]
-                .downcast_ref::<PhysicalSymmetricHashJoin>()
-                .unwrap_or_else(|| {
-                    panic!("{join_type}\n{}", format_operator_tree(&root))
-                });
-            assert!(join.determines_rows_by_order(), "{join_type}");
-            let actual = run_native(&root, plan, task_ctx()).await?;
-            assert_eq!(num_rows(&actual.batches), 1, "{join_type}");
+            Arc::new(
+                StreamingTableExec::try_new(
+                    timed_schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [order(side)],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let join = |left: Arc<dyn ExecutionPlan>,
+                    right: Arc<dyn ExecutionPlan>,
+                    join_type: JoinType,
+                    filter: JoinFilter|
+         -> Result<Arc<dyn ExecutionPlan>> {
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(SymmetricHashJoinExec::try_new(
+                left,
+                right,
+                on,
+                Some(filter),
+                &join_type,
+                NullEquality::NullEqualsNothing,
+                Some(order("l")),
+                Some(order("r")),
+                StreamJoinPartitionMode::SinglePartition,
+            )?))
+        };
+        let key = |id: i64| (id % 13 != 4).then_some((id % 7) as i32);
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+            JoinType::LeftAnti,
+            JoinType::RightAnti,
+            JoinType::LeftMark,
+            JoinType::RightSemi,
+        ] {
+            for (name, filter) in time_filters() {
+                let context = format!("{join_type} {name}");
+                let bounded = |side: &str, n: i64, every: i64| {
+                    MemorySourceConfig::try_new_exec(
+                        &[rows(side, n, every, key)],
+                        timed_schema(side),
+                        None,
+                    )
+                    .unwrap() as Arc<dyn ExecutionPlan>
+                };
+                let reference = hash_join(
+                    bounded("l", 600, 2),
+                    bounded("r", 800, 3),
+                    join_type,
+                    Some(filter.clone()),
+                    NullEquality::NullEqualsNothing,
+                )?;
+                let expected = EngineOutput {
+                    schema: reference.schema(),
+                    batches: with_timeout(collect(Arc::clone(&reference), task_ctx()))
+                        .await?,
+                    plan: reference,
+                    ordered: false,
+                };
+                let plan = join(
+                    stream("l", rows("l", 600, 2, key), false),
+                    stream("r", rows("r", 800, 3, key), false),
+                    join_type,
+                    filter,
+                )?;
+                let root = lower(&plan)?;
+                let tree = format_operator_tree(&root);
+                let symmetric = root
+                    .downcast_ref::<PhysicalSymmetricHashJoin>()
+                    .unwrap_or_else(|| panic!("{context}\n{tree}"));
+                assert!(symmetric.determines_rows_by_order(), "{context}\n{tree}");
+                let actual = run_native(&root, plan, task_ctx()).await?;
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\n{context}\n{tree}");
+                }
+            }
         }
+        // Streams that never end, with keys that never match: under a limit,
+        // the anti join emits a determined left row.
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let left = stream("l", rows("l", 100, 1, |id| Some((id * 2) as i32)), true);
+            let right =
+                stream("r", rows("r", 100, 1, |id| Some((id * 2 + 1) as i32)), true);
+            let filter = time_filter(|lt, rt| binary(lt, Operator::Lt, rt));
+            let join = join(left, right, JoinType::LeftAnti, filter)?;
+            Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
+        };
+        let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+        assert_eq!(num_rows(&expected), 1);
+        let plan = plan()?;
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        assert_eq!(num_rows(&actual.batches), 1);
         Ok(())
     }
 }
