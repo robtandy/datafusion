@@ -125,8 +125,8 @@ use parking_lot::Mutex;
 
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, evaluate_keys, filter_mask, is_smaller,
-    matchable_rows, probe_role, without_reordering,
+    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, computed_key_bytes, evaluate_keys,
+    filter_mask, is_smaller, matchable_rows, probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -484,7 +484,7 @@ impl SymmetricJoinSpec {
 /// determines their rows (see the [module documentation](self)), as
 /// DataFusion's `SymmetricHashJoinExec` prunes them: the interval graph of
 /// the filter, in which the first expression of the order of either input is
-/// a leaf.
+/// a leaf (as built: every determination solves a copy of it).
 #[derive(Debug, Clone)]
 struct SortedFilter {
     graph: ExprIntervalGraph,
@@ -794,6 +794,8 @@ struct ChunkJoin {
     /// The row whose candidates did not all fit into the last output, and its
     /// next candidate (a row of the other input).
     chain: Option<(usize, usize)>,
+    /// The memory of `keys` and `matchable`, held while the chunk is joined.
+    _reservation: MemoryReservation,
 }
 
 impl ChunkJoin {
@@ -886,11 +888,12 @@ impl Pruning {
             None => Interval::make_unbounded(&other.data_type)?,
         };
         let mut bounds = [(own.node, own_values), (other.node, other_values)];
-        match self
-            .filter
-            .graph
-            .update_ranges(&mut bounds, Interval::TRUE)?
-        {
+        // Every step is solved from the graph as built: propagating the
+        // constraints narrows the intervals of all its nodes, also of the other
+        // columns of the filter, which hold for these bounds only (they would
+        // rule out rows that later bounds let match).
+        let mut graph = self.filter.graph.clone();
+        match graph.update_ranges(&mut bounds, Interval::TRUE)? {
             // No row of `side` can match a row still to come.
             PropagationResult::Infeasible => return Ok(table.end()),
             PropagationResult::CannotPropagate => return Ok(from),
@@ -985,9 +988,17 @@ impl PhysicalSymmetricHashJoin {
         side: usize,
         batch: RecordBatch,
     ) -> Result<ChunkJoin> {
-        let keys = evaluate_keys(self.spec.keys(side), &batch)?;
-        let matchable = matchable_rows(&keys, self.spec.null_equality);
-        let keys = run.converter.convert_columns(&keys)?;
+        // The computed keys are reserved while they are encoded, and the
+        // encoded keys while the chunk is joined.
+        let arrays = evaluate_keys(self.spec.keys(side), &batch)?;
+        let reservation = run.reservation.new_empty();
+        reservation.try_grow(computed_key_bytes(&arrays, &batch))?;
+        let matchable = matchable_rows(&arrays, self.spec.null_equality);
+        let keys = run.converter.convert_columns(&arrays)?;
+        reservation.try_grow(keys.size())?;
+        drop(arrays);
+        let matchable_bytes = matchable.as_ref().map_or(0, |nulls| nulls.buffer().len());
+        reservation.try_resize(keys.size() + matchable_bytes)?;
         let num_rows = batch.num_rows();
         let variable_bytes = self.spec.widths[side].variable_bytes(&batch);
         let sort_rows = match &mut run.pruning {
@@ -1035,6 +1046,7 @@ impl PhysicalSymmetricHashJoin {
             first,
             next_row: 0,
             chain: None,
+            _reservation: reservation,
         })
     }
 
@@ -1319,8 +1331,13 @@ impl PhysicalSymmetricHashJoin {
         // The keys whose last row is dropped: their rows are all dropped.
         let mut released = 0;
         for (batch, start) in batches[..dropped].iter().zip(starts) {
-            let keys = evaluate_keys(self.spec.keys(side), batch)?;
-            let keys = converter.convert_columns(&keys)?;
+            // The keys, evaluated again and encoded, are reserved while they
+            // are looked up.
+            let arrays = evaluate_keys(self.spec.keys(side), batch)?;
+            let evaluated = reservation.new_empty();
+            evaluated.try_grow(computed_key_bytes(&arrays, batch))?;
+            let keys = converter.convert_columns(&arrays)?;
+            evaluated.try_grow(keys.size())?;
             for row in 0..batch.num_rows() {
                 let key = keys.row(row);
                 let position = table.base + start + row;
@@ -3547,6 +3564,233 @@ pub(crate) mod tests {
         let root = lower(&join)?;
         let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
         assert_eq!(num_rows(&output.batches), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_determination_starts_from_the_filter_as_built() -> Result<()> {
+        // A `Full` join of rows of the same key, with the filter
+        // `lt < lx AND lx < rt` of the ascending left times `lt`, the left
+        // values `lx`, and the descending right times `rt`: the bounds that a
+        // determination derives for `lx` (a column of the filter that no input
+        // is sorted by) hold for its bounds only, not for the next ones. The
+        // rows `(26, 27)` and `29` match, as with DataFusion's hash join.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("lid", DataType::Int64, false),
+            Field::new("lk", DataType::Int32, false),
+            Field::new("lt", DataType::Int64, false),
+            Field::new("lx", DataType::Int64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("rk", DataType::Int32, false),
+            Field::new("rt", DataType::Int64, false),
+        ]));
+        let left_rows = [(5, 22), (24, 24), (26, 27)];
+        let left_batch = |rows: &[(i64, i64)], first: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&left_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        first..first + rows.len() as i64,
+                    )),
+                    Arc::new(Int32Array::from(vec![1; rows.len()])),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+                ],
+            )
+            .unwrap()
+        };
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(Int32Array::from(vec![1, 1])),
+                Arc::new(Int64Array::from(vec![29, 23])),
+            ],
+        )?;
+        let filter = || {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("lt", DataType::Int64, false),
+                Field::new("lx", DataType::Int64, false),
+                Field::new("rt", DataType::Int64, false),
+            ]));
+            let [lt, lx, rt] = ["lt", "lx", "rt"].map(|name| col(name, &schema).unwrap());
+            JoinFilter::new(
+                binary(
+                    binary(lt, Operator::Lt, Arc::clone(&lx)),
+                    Operator::And,
+                    binary(lx, Operator::Lt, rt),
+                ),
+                vec![
+                    ColumnIndex {
+                        index: 2,
+                        side: JoinSide::Left,
+                    },
+                    ColumnIndex {
+                        index: 3,
+                        side: JoinSide::Left,
+                    },
+                    ColumnIndex {
+                        index: 2,
+                        side: JoinSide::Right,
+                    },
+                ],
+                schema,
+            )
+        };
+        let order = |schema: &SchemaRef, name: &str, descending: bool| {
+            LexOrdering::new([PhysicalSortExpr::new(
+                col(name, schema).unwrap(),
+                SortOptions::new(descending, false),
+            )])
+            .unwrap()
+        };
+        let on = |left: &SchemaRef, right: &SchemaRef| {
+            vec![(col("lk", left).unwrap(), col("rk", right).unwrap())]
+        };
+        let reference = hash_join(
+            MemorySourceConfig::try_new_exec(
+                &[vec![left_batch(&left_rows, 0)]],
+                Arc::clone(&left_schema),
+                None,
+            )?,
+            MemorySourceConfig::try_new_exec(
+                &[vec![right_batch.clone()]],
+                Arc::clone(&right_schema),
+                None,
+            )?,
+            JoinType::Full,
+            Some(filter()),
+            NullEquality::NullEqualsNothing,
+        )?;
+        let expected = EngineOutput {
+            schema: reference.schema(),
+            batches: with_timeout(collect(Arc::clone(&reference), task_ctx())).await?,
+            plan: reference,
+            ordered: false,
+        };
+        assert_eq!(num_rows(&expected.batches), 4);
+        let stream =
+            |schema: &SchemaRef, batches: Vec<RecordBatch>, order: LexOrdering| {
+                let partition = BatchesPartition {
+                    schema: Arc::clone(schema),
+                    batches,
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        Arc::clone(schema),
+                        vec![Arc::new(partition)],
+                        None,
+                        [order],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+        let left_batches = left_rows
+            .iter()
+            .enumerate()
+            .map(|(id, row)| left_batch(std::slice::from_ref(row), id as i64))
+            .collect();
+        let left = stream(&left_schema, left_batches, order(&left_schema, "lt", false));
+        let right = stream(
+            &right_schema,
+            vec![right_batch],
+            order(&right_schema, "rt", true),
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on(&left_schema, &right_schema),
+            Some(filter()),
+            &JoinType::Full,
+            NullEquality::NullEqualsNothing,
+            Some(order(&left_schema, "lt", false)),
+            Some(order(&right_schema, "rt", true)),
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&plan)?;
+        let join = root.downcast_ref::<PhysicalSymmetricHashJoin>().unwrap();
+        assert!(join.determines_rows_by_order());
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("Results differ: {message}");
+        }
+        Ok(())
+    }
+
+    /// The key of the joins of wide computed keys: a string of 16 KiB.
+    pub(crate) fn wide_key() -> PhysicalExprRef {
+        lit("k".repeat(16 * 1024))
+    }
+
+    /// The rows `(id)` of the `side` input of the joins of wide computed keys.
+    pub(crate) fn id_rows(side: &str, rows: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                format!("{side}id"),
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from_iter_values(0..rows))],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wide_computed_keys_are_reserved() -> Result<()> {
+        // A join of 1,024 rows with a row on a computed key, a string of 16 KiB:
+        // the keys of a chunk take 16 MB as values and 16 MB encoded, which the
+        // join reserves while it encodes and joins them, so that it fails in a
+        // pool of 256 KiB, and runs in one of 64 MiB.
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |batch: RecordBatch| {
+                let partition = BatchesPartition {
+                    schema: batch.schema(),
+                    batches: vec![batch.clone()],
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        batch.schema(),
+                        vec![Arc::new(partition)],
+                        None,
+                        vec![],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            Ok(Arc::new(SymmetricHashJoinExec::try_new(
+                stream(id_rows("l", 1024)),
+                stream(id_rows("r", 1)),
+                vec![(wide_key(), wide_key())],
+                None,
+                &JoinType::Inner,
+                NullEquality::NullEqualsNothing,
+                None,
+                None,
+                StreamJoinPartitionMode::SinglePartition,
+            )?))
+        };
+        let join = plan()?;
+        let root = lower(&join)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        let err = run_native(&root, join, limited_task_ctx(256 * 1024)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let join = plan()?;
+        let root = lower(&join)?;
+        let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 1024);
         Ok(())
     }
 }

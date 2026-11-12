@@ -1169,6 +1169,21 @@ pub(crate) fn evaluate_keys(
         .collect())
 }
 
+/// The memory of the arrays `keys`, the keys of the rows of `batch` (see
+/// [`evaluate_keys`]), that are not columns of `batch` (whose memory is that
+/// of the batch): of computed keys, and of columns of floats with `-0.0`.
+pub(crate) fn computed_key_bytes(keys: &[ArrayRef], batch: &RecordBatch) -> usize {
+    keys.iter()
+        .filter(|key| {
+            !batch
+                .columns()
+                .iter()
+                .any(|column| Arc::ptr_eq(column, key))
+        })
+        .map(|key| key.get_array_memory_size())
+        .sum()
+}
+
 /// The rows whose keys `keys` can match a key of the other input: `None` if
 /// all of them can, otherwise the rows without a NULL key (with
 /// [`NullEquality::NullEqualsNothing`]).
@@ -2461,19 +2476,35 @@ impl PhysicalMergeJoin {
         &self,
         progress: &MergeProgress,
         input: &DataChunk,
+        reservation: &MemoryReservation,
     ) -> Result<StreamedChunk> {
         let batch = input.compact()?;
-        let keys = evaluate_keys(self.spec.streamed_keys(), &batch)?;
-        let matchable = matchable_rows(&keys, self.spec.null_equality);
-        let zero_runs = ZeroRuns::of(&self.spec, &keys)?;
-        let keys = progress.converter.convert_columns(&keys)?;
+        // The computed keys are reserved while they are encoded, and the
+        // encoded keys (with the other structures of the chunk) while the
+        // chunk is joined.
+        let arrays = evaluate_keys(self.spec.streamed_keys(), &batch)?;
+        let chunk_reservation = reservation.new_empty();
+        chunk_reservation.try_grow(computed_key_bytes(&arrays, &batch))?;
+        let matchable = matchable_rows(&arrays, self.spec.null_equality);
+        let zero_runs = ZeroRuns::of(&self.spec, &arrays)?;
+        let keys = progress.converter.convert_columns(&arrays)?;
+        chunk_reservation
+            .try_grow(keys.size() + zero_runs.as_ref().map_or(0, ZeroRuns::size))?;
+        drop(arrays);
         let gathered = self.spec.gathered_bytes(&batch, true);
+        chunk_reservation.try_resize(
+            keys.size()
+                + zero_runs.as_ref().map_or(0, ZeroRuns::size)
+                + gathered.capacity() * size_of::<usize>()
+                + matchable.as_ref().map_or(0, |nulls| nulls.buffer().len()),
+        )?;
         Ok(StreamedChunk {
             batch,
             keys,
             matchable,
             gathered,
             zero_runs,
+            _reservation: chunk_reservation,
             next_row: 0,
             in_progress: None,
         })
@@ -3102,7 +3133,7 @@ impl BufferedWindow {
         if batch.num_rows() == 0 {
             return Ok(Poll::Ready(()));
         }
-        let keys = evaluate_keys(spec.buffered_keys(), &batch)?;
+        let (keys, _evaluated) = self.keys_of(spec, &batch)?;
         let Some(runs) = ZeroRuns::of(spec, &keys)? else {
             if self.pending.is_some() {
                 self.append_pending(spec)?;
@@ -3170,7 +3201,7 @@ impl BufferedWindow {
                 })
             });
             if !flips {
-                let keys = evaluate_keys(spec.buffered_keys(), &last)?;
+                let (keys, _evaluated) = self.keys_of(spec, &last)?;
                 let bound = self.converter.convert_columns(&keys)?.row(0).owned();
                 self.release_pending(bound.row(), spec)?;
             }
@@ -3201,7 +3232,7 @@ impl BufferedWindow {
         // The rows of the run, and their copies, are reserved until they are
         // held or appended again.
         self.reserve(pending.bytes + memory_size(&batch))?;
-        let keys = evaluate_keys(spec.buffered_keys(), &batch)?;
+        let (keys, _evaluated) = self.keys_of(spec, &batch)?;
         let rows = self.converter.convert_columns(&keys)?;
         let mut order = (0..batch.num_rows() as u32).collect::<Vec<_>>();
         order.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
@@ -3219,7 +3250,7 @@ impl BufferedWindow {
         match now.num_rows() {
             0 => self.reserve(0),
             _ => {
-                let keys = evaluate_keys(spec.buffered_keys(), &now)?;
+                let (keys, _evaluated) = self.keys_of(spec, &now)?;
                 self.append(now, &keys, spec)
             }
         }
@@ -3243,7 +3274,7 @@ impl BufferedWindow {
                 self.reserve(0)
             }
             _ => {
-                let keys = evaluate_keys(spec.buffered_keys(), &batch)?;
+                let (keys, _evaluated) = self.keys_of(spec, &batch)?;
                 self.append(batch, &keys, spec)
             }
         }
@@ -3261,13 +3292,13 @@ impl BufferedWindow {
         // The rows of the run, and their copies, are reserved until they are
         // appended.
         self.reserve(pending.bytes + memory_size(&batch))?;
-        let keys = evaluate_keys(spec.buffered_keys(), &batch)?;
+        let (keys, _evaluated) = self.keys_of(spec, &batch)?;
         let rows = self.converter.convert_columns(&keys)?;
         let mut order = (0..batch.num_rows() as u32).collect::<Vec<_>>();
         order.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
         let sorted = take_record_batch(&batch, &UInt32Array::from(order))?;
         drop((pending, batch, rows));
-        let keys = evaluate_keys(spec.buffered_keys(), &sorted)?;
+        let (keys, _evaluated) = self.keys_of(spec, &sorted)?;
         self.append(sorted, &keys, spec)
     }
 
@@ -3286,6 +3317,20 @@ impl BufferedWindow {
         let last = self.rows.keys.num_rows() - 1;
         self.last_key = Some(self.rows.keys.row(last).owned());
         Ok(())
+    }
+
+    /// The keys of the rows of `batch` (see [`evaluate_keys`]), and the
+    /// reservation of their memory if they are computed, to hold while the
+    /// keys are.
+    fn keys_of(
+        &self,
+        spec: &MergeJoinSpec,
+        batch: &RecordBatch,
+    ) -> Result<(Vec<ArrayRef>, MemoryReservation)> {
+        let keys = evaluate_keys(spec.buffered_keys(), batch)?;
+        let reservation = self.reservation.new_empty();
+        reservation.try_grow(computed_key_bytes(&keys, batch))?;
+        Ok((keys, reservation))
     }
 
     /// The memory of the window: of the batches of its rows, of the structures
@@ -3423,6 +3468,17 @@ impl ZeroRuns {
             .iter()
             .any(Option::is_some)
             .then_some(Self { runs, prefixes }))
+    }
+
+    /// The memory of the runs.
+    fn size(&self) -> usize {
+        self.runs.capacity() * size_of::<Option<usize>>()
+            + self
+                .prefixes
+                .iter()
+                .flatten()
+                .map(Rows::size)
+                .sum::<usize>()
     }
 
     /// The run of `row`: the position of its first key with a zero in
@@ -3707,6 +3763,9 @@ struct StreamedChunk {
     gathered: Vec<usize>,
     /// The runs of signed zeros of the rows, if any.
     zero_runs: Option<ZeroRuns>,
+    /// The memory of `keys`, `gathered` and `zero_runs`, held while the
+    /// chunk is joined.
+    _reservation: MemoryReservation,
     /// The next row to join.
     next_row: usize,
     /// The row whose candidates did not all fit into the last output.
@@ -3915,6 +3974,9 @@ impl PhysicalOperator for PhysicalMergeJoin {
             return Ok(SinkResult::NeedMoreInput);
         }
         let keys = evaluate_keys(self.spec.buffered_keys(), &batch)?;
+        // The computed keys are reserved while they are encoded.
+        let evaluated = state.reservation.new_empty();
+        evaluated.try_grow(computed_key_bytes(&keys, &batch))?;
         let mut building = state.building.lock();
         let Some(build) = building.as_mut() else {
             return internal_err!(
@@ -4033,7 +4095,8 @@ impl PhysicalOperator for PhysicalMergeJoin {
     ) -> Result<OperatorResult> {
         let state = downcast_state_mut::<StreamState>(lstate.as_any_mut(), self.name())?;
         if state.progress.chunk.is_none() {
-            state.progress.chunk = Some(self.start_chunk(&state.progress, input)?);
+            state.progress.chunk =
+                Some(self.start_chunk(&state.progress, input, &state.reservation)?);
         }
         let batch = match &state.buffered {
             Buffered::Sorted(buffered) => {
@@ -5475,6 +5538,47 @@ pub(crate) mod tests {
         assert_eq!(num_rows(&output.batches), rows as usize);
         let peak = pool.peak.load(Ordering::Relaxed);
         assert!(peak < 20 << 20, "the join reserved {peak} bytes at most");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wide_computed_keys_are_reserved() -> Result<()> {
+        // As the symmetric join's: a merge join of 1,024 streamed rows with a
+        // buffered row on a computed key, a string of 16 KiB, reserves the
+        // keys of the streamed chunk (16 MB as values, 16 MB encoded) while it
+        // encodes and joins them.
+        use crate::join::symmetric_hash_join::tests::{id_rows, wide_key};
+        let join = || -> Result<Arc<dyn PhysicalOperator>> {
+            let source = |batch: RecordBatch| -> Arc<dyn PhysicalOperator> {
+                Arc::new(TestSource::with_schema(
+                    batch.schema(),
+                    vec![DataChunk::from_record_batch(batch)],
+                ))
+            };
+            Ok(Arc::new(PhysicalMergeJoin::try_new(
+                source(id_rows("l", 1024)),
+                source(id_rows("r", 1)),
+                vec![(wide_key(), wide_key())],
+                None,
+                JoinType::Inner,
+                &[SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+                false,
+                None,
+            )?))
+        };
+        let err =
+            with_timeout(Executor::collect(join()?, limited_task_ctx(256 * 1024)?, 4))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let batches =
+            with_timeout(Executor::collect(join()?, limited_task_ctx(64 << 20)?, 4))
+                .await?;
+        assert_eq!(num_rows(&batches), 1024);
         Ok(())
     }
 
