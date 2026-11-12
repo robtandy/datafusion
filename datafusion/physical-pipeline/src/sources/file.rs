@@ -13,9 +13,13 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_plan::ExecutionPlan;
 
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+
 use super::FileScan;
+use super::batches::chunk_memory;
 use crate::operator::{
-    ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator, SourceResult,
+    ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
+    SourceResult, downcast_state_mut,
 };
 
 /// A source that scans the files of a `DataSourceExec` of any file format
@@ -29,6 +33,9 @@ use crate::operator::{
 /// of the `FileSource` of the scan, which DataFusion's `FileStream` reads them
 /// with too: the projection, partition columns, schema adaptation and limit of
 /// the scan are those of DataFusion.
+///
+/// The memory of the batch that a thread emits the chunks of is reserved in
+/// the memory pool of the session.
 ///
 /// The files are read as DataFusion planned them: the byte ranges into which
 /// DataFusion split large files (for the formats that can read byte ranges,
@@ -122,7 +129,10 @@ impl PhysicalOperator for FileScanSource {
         ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
     ) -> Result<Box<dyn LocalSourceState>> {
-        self.scan.get_local_source_state(ctx, gstate)
+        let scan = self.scan.get_local_source_state(ctx, gstate)?;
+        let reservation =
+            MemoryConsumer::new("FileScanSource").register(ctx.task_ctx.memory_pool());
+        Ok(Box::new(FileScanSourceState { scan, reservation }))
     }
 
     fn get_data(
@@ -131,9 +141,34 @@ impl PhysicalOperator for FileScanSource {
         gstate: &dyn GlobalSourceState,
         lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
-        self.scan.get_data(ctx, gstate, lstate)
+        let state =
+            downcast_state_mut::<FileScanSourceState>(lstate.as_any_mut(), self.name())?;
+        let result = self.scan.get_data(ctx, gstate, state.scan.as_mut())?;
+        match &result {
+            // A chunk is a slice of the batch that the thread read, whose
+            // buffers it shares: the memory of the batch, which the scan
+            // holds until it emitted all of its chunks.
+            SourceResult::Chunk(chunk) if !chunk.is_empty() => {
+                state.reservation.try_resize(chunk_memory(chunk))?;
+            }
+            SourceResult::Finished => {
+                state.reservation.free();
+            }
+            _ => {}
+        }
+        Ok(result)
     }
 }
+
+/// The local source state of a [`FileScanSource`]: the state of its scan,
+/// and the memory of the batch that the thread emits the chunks of, which is
+/// reserved in the memory pool of the session.
+struct FileScanSourceState {
+    scan: Box<dyn LocalSourceState>,
+    reservation: MemoryReservation,
+}
+
+impl LocalSourceState for FileScanSourceState {}
 
 #[cfg(test)]
 mod tests {
@@ -153,7 +188,10 @@ mod tests {
     use datafusion_physical_plan::ExecutionPlanProperties;
 
     use crate::executor::Executor;
-    use crate::operators::lowering_tests::{assert_lowered, count};
+    use crate::operators::lowering_tests::{
+        assert_lowered, assert_resources_exhausted, count, lowered,
+        pipeline_context_with_memory_limit,
+    };
     use crate::test_utils::{register_test_tables, test_session_config};
 
     fn schema() -> SchemaRef {
@@ -357,6 +395,28 @@ mod tests {
         }
         let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
         assert_lowered("SELECT * FROM j", config, setup).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_batches_of_a_thread_reserve_memory() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write_tables(dir.path()).await?;
+        for table in ["j", "a", "stream", "array"] {
+            let sql = format!("SELECT * FROM {table}");
+            // A pool of one byte cannot hold a batch.
+            let ctx = pipeline_context_with_memory_limit(1);
+            register_tables(&ctx, dir.path()).await?;
+            let root = lowered(&ctx, &sql).await?;
+            assert_eq!(count::<FileScanSource>(&root), 1, "{sql}");
+            assert_resources_exhausted(&ctx, &sql).await;
+            // A pool that holds the batches of the threads.
+            let ctx = pipeline_context_with_memory_limit(64 * 1024 * 1024);
+            register_tables(&ctx, dir.path()).await?;
+            let batches = ctx.sql(&sql).await?.collect().await?;
+            assert!(!batches.is_empty(), "{sql}");
+            assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0, "{sql}");
+        }
         Ok(())
     }
 

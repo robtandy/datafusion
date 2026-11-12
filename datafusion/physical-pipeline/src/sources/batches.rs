@@ -11,6 +11,17 @@ use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 
+/// The memory of the physical columns of `chunk`: the memory that
+/// compacting it (into the batch of its rows) allocates at most, and the
+/// memory that its batch holds.
+pub(crate) fn chunk_memory(chunk: &DataChunk) -> usize {
+    chunk
+        .columns()
+        .iter()
+        .map(|column| column.get_array_memory_size())
+        .sum()
+}
+
 /// The batch that a thread of a source emits, in zero-copy chunks of at most
 /// [`DEFAULT_VECTOR_SIZE`] rows.
 ///

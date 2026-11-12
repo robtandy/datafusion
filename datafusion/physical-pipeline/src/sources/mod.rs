@@ -77,7 +77,7 @@ use crate::operator::{
     SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
 
-mod batches;
+pub(crate) mod batches;
 pub mod csv;
 pub mod empty;
 pub mod explain;
