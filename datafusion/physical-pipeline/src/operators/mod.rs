@@ -10,4 +10,5 @@ pub mod filter;
 pub mod limit;
 pub mod placeholder_row;
 pub mod projection;
+pub mod recursive_cte;
 pub mod union;
