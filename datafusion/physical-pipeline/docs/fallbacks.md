@@ -152,14 +152,17 @@ receives them, in a single pipeline:
   of every partition: it is lowered as the `PhysicalUnion` of a
   `PhysicalPartialSort` of every partition, with the fetch, of the plans of
   the partitions of its input. These are the partitions of scans of in-memory
-  batches, of files (a plan for every file group) and of streaming tables;
-  of hash and range repartitionings (the rows that DataFusion's
-  `BatchPartitioner` routes to every partition, a `PhysicalRoutedPartition`,
-  merged in their order); and of the unions above them, and of the nodes
-  that compute every partition of the same partition of their input
-  (projections, filters, `LocalLimitExec`s, sorts, aggregations and windows
-  of every partition, and the nodes that only change the size of batches).
-  The partitions of other inputs (e.g. of a round robin repartitioning, whose
+  batches, of files (a plan for every file group) and of streaming tables,
+  and of the unions above them, and of the nodes that compute every
+  partition of the same partition of their input (projections, filters,
+  `LocalLimitExec`s, sorts, aggregations and windows of every partition, and
+  the nodes that only change the size of batches).
+- The partitions of a hash or range `RepartitionExec` below such a partial
+  sort are the rows that an execution of its input routes to them: a
+  `PhysicalTopKOfPartitions` of its input routes every row once, with
+  DataFusion's `BatchPartitioner` (also by volatile keys), and keeps the
+  first rows of every partition.
+- The partitions of other inputs (e.g. of a round robin repartitioning, whose
   partitions depend on the batches in which DataFusion reads its rows, or of
   a join) are not kept apart: the partial sort keeps the first rows of all of
   them. A merge above that keeps at most the rows of every partition is the
@@ -201,7 +204,8 @@ runs out (they do not spill):
   they arrive, and their concatenations and order before it allocates them,
   and the build rows that it emits once it probed all rows;
   `PhysicalStreamingMerge` reserves the batch of every input whose rows it
-  merges, and their keys; `MaterializedCteScan` reserves its list of the
+  merges, and their keys; `PhysicalTopKOfPartitions` the rows that every
+  partition holds, and what sorting them allocates, before it sorts them; `MaterializedCteScan` reserves its list of the
   batches of the body and of their chunks;
 - `PhysicalPartitionedTopK` holds no rows (the `PhysicalSort` below it does,
   which, like the other native sorts, does not reserve its memory yet), but

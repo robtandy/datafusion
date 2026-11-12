@@ -268,7 +268,6 @@ use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::range_join::PhysicalRangeJoin;
 use crate::operators::recursive_cte::{PhysicalRecursiveCte, WorkTableScanSource};
-use crate::operators::routed_partition::PhysicalRoutedPartition;
 use crate::operators::streaming_merge::PhysicalStreamingMerge;
 use crate::operators::union::PhysicalUnion;
 use crate::operators::unnest::PhysicalUnnest;
@@ -763,11 +762,6 @@ impl Lowering<'_> {
         if let Some(unnest) = PhysicalUnnest::try_lower(plan, |input| self.lower(input))?
         {
             return Ok(Arc::new(unnest));
-        }
-        if let Some(routed) =
-            PhysicalRoutedPartition::try_lower(plan, |input| self.lower(input))?
-        {
-            return Ok(Arc::new(routed));
         }
         // A partial sort with a fetch stops its pipeline once it has its rows.
         if let Some(sort) = PhysicalPartialSort::try_lower(plan, |input| {

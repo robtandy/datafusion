@@ -22,7 +22,7 @@ pub mod placeholder_row;
 pub mod projection;
 pub mod range_join;
 pub mod recursive_cte;
-pub(crate) mod routed_partition;
 pub mod streaming_merge;
+pub mod topk_of_partitions;
 pub mod union;
 pub mod unnest;

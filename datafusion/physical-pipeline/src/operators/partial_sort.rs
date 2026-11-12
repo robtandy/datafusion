@@ -21,7 +21,6 @@ use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::async_func::AsyncFuncExec;
 use datafusion_physical_plan::buffer::BufferExec;
-use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::LocalLimitExec;
@@ -44,7 +43,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut, operator_key,
 };
-use crate::operators::routed_partition::RoutedPartitionExec;
+use crate::operators::topk_of_partitions::PhysicalTopKOfPartitions;
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::PipelineGraph;
 use crate::sort::{PhysicalSort, PhysicalTopK};
@@ -115,10 +114,13 @@ impl PhysicalPartialSort {
     /// its partitioning) keeps the first `fetch` rows of every partition: it
     /// is lowered as the [`PhysicalUnion`] of the partial sorts of the plans
     /// of its partitions (see [`partitions_of`]), every one with the fetch.
-    /// The partitions of an input that the planner cannot split (e.g. of a
-    /// `RepartitionExec`), which depend on how DataFusion distributes the
-    /// rows, are those of the pipeline engine: a single one, which keeps the
-    /// first `fetch` rows of all of them.
+    /// The partitions of a hash or range `RepartitionExec`, which only an
+    /// execution of its input distributes, are kept by a
+    /// [`PhysicalTopKOfPartitions`] of its input instead. The partitions of
+    /// other inputs that the planner cannot split (e.g. of a round robin
+    /// repartitioning, which depend on the batches in which DataFusion reads
+    /// its rows) are those of the pipeline engine: a single one, which keeps
+    /// the first `fetch` rows of all of them.
     ///
     /// The rows of an input that the pipeline engine runs in several
     /// pipelines (e.g. of a union below a `CoalescePartitionsExec`) would
@@ -138,6 +140,25 @@ impl PhysicalPartialSort {
         let Some(sort) = plan.downcast_ref::<PartialSortExec>() else {
             return Ok(None);
         };
+        // The partitions of a hash or range repartitioning are the rows that
+        // an execution of its input routes to them: every one keeps its
+        // first rows, by a TopK of its own, of rows routed once.
+        if limits_every_partition(sort)
+            && let Some(repartition) = sort.input().downcast_ref::<RepartitionExec>()
+            && matches!(
+                repartition.partitioning(),
+                Partitioning::Hash(..) | Partitioning::Range(_)
+            )
+            && let Some(fetch) = sort.fetch().filter(|&fetch| fetch > 0)
+        {
+            let topk = PhysicalTopKOfPartitions::try_new(
+                lower_input(repartition.input())?,
+                repartition.partitioning().clone(),
+                sort.expr().clone(),
+                fetch,
+            )?;
+            return Ok(Some(Arc::new(topk)));
+        }
         let inputs = match limits_every_partition(sort) {
             true => partitions_of(sort.input())?,
             false => None,
@@ -277,14 +298,12 @@ pub(crate) fn first_rows_of_merged_partitions(
 /// with the rows of its partition, in their order: of a scan of in-memory
 /// batches (every partition with its batches), of a scan of files (every
 /// partition with its file group), of a streaming table (every partition
-/// with its stream), of a hash or range repartitioning (every partition
-/// with the rows that it routes to it, see [`RoutedPartitionExec`]), and of
-/// the unions of them and of the nodes above them that compute every
-/// partition of the same partition of their input (projections, filters,
-/// limits, sorts, aggregations and windows of every partition, and the
-/// nodes that only change the size of batches). `None` for any other plan of
-/// several partitions, e.g. of a round robin repartitioning, whose
-/// partitions depend on the batches in which DataFusion reads its rows.
+/// with its stream), and of the unions of them and of the nodes above them
+/// that compute every partition of the same partition of their input
+/// (projections, filters, limits, sorts, aggregations and windows of every
+/// partition, and the nodes that only change the size of batches). `None`
+/// for any other plan of several partitions, e.g. of a repartitioning, whose
+/// rows only an execution of its input distributes over its partitions.
 pub(crate) fn partitions_of(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
@@ -330,36 +349,6 @@ pub(crate) fn partitions_of(
             .collect::<Result<Vec<_>>>()?;
         return Ok(Some(partitions));
     }
-    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
-        && matches!(
-            repartition.partitioning(),
-            Partitioning::Hash(..) | Partitioning::Range(_)
-        )
-    {
-        let input = repartition.input();
-        let ordering = input.output_ordering().cloned();
-        let several = input.output_partitioning().partition_count() > 1;
-        let partitions = (0..count)
-            .map(|partition| {
-                let routed: Arc<dyn ExecutionPlan> =
-                    Arc::new(RoutedPartitionExec::try_new(
-                        Arc::clone(input),
-                        repartition.partitioning().clone(),
-                        partition,
-                    )?);
-                // The rows of the partitions of the input, merged in their
-                // order if the repartitioning keeps it.
-                Ok(match (several, repartition.preserve_order(), &ordering) {
-                    (false, _, _) => routed,
-                    (true, true, Some(ordering)) => {
-                        Arc::new(SortPreservingMergeExec::new(ordering.clone(), routed))
-                    }
-                    (true, _, _) => Arc::new(CoalescePartitionsExec::new(routed)),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        return Ok(Some(partitions));
-    }
     if plan.is::<UnionExec>() {
         let mut partitions = Vec::with_capacity(count);
         for input in plan.children() {
@@ -382,8 +371,7 @@ pub(crate) fn partitions_of(
         || plan.is::<BoundedWindowAggExec>()
         || plan.is::<WindowAggExec>()
         || plan.is::<UnnestExec>()
-        || plan.is::<AsyncFuncExec>()
-        || plan.is::<RoutedPartitionExec>();
+        || plan.is::<AsyncFuncExec>();
     if of_every_partition
         && let [input] = plan.children()[..]
         && input.output_partitioning().partition_count() == count
@@ -717,6 +705,7 @@ mod tests {
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::expressions::{col, lit};
 
+    use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion_physical_plan::union::UnionExec;
 
     use crate::executor::Executor;
@@ -987,8 +976,58 @@ mod tests {
                 merge_fetch.is_some(),
             )
             .await;
-            assert_eq!(count::<PhysicalPartialSort>(&root), 3, "{merge_fetch:?}");
+            assert_eq!(
+                count::<PhysicalTopKOfPartitions>(&root),
+                1,
+                "{merge_fetch:?}"
+            );
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_rows_of_repartitionings_by_volatile_keys_are_routed_once() -> Result<()>
+    {
+        // 10,000 ids, repartitioned by a hash of `random()` into four
+        // partitions, every one of which keeps up to 10,000 rows: every id
+        // once.
+        let config = test_session_config();
+        let ctx = crate::test_utils::datafusion_context(config.clone());
+        let input = ctx
+            .sql("SELECT 0 AS k, value AS id, random() AS r FROM generate_series(1, 10000)")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let schema = input.schema();
+            let hash = Partitioning::Hash(vec![col("r", &schema).unwrap()], 4);
+            let repartition = RepartitionExec::try_new(Arc::clone(&input), hash).unwrap();
+            let ordering = LexOrdering::new(vec![
+                PhysicalSortExpr::new_default(col("k", &schema).unwrap()),
+                PhysicalSortExpr::new_default(col("id", &schema).unwrap()),
+            ])
+            .unwrap();
+            let sort = PartialSortExec::new(ordering, Arc::new(repartition), 1)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(10_000));
+            let id = vec![(col("id", &schema).unwrap(), "id".to_owned())];
+            Arc::new(ProjectionExec::try_new(id, Arc::new(sort)).unwrap())
+        };
+        let root = assert_plan_lowered(make_plan, config, false).await;
+        assert_eq!(count::<PhysicalTopKOfPartitions>(&root), 1);
+        let output = Executor::collect(root, ctx.task_ctx(), 4).await?;
+        let mut ids = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow::datatypes::Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=10_000).collect::<Vec<_>>());
         Ok(())
     }
 
