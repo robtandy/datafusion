@@ -670,7 +670,7 @@ pub async fn assert_same_results_as_datafusion_with_options<F>(
 ) where
     F: AsyncFn(&SessionContext) -> Result<()>,
 {
-    let outcomes = match run_both_engines(sql, config, setup).await {
+    let outcomes = match run_both_engines(sql, config, setup, &options).await {
         Ok(outcomes) => outcomes,
         Err(e) => panic!("Failed to run query on both engines: {e}\nquery: {sql}"),
     };
@@ -738,8 +738,10 @@ impl EngineOutcomes {
 /// Run `sql` on both engines, configured with `config` and set up with
 /// `setup` (called for the session of DataFusion first, then for the session
 /// of the pipeline engine), and return their outcomes, with the
-/// [`result_order`] of the query (for which DataFusion runs the query again
-/// if it has a top-level `ORDER BY`).
+/// [`result_order`] of the query for the comparison `options` (for which
+/// DataFusion sorts the rows of the query again if it has a top-level
+/// `ORDER BY`). Compare the outcomes with the same options, see
+/// [`EngineOutcomes::compare`].
 ///
 /// Fails if `setup` fails, if `sql` is not a valid query (DataFusion cannot
 /// plan it logically), or if the pipeline engine did not plan the query.
@@ -747,6 +749,7 @@ pub async fn run_both_engines<F>(
     sql: &str,
     config: SessionConfig,
     setup: F,
+    options: &ComparisonOptions,
 ) -> Result<EngineOutcomes>
 where
     F: AsyncFn(&SessionContext) -> Result<()>,
@@ -768,7 +771,7 @@ where
             output.plan.name()
         )));
     }
-    let order = result_order(&datafusion, &plan).await;
+    let order = result_order(&datafusion, &plan, options).await;
     Ok(EngineOutcomes {
         datafusion: datafusion_outcome,
         pipeline: pipeline_outcome,
@@ -815,23 +818,36 @@ pub struct SortedReference {
     /// The maximum number of sorted rows that the query returns (`LIMIT`).
     pub fetch: Option<usize>,
     /// The ranges of sorted rows whose output columns are not computed, with
-    /// the reason: the query cannot return them, as their keys cannot tie
-    /// with the keys of the rows that it returns, whatever the tolerance, or
-    /// it fails on them (e.g. on a division by zero above its `LIMIT`). The
-    /// query returns none of these rows.
+    /// the reason: the query fails on them (e.g. on a division by zero above
+    /// its `LIMIT`), or the reference stopped looking for the rows on which
+    /// it fails, or the query fails on the rows that it cannot return (whose
+    /// keys cannot tie with the keys of the rows that it returns within
+    /// [`SortedReference::tolerance`]: their output columns are only computed
+    /// to describe differences). Results that have one of these rows differ
+    /// from the reference.
     pub uncomputed: Vec<(Range<usize>, String)>,
+    /// The floating-point tolerance within which the reference computes the
+    /// output columns of the sorted rows that the query may return (see
+    /// [`ComparisonOptions::float_tolerance`]). Results are compared with it
+    /// within this tolerance at most.
+    pub tolerance: f64,
 }
 
-/// How the rows of the result of `plan`, planned by `ctx`, are ordered. For a
-/// query with a top-level `ORDER BY`, `ctx` sorts all rows of its top-level
-/// sort (without its `LIMIT` and `OFFSET`), with the values of its `ORDER BY`
-/// keys, and computes the output columns of the sorted rows that the query
-/// may return, to compute its [`SortedReference`].
-pub async fn result_order(ctx: &SessionContext, plan: &LogicalPlan) -> ResultOrder {
+/// How the rows of the result of `plan`, planned by `ctx`, are ordered, to be
+/// compared with `options`. For a query with a top-level `ORDER BY`, `ctx`
+/// sorts all rows of its top-level sort (without its `LIMIT` and `OFFSET`),
+/// with the values of its `ORDER BY` keys, and computes the output columns of
+/// the sorted rows that the query may return within the tolerance of
+/// `options`, to compute its [`SortedReference`].
+pub async fn result_order(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    options: &ComparisonOptions,
+) -> ResultOrder {
     if !has_top_level_order_by(plan) {
         return ResultOrder::Unordered;
     }
-    match sorted_reference(ctx, plan).await {
+    match sorted_reference(ctx, plan, options.float_tolerance).await {
         Ok(reference) => ResultOrder::Sorted(reference),
         Err(e) => ResultOrder::Exact(e.to_string()),
     }
@@ -840,6 +856,7 @@ pub async fn result_order(ctx: &SessionContext, plan: &LogicalPlan) -> ResultOrd
 async fn sorted_reference(
     ctx: &SessionContext,
     plan: &LogicalPlan,
+    tolerance: f64,
 ) -> Result<SortedReference> {
     let reference = reference_plan(plan, &ctx.state())?;
     let sorted = ctx
@@ -857,8 +874,33 @@ async fn sorted_reference(
         return internal_err!("the sorted rows do not have the columns of the sort");
     }
     let rows = sorted.num_rows();
-    let returnable = returnable_rows(&sorted, width, reference.window.rows(rows))?;
-    let (outputs, failures) = reference.outputs(ctx, &sorted, &returnable).await?;
+    let window = reference.window.rows(rows);
+    let returnable = returnable_rows(&sorted, width, window.clone(), tolerance)?;
+    // The rows closest to the rows that the query returns first.
+    let mut closest = returnable.clone();
+    closest.sort_by_key(|&row| {
+        (row + 1)
+            .saturating_sub(window.end)
+            .max(window.start.saturating_sub(row))
+    });
+    let (mut outputs, mut failures) = reference.outputs(ctx, &sorted, &closest).await?;
+    // The other rows, only to describe differences (e.g. a row out of order):
+    // the query cannot return them, so it may fail on them.
+    let others = {
+        let mut returnable = returnable.iter().peekable();
+        (0..rows)
+            .filter(|row| returnable.next_if_eq(&row).is_none())
+            .collect::<Vec<_>>()
+    };
+    match reference.compute(ctx, &sorted, &others).await {
+        _ if others.is_empty() => {}
+        Ok(batches) => outputs.extend(batches),
+        Err(_) => failures.extend(others.iter().map(|&row| {
+            let reason = "the query cannot return it, as its keys cannot tie with \
+                          the keys of the rows that it returns within the tolerance";
+            (row, reason.to_string())
+        })),
+    }
 
     // The output columns of the sorted rows, at their positions.
     let output = plan.schema().fields();
@@ -890,10 +932,7 @@ async fn sorted_reference(
         }
     }
     let failed = failures.iter().map(|(row, _)| *row).collect::<HashSet<_>>();
-    if returnable
-        .iter()
-        .any(|row| index[*row].is_none() && !failed.contains(row))
-    {
+    if (0..rows).any(|row| index[row].is_none() && !failed.contains(&row)) {
         return internal_err!("the output columns of a sorted row are not computed");
     }
     let index = UInt32Array::from(index);
@@ -913,22 +952,12 @@ async fn sorted_reference(
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
 
     // The rows whose output columns are not computed, with the reason.
-    let mut failures = failures
-        .into_iter()
-        .map(|(row, e)| (row, format!("the query fails on it: {e}")))
-        .collect::<HashMap<_, _>>();
-    let mut returnable = returnable.into_iter().peekable();
+    let mut failures = failures.into_iter().collect::<HashMap<_, _>>();
     let mut uncomputed: Vec<(Range<usize>, String)> = vec![];
     for row in 0..rows {
-        let reason = match returnable.next_if_eq(&row) {
-            Some(_) => failures.remove(&row),
-            None => Some(
-                "the query cannot return it, as its keys cannot tie with the keys of \
-                 the rows that it returns"
-                    .to_string(),
-            ),
+        let Some(reason) = failures.remove(&row) else {
+            continue;
         };
-        let Some(reason) = reason else { continue };
         match uncomputed.last_mut() {
             Some((range, last)) if range.end == row && *last == reason => range.end += 1,
             _ => uncomputed.push((row..row + 1, reason)),
@@ -941,40 +970,34 @@ async fn sorted_reference(
         skip: reference.window.skip,
         fetch: reference.window.fetch,
         uncomputed,
+        tolerance,
     })
 }
 
 /// The sorted rows (`sorted`, whose columns from `width` are the values of the
 /// `ORDER BY` keys) that a query may return if it returns the sorted rows
-/// `window`, whatever the tolerance: these rows, and the rows whose keys may
-/// tie with their keys, which are the same up to their first floating-point
-/// value but for this value (they have the same [`Shape`], see
-/// [`decision_keys`]).
-// The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
-// for memory accounting with the `arrow-buffer/pool` feature (enabled by
-// `--all-features`): it affects neither their equality nor their hashing. Not
-// `expect`: the lint only fires with that feature.
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)]
+/// `window`, within the tolerance `tolerance`: the rows of the classes that
+/// may be at the positions of `window`, as they tie with other classes (see
+/// [`bounds`]).
 fn returnable_rows(
     sorted: &RecordBatch,
     width: usize,
     window: Range<usize>,
+    tolerance: f64,
 ) -> Result<Vec<usize>> {
-    let keys = (0..sorted.num_rows())
-        .map(|row| {
-            let keys = sorted.columns()[width..]
-                .iter()
-                .map(|column| Value::try_new(column.as_ref(), row))
-                .collect::<Result<Row>>()?;
-            Ok(decision_keys(&keys, &|_, _| true).0)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let shapes = keys[window.clone()]
+    let keys = (0..sorted.num_rows()).map(|row| {
+        sorted.columns()[width..]
+            .iter()
+            .map(|column| Value::try_new(column.as_ref(), row))
+            .collect::<Result<Row>>()
+    });
+    let (classes, _, varies) = classes(keys, tolerance)?;
+    let tied = tied_classes(&classes, &varies, tolerance);
+    Ok(classes
         .iter()
-        .map(|keys| Shape(keys))
-        .collect::<HashSet<_>>();
-    Ok((0..keys.len())
-        .filter(|row| window.contains(row) || shapes.contains(&Shape(&keys[*row])))
+        .zip(bounds(&classes, &tied))
+        .filter(|(_, (first, last))| *first < window.end && *last >= window.start)
+        .flat_map(|((rows, _), _)| rows.clone())
         .collect())
 }
 
@@ -1024,7 +1047,7 @@ const SORTED_POSITION: &str = "__test_utils_sorted_position";
 
 /// The maximum number of times that [`ReferencePlan::outputs`] computes the
 /// output columns of sorted rows, as it looks for the rows on which the query
-/// fails.
+/// fails: it does not compute the rows that are left.
 const MAX_OUTPUT_COMPUTATIONS: usize = 256;
 
 /// The plans of the [`SortedReference`] of a query with a top-level `ORDER BY`
@@ -1049,28 +1072,33 @@ struct ReferencePlan {
 impl ReferencePlan {
     /// The output columns of the sorted rows `rows` of `sorted` (the rows of
     /// [`ReferencePlan::sort`]), each followed by its position, and the rows
-    /// on which the query fails, with the error. They are computed for all
-    /// rows at once, or, if the query fails, for each half of them, down to
-    /// the single rows on which it fails.
+    /// whose output columns are not computed, with the reason. They are
+    /// computed for all rows at once, or, if the query fails, for each half of
+    /// them (the first rows first), down to the single rows on which it
+    /// fails. After [`MAX_OUTPUT_COMPUTATIONS`] computations, the rows that
+    /// are left are not computed.
     async fn outputs(
         &self,
         ctx: &SessionContext,
         sorted: &RecordBatch,
         rows: &[usize],
-    ) -> Result<(Vec<RecordBatch>, Vec<(usize, DataFusionError)>)> {
-        let (mut outputs, mut failures) = (vec![], vec![]);
+    ) -> Result<(Vec<RecordBatch>, Vec<(usize, String)>)> {
+        let (mut outputs, mut uncomputed) = (vec![], vec![]);
         let (mut pending, mut computations, mut planned) = (vec![rows], 0, false);
         while let Some(rows) = pending.pop() {
             if rows.is_empty() {
                 continue;
             }
-            computations += 1;
-            if computations > MAX_OUTPUT_COMPUTATIONS {
-                return not_impl_err!(
-                    "the output columns of the sorted rows: the query fails on too many \
-                     of them (computed more than {MAX_OUTPUT_COMPUTATIONS} times)"
+            if computations == MAX_OUTPUT_COMPUTATIONS {
+                let reason = format!(
+                    "the query fails on some of the rows near it, and the reference \
+                     stopped looking for them after {MAX_OUTPUT_COMPUTATIONS} \
+                     computations"
                 );
+                uncomputed.extend(rows.iter().map(|&row| (row, reason.clone())));
+                continue;
             }
+            computations += 1;
             match self.compute(ctx, sorted, rows).await {
                 Ok(batches) => outputs.extend(batches),
                 Err(e) => {
@@ -1081,7 +1109,7 @@ impl ReferencePlan {
                         planned = true;
                     }
                     if let [row] = rows {
-                        failures.push((*row, e));
+                        uncomputed.push((*row, format!("the query fails on it: {e}")));
                     } else {
                         let (first, second) = rows.split_at(rows.len() / 2);
                         pending.extend([second, first]);
@@ -1089,7 +1117,7 @@ impl ReferencePlan {
                 }
             }
         }
-        Ok((outputs, failures))
+        Ok((outputs, uncomputed))
     }
 
     /// The output columns of the sorted rows `rows` of `sorted`, each followed
@@ -1443,9 +1471,16 @@ pub fn compare_results(
                     expected.schema.fields().len()
                 ));
             }
-            // The keys of each engine may be off by the tolerance.
+            if tolerance > reference.tolerance {
+                return Err(format!(
+                    "the sorted reference is computed for the float tolerance {}, but the \
+                     results are compared within {tolerance}: compute it with the \
+                     same options (see `run_both_engines`)",
+                    reference.tolerance
+                ));
+            }
             let sorted = reference
-                .sorted_rows(2.0 * tolerance)
+                .sorted_rows(tolerance)
                 .map_err(|e| format!("cannot read the sorted reference: {e}"))?;
             let names = (columns.as_str(), reference.keys.join(", "));
             let names = (names.0, names.1.as_str());
@@ -1564,6 +1599,9 @@ struct SortedRows {
     classes: Vec<(Range<usize>, Row)>,
     /// For each class, whether its rows have keys after these keys.
     truncated: Vec<bool>,
+    /// For each class, whether the last floating-point value of its keys may
+    /// vary within the tolerance (see [`may_vary`]).
+    varies: Vec<bool>,
     /// The sorted rows that the query returns.
     window: Range<usize>,
 }
@@ -1595,11 +1633,11 @@ impl SortedRows {
 }
 
 /// The keys of a row (the values of its `ORDER BY` keys, `keys`) that decide
-/// its order relative to rows of other keys, and whether `keys` has values
-/// after them: the keys up to their first floating-point value that may vary
-/// (`may_vary`, included), in the order in which they are compared
-/// (lexicographically, also the elements of lists and the fields of
-/// structs).
+/// its order relative to rows of other keys, whether `keys` has values after
+/// them, and whether their last floating-point value may vary: the keys up to
+/// their first floating-point value that may vary (`may_vary`, included), in
+/// the order in which they are compared (lexicographically, also the
+/// elements of lists and the fields of structs).
 ///
 /// The floating-point values of each engine may be off by the tolerance: of
 /// two rows whose keys are exactly equal before their first floating-point
@@ -1609,7 +1647,7 @@ impl SortedRows {
 fn decision_keys(
     keys: &[Value],
     may_vary: &dyn Fn(f64, Precision) -> bool,
-) -> (Row, bool) {
+) -> (Row, bool, bool) {
     /// Push the values of `values` up to their first floating-point value
     /// that may vary (included) to `prefix`. Returns `None` if they have none,
     /// or whether they have values after it.
@@ -1645,8 +1683,8 @@ fn decision_keys(
         None
     }
     let mut prefix = vec![];
-    let truncated = push_prefix(keys, may_vary, &mut prefix).unwrap_or(false);
-    (prefix, truncated)
+    let found = push_prefix(keys, may_vary, &mut prefix);
+    (prefix, found.unwrap_or(false), found.is_some())
 }
 
 /// Whether the floating-point value `value` of the precision `precision` is
@@ -1705,11 +1743,68 @@ impl Precision {
     }
 }
 
+/// The classes of sorted rows (see [`SortedRows::classes`]), the keys of each
+/// class, whether its rows have keys after them, and whether their last
+/// floating-point value may vary: the ranges of rows whose `ORDER BY` keys
+/// (`keys`, of each sorted row in their order) are exactly equal up to their
+/// first floating-point value that may vary within the tolerance `tolerance`
+/// (their [`decision_keys`]).
+type Classes = (Vec<(Range<usize>, Row)>, Vec<bool>, Vec<bool>);
+
+/// The [`Classes`] of the sorted rows whose `ORDER BY` keys are `keys`, within
+/// the tolerance `tolerance`.
+fn classes(
+    keys: impl IntoIterator<Item = Result<Row>>,
+    tolerance: f64,
+) -> Result<Classes> {
+    let (mut classes, mut truncated, mut varies): Classes = Default::default();
+    for (position, keys) in keys.into_iter().enumerate() {
+        let (keys, truncates, may) = decision_keys(&keys?, &|value, precision| {
+            may_vary(value, precision, tolerance)
+        });
+        match classes.last_mut() {
+            Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
+                range.end = position + 1;
+                *truncated.last_mut().expect("a class") |= truncates;
+            }
+            _ => {
+                classes.push((position..position + 1, keys));
+                truncated.push(truncates);
+                varies.push(may);
+            }
+        }
+    }
+    Ok((classes, truncated, varies))
+}
+
+/// The first and the last positions of sorted rows at which the rows of each
+/// class of `classes` may be, as they tie with the classes `tied` (see
+/// [`tied_classes`]).
+fn bounds(classes: &[(Range<usize>, Row)], tied: &[Vec<usize>]) -> Vec<(usize, usize)> {
+    classes
+        .iter()
+        .enumerate()
+        .map(|(class, (rows, _))| {
+            let tied_rows = |range: Range<usize>| {
+                tied[class]
+                    .iter()
+                    .filter(|other| range.contains(*other))
+                    .map(|&other| classes[other].0.len())
+                    .sum::<usize>()
+            };
+            (
+                rows.start - tied_rows(0..class),
+                rows.end - 1 + tied_rows(class + 1..classes.len()),
+            )
+        })
+        .collect()
+}
+
 impl SortedReference {
     /// All sorted rows, in classes of rows whose keys are exactly equal up to
     /// their first floating-point value that may vary within the tolerance
-    /// `tie_tolerance` (see [`decision_keys`]).
-    fn sorted_rows(&self, tie_tolerance: f64) -> Result<SortedRows> {
+    /// `tolerance` (see [`classes`]).
+    fn sorted_rows(&self, tolerance: f64) -> Result<SortedRows> {
         let width = self.columns + self.keys.len();
         if let Some(batch) = self
             .batches
@@ -1726,39 +1821,28 @@ impl SortedReference {
                 .map(|column| Value::try_new(batch.column(column).as_ref(), row))
                 .collect::<Result<Row>>()
         };
+        let rows = self
+            .batches
+            .iter()
+            .flat_map(|batch| (0..batch.num_rows()).map(move |i| (batch, i)));
+        let keys = rows
+            .clone()
+            .map(|(batch, i)| row(batch, i, self.columns..width));
+        let (classes, truncated, varies) = classes(keys, tolerance)?;
         let mut values = vec![];
-        let mut classes: Vec<(Range<usize>, Row)> = vec![];
-        let mut truncated = vec![];
-        for batch in &self.batches {
-            for i in 0..batch.num_rows() {
-                let keys = row(batch, i, self.columns..width)?;
-                let (keys, truncates) = decision_keys(&keys, &|value, precision| {
-                    may_vary(value, precision, tie_tolerance)
-                });
-                let position = values.len();
-                match classes.last_mut() {
-                    Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
-                        range.end = position + 1;
-                        *truncated.last_mut().expect("a class") |= truncates;
-                    }
-                    _ => {
-                        classes.push((position..position + 1, keys));
-                        truncated.push(truncates);
-                    }
-                }
-                let next = self
-                    .uncomputed
-                    .partition_point(|(rows, _)| rows.end <= position);
-                let computed = self
-                    .uncomputed
-                    .get(next)
-                    .is_none_or(|(rows, _)| !rows.contains(&position));
-                values.push(
-                    computed
-                        .then(|| row(batch, i, 0..self.columns))
-                        .transpose()?,
-                );
-            }
+        for (position, (batch, i)) in rows.enumerate() {
+            let next = self
+                .uncomputed
+                .partition_point(|(rows, _)| rows.end <= position);
+            let computed = self
+                .uncomputed
+                .get(next)
+                .is_none_or(|(rows, _)| !rows.contains(&position));
+            values.push(
+                computed
+                    .then(|| row(batch, i, 0..self.columns))
+                    .transpose()?,
+            );
         }
         let window = Window {
             skip: self.skip,
@@ -1770,51 +1854,67 @@ impl SortedReference {
             uncomputed: self.uncomputed.clone(),
             classes,
             truncated,
+            varies,
             window,
         })
     }
 }
 
 /// For each class of sorted rows, the other classes whose keys tie with its
-/// keys (in their order). The keys of the classes are their
-/// [`decision_keys`]: only their last floating-point value may vary within
-/// `tie_tolerance`. Only keys with the same [`Shape`] can tie (their values
-/// but their floating-point values are equal): their floating-point values
-/// are compared within `tie_tolerance` (values that may not vary are only
-/// equal to equal values, see [`may_vary`]).
+/// keys (in their order), within the tolerance `tolerance`. The keys of the
+/// classes are their [`decision_keys`]: all but their last floating-point
+/// value cannot vary within the tolerance, and `varies` tells for each class
+/// whether its last one may (see [`may_vary`]).
+///
+/// Keys tie if they have the same [`Shape`] (their values but their
+/// floating-point values are equal), the same floating-point values but the
+/// last, and last values that are equal within the tolerance once for each
+/// of them that may vary: each engine's value may be off by the tolerance.
 // The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
 // for memory accounting with the `arrow-buffer/pool` feature (enabled by
 // `--all-features`): it affects neither their equality nor their hashing. Not
 // `expect`: the lint only fires with that feature.
 #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
-fn tied_classes(classes: &[(Range<usize>, Row)], tie_tolerance: f64) -> Vec<Vec<usize>> {
+fn tied_classes(
+    classes: &[(Range<usize>, Row)],
+    varies: &[bool],
+    tolerance: f64,
+) -> Vec<Vec<usize>> {
     let mut tied = vec![vec![]; classes.len()];
-    let mut classes_of_shape: HashMap<Shape<'_>, Vec<usize>> = HashMap::new();
+    // The classes of each shape and floating-point values but the last, and
+    // the last floating-point value of each class.
+    let mut members_of: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
+    let mut last = vec![0.0; classes.len()];
     for (class, (_, keys)) in classes.iter().enumerate() {
-        if keys.iter().any(Value::has_floats) {
-            classes_of_shape.entry(Shape(keys)).or_default().push(class);
+        let mut floats = vec![];
+        for value in keys {
+            value.collect_floats(&mut floats);
         }
+        let Some(value) = floats.pop() else {
+            continue;
+        };
+        last[class] = normalized(value);
+        let others = floats.into_iter().map(|value| normalized(value).to_bits());
+        members_of
+            .entry((Shape(keys), others.collect()))
+            .or_default()
+            .push(class);
     }
-    for members in classes_of_shape
-        .values()
-        .filter(|members| members.len() > 1)
-    {
-        let vectors = members
+    for members in members_of.values().filter(|members| members.len() > 1) {
+        let values = members
             .iter()
-            .map(|&class| {
-                let mut floats = vec![];
-                for value in &classes[class].1 {
-                    value.collect_floats(&mut floats);
-                }
-                floats.into_iter().map(normalized).collect::<Vec<_>>()
-            })
+            .map(|&class| vec![last[class]])
             .collect::<Vec<_>>();
-        for (a, others) in equal_pairs(&vectors, &vectors, tie_tolerance)
+        for (a, others) in equal_pairs(&values, &values, 2.0 * tolerance)
             .into_iter()
             .enumerate()
         {
             for b in others.into_iter().filter(|&b| b != a) {
-                tied[members[a]].push(members[b]);
+                let (a, b) = (members[a], members[b]);
+                let off = f64::from(u8::from(varies[a]) + u8::from(varies[b]));
+                if floats_equal(last[a], last[b], off * tolerance) {
+                    tied[a].push(b);
+                }
             }
         }
     }
@@ -1880,7 +1980,7 @@ fn compare_sorted(
     let classes = &sorted.classes;
     // The keys of each engine may be off by the tolerance. Ties are not
     // transitive: two rows that tie with a row may not tie with each other.
-    let tied = tied_classes(classes, 2.0 * tolerance);
+    let tied = tied_classes(classes, &sorted.varies, tolerance);
     let ties = |a: usize, b: usize| a == b || tied[a].binary_search(&b).is_ok();
     let display = |row: &Row| {
         row.iter()
@@ -1910,23 +2010,7 @@ fn compare_sorted(
 
     // The first and the last positions of sorted rows at which the rows of
     // each class may be.
-    let bounds = classes
-        .iter()
-        .enumerate()
-        .map(|(class, (rows, _))| {
-            let tied_rows = |range: Range<usize>| {
-                tied[class]
-                    .iter()
-                    .filter(|other| range.contains(*other))
-                    .map(|&other| classes[other].0.len())
-                    .sum::<usize>()
-            };
-            (
-                rows.start - tied_rows(0..class),
-                rows.end - 1 + tied_rows(class + 1..classes.len()),
-            )
-        })
-        .collect::<Vec<_>>();
+    let bounds = bounds(classes, &tied);
 
     // The groups of sorted rows of a class with equal values, and the groups
     // of each class and shape.
@@ -3927,6 +4011,7 @@ mod tests {
             skip,
             fetch,
             uncomputed: vec![],
+            tolerance: f64::INFINITY,
         })
     }
 
@@ -3965,6 +4050,7 @@ mod tests {
             skip,
             fetch,
             uncomputed: vec![],
+            tolerance: f64::INFINITY,
         })
     }
 
@@ -4625,6 +4711,7 @@ mod tests {
             skip,
             fetch,
             uncomputed: vec![],
+            tolerance: f64::INFINITY,
         })
     }
 
@@ -5498,7 +5585,7 @@ mod tests {
             let expected: Option<Sorted<'_>> = expected;
             let df = ctx.sql(sql).await?;
             let plan = df.logical_plan();
-            let order = result_order(&ctx, plan).await;
+            let order = result_order(&ctx, plan, &ComparisonOptions::default()).await;
             let sorted = match &order {
                 ResultOrder::Unordered => None,
                 ResultOrder::Sorted(reference) => Some(reference),
@@ -5525,12 +5612,13 @@ mod tests {
         // The sorted rows have the values of the keys after the output
         // columns.
         let df = ctx.sql("SELECT a FROM t1 ORDER BY id DESC LIMIT 3").await?;
-        let ResultOrder::Sorted(reference) = result_order(&ctx, df.logical_plan()).await
+        let ResultOrder::Sorted(reference) =
+            result_order(&ctx, df.logical_plan(), &ComparisonOptions::default()).await
         else {
             panic!("not sorted");
         };
         let tolerance = ComparisonOptions::DEFAULT_FLOAT_TOLERANCE;
-        let rows = reference.sorted_rows(2.0 * tolerance)?;
+        let rows = reference.sorted_rows(tolerance)?;
         assert_eq!(rows.window, 0..3);
         let ids = rows.classes[..3]
             .iter()
@@ -5541,7 +5629,8 @@ mod tests {
 
         // A LIMIT that is not a constant.
         let df = ctx.sql("SELECT id FROM t1 ORDER BY id LIMIT $1").await?;
-        let order = result_order(&ctx, df.logical_plan()).await;
+        let order =
+            result_order(&ctx, df.logical_plan(), &ComparisonOptions::default()).await;
         assert!(matches!(&order, ResultOrder::Exact(_)), "{order:?}");
         Ok(())
     }
@@ -5566,7 +5655,7 @@ mod tests {
         let ctx = datafusion_context(test_session_config());
         ctx.register_batch("m", kv_int_batch(rows))?;
         let df = ctx.sql(sql).await?;
-        Ok(result_order(&ctx, df.logical_plan()).await)
+        Ok(result_order(&ctx, df.logical_plan(), &ComparisonOptions::default()).await)
     }
 
     #[tokio::test]
@@ -5586,7 +5675,7 @@ mod tests {
             panic!("not sorted: {order:?}");
         };
         let cannot_return = "the query cannot return it, as its keys cannot tie with \
-                             the keys of the rows that it returns";
+                             the keys of the rows that it returns within the tolerance";
         assert_eq!(reference.uncomputed, [(2..3, cannot_return.to_string())]);
         same_results(x(&[10, 5]), x(&[5, 10]), &order).unwrap();
         let err = same_results(x(&[10, 5]), x(&[10, 10]), &order).unwrap_err();
@@ -5615,14 +5704,18 @@ mod tests {
         let ResultOrder::Sorted(reference) = &order else {
             panic!("not sorted: {order:?}");
         };
-        assert_eq!(reference.uncomputed.len(), 2, "{:?}", reference.uncomputed);
-        assert_eq!(reference.uncomputed[1], (2..3, cannot_return.to_string()));
+        // The query cannot return the last row either, but does not fail on it:
+        // its output columns are computed, to describe differences.
+        let [(rows, reason)] = reference.uncomputed.as_slice() else {
+            panic!("{:?}", reference.uncomputed);
+        };
+        assert_eq!(*rows, 1..2);
+        assert!(reason.starts_with("the query fails on it: "), "{reason}");
         let err = same_results(x(&[10, 2]), x(&[10, 2]), &order).unwrap_err();
         assert!(
             err.contains(
-                "row 1 of DataFusion differs: it is not among the sorted rows of the \
-                 sorted reference of DataFusion that the query may return at its \
-                 position"
+                "row 1 of DataFusion is out of order: the sorted rows of the sorted \
+                 reference of DataFusion with its values may not be at its position"
             ),
             "{err}"
         );
@@ -5638,10 +5731,20 @@ mod tests {
 
     /// The order of `sql` over the table `m` of `batch`.
     async fn order_of(batch: RecordBatch, sql: &str) -> Result<ResultOrder> {
+        order_with(batch, sql, &ComparisonOptions::default()).await
+    }
+
+    /// The order of `sql` over the table `m` of `batch`, to be compared with
+    /// `options`.
+    async fn order_with(
+        batch: RecordBatch,
+        sql: &str,
+        options: &ComparisonOptions,
+    ) -> Result<ResultOrder> {
         let ctx = datafusion_context(test_session_config());
         ctx.register_batch("m", batch)?;
         let df = ctx.sql(sql).await?;
-        Ok(result_order(&ctx, df.logical_plan()).await)
+        Ok(result_order(&ctx, df.logical_plan(), options).await)
     }
 
     #[tokio::test]
@@ -5708,7 +5811,18 @@ mod tests {
                 err.starts_with("row 0 of the pipeline engine is out of order"),
                 "{sql}: {err}"
             );
+            // The reference is computed for the tolerance of the comparison.
             let coarse = ComparisonOptions::default().with_float_tolerance(1e-6);
+            let err = same_results_with(expected.clone(), actual.clone(), &order, coarse)
+                .unwrap_err();
+            assert!(
+                err.starts_with(
+                    "the sorted reference is computed for the float tolerance \
+                     0.000000001, but the results are compared within 0.000001"
+                ),
+                "{err}"
+            );
+            let order = order_with(m(), sql, &coarse).await?;
             same_results_with(expected, actual, &order, coarse).unwrap();
         }
         // The keys after a float that cannot vary are shown.
@@ -6132,9 +6246,14 @@ mod tests {
         let options = ComparisonOptions::default().with_allow_error_differences(true);
         for (datafusion, pipeline) in [(some, zero), (zero, some)] {
             let setup = per_engine_tables(int_batch(datafusion), int_batch(pipeline));
-            let outcomes = run_both_engines(sql, test_session_config(), &setup)
-                .await
-                .unwrap();
+            let outcomes = run_both_engines(
+                sql,
+                test_session_config(),
+                &setup,
+                &ComparisonOptions::default(),
+            )
+            .await
+            .unwrap();
             assert_ne!(outcomes.datafusion.is_ok(), outcomes.pipeline.is_ok());
             assert_same_results_as_datafusion_with_options(
                 sql,
