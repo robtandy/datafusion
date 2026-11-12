@@ -128,8 +128,9 @@ use parking_lot::Mutex;
 
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, comparable_type, evaluate_keys,
-    filter_mask, is_smaller, key_memory, matchable_rows, probe_role, without_reordering,
+    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, compact_to_keep, comparable_type,
+    evaluate_keys, filter_mask, is_smaller, key_memory, matchable_rows, probe_role,
+    without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -1257,6 +1258,8 @@ impl PhysicalSymmetricHashJoin {
         side: usize,
         batch: RecordBatch,
     ) -> Result<ChunkJoin> {
+        // The table of the side keeps the rows of the chunk.
+        let batch = compact_to_keep(batch)?;
         // The computed keys, and their encoding, are reserved before they are
         // encoded (see `key_memory`), and the encoded keys while the chunk is
         // joined.
@@ -1896,10 +1899,11 @@ pub(crate) mod tests {
     use crate::join::PhysicalHashJoin;
     use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
-        ALL_JOIN_TYPES, BuiltPartition, PeakPool, data_batch, data_schema,
-        dictionary_probe_rows, dictionary_schema, dictionary_view_rows,
-        empty_dictionary_cases, fanout_rows, fanout_schema, gather_cases, join_filter,
-        keyed_rows, limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
+        ALL_JOIN_TYPES, BuiltPartition, PeakPool, SlicedRows, count_native_rows,
+        data_batch, data_schema, dictionary_probe_rows, dictionary_schema,
+        dictionary_view_rows, empty_dictionary_cases, fanout_rows, fanout_schema,
+        gather_cases, join_filter, keyed_rows, limited_single_thread_ctx,
+        limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
         reference_join_of_rows, rejecting_filter, run_native, time_beside,
         union_key_layouts, union_key_matches, with_timeout,
     };
@@ -4961,6 +4965,61 @@ pub(crate) mod tests {
             "{err}"
         );
         assert!(allocated < 1 << 20, "the query allocated {allocated} bytes");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sliced_rows_are_kept_in_copies_of_their_rows() -> Result<()> {
+        // A symmetric join of streams that never end of 32 rows, every row a
+        // zero-copy slice of a row of an array of 1 MiB of its own (see
+        // `SlicedRows`): the tables keep copies of the rows only, not the
+        // arrays that they are slices of (which the bytes of the rows, which
+        // they reserve, do not count). In a pool of 4 MiB, the join joins all
+        // rows, allocating less than 16 MiB (on the thread of the test, as a
+        // runtime of the current thread runs all tasks of the query there),
+        // while the arrays of all rows take 64 MiB. (On a thread, the nested
+        // executions of the inputs queue at most two rows for the join; the
+        // rows of the output are dropped as they are read.)
+        let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+            let partition = SlicedRows::new(side, 32);
+            let schema = Arc::clone(&partition.schema);
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    vec![],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let (left, right) = (stream("l"), stream("r"));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let join: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            None,
+            None,
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&join)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        allocations::reset_peak();
+        let before = allocations::held();
+        let rows =
+            count_native_rows(&root, join, limited_single_thread_ctx(4 << 20)?).await?;
+        let allocated = allocations::peak() - before;
+        assert_eq!(rows, 32);
+        assert!(
+            allocated < 16 << 20,
+            "the query allocated {allocated} bytes"
+        );
         Ok(())
     }
 }

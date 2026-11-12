@@ -1842,6 +1842,59 @@ pub(crate) fn key_memory(keys: &[ArrayRef], batch: &RecordBatch) -> usize {
         + size_of::<Rows>()
 }
 
+/// The bytes that a column of a batch that a join keeps may take beyond twice
+/// those of its rows before the join copies it (see [`compact_to_keep`]): of
+/// the structures of its arrays.
+const KEPT_EXCESS_BYTES: usize = 1024;
+
+/// `batch`, to keep (the joins keep the batches of their rows, reserving the
+/// bytes of their rows, see [`memory_size`]): with the columns that take more
+/// than twice the memory of their rows (and [`KEPT_EXCESS_BYTES`]) copied to
+/// arrays of their rows only, so that a kept batch takes at most about twice
+/// the memory that is reserved for it (as the arrays that builders make, whose
+/// buffers may have twice the capacity that they use, which are not copied).
+/// A zero-copy slice of an array keeps all of its buffers (e.g. a row of an
+/// array of 1 MiB), whose bytes beyond those of its rows `memory_size` does
+/// not count. (It counts whole the values that views, dictionaries and lists
+/// refer to, which the copies share.)
+pub(crate) fn compact_to_keep(batch: RecordBatch) -> Result<RecordBatch> {
+    let Ok(rows) = u32::try_from(batch.num_rows()) else {
+        return Ok(batch);
+    };
+    let mut indices = None;
+    let mut columns = None;
+    for (index, column) in batch.columns().iter().enumerate() {
+        let bytes = column_memory_size(column);
+        if column.get_array_memory_size() <= 2 * bytes + KEPT_EXCESS_BYTES {
+            continue;
+        }
+        let indices =
+            indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
+        // A column that `take` does not copy is kept as it is.
+        let Ok(copy) = take(column.as_ref(), indices, None) else {
+            continue;
+        };
+        columns.get_or_insert_with(|| batch.columns().to_vec())[index] = copy;
+    }
+    let Some(columns) = columns else {
+        return Ok(batch);
+    };
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
+}
+
+/// The bytes of the rows of `column`, as [`memory_size`] counts them.
+fn column_memory_size(column: &ArrayRef) -> usize {
+    column
+        .to_data()
+        .get_slice_memory_size()
+        .unwrap_or_else(|_| column.get_array_memory_size())
+}
+
 /// About (an upper bound of) the bytes that the row format takes to encode
 /// the values of `array`: those of the values of every row (see
 /// [`encoded_row_bytes`]), and those of the values nested in it, which it
@@ -3050,7 +3103,7 @@ impl PhysicalOperator for MergeJoinSort {
     ) -> Result<SinkResult> {
         let state = downcast_state::<MergeJoinSortState>(gstate.as_any(), self.name())?;
         let local = downcast_state_mut::<SortBuffer>(lstate.as_any_mut(), self.name())?;
-        let batch = input.compact()?;
+        let batch = compact_to_keep(input.compact()?)?;
         let bytes = memory_size(&batch);
         state.reservation.try_grow(bytes)?;
         local.rows += batch.num_rows();
@@ -4440,6 +4493,8 @@ impl BufferedWindow {
         if batch.num_rows() == 0 {
             return Ok(Poll::Ready(()));
         }
+        // The window keeps the rows of the batch (some for long, and in parts).
+        let batch = compact_to_keep(batch)?;
         let (keys, evaluated) = self.keys_of(spec, &batch)?;
         // A NULL key proves a null-aware join empty: the join learns of it now,
         // also if the row is held in a run.
@@ -5654,7 +5709,7 @@ impl PhysicalOperator for PhysicalMergeJoin {
         _lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         let state = downcast_state::<MergeJoinState>(gstate.as_any(), self.name())?;
-        let batch = input.compact()?;
+        let batch = compact_to_keep(input.compact()?)?;
         if batch.num_rows() == 0 {
             return Ok(SinkResult::NeedMoreInput);
         }
@@ -6217,6 +6272,24 @@ pub(crate) mod tests {
         })
     }
 
+    /// The number of rows of the output of the native plan `root` of `plan`,
+    /// whose batches are dropped as they are read (so that the memory of a
+    /// query is that of its operators, not of its output).
+    pub(crate) async fn count_native_rows(
+        root: &Arc<dyn PhysicalOperator>,
+        plan: Arc<dyn ExecutionPlan>,
+        task_ctx: Arc<TaskContext>,
+    ) -> Result<usize> {
+        use futures::TryStreamExt;
+        let exec: Arc<dyn ExecutionPlan> =
+            Arc::new(PipelineRootExec::try_new(Arc::clone(root), plan)?);
+        let stream = datafusion_physical_plan::execute_stream(exec, task_ctx)?;
+        with_timeout(
+            stream.try_fold(0, |rows, batch| async move { Ok(rows + batch.num_rows()) }),
+        )
+        .await
+    }
+
     /// Assert that the rows of `batches` are sorted by `ordering` (with
     /// `-0.0` and `+0.0` as one value, as the merge join sorts them).
     fn assert_sorted(batches: &[RecordBatch], ordering: &LexOrdering, context: &str) {
@@ -6717,6 +6790,19 @@ pub(crate) mod tests {
             .with_memory_limit(limit, 1.0)
             .build_arc()?;
         Ok(Arc::new(TaskContext::default().with_runtime(runtime)))
+    }
+
+    /// [`limited_task_ctx`] of executions on a thread, whose nested
+    /// executions (see `NestedInput`) queue at most two chunks of their
+    /// output (which keep the memory of their arrays) for the join.
+    pub(crate) fn limited_single_thread_ctx(limit: usize) -> Result<Arc<TaskContext>> {
+        let ctx = limited_task_ctx(limit)?;
+        let config = ctx.session_config().clone().with_target_partitions(1);
+        Ok(Arc::new(
+            TaskContext::default()
+                .with_session_config(config)
+                .with_runtime(ctx.runtime_env()),
+        ))
     }
 
     /// A merge join of `left` and `right` on `k` like [`merge_join_of`], of
@@ -9148,6 +9234,120 @@ pub(crate) mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// A stream of `rows` batches of a row each, whose `{side}k` is the index
+    /// of the batch: every batch a zero-copy slice of a row of an array of 1
+    /// MiB of its own, made as the stream is read (which keeps none of them).
+    #[derive(Debug)]
+    pub(crate) struct SlicedRows {
+        pub(crate) schema: SchemaRef,
+        pub(crate) rows: usize,
+    }
+
+    impl SlicedRows {
+        pub(crate) fn new(side: &str, rows: usize) -> Self {
+            let field = Field::new(format!("{side}k"), DataType::Int64, false);
+            Self {
+                schema: Arc::new(Schema::new(vec![field])),
+                rows,
+            }
+        }
+    }
+
+    impl PartitionStream for SlicedRows {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let schema = Arc::clone(&self.schema);
+            let batches = (0..self.rows as i64).map(move |row| {
+                let array =
+                    Int64Array::from_iter_values(std::iter::repeat_n(row, 1 << 17));
+                let row: ArrayRef = Arc::new(array.slice(0, 1));
+                Ok(RecordBatch::try_new(Arc::clone(&schema), vec![row])?)
+            });
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::iter(batches),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn sliced_rows_are_kept_in_copies_of_their_rows() -> Result<()> {
+        // A sort-merge join of streams of 32 rows sorted by `k`, every row a
+        // zero-copy slice of a row of an array of 1 MiB of its own (see
+        // `SlicedRows`): the joins keep copies of the rows only, not the
+        // arrays that they are slices of (which the bytes of the rows, which
+        // they reserve, do not count). In a pool of 4 MiB, the merge join of
+        // streams that end (whose `MergeJoinSort`s keep the rows of both
+        // inputs until they sort them), and the streaming merge join of
+        // streams that never end (which keeps the buffered rows), join all
+        // rows, allocating less than 16 MiB (on the thread of the test, as a
+        // runtime of the current thread runs all tasks of the query there),
+        // while the arrays of all rows take 64 MiB. (On a thread, the nested
+        // executions of the inputs queue at most two rows for the join; the
+        // rows of the output, which may be slices of the streamed rows, are
+        // dropped as they are read.)
+        let join_of = |infinite: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+                let partition = SlicedRows::new(side, 32);
+                let schema = Arc::clone(&partition.schema);
+                let order = LexOrdering::new([PhysicalSortExpr::new(
+                    col(&format!("{side}k"), &schema).unwrap(),
+                    SortOptions::default(),
+                )])
+                .unwrap();
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        schema,
+                        vec![Arc::new(partition)],
+                        None,
+                        [order],
+                        infinite,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let (left, right) = (stream("l"), stream("r"));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Inner,
+                vec![SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+            )?))
+        };
+        for (name, infinite) in [
+            ("streams that end", false),
+            ("streams that never end", true),
+        ] {
+            let plan = join_of(infinite)?;
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            let tree = format_operator_tree(&root);
+            match infinite {
+                true => assert_streaming_merge_join(&root, name),
+                false => assert_eq!(count::<MergeJoinSort>(&root), 2, "{name}\n{tree}"),
+            }
+            allocations::reset_peak();
+            let before = allocations::held();
+            let rows =
+                count_native_rows(&root, plan, limited_single_thread_ctx(4 << 20)?)
+                    .await?;
+            let allocated = allocations::peak() - before;
+            assert_eq!(rows, 32, "{name}");
+            assert!(
+                allocated < 16 << 20,
+                "{name}: the query allocated {allocated} bytes\n{tree}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
