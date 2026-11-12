@@ -33,11 +33,11 @@
 //!   because the join has a single partition with an order, which the nodes
 //!   above it (a limit, or the result) may rely on, like the null-aware
 //!   `NOT IN` join (see [`promises_order`]);
-//! * a join whose inputs never end (unbounded inputs) is a
+//! * an unordered join of inputs that never end (unbounded inputs) is a
 //!   [`PhysicalHashJoin`] that builds on its bounded input, or a
 //!   [`PhysicalSymmetricHashJoin`] if both are unbounded (see
-//!   [`super::symmetric_hash_join`]), unless its order is required: the
-//!   native joins read all of an input before they emit rows in its order.
+//!   [`super::symmetric_hash_join`]); an ordered one is a merge join that
+//!   reads them in their own order, see below.
 //!
 //! A join that the hash join does not implement (e.g. of keys or columns
 //! that its hash table cannot store) is a merge join too.
@@ -49,22 +49,24 @@
 //! sorted rows of its streamed input against it in its streaming pipeline:
 //!
 //! ```text
-//! MetaPipeline 0 (sink: ...) children: [1, 2]
-//!   Pipeline 0: PhysicalSort -> PhysicalMergeJoin -> ... depends on meta pipelines [1, 2]
+//! MetaPipeline 0 (sink: ...) children: [1, 3]
+//!   Pipeline 0: MergeJoinSort -> PhysicalMergeJoin -> ... depends on meta pipelines [1, 3]
 //!   Pipeline 4: PhysicalMergeJoin -> ... depends on pipelines [0]          (Full joins)
-//! MetaPipeline 1 (sink: PhysicalMergeJoin) children: [3]
-//!   Pipeline 1: PhysicalSort -> PhysicalMergeJoin depends on meta pipelines [3]
-//! MetaPipeline 2 (sink: PhysicalSort)
-//!   Pipeline 2: streamed input -> PhysicalSort
-//! MetaPipeline 3 (sink: PhysicalSort)
-//!   Pipeline 3: buffered input -> PhysicalSort
+//! MetaPipeline 1 (sink: PhysicalMergeJoin) children: [2]
+//!   Pipeline 1: MergeJoinSort -> PhysicalMergeJoin depends on meta pipelines [2]
+//! MetaPipeline 2 (sink: MergeJoinSort)
+//!   Pipeline 2: buffered input -> MergeJoinSort
+//! MetaPipeline 3 (sink: MergeJoinSort)
+//!   Pipeline 3: streamed input -> MergeJoinSort
 //! ```
 //!
-//! * Both inputs are sorted by parallel [`PhysicalSort`]s, which replace the
+//! * Both inputs are sorted by parallel [`MergeJoinSort`]s, which replace the
 //!   sorts and the repartitionings below the `SortMergeJoinExec`: by the
 //!   order of the input of the `SortMergeJoinExec` (its sort, or the order of
 //!   a sorted input), which the join keeps. Floating point keys are sorted
-//!   with `-0.0` and `+0.0` as one value, as the join compares them.
+//!   with `-0.0` and `+0.0` as one value, as the join compares them. The sorts
+//!   reserve the memory of the rows they keep in the memory pool of the
+//!   session.
 //! * **Sink** (the buffered input): a single thread collects the sorted rows
 //!   of the buffered input, and their keys encoded in the Arrow row format
 //!   (in the order of the join keys), in which comparing two keys is a
@@ -83,6 +85,18 @@
 //! * **Source** (`Full` joins only): once the streamed input ends, the threads
 //!   of a last pipeline emit the buffered rows that found no match.
 //!
+//! An input that never ends is not sorted (it is sorted already: DataFusion
+//! cannot sort it either), but read in its own order (merged by a
+//! `SortPreservingMergeExec` if it has several sorted partitions). Such a
+//! streamed input runs in the pipeline of the join; such a buffered input is
+//! read as a stream (`NestedInput`, an execution of its own) as the
+//! streamed rows need its rows: before it joins a streamed row, the join reads
+//! the buffered rows until one has a later key (or the input ends), waiting
+//! for them (`Blocked`) if the input has none yet, and it drops the buffered
+//! rows that no later streamed row matches (but for a `Full` join, which emits
+//! the buffered rows without a match once the streamed input ends). So the
+//! join emits its rows, in order, as its inputs produce them.
+//!
 //! Join keys are equal with DataFusion's join key equality: `-0.0 = +0.0`,
 //! NaNs with the same bits are equal, and NULLs are equal only with
 //! [`NullEquality::NullEqualsNull`]. The null-aware `LeftAnti` join (`NOT
@@ -91,16 +105,19 @@
 //!
 //! The module also holds the parts that the merge join shares with the
 //! [`PhysicalSymmetricHashJoin`]: the output of a join (`JoinOutput`), the
-//! rows that it gathers (`JoinRows`, `StoredRows`) and the evaluation of its
-//! residual filter (`filter_mask`).
+//! rows that it gathers (`JoinRows`, `StoredRows`), the evaluation of its
+//! residual filter (`filter_mask`) and the inputs that it reads as streams
+//! (`NestedInput`).
 //!
 //! [`PhysicalSymmetricHashJoin`]: super::symmetric_hash_join::PhysicalSymmetricHashJoin
 
+use std::collections::VecDeque;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
@@ -137,25 +154,46 @@ use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
     ReplaceChildrenOptions,
 };
+use futures::StreamExt;
 use parking_lot::Mutex;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
+use crate::executor::{Executor, PipelineStream};
 use crate::join::PhysicalHashJoin;
 use crate::join::symmetric_hash_join;
 use crate::operator::{
-    ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
-    LocalSinkState, LocalSourceState, OperatorResult, OperatorState, PhysicalOperator,
-    SinkFinalize, SinkResult, SourceResult, downcast_state, downcast_state_mut,
+    EmptyState, ExecutionContext, GlobalOperatorState, GlobalSinkState,
+    GlobalSourceState, LocalSinkState, LocalSourceState, OperatorResult, OperatorState,
+    PhysicalOperator, SinkFinalize, SinkResult, SourceResult, TaskInterrupt,
+    downcast_state, downcast_state_mut,
 };
 use crate::operators::caching::CachingOperator;
 use crate::operators::filter::PhysicalFilter;
 use crate::operators::projection::PhysicalProjection;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
-use crate::sort::{PhysicalSort, SortKeys, memory_size};
+use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
+use crate::sort::{RunKeys, RunMerger, SortKeys, SortedRun, memory_size};
 
 // ---------------------------------------------------------------------------
 // Lowering
 // ---------------------------------------------------------------------------
+
+/// How a join reads one of its inputs, which decides how the input is
+/// lowered (see `Lowering::lower_in` of the planner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputRole {
+    /// The join reads all rows of the input before it emits any, in a
+    /// pipeline that runs until the input ends: the build side of a hash
+    /// join, the inputs that a merge join sorts.
+    Collected,
+    /// The input runs in the pipeline of the join, which may stop before the
+    /// input ends when the pipeline does: the probe side of a hash join.
+    Pipelined,
+    /// The join reads the rows of the input as they come (an input that never
+    /// ends): no operator of the input may hold its rows back (e.g. the cache
+    /// of a filter, until it is full), as the input may never produce more.
+    Streamed,
+}
 
 /// Lower a DataFusion `SortMergeJoinExec` natively, see the [module
 /// documentation](self): to a [`PhysicalMergeJoin`] if `ordered` (a node above
@@ -165,24 +203,21 @@ use crate::sort::{PhysicalSort, SortKeys, memory_size};
 /// [`PhysicalSymmetricHashJoin`](super::symmetric_hash_join::PhysicalSymmetricHashJoin))
 /// otherwise.
 ///
-/// `lower_input` lowers an input of the join; its second argument tells
-/// whether the input runs in the pipeline of the join (the probe side of a
-/// hash join, the inputs of a symmetric hash join), which stops when the join
-/// stops, or in a pipeline that reads all of its input (the build side of a
-/// hash join, the sorted inputs of a merge join).
+/// `lower_input` lowers an input of the join, which the join reads as its
+/// [`InputRole`] says.
 ///
 /// Returns `Ok(None)` for any other node, and for the joins that no native
 /// join executes: joins whose keys have different types on the two sides,
 /// whose keys or columns the native joins cannot store or sort (e.g. keys of
-/// unions), and joins of inputs that never end whose order is required (or
-/// that are null-aware), which the native joins would wait for forever.
+/// unions), and null-aware joins of two inputs that never end, which neither
+/// of them can be collected for first.
 pub fn try_lower<F>(
     plan: &Arc<dyn ExecutionPlan>,
     ordered: bool,
     mut lower_input: F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
-    F: FnMut(&Arc<dyn ExecutionPlan>, bool) -> Result<Arc<dyn PhysicalOperator>>,
+    F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
     let Some(join) = plan.downcast_ref::<SortMergeJoinExec>() else {
         return Ok(None);
@@ -190,10 +225,6 @@ where
     let unbounded =
         [join.left(), join.right()].map(|input| input.boundedness().is_unbounded());
     if ordered || promises_order(plan) {
-        // The merge join reads all of both inputs before it emits a row.
-        if unbounded.contains(&true) {
-            return Ok(None);
-        }
         let Some(spec) = MergeJoinSpec::of(join)? else {
             return Ok(None);
         };
@@ -227,25 +258,35 @@ where
         true => (&right, &left),
         false => (&left, &right),
     };
-    let build = lower_input(build, false)?;
-    let probe = lower_input(probe, true)?;
+    let build = lower_input(build, InputRole::Collected)?;
+    let probe = lower_input(probe, probe_role(probe))?;
     if let Some(hash_join) = equi_join.hash_join(build_right, &build, &probe)? {
         return Ok(Some(Arc::new(hash_join)));
     }
     // A join that the hash join does not implement: a merge join, of the same
-    // inputs, unless an input never ends.
-    if unbounded.contains(&true) {
-        return Ok(None);
-    }
+    // inputs if they end.
     let Some(spec) = MergeJoinSpec::of(join)? else {
         return Ok(None);
     };
+    if unbounded.contains(&true) {
+        let join = lower_merge_join(join, spec, &mut lower_input)?;
+        return Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>));
+    }
     let (left, right) = match build_right {
         true => (probe, build),
         false => (build, probe),
     };
     let join = merge_join_of_inputs(join, spec, left, right)?;
     Ok(join.map(|join| Arc::new(join) as Arc<dyn PhysicalOperator>))
+}
+
+/// How a hash join reads its probe side `probe`: in its pipeline, as a stream
+/// if it never ends.
+pub(crate) fn probe_role(probe: &Arc<dyn ExecutionPlan>) -> InputRole {
+    match probe.boundedness().is_unbounded() {
+        true => InputRole::Streamed,
+        false => InputRole::Pipelined,
+    }
 }
 
 /// Whether `plan` promises the order of its output to the nodes above it: it
@@ -544,67 +585,144 @@ fn emits_both_inputs(join_type: JoinType) -> bool {
     )
 }
 
-/// Lower `join` to a [`PhysicalMergeJoin`] with the specification `spec`,
-/// sorting both of its inputs (lowered with `lower_input`, without the sorts
-/// and repartitionings below the join) with [`PhysicalSort`]s.
+/// Lower `join` to a [`PhysicalMergeJoin`] with the specification `spec`, of
+/// its inputs lowered with `lower_input` (without the sorts and
+/// repartitionings below the join): sorted by [`MergeJoinSort`]s if they end,
+/// and read in their own order if they never end (see [`ordered_input`]),
+/// the buffered input then as a stream.
 fn lower_merge_join<F>(
     join: &SortMergeJoinExec,
     spec: MergeJoinSpec,
     lower_input: &mut F,
 ) -> Result<Option<PhysicalMergeJoin>>
 where
-    F: FnMut(&Arc<dyn ExecutionPlan>, bool) -> Result<Arc<dyn PhysicalOperator>>,
+    F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
-    // The sorts read all of their input.
-    let left = lower_input(&without_reordering(join.left())?, false)?;
-    let right = lower_input(&without_reordering(join.right())?, false)?;
-    merge_join_of_inputs(join, spec, left, right)
+    let mut children = Vec::with_capacity(2);
+    for (side, input) in [
+        (JoinSide::Left, join.left()),
+        (JoinSide::Right, join.right()),
+    ] {
+        let child = match input.boundedness().is_unbounded() {
+            false => {
+                // The sorts read all of their input.
+                let lowered =
+                    lower_input(&without_reordering(input)?, InputRole::Collected)?;
+                sorted_input(join, side, input, lowered)?
+            }
+            true => ordered_input(input, lower_input)?,
+        };
+        let Some(child) = child else {
+            return Ok(None);
+        };
+        children.push(child);
+    }
+    let buffered = match spec.streamed {
+        JoinSide::Left => join.right(),
+        _ => join.left(),
+    };
+    let streams_buffered = buffered.boundedness().is_unbounded();
+    let (Some(right), Some(left)) = (children.pop(), children.pop()) else {
+        return internal_err!("A merge join without inputs");
+    };
+    Ok(Some(PhysicalMergeJoin {
+        children: vec![left, right],
+        spec,
+        streams_buffered,
+    }))
 }
 
 /// The [`PhysicalMergeJoin`] of `join` with the specification `spec`, over
 /// its lowered inputs `left` and `right` (without the sorts and
-/// repartitionings below the join), which it sorts with [`PhysicalSort`]s by
-/// the order of the inputs of the `SortMergeJoinExec` (see [`sort_order`]).
-/// `Ok(None)` if they cannot be sorted natively.
+/// repartitionings below the join), inputs that end, which it sorts (see
+/// [`sorted_input`]). `Ok(None)` if they cannot be sorted natively.
 fn merge_join_of_inputs(
     join: &SortMergeJoinExec,
     spec: MergeJoinSpec,
     left: Arc<dyn PhysicalOperator>,
     right: Arc<dyn PhysicalOperator>,
 ) -> Result<Option<PhysicalMergeJoin>> {
-    let mut children = Vec::with_capacity(2);
-    for (input, lowered) in [(join.left(), left), (join.right(), right)] {
-        if lowered.schema() != input.schema() {
-            return internal_err!(
-                "The lowered input {} of a SortMergeJoinExec has schema {:?}, expected {:?}",
-                lowered.name(),
-                lowered.schema(),
-                input.schema()
-            );
-        }
-        let keys = join
-            .on()
-            .iter()
-            .map(|(left, right)| match children.is_empty() {
-                true => left,
-                false => right,
-            });
-        let Some(ordering) = sort_order(input, keys, join.sort_options())? else {
-            return Ok(None);
-        };
-        let sort: Arc<dyn PhysicalOperator> =
-            Arc::new(PhysicalSort::try_new(lowered, ordering, None)?);
-        children.push(sort);
-    }
-    let right = children.pop();
-    let left = children.pop();
+    let left = sorted_input(join, JoinSide::Left, join.left(), left)?;
+    let right = sorted_input(join, JoinSide::Right, join.right(), right)?;
     let (Some(left), Some(right)) = (left, right) else {
-        return internal_err!("A merge join without inputs");
+        return Ok(None);
     };
     Ok(Some(PhysicalMergeJoin {
         children: vec![left, right],
         spec,
+        streams_buffered: false,
     }))
+}
+
+/// `lowered`, the lowered input `input` (on the side `side`) of `join`, an
+/// input that ends, sorted by a [`MergeJoinSort`] by the order of `input` (see
+/// [`sort_order`]). `Ok(None)` if it cannot be sorted natively.
+fn sorted_input(
+    join: &SortMergeJoinExec,
+    side: JoinSide,
+    input: &Arc<dyn ExecutionPlan>,
+    lowered: Arc<dyn PhysicalOperator>,
+) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+    check_lowered_input(input, &lowered)?;
+    let keys = join.on().iter().map(|(left, right)| match side {
+        JoinSide::Left => left,
+        _ => right,
+    });
+    let Some(ordering) = sort_order(input, keys, join.sort_options())? else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(MergeJoinSort::try_new(lowered, ordering)?)))
+}
+
+/// `input`, an input of a sort-merge join that never ends, lowered with
+/// `lower_input` to the rows of `input` in its order, on a single thread: a
+/// stream that never ends is sorted already (DataFusion cannot sort it, nor
+/// can the merge join). The nodes that only sort or distribute its rows are
+/// removed (see [`without_reordering`]); if they merged several sorted
+/// partitions, the input is merged by a `SortPreservingMergeExec` (in order)
+/// instead. `Ok(None)` if `input` has no order, or its partitions are not
+/// sorted by it.
+fn ordered_input<F>(
+    input: &Arc<dyn ExecutionPlan>,
+    lower_input: &mut F,
+) -> Result<Option<Arc<dyn PhysicalOperator>>>
+where
+    F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
+{
+    let Some(ordering) = input.output_ordering().cloned() else {
+        return Ok(None);
+    };
+    let stripped = without_reordering(input)?;
+    if !stripped
+        .equivalence_properties()
+        .ordering_satisfy(ordering.clone())?
+    {
+        return Ok(None);
+    }
+    let ordered: Arc<dyn ExecutionPlan> =
+        match stripped.output_partitioning().partition_count() > 1 {
+            true => Arc::new(SortPreservingMergeExec::new(ordering, stripped)),
+            false => stripped,
+        };
+    let lowered = lower_input(&ordered, InputRole::Streamed)?;
+    check_lowered_input(input, &lowered)?;
+    Ok(Some(lowered))
+}
+
+/// Check that `lowered` has the schema of `input`, which it was lowered from.
+fn check_lowered_input(
+    input: &Arc<dyn ExecutionPlan>,
+    lowered: &Arc<dyn PhysicalOperator>,
+) -> Result<()> {
+    if lowered.schema() != input.schema() {
+        return internal_err!(
+            "The lowered input {} of a join has schema {:?}, expected {:?}",
+            lowered.name(),
+            lowered.schema(),
+            input.schema()
+        );
+    }
+    Ok(())
 }
 
 /// The order in which a [`PhysicalMergeJoin`] sorts `input`, an input of a
@@ -885,6 +1003,21 @@ impl StoredRows {
         self.batches.push(batch);
     }
 
+    /// The position of the first row of every batch.
+    fn batch_starts(&self) -> &[usize] {
+        &self.starts
+    }
+
+    /// The rows without the first `batches` batches, at positions decreased
+    /// by the rows of these batches.
+    fn without_first_batches(&self, batches: usize) -> Self {
+        let mut rows = Self::new(Arc::clone(&self.schema));
+        for batch in self.batches.iter().skip(batches) {
+            rows.push(batch.clone());
+        }
+        rows
+    }
+
     /// The batch and the row in it of every position of `positions` (the
     /// next batch after the last one for `None`, the batch of NULLs of
     /// [`Self::gather`]).
@@ -1090,6 +1223,336 @@ impl PhysicalExpr for NormalizedFloats {
 }
 
 // ---------------------------------------------------------------------------
+// The inputs of joins that are read as streams, shared with the symmetric
+// hash join
+// ---------------------------------------------------------------------------
+
+/// An input of a join that the join reads as a stream: its operator tree is
+/// executed by an [`Executor`] of its own (on the threads of the session, with
+/// the memory pool of the session), and the join reads its rows as they come,
+/// in their order.
+///
+/// The joins read so the inputs that never end whose rows they need at the
+/// same time as the rows of another input: the pipelines of an execution read
+/// the output of a pipeline breaker only once it is complete, and the
+/// executor runs the pipelines that share an operator that is not parallel
+/// (e.g. a limit that keeps the order of its input) one after the other, so
+/// that two pipelines of inputs that never end would wait for each other
+/// forever. The operators of the input are still part of the operator tree
+/// (they are the children of the join), but not of the pipelines of the
+/// join, nor of its metrics.
+pub(crate) struct NestedInput {
+    /// The output of the execution of the input, until it ended.
+    stream: Option<PipelineStream>,
+}
+
+impl NestedInput {
+    /// Execute `input`, in the execution of `ctx`: the execution starts when
+    /// the input is first polled, and is cancelled when it is dropped.
+    pub(crate) fn start(
+        input: &Arc<dyn PhysicalOperator>,
+        ctx: &ExecutionContext,
+    ) -> Result<Self> {
+        let stream = Executor::execute_stream(
+            Arc::clone(input),
+            Arc::clone(&ctx.task_ctx),
+            ctx.num_threads.max(1),
+        )?;
+        Ok(Self {
+            stream: Some(stream),
+        })
+    }
+
+    /// The next batch of the input: `Ready(Ok(Some(batch)))`, `Ready(Ok(None))`
+    /// once the input ended, or `Pending`, with the waker of the task of `ctx`
+    /// registered with the input.
+    pub(crate) fn poll_next(
+        &mut self,
+        ctx: &ExecutionContext,
+    ) -> Poll<Result<Option<RecordBatch>>> {
+        let Some(stream) = &mut self.stream else {
+            return Poll::Ready(Ok(None));
+        };
+        let mut cx = Context::from_waker(ctx.waker());
+        match stream.poll_next_unpin(&mut cx) {
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Ok(Some(batch))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
+            Poll::Ready(None) => {
+                self.stream = None;
+                Poll::Ready(Ok(None))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Whether the input ended.
+    pub(crate) fn is_done(&self) -> bool {
+        self.stream.is_none()
+    }
+}
+
+impl fmt::Debug for NestedInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NestedInput")
+            .field("done", &self.is_done())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MergeJoinSort
+// ---------------------------------------------------------------------------
+
+/// Sorts an input of a [`PhysicalMergeJoin`] that ends, like a
+/// [`PhysicalSort`](crate::sort::PhysicalSort), and reserves the memory of
+/// the rows that it keeps in the memory pool of the session.
+///
+/// * **Sink**: every thread of the pipelines of the input buffers the chunks
+///   it pushes, and sorts them into runs once it buffered
+///   [`SORT_RUN_ROWS`] rows (or about [`SORT_RUN_BYTES`] bytes), in
+///   parallel. The buffered rows and the runs are reserved in the memory
+///   pool before they are kept (the runs while the rows they copy are still
+///   buffered): the sort fails with `ResourcesExhausted` when the pool
+///   refuses them.
+/// * **Source**: a single thread merges the runs of all threads (with a
+///   [`RunMerger`]) and emits the rows in order. The memory of the runs stays
+///   reserved until the source is dropped, once its pipeline completed.
+#[derive(Debug)]
+pub struct MergeJoinSort {
+    /// The input, the only child.
+    children: Vec<Arc<dyn PhysicalOperator>>,
+    schema: SchemaRef,
+    keys: SortKeys,
+}
+
+impl MergeJoinSort {
+    /// Sort the rows of `input` by `ordering`.
+    pub fn try_new(
+        input: Arc<dyn PhysicalOperator>,
+        ordering: LexOrdering,
+    ) -> Result<Self> {
+        let schema = input.schema();
+        let keys = SortKeys::try_new(ordering, &schema)?;
+        Ok(Self {
+            children: vec![input],
+            schema,
+            keys,
+        })
+    }
+
+    /// The sort keys.
+    pub fn ordering(&self) -> &LexOrdering {
+        self.keys.ordering()
+    }
+
+    /// Sort the rows buffered in `local` into runs, reserving their memory
+    /// in `reservation` (and releasing the memory of the buffered rows).
+    fn sort_buffered_rows(
+        &self,
+        local: &mut SortBuffer,
+        reservation: &MemoryReservation,
+    ) -> Result<()> {
+        if local.batches.is_empty() {
+            return Ok(());
+        }
+        let batches = std::mem::take(&mut local.batches);
+        let runs = self.keys.sort(&self.schema, &batches, None)?;
+        reservation.try_grow(runs.iter().map(run_memory_size).sum())?;
+        drop(batches);
+        reservation.shrink(std::mem::take(&mut local.bytes));
+        local.rows = 0;
+        local.runs.extend(runs);
+        Ok(())
+    }
+}
+
+/// The bytes of a sorted run: its rows and its keys.
+fn run_memory_size(run: &SortedRun) -> usize {
+    let keys = match run.keys() {
+        RunKeys::Rows(rows) => rows.size(),
+        RunKeys::Column(column) => column.values().get_array_memory_size(),
+    };
+    memory_size(run.batch()) + keys
+}
+
+/// The global sink state of a [`MergeJoinSort`].
+struct MergeJoinSortState {
+    /// The sorted runs of the threads that completed.
+    runs: Mutex<Vec<SortedRun>>,
+    /// The merge of the runs, once the sink is finalized.
+    merger: Mutex<Option<RunMerger>>,
+    /// The memory of the buffered rows and of the runs.
+    reservation: MemoryReservation,
+}
+
+impl GlobalSinkState for MergeJoinSortState {}
+
+/// The rows of a thread of the input of a [`MergeJoinSort`].
+#[derive(Default)]
+struct SortBuffer {
+    /// Compacted chunks that are not sorted yet.
+    batches: Vec<RecordBatch>,
+    /// The number of rows of `batches`.
+    rows: usize,
+    /// The memory size of `batches`, reserved.
+    bytes: usize,
+    /// The sorted runs of the thread.
+    runs: Vec<SortedRun>,
+}
+
+impl LocalSinkState for SortBuffer {}
+
+/// The global source state of a [`MergeJoinSort`]: the merge of its runs,
+/// read by a single thread, and the reservation of their memory.
+struct MergeJoinSortSource {
+    merger: Mutex<RunMerger>,
+    _reservation: MemoryReservation,
+}
+
+impl GlobalSourceState for MergeJoinSortSource {}
+
+impl PhysicalOperator for MergeJoinSort {
+    fn name(&self) -> &str {
+        "MergeJoinSort"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &self.children
+    }
+
+    fn description(&self) -> String {
+        format!("MergeJoinSort: expr=[{}]", self.ordering())
+    }
+
+    fn is_sink(&self) -> bool {
+        true
+    }
+
+    fn parallel_sink(&self) -> bool {
+        true
+    }
+
+    fn get_global_sink_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSinkState>> {
+        let reservation =
+            MemoryConsumer::new("MergeJoinSort").register(ctx.task_ctx.memory_pool());
+        Ok(Arc::new(MergeJoinSortState {
+            runs: Mutex::new(vec![]),
+            merger: Mutex::new(None),
+            reservation,
+        }))
+    }
+
+    fn get_local_sink_state(
+        &self,
+        _ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSinkState,
+    ) -> Result<Box<dyn LocalSinkState>> {
+        Ok(Box::new(SortBuffer::default()))
+    }
+
+    fn sink(
+        &self,
+        _ctx: &ExecutionContext,
+        input: &DataChunk,
+        gstate: &dyn GlobalSinkState,
+        lstate: &mut dyn LocalSinkState,
+    ) -> Result<SinkResult> {
+        let state = downcast_state::<MergeJoinSortState>(gstate.as_any(), self.name())?;
+        let local = downcast_state_mut::<SortBuffer>(lstate.as_any_mut(), self.name())?;
+        let batch = input.compact()?;
+        let bytes = memory_size(&batch);
+        state.reservation.try_grow(bytes)?;
+        local.rows += batch.num_rows();
+        local.bytes += bytes;
+        local.batches.push(batch);
+        if local.rows >= SORT_RUN_ROWS || local.bytes >= SORT_RUN_BYTES {
+            self.sort_buffered_rows(local, &state.reservation)?;
+        }
+        Ok(SinkResult::NeedMoreInput)
+    }
+
+    fn combine(
+        &self,
+        _ctx: &ExecutionContext,
+        gstate: &dyn GlobalSinkState,
+        lstate: &mut dyn LocalSinkState,
+    ) -> Result<()> {
+        let state = downcast_state::<MergeJoinSortState>(gstate.as_any(), self.name())?;
+        let local = downcast_state_mut::<SortBuffer>(lstate.as_any_mut(), self.name())?;
+        self.sort_buffered_rows(local, &state.reservation)?;
+        state.runs.lock().append(&mut local.runs);
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &ExecutionContext,
+        gstate: &dyn GlobalSinkState,
+    ) -> Result<SinkFinalize> {
+        let state = downcast_state::<MergeJoinSortState>(gstate.as_any(), self.name())?;
+        let runs = std::mem::take(&mut *state.runs.lock());
+        let merger = RunMerger::new(Arc::clone(&self.schema), runs, None);
+        let empty = merger.remaining_rows() == 0;
+        *state.merger.lock() = Some(merger);
+        Ok(match empty {
+            true => SinkFinalize::NoOutputPossible,
+            false => SinkFinalize::Ready,
+        })
+    }
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    /// A single thread emits the rows, in order.
+    fn parallel_source(&self) -> bool {
+        false
+    }
+
+    fn get_global_source_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSourceState>> {
+        let Some(sink) = ctx.global_sink_state(self) else {
+            return internal_err!(
+                "{} is read before it collected its input",
+                self.name()
+            );
+        };
+        let state = downcast_state::<MergeJoinSortState>(sink.as_any(), self.name())?;
+        let Some(merger) = state.merger.lock().take() else {
+            return internal_err!("{} is read before its sink is finalized", self.name());
+        };
+        // The memory of the runs is held by the merger from now on.
+        let reservation = state.reservation.split(state.reservation.size());
+        Ok(Arc::new(MergeJoinSortSource {
+            merger: Mutex::new(merger),
+            _reservation: reservation,
+        }))
+    }
+
+    fn get_data(
+        &self,
+        _ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+        _lstate: &mut dyn LocalSourceState,
+    ) -> Result<SourceResult> {
+        let state = downcast_state::<MergeJoinSortSource>(gstate.as_any(), self.name())?;
+        Ok(match state.merger.lock().next_batch(DEFAULT_VECTOR_SIZE)? {
+            Some(batch) => SourceResult::Chunk(DataChunk::from_record_batch(batch)),
+            None => SourceResult::Finished,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PhysicalMergeJoin
 // ---------------------------------------------------------------------------
 
@@ -1101,9 +1564,14 @@ impl PhysicalExpr for NormalizedFloats {
 /// See the [module documentation](self) for its pipelines.
 #[derive(Debug)]
 pub struct PhysicalMergeJoin {
-    /// The left and the right input, sorted by the join keys.
+    /// The left and the right input, which emit their rows sorted by the
+    /// join keys, on a single thread.
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: MergeJoinSpec,
+    /// Whether the join reads its buffered input as a stream (an input that
+    /// never ends, see [`NestedInput`]), as the streamed rows need its rows,
+    /// rather than collecting all of its rows as a sink first.
+    streams_buffered: bool,
 }
 
 /// Everything about a merge join that does not depend on its inputs, only on
@@ -1147,14 +1615,17 @@ impl MergeJoinSpec {
                 on.len()
             );
         }
+        // The NULLs of the buffered input come first, so that a stream of it
+        // tells with its first row whether it has a NULL key.
         if null_aware
             && (join_type != JoinType::LeftAnti
                 || on.len() != 1
                 || filter.is_some()
-                || null_equality != NullEquality::NullEqualsNothing)
+                || null_equality != NullEquality::NullEqualsNothing
+                || !sort_options[0].nulls_first)
         {
             return not_impl_err!(
-                "A null-aware PhysicalMergeJoin is a LeftAnti join of a single key, without filter and with NullEqualsNothing"
+                "A null-aware PhysicalMergeJoin is a LeftAnti join of a single key sorted with NULLs first, without filter and with NullEqualsNothing"
             );
         }
         let mut key_fields = Vec::with_capacity(on.len());
@@ -1289,6 +1760,21 @@ impl MergeJoinSpec {
     fn key_converter(&self) -> Result<RowConverter> {
         Ok(RowConverter::new(self.key_fields.clone())?)
     }
+
+    /// No buffered rows yet, with the encoder of their keys.
+    fn empty_buffered_rows(
+        &self,
+        schema: SchemaRef,
+    ) -> Result<(RowConverter, BufferedRows)> {
+        let converter = self.key_converter()?;
+        let rows = BufferedRows {
+            rows: StoredRows::new(schema),
+            keys: converter.empty_rows(0, 0),
+            has_null_key: false,
+            matched: vec![],
+        };
+        Ok((converter, rows))
+    }
 }
 
 impl PhysicalMergeJoin {
@@ -1296,7 +1782,7 @@ impl PhysicalMergeJoin {
     /// key)`), with the semantics of a `SortMergeJoinExec` with the same
     /// arguments, and its output schema and order. Both inputs must emit their
     /// rows sorted by their keys, with `sort_options`, on a single thread
-    /// (e.g. [`PhysicalSort`]s): the join fails if they do not.
+    /// (e.g. [`MergeJoinSort`]s): the join fails if they do not.
     #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         left: Arc<dyn PhysicalOperator>,
@@ -1323,7 +1809,17 @@ impl PhysicalMergeJoin {
         Ok(Self {
             children: vec![left, right],
             spec,
+            streams_buffered: false,
         })
+    }
+
+    /// Read the buffered input as a stream, as the streamed rows need its
+    /// rows (e.g. an input that never ends), if `streams`: it is executed by an
+    /// executor of its own, and the join keeps only the buffered rows that
+    /// later streamed rows may still match (all of them for a `Full` join).
+    pub fn with_buffered_stream(mut self, streams: bool) -> Self {
+        self.streams_buffered = streams;
+        self
     }
 
     /// The left input.
@@ -1347,6 +1843,12 @@ impl PhysicalMergeJoin {
         self.spec.streamed
     }
 
+    /// Whether the join reads its buffered input as a stream, see
+    /// [`Self::with_buffered_stream`].
+    pub fn streams_buffered_input(&self) -> bool {
+        self.streams_buffered
+    }
+
     fn streamed_input(&self) -> &Arc<dyn PhysicalOperator> {
         match self.spec.streamed {
             JoinSide::Left => self.left(),
@@ -1362,7 +1864,7 @@ impl PhysicalMergeJoin {
     }
 
     /// The buffered rows of the execution of `ctx`, once the buffered input
-    /// is finalized.
+    /// is finalized (for a join that collects them as a sink).
     fn buffered_rows(&self, ctx: &ExecutionContext) -> Result<Arc<BufferedRows>> {
         ctx.global_sink_state(self)
             .and_then(|state| state.downcast_arc::<MergeJoinState>())
@@ -1374,16 +1876,27 @@ impl PhysicalMergeJoin {
             })
     }
 
+    /// The buffered rows of the execution of `ctx` (for a join that reads its
+    /// buffered input as a stream): its global operator state.
+    fn buffered_window(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<Mutex<BufferedWindow>>> {
+        let state = ctx.registry().get_or_create_operator_state(self, ctx)?;
+        let state = downcast_state::<StreamedBuffer>(state.as_any(), self.name())?;
+        Ok(Arc::clone(&state.window))
+    }
+
     /// Start joining the streamed rows of `input`.
     fn start_chunk(
         &self,
-        state: &StreamState,
+        progress: &MergeProgress,
         input: &DataChunk,
     ) -> Result<StreamedChunk> {
         let batch = input.compact()?;
         let keys = evaluate_keys(self.spec.streamed_keys(), &batch)?;
         let matchable = matchable_rows(&keys, self.spec.null_equality);
-        let keys = state.converter.convert_columns(&keys)?;
+        let keys = progress.converter.convert_columns(&keys)?;
         Ok(StreamedChunk {
             batch,
             keys,
@@ -1393,9 +1906,9 @@ impl PhysicalMergeJoin {
         })
     }
 
-    /// The next output of the streamed rows of the current chunk of `state`,
-    /// of at most [`DEFAULT_VECTOR_SIZE`] rows: `None` if the rows joined so
-    /// far produce no output.
+    /// The next output of the streamed rows of the current chunk of
+    /// `progress`, joined with the buffered rows `buffered`, of at most
+    /// [`DEFAULT_VECTOR_SIZE`] rows.
     ///
     /// The candidate pairs of a batch of streamed rows (with the buffered rows
     /// of their keys) are collected first, at most [`DEFAULT_VECTOR_SIZE`] of
@@ -1403,16 +1916,26 @@ impl PhysicalMergeJoin {
     /// is evaluated on all of them at once, and the rows are emitted in the
     /// order of the streamed rows. A streamed row whose candidates do not all
     /// fit is continued by the next call.
-    fn next_output(&self, state: &mut StreamState) -> Result<Option<RecordBatch>> {
+    ///
+    /// `complete(key)` tells whether `buffered` has all the buffered rows that
+    /// a streamed row with the key `key` (`None`: a key that cannot match) may
+    /// match: a buffered input that is read as a stream may not have them yet.
+    /// The batch stops before the first streamed row whose rows are not
+    /// complete, and the output says so ([`MergeOutput::needs_buffered_rows`]).
+    fn next_output(
+        &self,
+        progress: &mut MergeProgress,
+        buffered: &BufferedRows,
+        complete: &dyn Fn(Option<Row<'_>>) -> bool,
+    ) -> Result<MergeOutput> {
         let spec = &self.spec;
         let join_type = spec.join_type();
-        let StreamState {
-            buffered,
+        let MergeProgress {
             cursor,
             group,
             chunk,
             ..
-        } = state;
+        } = progress;
         let Some(chunk) = chunk.as_mut() else {
             return internal_err!("PhysicalMergeJoin has no streamed rows to join");
         };
@@ -1422,6 +1945,7 @@ impl PhysicalMergeJoin {
         // mark joins).
         let decided_by_match = !spec.emits_pairs();
 
+        let mut needs_buffered_rows = false;
         let mut pairs_streamed = Vec::new();
         let mut pairs_buffered = Vec::new();
         let mut parts = Vec::new();
@@ -1434,12 +1958,15 @@ impl PhysicalMergeJoin {
                     if row >= chunk.batch.num_rows() {
                         break;
                     }
+                    let key = chunk.is_matchable(row).then(|| chunk.keys.row(row));
+                    if !complete(key) {
+                        needs_buffered_rows = true;
+                        break;
+                    }
                     chunk.next_row += 1;
-                    let rows = match chunk.is_matchable(row) {
-                        true => {
-                            buffered.rows_of_key(cursor, group, chunk.keys.row(row))?
-                        }
-                        false => 0..0,
+                    let rows = match key {
+                        Some(key) => buffered.rows_of_key(cursor, group, key)?,
+                        None => 0..0,
                     };
                     RowProgress {
                         row,
@@ -1564,7 +2091,10 @@ impl PhysicalMergeJoin {
 
         let num_rows = out_streamed.len();
         if num_rows == 0 {
-            return Ok(None);
+            return Ok(MergeOutput {
+                batch: None,
+                needs_buffered_rows,
+            });
         }
         let streamed_rows = UInt32Array::from(out_streamed);
         let streamed = JoinRows::Batch(&chunk.batch, &streamed_rows);
@@ -1574,17 +2104,63 @@ impl PhysicalMergeJoin {
             .output
             .is_mark_join()
             .then(|| Arc::new(BooleanArray::from(marks)) as ArrayRef);
-        Ok(Some(spec.output.batch(
-            &left,
-            &right,
-            marks.as_ref(),
-            num_rows,
-        )?))
+        let batch = spec.output.batch(&left, &right, marks.as_ref(), num_rows)?;
+        Ok(MergeOutput {
+            batch: Some(batch),
+            needs_buffered_rows,
+        })
+    }
+
+    /// Join the streamed rows of the current chunk of `progress` with the
+    /// buffered rows of a buffered input that the join reads as a stream (see
+    /// [`Self::next_output`]): read the buffered rows as the streamed rows need
+    /// them, waiting for the stream (`Pending`, the waker of the task of `ctx`
+    /// is registered with it) when it has none.
+    fn next_streaming_output(
+        &self,
+        ctx: &ExecutionContext,
+        progress: &mut MergeProgress,
+        window: &Mutex<BufferedWindow>,
+    ) -> Result<Poll<Option<RecordBatch>>> {
+        let mut window = window.lock();
+        loop {
+            // The rows that no later streamed row matches are dropped.
+            if progress
+                .chunk
+                .as_ref()
+                .is_none_or(|chunk| chunk.in_progress.is_none())
+                && !self.spec.emits_unmatched_buffered_rows()
+            {
+                let dropped = window.drop_rows_before(progress.cursor)?;
+                progress.rebase(dropped);
+            }
+            let output = {
+                let window = &*window;
+                let null_aware = self.spec.null_aware;
+                self.next_output(progress, &window.rows, &|key| {
+                    window.is_complete_for(key, null_aware)
+                })?
+            };
+            if output.batch.is_some() || !output.needs_buffered_rows {
+                return Ok(Poll::Ready(output.batch));
+            }
+            if window.poll_more(ctx, &self.spec)?.is_pending() {
+                return Ok(Poll::Pending);
+            }
+        }
     }
 }
 
-/// The global state of a merge join, its global sink state: the buffered
-/// rows.
+/// The output of [`PhysicalMergeJoin::next_output`].
+struct MergeOutput {
+    batch: Option<RecordBatch>,
+    /// Whether the next streamed row needs buffered rows that a buffered
+    /// input read as a stream did not produce yet.
+    needs_buffered_rows: bool,
+}
+
+/// The global sink state of a merge join that collects its buffered rows as
+/// a sink.
 struct MergeJoinState {
     /// The buffered rows, until the buffered input is finalized.
     building: Mutex<Option<BufferedBuild>>,
@@ -1599,12 +2175,10 @@ impl GlobalSinkState for MergeJoinState {}
 /// The buffered rows, as the buffered input produces them.
 struct BufferedBuild {
     converter: RowConverter,
-    rows: StoredRows,
-    keys: Rows,
-    has_null_key: bool,
+    rows: BufferedRows,
 }
 
-/// The sorted buffered rows of a merge join.
+/// The buffered rows of a merge join, in the order of their keys.
 struct BufferedRows {
     rows: StoredRows,
     /// The keys of the rows, in the row format, in their order.
@@ -1617,6 +2191,40 @@ struct BufferedRows {
 }
 
 impl BufferedRows {
+    /// Append the buffered rows of `batch` (whose keys are `keys`, encoded by
+    /// `converter`), which must not come before the rows so far. Returns the
+    /// bytes of the rows and of their keys.
+    fn append(
+        &mut self,
+        converter: &RowConverter,
+        batch: RecordBatch,
+        keys: &[ArrayRef],
+        spec: &MergeJoinSpec,
+    ) -> Result<usize> {
+        let key_bytes = self.keys.size();
+        let first = self.keys.num_rows();
+        converter.append(&mut self.keys, keys)?;
+        // The rows must arrive sorted by their keys.
+        if (first.max(1)..self.keys.num_rows())
+            .any(|row| self.keys.row(row) < self.keys.row(row - 1))
+        {
+            return internal_err!(
+                "The buffered input of PhysicalMergeJoin is not sorted by the join keys"
+            );
+        }
+        if spec.null_aware {
+            self.has_null_key |= keys.iter().any(|key| key.logical_null_count() > 0);
+        }
+        let mut bytes = memory_size(&batch) + self.keys.size().saturating_sub(key_bytes);
+        self.rows.push(batch);
+        if spec.emits_unmatched_buffered_rows() {
+            let words = self.rows.len().div_ceil(64);
+            bytes += words.saturating_sub(self.matched.len()) * size_of::<AtomicU64>();
+            self.matched.resize_with(words, || AtomicU64::new(0));
+        }
+        Ok(bytes)
+    }
+
     /// The positions of the buffered rows whose key is `key`, a key not below
     /// the keys before it. `cursor` is the first row whose key is not below
     /// these keys, and `group` the rows of the last key (both are updated).
@@ -1698,15 +2306,139 @@ fn partition_point_from(
     high
 }
 
+/// The global operator state of a merge join that reads its buffered input
+/// as a stream: the buffered rows read so far.
+struct StreamedBuffer {
+    window: Arc<Mutex<BufferedWindow>>,
+}
+
+impl GlobalOperatorState for StreamedBuffer {}
+
+/// The buffered rows of a buffered input that the join reads as a stream:
+/// those that the streamed rows still need, and the stream of the others.
+struct BufferedWindow {
+    input: NestedInput,
+    rows: BufferedRows,
+    converter: RowConverter,
+    /// The key of the last buffered row read.
+    last_key: Option<OwnedRow>,
+    /// The memory of `rows`.
+    reservation: MemoryReservation,
+    /// The bytes of every batch of `rows` (and of the keys of its rows), to
+    /// release them when the rows are dropped.
+    batch_bytes: VecDeque<usize>,
+}
+
+/// The join drops the buffered rows that no later streamed row matches once
+/// there are this many of them, and at least as many as the rows it keeps.
+const DROPPED_BUFFERED_ROWS: usize = 1 << 16;
+
+impl BufferedWindow {
+    /// Whether the buffered rows read so far are all the buffered rows that a
+    /// streamed row with the key `key` (`None`: a key that cannot match) may
+    /// match: the input ended, or a later key was read (the keys are
+    /// sorted). A null-aware join (`NOT IN`) needs to know first whether the
+    /// input is empty or has a NULL key (which come first).
+    fn is_complete_for(&self, key: Option<Row<'_>>, null_aware: bool) -> bool {
+        let ended = self.input.is_done();
+        if null_aware && !ended && self.rows.rows.is_empty() {
+            return false;
+        }
+        match key {
+            None => true,
+            Some(key) => {
+                ended || self.last_key.as_ref().is_some_and(|last| last.row() > key)
+            }
+        }
+    }
+
+    /// Read the next batch of buffered rows: `Ready(())` once a batch was read
+    /// or the input ended, `Pending` while the input has nothing.
+    fn poll_more(
+        &mut self,
+        ctx: &ExecutionContext,
+        spec: &MergeJoinSpec,
+    ) -> Result<Poll<()>> {
+        let batch = match self.input.poll_next(ctx) {
+            Poll::Ready(Ok(Some(batch))) => batch,
+            Poll::Ready(Ok(None)) => return Ok(Poll::Ready(())),
+            Poll::Ready(Err(e)) => return Err(e),
+            Poll::Pending => return Ok(Poll::Pending),
+        };
+        if batch.num_rows() == 0 {
+            return Ok(Poll::Ready(()));
+        }
+        let keys = evaluate_keys(spec.buffered_keys(), &batch)?;
+        let bytes = self.rows.append(&self.converter, batch, &keys, spec)?;
+        self.reservation.try_grow(bytes)?;
+        self.batch_bytes.push_back(bytes);
+        let last = self.rows.keys.num_rows() - 1;
+        self.last_key = Some(self.rows.keys.row(last).owned());
+        Ok(Poll::Ready(()))
+    }
+
+    /// Drop the buffered rows before `position` if there are enough of them
+    /// (see [`DROPPED_BUFFERED_ROWS`]), in whole batches, releasing their
+    /// memory: the number of rows dropped, by which the positions of the
+    /// other rows decrease.
+    fn drop_rows_before(&mut self, position: usize) -> Result<usize> {
+        let starts = self.rows.rows.batch_starts();
+        // The batches that end before `position`.
+        let batches = starts
+            .iter()
+            .zip(
+                starts
+                    .iter()
+                    .skip(1)
+                    .chain(std::iter::once(&self.rows.rows.len())),
+            )
+            .take_while(|&(_, &end)| end <= position)
+            .count();
+        let dropped = starts.get(batches).copied().unwrap_or(self.rows.rows.len());
+        if dropped < DROPPED_BUFFERED_ROWS || dropped * 2 < self.rows.rows.len() {
+            return Ok(0);
+        }
+        let rows = self.rows.rows.without_first_batches(batches);
+        let mut keys = self
+            .converter
+            .empty_rows(self.rows.keys.num_rows() - dropped, self.rows.keys.size());
+        for row in dropped..self.rows.keys.num_rows() {
+            keys.push(self.rows.keys.row(row));
+        }
+        self.rows.rows = rows;
+        self.rows.keys = keys;
+        let released = self.batch_bytes.drain(..batches).sum::<usize>();
+        self.reservation
+            .shrink(released.min(self.reservation.size()));
+        Ok(dropped)
+    }
+}
+
 /// The buffered rows of the key of the last streamed row.
 struct KeyGroup {
     key: OwnedRow,
     rows: Range<usize>,
 }
 
+/// The buffered rows that the streamed rows are joined with.
+enum Buffered {
+    /// All buffered rows, collected by the join as a sink.
+    Sorted(Arc<BufferedRows>),
+    /// The buffered rows read so far from a buffered input that the join
+    /// reads as a stream.
+    Streamed(Arc<Mutex<BufferedWindow>>),
+}
+
 /// The state of the thread that streams the streamed input.
 struct StreamState {
-    buffered: Arc<BufferedRows>,
+    buffered: Buffered,
+    progress: MergeProgress,
+}
+
+impl OperatorState for StreamState {}
+
+/// How far the streamed rows were joined.
+struct MergeProgress {
     converter: RowConverter,
     /// The first buffered row whose key is not below the key of the last
     /// streamed row.
@@ -1718,7 +2450,19 @@ struct StreamState {
     chunk: Option<StreamedChunk>,
 }
 
-impl OperatorState for StreamState {}
+impl MergeProgress {
+    /// The positions of the buffered rows decreased by `dropped`, the number
+    /// of buffered rows that were dropped before them.
+    fn rebase(&mut self, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        self.cursor -= dropped;
+        if let Some(group) = &mut self.group {
+            group.rows = group.rows.start - dropped..group.rows.end - dropped;
+        }
+    }
+}
 
 /// A chunk of streamed rows being joined.
 struct StreamedChunk {
@@ -1773,19 +2517,65 @@ struct Part {
 
 /// The global state of the scan of the buffered rows without a match (of a
 /// `Full` join).
-struct UnmatchedScanState {
-    buffered: Arc<BufferedRows>,
-    /// The next position to scan.
-    next: AtomicUsize,
+enum UnmatchedScanState {
+    /// All buffered rows, collected by the join as a sink, scanned in
+    /// parallel: the next position to scan.
+    Sorted {
+        buffered: Arc<BufferedRows>,
+        next: AtomicUsize,
+    },
+    /// The buffered rows of a buffered input that the join reads as a stream,
+    /// all of which (until the input ends) are scanned by a single thread.
+    Streamed {
+        window: Arc<Mutex<BufferedWindow>>,
+        next: AtomicUsize,
+    },
 }
 
 impl GlobalSourceState for UnmatchedScanState {
     fn max_threads(&self) -> usize {
-        self.buffered
-            .rows
-            .len()
-            .div_ceil(DEFAULT_VECTOR_SIZE)
-            .max(1)
+        match self {
+            Self::Sorted { buffered, .. } => {
+                buffered.rows.len().div_ceil(DEFAULT_VECTOR_SIZE).max(1)
+            }
+            Self::Streamed { .. } => 1,
+        }
+    }
+}
+
+impl PhysicalMergeJoin {
+    /// The next chunk of the buffered rows without a match of `buffered`,
+    /// from the position `next` on, `None` once all were scanned.
+    fn next_unmatched_rows(
+        &self,
+        buffered: &BufferedRows,
+        next: &AtomicUsize,
+    ) -> Result<Option<RecordBatch>> {
+        let num_rows = buffered.rows.len();
+        loop {
+            let start = next.fetch_add(DEFAULT_VECTOR_SIZE, Ordering::Relaxed);
+            if start >= num_rows {
+                return Ok(None);
+            }
+            let end = (start + DEFAULT_VECTOR_SIZE).min(num_rows);
+            let positions = (start..end)
+                .filter(|&position| !buffered.is_matched(position))
+                .map(Some)
+                .collect::<Vec<_>>();
+            if positions.is_empty() {
+                continue;
+            }
+            let streamed_schema = self.streamed_input().schema();
+            let (left, right) = self.spec.sides(
+                JoinRows::Nulls(&streamed_schema, positions.len()),
+                JoinRows::Stored(&buffered.rows, &positions),
+            );
+            let batch = self
+                .spec
+                .output
+                .batch(&left, &right, None, positions.len())?;
+            return Ok(Some(batch));
+        }
     }
 }
 
@@ -1813,15 +2603,18 @@ impl PhysicalOperator for PhysicalMergeJoin {
         if spec.null_aware {
             description.push_str(", null_aware");
         }
+        if self.streams_buffered {
+            description.push_str(", buffered_stream=true");
+        }
         description
     }
 
     // ---------------------------------------------------------------------
-    // Sink: the buffered input
+    // Sink: the buffered input (unless it is read as a stream)
     // ---------------------------------------------------------------------
 
     fn is_sink(&self) -> bool {
-        true
+        !self.streams_buffered
     }
 
     /// The buffered rows arrive in order, from a single thread.
@@ -1833,17 +2626,13 @@ impl PhysicalOperator for PhysicalMergeJoin {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSinkState>> {
-        let converter = self.spec.key_converter()?;
-        let keys = converter.empty_rows(0, 0);
+        let (converter, rows) = self
+            .spec
+            .empty_buffered_rows(self.buffered_input().schema())?;
         let reservation =
             MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
         Ok(Arc::new(MergeJoinState {
-            building: Mutex::new(Some(BufferedBuild {
-                converter,
-                rows: StoredRows::new(self.buffered_input().schema()),
-                keys,
-                has_null_key: false,
-            })),
+            building: Mutex::new(Some(BufferedBuild { converter, rows })),
             rows: OnceLock::new(),
             reservation,
         }))
@@ -1868,23 +2657,10 @@ impl PhysicalOperator for PhysicalMergeJoin {
                 "PhysicalMergeJoin received buffered rows after its build"
             );
         };
-        let key_bytes = build.keys.size();
-        let first = build.keys.num_rows();
-        build.converter.append(&mut build.keys, &keys)?;
-        // The rows must arrive sorted by their keys.
-        if (first.max(1)..build.keys.num_rows())
-            .any(|row| build.keys.row(row) < build.keys.row(row - 1))
-        {
-            return internal_err!(
-                "The buffered input of PhysicalMergeJoin is not sorted by the join keys"
-            );
-        }
-        if self.spec.null_aware {
-            build.has_null_key |= keys.iter().any(|key| key.logical_null_count() > 0);
-        }
-        let grown = memory_size(&batch) + build.keys.size().saturating_sub(key_bytes);
-        state.reservation.try_grow(grown)?;
-        build.rows.push(batch);
+        let bytes = build
+            .rows
+            .append(&build.converter, batch, &keys, &self.spec)?;
+        state.reservation.try_grow(bytes)?;
         Ok(SinkResult::NeedMoreInput)
     }
 
@@ -1901,23 +2677,10 @@ impl PhysicalOperator for PhysicalMergeJoin {
         if ctx.registry().is_sink_finished(self) {
             return Ok(SinkFinalize::NoOutputPossible);
         }
-        let matched = match self.spec.emits_unmatched_buffered_rows() {
-            true => {
-                let words = build.rows.len().div_ceil(64);
-                state.reservation.try_grow(words * size_of::<AtomicU64>())?;
-                (0..words).map(|_| AtomicU64::new(0)).collect()
-            }
-            false => vec![],
-        };
-        let empty = build.rows.is_empty();
-        let has_null_key = build.has_null_key;
-        let rows = Arc::new(BufferedRows {
-            rows: build.rows,
-            keys: build.keys,
-            has_null_key,
-            matched,
-        });
-        if state.rows.set(rows).is_err() {
+        let rows = build.rows;
+        let empty = rows.rows.is_empty();
+        let has_null_key = rows.has_null_key;
+        if state.rows.set(Arc::new(rows)).is_err() {
             return internal_err!("PhysicalMergeJoin was finalized twice");
         }
         // The streamed input is not read if the join cannot produce output:
@@ -1939,37 +2702,98 @@ impl PhysicalOperator for PhysicalMergeJoin {
         false
     }
 
+    /// For a join that reads its buffered input as a stream: the stream, and
+    /// the buffered rows read so far.
+    fn get_global_operator_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalOperatorState>> {
+        if !self.streams_buffered {
+            return Ok(Arc::new(EmptyState));
+        }
+        let (converter, rows) = self
+            .spec
+            .empty_buffered_rows(self.buffered_input().schema())?;
+        let reservation =
+            MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
+        let window = BufferedWindow {
+            input: NestedInput::start(self.buffered_input(), ctx)?,
+            rows,
+            converter,
+            last_key: None,
+            reservation,
+            batch_bytes: VecDeque::new(),
+        };
+        Ok(Arc::new(StreamedBuffer {
+            window: Arc::new(Mutex::new(window)),
+        }))
+    }
+
     fn get_operator_state(
         &self,
         ctx: &ExecutionContext,
-        _gstate: &dyn GlobalOperatorState,
+        gstate: &dyn GlobalOperatorState,
     ) -> Result<Box<dyn OperatorState>> {
+        let buffered = match self.streams_buffered {
+            false => Buffered::Sorted(self.buffered_rows(ctx)?),
+            true => {
+                let state =
+                    downcast_state::<StreamedBuffer>(gstate.as_any(), self.name())?;
+                Buffered::Streamed(Arc::clone(&state.window))
+            }
+        };
         Ok(Box::new(StreamState {
-            buffered: self.buffered_rows(ctx)?,
-            converter: self.spec.key_converter()?,
-            cursor: 0,
-            group: None,
-            chunk: None,
+            buffered,
+            progress: MergeProgress {
+                converter: self.spec.key_converter()?,
+                cursor: 0,
+                group: None,
+                chunk: None,
+            },
         }))
     }
 
     fn execute(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         input: &DataChunk,
         output: &mut DataChunk,
         _gstate: &dyn GlobalOperatorState,
         lstate: &mut dyn OperatorState,
     ) -> Result<OperatorResult> {
         let state = downcast_state_mut::<StreamState>(lstate.as_any_mut(), self.name())?;
-        if state.chunk.is_none() {
-            state.chunk = Some(self.start_chunk(state, input)?);
+        if state.progress.chunk.is_none() {
+            state.progress.chunk = Some(self.start_chunk(&state.progress, input)?);
         }
-        if let Some(batch) = self.next_output(state)? {
+        let batch = match &state.buffered {
+            Buffered::Sorted(buffered) => {
+                let buffered = Arc::clone(buffered);
+                self.next_output(&mut state.progress, &buffered, &|_| true)?
+                    .batch
+            }
+            Buffered::Streamed(window) => {
+                let window = Arc::clone(window);
+                match self.next_streaming_output(ctx, &mut state.progress, &window)? {
+                    Poll::Ready(batch) => batch,
+                    // The buffered input has no rows yet.
+                    Poll::Pending => {
+                        return Ok(OperatorResult::Blocked(
+                            TaskInterrupt::waker_registered(),
+                        ));
+                    }
+                }
+            }
+        };
+        if let Some(batch) = batch {
             *output = DataChunk::from_record_batch(batch);
         }
-        if state.chunk.as_ref().is_some_and(StreamedChunk::is_done) {
-            state.chunk = None;
+        if state
+            .progress
+            .chunk
+            .as_ref()
+            .is_some_and(StreamedChunk::is_done)
+        {
+            state.progress.chunk = None;
             return Ok(OperatorResult::NeedMoreInput);
         }
         Ok(OperatorResult::HaveMoreOutput)
@@ -1983,53 +2807,57 @@ impl PhysicalOperator for PhysicalMergeJoin {
         self.spec.emits_unmatched_buffered_rows()
     }
 
+    /// The rows of a buffered input read as a stream are read by a single
+    /// thread.
     fn parallel_source(&self) -> bool {
-        true
+        !self.streams_buffered
     }
 
     fn get_global_source_state(
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
-        Ok(Arc::new(UnmatchedScanState {
-            buffered: self.buffered_rows(ctx)?,
-            next: AtomicUsize::new(0),
+        Ok(Arc::new(match self.streams_buffered {
+            false => UnmatchedScanState::Sorted {
+                buffered: self.buffered_rows(ctx)?,
+                next: AtomicUsize::new(0),
+            },
+            true => UnmatchedScanState::Streamed {
+                window: self.buffered_window(ctx)?,
+                next: AtomicUsize::new(0),
+            },
         }))
     }
 
     fn get_data(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
         gstate: &dyn GlobalSourceState,
         _lstate: &mut dyn LocalSourceState,
     ) -> Result<SourceResult> {
         let state = downcast_state::<UnmatchedScanState>(gstate.as_any(), self.name())?;
-        let buffered = &state.buffered;
-        let num_rows = buffered.rows.len();
-        loop {
-            let start = state.next.fetch_add(DEFAULT_VECTOR_SIZE, Ordering::Relaxed);
-            if start >= num_rows {
-                return Ok(SourceResult::Finished);
+        let batch = match state {
+            UnmatchedScanState::Sorted { buffered, next } => {
+                self.next_unmatched_rows(buffered, next)?
             }
-            let end = (start + DEFAULT_VECTOR_SIZE).min(num_rows);
-            let positions = (start..end)
-                .filter(|&position| !buffered.is_matched(position))
-                .map(Some)
-                .collect::<Vec<_>>();
-            if positions.is_empty() {
-                continue;
+            UnmatchedScanState::Streamed { window, next } => {
+                let mut window = window.lock();
+                // The rows of the input that come after the last streamed row
+                // match none: all of them are read first.
+                while !window.input.is_done() {
+                    if window.poll_more(ctx, &self.spec)?.is_pending() {
+                        return Ok(SourceResult::Blocked(
+                            TaskInterrupt::waker_registered(),
+                        ));
+                    }
+                }
+                self.next_unmatched_rows(&window.rows, next)?
             }
-            let streamed_schema = self.streamed_input().schema();
-            let (left, right) = self.spec.sides(
-                JoinRows::Nulls(&streamed_schema, positions.len()),
-                JoinRows::Stored(&buffered.rows, &positions),
-            );
-            let batch = self
-                .spec
-                .output
-                .batch(&left, &right, None, positions.len())?;
-            return Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)));
-        }
+        };
+        Ok(match batch {
+            Some(batch) => SourceResult::Chunk(DataChunk::from_record_batch(batch)),
+            None => SourceResult::Finished,
+        })
     }
 
     // ---------------------------------------------------------------------
@@ -2048,8 +2876,9 @@ impl PhysicalOperator for PhysicalMergeJoin {
         let Some(last_pipeline) = meta.pipelines().last().copied() else {
             return internal_err!("A meta pipeline without pipelines");
         };
-        // The buffered input sinks into the join, in a child meta pipeline.
-        {
+        // The buffered input sinks into the join, in a child meta pipeline,
+        // unless the join reads it as a stream (in an execution of its own).
+        if !self.streams_buffered {
             let (mut build, mut build_pipeline) =
                 meta.create_child_meta_pipeline(current, Arc::clone(&this))?;
             build.build(&mut build_pipeline, self.buffered_input())?;
@@ -2077,15 +2906,21 @@ pub(crate) mod tests {
         StringViewArray, TimestampNanosecondArray,
     };
     use arrow::compute::concat_batches;
+    use arrow::compute::{SortColumn, lexsort_to_indices, take_record_batch};
     use arrow::datatypes::{Field, TimeUnit};
     use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_datasource::memory::MemorySourceConfig;
+    use datafusion_execution::SendableRecordBatchStream;
     use datafusion_execution::TaskContext;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{BinaryExpr, Column, col};
     use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::collect;
+    use datafusion_physical_plan::limit::GlobalLimitExec;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
 
     use crate::bridge::{PipelineRootExec, bridged_plans};
     use crate::executor::Executor;
@@ -2627,8 +3462,33 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// A sort-merge join of `left` and `right` (two sorted inputs of
-    /// [`TestSource`]s with the rows of `(id, k)`) on `k`.
+    /// The schema of the rows `(id, k)` of the `side` input of the joins of
+    /// [`TestSource`]s.
+    fn key_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+        ]))
+    }
+
+    /// The rows `(id, k)` of `rows`, in chunks of 1,000 rows.
+    fn key_chunks(side: &str, rows: &[(i64, i32)]) -> Result<Vec<DataChunk>> {
+        rows.chunks(1000)
+            .map(|rows| {
+                let batch = RecordBatch::try_new(
+                    key_schema(side),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                        Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.1))),
+                    ],
+                )?;
+                Ok(DataChunk::from_record_batch(batch))
+            })
+            .collect()
+    }
+
+    /// A sort-merge join of `left` and `right` (two inputs of [`TestSource`]s
+    /// with the rows of `(id, k)`, sorted by [`MergeJoinSort`]s) on `k`.
     fn merge_join_of(
         left: Vec<(i64, i32)>,
         right: Vec<(i64, i32)>,
@@ -2638,34 +3498,15 @@ pub(crate) mod tests {
         let source = |side: &str,
                       rows: Vec<(i64, i32)>|
          -> Result<Arc<dyn PhysicalOperator>> {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new(format!("{side}id"), DataType::Int64, false),
-                Field::new(format!("{side}k"), DataType::Int32, false),
-            ]));
-            let chunks = rows
-                .chunks(1000)
-                .map(|rows| {
-                    let batch = RecordBatch::try_new(
-                        Arc::clone(&schema),
-                        vec![
-                            Arc::new(Int64Array::from_iter_values(
-                                rows.iter().map(|r| r.0),
-                            )),
-                            Arc::new(Int32Array::from_iter_values(
-                                rows.iter().map(|r| r.1),
-                            )),
-                        ],
-                    )?;
-                    Ok(DataChunk::from_record_batch(batch))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let schema = key_schema(side);
+            let chunks = key_chunks(side, &rows)?;
             let source = Arc::new(TestSource::with_schema(Arc::clone(&schema), chunks));
             let ordering = LexOrdering::new([PhysicalSortExpr::new_default(col(
                 &format!("{side}k"),
                 &schema,
             )?)])
             .unwrap();
-            Ok(Arc::new(PhysicalSort::try_new(source, ordering, None)?))
+            Ok(Arc::new(MergeJoinSort::try_new(source, ordering)?))
         };
         let left = source("l", left)?;
         let right = source("r", right)?;
@@ -2838,31 +3679,304 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A task context whose memory pool has `limit` bytes.
+    pub(crate) fn limited_task_ctx(limit: usize) -> Result<Arc<TaskContext>> {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(limit, 1.0)
+            .build_arc()?;
+        Ok(Arc::new(TaskContext::default().with_runtime(runtime)))
+    }
+
+    /// A merge join of `left` and `right` on `k` like [`merge_join_of`], of
+    /// inputs that emit their rows sorted (without sorting them).
+    fn merge_join_of_sorted(
+        left: Vec<(i64, i32)>,
+        right: Vec<(i64, i32)>,
+        join_type: JoinType,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let source =
+            |side: &str, rows: Vec<(i64, i32)>| -> Result<Arc<dyn PhysicalOperator>> {
+                let chunks = key_chunks(side, &rows)?;
+                Ok(Arc::new(TestSource::with_schema(key_schema(side), chunks)))
+            };
+        let (left, right) = (source("l", left)?, source("r", right)?);
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        Ok(Arc::new(PhysicalMergeJoin::try_new(
+            left,
+            right,
+            on,
+            None,
+            join_type,
+            &[SortOptions::default()],
+            NullEquality::NullEqualsNothing,
+            false,
+            None,
+        )?))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_buffered_rows_are_reserved_in_the_memory_pool() -> Result<()> {
-        let left = (0..100).map(|i| (i, (i % 10) as i32)).collect::<Vec<_>>();
-        let right = (0..20_000)
-            .map(|i| (i, (i % 10) as i32))
-            .collect::<Vec<_>>();
-        let limited = |limit: usize| -> Result<Arc<TaskContext>> {
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_limit(limit, 1.0)
-                .build_arc()?;
-            Ok(Arc::new(TaskContext::default().with_runtime(runtime)))
+    async fn the_rows_of_merge_joins_are_reserved_in_the_memory_pool() -> Result<()> {
+        let rows = |n: i64| (0..n).map(|i| (i, (i % 10) as i32)).collect::<Vec<_>>();
+        let sorted = |n: i64| {
+            let mut rows = rows(n);
+            rows.sort_by_key(|row| row.1);
+            rows
         };
+        // The buffered rows of the join (of inputs that are sorted already).
         let join =
-            || merge_join_of(left.clone(), right.clone(), JoinType::LeftSemi, None);
-        let err = with_timeout(Executor::collect(join()?, limited(64 * 1024)?, 4))
+            || merge_join_of_sorted(sorted(100), sorted(20_000), JoinType::LeftSemi);
+        // The rows of the sorts of the inputs: many streamed rows, and a
+        // single buffered row.
+        let sorts = || merge_join_of(rows(50_000), rows(1), JoinType::Inner, None);
+        for (join, consumer, output) in [
+            (join()?, "PhysicalMergeJoin", 100),
+            (sorts()?, "MergeJoinSort", 5_000),
+        ] {
+            let err = with_timeout(Executor::collect(
+                Arc::clone(&join),
+                limited_task_ctx(64 * 1024)?,
+                4,
+            ))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
-            "{err}"
-        );
-        assert!(err.to_string().contains("PhysicalMergeJoin"), "{err}");
-        let batches =
-            with_timeout(Executor::collect(join()?, limited(64 << 20)?, 4)).await?;
-        assert_eq!(num_rows(&batches), 100);
+            assert!(
+                matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{err}"
+            );
+            assert!(err.to_string().contains(consumer), "{err}");
+            let batches =
+                with_timeout(Executor::collect(join, limited_task_ctx(64 << 20)?, 4))
+                    .await?;
+            assert_eq!(num_rows(&batches), output, "{consumer}");
+        }
+        Ok(())
+    }
+
+    /// A partition of a stream that produces `batches`, and then ends, or
+    /// never produces anything again if `forever`.
+    #[derive(Debug)]
+    pub(crate) struct StreamPartition {
+        pub(crate) schema: SchemaRef,
+        pub(crate) batches: Vec<RecordBatch>,
+        pub(crate) forever: bool,
+    }
+
+    impl PartitionStream for StreamPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batches = futures::stream::iter(self.batches.clone().into_iter().map(Ok));
+            let stream = match self.forever {
+                true => batches.chain(futures::stream::pending()).boxed(),
+                false => batches.boxed(),
+            };
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream,
+            ))
+        }
+    }
+
+    /// The order of the sorted streams: by `<side>k`, NULLs first.
+    fn stream_order(side: &str) -> LexOrdering {
+        let key = col(&format!("{side}k"), &data_schema(side)).unwrap();
+        LexOrdering::new([PhysicalSortExpr::new(key, SortOptions::new(false, true))])
+            .unwrap()
+    }
+
+    /// A stream (that never ends, for DataFusion) of the rows `0..rows` of the
+    /// `side` input (see [`data_batch`]) in `partitions` partitions of batches
+    /// of 50 rows, every partition sorted by `<side>k` (NULLs first). The
+    /// partitions end, unless `forever` (then they produce nothing after their
+    /// rows).
+    fn sorted_stream(
+        side: &str,
+        rows: i64,
+        skew: i64,
+        partitions: i64,
+        forever: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        let batch = data_batch(side, 0..rows, skew);
+        let partitions = (0..partitions)
+            .map(|partition| {
+                let rows = (0..rows)
+                    .filter(|row| row % partitions == partition)
+                    .map(|row| row as u32)
+                    .collect::<Vec<_>>();
+                let rows = take_record_batch(&batch, &UInt32Array::from(rows)).unwrap();
+                let order = SortColumn {
+                    values: Arc::clone(rows.column(1)),
+                    options: Some(SortOptions::new(false, true)),
+                };
+                let sorted = lexsort_to_indices(&[order], None).unwrap();
+                let sorted = take_record_batch(&rows, &sorted).unwrap();
+                let batches = (0..sorted.num_rows())
+                    .step_by(50)
+                    .map(|offset| {
+                        sorted.slice(offset, 50.min(sorted.num_rows() - offset))
+                    })
+                    .collect();
+                Arc::new(StreamPartition {
+                    schema: data_schema(side),
+                    batches,
+                    forever,
+                }) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        Arc::new(
+            StreamingTableExec::try_new(
+                data_schema(side),
+                partitions,
+                None,
+                [stream_order(side)],
+                true,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A sort-merge join of sorted streams (see [`sorted_stream`]) of the
+    /// left and the right input on `lk = rk`, of a single partition: its
+    /// order is the order of its streamed input. A stream of several
+    /// partitions is merged by a `SortPreservingMergeExec` first.
+    fn join_of_sorted_streams(
+        join_type: JoinType,
+        filter: Option<JoinFilter>,
+        partitions: i64,
+        forever: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input = |side: &str, rows: i64, skew: i64| -> Arc<dyn ExecutionPlan> {
+            let stream = sorted_stream(side, rows, skew, partitions, forever);
+            match partitions {
+                1 => stream,
+                _ => Arc::new(SortPreservingMergeExec::new(stream_order(side), stream)),
+            }
+        };
+        let (left, right) = (input("l", 300, 0), input("r", 500, 3));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        // The `NOT IN` of a single partition, without filter.
+        let null_aware =
+            join_type == JoinType::LeftAnti && filter.is_none() && partitions == 1;
+        let join = SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            vec![SortOptions::new(false, true)],
+            NullEquality::NullEqualsNothing,
+        )?
+        .with_null_aware(null_aware)?;
+        Ok(Arc::new(join))
+    }
+
+    /// Assert that `root`, a native merge join, reads its inputs as streams:
+    /// it neither sorts them nor collects them, nor is it left to DataFusion,
+    /// but the streams below it.
+    fn assert_streaming_merge_join(root: &Arc<dyn PhysicalOperator>, context: &str) {
+        let tree = format_operator_tree(root);
+        let join = root
+            .downcast_ref::<PhysicalMergeJoin>()
+            .unwrap_or_else(|| panic!("not a merge join: {context}\n{tree}"));
+        assert!(join.streams_buffered_input(), "{context}\n{tree}");
+        assert_eq!(count::<MergeJoinSort>(root), 0, "{context}\n{tree}");
+        for plan in bridged_plans(root) {
+            let streams = plan
+                .apply(|node| {
+                    Ok(
+                        match node.is::<StreamingTableExec>()
+                            || node.is::<SortPreservingMergeExec>()
+                        {
+                            true => TreeNodeRecursion::Continue,
+                            false => TreeNodeRecursion::Stop,
+                        },
+                    )
+                })
+                .is_ok_and(|recursion| recursion != TreeNodeRecursion::Stop);
+            assert!(streams, "{context}: bridged {}\n{tree}", plan.name());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_joins_of_sorted_inputs_that_never_end_are_native() -> Result<()> {
+        // A sort-merge join of one partition promises its order: the merge join
+        // reads its inputs, which never end, in their order (the buffered one
+        // as a stream), instead of sorting them, and emits its rows in the
+        // order of the streamed rows, as they come. (A `Full` join has no
+        // order: it is a symmetric hash join.)
+        for join_type in ALL_JOIN_TYPES
+            .into_iter()
+            .filter(|join_type| *join_type != JoinType::Full)
+        {
+            for filter in [None, Some(("id", Operator::Lt, "id"))] {
+                for partitions in [1, 3] {
+                    let context = format!("{join_type} {filter:?} {partitions}");
+                    let make_plan = || {
+                        let filter = filter.map(|(l, op, r)| join_filter(l, op, r));
+                        join_of_sorted_streams(join_type, filter, partitions, false)
+                    };
+                    let plan = make_plan()?;
+                    let expected = EngineOutput {
+                        schema: plan.schema(),
+                        plan: Arc::clone(&plan),
+                        batches: with_timeout(collect(make_plan()?, task_ctx())).await?,
+                        ordered: false,
+                    };
+                    let root = lower_join(&plan, false)?;
+                    assert_streaming_merge_join(&root, &context);
+                    let actual = run_native(&root, Arc::clone(&plan), task_ctx()).await?;
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!(
+                            "Results differ: {message}\n{context}\n{}",
+                            format_operator_tree(&root)
+                        );
+                    }
+                    let ordering = plan.output_ordering().expect("an ordered join");
+                    let ordering =
+                        LexOrdering::new(ordering.iter().take(1).cloned()).unwrap();
+                    assert_sorted(&actual.batches, &ordering, &context);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_joins_of_streams_that_never_end_emit_their_rows() -> Result<()> {
+        // The streams produce their rows and then nothing, forever: the join
+        // emits its rows in order as they come, so that a limit above it ends
+        // the query, with the first rows of the join.
+        for join_type in [JoinType::Inner, JoinType::Left, JoinType::RightSemi] {
+            let limit = 40;
+            let all = |forever| join_of_sorted_streams(join_type, None, 1, forever);
+            let plan = all(true)?;
+            let limited: Arc<dyn ExecutionPlan> =
+                Arc::new(GlobalLimitExec::new(Arc::clone(&plan), 0, Some(limit)));
+            let root = crate::planner::lower_execution_plan(&limited)?;
+            let join = &root.children()[0];
+            assert_streaming_merge_join(join, &join_type.to_string());
+            let output = run_native(&root, limited, task_ctx()).await?;
+            assert_eq!(num_rows(&output.batches), limit, "{join_type}");
+            // The first rows of the join of the rows of the streams.
+            let expected = collect(all(false)?, task_ctx()).await?;
+            let expected = concat_batches(&plan.schema(), &expected)?;
+            let ordering = plan.output_ordering().expect("an ordered join");
+            let ordering = LexOrdering::new(ordering.iter().take(1).cloned()).unwrap();
+            assert_sorted(&output.batches, &ordering, &join_type.to_string());
+            let keys = |batch: &RecordBatch| {
+                let key = ordering[0].expr.evaluate(batch).unwrap();
+                key.into_array(batch.num_rows()).unwrap()
+            };
+            let actual = concat_batches(&plan.schema(), &output.batches)?;
+            assert_eq!(
+                keys(&actual).as_ref(),
+                keys(&expected.slice(0, limit)).as_ref(),
+                "{join_type}"
+            );
+        }
         Ok(())
     }
 
@@ -2873,25 +3987,25 @@ pub(crate) mod tests {
             (
                 JoinType::Inner,
                 "MetaPipeline 0 (sink: ResultSink) children: [1, 3]\n  \
-                 Pipeline 0: PhysicalSort -> PhysicalMergeJoin -> ResultSink depends on meta pipelines [1, 3]\n\
+                 Pipeline 0: MergeJoinSort -> PhysicalMergeJoin -> ResultSink depends on meta pipelines [1, 3]\n\
                  MetaPipeline 1 (sink: PhysicalMergeJoin) children: [2]\n  \
-                 Pipeline 1: PhysicalSort -> PhysicalMergeJoin depends on meta pipelines [2]\n\
-                 MetaPipeline 2 (sink: PhysicalSort)\n  \
-                 Pipeline 2: TestSource -> PhysicalSort\n\
-                 MetaPipeline 3 (sink: PhysicalSort)\n  \
-                 Pipeline 3: TestSource -> PhysicalSort\n",
+                 Pipeline 1: MergeJoinSort -> PhysicalMergeJoin depends on meta pipelines [2]\n\
+                 MetaPipeline 2 (sink: MergeJoinSort)\n  \
+                 Pipeline 2: TestSource -> MergeJoinSort\n\
+                 MetaPipeline 3 (sink: MergeJoinSort)\n  \
+                 Pipeline 3: TestSource -> MergeJoinSort\n",
             ),
             (
                 JoinType::Full,
                 "MetaPipeline 0 (sink: ResultSink) children: [1, 3]\n  \
-                 Pipeline 0: PhysicalSort -> PhysicalMergeJoin -> ResultSink depends on meta pipelines [1, 3]\n  \
+                 Pipeline 0: MergeJoinSort -> PhysicalMergeJoin -> ResultSink depends on meta pipelines [1, 3]\n  \
                  Pipeline 4: PhysicalMergeJoin -> ResultSink depends on pipelines [0]\n\
                  MetaPipeline 1 (sink: PhysicalMergeJoin) children: [2]\n  \
-                 Pipeline 1: PhysicalSort -> PhysicalMergeJoin depends on meta pipelines [2]\n\
-                 MetaPipeline 2 (sink: PhysicalSort)\n  \
-                 Pipeline 2: TestSource -> PhysicalSort\n\
-                 MetaPipeline 3 (sink: PhysicalSort)\n  \
-                 Pipeline 3: TestSource -> PhysicalSort\n",
+                 Pipeline 1: MergeJoinSort -> PhysicalMergeJoin depends on meta pipelines [2]\n\
+                 MetaPipeline 2 (sink: MergeJoinSort)\n  \
+                 Pipeline 2: TestSource -> MergeJoinSort\n\
+                 MetaPipeline 3 (sink: MergeJoinSort)\n  \
+                 Pipeline 3: TestSource -> MergeJoinSort\n",
             ),
         ] {
             let join = merge_join_of(left.clone(), left.clone(), join_type, None)?;

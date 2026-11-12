@@ -770,19 +770,36 @@ impl Lowering<'_> {
     /// [`PhysicalMergeJoin`](crate::join::PhysicalMergeJoin) if a merge above
     /// it relies on its order (see
     /// [`Self::try_lower_merge_of_sort_merge_join`]) or if it has a single
-    /// partition with an order, and to a [`PhysicalHashJoin`] otherwise. The
-    /// inputs that run in the pipeline of the join (the probe side of a hash
-    /// join) are lowered in it, see [`Self::lower_in`].
+    /// partition with an order, and to a [`PhysicalHashJoin`] otherwise. Its
+    /// inputs are lowered as the join reads them, see [`Self::lower_join_input_as`].
     fn try_lower_sort_merge_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
         let key = Arc::as_ptr(plan).cast::<()>().addr();
         let ordered = self.ordered_joins.borrow().contains(&key);
-        let early_stop = self.early_stop.get();
-        merge_join::try_lower(plan, ordered, |input, in_pipeline| {
-            self.lower_in(input, in_pipeline && early_stop)
+        merge_join::try_lower(plan, ordered, |input, role| {
+            self.lower_join_input_as(input, role)
         })
+    }
+
+    /// Lower `input`, an input of a native join that reads it as `role` says
+    /// (see [`Self::lower_in`]): in a pipeline that runs until its input ends
+    /// if the join collects all of its rows, in the pipeline of the join (which
+    /// may stop early with it) if it is the probe side of a hash join, and as
+    /// in a pipeline that may stop early if the join reads its rows as they
+    /// come (an input that never ends, whose rows no cache may hold back).
+    fn lower_join_input_as(
+        &self,
+        input: &Arc<dyn ExecutionPlan>,
+        role: merge_join::InputRole,
+    ) -> Result<Arc<dyn PhysicalOperator>> {
+        let early_stop = match role {
+            merge_join::InputRole::Collected => false,
+            merge_join::InputRole::Pipelined => self.early_stop.get(),
+            merge_join::InputRole::Streamed => true,
+        };
+        self.lower_in(input, early_stop)
     }
 
     /// Lower a `SortPreservingMergeExec` that merges the sorted partitions of
@@ -824,15 +841,14 @@ impl Lowering<'_> {
     /// Lower a symmetric hash join with [`symmetric_hash_join::try_lower`]: to
     /// a [`PhysicalHashJoin`] that builds on an input that ends, or to a
     /// [`PhysicalSymmetricHashJoin`](crate::join::PhysicalSymmetricHashJoin) of
-    /// two inputs that never end, which streams both of them in its pipelines
-    /// (see [`Self::lower_in`]).
+    /// two inputs that never end, which reads both of them as streams (see
+    /// [`Self::lower_join_input_as`]).
     fn try_lower_symmetric_hash_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
-        let early_stop = self.early_stop.get();
-        symmetric_hash_join::try_lower(plan, |input, in_pipeline| {
-            self.lower_in(input, in_pipeline && early_stop)
+        symmetric_hash_join::try_lower(plan, |input, role| {
+            self.lower_join_input_as(input, role)
         })
     }
 
