@@ -7632,6 +7632,14 @@ mod tests {
             "SELECT a.v AS a, b.v AS b \
              FROM (SELECT v FROM m ORDER BY k LIMIT 1) a \
              JOIN (SELECT v FROM n ORDER BY k LIMIT 1) b ON a.v < b.v WHERE a.v > 0",
+            // An equi-join, which only joins the rows of the same choices.
+            "SELECT a.v AS a, b.w AS b \
+             FROM (SELECT v FROM m ORDER BY k LIMIT 1) a \
+             JOIN (SELECT v / 10 AS v, v AS w FROM n ORDER BY k LIMIT 1) b ON a.v = b.v \
+             ORDER BY a",
+            "SELECT a.v AS a, b.v AS b \
+             FROM (SELECT v FROM m ORDER BY k LIMIT 1) a \
+             JOIN (SELECT v - 9 AS v FROM n ORDER BY k LIMIT 1) b ON a.v = b.v",
             "SELECT v FROM (SELECT v FROM l ORDER BY k LIMIT 1) s ORDER BY v",
             "SELECT v + 1 AS w FROM (SELECT v FROM l ORDER BY k LIMIT 2) s ORDER BY w DESC",
         ] {
