@@ -20,5 +20,6 @@ pub mod partitioned_topk;
 pub(crate) mod piecewise_merge_join;
 pub mod placeholder_row;
 pub mod projection;
+pub mod recursive_cte;
 pub mod union;
 pub mod unnest;

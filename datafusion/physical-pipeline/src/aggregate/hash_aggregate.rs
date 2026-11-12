@@ -38,6 +38,7 @@ use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
+use super::dynamic_filter::{AggregateFilter, filters_enabled};
 use super::radix_ht::{RadixHashAggregate, TableCapacity};
 use super::ungrouped::UngroupedAggregate;
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
@@ -56,7 +57,8 @@ use crate::operator::{
 /// -> AggregateExec(Final / FinalPartitioned)` chain, using the expressions,
 /// accumulators and schema of these nodes, without shuffling the partial
 /// states through channels. See the [module documentation](super) for how
-/// the work is split between the threads.
+/// the work is split between the threads, and for the dynamic filters that
+/// it updates while it aggregates its input.
 #[derive(Debug)]
 pub struct PhysicalHashAggregate {
     /// The input, the only child.
@@ -103,6 +105,11 @@ pub(crate) struct AggregateSpec {
     /// its thread-local table, and are aggregated by the final aggregation of
     /// their radix partitions directly (see [`rows_can_bypass_tables`]).
     pub(crate) bypass: bool,
+    /// The dynamic filter that the aggregation updates while it aggregates
+    /// its input, which nodes of its input read (see [`super::dynamic_filter`]):
+    /// the filter of DataFusion's `AggregateExec` of the bounds of its `MIN` and
+    /// `MAX` aggregates, or a filter that the aggregation published.
+    pub(crate) dynamic_filter: Option<AggregateFilter>,
 }
 
 impl AggregateSpec {
@@ -614,6 +621,14 @@ impl PhysicalHashAggregate {
     ///   chooses (see `TopK`), or all of its groups, among which the sort
     ///   above selects them (e.g. for limits of more than `MAX_TOP_K_LIMIT`
     ///   groups).
+    ///
+    /// The aggregation updates the dynamic filter of the `MIN` and `MAX`
+    /// aggregates that DataFusion's partial `AggregateExec` produces, and it
+    /// publishes a dynamic filter of its own into its input (before it is
+    /// lowered) if its state can prune its input but DataFusion produces no
+    /// filter: for a single stage aggregation of `MIN` and `MAX` aggregates
+    /// without `GROUP BY`, and for a top-k aggregation (see the module
+    /// `dynamic_filter`).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         mut lower_input: F,
@@ -668,12 +683,39 @@ impl PhysicalHashAggregate {
         }) {
             return Ok(None);
         }
-        let input = lower_input(raw.input())?;
-        let aggregate = match last {
+        let top_k = match group_limit(raw, last) {
+            GroupLimit::TopK(top_k) => Some(top_k),
+            GroupLimit::None | GroupLimit::Soft(_) => None,
+        };
+        let published = AggregateFilter::try_publish(raw, last, top_k)?;
+        let input = match &published {
+            // The input with the nodes that read the published filter.
+            Some((_, input)) => lower_input(input)?,
+            None => lower_input(raw.input())?,
+        };
+        let mut aggregate = match last {
             Some(last) => Self::try_new_two_stage(raw, last, input)?,
             None => Self::try_new_single_stage(raw, input)?,
         };
+        if let Some((filter, _)) = published {
+            aggregate = aggregate.with_published_filter(filter)?;
+        }
         Ok(Some(aggregate))
+    }
+
+    /// The aggregation, which updates `filter`, a dynamic filter that it
+    /// published into its input (see [`AggregateFilter::try_publish`]).
+    fn with_published_filter(mut self, filter: AggregateFilter) -> Result<Self> {
+        let Some(spec) = Arc::get_mut(&mut self.spec) else {
+            return internal_err!(
+                "The aggregation is shared: it cannot publish a filter"
+            );
+        };
+        if spec.dynamic_filter.is_some() {
+            return internal_err!("The aggregation updates the filters of DataFusion");
+        }
+        spec.dynamic_filter = Some(filter);
+        Ok(self)
     }
 
     /// The aggregation of `aggregate`, an `AggregateExec` in `Single` or
@@ -785,6 +827,7 @@ impl PhysicalHashAggregate {
             && soft_limit.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
+        let dynamic_filter = AggregateFilter::of_aggregate_exec(raw)?;
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),
@@ -800,6 +843,7 @@ impl PhysicalHashAggregate {
                 top_k,
                 soft_limit,
                 bypass,
+                dynamic_filter,
             }),
         })
     }
@@ -1170,7 +1214,7 @@ const BUILTIN_AGGREGATES: [(&str, BuiltinAggregate); 15] = [
 type BuiltinAggregate = fn() -> Arc<AggregateUDF>;
 
 /// The type that implements `udaf`.
-fn implementation_type(udaf: &AggregateUDF) -> TypeId {
+pub(crate) fn implementation_type(udaf: &AggregateUDF) -> TypeId {
     let implementation: &dyn Any = udaf.inner().as_ref();
     implementation.type_id()
 }
@@ -1426,6 +1470,9 @@ impl fmt::Display for AggregateSpec {
         if let Some(limit) = self.soft_limit {
             write!(f, ", lim=[{limit}]")?;
         }
+        if self.dynamic_filter.is_some() {
+            write!(f, ", dynamic_filter=true")?;
+        }
         Ok(())
     }
 }
@@ -1461,22 +1508,25 @@ impl PhysicalOperator for PhysicalHashAggregate {
 
     fn get_global_sink_state(
         &self,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSinkState>> {
+        // Whether the threads update the dynamic filter of the aggregation.
+        let filters = filters_enabled(ctx);
         if self.spec.is_ungrouped() {
-            UngroupedAggregate::global_sink_state()
+            let batch_size = ctx.task_ctx.session_config().batch_size();
+            UngroupedAggregate::global_sink_state(&self.spec, filters, batch_size)
         } else {
-            RadixHashAggregate::global_sink_state()
+            RadixHashAggregate::global_sink_state(filters)
         }
     }
 
     fn get_local_sink_state(
         &self,
         _ctx: &ExecutionContext,
-        _gstate: &dyn GlobalSinkState,
+        gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         if self.spec.is_ungrouped() {
-            return UngroupedAggregate::local_sink_state(&self.spec);
+            return UngroupedAggregate::local_sink_state(&self.spec, gstate);
         }
         RadixHashAggregate::local_sink_state(
             &self.spec,
@@ -1494,7 +1544,7 @@ impl PhysicalOperator for PhysicalHashAggregate {
     ) -> Result<SinkResult> {
         let batch = input.compact()?;
         if self.spec.is_ungrouped() {
-            UngroupedAggregate::sink(&self.spec, batch, lstate)?;
+            UngroupedAggregate::sink(&self.spec, batch, gstate, lstate)?;
             return Ok(SinkResult::NeedMoreInput);
         }
         RadixHashAggregate::sink(&self.spec, batch, gstate, lstate)
@@ -1518,6 +1568,11 @@ impl PhysicalOperator for PhysicalHashAggregate {
         _ctx: &ExecutionContext,
         gstate: &dyn GlobalSinkState,
     ) -> Result<SinkFinalize> {
+        // The input is aggregated: the dynamic filter will not change any
+        // more.
+        if let Some(filter) = &self.spec.dynamic_filter {
+            filter.mark_complete();
+        }
         if self.spec.is_ungrouped() {
             UngroupedAggregate::finalize(&self.spec, gstate)
         } else {

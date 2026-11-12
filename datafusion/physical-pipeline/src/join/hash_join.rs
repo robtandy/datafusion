@@ -98,7 +98,7 @@
 //! [`PhysicalHashJoin`] lowered from such a join sets the filter, like
 //! DataFusion's, to the bounds and the membership of its build keys when its
 //! build side is finalized, and marks it complete (see
-//! `PhysicalHashJoin::dynamic_filter_predicate`):
+//! `PhysicalHashJoin::dynamic_filter_predicates`):
 //!
 //! * the bounds `key >= min AND key <= max` (or `false` if no build row can
 //!   match);
@@ -110,6 +110,14 @@
 //! * otherwise a lookup of the keys in the [`JoinHashTable`]
 //!   ([`JoinHashTableLookupExpr`], DataFusion's `HashTableLookupExpr`), with
 //!   which scans filter their rows (with `pushdown_filters`).
+//!
+//! The join sets more dynamic filters of its probe keys, of all of them or of
+//! some (see [`PhysicalHashJoin::with_filter_targets`]): the planner routes
+//! the filter of a join to the scans below its probe side that produce its
+//! probe keys, also below other joins and aggregations, each with a filter
+//! of the keys it produces (see `PipelineQueryPlanner`). A filter of some of
+//! the keys holds their bounds and `IN` lists (the lookup in the hash table
+//! needs all of them).
 //!
 //! The probe side, and the pipeline breakers on it, wait for the build side
 //! (see [Pipelines](#pipelines)), so the filter is complete before any scan of
@@ -212,9 +220,69 @@ pub struct PhysicalHashJoin {
     /// The dynamic filters of the `HashJoinExec` the join was lowered from
     /// (see `ExecutionPlan::dynamic_expressions_produced`), which nodes of
     /// its probe side read: the join sets them to the bounds and the
-    /// membership of its build keys (see [`Self::dynamic_filter_predicate`]),
+    /// membership of its build keys (see [`Self::dynamic_filter_predicates`]),
     /// and marks them complete, when its build side is finalized.
     dynamic_filters: Vec<Arc<DynamicFilterPhysicalExpr>>,
+    /// More dynamic filters of some of the probe keys, which the join sets
+    /// with its own (see [`Self::with_filter_targets`]).
+    filter_targets: Vec<JoinFilterTarget>,
+}
+
+/// A dynamic filter of some of the probe keys of a [`PhysicalHashJoin`],
+/// which the join sets, besides the filters of the `HashJoinExec` it was
+/// lowered from, when its build side is finalized: e.g. the filter that the
+/// planner routes to a scan below the probe side that produces these keys
+/// (see `PipelineQueryPlanner`).
+///
+/// The filter is set to the predicates of its keys (their bounds and `IN`
+/// lists, see [`PhysicalHashJoin::with_filter_targets`]), and to the lookup of
+/// the keys in the hash table too if it has all the keys of the join.
+#[derive(Debug, Clone)]
+pub struct JoinFilterTarget {
+    filter: Arc<DynamicFilterPhysicalExpr>,
+    keys: Vec<usize>,
+}
+
+impl JoinFilterTarget {
+    /// A filter of the probe keys `keys` (indices of the join keys `on`, see
+    /// [`PhysicalHashJoin::on`]): the children of `filter` must be the probe
+    /// keys of `keys`, in this order (e.g. a filter created with
+    /// [`Self::filter_of`]), which the join sets it over.
+    pub fn new(filter: Arc<DynamicFilterPhysicalExpr>, keys: Vec<usize>) -> Self {
+        Self { filter, keys }
+    }
+
+    /// A new dynamic filter of the probe keys `keys` (indices of the join keys
+    /// `on`, pairs of a build key and a probe key), which is `true` until a
+    /// join sets it.
+    pub fn filter_of(
+        on: &[(PhysicalExprRef, PhysicalExprRef)],
+        keys: &[usize],
+    ) -> Result<Arc<DynamicFilterPhysicalExpr>> {
+        let probe_keys = keys
+            .iter()
+            .map(|&key| match on.get(key) {
+                Some((_, probe_key)) => Ok(Arc::clone(probe_key)),
+                None => {
+                    internal_err!("A join filter of the key {key} of {} keys", on.len())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(DynamicFilterPhysicalExpr::new(
+            probe_keys,
+            lit(true),
+        )))
+    }
+
+    /// The dynamic filter.
+    pub fn filter(&self) -> &Arc<DynamicFilterPhysicalExpr> {
+        &self.filter
+    }
+
+    /// The probe keys of the filter, as indices of the join keys.
+    pub fn keys(&self) -> &[usize] {
+        &self.keys
+    }
 }
 
 /// Everything about a join that does not depend on its inputs, only on
@@ -251,7 +319,7 @@ struct JoinSpec {
     tracks_key_range: bool,
     /// For every key, whether the build computes its bounds (its smallest and
     /// largest value), for the dynamic filters of the join (see
-    /// [`PhysicalHashJoin::dynamic_filter_predicate`]): the keys whose values
+    /// [`PhysicalHashJoin::dynamic_filter_predicates`]): the keys whose values
     /// are ordered like they are equal (see [`has_exact_bounds`]) of a join
     /// with dynamic filters. The values of these keys are also equal as join
     /// keys exactly if they are equal in an `IN` list.
@@ -532,6 +600,7 @@ impl PhysicalHashJoin {
             children: vec![build, probe],
             spec,
             dynamic_filters: vec![],
+            filter_targets: vec![],
         })
     }
 
@@ -636,7 +705,7 @@ impl PhysicalHashJoin {
             return Ok(None);
         }
         // The join sets its dynamic filters to the bounds (and `IN` lists) of
-        // the keys that have exact bounds (see `dynamic_filter_predicate`).
+        // the keys that have exact bounds (see `dynamic_filter_predicates`).
         if !dynamic_filters.is_empty() {
             let build_schema = join.left().schema();
             spec.bounded_keys = join
@@ -669,11 +738,79 @@ impl PhysicalHashJoin {
             children,
             spec,
             dynamic_filters,
+            filter_targets: vec![],
         }))
     }
 
+    /// The join, setting the dynamic filters `targets` too, each to the
+    /// predicates of its probe keys, when its build side is finalized (see
+    /// the [module documentation](self#dynamic-filters)), and marking them
+    /// complete:
+    ///
+    /// * a filter of all the keys is set like the filters of the
+    ///   `HashJoinExec` the join was lowered from (with the lookup of the keys
+    ///   in the hash table, unless their bounds and `IN` lists are exact);
+    /// * a filter of some of the keys (e.g. of the keys that a scan below the
+    ///   probe side produces, when the other keys come from other inputs) is
+    ///   set to the bounds and `IN` lists of its keys: the lookup needs all of
+    ///   them.
+    ///
+    /// A join whose probe rows count also if they do not match (one that
+    /// emits its unmatched probe rows, or a null-aware one) leaves the filters
+    /// `true`, as its own.
+    ///
+    /// Fails if the children of a filter are not the probe keys of its keys
+    /// (see [`JoinFilterTarget::new`]).
+    pub fn with_filter_targets(mut self, targets: Vec<JoinFilterTarget>) -> Result<Self> {
+        for target in &targets {
+            let probe_keys = target
+                .keys
+                .iter()
+                .map(|&key| self.spec.on.get(key).map(|(_, probe_key)| probe_key))
+                .collect::<Option<Vec<_>>>();
+            let children = target.filter.children();
+            let distinct = target
+                .keys
+                .iter()
+                .enumerate()
+                .all(|(i, key)| !target.keys[..i].contains(key));
+            let matches = probe_keys.is_some_and(|probe_keys| {
+                probe_keys.len() == children.len()
+                    && probe_keys
+                        .iter()
+                        .zip(&children)
+                        .all(|(probe_key, child)| *probe_key == *child)
+            });
+            if !distinct || !matches {
+                return internal_err!(
+                    "A dynamic filter of {} is not a filter of the probe keys {:?} of the join",
+                    target.filter,
+                    target.keys
+                );
+            }
+        }
+        if !targets.is_empty() {
+            // The build computes the bounds of the keys that have exact bounds.
+            self.spec.bounded_keys = self
+                .spec
+                .key_schema
+                .fields()
+                .iter()
+                .map(|field| has_exact_bounds(field.data_type()))
+                .collect();
+        }
+        self.filter_targets.extend(targets);
+        Ok(self)
+    }
+
+    /// The dynamic filters of some of the probe keys that the join sets too,
+    /// see [`Self::with_filter_targets`].
+    pub fn filter_targets(&self) -> &[JoinFilterTarget] {
+        &self.filter_targets
+    }
+
     /// Finalize the build side: build the hash table and set the dynamic
-    /// filters (see [`Self::dynamic_filter_predicate`]), unless the join was
+    /// filters (see [`Self::dynamic_filter_predicates`]), unless the join was
     /// canceled.
     fn finalize_build(
         &self,
@@ -690,13 +827,23 @@ impl PhysicalHashJoin {
         }
         let build_empty = state.build_rows.load(Ordering::Relaxed) == 0;
         let table = state.finish_build(spec)?;
-        if !self.dynamic_filters.is_empty() {
+        if !self.dynamic_filters.is_empty() || !self.filter_targets.is_empty() {
             let options = &ctx.task_ctx.session_config().options().optimizer;
-            let predicate =
-                self.dynamic_filter_predicate(&table, &state.key_stats.lock(), options)?;
-            if let Some(predicate) = predicate {
-                for filter in &self.dynamic_filters {
-                    filter.update(Arc::clone(&predicate))?;
+            let predicates =
+                self.dynamic_filter_predicates(&table, &state.key_stats.lock(), options)?;
+            if let Some(predicates) = predicates {
+                let all_keys = (0..spec.num_keys()).collect::<Vec<_>>();
+                if !self.dynamic_filters.is_empty()
+                    && let Some(predicate) = predicates.of_keys(&all_keys)
+                {
+                    for filter in &self.dynamic_filters {
+                        filter.update(Arc::clone(&predicate))?;
+                    }
+                }
+                for target in &self.filter_targets {
+                    if let Some(predicate) = predicates.of_keys(&target.keys) {
+                        target.filter.update(predicate)?;
+                    }
                 }
             }
         }
@@ -709,12 +856,13 @@ impl PhysicalHashJoin {
         Ok(SinkFinalize::Ready)
     }
 
-    /// The predicate of the probe keys that the dynamic filters of the join are
-    /// set to once its build side is collected, like DataFusion's: the bounds
-    /// and the membership of the build keys, `false` if no build row can match.
-    /// The nodes of the probe side that read the filters (e.g. Parquet scans)
-    /// then skip the files, row groups, pages and rows whose keys no build key
-    /// equals, which the join would drop anyway. For every key:
+    /// The predicates of the probe keys that the dynamic filters of the join
+    /// are set to once its build side is collected, like DataFusion's: the
+    /// bounds and the membership of the build keys, `false` if no build row can
+    /// match (see [`ProbeKeyPredicates`]). The nodes of the probe side that read
+    /// the filters (e.g. Parquet scans) then skip the files, row groups, pages
+    /// and rows whose keys no build key equals, which the join would drop
+    /// anyway. For every key:
     ///
     /// * `key >= min AND key <= max`, if it has exact bounds (see
     ///   [`JoinSpec::bounded_keys`]);
@@ -739,21 +887,25 @@ impl PhysicalHashJoin {
     /// statistics, pages and bloom filters cannot prune with): the lookup
     /// checks the tuples.
     ///
+    /// The filters of all keys are set to all these predicates, those of some
+    /// keys (see [`Self::with_filter_targets`]) to the predicates of their
+    /// keys.
+    ///
     /// `None` (the filters stay `true`) for the joins that emit their probe
     /// rows without a match, and the null-aware ones, whose probe rows count
     /// also if they do not match.
-    fn dynamic_filter_predicate(
+    fn dynamic_filter_predicates(
         &self,
         table: &Arc<JoinHashTable>,
         stats: &BuildKeyStats,
         options: &OptimizerOptions,
-    ) -> Result<Option<PhysicalExprRef>> {
+    ) -> Result<Option<ProbeKeyPredicates>> {
         let spec = &self.spec;
         if spec.null_aware || spec.emits_unmatched_probe_rows() {
             return Ok(None);
         }
         if table.is_empty() {
-            return Ok(Some(lit(false)));
+            return Ok(Some(ProbeKeyPredicates::nothing_matches()));
         }
         let null_keys_match = spec.null_equality == NullEquality::NullEqualsNull;
         // The distinct keys of a build side of few of them, for `IN` lists (not
@@ -780,7 +932,7 @@ impl PhysicalHashJoin {
             None
         };
         let probe_schema = self.probe_side().schema();
-        let mut predicates = Vec::with_capacity(spec.num_keys() + 1);
+        let mut predicates = Vec::with_capacity(spec.num_keys());
         // Whether the predicates are true for exactly the probe keys that a
         // build row has.
         let mut exact = spec.num_keys() == 1;
@@ -857,17 +1009,21 @@ impl PhysicalHashJoin {
                 _ => None,
             };
             exact &= key_exact && predicate.is_some();
-            predicates.extend(predicate);
+            predicates.push(predicate);
         }
-        if !exact {
+        let lookup = (!exact).then(|| {
             let keys = spec
                 .on
                 .iter()
                 .map(|(_, probe_key)| Arc::clone(probe_key))
                 .collect();
-            predicates.push(Arc::new(JoinHashTableLookupExpr::new(keys, table)));
-        }
-        Ok(Some(conjunction(predicates)))
+            Arc::new(JoinHashTableLookupExpr::new(keys, table)) as PhysicalExprRef
+        });
+        Ok(Some(ProbeKeyPredicates {
+            nothing_matches: false,
+            keys: predicates,
+            lookup,
+        }))
     }
 
     /// The build side (DataFusion's left input).
@@ -1603,9 +1759,52 @@ fn dynamic_filters(
         .collect()
 }
 
+/// The predicates of the probe keys of a join, once its build side is
+/// collected, that its dynamic filters are set to (see
+/// [`PhysicalHashJoin::dynamic_filter_predicates`]).
+#[derive(Debug)]
+struct ProbeKeyPredicates {
+    /// Whether no build row can match: then every filter is `false`.
+    nothing_matches: bool,
+    /// For every key, the predicate that its probe values satisfy if a build
+    /// key equals them (its bounds, its `IN` list, `key IS NULL`), if any.
+    keys: Vec<Option<PhysicalExprRef>>,
+    /// The lookup of all keys in the hash table, unless the predicates of the
+    /// keys are true for exactly the keys of the build rows.
+    lookup: Option<PhysicalExprRef>,
+}
+
+impl ProbeKeyPredicates {
+    /// The predicates of a join of which no build row can match.
+    fn nothing_matches() -> Self {
+        Self {
+            nothing_matches: true,
+            keys: vec![],
+            lookup: None,
+        }
+    }
+
+    /// The predicate of the probe keys `keys` (indices of the join keys): the
+    /// conjunction of their predicates, and of the lookup if they are all the
+    /// keys of the join; `None` if there is none (the filter stays `true`).
+    fn of_keys(&self, keys: &[usize]) -> Option<PhysicalExprRef> {
+        if self.nothing_matches {
+            return Some(lit(false));
+        }
+        let mut predicates = keys
+            .iter()
+            .filter_map(|&key| self.keys.get(key).cloned().flatten())
+            .collect::<Vec<_>>();
+        if (0..self.keys.len()).all(|key| keys.contains(&key)) {
+            predicates.extend(self.lookup.iter().cloned());
+        }
+        (!predicates.is_empty()).then(|| conjunction(predicates))
+    }
+}
+
 /// Whether the values of `data_type` are ordered like they are equal as join
 /// keys, so that every key equal to a build key is between the smallest and
-/// the largest build key (which [`PhysicalHashJoin::dynamic_filter_predicate`]
+/// the largest build key (which [`PhysicalHashJoin::dynamic_filter_predicates`]
 /// prunes the probe side with): integers, decimals, dates, times, timestamps,
 /// durations, booleans, strings and binaries. Not floating point numbers, of
 /// which `-0.0` and `+0.0` are equal keys, but ordered (like the `NaN`s with
@@ -2231,6 +2430,9 @@ impl PhysicalOperator for PhysicalHashJoin {
         for filter in &self.dynamic_filters {
             filter.mark_complete();
         }
+        for target in &self.filter_targets {
+            target.filter.mark_complete();
+        }
         result
     }
 
@@ -2470,7 +2672,7 @@ impl PhysicalOperator for JoinHashTableBuild {
 
 /// The membership of the probe keys of a [`PhysicalHashJoin`] in its build
 /// keys, with which the join sets its dynamic filters (see
-/// `PhysicalHashJoin::dynamic_filter_predicate`), like DataFusion's
+/// `PhysicalHashJoin::dynamic_filter_predicates`), like DataFusion's
 /// `HashTableLookupExpr`: whether a build row of the [`JoinHashTable`] of the
 /// join may have the keys of a row (see [`JoinHashTable::may_contain_keys`]).
 /// It is `true` for every row with a match, and `false` for almost all
@@ -5966,6 +6168,146 @@ mod tests {
             assert_eq!(filters[0].current()?.to_string(), expected, "{sql}");
             assert_join_parity_with_setup(sql, config.clone(), &setup, 1).await;
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filter_targets_are_set_to_the_predicates_of_their_keys() -> Result<()> {
+        // Joins of the memory tables `b` (the build side) and `t` on two keys,
+        // `b.k = t.k AND b.w = t.d`, with filter targets of the first key, of
+        // the second one and of both (in the other order): when the build side
+        // is finalized, the join sets each of them to the bounds and `IN`
+        // lists of its keys (`k` has no `IN` list: its values 1, 2 and 3 fill
+        // their bounds), and the filter of both keys to the lookup of the keys
+        // in the hash table too, and marks them complete. A copy of a filter
+        // over other columns (as a scan reads it) reads the predicate over its
+        // columns. No build row matches without build rows: the filters are
+        // `false`. A join that emits its unmatched probe rows leaves them
+        // `true`.
+        let setup = async |ctx: &SessionContext| {
+            let b = RecordBatch::try_from_iter([
+                ("k", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef),
+                (
+                    "w",
+                    Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+                ),
+            ])?;
+            let t = RecordBatch::try_from_iter([
+                (
+                    "k",
+                    Arc::new(Int64Array::from_iter_values(0..100)) as ArrayRef,
+                ),
+                (
+                    "d",
+                    Arc::new(Int64Array::from_iter_values((0..100).map(|i| i % 40)))
+                        as ArrayRef,
+                ),
+            ])?;
+            ctx.register_batch("b", b)?;
+            ctx.register_batch("t", t)?;
+            Ok(())
+        };
+        let mut config = test_session_config();
+        config.options_mut().optimizer.join_reordering = false;
+        let both = "d@1 >= 10 AND d@1 <= 30 AND d@1 IN (SET) ([10, 20, 30]) \
+                    AND k@0 >= 1 AND k@0 <= 3 AND hash_lookup(k@0, d@1)";
+        for (sql, expected) in [
+            (
+                "SELECT b.w, t.k FROM b JOIN t ON b.k = t.k AND b.w = t.d",
+                [
+                    "k@0 >= 1 AND k@0 <= 3",
+                    "d@1 >= 10 AND d@1 <= 30 AND d@1 IN (SET) ([10, 20, 30])",
+                    both,
+                ],
+            ),
+            (
+                "SELECT b.w, t.k FROM b JOIN t ON b.k = t.k AND b.w = t.d WHERE b.w > 30",
+                ["false"; 3],
+            ),
+            (
+                "SELECT b.w, t.k FROM b RIGHT JOIN t ON b.k = t.k AND b.w = t.d",
+                ["true"; 3],
+            ),
+        ] {
+            let ctx = datafusion_context(config.clone());
+            setup(&ctx).await?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let join = PhysicalHashJoin::try_lower(&plan, lower)?
+                .unwrap_or_else(|| panic!("{sql}: not a native join"));
+            assert!(
+                dynamic_filters(&plan).is_some_and(|f| f.is_empty()),
+                "{sql}"
+            );
+            let on = join.on().to_vec();
+            let targets = [vec![0], vec![1], vec![1, 0]]
+                .into_iter()
+                .map(|keys| {
+                    Ok(JoinFilterTarget::new(
+                        JoinFilterTarget::filter_of(&on, &keys)?,
+                        keys,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // A scan of the columns `(x, k, d)` reads its copy of the filter of
+            // `d`.
+            let scan_filter = (Arc::clone(targets[1].filter()) as PhysicalExprRef)
+                .with_new_children(vec![Arc::new(Column::new("d", 2))])?;
+            let join = join.with_filter_targets(targets.clone())?;
+            assert_eq!(join.filter_targets().len(), 3, "{sql}");
+            let exec = Arc::new(PipelineRootExec::try_new(Arc::new(join), plan)?);
+            with_timeout(collect(exec, ctx.task_ctx())).await?;
+            for (target, expected) in targets.iter().zip(expected) {
+                let filter = target.filter();
+                assert!(filter.is_complete(), "{sql}: {filter}");
+                assert_eq!(filter.current()?.to_string(), expected, "{sql}");
+            }
+            let scan_expected = expected[1].replace("d@1", "d@2");
+            let scan_predicate = scan_filter
+                .downcast_ref::<DynamicFilterPhysicalExpr>()
+                .expect("a dynamic filter")
+                .current()?;
+            assert_eq!(scan_predicate.to_string(), scan_expected, "{sql}");
+            assert_join_parity_with_setup(sql, config.clone(), &setup, 1).await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filter_targets_must_be_filters_of_probe_keys() -> Result<()> {
+        // A target whose filter is not a filter of the probe keys of its keys,
+        // of a key that the join does not have, or of a key twice, is refused.
+        let ctx = datafusion_context(test_session_config());
+        register_test_tables(&ctx)?;
+        let sql = "SELECT t1.id, t2.w FROM t2 JOIN t1 ON t2.k = t1.a AND t2.w = t1.b";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let join = find_hash_join(&plan).expect("a hash join");
+        let native = || {
+            PhysicalHashJoin::try_lower(&join, lower)
+                .map(|join| join.expect("a native join"))
+        };
+        let on = native()?.on().to_vec();
+        assert!(JoinFilterTarget::filter_of(&on, &[2]).is_err());
+        let of_key = |key: usize| JoinFilterTarget::filter_of(&on, &[key]);
+        let both = JoinFilterTarget::filter_of(&on, &[0, 0])?;
+        for target in [
+            JoinFilterTarget::new(of_key(0)?, vec![1]),
+            JoinFilterTarget::new(of_key(0)?, vec![0, 1]),
+            JoinFilterTarget::new(of_key(0)?, vec![2]),
+            JoinFilterTarget::new(both, vec![0, 0]),
+        ] {
+            let error = native()?
+                .with_filter_targets(vec![target.clone()])
+                .expect_err("an invalid target");
+            assert!(
+                error
+                    .to_string()
+                    .contains("is not a filter of the probe keys"),
+                "{target:?}: {error}"
+            );
+        }
+        let target = JoinFilterTarget::new(of_key(1)?, vec![1]);
+        let join = native()?.with_filter_targets(vec![target])?;
+        assert_eq!(join.filter_targets()[0].keys(), &[1]);
         Ok(())
     }
 
