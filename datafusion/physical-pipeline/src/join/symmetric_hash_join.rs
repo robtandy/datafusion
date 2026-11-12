@@ -128,8 +128,8 @@ use parking_lot::Mutex;
 
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, evaluate_keys, filter_mask, is_smaller,
-    key_memory, matchable_rows, probe_role, without_reordering,
+    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, comparable_type, evaluate_keys,
+    filter_mask, is_smaller, key_memory, matchable_rows, probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -352,7 +352,8 @@ impl SymmetricJoinSpec {
                     "PhysicalSymmetricHashJoin requires join keys of the same type, key {i} has types {left_type} and {right_type}"
                 );
             }
-            key_fields.push(SortField::new(left_type));
+            // Unions as DataFusion compares them (see `comparable_unions`).
+            key_fields.push(SortField::new(comparable_type(&left_type)));
         }
         if !RowConverter::supports_fields(&key_fields) {
             return plan_err!("The row format does not support the keys of the join");
@@ -1878,7 +1879,8 @@ pub(crate) mod tests {
     use crate::join::merge_join::allocations;
     use crate::join::merge_join::tests::{
         ALL_JOIN_TYPES, PeakPool, data_batch, data_schema, dictionary_view_rows,
-        join_filter, limited_task_ctx, num_rows, run_native, with_timeout,
+        join_filter, keyed_rows, limited_task_ctx, num_rows, reference_join_of_keys,
+        run_native, union_key_layouts, union_key_matches, with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4590,6 +4592,79 @@ pub(crate) mod tests {
             "the query holds {held} bytes, and reserves {reserved}"
         );
         assert!(reserved < 1 << 20, "the join reserves {reserved} bytes");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_keys_are_joined_as_datafusion_compares_them() -> Result<()> {
+        // Streams of union keys, with a NULL of the Int32 child on the left
+        // and of the Utf8 child on the right: DataFusion compares them as equal
+        // NULLs (also nested in lists and structs, where they match either
+        // way), which the row format distinguishes by their types. The
+        // symmetric join matches the rows of DataFusion's sort-merge join.
+        for (name, keys) in union_key_layouts() {
+            for null_equality in [
+                NullEquality::NullEqualsNull,
+                NullEquality::NullEqualsNothing,
+            ] {
+                for join_type in [JoinType::Inner, JoinType::Full] {
+                    let context = format!("{name} {null_equality:?} {join_type}");
+                    let expected =
+                        reference_join_of_keys(&keys, join_type, null_equality).await?;
+                    if join_type == JoinType::Inner {
+                        assert_eq!(
+                            num_rows(&expected.batches),
+                            union_key_matches(name, null_equality),
+                            "{context}"
+                        );
+                    }
+                    let stream =
+                        |side: &str, keys: &ArrayRef| -> Arc<dyn ExecutionPlan> {
+                            let batch = keyed_rows(side, keys);
+                            let schema = batch.schema();
+                            let partition = BatchesPartition {
+                                schema: Arc::clone(&schema),
+                                batches: vec![batch],
+                                forever: false,
+                            };
+                            Arc::new(
+                                StreamingTableExec::try_new(
+                                    schema,
+                                    vec![Arc::new(partition)],
+                                    None,
+                                    [],
+                                    true,
+                                    None,
+                                )
+                                .unwrap(),
+                            )
+                        };
+                    let (left, right) = (stream("l", &keys[0]), stream("r", &keys[1]));
+                    let on =
+                        vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                    let plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(SymmetricHashJoinExec::try_new(
+                            left,
+                            right,
+                            on,
+                            None,
+                            &join_type,
+                            null_equality,
+                            None,
+                            None,
+                            StreamJoinPartitionMode::SinglePartition,
+                        )?);
+                    let root = lower(&plan)?;
+                    assert!(root.is::<PhysicalSymmetricHashJoin>(), "{context}");
+                    let actual = run_native(&root, plan, task_ctx())
+                        .await
+                        .unwrap_or_else(|e| panic!("{context}: {e}"));
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!("Results differ: {message}\n{context}");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

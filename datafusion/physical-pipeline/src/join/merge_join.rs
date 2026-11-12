@@ -130,8 +130,8 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
-    make_array, new_empty_array, new_null_array,
+    Array, ArrayRef, AsArray, BooleanArray, Int8Array, RecordBatch, RecordBatchOptions,
+    StructArray, UInt32Array, make_array, new_empty_array, new_null_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{
@@ -139,8 +139,8 @@ use arrow::compute::{
     take_record_batch,
 };
 use arrow::datatypes::{
-    DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    Schema, SchemaRef, UnionMode,
+    DataType, Field, FieldRef, Float16Type, Float32Type, Float64Type, Int16Type,
+    Int32Type, Int64Type, Schema, SchemaRef, UnionMode,
 };
 use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use datafusion_common::cast::as_boolean_array;
@@ -1174,10 +1174,112 @@ pub(crate) fn evaluate_keys(
     batch: &RecordBatch,
 ) -> Result<Vec<ArrayRef>> {
     let keys = keys.into_iter().collect::<Vec<_>>();
-    Ok(evaluate_expressions_to_arrays(&keys, batch)?
+    evaluate_expressions_to_arrays(&keys, batch)?
         .iter()
-        .map(normalize_floats)
-        .collect())
+        .map(|key| comparable_unions(&normalize_floats(key)))
+        .collect()
+}
+
+/// `array` with its unions (also those nested in it) replaced by structs of
+/// the type id and of the children of their values (`{type_id, c<id>, ...}`:
+/// the value of the child of the type id, NULLs of the other children), NULL
+/// where the union is (where the value of its child is), see
+/// [`comparable_type`]. The row format encodes a union as its type id and the
+/// value of its child, which distinguishes NULLs of children of other types
+/// (and orders them by their types), while DataFusion compares join keys (see
+/// `JoinKeyComparator`, of `make_comparator`) with all NULL unions equal, and
+/// the others by their type ids, then by their values: as the row format
+/// compares the structs, in the order of the keys (with their NULLs first or
+/// last).
+pub(crate) fn comparable_unions(array: &ArrayRef) -> Result<ArrayRef> {
+    if !has_union(array.data_type()) {
+        return Ok(Arc::clone(array));
+    }
+    let data_type = comparable_type(array.data_type());
+    if let DataType::Union(fields, _) = array.data_type() {
+        let union = array.as_union();
+        let mut columns: Vec<ArrayRef> =
+            vec![Arc::new(Int8Array::new(union.type_ids().clone(), None))];
+        for (type_id, _) in fields.iter() {
+            // The values of the rows of the type, NULLs for the others.
+            let indices = UInt32Array::from_iter((0..union.len()).map(|row| {
+                (union.type_id(row) == type_id).then(|| union.value_offset(row) as u32)
+            }));
+            let child = take(union.child(type_id).as_ref(), &indices, None)?;
+            columns.push(comparable_unions(&child)?);
+        }
+        let DataType::Struct(fields) = data_type else {
+            return internal_err!("The comparable type of a union is not a struct");
+        };
+        return Ok(Arc::new(StructArray::try_new(
+            fields,
+            columns,
+            union.logical_nulls(),
+        )?));
+    }
+    // The unions in the children (of a struct, a list, a dictionary, ...).
+    let data = array.to_data();
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| Ok(comparable_unions(&make_array(child.clone()))?.to_data()))
+        .collect::<Result<Vec<_>>>()?;
+    let data = data
+        .into_builder()
+        .data_type(data_type)
+        .child_data(children)
+        .build()?;
+    Ok(make_array(data))
+}
+
+/// The type of the values of `data_type` with their unions (also those nested
+/// in them) replaced by structs of their type ids and of their children (see
+/// [`comparable_unions`]).
+pub(crate) fn comparable_type(data_type: &DataType) -> DataType {
+    if !has_union(data_type) {
+        return data_type.clone();
+    }
+    // A field of unions may be NULL as a struct.
+    let field = |field: &FieldRef| -> FieldRef {
+        let nullable =
+            field.is_nullable() || matches!(field.data_type(), DataType::Union(_, _));
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(comparable_type(field.data_type()))
+                .with_nullable(nullable),
+        )
+    };
+    match data_type {
+        DataType::Union(fields, _) => DataType::Struct(
+            std::iter::once(Field::new("type_id", DataType::Int8, false))
+                .chain(fields.iter().map(|(type_id, field)| {
+                    Field::new(
+                        format!("c{type_id}"),
+                        comparable_type(field.data_type()),
+                        true,
+                    )
+                }))
+                .collect(),
+        ),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+        DataType::List(item) => DataType::List(field(item)),
+        DataType::LargeList(item) => DataType::LargeList(field(item)),
+        DataType::ListView(item) => DataType::ListView(field(item)),
+        DataType::LargeListView(item) => DataType::LargeListView(field(item)),
+        DataType::FixedSizeList(item, size) => {
+            DataType::FixedSizeList(field(item), *size)
+        }
+        DataType::Map(entries, sorted) => DataType::Map(field(entries), *sorted),
+        DataType::Dictionary(key, values) => {
+            DataType::Dictionary(key.clone(), Box::new(comparable_type(values)))
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            DataType::RunEndEncoded(Arc::clone(run_ends), field(values))
+        }
+        data_type => data_type.clone(),
+    }
 }
 
 /// The memory of the arrays `keys`, the keys of the rows of `batch` (see
@@ -2451,8 +2553,10 @@ impl MergeJoinSpec {
                     "PhysicalMergeJoin requires join keys of the same type, key {i} has types {left_type} and {right_type}"
                 );
             }
-            KeyComponent::push(i, &left_type, vec![], &mut components);
-            key_fields.push(SortField::new_with_options(left_type, *options));
+            // Unions as DataFusion compares them (see `comparable_unions`).
+            let key_type = comparable_type(&left_type);
+            KeyComponent::push(i, &key_type, vec![], &mut components);
+            key_fields.push(SortField::new_with_options(key_type, *options));
         }
         if !RowConverter::supports_fields(&key_fields) {
             return not_impl_err!("The row format does not support the keys of the join");
@@ -3522,7 +3626,10 @@ impl BufferedWindow {
             let raw = evaluate_expressions_to_arrays(
                 &spec.buffered_keys().collect::<Vec<_>>(),
                 &last,
-            )?;
+            )?
+            .iter()
+            .map(comparable_unions)
+            .collect::<Result<Vec<_>>>()?;
             let flips = spec.zero_components.iter().any(|&index| {
                 let component = &spec.components[index];
                 let negative = !spec
@@ -4873,7 +4980,7 @@ pub(crate) mod tests {
         TimestampNanosecondArray,
     };
     use arrow::compute::{SortColumn, lexsort_to_indices};
-    use arrow::datatypes::{Field, Fields, TimeUnit};
+    use arrow::datatypes::{Field, Fields, TimeUnit, UnionFields};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -7617,6 +7724,258 @@ pub(crate) mod tests {
             allocated < 16 << 20,
             "the query allocated {allocated} bytes"
         );
+        Ok(())
+    }
+
+    /// A value of a union `{0: Int32, 1: Utf8}` of the joins of union keys.
+    #[derive(Clone, Copy)]
+    enum UnionValue {
+        Int(Option<i32>),
+        Str(Option<&'static str>),
+    }
+
+    /// The union `{0: Int32, 1: Utf8}` of `values`, dense or sparse.
+    fn union_of(values: &[UnionValue], mode: UnionMode) -> ArrayRef {
+        let fields = UnionFields::try_new(
+            [0, 1],
+            [
+                Field::new("i", DataType::Int32, true),
+                Field::new("s", DataType::Utf8, true),
+            ],
+        )
+        .unwrap();
+        let type_ids = values
+            .iter()
+            .map(|value| match value {
+                UnionValue::Int(_) => 0,
+                UnionValue::Str(_) => 1,
+            })
+            .collect::<Vec<i8>>();
+        let ints = |all: bool| {
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    UnionValue::Int(value) => Some(*value),
+                    UnionValue::Str(_) => all.then_some(None),
+                })
+                .collect::<Int32Array>()
+        };
+        let strings = |all: bool| {
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    UnionValue::Str(value) => Some(*value),
+                    UnionValue::Int(_) => all.then_some(None),
+                })
+                .collect::<StringArray>()
+        };
+        let offsets = match mode {
+            UnionMode::Dense => {
+                let mut next = [0, 0];
+                Some(
+                    type_ids
+                        .iter()
+                        .map(|&type_id| {
+                            let offset = next[type_id as usize];
+                            next[type_id as usize] += 1;
+                            offset
+                        })
+                        .collect::<Vec<i32>>()
+                        .into(),
+                )
+            }
+            UnionMode::Sparse => None,
+        };
+        let sparse = mode == UnionMode::Sparse;
+        Arc::new(
+            arrow::array::UnionArray::try_new(
+                fields,
+                type_ids.into(),
+                offsets,
+                vec![Arc::new(ints(sparse)), Arc::new(strings(sparse))],
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The keys of the left and of the right input of the joins of union keys
+    /// (in the order in which DataFusion sorts them, NULLs first), of every
+    /// layout: of a union of a NULL of either type (that DataFusion compares
+    /// as equal NULLs), and of values, dense, sparse, in lists and in structs.
+    pub(crate) fn union_key_layouts() -> Vec<(&'static str, [ArrayRef; 2])> {
+        use UnionValue::{Int, Str};
+        let left = [Int(None), Int(Some(5)), Str(Some("a"))];
+        let right = [Str(None), Int(Some(5)), Str(Some("a")), Str(Some("b"))];
+        let in_lists = |values: &[UnionValue]| -> ArrayRef {
+            let values = union_of(values, UnionMode::Dense);
+            let item = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+            Arc::new(ListArray::new(
+                item,
+                arrow::buffer::OffsetBuffer::from_lengths(vec![1; values.len()]),
+                values,
+                None,
+            ))
+        };
+        let in_structs = |values: &[UnionValue]| -> ArrayRef {
+            let values = union_of(values, UnionMode::Dense);
+            let fields =
+                Fields::from(vec![Field::new("u", values.data_type().clone(), true)]);
+            Arc::new(StructArray::new(fields, vec![values], None))
+        };
+        vec![
+            (
+                "dense unions",
+                [
+                    union_of(&left, UnionMode::Dense),
+                    union_of(&right, UnionMode::Dense),
+                ],
+            ),
+            (
+                "sparse unions",
+                [
+                    union_of(&left, UnionMode::Sparse),
+                    union_of(&right, UnionMode::Sparse),
+                ],
+            ),
+            ("lists of unions", [in_lists(&left), in_lists(&right)]),
+            ("structs of unions", [in_structs(&left), in_structs(&right)]),
+        ]
+    }
+
+    /// The rows `(<side>id, <side>k)` of the keys `keys`.
+    pub(crate) fn keyed_rows(side: &str, keys: &ArrayRef) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), keys.data_type().clone(), true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..keys.len() as i64)),
+                Arc::clone(keys),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// DataFusion's sort-merge join (which compares the keys with its
+    /// `JoinKeyComparator`) of the rows of the keys `keys` (sorted as it sorts
+    /// them), on `lk = rk`.
+    pub(crate) async fn reference_join_of_keys(
+        keys: &[ArrayRef; 2],
+        join_type: JoinType,
+        null_equality: NullEquality,
+    ) -> Result<EngineOutput> {
+        let bounded = |side: &str, keys: &ArrayRef| {
+            let batch = keyed_rows(side, keys);
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                .unwrap() as Arc<dyn ExecutionPlan>
+        };
+        let (left, right) = (bounded("l", &keys[0]), bounded("r", &keys[1]));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            join_type,
+            vec![SortOptions::default()],
+            null_equality,
+        )?);
+        Ok(EngineOutput {
+            schema: plan.schema(),
+            batches: with_timeout(collect(Arc::clone(&plan), task_ctx())).await?,
+            plan,
+            ordered: false,
+        })
+    }
+
+    /// The rows that the Inner joins of [`union_key_layouts`] match: the keys
+    /// of NULLs of either type are equal NULLs (unless in lists or structs, of
+    /// keys that are not NULL), the other ones match as values.
+    pub(crate) fn union_key_matches(name: &str, null_equality: NullEquality) -> usize {
+        let nested = name.starts_with("lists") || name.starts_with("structs");
+        match (nested, null_equality) {
+            (false, NullEquality::NullEqualsNothing) => 2,
+            _ => 3,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn union_keys_are_merged_as_datafusion_compares_them() -> Result<()> {
+        // Sorted streams of union keys, with a NULL of the Int32 child on the
+        // left and of the Utf8 child on the right: DataFusion compares them as
+        // equal NULLs (also nested in lists and structs, where they match
+        // either way), which the row format distinguishes by their types. The
+        // merge join matches the rows of DataFusion's sort-merge join.
+        for (name, keys) in union_key_layouts() {
+            for null_equality in [
+                NullEquality::NullEqualsNull,
+                NullEquality::NullEqualsNothing,
+            ] {
+                // Joins that keep the order of their streamed input are merged
+                // (the others are symmetric hash joins of the streams).
+                for join_type in [JoinType::Inner, JoinType::Left] {
+                    let context = format!("{name} {null_equality:?} {join_type}");
+                    let expected =
+                        reference_join_of_keys(&keys, join_type, null_equality).await?;
+                    if join_type == JoinType::Inner {
+                        assert_eq!(
+                            num_rows(&expected.batches),
+                            union_key_matches(name, null_equality),
+                            "{context}"
+                        );
+                    }
+                    let stream =
+                        |side: &str, keys: &ArrayRef| -> Arc<dyn ExecutionPlan> {
+                            let batch = keyed_rows(side, keys);
+                            let schema = batch.schema();
+                            let order = LexOrdering::new([PhysicalSortExpr::new(
+                                col(&format!("{side}k"), &schema).unwrap(),
+                                SortOptions::default(),
+                            )])
+                            .unwrap();
+                            let partition = StreamPartition {
+                                schema: Arc::clone(&schema),
+                                batches: vec![batch],
+                                forever: false,
+                            };
+                            Arc::new(
+                                StreamingTableExec::try_new(
+                                    schema,
+                                    vec![Arc::new(partition)],
+                                    None,
+                                    [order],
+                                    true,
+                                    None,
+                                )
+                                .unwrap(),
+                            )
+                        };
+                    let (left, right) = (stream("l", &keys[0]), stream("r", &keys[1]));
+                    let on =
+                        vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                    let plan: Arc<dyn ExecutionPlan> =
+                        Arc::new(SortMergeJoinExec::try_new(
+                            left,
+                            right,
+                            on,
+                            None,
+                            join_type,
+                            vec![SortOptions::default()],
+                            null_equality,
+                        )?);
+                    let root = crate::planner::lower_execution_plan(&plan)?;
+                    assert_streaming_merge_join(&root, &context);
+                    let actual = run_native(&root, plan, task_ctx())
+                        .await
+                        .unwrap_or_else(|e| panic!("{context}: {e}"));
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!("Results differ: {message}\n{context}");
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
