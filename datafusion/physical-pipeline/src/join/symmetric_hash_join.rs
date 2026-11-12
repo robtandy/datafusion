@@ -525,12 +525,10 @@ impl SortedFilter {
         // The values are compared with `-0.0` as `+0.0` (see `Pruning`), but
         // interval arithmetic orders `-0.0` before `+0.0`: an expression that
         // turns a zero into `-0.0` (a negation, a product or a quotient, or the
-        // literal) would make it rule out rows that the filter matches.
-        let floats = filter
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| field.data_type().is_floating());
+        // literal) of floats, also of floats that the filter computes (e.g. a
+        // cast of integers), would make it rule out rows that the filter
+        // matches.
+        let floats = has_float_values(filter.expression(), filter.schema());
         if floats && may_negate_zeros(filter.expression()) {
             return Ok(None);
         }
@@ -615,6 +613,17 @@ fn filter_expression(
         .data()?;
     let contains = |expr: &PhysicalExprRef| has_subexpression(expr, &converted);
     Ok((complete && contains(filter.expression())).then_some(converted))
+}
+
+/// Whether `expr`, or an expression below it, evaluates to floats (of the
+/// columns of `schema`).
+fn has_float_values(expr: &PhysicalExprRef, schema: &Schema) -> bool {
+    expr.data_type(schema)
+        .is_ok_and(|data_type| data_type.is_floating())
+        || expr
+            .children()
+            .into_iter()
+            .any(|child| has_float_values(child, schema))
 }
 
 /// Whether `expr` may evaluate to `-0.0` for operands that are `+0.0`: it has a
@@ -1574,7 +1583,9 @@ pub(crate) mod tests {
     use datafusion_expr::Operator;
     use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::col;
-    use datafusion_physical_expr::expressions::{BinaryExpr, lit};
+    use datafusion_physical_expr::expressions::{
+        BinaryExpr, CastExpr, NegativeExpr, lit,
+    };
     use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion_physical_plan::Partitioning;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -3862,6 +3873,133 @@ pub(crate) mod tests {
         let root = lower(&join)?;
         let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
         assert_eq!(num_rows(&output.batches), 8);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computed_signed_zeros_determine_no_rows() -> Result<()> {
+        // Integer times, all zero, by which the inputs are sorted as doubles,
+        // and the filter `-CAST(lt AS DOUBLE) = CAST(rt AS DOUBLE)`, which
+        // computes `-0.0` of the left times: the filter compares it as `+0.0`,
+        // interval arithmetic before it, so that the join does not determine
+        // rows by the orders, and the left row matches the three right rows (in
+        // batches of their own), as with DataFusion's hash join.
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Int32, false),
+                Field::new(format!("{side}t"), DataType::Int64, false),
+            ])) as SchemaRef
+        };
+        let rows = |side: &str, ids: Range<i64>| {
+            let n = (ids.end - ids.start) as usize;
+            RecordBatch::try_new(
+                schema(side),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(ids)),
+                    Arc::new(Int32Array::from(vec![1; n])),
+                    Arc::new(Int64Array::from(vec![0; n])),
+                ],
+            )
+            .unwrap()
+        };
+        let double = |expr: PhysicalExprRef| -> PhysicalExprRef {
+            Arc::new(CastExpr::new(expr, DataType::Float64, None))
+        };
+        let filter = || {
+            let filter_schema = Arc::new(Schema::new(vec![
+                Field::new("lt", DataType::Int64, false),
+                Field::new("rt", DataType::Int64, false),
+            ]));
+            let (lt, rt) = (
+                col("lt", &filter_schema).unwrap(),
+                col("rt", &filter_schema).unwrap(),
+            );
+            let negated: PhysicalExprRef = Arc::new(NegativeExpr::new(double(lt)));
+            JoinFilter::new(
+                binary(negated, Operator::Eq, double(rt)),
+                vec![
+                    ColumnIndex {
+                        index: 2,
+                        side: JoinSide::Left,
+                    },
+                    ColumnIndex {
+                        index: 2,
+                        side: JoinSide::Right,
+                    },
+                ],
+                filter_schema,
+            )
+        };
+        let order = |side: &str| {
+            let time = col(&format!("{side}t"), &schema(side)).unwrap();
+            LexOrdering::new([PhysicalSortExpr::new(
+                double(time),
+                SortOptions::new(false, false),
+            )])
+            .unwrap()
+        };
+        let stream = |side: &str, batches: Vec<RecordBatch>| {
+            let partition = BatchesPartition {
+                schema: schema(side),
+                batches,
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [order(side)],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let reference = hash_join(
+            MemorySourceConfig::try_new_exec(
+                &[vec![rows("l", 0..1)]],
+                schema("l"),
+                None,
+            )?,
+            MemorySourceConfig::try_new_exec(
+                &[vec![rows("r", 0..3)]],
+                schema("r"),
+                None,
+            )?,
+            JoinType::Inner,
+            Some(filter()),
+            NullEquality::NullEqualsNothing,
+        )?;
+        let expected = EngineOutput {
+            schema: reference.schema(),
+            batches: with_timeout(collect(Arc::clone(&reference), task_ctx())).await?,
+            plan: reference,
+            ordered: false,
+        };
+        assert_eq!(num_rows(&expected.batches), 3);
+        let left = stream("l", vec![rows("l", 0..1)]);
+        let right = stream("r", (0..3).map(|id| rows("r", id..id + 1)).collect());
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(filter()),
+            &JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+            Some(order("l")),
+            Some(order("r")),
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&plan)?;
+        let join = root.downcast_ref::<PhysicalSymmetricHashJoin>().unwrap();
+        assert!(!join.determines_rows_by_order());
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("Results differ: {message}");
+        }
         Ok(())
     }
 }

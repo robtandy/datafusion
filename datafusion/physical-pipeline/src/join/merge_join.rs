@@ -131,7 +131,7 @@ use std::task::{Context, Poll};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
-    make_array, new_empty_array, new_null_array,
+    make_array, make_comparator, new_empty_array, new_null_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{
@@ -2155,9 +2155,8 @@ struct MergeJoinSpec {
     /// are not sorted by the keys of the join (in which `-0.0` is `+0.0`)
     /// where such a component is (or has) a zero (see [`ZeroRuns`]).
     zero_components: Vec<usize>,
-    /// For every key, whether the inputs are sorted by it in descending
-    /// order.
-    descending: Vec<bool>,
+    /// For every key, the order by which the inputs are sorted.
+    key_options: Vec<SortOptions>,
 }
 
 impl MergeJoinSpec {
@@ -2267,10 +2266,7 @@ impl MergeJoinSpec {
             widths,
             components,
             zero_components,
-            descending: sort_options
-                .iter()
-                .map(|options| options.descending)
-                .collect(),
+            key_options: sort_options.to_vec(),
         })
     }
 
@@ -2386,6 +2382,34 @@ impl MergeJoinSpec {
             _ => 1,
         };
         self.widths[side].null_row_bytes(OUTPUT)
+    }
+
+    /// The order of the values of the component `index` of the keys (see
+    /// [`KeyComponent`]): that of its key, or, for the validity of a struct,
+    /// with the NULLs (`false`) first if its key has them first.
+    fn component_options(&self, index: usize) -> SortOptions {
+        let component = &self.components[index];
+        let options = self
+            .key_options
+            .get(component.key)
+            .copied()
+            .unwrap_or_default();
+        match component.validity {
+            true => SortOptions::new(!options.nulls_first, false),
+            false => options,
+        }
+    }
+
+    /// The number of components that bound the keys of the rows of a run of
+    /// signed zeros (see [`PendingRun::bound`]) whose zero component is the
+    /// one at `position` in `zero_components`: those before it, and it if it
+    /// is a float (then a zero, as `+0.0`).
+    fn bound_components(&self, position: usize) -> usize {
+        let index = self.zero_components[position];
+        match self.components[index].data_type {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => index + 1,
+            _ => index,
+        }
     }
 
     fn key_converter(&self) -> Result<RowConverter> {
@@ -2536,10 +2560,14 @@ impl PhysicalMergeJoin {
         let matchable = matchable_rows(&arrays, self.spec.null_equality);
         let zero_runs = ZeroRuns::of(&self.spec, &arrays)?;
         let keys = progress.converter.convert_columns(&arrays)?;
-        drop(arrays);
+        let key_arrays = match self.spec.zero_components.is_empty() {
+            true => vec![],
+            false => arrays,
+        };
         let gathered = self.spec.gathered_bytes(&batch, true);
         chunk_reservation.try_resize(
-            keys.size()
+            computed_key_bytes(&key_arrays, &batch)
+                + keys.size()
                 + zero_runs.as_ref().map_or(0, ZeroRuns::size)
                 + gathered.capacity() * size_of::<usize>()
                 + matchable.as_ref().map_or(0, |nulls| nulls.buffer().len()),
@@ -2550,6 +2578,7 @@ impl PhysicalMergeJoin {
             matchable,
             gathered,
             zero_runs,
+            key_arrays,
             _reservation: chunk_reservation,
             next_row: 0,
             in_progress: None,
@@ -2570,16 +2599,16 @@ impl PhysicalMergeJoin {
     /// streamed rows. A streamed row whose candidates do not all fit is
     /// continued by the next call.
     ///
-    /// `complete(key)` tells whether `buffered` has all the buffered rows that
-    /// a streamed row with the key `key` (`None`: a key that cannot match) may
-    /// match: a buffered input that is read as a stream may not have them yet.
+    /// `complete(key, row)` tells whether `buffered` has all the buffered rows
+    /// that the streamed row `row`, with the key `key` (`None`: a key that
+    /// cannot match), may match: a buffered input that is read as a stream may not have them yet.
     /// The batch stops before the first streamed row whose rows are not
     /// complete, and the output says so ([`MergeOutput::needs_buffered_rows`]).
     fn next_output(
         &self,
         progress: &mut MergeProgress,
         buffered: &BufferedRows,
-        complete: &dyn Fn(Option<Row<'_>>) -> bool,
+        complete: &dyn Fn(Option<Row<'_>>, usize) -> bool,
         reservation: &MemoryReservation,
     ) -> Result<MergeOutput> {
         let spec = &self.spec;
@@ -2624,7 +2653,7 @@ impl PhysicalMergeJoin {
                         break;
                     }
                     let key = chunk.is_matchable(row).then(|| chunk.keys.row(row));
-                    if !complete(key) {
+                    if !complete(key, row) {
                         needs_buffered_rows = true;
                         break;
                     }
@@ -2872,10 +2901,23 @@ impl PhysicalMergeJoin {
             let output = {
                 let window = &*window;
                 let null_aware = self.spec.null_aware;
+                // The streamed rows before the held run have all their
+                // buffered rows, though the run did not end.
+                let before = match &progress.chunk {
+                    Some(chunk)
+                        if window.pending.is_some() && !chunk.key_arrays.is_empty() =>
+                    {
+                        window.before_pending(&self.spec, &chunk.key_arrays)?
+                    }
+                    _ => vec![],
+                };
                 self.next_output(
                     progress,
                     &window.rows,
-                    &|key| window.is_complete_for(key, null_aware),
+                    &|key, row| {
+                        window.is_complete_for(key, null_aware)
+                            || before.get(row).copied().unwrap_or_default()
+                    },
                     reservation,
                 )?
             };
@@ -3127,6 +3169,14 @@ struct PendingRun {
     /// [`MergeJoinSpec::zero_components`], and the keys of its rows before it.
     position: usize,
     prefix: Box<[u8]>,
+    /// The components of the keys of the first row of the run that bound the
+    /// keys of all rows of the run and after it (see
+    /// [`MergeJoinSpec::bound_components`]): those rows come after it in the
+    /// order of the input, so that they have the same values before their
+    /// zero (or later ones), and a zero (or a later value), once `-0.0` is
+    /// `+0.0`. A key before the bound has all its buffered rows, before the
+    /// run.
+    bound: Vec<ArrayRef>,
     batches: Vec<RecordBatch>,
     /// The memory of `batches`.
     bytes: usize,
@@ -3158,6 +3208,49 @@ impl BufferedWindow {
                 ended || self.last_key.as_ref().is_some_and(|last| last.row() > key)
             }
         }
+    }
+
+    /// For every row of the keys `keys` (of streamed rows, with `-0.0` as
+    /// `+0.0`): whether it comes before the bound of the held run (see
+    /// [`PendingRun::bound`]), so that the buffered rows read so far are all
+    /// those that it can match, though the held run did not end. Empty without
+    /// a held run.
+    fn before_pending(
+        &self,
+        spec: &MergeJoinSpec,
+        keys: &[ArrayRef],
+    ) -> Result<Vec<bool>> {
+        let Some(pending) = &self.pending else {
+            return Ok(vec![]);
+        };
+        let rows = keys.first().map_or(0, |key| key.len());
+        let mut before = vec![false; rows];
+        let mut decided = vec![false; rows];
+        for (index, bound) in pending.bound.iter().enumerate() {
+            let component = &spec.components[index];
+            let values = component.array(keys);
+            let compare = make_comparator(
+                values.as_ref(),
+                bound.as_ref(),
+                spec.component_options(index),
+            )?;
+            let bound_null = component.validity && !bound.as_boolean().value(0);
+            for row in 0..rows {
+                if decided[row] {
+                    continue;
+                }
+                match compare(row, 0) {
+                    std::cmp::Ordering::Less => {
+                        before[row] = true;
+                        decided[row] = true;
+                    }
+                    std::cmp::Ordering::Greater => decided[row] = true,
+                    // The fields of NULL structs do not count.
+                    std::cmp::Ordering::Equal => decided[row] = bound_null,
+                }
+            }
+        }
+        Ok(before)
     }
 
     /// Read the next batch of buffered rows: `Ready(())` once a batch was read
@@ -3212,9 +3305,14 @@ impl BufferedWindow {
             start = row;
             held = match run {
                 Some((position, prefix)) => {
+                    let bound = spec.components[..spec.bound_components(position)]
+                        .iter()
+                        .map(|component| component.array(&keys).slice(row, 1))
+                        .collect();
                     self.pending = Some(PendingRun {
                         position,
                         prefix: prefix.into(),
+                        bound,
                         batches: vec![],
                         bytes: 0,
                     });
@@ -3240,10 +3338,9 @@ impl BufferedWindow {
             let flips = spec.zero_components.iter().any(|&index| {
                 let component = &spec.components[index];
                 let negative = !spec
-                    .descending
+                    .key_options
                     .get(component.key)
-                    .copied()
-                    .unwrap_or_default();
+                    .is_some_and(|options| options.descending);
                 zero_value_rows(component.array(&raw).as_ref(), Some(negative))
                     .first()
                     .copied()
@@ -3267,9 +3364,11 @@ impl BufferedWindow {
             return Ok(());
         };
         let (position, prefix) = (pending.position, pending.prefix.clone());
+        let run_bound = pending.bound.clone();
         let held = |batches: Vec<RecordBatch>, bytes: usize| PendingRun {
             position,
             prefix: prefix.clone(),
+            bound: run_bound.clone(),
             batches,
             bytes,
         };
@@ -3911,6 +4010,10 @@ struct StreamedChunk {
     gathered: Vec<usize>,
     /// The runs of signed zeros of the rows, if any.
     zero_runs: Option<ZeroRuns>,
+    /// The keys of the rows (with `-0.0` as `+0.0`), if the keys have
+    /// components with signed zeros (for the bounds of held runs, see
+    /// [`BufferedWindow::before_pending`]).
+    key_arrays: Vec<ArrayRef>,
     /// The memory of `keys`, `gathered` and `zero_runs`, held while the
     /// chunk is joined.
     _reservation: MemoryReservation,
@@ -4253,7 +4356,7 @@ impl PhysicalOperator for PhysicalMergeJoin {
                 self.next_output(
                     &mut state.progress,
                     &buffered,
-                    &|_| true,
+                    &|_, _| true,
                     &state.reservation,
                 )?
                 .batch
@@ -6862,6 +6965,132 @@ pub(crate) mod tests {
                 ids.as_any().downcast_ref::<Int64Array>().unwrap().value(0)
             };
             assert_eq!(id("lid"), id("rid"), "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streamed_rows_before_a_held_run_do_not_wait_for_it() -> Result<()> {
+        // A `Left` join of 20,000 left rows (-1.0, i) with the right rows
+        // (-0.0, 5), (-0.0, 6), and then nothing, forever: the right rows are a
+        // run of signed zeros that never ends (a row (+0.0, 1) could still
+        // come, before them), but no right row still to come comes before
+        // (0, ...), so that the left rows have all their right rows: they are
+        // emitted without a match, and a limit above the join ends the query.
+        // Of the keys (a, b), and of a struct key (a, b).
+        let limit = 1;
+        let order = SortOptions::new(false, true);
+        // The keys (a, b).
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}a"), DataType::Float64, false),
+                Field::new(format!("{side}b"), DataType::Int32, false),
+            ])) as SchemaRef
+        };
+        let rows = |side: &str, keys: &[(f64, i32)], first: i64| {
+            RecordBatch::try_new(
+                schema(side),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(
+                        first..first + keys.len() as i64,
+                    )),
+                    Arc::new(Float64Array::from_iter_values(
+                        keys.iter().map(|key| key.0),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(keys.iter().map(|key| key.1))),
+                ],
+            )
+            .unwrap()
+        };
+        let stream = |side: &str, batches: Vec<RecordBatch>| -> Arc<dyn ExecutionPlan> {
+            let keys = ["a", "b"].map(|key| {
+                PhysicalSortExpr::new(
+                    col(&format!("{side}{key}"), &schema(side)).unwrap(),
+                    order,
+                )
+            });
+            let partition = StreamPartition {
+                schema: schema(side),
+                batches,
+                forever: true,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [LexOrdering::new(keys).unwrap()],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let left_keys = (0..20_000).map(|i| (-1.0, i)).collect::<Vec<_>>();
+        let right_keys = [(-0.0, 5), (-0.0, 6)];
+        let left = stream(
+            "l",
+            left_keys
+                .chunks(4096)
+                .enumerate()
+                .map(|(batch, keys)| rows("l", keys, batch as i64 * 4096))
+                .collect(),
+        );
+        let right = stream("r", vec![rows("r", &right_keys, 0)]);
+        let on = vec![
+            (col("la", &left.schema())?, col("ra", &right.schema())?),
+            (col("lb", &left.schema())?, col("rb", &right.schema())?),
+        ];
+        let flat: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            JoinType::Left,
+            vec![order; 2],
+            NullEquality::NullEqualsNothing,
+        )?);
+        // The struct key (a, b).
+        let left = struct_key_stream(
+            "l",
+            left_keys
+                .chunks(4096)
+                .enumerate()
+                .map(|(batch, keys)| struct_key_rows("l", keys, batch as i64 * 4096))
+                .collect(),
+            order,
+            true,
+        );
+        let right = struct_key_stream(
+            "r",
+            vec![struct_key_rows("r", &right_keys, 0)],
+            order,
+            true,
+        );
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let nested: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            JoinType::Left,
+            vec![order],
+            NullEquality::NullEqualsNothing,
+        )?);
+        for (name, join) in [("(a, b)", flat), ("struct (a, b)", nested)] {
+            let limited: Arc<dyn ExecutionPlan> =
+                Arc::new(GlobalLimitExec::new(join, 0, Some(limit)));
+            let root = crate::planner::lower_execution_plan(&limited)?;
+            assert_streaming_merge_join(&root.children()[0], name);
+            let output = run_native(&root, limited, task_ctx()).await?;
+            assert_eq!(num_rows(&output.batches), limit, "{name}");
+            let batch = &output.batches[0];
+            assert_eq!(
+                batch.column_by_name("rid").unwrap().null_count(),
+                1,
+                "{name}"
+            );
         }
         Ok(())
     }
