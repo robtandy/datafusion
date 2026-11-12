@@ -1436,7 +1436,9 @@ mod tests {
     }
 
     /// Whether the DataFusion plan `plan` has a recursive query or a scan of
-    /// a working table.
+    /// the working table of one (a `WorkTableExec`, unlike the
+    /// [`PipelineWorkTableExec`]s, which scan the working tables of native
+    /// CTEs).
     fn has_recursion(plan: &Arc<dyn ExecutionPlan>) -> bool {
         plan.is::<RecursiveQueryExec>()
             || plan.is::<WorkTableExec>()
@@ -1454,7 +1456,9 @@ mod tests {
 
     /// Assert that the operator tree `root` runs its recursive queries
     /// natively: they are [`PhysicalRecursiveCte`]s, and DataFusion executes
-    /// neither a recursive query nor a scan of a working table.
+    /// neither a recursive query nor a scan of the working table of one (but
+    /// it may execute scans of the working tables of the native CTEs, see
+    /// [`PipelineWorkTableExec`]).
     fn assert_recursion_is_native(root: &Arc<dyn PhysicalOperator>, sql: &str) {
         assert!(
             count::<PhysicalRecursiveCte>(root) > 0,
