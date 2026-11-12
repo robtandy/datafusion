@@ -30,7 +30,7 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkResult, SourceResult, downcast_state,
 };
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
-use crate::sources::batches::chunk_memory;
+use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// The bodies of the materialized CTEs whose continuations are being lowered,
 /// by the id of their buffer, which their scans read (see
@@ -354,7 +354,8 @@ impl PhysicalOperator for MaterializedCteBody {
         let estimate = chunk_memory(input);
         state.reservation.try_grow(estimate)?;
         let batch = input.compact()?;
-        let size = batch.get_array_memory_size();
+        // The arrays of the batch, and the batch in the list of batches.
+        let size = batch.get_array_memory_size() + batch_overhead(&batch);
         match size.checked_sub(estimate) {
             Some(more) => state.reservation.try_grow(more)?,
             None => state.reservation.shrink(estimate - size),
@@ -408,6 +409,8 @@ struct ScanRows {
     /// For every chunk: its batch and the offset of its first row.
     chunks: Vec<(usize, usize)>,
     next: AtomicUsize,
+    /// The list of the batches and the chunks (the body holds the arrays).
+    _reservation: MemoryReservation,
 }
 
 impl GlobalSourceState for ScanRows {
@@ -446,7 +449,20 @@ impl PhysicalOperator for MaterializedCteScan {
             return internal_err!("A materialized CTE is scanned before its body ran");
         };
         let rows = downcast_state::<BodyRows>(state.as_any(), self.name())?;
-        let batches = rows.batches.lock().clone();
+        let batches = rows.batches.lock();
+        // The list of the batches and the chunks of the scan, before they
+        // are allocated.
+        let num_chunks = batches
+            .iter()
+            .map(|batch| batch.num_rows().div_ceil(DEFAULT_VECTOR_SIZE))
+            .sum::<usize>();
+        let reservation = MemoryConsumer::new("MaterializedCteScan")
+            .register(ctx.task_ctx.memory_pool());
+        reservation.try_grow(
+            batches.iter().map(batch_overhead).sum::<usize>()
+                + num_chunks * size_of::<(usize, usize)>(),
+        )?;
+        let batches = batches.clone();
         let chunks = batches
             .iter()
             .enumerate()
@@ -460,6 +476,7 @@ impl PhysicalOperator for MaterializedCteScan {
             batches,
             chunks,
             next: AtomicUsize::new(0),
+            _reservation: reservation,
         }))
     }
 
@@ -489,8 +506,8 @@ mod tests {
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     use crate::operators::lowering_tests::{
-        assert_lowered, assert_resources_exhausted, count, lowered,
-        pipeline_context_with_memory_limit,
+        assert_exhausted, assert_lowered, assert_resources_exhausted, count, lowered,
+        pipeline_context_with_memory_limit, task_context_with_memory_limit,
     };
     use crate::test_utils::{register_test_tables, test_session_config};
 
@@ -590,6 +607,22 @@ mod tests {
                 .value(0);
             assert_eq!(n, 1);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_batches_of_the_body_reserve_memory_also_without_columns() -> Result<()> {
+        // The batches of a body without columns take memory of their own.
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let source = crate::sources::EmptyScanSource::new(Arc::clone(&schema));
+        let body = MaterializedCteBody::new(Arc::new(source));
+        let ctx = ExecutionContext::new(task_context_with_memory_limit(1), 0, 1);
+        let state = body.get_global_sink_state(&ctx)?;
+        let mut local = body.get_local_sink_state(&ctx, state.as_ref())?;
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(10));
+        let batch = RecordBatch::try_new_with_options(schema, vec![], &options)?;
+        let chunk = DataChunk::from_record_batch(batch);
+        assert_exhausted(body.sink(&ctx, &chunk, state.as_ref(), local.as_mut()));
         Ok(())
     }
 

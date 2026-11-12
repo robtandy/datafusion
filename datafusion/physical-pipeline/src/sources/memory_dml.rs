@@ -26,6 +26,7 @@ use crate::operator::{
     SourceResult, TaskInterrupt, downcast_state_mut,
 };
 use crate::sort::memory_size;
+use crate::sources::batches::batch_overhead;
 
 /// What a [`MemoryDmlSource`] does to the rows that its predicates match.
 #[derive(Debug)]
@@ -188,6 +189,9 @@ impl MemoryDmlSource {
         reservation: &MemoryReservation,
     ) -> Result<u64> {
         let mut changed = 0;
+        // The list of the batches that replace those of the partition (also
+        // of those it keeps), before it is allocated.
+        reservation.try_grow(partition.iter().map(batch_overhead).sum())?;
         let mut batches = Vec::with_capacity(partition.len());
         for batch in partition.iter().filter(|batch| batch.num_rows() > 0) {
             let (mask, count) = self.matches(batch)?;
@@ -468,6 +472,9 @@ mod tests {
             1
         );
         assert_resources_exhausted(&ctx, statement).await;
+        // Also when no row changes: the batches of a partition are listed
+        // again.
+        assert_resources_exhausted(&ctx, "DELETE FROM t WHERE id > 100000").await;
         // The first partition, whose rows did not fit, is unchanged.
         let changed = ctx
             .sql("SELECT * FROM t WHERE name = 'changed'")

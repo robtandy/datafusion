@@ -812,6 +812,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computed_match_values_of_the_right_input_reserve_memory() -> Result<()> {
+        // The join computes match values of 100 KB for 1000 right rows.
+        let ctx = pipeline_context_with_memory_limit(1 << 20);
+        let sql = "SELECT l.id, r.id FROM \
+                   (SELECT value AS id, 'b' AS s FROM generate_series(1, 10)) l \
+                   ASOF JOIN (SELECT value AS id, 'a' AS s FROM generate_series(1, 1000)) r \
+                   MATCH_CONDITION (repeat(l.s, 100000) >= repeat(r.s, 100000))";
+        let root = lowered(&ctx, sql).await?;
+        assert_eq!(count::<PhysicalAsOfJoin>(&root), 1);
+        assert_resources_exhausted(&ctx, sql).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_rows_of_the_right_input_reserve_memory() -> Result<()> {
         let ctx = pipeline_context_with_memory_limit(10_000);
         register_tables(&ctx).await?;

@@ -38,7 +38,7 @@ use crate::operator::{
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::PipelineGraph;
 use crate::sort::{PhysicalSort, PhysicalTopK};
-use crate::sources::batches::chunk_memory;
+use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// Sorts an input whose rows are sorted by a prefix of its sort keys (the
 /// first `common_prefix_length` keys), as `PartialSortExec` does: it buffers
@@ -433,14 +433,15 @@ impl PartialSortState {
         self.reserve_with(0)
     }
 
-    /// Reserve the memory of the buffered and the sorted rows, and `extra`
-    /// bytes, before the operator allocates them.
+    /// Reserve the memory of the buffered and the sorted rows (their arrays,
+    /// and the batches in the list of batches), and `extra` bytes, before the
+    /// operator allocates them.
     fn reserve_with(&self, extra: usize) -> Result<()> {
         let size = self
             .group
             .iter()
             .chain(&self.sorted)
-            .map(RecordBatch::get_array_memory_size)
+            .map(|batch| batch.get_array_memory_size() + batch_overhead(batch))
             .sum::<usize>();
         self.reservation.try_resize(size + extra)
     }
@@ -622,14 +623,15 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::PhysicalSortExpr;
-    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_expr::expressions::{col, lit};
 
     use datafusion_physical_plan::union::UnionExec;
 
     use crate::executor::Executor;
     use crate::operators::lowering_tests::{
-        assert_lowered, assert_plan_lowered, assert_resources_exhausted, count, lowered,
-        pipeline_context_with_memory_limit,
+        assert_exhausted, assert_lowered, assert_plan_lowered,
+        assert_resources_exhausted, count, lowered, pipeline_context_with_memory_limit,
+        task_context_with_memory_limit,
     };
     use crate::sources::MemoryScanSource;
     use crate::test_utils::{register_test_tables, test_session_config};
@@ -973,6 +975,32 @@ mod tests {
         // The partial sort of a single pipeline stays a partial sort.
         let single = partial_sort(vec![batch(vec![1, 1], vec![2, 1])], Some(1))?;
         assert!(pipelines_of(&single).is_ok_and(|pipelines| pipelines == 1));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn buffered_batches_without_columns_reserve_memory() -> Result<()> {
+        // A partial sort by literals of rows without columns, whose buffered
+        // batches take memory of their own.
+        let schema = Arc::new(Schema::empty());
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(10));
+        let batches = (0..1000)
+            .map(|_| {
+                RecordBatch::try_new_with_options(Arc::clone(&schema), vec![], &options)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let source =
+            MemoryScanSource::try_new(&[batches], Arc::clone(&schema), None, None)?
+                .with_preserve_order(true);
+        let expr = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(lit(1)),
+            PhysicalSortExpr::new_default(lit(2)),
+        ])
+        .unwrap();
+        let sort = PhysicalPartialSort::try_new(Arc::new(source), expr, 1, None)?;
+        let output =
+            Executor::collect(Arc::new(sort), task_context_with_memory_limit(1), 4).await;
+        assert_exhausted(output);
         Ok(())
     }
 

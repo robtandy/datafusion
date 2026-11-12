@@ -88,6 +88,28 @@ pub(crate) fn pipeline_context_with_memory_limit(limit: usize) -> SessionContext
     SessionContext::new_with_state(state)
 }
 
+/// A `TaskContext` with a memory pool of `limit` bytes.
+pub(crate) fn task_context_with_memory_limit(
+    limit: usize,
+) -> Arc<datafusion_execution::TaskContext> {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(GreedyMemoryPool::new(limit)))
+        .build_arc()
+        .unwrap();
+    Arc::new(datafusion_execution::TaskContext::default().with_runtime(runtime))
+}
+
+/// Assert that `result` failed with `ResourcesExhausted`.
+pub(crate) fn assert_exhausted<T>(result: Result<T>) {
+    match result {
+        Ok(_) => panic!("succeeds, expected ResourcesExhausted"),
+        Err(error) => assert!(
+            matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        ),
+    }
+}
+
 /// The operator tree that the pipeline engine of `ctx` lowers `sql` to.
 pub(crate) async fn lowered(
     ctx: &SessionContext,

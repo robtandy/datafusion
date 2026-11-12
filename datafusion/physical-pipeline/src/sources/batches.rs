@@ -5,11 +5,18 @@
 //! [`BatchChunks`]: the chunks of the batch that a thread of a source emits,
 //! with the memory of the batch reserved in the memory pool.
 
-use arrow::array::RecordBatch;
+use arrow::array::{ArrayRef, RecordBatch};
 use datafusion_common::Result;
 use datafusion_execution::memory_pool::MemoryReservation;
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
+
+/// The memory that holding `batch` takes besides the memory of its arrays:
+/// the batch and its list of columns. It is all that a batch without
+/// columns takes.
+pub(crate) fn batch_overhead(batch: &RecordBatch) -> usize {
+    size_of::<RecordBatch>() + batch.num_columns() * size_of::<ArrayRef>()
+}
 
 /// The memory of the physical columns of `chunk`: the memory that
 /// compacting it (into the batch of its rows) allocates at most, and the
