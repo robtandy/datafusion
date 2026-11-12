@@ -5793,6 +5793,28 @@ mod tests {
             );
             same_results(expected, actual, &order).unwrap();
         }
+        // Nor within a tolerance smaller than the distance to their neighbors,
+        // which is `1.1e-16` below 1 and `2.2e-16` above (not within twice the
+        // tolerance, as the value of each engine may only be off by the
+        // tolerance).
+        let fine = ComparisonOptions::default().with_float_tolerance(8e-17);
+        for sql in [
+            "SELECT id FROM m ORDER BY CAST(1 AS DOUBLE), id",
+            "SELECT id FROM m ORDER BY CAST(1 AS DOUBLE), id LIMIT 1",
+        ] {
+            let order = order_with(m(), sql, &fine).await?;
+            let (expected, actual) = if sql.ends_with("LIMIT 1") {
+                (ids(&[1]), ids(&[2]))
+            } else {
+                (ids(&[1, 2]), ids(&[2, 1]))
+            };
+            same_results_with(expected.clone(), expected.clone(), &order, fine).unwrap();
+            let err = same_results_with(expected, actual, &order, fine).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+        }
         // `Float32` values cannot vary within the default tolerance, which is
         // smaller than the distance to their neighbors, but can within a larger
         // tolerance.
@@ -5867,6 +5889,98 @@ mod tests {
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
+    }
+
+    /// A batch of `(k DOUBLE, v INT)` rows: `rows`, then `zeros` rows of
+    /// `(zero_k, 0)`.
+    fn float_kv_batch(rows: &[(f64, i32)], zeros: usize, zero_k: f64) -> RecordBatch {
+        let rows = rows
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n((zero_k, 0), zeros))
+            .collect::<Vec<_>>();
+        batch_of(vec![
+            (
+                "k",
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0)))
+                    as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ),
+        ])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_evaluate_no_rows_out_of_the_reach_of_the_tolerance()
+     {
+        // The keys `2.0` of the 200 rows on which the query fails cannot tie
+        // with the keys `1.0` of the rows that it returns, within the tolerance
+        // of the comparison: the reference does not look for the rows on which
+        // it fails among them.
+        let sql = "SELECT 10 / v AS x FROM (SELECT v FROM m ORDER BY k LIMIT 2) t";
+        let setup = per_engine_tables(
+            float_kv_batch(&[(1.0, 1), (1.0, 2)], 200, 2.0),
+            float_kv_batch(&[(1.0, 2), (1.0, 1)], 200, 2.0),
+        );
+        assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        let batch = float_kv_batch(&[(1.0, 1), (1.0, 2)], 200, 2.0);
+        let order = order_of(batch, sql).await.unwrap();
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        let cannot_return = "the query cannot return it, as its keys cannot tie with the \
+                             keys of the rows that it returns within the tolerance";
+        assert_eq!(reference.uncomputed, [(2..202, cannot_return.to_string())]);
+    }
+
+    #[tokio::test]
+    async fn result_order_keeps_the_ties_if_it_stops_looking_for_the_rows_that_fail()
+    -> Result<()> {
+        // All rows tie on `k`, whatever `v`: the query may return any 2 of them,
+        // but fails on the 300 rows of `v = 0`, which follow the 2 others. After
+        // too many computations, the reference stops looking for the rows on
+        // which it fails, but compares the rows that tie.
+        let batch = float_kv_batch(&[(1.0, 1), (1.0, 2)], 300, 1.0);
+        let sql =
+            "SELECT 10 / v AS x FROM (SELECT v FROM m ORDER BY k, v DESC LIMIT 2) t";
+        let order = order_of(batch, sql).await?;
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        let reasons = reference
+            .uncomputed
+            .iter()
+            .map(|(_, reason)| reason.split(':').next().unwrap_or_default())
+            .collect::<HashSet<_>>();
+        assert!(
+            reasons.contains(
+                "the query fails on some of the rows near it, and the reference stopped \
+                 looking for them after 256 computations"
+            ),
+            "{:?}",
+            reference.uncomputed
+        );
+        assert!(
+            reasons.contains("the query fails on it"),
+            "{:?}",
+            reference.uncomputed
+        );
+        let uncomputed = reference.uncomputed.iter().map(|(rows, _)| rows.len());
+        assert_eq!(uncomputed.sum::<usize>(), 300);
+        let x = |values: &[i64]| {
+            let x = Int64Array::from(values.to_vec());
+            vec![batch_of(vec![("x", Arc::new(x) as ArrayRef)])]
+        };
+        same_results(x(&[5, 10]), x(&[10, 5]), &order).unwrap();
+        same_results(x(&[5, 10]), x(&[5, 10]), &order).unwrap();
+        let err = same_results(x(&[5, 10]), x(&[5, 5]), &order).unwrap_err();
+        assert!(
+            err.starts_with("row 1 of the pipeline engine differs"),
+            "{err}"
+        );
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
