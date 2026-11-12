@@ -592,6 +592,7 @@ mod tests {
     use super::*;
 
     use std::path::Path;
+    use std::time::Duration;
 
     use arrow::array::{AsArray, Int32Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema};
@@ -613,7 +614,9 @@ mod tests {
         data_batch, data_schema, write_parquet,
     };
     use crate::sources::try_create_scan_source;
-    use crate::test_utils::{register_test_tables, test_session_config};
+    use crate::test_utils::{
+        pipeline_context, register_test_tables, run_sql, test_session_config,
+    };
 
     /// Write the Hive-partitioned table of [`register_table`] to `dir`:
     ///
@@ -1163,6 +1166,36 @@ mod tests {
         assert!(matches!(sharing.take(3, &waker), SourceResult::Finished));
         // Without readers, chunks are kept.
         assert!(sharing.offer(chunk(0..1)).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn limits_stop_the_threads_that_wait_for_chunks() -> Result<()> {
+        // The scan of `p` (with the pipeline engine) has three units, of 5000,
+        // 100 and 7 rows: the threads that read the small ones wait for the
+        // chunks of the thread that reads the large one, until the native
+        // limit above the filter stops the pipeline.
+        let dir = table();
+        let ctx = pipeline_context(test_session_config());
+        register_table(&ctx, dir.path()).await?;
+        for (sql, rows) in [
+            ("SELECT id FROM p WHERE a > -100 LIMIT 3000", 3000),
+            ("SELECT id, s FROM p WHERE a > 40 OR s IS NULL LIMIT 5", 5),
+            ("SELECT id FROM p WHERE a > -100", 4643),
+        ] {
+            for _ in 0..3 {
+                let output =
+                    tokio::time::timeout(Duration::from_secs(60), run_sql(&ctx, sql))
+                        .await
+                        .unwrap_or_else(|_| panic!("{sql} hangs"))?;
+                let output_rows = output
+                    .batches
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>();
+                assert_eq!(output_rows, rows, "{sql}");
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
