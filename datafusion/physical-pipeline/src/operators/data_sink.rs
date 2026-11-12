@@ -5,6 +5,7 @@
 //! [`PhysicalDataSink`]: the writes of `INSERT` and `COPY TO` into a
 //! `DataSink` (`DataSinkExec`).
 
+use std::any::Any;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -12,6 +13,7 @@ use arrow::array::{RecordBatch, UInt64Array};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{DataFusionError, Result, internal_err};
 use datafusion_common_runtime::SpawnedTask;
+use datafusion_datasource::memory::MemSink;
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_plan::execution_plan::check_not_null_constraints;
@@ -127,12 +129,17 @@ type Queued = (RecordBatch, usize);
 /// The global sink state of a [`PhysicalDataSink`]: the queue of the rows
 /// for the writer, and the task of the writer.
 struct DataSinkState {
+    /// The task that writes the rows, and returns their count. Declared
+    /// first, so that an execution that fails cancels it before it drops
+    /// `sender`, which ends the stream of the rows (a sink commits the rows
+    /// of a stream that ends).
+    writer: Mutex<Option<SpawnedTask<Result<u64>>>>,
     /// The sending end of the queue, of which every thread has a clone,
     /// closed once all threads are done (when the sink is finalized).
     sender: Mutex<Option<mpsc::Sender<Queued>>>,
-    /// The task that writes the rows, and returns their count.
-    writer: Mutex<Option<SpawnedTask<Result<u64>>>>,
-    /// The memory of the rows in the queue.
+    /// The memory of the rows in the queue, and of those that the sink holds
+    /// until it commits them (a memory table, see
+    /// [`PhysicalOperator::get_global_sink_state`]).
     reservation: Arc<MemoryReservation>,
 }
 
@@ -197,9 +204,17 @@ impl PhysicalOperator for PhysicalDataSink {
         let reservation = Arc::new(
             MemoryConsumer::new("PhysicalDataSink").register(ctx.task_ctx.memory_pool()),
         );
+        // A memory table (`MemSink`) holds the rows that it is written until
+        // it commits them, once all of them are there: they stay reserved
+        // until the writer completes. Other sinks write the rows they
+        // dequeue.
+        let sink = Self::sink_exec(&self.plan)?.sink();
+        let holds_rows = (sink as &dyn Any).is::<MemSink>();
         let written = Arc::clone(&reservation);
         let rows = receiver.map(move |(batch, size)| {
-            written.shrink(size);
+            if !holds_rows {
+                written.shrink(size);
+            }
             Ok(batch)
         });
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -213,8 +228,8 @@ impl PhysicalOperator for PhysicalDataSink {
             exec.sink().write_all(stream, &task_ctx).await
         });
         Ok(Arc::new(DataSinkState {
-            sender: Mutex::new(Some(sender)),
             writer: Mutex::new(Some(writer)),
+            sender: Mutex::new(Some(sender)),
             reservation,
         }))
     }
@@ -367,6 +382,8 @@ impl PhysicalOperator for PhysicalDataSink {
             }
         };
         *writer = None;
+        // The sink committed (or dropped) the rows it held.
+        state.reservation.free();
         local.emitted = true;
         let batch = RecordBatch::try_new(
             Arc::clone(&self.schema),
@@ -610,6 +627,39 @@ mod tests {
         let root = lowered(&ctx, sql).await?;
         assert_eq!(count::<PhysicalDataSink>(&root), 1);
         assert_resources_exhausted(&ctx, sql).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_rows_that_a_memory_table_holds_until_it_commits_reserve_memory()
+    -> Result<()> {
+        // A memory table holds the 8 MB of a million rows until all of them
+        // are there, in a pool of 4 MiB.
+        let sql = "INSERT INTO target SELECT value FROM generate_series(1, 1000000)";
+        let ctx = pipeline_context_with_memory_limit(4 << 20);
+        ctx.sql("CREATE TABLE target (v BIGINT)")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(count::<PhysicalDataSink>(&lowered(&ctx, sql).await?), 1);
+        assert_resources_exhausted(&ctx, sql).await;
+        // The insert that failed committed no row.
+        let rows = ctx.sql("SELECT * FROM target").await?.collect().await?;
+        assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        // In a pool that holds them, they are inserted, and the table holds
+        // them: nothing stays reserved.
+        let ctx = pipeline_context_with_memory_limit(64 << 20);
+        ctx.sql("CREATE TABLE target (v BIGINT)")
+            .await?
+            .collect()
+            .await?;
+        ctx.sql(sql).await?.collect().await?;
+        assert_eq!(ctx.runtime_env().memory_pool.reserved(), 0);
+        let rows = ctx.sql("SELECT * FROM target").await?.collect().await?;
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1_000_000
+        );
         Ok(())
     }
 }
