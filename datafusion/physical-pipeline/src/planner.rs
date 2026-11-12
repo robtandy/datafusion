@@ -185,6 +185,7 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     JoinSide, JoinType, Result, ScalarValue, exec_err, internal_err,
 };
+use datafusion_datasource::file::FileSource;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_csv::source::CsvSource;
@@ -817,10 +818,13 @@ impl Lowering<'_> {
     /// * a Parquet scan reads them in its predicate, like the dynamic filters
     ///   that DataFusion pushes into it: it skips the files, row groups and
     ///   pages (by their statistics, page indexes and bloom filters) that they
-    ///   reject, and filters its rows with them with `pushdown_filters`;
+    ///   reject, and filters its rows with them with `pushdown_filters`. Its
+    ///   predicate is evaluated on the columns of its files, before its
+    ///   projection: its filters are of keys that are columns of its files (see
+    ///   [`route_join_filters`]), which its projection does not compute;
     /// * the chunks of a scan of a memory table or of CSV files, which cannot
-    ///   filter its rows itself, are filtered with them (see
-    ///   [`JoinFilteredScan`]).
+    ///   filter its rows itself, are filtered with them, after its projection
+    ///   (see [`JoinFilteredScan`]).
     fn lower_scan(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1623,7 +1627,11 @@ struct ScanJoinFilter {
 ///   of the scans;
 /// * a Parquet scan gets the filter unless it reads the dynamic filter of the
 ///   join already (which DataFusion pushes into the scans that it reaches,
-///   with all the keys): it prunes its files, row groups and pages with it;
+///   with all the keys): it prunes its files, row groups and pages with it.
+///   It evaluates its predicate on the columns of its files, before its
+///   projection: it gets the filter of the keys that are columns of its files
+///   only, not of those that its projection computes (whose filter would
+///   compute them again, e.g. volatile functions, maybe to other values);
 /// * a scan of a memory table or of CSV files, which does not prune, gets
 ///   the filter only if its rows reach the join through other joins,
 ///   aggregations or sorts, whose work on the rows that the filter rejects it
@@ -1666,7 +1674,8 @@ fn route_join_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<JoinFilterRou
         let Some(exec) = scan.downcast_ref::<DataSourceExec>() else {
             continue;
         };
-        let useful = if exec.downcast_to_file_source::<ParquetSource>().is_some() {
+        let parquet = exec.downcast_to_file_source::<ParquetSource>();
+        let useful = if parquet.is_some() {
             !join_filters
                 .iter()
                 .any(|&filter| consumes_dynamic_filter(&scan, filter))
@@ -1677,6 +1686,21 @@ fn route_join_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<JoinFilterRou
         if !useful || occurrences(probe, &scan) != 1 {
             continue;
         }
+        // A Parquet scan evaluates its predicate on the columns of its files,
+        // before it projects them (the filter is unprojected, see
+        // `FileScanConfig::try_pushdown_filters`): the filter of a key that the
+        // projection of the scan computes would compute it again, maybe to
+        // other values (e.g. of a volatile function) than those of the rows
+        // that the join reads, and drop rows that match.
+        let projection = parquet.and_then(|(_, source)| source.projection());
+        let is_file_column = |column: usize| {
+            projection.is_none_or(|projection| {
+                projection
+                    .iter()
+                    .nth(column)
+                    .is_some_and(|projected| projected.expr.is::<Column>())
+            })
+        };
         // The keys that the scan produces, with the same types.
         let scan_schema = scan.schema();
         let (keys, scan_columns): (Vec<usize>, Vec<Arc<dyn PhysicalExpr>>) = columns
@@ -1684,6 +1708,9 @@ fn route_join_filters(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<JoinFilterRou
             .enumerate()
             .filter_map(|(key, column)| {
                 let column = (*column)?;
+                if !is_file_column(column) {
+                    return None;
+                }
                 let field = scan_schema.fields().get(column)?;
                 let (_, probe_key) = join.on().get(key)?;
                 let same_type = probe_key
@@ -9244,6 +9271,154 @@ mod join_filters {
                 assert!(scan.rows > matching && scan.rows < 200_000, "{scan:?}");
             }
         }
+        Ok(())
+    }
+
+    /// A volatile function that numbers the rows that it is evaluated on:
+    /// `next_key()` returns 0, 1, 2, ... in the order of its calls, and counts
+    /// the rows in `evaluated`.
+    #[derive(Debug)]
+    struct NextKey {
+        evaluated: Arc<std::sync::atomic::AtomicI64>,
+        signature: datafusion_expr::Signature,
+    }
+
+    impl PartialEq for NextKey {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.evaluated, &other.evaluated)
+        }
+    }
+
+    impl Eq for NextKey {}
+
+    impl std::hash::Hash for NextKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.evaluated).hash(state);
+        }
+    }
+
+    impl datafusion_expr::ScalarUDFImpl for NextKey {
+        fn name(&self) -> &str {
+            "next_key"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn invoke_with_args(
+            &self,
+            args: datafusion_expr::ScalarFunctionArgs,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            let rows = i64::try_from(args.number_rows).expect("rows");
+            let first = self
+                .evaluated
+                .fetch_add(rows, std::sync::atomic::Ordering::SeqCst);
+            let keys = arrow::array::Int64Array::from_iter_values(first..first + rows);
+            Ok(datafusion_expr::ColumnarValue::Array(Arc::new(keys)))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn join_filters_do_not_compute_the_keys_of_scans_again() -> Result<()> {
+        // `next_key()`, a volatile function that numbers its rows, projected by
+        // the scan of a Parquet file of 1,000 rows (DataFusion pushes the
+        // projection into the scan), crossed with two rows, and joined with the
+        // keys 0 to 99, with `pushdown_filters`: the 200 rows of the keys 0 to
+        // 99 match. The planner routes no filter of the key to the scan, which
+        // would compute `next_key()` again to evaluate it on the columns of the
+        // file (as its row filter, before the projection), to other numbers, and
+        // drop the rows of the keys that match: both engines evaluate
+        // `next_key()` once per row, 1,000 times, and count 200 rows.
+        let dir = tempfile::tempdir()?;
+        let generator = datafusion_context(test_session_config());
+        let values = generator
+            .sql("SELECT value AS v FROM generate_series(0, 999)")
+            .await?
+            .collect()
+            .await?;
+        let path = dir.path().join("vpq").join("part-0.parquet");
+        write_parquet(&path, values[0].schema(), &values, None)?;
+        let keys = generator
+            .sql("SELECT value AS dk FROM generate_series(0, 99)")
+            .await?
+            .collect()
+            .await?;
+        let counters = std::sync::Mutex::new(vec![]);
+        let setup = async |ctx: &SessionContext| {
+            let evaluated = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            counters
+                .lock()
+                .expect("counters")
+                .push(Arc::clone(&evaluated));
+            ctx.register_udf(datafusion_expr::ScalarUDF::new_from_impl(NextKey {
+                evaluated,
+                signature: datafusion_expr::Signature::nullary(
+                    datafusion_expr::Volatility::Volatile,
+                ),
+            }));
+            let schema = keys[0].schema();
+            ctx.register_table(
+                "keys",
+                Arc::new(MemTable::try_new(schema, vec![keys.clone()])?),
+            )?;
+            let path = dir.path().join("vpq");
+            ctx.register_parquet(
+                "vpq",
+                path.to_str().expect("a path"),
+                Default::default(),
+            )
+            .await?;
+            Ok(())
+        };
+        let sql = "SELECT COUNT(*) AS n FROM keys k JOIN \
+                   (SELECT p.key FROM (SELECT next_key() AS key FROM vpq) p \
+                    CROSS JOIN (SELECT * FROM (VALUES (1), (2)) AS t(x)) t) x \
+                   ON k.dk = x.key";
+        let mut config = semantics_config();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        let (actual, _) = assert_same_results(sql, config, setup).await;
+        let count = actual.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("a count")
+            .value(0);
+        assert_eq!(count, 200);
+        // The scan computes the key: its projection evaluates `next_key()`.
+        let exec = actual
+            .plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        let mut computes_key = false;
+        let _ = exec.input().apply(|node| {
+            if let Some((_, source)) = node
+                .downcast_ref::<DataSourceExec>()
+                .and_then(DataSourceExec::downcast_to_file_source::<ParquetSource>)
+            {
+                computes_key |= source.projection().is_some_and(|projection| {
+                    projection
+                        .iter()
+                        .any(|projected| !projected.expr.is::<Column>())
+                });
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        assert!(computes_key, "{sql}");
+        let scans = scans(&actual);
+        let scan = scan_of(&scans, "key", sql);
+        assert_eq!(scan.routed, Vec::<String>::new(), "{scan:?}");
+        let evaluated = counters
+            .lock()
+            .expect("counters")
+            .iter()
+            .map(|evaluated| evaluated.load(std::sync::atomic::Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        assert_eq!(evaluated, vec![1000, 1000], "{sql}");
         Ok(())
     }
 }
