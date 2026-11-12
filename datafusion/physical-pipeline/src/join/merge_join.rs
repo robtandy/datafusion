@@ -115,7 +115,7 @@ use std::collections::VecDeque;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
@@ -1190,6 +1190,17 @@ pub(crate) struct GatherWidths {
     variable: [Vec<(usize, VariableWidth)>; 2],
 }
 
+/// A join gathers about this many bytes of rows for a batch of candidate
+/// pairs (for its filter and its output, see [`GatherWidths`]), or of rows
+/// that it emits at once: fewer than [`DEFAULT_VECTOR_SIZE`] rows if they are
+/// wide. A batch has a pair (or a row) at least.
+pub(crate) const PART_BYTES: usize = 1 << 20;
+
+/// The bytes of the indices of a candidate pair of rows of a join, and of a
+/// pair of its output.
+pub(crate) const PAIR_INDEX_BYTES: usize =
+    2 * (size_of::<u32>() + size_of::<Option<usize>>());
+
 /// The batch of the filter of a join, see [`GatherWidths`].
 pub(crate) const FILTER: usize = 0;
 
@@ -1796,6 +1807,9 @@ struct MergeJoinSpec {
     /// The fields of the keys in the row format: their types, and their
     /// orders in the sorted inputs.
     key_fields: Vec<SortField>,
+    /// The bytes that gathering the rows of the left and of the right input
+    /// takes, for the filter and the output.
+    widths: [GatherWidths; 2],
 }
 
 impl MergeJoinSpec {
@@ -1871,14 +1885,30 @@ impl MergeJoinSpec {
                 );
             }
         }
+        let output = JoinOutput::try_new(left, right, join_type, projection)?;
+        let widths =
+            [(JoinSide::Left, left), (JoinSide::Right, right)].map(|(side, schema)| {
+                let filter_columns = filter
+                    .iter()
+                    .flat_map(|filter| filter.column_indices())
+                    .filter(|column| column.side == side)
+                    .map(|column| column.index);
+                let output_columns = output
+                    .column_indices
+                    .iter()
+                    .filter(|column| column.side == side)
+                    .map(|column| column.index);
+                GatherWidths::new(schema, filter_columns, output_columns)
+            });
         Ok(Self {
-            output: JoinOutput::try_new(left, right, join_type, projection)?,
+            output,
             on,
             filter,
             null_equality,
             null_aware,
             streamed: SortMergeJoinExec::probe_side(&join_type),
             key_fields,
+            widths,
         })
     }
 
@@ -1963,6 +1993,39 @@ impl MergeJoinSpec {
         )
     }
 
+    /// The bytes that the candidate pairs of the join gather of each row of
+    /// `batch`, a batch of the streamed input (or of the buffered one if not
+    /// `streamed`), for the filter (if any) and the output.
+    fn gathered_bytes(&self, batch: &RecordBatch, streamed: bool) -> Vec<usize> {
+        let side = match (self.streamed, streamed) {
+            (JoinSide::Left, true) | (JoinSide::Right, false) => 0,
+            _ => 1,
+        };
+        let widths = &self.widths[side];
+        widths
+            .variable_bytes(batch)
+            .into_iter()
+            .map(|variable| {
+                let filter = match self.filter {
+                    Some(_) => widths.row_bytes(variable, FILTER),
+                    None => 0,
+                };
+                filter + widths.row_bytes(variable, OUTPUT)
+            })
+            .collect()
+    }
+
+    /// The bytes of a row of NULLs of the buffered input (or of the streamed
+    /// one if not `buffered`) in the output: the other side of a row without a
+    /// match.
+    fn null_row_bytes(&self, buffered: bool) -> usize {
+        let side = match (self.streamed, buffered) {
+            (JoinSide::Left, false) | (JoinSide::Right, true) => 0,
+            _ => 1,
+        };
+        self.widths[side].null_row_bytes(OUTPUT)
+    }
+
     fn key_converter(&self) -> Result<RowConverter> {
         Ok(RowConverter::new(self.key_fields.clone())?)
     }
@@ -1978,6 +2041,7 @@ impl MergeJoinSpec {
             keys: converter.empty_rows(0, 0),
             has_null_key: false,
             matched: vec![],
+            gathered: vec![0],
         };
         Ok((converter, rows))
     }
@@ -2103,10 +2167,12 @@ impl PhysicalMergeJoin {
         let keys = evaluate_keys(self.spec.streamed_keys(), &batch)?;
         let matchable = matchable_rows(&keys, self.spec.null_equality);
         let keys = progress.converter.convert_columns(&keys)?;
+        let gathered = self.spec.gathered_bytes(&batch, true);
         Ok(StreamedChunk {
             batch,
             keys,
             matchable,
+            gathered,
             next_row: 0,
             in_progress: None,
         })
@@ -2118,10 +2184,13 @@ impl PhysicalMergeJoin {
     ///
     /// The candidate pairs of a batch of streamed rows (with the buffered rows
     /// of their keys) are collected first, at most [`DEFAULT_VECTOR_SIZE`] of
-    /// them (a streamed row without candidates counts as one), then the filter
-    /// is evaluated on all of them at once, and the rows are emitted in the
-    /// order of the streamed rows. A streamed row whose candidates do not all
-    /// fit is continued by the next call.
+    /// them (a streamed row without candidates counts as one) and about
+    /// [`PART_BYTES`] of the rows that they gather for the filter and the
+    /// output (fewer pairs of wide rows), whose bytes are reserved with
+    /// `reservation` while they are gathered; then the filter is evaluated on
+    /// all of them at once, and the rows are emitted in the order of the
+    /// streamed rows. A streamed row whose candidates do not all fit is
+    /// continued by the next call.
     ///
     /// `complete(key)` tells whether `buffered` has all the buffered rows that
     /// a streamed row with the key `key` (`None`: a key that cannot match) may
@@ -2133,6 +2202,7 @@ impl PhysicalMergeJoin {
         progress: &mut MergeProgress,
         buffered: &BufferedRows,
         complete: &dyn Fn(Option<Row<'_>>) -> bool,
+        reservation: &MemoryReservation,
     ) -> Result<MergeOutput> {
         let spec = &self.spec;
         let join_type = spec.join_type();
@@ -2156,7 +2226,10 @@ impl PhysicalMergeJoin {
         let mut pairs_buffered = Vec::new();
         let mut parts = Vec::new();
         let mut cost = 0;
-        while cost < DEFAULT_VECTOR_SIZE {
+        // The bytes of the rows that the batch gathers.
+        let mut bytes = 0;
+        let null_buffered_bytes = spec.null_row_bytes(true);
+        while cost < DEFAULT_VECTOR_SIZE && bytes < PART_BYTES {
             let mut progress = match chunk.in_progress.take() {
                 Some(progress) => progress,
                 None => {
@@ -2188,6 +2261,11 @@ impl PhysicalMergeJoin {
                 progress.next = progress.end;
             }
             let remaining = progress.end - progress.next;
+            let row_bytes = chunk
+                .gathered
+                .get(progress.row)
+                .copied()
+                .unwrap_or_default();
             if !enumerates_pairs || remaining == 0 {
                 parts.push(Part {
                     row: progress.row,
@@ -2198,9 +2276,29 @@ impl PhysicalMergeJoin {
                     matched_before: progress.matched,
                 });
                 cost += 1;
+                bytes += row_bytes + null_buffered_bytes + PAIR_INDEX_BYTES;
                 continue;
             }
-            let n = remaining.min(DEFAULT_VECTOR_SIZE - cost);
+            // The pairs whose rows fit into the bytes of the batch, one at
+            // least.
+            let pairs_bytes = |n: usize| {
+                n * (row_bytes + PAIR_INDEX_BYTES)
+                    + buffered.gathered_bytes(progress.next..progress.next + n)
+            };
+            let mut n = remaining.min(DEFAULT_VECTOR_SIZE - cost);
+            let budget = PART_BYTES.saturating_sub(bytes);
+            if pairs_bytes(n) > budget {
+                let (mut low, mut high) = (1, n);
+                while low < high {
+                    let mid = low + (high - low).div_ceil(2);
+                    match pairs_bytes(mid) <= budget {
+                        true => low = mid,
+                        false => high = mid - 1,
+                    }
+                }
+                n = low;
+            }
+            bytes += pairs_bytes(n);
             let start = pairs_buffered.len();
             pairs_streamed.extend(std::iter::repeat_n(progress.row as u32, n));
             pairs_buffered.extend((progress.next..progress.next + n).map(Some));
@@ -2221,6 +2319,11 @@ impl PhysicalMergeJoin {
                 break;
             }
         }
+
+        // The rows gathered for the filter and the output are reserved while
+        // they are joined.
+        let transient = reservation.new_empty();
+        transient.try_grow(bytes)?;
 
         // The filter, on all pairs at once.
         let mask = match &spec.filter {
@@ -2327,6 +2430,7 @@ impl PhysicalMergeJoin {
         ctx: &ExecutionContext,
         progress: &mut MergeProgress,
         window: &Mutex<BufferedWindow>,
+        reservation: &MemoryReservation,
     ) -> Result<StreamingStep> {
         let mut window = window.lock();
         let mut batches = 0;
@@ -2350,9 +2454,12 @@ impl PhysicalMergeJoin {
             let output = {
                 let window = &*window;
                 let null_aware = self.spec.null_aware;
-                self.next_output(progress, &window.rows, &|key| {
-                    window.is_complete_for(key, null_aware)
-                })?
+                self.next_output(
+                    progress,
+                    &window.rows,
+                    &|key| window.is_complete_for(key, null_aware),
+                    reservation,
+                )?
             };
             if output.batch.is_some() || !output.needs_buffered_rows {
                 return Ok(StreamingStep::Output(output.batch));
@@ -2420,6 +2527,10 @@ struct BufferedRows {
     /// For `Full` joins: the rows that matched a streamed row, one bit per
     /// row.
     matched: Vec<AtomicU64>,
+    /// The bytes that the candidate pairs gather of the rows before every
+    /// position (from the first row, see [`MergeJoinSpec::gathered_bytes`]):
+    /// those of the rows `a..b` are `gathered[b] - gathered[a]`.
+    gathered: Vec<usize>,
 }
 
 impl BufferedRows {
@@ -2447,7 +2558,14 @@ impl BufferedRows {
         if spec.null_aware {
             self.has_null_key |= keys.iter().any(|key| key.logical_null_count() > 0);
         }
-        let mut bytes = memory_size(&batch) + self.keys.size().saturating_sub(key_bytes);
+        let mut gathered = self.gathered.last().copied().unwrap_or_default();
+        for row_bytes in spec.gathered_bytes(&batch, false) {
+            gathered += row_bytes;
+            self.gathered.push(gathered);
+        }
+        let mut bytes = memory_size(&batch)
+            + self.keys.size().saturating_sub(key_bytes)
+            + batch.num_rows() * size_of::<usize>();
         self.rows.push(batch);
         if spec.emits_unmatched_buffered_rows() {
             let words = self.rows.len().div_ceil(64);
@@ -2486,6 +2604,14 @@ impl BufferedRows {
             rows: start..end,
         });
         Ok(start..end)
+    }
+
+    /// The bytes that the candidate pairs gather of the rows `rows`.
+    fn gathered_bytes(&self, rows: Range<usize>) -> usize {
+        match (self.gathered.get(rows.start), self.gathered.get(rows.end)) {
+            (Some(start), Some(end)) => end - start,
+            _ => 0,
+        }
     }
 
     fn set_matched(&self, position: usize) {
@@ -2644,6 +2770,11 @@ impl BufferedWindow {
         }
         self.rows.rows = rows;
         self.rows.keys = keys;
+        let base = self.rows.gathered[dropped];
+        self.rows.gathered = self.rows.gathered[dropped..]
+            .iter()
+            .map(|bytes| bytes - base)
+            .collect();
         let released = self.batch_bytes.drain(..batches).sum::<usize>();
         self.reservation
             .shrink(released.min(self.reservation.size()));
@@ -2670,6 +2801,8 @@ enum Buffered {
 struct StreamState {
     buffered: Buffered,
     progress: MergeProgress,
+    /// Reserves the rows that the join gathers for a batch of candidates.
+    reservation: MemoryReservation,
 }
 
 impl OperatorState for StreamState {}
@@ -2707,6 +2840,9 @@ struct StreamedChunk {
     keys: Rows,
     /// The rows whose keys can match, `None` if all.
     matchable: Option<NullBuffer>,
+    /// The bytes that the candidate pairs gather of every row (see
+    /// [`MergeJoinSpec::gathered_bytes`]).
+    gathered: Vec<usize>,
     /// The next row to join.
     next_row: usize,
     /// The row whose candidates did not all fit into the last output.
@@ -2759,13 +2895,15 @@ enum UnmatchedScanState {
     /// parallel: the next position to scan.
     Sorted {
         buffered: Arc<BufferedRows>,
-        next: AtomicUsize,
+        next: Mutex<usize>,
+        reservation: MemoryReservation,
     },
     /// The buffered rows of a buffered input that the join reads as a stream,
     /// all of which (until the input ends) are scanned by a single thread.
     Streamed {
         window: Arc<Mutex<BufferedWindow>>,
-        next: AtomicUsize,
+        next: Mutex<usize>,
+        reservation: MemoryReservation,
     },
 }
 
@@ -2782,19 +2920,42 @@ impl GlobalSourceState for UnmatchedScanState {
 
 impl PhysicalMergeJoin {
     /// The next chunk of the buffered rows without a match of `buffered`,
-    /// from the position `next` on, `None` once all were scanned.
+    /// from the position `next` on, `None` once all were scanned: of the rows
+    /// of at most [`DEFAULT_VECTOR_SIZE`] positions and about [`PART_BYTES`]
+    /// of their bytes, which are reserved with `reservation` while they are
+    /// gathered.
     fn next_unmatched_rows(
         &self,
         buffered: &BufferedRows,
-        next: &AtomicUsize,
+        next: &Mutex<usize>,
+        reservation: &MemoryReservation,
     ) -> Result<Option<RecordBatch>> {
         let num_rows = buffered.rows.len();
+        let null_streamed_bytes = self.spec.null_row_bytes(false);
+        let rows_bytes = |rows: Range<usize>| {
+            buffered.gathered_bytes(rows.clone())
+                + rows.len() * (null_streamed_bytes + size_of::<Option<usize>>())
+        };
         loop {
-            let start = next.fetch_add(DEFAULT_VECTOR_SIZE, Ordering::Relaxed);
-            if start >= num_rows {
-                return Ok(None);
-            }
-            let end = (start + DEFAULT_VECTOR_SIZE).min(num_rows);
+            let (start, end) = {
+                let mut next = next.lock();
+                let start = *next;
+                if start >= num_rows {
+                    return Ok(None);
+                }
+                // The rows that fit into the bytes of a chunk, one at least.
+                let (mut low, mut high) =
+                    (start + 1, (start + DEFAULT_VECTOR_SIZE).min(num_rows));
+                while low < high {
+                    let mid = low + (high - low).div_ceil(2);
+                    match rows_bytes(start..mid) <= PART_BYTES {
+                        true => low = mid,
+                        false => high = mid - 1,
+                    }
+                }
+                *next = low;
+                (start, low)
+            };
             let positions = (start..end)
                 .filter(|&position| !buffered.is_matched(position))
                 .map(Some)
@@ -2802,6 +2963,8 @@ impl PhysicalMergeJoin {
             if positions.is_empty() {
                 continue;
             }
+            let transient = reservation.new_empty();
+            transient.try_grow(rows_bytes(start..end))?;
             let streamed_schema = self.streamed_input().schema();
             let (left, right) = self.spec.sides(
                 JoinRows::Nulls(&streamed_schema, positions.len()),
@@ -2979,8 +3142,11 @@ impl PhysicalOperator for PhysicalMergeJoin {
                 Buffered::Streamed(Arc::clone(&state.window))
             }
         };
+        let reservation =
+            MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
         Ok(Box::new(StreamState {
             buffered,
+            reservation,
             progress: MergeProgress {
                 converter: self.spec.key_converter()?,
                 cursor: 0,
@@ -3005,12 +3171,22 @@ impl PhysicalOperator for PhysicalMergeJoin {
         let batch = match &state.buffered {
             Buffered::Sorted(buffered) => {
                 let buffered = Arc::clone(buffered);
-                self.next_output(&mut state.progress, &buffered, &|_| true)?
-                    .batch
+                self.next_output(
+                    &mut state.progress,
+                    &buffered,
+                    &|_| true,
+                    &state.reservation,
+                )?
+                .batch
             }
             Buffered::Streamed(window) => {
                 let window = Arc::clone(window);
-                match self.next_streaming_output(ctx, &mut state.progress, &window)? {
+                match self.next_streaming_output(
+                    ctx,
+                    &mut state.progress,
+                    &window,
+                    &state.reservation,
+                )? {
                     StreamingStep::Output(batch) => batch,
                     StreamingStep::Yield => {
                         return Ok(OperatorResult::Blocked(TaskInterrupt::yield_now()));
@@ -3060,14 +3236,18 @@ impl PhysicalOperator for PhysicalMergeJoin {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
+        let reservation =
+            MemoryConsumer::new("PhysicalMergeJoin").register(ctx.task_ctx.memory_pool());
         Ok(Arc::new(match self.streams_buffered {
             false => UnmatchedScanState::Sorted {
                 buffered: self.buffered_rows(ctx)?,
-                next: AtomicUsize::new(0),
+                next: Mutex::new(0),
+                reservation,
             },
             true => UnmatchedScanState::Streamed {
                 window: self.buffered_window(ctx)?,
-                next: AtomicUsize::new(0),
+                next: Mutex::new(0),
+                reservation,
             },
         }))
     }
@@ -3080,10 +3260,16 @@ impl PhysicalOperator for PhysicalMergeJoin {
     ) -> Result<SourceResult> {
         let state = downcast_state::<UnmatchedScanState>(gstate.as_any(), self.name())?;
         let batch = match state {
-            UnmatchedScanState::Sorted { buffered, next } => {
-                self.next_unmatched_rows(buffered, next)?
-            }
-            UnmatchedScanState::Streamed { window, next } => {
+            UnmatchedScanState::Sorted {
+                buffered,
+                next,
+                reservation,
+            } => self.next_unmatched_rows(buffered, next, reservation)?,
+            UnmatchedScanState::Streamed {
+                window,
+                next,
+                reservation,
+            } => {
                 let mut window = window.lock();
                 // The rows of the input that come after the last streamed row
                 // match none: all of them are read first.
@@ -3094,7 +3280,7 @@ impl PhysicalOperator for PhysicalMergeJoin {
                         ));
                     }
                 }
-                self.next_unmatched_rows(&window.rows, next)?
+                self.next_unmatched_rows(&window.rows, next, reservation)?
             }
         };
         Ok(match batch {
@@ -3993,6 +4179,103 @@ pub(crate) mod tests {
                     .await?;
             assert_eq!(num_rows(&batches), output, "{consumer}");
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wide_rows_are_reserved_and_merged_in_fewer_pairs() -> Result<()> {
+        // Sorted inputs whose rows have strings of 1 KiB: the merge join
+        // reserves the bytes of the rows that it gathers for a batch of pairs
+        // (or of rows without a match) before it gathers them, in batches of
+        // about a MiB of rows, not of 2,048 pairs.
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Int32, false),
+                Field::new(format!("{side}s"), DataType::Utf8, false),
+            ])) as SchemaRef
+        };
+        let source =
+            |side: &str, rows: i64, key: i32| -> Result<Arc<dyn PhysicalOperator>> {
+                let batch = RecordBatch::try_new(
+                    schema(side),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(0..rows)),
+                        Arc::new(Int32Array::from(vec![key; rows as usize])),
+                        Arc::new(StringArray::from_iter_values(
+                            (0..rows).map(|id| format!("{id:>1024}")),
+                        )),
+                    ],
+                )?;
+                let chunks = (0..batch.num_rows())
+                    .step_by(100)
+                    .map(|offset| {
+                        DataChunk::from_record_batch(
+                            batch.slice(offset, 100.min(batch.num_rows() - offset)),
+                        )
+                    })
+                    .collect();
+                Ok(Arc::new(TestSource::with_schema(schema(side), chunks)))
+            };
+        let join = |right_rows: i64,
+                    right_key: i32,
+                    join_type: JoinType|
+         -> Result<Arc<dyn PhysicalOperator>> {
+            let (left, right) =
+                (source("l", 100, 1)?, source("r", right_rows, right_key)?);
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(PhysicalMergeJoin::try_new(
+                left,
+                right,
+                on,
+                None,
+                join_type,
+                &[SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+                false,
+                None,
+            )?))
+        };
+        // 10,000 pairs of 2 KiB of strings: a pool of 512 KiB holds the buffered
+        // rows, but not a batch of pairs; one of 4 MiB holds both.
+        let err = with_timeout(Executor::collect(
+            join(100, 1, JoinType::Inner)?,
+            limited_task_ctx(512 * 1024)?,
+            4,
+        ))
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("PhysicalMergeJoin"), "{err}");
+        let batches = with_timeout(Executor::collect(
+            join(100, 1, JoinType::Inner)?,
+            limited_task_ctx(4 << 20)?,
+            4,
+        ))
+        .await?;
+        assert_eq!(num_rows(&batches), 10_000);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= PART_BYTES / 2048 + 1)
+        );
+        // The 2,000 buffered rows of a `Full` join match no streamed row: they
+        // are emitted in chunks of about a MiB, too.
+        let batches = with_timeout(Executor::collect(
+            join(2_000, 2, JoinType::Full)?,
+            limited_task_ctx(8 << 20)?,
+            4,
+        ))
+        .await?;
+        assert_eq!(num_rows(&batches), 2_100);
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.num_rows() <= PART_BYTES / 1024 + 1)
+        );
         Ok(())
     }
 

@@ -122,8 +122,8 @@ use parking_lot::Mutex;
 
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    StoredRows, evaluate_keys, filter_mask, is_smaller, matchable_rows, ordered_plan,
-    probe_role, without_reordering,
+    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, evaluate_keys, filter_mask, is_smaller,
+    matchable_rows, ordered_plan, probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -675,16 +675,6 @@ const NO_ROW: usize = usize::MAX;
 /// The join reads at most this many chunks of its inputs that produce no
 /// output in a call of `get_data` before it lets the other tasks run.
 const CHUNKS_PER_CALL: usize = 16;
-
-/// The join gathers about this many bytes of rows for a part of a chunk (for
-/// its filter and its output), or for the final rows that it emits at once:
-/// fewer than [`DEFAULT_VECTOR_SIZE`] rows if they are wide. A part has a
-/// pair (or a row) at least.
-const PART_BYTES: usize = 1 << 20;
-
-/// The bytes of the indices of a candidate pair of rows of a part, and of a
-/// pair of the output.
-const PAIR_INDEX_BYTES: usize = 2 * (size_of::<u32>() + size_of::<Option<usize>>());
 
 /// The bytes of the index of a final row, and of its mark.
 const FINAL_ROW_INDEX_BYTES: usize = size_of::<Option<usize>>() + 1;
