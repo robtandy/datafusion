@@ -139,7 +139,8 @@ use arrow::compute::{
     take_record_batch,
 };
 use arrow::datatypes::{
-    DataType, Float16Type, Float32Type, Float64Type, Schema, SchemaRef, UnionMode,
+    DataType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Schema, SchemaRef, UnionMode,
 };
 use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use datafusion_common::cast::as_boolean_array;
@@ -3152,7 +3153,7 @@ impl BufferedWindow {
             let flips = spec.zero_keys.iter().any(|&key| {
                 let negative = !spec.descending.get(key).copied().unwrap_or_default();
                 raw.get(key).is_some_and(|key| {
-                    signed_zero_rows(key.as_ref(), negative)
+                    zero_value_rows(key.as_ref(), Some(negative))
                         .first()
                         .copied()
                         .unwrap_or_default()
@@ -3350,7 +3351,7 @@ impl ZeroRuns {
         let mut runs = vec![None; rows];
         let mut prefixes = Vec::with_capacity(spec.zero_keys.len());
         for (position, &key) in spec.zero_keys.iter().enumerate() {
-            let zeros = zero_rows(keys[key].as_ref());
+            let zeros = zero_value_rows(keys[key].as_ref(), None);
             let mut first = false;
             for (run, zero) in runs.iter_mut().zip(zeros) {
                 if run.is_none() && zero {
@@ -3384,106 +3385,53 @@ impl ZeroRuns {
     }
 }
 
-/// For every row of `array`, a key with `-0.0` as `+0.0`: whether it is a
-/// float zero, or has one (in a struct, a list, or a dictionary value). Other
-/// types have none.
-fn zero_rows(array: &dyn Array) -> Vec<bool> {
+/// For every row of `array`, a key: whether it is a float zero, or has one
+/// nested in it, of any sign if `sign` is `None` (a key with `-0.0` as
+/// `+0.0`), of a negative sign if `Some(true)` (`-0.0`), of a positive sign
+/// if `Some(false)` (`+0.0`, of a key as its input has it). The layouts that
+/// the row format supports are looked into: structs, lists, list views,
+/// fixed size lists, maps, dictionaries, run-end encoded values and unions;
+/// any other with floats has a zero in every row (an upper bound).
+fn zero_value_rows(array: &dyn Array, sign: Option<bool>) -> Vec<bool> {
     let rows = array.len();
-    match array.data_type() {
-        DataType::Float16 => array
-            .as_primitive::<Float16Type>()
-            .iter()
-            .map(|value| value.is_some_and(|value| value.to_f32() == 0.0))
-            .collect(),
-        DataType::Float32 => array
-            .as_primitive::<Float32Type>()
-            .iter()
-            .map(|value| value == Some(0.0))
-            .collect(),
-        DataType::Float64 => array
-            .as_primitive::<Float64Type>()
-            .iter()
-            .map(|value| value == Some(0.0))
-            .collect(),
-        DataType::Struct(_) => {
-            let mut zeros = vec![false; rows];
-            for column in array.as_struct().columns() {
-                for (zero, column_zero) in
-                    zeros.iter_mut().zip(zero_rows(column.as_ref()))
-                {
-                    *zero |= column_zero;
-                }
-            }
-            zeros
-        }
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
-            let (values, ranges) = list_ranges(array);
-            let values = zero_rows(values.as_ref());
-            ranges
-                .into_iter()
-                .map(|(start, end)| {
-                    values
-                        .get(start..end)
-                        .is_some_and(|zeros| zeros.contains(&true))
-                })
-                .collect()
-        }
-        DataType::Dictionary(_, _) => {
-            let dictionary = array.as_any_dictionary();
-            let values = zero_rows(dictionary.values().as_ref());
-            dictionary
-                .normalized_keys()
-                .into_iter()
-                .map(|key| values.get(key).copied().unwrap_or_default())
-                .collect()
-        }
-        _ => vec![false; rows],
-    }
-}
-
-/// For every row of `array`, a key as its input has it: whether it is a
-/// float zero with a negative sign if `negative` (`-0.0`), a positive one
-/// otherwise (`+0.0`), or has one (in a struct, a list, or a dictionary
-/// value).
-fn signed_zero_rows(array: &dyn Array, negative: bool) -> Vec<bool> {
-    let rows = array.len();
+    let leaf =
+        |zero: bool, negative: bool| zero && sign.is_none_or(|sign| negative == sign);
     match array.data_type() {
         DataType::Float16 => array
             .as_primitive::<Float16Type>()
             .iter()
             .map(|value| {
-                value.is_some_and(|v| {
-                    v.to_f32() == 0.0 && v.is_sign_negative() == negative
-                })
+                value.is_some_and(|v| leaf(v.to_f32() == 0.0, v.is_sign_negative()))
             })
             .collect(),
         DataType::Float32 => array
             .as_primitive::<Float32Type>()
             .iter()
-            .map(|value| {
-                value.is_some_and(|v| v == 0.0 && v.is_sign_negative() == negative)
-            })
+            .map(|value| value.is_some_and(|v| leaf(v == 0.0, v.is_sign_negative())))
             .collect(),
         DataType::Float64 => array
             .as_primitive::<Float64Type>()
             .iter()
-            .map(|value| {
-                value.is_some_and(|v| v == 0.0 && v.is_sign_negative() == negative)
-            })
+            .map(|value| value.is_some_and(|v| leaf(v == 0.0, v.is_sign_negative())))
             .collect(),
         DataType::Struct(_) => {
             let mut zeros = vec![false; rows];
             for column in array.as_struct().columns() {
-                let column_zeros = signed_zero_rows(column.as_ref(), negative);
+                let column_zeros = zero_value_rows(column.as_ref(), sign);
                 for (zero, column_zero) in zeros.iter_mut().zip(column_zeros) {
                     *zero |= column_zero;
                 }
             }
             zeros
         }
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _) => {
             let (values, ranges) = list_ranges(array);
-            let values = signed_zero_rows(values.as_ref(), negative);
+            let values = zero_value_rows(values, sign);
             ranges
                 .into_iter()
                 .map(|(start, end)| {
@@ -3495,20 +3443,70 @@ fn signed_zero_rows(array: &dyn Array, negative: bool) -> Vec<bool> {
         }
         DataType::Dictionary(_, _) => {
             let dictionary = array.as_any_dictionary();
-            let values = signed_zero_rows(dictionary.values().as_ref(), negative);
+            let values = zero_value_rows(dictionary.values().as_ref(), sign);
             dictionary
                 .normalized_keys()
                 .into_iter()
                 .map(|key| values.get(key).copied().unwrap_or_default())
                 .collect()
         }
-        _ => vec![false; rows],
+        DataType::RunEndEncoded(run_ends, _) => {
+            // The value of the run of every row.
+            let (values, physical): (&ArrayRef, Vec<usize>) = match run_ends.data_type() {
+                DataType::Int16 => {
+                    let run = array.as_run::<Int16Type>();
+                    let physical = (0..rows).map(|row| run.get_physical_index(row));
+                    (run.values(), physical.collect())
+                }
+                DataType::Int32 => {
+                    let run = array.as_run::<Int32Type>();
+                    let physical = (0..rows).map(|row| run.get_physical_index(row));
+                    (run.values(), physical.collect())
+                }
+                _ => {
+                    let run = array.as_run::<Int64Type>();
+                    let physical = (0..rows).map(|row| run.get_physical_index(row));
+                    (run.values(), physical.collect())
+                }
+            };
+            let values = zero_value_rows(values.as_ref(), sign);
+            physical
+                .into_iter()
+                .map(|index| values.get(index).copied().unwrap_or_default())
+                .collect()
+        }
+        DataType::Union(fields, _) => {
+            let union = array.as_union();
+            let children = fields
+                .iter()
+                .map(|(type_id, _)| {
+                    (
+                        type_id,
+                        zero_value_rows(union.child(type_id).as_ref(), sign),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (0..rows)
+                .map(|row| {
+                    let type_id = union.type_id(row);
+                    children
+                        .iter()
+                        .find(|(id, _)| *id == type_id)
+                        .and_then(|(_, zeros)| {
+                            zeros.get(union.value_offset(row)).copied()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+        data_type => vec![has_float_leaf(data_type); rows],
     }
 }
 
-/// The values of a list `array` (of type `List`, `LargeList` or
-/// `FixedSizeList`), and the range of them of every row.
-fn list_ranges(array: &dyn Array) -> (&ArrayRef, Vec<(usize, usize)>) {
+/// The values of a list `array` (of type `List`, `LargeList`, `ListView`,
+/// `LargeListView`, `FixedSizeList` or `Map`, whose values are its entries),
+/// and the range of them of every row.
+fn list_ranges(array: &dyn Array) -> (&dyn Array, Vec<(usize, usize)>) {
     let to_usize = |offset: i64| usize::try_from(offset).unwrap_or_default();
     match array.data_type() {
         DataType::List(_) => {
@@ -3518,7 +3516,7 @@ fn list_ranges(array: &dyn Array) -> (&ArrayRef, Vec<(usize, usize)>) {
                 .windows(2)
                 .map(|ends| (to_usize(ends[0].into()), to_usize(ends[1].into())))
                 .collect();
-            (list.values(), ranges)
+            (list.values().as_ref(), ranges)
         }
         DataType::LargeList(_) => {
             let list = array.as_list::<i64>();
@@ -3527,7 +3525,41 @@ fn list_ranges(array: &dyn Array) -> (&ArrayRef, Vec<(usize, usize)>) {
                 .windows(2)
                 .map(|ends| (to_usize(ends[0]), to_usize(ends[1])))
                 .collect();
-            (list.values(), ranges)
+            (list.values().as_ref(), ranges)
+        }
+        DataType::ListView(_) => {
+            let list = array.as_list_view::<i32>();
+            let ranges = list
+                .value_offsets()
+                .iter()
+                .zip(list.value_sizes())
+                .map(|(&offset, &size)| {
+                    let start = to_usize(offset.into());
+                    (start, start + to_usize(size.into()))
+                })
+                .collect();
+            (list.values().as_ref(), ranges)
+        }
+        DataType::LargeListView(_) => {
+            let list = array.as_list_view::<i64>();
+            let ranges = list
+                .value_offsets()
+                .iter()
+                .zip(list.value_sizes())
+                .map(|(&offset, &size)| {
+                    (to_usize(offset), to_usize(offset) + to_usize(size))
+                })
+                .collect();
+            (list.values().as_ref(), ranges)
+        }
+        DataType::Map(_, _) => {
+            let map = array.as_map();
+            let ranges = map
+                .value_offsets()
+                .windows(2)
+                .map(|ends| (to_usize(ends[0].into()), to_usize(ends[1].into())))
+                .collect();
+            (map.entries() as &dyn Array, ranges)
         }
         _ => {
             let list = array.as_fixed_size_list();
@@ -3535,7 +3567,7 @@ fn list_ranges(array: &dyn Array) -> (&ArrayRef, Vec<(usize, usize)>) {
             let ranges = (0..array.len())
                 .map(|row| (row * size, (row + 1) * size))
                 .collect();
-            (list.values(), ranges)
+            (list.values().as_ref(), ranges)
         }
     }
 }
@@ -4113,8 +4145,10 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use arrow::array::{
-        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
-        StringViewArray, StructArray, TimestampNanosecondArray,
+        Decimal128Array, FixedSizeListArray, Float64Array, Float64Builder, Int32Array,
+        Int32Builder, Int64Array, LargeListArray, LargeListViewArray, ListArray,
+        ListViewArray, MapBuilder, RunArray, StringArray, StringViewArray, StructArray,
+        TimestampNanosecondArray,
     };
     use arrow::compute::{SortColumn, lexsort_to_indices};
     use arrow::datatypes::{Field, Fields, TimeUnit};
@@ -5941,6 +5975,216 @@ pub(crate) mod tests {
                     assert!(
                         ids.windows(2).all(|pair| pair[0] <= pair[1]),
                         "{context}: {ids:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The keys of the rows `rows` (a float and an integer) in the layout
+    /// `layout`: a list (or list view, ...) of both as floats, a map of the
+    /// float to the integer, or a run-end encoded float and the integer (two
+    /// keys).
+    fn nested_keys(layout: &str, rows: &[(f64, i32)]) -> Vec<ArrayRef> {
+        let lists = || {
+            rows.iter()
+                .map(|&(f, i)| Some(vec![Some(f), Some(f64::from(i))]))
+                .collect::<Vec<_>>()
+        };
+        match layout {
+            "List" => vec![Arc::new(
+                ListArray::from_iter_primitive::<Float64Type, _, _>(lists()),
+            )],
+            "LargeList" => vec![Arc::new(LargeListArray::from_iter_primitive::<
+                Float64Type,
+                _,
+                _,
+            >(lists()))],
+            "ListView" => vec![Arc::new(ListViewArray::from(
+                ListArray::from_iter_primitive::<Float64Type, _, _>(lists()),
+            ))],
+            "LargeListView" => vec![Arc::new(LargeListViewArray::from(
+                LargeListArray::from_iter_primitive::<Float64Type, _, _>(lists()),
+            ))],
+            "FixedSizeList" => vec![Arc::new(FixedSizeListArray::from_iter_primitive::<
+                Float64Type,
+                _,
+                _,
+            >(lists(), 2))],
+            "Map" => {
+                let mut builder =
+                    MapBuilder::new(None, Float64Builder::new(), Int32Builder::new());
+                for &(f, i) in rows {
+                    builder.keys().append_value(f);
+                    builder.values().append_value(i);
+                    builder.append(true).unwrap();
+                }
+                vec![Arc::new(builder.finish())]
+            }
+            _ => {
+                let ends = Int32Array::from_iter_values(1..=rows.len() as i32);
+                let floats = Float64Array::from_iter_values(rows.iter().map(|row| row.0));
+                vec![
+                    Arc::new(RunArray::<Int32Type>::try_new(&ends, &floats).unwrap()),
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.1))),
+                ]
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_joins_of_streams_with_signed_zeros_in_nested_keys_match_them()
+    -> Result<()> {
+        // Keys of every nested layout that the row format supports, with the
+        // rows `[-0.0, 5]` and `[+0.0, 1]` (in their order): the join compares
+        // them as `[0, 5]` and `[0, 1]`. Streams of them (in one batch, and
+        // in a batch a row) joined with themselves: every row matches itself,
+        // as with DataFusion's hash join.
+        let rows = [(-0.0, 5), (0.0, 1)];
+        for layout in [
+            "ListView",
+            "LargeListView",
+            "List",
+            "LargeList",
+            "FixedSizeList",
+            "Map",
+            "RunEndEncoded",
+        ] {
+            for split in [false, true] {
+                let context = format!("{layout} split: {split}");
+                let keys = nested_keys(layout, &rows);
+                let schema = |side: &str| {
+                    let mut fields =
+                        vec![Field::new(format!("{side}id"), DataType::Int64, false)];
+                    for (i, key) in keys.iter().enumerate() {
+                        fields.push(Field::new(
+                            format!("{side}k{i}"),
+                            key.data_type().clone(),
+                            true,
+                        ));
+                    }
+                    Arc::new(Schema::new(fields)) as SchemaRef
+                };
+                let batch = |side: &str| {
+                    let mut columns: Vec<ArrayRef> = vec![Arc::new(
+                        Int64Array::from_iter_values(0..rows.len() as i64),
+                    )];
+                    columns.extend(nested_keys(layout, &rows));
+                    RecordBatch::try_new(schema(side), columns).unwrap()
+                };
+                let batches = |side: &str| match split {
+                    true => (0..rows.len())
+                        .map(|row| batch(side).slice(row, 1))
+                        .collect(),
+                    false => vec![batch(side)],
+                };
+                let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+                    let order = LexOrdering::new((0..keys.len()).map(|i| {
+                        PhysicalSortExpr::new(
+                            col(&format!("{side}k{i}"), &schema(side)).unwrap(),
+                            SortOptions::new(false, true),
+                        )
+                    }))
+                    .unwrap();
+                    let partition = StreamPartition {
+                        schema: schema(side),
+                        batches: batches(side),
+                        forever: false,
+                    };
+                    Arc::new(
+                        StreamingTableExec::try_new(
+                            schema(side),
+                            vec![Arc::new(partition)],
+                            None,
+                            [order],
+                            true,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let on = |left: &Arc<dyn ExecutionPlan>,
+                          right: &Arc<dyn ExecutionPlan>| {
+                    (0..keys.len())
+                        .map(|i| {
+                            (
+                                col(&format!("lk{i}"), &left.schema()).unwrap(),
+                                col(&format!("rk{i}"), &right.schema()).unwrap(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let (left, right) = (stream("l"), stream("r"));
+                let on_keys = on(&left, &right);
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+                    left,
+                    right,
+                    on_keys,
+                    None,
+                    JoinType::Inner,
+                    vec![SortOptions::new(false, true); keys.len()],
+                    NullEquality::NullEqualsNothing,
+                )?);
+                let root = lower_join(&plan, false)?;
+                assert_streaming_merge_join(&root, &context);
+                let actual = run_native(&root, Arc::clone(&plan), task_ctx())
+                    .await
+                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                // Every row matches itself.
+                let mut pairs = actual
+                    .batches
+                    .iter()
+                    .flat_map(|batch| {
+                        let id = |name: &str| {
+                            let ids = batch.column_by_name(name).unwrap();
+                            ids.as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .values()
+                                .to_vec()
+                        };
+                        id("lid").into_iter().zip(id("rid"))
+                    })
+                    .collect::<Vec<_>>();
+                pairs.sort_unstable();
+                assert_eq!(pairs, vec![(0, 0), (1, 1)], "{context}");
+                // And as DataFusion's hash join, if it joins such keys.
+                let bounded = |side: &str| {
+                    MemorySourceConfig::try_new_exec(
+                        &[vec![batch(side)]],
+                        schema(side),
+                        None,
+                    )
+                    .unwrap() as Arc<dyn ExecutionPlan>
+                };
+                let (left, right) = (bounded("l"), bounded("r"));
+                let on_keys = on(&left, &right);
+                let reference = Arc::new(HashJoinExec::try_new(
+                    left,
+                    right,
+                    on_keys,
+                    None,
+                    &JoinType::Inner,
+                    None,
+                    PartitionMode::CollectLeft,
+                    NullEquality::NullEqualsNothing,
+                    false,
+                )?) as Arc<dyn ExecutionPlan>;
+                if let Ok(batches) = collect(Arc::clone(&reference), task_ctx()).await {
+                    let expected = EngineOutput {
+                        schema: reference.schema(),
+                        batches,
+                        plan: reference,
+                        ordered: false,
+                    };
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!("Results differ: {message}\n{context}");
+                    }
+                } else {
+                    assert_ne!(
+                        layout, "ListView",
+                        "DataFusion's hash join fails: {context}"
                     );
                 }
             }
