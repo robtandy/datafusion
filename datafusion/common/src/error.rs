@@ -1353,26 +1353,76 @@ mod test {
         assert_eq!(res.strip_backtrace(), "Arrow error: Schema error: bar");
     }
 
-    // To pass the test the environment variable RUST_BACKTRACE should be set to 1 to enforce backtrace
+    /// Errors carry a backtrace only if the environment asks for one:
+    /// [`Backtrace::capture`] reads `RUST_LIB_BACKTRACE`, or else
+    /// `RUST_BACKTRACE`, once per process. So that the tests of backtraces don't
+    /// depend on how they are run, re-run the test `name` in a child process
+    /// with `RUST_BACKTRACE=1` when this process doesn't have it.
+    ///
+    /// Returns whether the test ran in a child process, in which case the
+    /// caller has nothing left to check.
     #[cfg(feature = "backtrace")]
-    fn ensure_rust_backtrace_enabled() {
-        match std::env::var("RUST_BACKTRACE") {
-            Ok(val) if val == "1" => {}
-            _ => panic!("Environment variable RUST_BACKTRACE must be set to 1"),
+    fn rerun_with_rust_backtrace(name: &str) -> bool {
+        let enabled = std::env::var_os("RUST_LIB_BACKTRACE").is_none()
+            && std::env::var("RUST_BACKTRACE").is_ok_and(|val| val == "1");
+        if !enabled {
+            run_test_in_child(name, Some("1"));
         }
+        !enabled
     }
 
-    // To pass the test the environment variable RUST_BACKTRACE should be set to 1 to enforce backtrace
+    /// Runs the test `name` of this module alone in a child process, with
+    /// `RUST_BACKTRACE` set to `rust_backtrace`, or unset if it is `None`, and
+    /// checks that it passes.
+    #[cfg(feature = "backtrace")]
+    fn run_test_in_child(name: &str, rust_backtrace: Option<&str>) {
+        // The test harness names the tests by their paths in the crate.
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{name}");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", &test, "--nocapture"])
+            .env_remove("RUST_LIB_BACKTRACE");
+        if let Some(val) = rust_backtrace {
+            command.env("RUST_BACKTRACE", val);
+        } else {
+            command.env_remove("RUST_BACKTRACE");
+        }
+        let output = command.output().unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{test} failed with status {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // A path that matches no test passes without running anything.
+        assert!(
+            stdout.contains("running 1 test"),
+            "{test} did not select exactly one test\nstdout:\n{stdout}",
+        );
+    }
+
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace("test_enabled_backtrace") {
+            return;
+        }
 
         let res: Result<(), DataFusionError> = plan_err!("Err");
         assert_error_have_message_and_backtrace(
             &res.unwrap_err(),
             "Error during planning: Err",
         );
+    }
+
+    /// The tests of backtraces pass where `RUST_BACKTRACE` isn't set, too.
+    #[cfg(feature = "backtrace")]
+    #[test]
+    fn test_enabled_backtrace_without_rust_backtrace() {
+        run_test_in_child("test_enabled_backtrace", None);
     }
 
     #[cfg(not(feature = "backtrace"))]
@@ -1439,7 +1489,10 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_unwrap_or_internal_err() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace("test_enabled_backtrace_for_unwrap_or_internal_err")
+        {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             let item = None::<()>;
@@ -1455,7 +1508,6 @@ mod test {
         );
     }
 
-    // To pass the test the environment variable RUST_BACKTRACE should be set to 1 to enforce backtrace
     #[cfg(not(feature = "backtrace"))]
     #[test]
     fn test_disabled_backtrace_for_unwrap_or_internal_err() {
@@ -1476,7 +1528,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_or_internal_err_without_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_or_internal_err_without_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             assert_or_internal_err!(false);
@@ -1494,7 +1550,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_or_internal_err_with_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_or_internal_err_with_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             assert_or_internal_err!(false, "my cool context");
@@ -1544,7 +1604,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_eq_or_internal_err_without_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_eq_or_internal_err_without_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             let arg1 = 1;
@@ -1564,7 +1628,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_eq_or_internal_err_with_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_eq_or_internal_err_with_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             let arg1 = 1;
@@ -1620,7 +1688,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_ne_or_internal_err_without_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_ne_or_internal_err_without_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             let arg1 = 1;
@@ -1640,7 +1712,11 @@ mod test {
     #[cfg(feature = "backtrace")]
     #[test]
     fn test_enabled_backtrace_for_assert_ne_or_internal_err_with_args() {
-        ensure_rust_backtrace_enabled();
+        if rerun_with_rust_backtrace(
+            "test_enabled_backtrace_for_assert_ne_or_internal_err_with_args",
+        ) {
+            return;
+        }
 
         fn get_error() -> Result<(), DataFusionError> {
             let arg1 = 1;
