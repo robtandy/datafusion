@@ -1,0 +1,462 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+// SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+//! [`PhysicalStreamingMerge`]: the merge of sorted partitions that never end
+//! (a `SortPreservingMergeExec` of unbounded inputs).
+
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use arrow::array::{Array, RecordBatch};
+use arrow::compute::interleave;
+use arrow::datatypes::SchemaRef;
+use arrow::row::{RowConverter, Rows, SortField};
+use datafusion_common::Result;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion_physical_expr::LexOrdering;
+use futures::StreamExt;
+
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
+use crate::executor::{Executor, PipelineStream};
+use crate::operator::{
+    ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
+    SourceResult, TaskInterrupt, downcast_state_mut,
+};
+use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::sort::memory_size;
+use crate::sources::batches::batch_overhead;
+
+/// Merges the rows of its inputs, every one of them sorted by `expr`, into
+/// rows sorted by `expr`, as they arrive, as `SortPreservingMergeExec` does:
+/// it emits a row once every input that did not end has a row, the smallest
+/// of their rows (in the Arrow row format of `expr`), so that it streams
+/// over inputs that never end, which the native sort, which reads all of its
+/// input first, does not. With a fetch, it emits the first `fetch` rows, and
+/// then finishes.
+///
+/// Every input (the native operators of a partition of the merge, see
+/// `Lowering::try_lower_streaming_merge` in `planner.rs`) runs in an
+/// execution of its own ([`Executor::execute_stream`]), whose rows the merge,
+/// the source of its pipeline, polls with the waker of its task. It holds the
+/// batch of every input whose rows it merges, and their keys, which are
+/// reserved in the memory pool of the session.
+#[derive(Debug)]
+pub struct PhysicalStreamingMerge {
+    /// The inputs: they are not part of the pipelines of the merge.
+    children: Vec<Arc<dyn PhysicalOperator>>,
+    schema: SchemaRef,
+    expr: LexOrdering,
+    fetch: Option<usize>,
+}
+
+impl PhysicalStreamingMerge {
+    /// Merge `inputs`, every one sorted by `expr`, into rows with the schema
+    /// `schema`, keeping the first `fetch` rows (if any).
+    pub fn try_new(
+        inputs: Vec<Arc<dyn PhysicalOperator>>,
+        schema: SchemaRef,
+        expr: LexOrdering,
+        fetch: Option<usize>,
+    ) -> Result<Self> {
+        // The keys must be in the row format.
+        Self::converter(&expr, &schema)?;
+        Ok(Self {
+            children: inputs,
+            schema,
+            expr,
+            fetch,
+        })
+    }
+
+    /// The row converter of the keys `expr` of rows with the schema `schema`.
+    fn converter(expr: &LexOrdering, schema: &SchemaRef) -> Result<RowConverter> {
+        let fields = expr
+            .iter()
+            .map(|key| {
+                Ok(SortField::new_with_options(
+                    key.expr.data_type(schema)?,
+                    key.options,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RowConverter::new(fields)?)
+    }
+}
+
+/// An input of a [`PhysicalStreamingMerge`]: its stream, and the batch whose
+/// rows the merge merges, their keys and the next of them.
+struct Input {
+    stream: PipelineStream,
+    batch: Option<(RecordBatch, Rows)>,
+    next: usize,
+    ended: bool,
+}
+
+/// The state of the thread of a [`PhysicalStreamingMerge`].
+struct MergeState {
+    converter: RowConverter,
+    inputs: Vec<Input>,
+    /// The rows that may still be emitted.
+    remaining: Option<usize>,
+    reservation: MemoryReservation,
+}
+
+impl LocalSourceState for MergeState {}
+
+impl MergeState {
+    /// Reserve the memory of the batches of the inputs and of their keys.
+    fn reserve(&self) -> Result<()> {
+        let memory = self
+            .inputs
+            .iter()
+            .filter_map(|input| input.batch.as_ref())
+            .map(|(batch, keys)| memory_size(batch) + batch_overhead(batch) + keys.size())
+            .sum();
+        self.reservation.try_resize(memory)
+    }
+}
+
+impl PhysicalOperator for PhysicalStreamingMerge {
+    fn name(&self) -> &str {
+        "PhysicalStreamingMerge"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &self.children
+    }
+
+    fn description(&self) -> String {
+        let fetch = self
+            .fetch
+            .map(|fetch| format!(", fetch={fetch}"))
+            .unwrap_or_default();
+        format!(
+            "PhysicalStreamingMerge: expr=[{}], inputs={}{fetch}",
+            self.expr,
+            self.children.len()
+        )
+    }
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn get_local_source_state(
+        &self,
+        ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        // The source is not parallel: a single thread merges the inputs.
+        let inputs = self
+            .children
+            .iter()
+            .map(|input| {
+                let stream = Executor::execute_stream(
+                    Arc::clone(input),
+                    Arc::clone(&ctx.task_ctx),
+                    ctx.num_threads,
+                )?;
+                Ok(Input {
+                    stream,
+                    batch: None,
+                    next: 0,
+                    ended: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let reservation = MemoryConsumer::new("PhysicalStreamingMerge")
+            .register(ctx.task_ctx.memory_pool());
+        Ok(Box::new(MergeState {
+            converter: Self::converter(&self.expr, &self.schema)?,
+            inputs,
+            remaining: self.fetch,
+            reservation,
+        }))
+    }
+
+    fn get_data(
+        &self,
+        ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSourceState,
+        lstate: &mut dyn LocalSourceState,
+    ) -> Result<SourceResult> {
+        let state = downcast_state_mut::<MergeState>(lstate.as_any_mut(), self.name())?;
+        if state.remaining == Some(0) {
+            return Ok(SourceResult::Finished);
+        }
+        // Every input that did not end needs a row.
+        let mut cx = Context::from_waker(ctx.waker());
+        for input in &mut state.inputs {
+            while !input.ended && input.batch.is_none() {
+                match input.stream.poll_next_unpin(&mut cx) {
+                    Poll::Ready(Some(batch)) => {
+                        let batch = batch?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let keys = self
+                            .expr
+                            .iter()
+                            .map(|key| {
+                                key.expr.evaluate(&batch)?.into_array(batch.num_rows())
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let keys = state.converter.convert_columns(&keys)?;
+                        input.batch = Some((batch, keys));
+                        input.next = 0;
+                    }
+                    Poll::Ready(None) => input.ended = true,
+                    Poll::Pending => {
+                        state.reserve()?;
+                        return Ok(SourceResult::Blocked(
+                            TaskInterrupt::waker_registered(),
+                        ));
+                    }
+                }
+            }
+        }
+        state.reserve()?;
+        if state.inputs.iter().all(|input| input.batch.is_none()) {
+            return Ok(SourceResult::Finished);
+        }
+        // The smallest rows, until the batch of an input is consumed (its
+        // next batch may have smaller rows than the others).
+        let limit = state
+            .remaining
+            .unwrap_or(usize::MAX)
+            .min(DEFAULT_VECTOR_SIZE);
+        let mut rows = Vec::with_capacity(limit);
+        let mut consumed = false;
+        while rows.len() < limit && !consumed {
+            let (smallest, _) = state
+                .inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| {
+                    let (_, keys) = input.batch.as_ref()?;
+                    Some((index, keys.row(input.next)))
+                })
+                .min_by(|(_, a), (_, b)| a.cmp(b))
+                .expect("an input has a row");
+            let input = &mut state.inputs[smallest];
+            rows.push((smallest, input.next));
+            input.next += 1;
+            let len = input
+                .batch
+                .as_ref()
+                .map_or(0, |(batch, _)| batch.num_rows());
+            consumed = input.next == len;
+        }
+        // The batches of the inputs, in the order of the inputs.
+        let batches = state
+            .inputs
+            .iter()
+            .map(|input| input.batch.as_ref().map(|(batch, _)| batch))
+            .collect::<Vec<_>>();
+        let present = batches
+            .iter()
+            .enumerate()
+            .filter_map(|(index, batch)| batch.map(|batch| (index, batch)))
+            .collect::<Vec<_>>();
+        let position = |input: usize| {
+            present
+                .iter()
+                .position(|&(index, _)| index == input)
+                .expect("the input of a row has a batch")
+        };
+        let indices = rows
+            .iter()
+            .map(|&(input, row)| (position(input), row))
+            .collect::<Vec<_>>();
+        let columns = (0..self.schema.fields().len())
+            .map(|column| {
+                let arrays = present
+                    .iter()
+                    .map(|(_, batch)| batch.column(column).as_ref())
+                    .collect::<Vec<&dyn Array>>();
+                Ok(interleave(&arrays, &indices)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output = RecordBatch::try_new_with_options(
+            Arc::clone(&self.schema),
+            columns,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(indices.len())),
+        )?;
+        // The batches that are consumed are released.
+        for input in &mut state.inputs {
+            if input
+                .batch
+                .as_ref()
+                .is_some_and(|(batch, _)| input.next == batch.num_rows())
+            {
+                input.batch = None;
+            }
+        }
+        if let Some(remaining) = &mut state.remaining {
+            *remaining -= output.num_rows();
+        }
+        state.reserve()?;
+        Ok(SourceResult::Chunk(DataChunk::from_record_batch(output)))
+    }
+
+    fn build_pipelines(
+        &self,
+        current: &mut PipelineBuilder,
+        meta: &mut MetaPipelineBuilder<'_>,
+    ) -> Result<()> {
+        // The merge is the source of the pipeline; its inputs run in
+        // executions of their own.
+        meta.build_source(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::LazyLock;
+    use std::time::Duration;
+
+    use arrow::array::{AsArray, Int64Array};
+    use arrow::datatypes::{DataType, Field, Int64Type, Schema};
+    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion_physical_expr::PhysicalSortExpr;
+    use datafusion_physical_expr::expressions::col;
+    use datafusion_physical_plan::repartition::RepartitionExec;
+    use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion_physical_plan::streaming::{PartitionStream, StreamingTableExec};
+    use datafusion_physical_plan::{ExecutionPlan, Partitioning};
+
+    use crate::bridge::bridged_plans;
+    use crate::operators::lowering_tests::{assert_plan_lowered, count};
+    use crate::test_utils::{datafusion_context, test_session_config};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
+    }
+
+    fn ordering() -> LexOrdering {
+        LexOrdering::new(vec![PhysicalSortExpr::new_default(
+            col("a", &schema()).unwrap(),
+        )])
+        .unwrap()
+    }
+
+    /// A partition of batches whose stream stays pending once it produced
+    /// them: it never ends.
+    #[derive(Debug)]
+    struct Endless(Vec<RecordBatch>);
+
+    impl PartitionStream for Endless {
+        fn schema(&self) -> &SchemaRef {
+            static SCHEMA: LazyLock<SchemaRef> = LazyLock::new(schema);
+            &SCHEMA
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let batches = futures::stream::iter(self.0.clone().into_iter().map(Ok))
+                .chain(futures::stream::pending());
+            Box::pin(RecordBatchStreamAdapter::new(schema(), batches))
+        }
+    }
+
+    /// A streaming table of `partitions` partitions that never end, sorted
+    /// by `a`: partition `p` has the values `p, p + partitions, ...` below
+    /// 1000, in batches of 7 rows.
+    fn endless_table(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let streams = (0..partitions)
+            .map(|partition| {
+                let values = (partition as i64..1000)
+                    .step_by(partitions)
+                    .collect::<Vec<_>>();
+                let batches = values
+                    .chunks(7)
+                    .map(|values| {
+                        RecordBatch::try_new(
+                            schema(),
+                            vec![Arc::new(Int64Array::from(values.to_vec()))],
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                Arc::new(Endless(batches)) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let table = StreamingTableExec::try_new(
+            schema(),
+            streams,
+            None,
+            [ordering()],
+            true,
+            None,
+        )
+        .unwrap();
+        Arc::new(table)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_partitions_that_never_end_are_native() {
+        for (partitions, fetch) in [(2, 5), (3, 100), (4, 1), (2, 900)] {
+            let make_plan = || -> Arc<dyn ExecutionPlan> {
+                Arc::new(
+                    SortPreservingMergeExec::new(ordering(), endless_table(partitions))
+                        .with_fetch(Some(fetch)),
+                )
+            };
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(count::<PhysicalStreamingMerge>(&root), 1, "{partitions}");
+        }
+        // A single partition, which a repartitioning that keeps the order of
+        // every partition distributes, is merged already.
+        let make_plan = || -> Arc<dyn ExecutionPlan> {
+            let repartition = RepartitionExec::try_new(
+                endless_table(1),
+                Partitioning::RoundRobinBatch(4),
+            )
+            .unwrap()
+            .with_preserve_order();
+            Arc::new(
+                SortPreservingMergeExec::new(ordering(), Arc::new(repartition))
+                    .with_fetch(Some(10)),
+            )
+        };
+        let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+        assert_eq!(count::<PhysicalStreamingMerge>(&root), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_emit_their_rows_before_their_inputs_end() -> Result<()> {
+        // Without a fetch, the merge of inputs that never end (and so never
+        // ends either) emits their rows as they arrive.
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(ordering(), endless_table(3)));
+        let ctx = datafusion_context(test_session_config());
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            plan,
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        let operator = Arc::clone(root.operator());
+        assert_eq!(count::<PhysicalStreamingMerge>(&operator), 1);
+        assert!(bridged_plans(&operator).is_empty());
+        let mut stream = root.execute(0, ctx.task_ctx())?;
+        let mut values = vec![];
+        while values.len() < 900 {
+            let batch = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("the merge emits rows")
+                .expect("the merge does not end")?;
+            values
+                .extend_from_slice(batch.column(0).as_primitive::<Int64Type>().values());
+        }
+        assert_eq!(values[..900], (0..900).collect::<Vec<_>>());
+        Ok(())
+    }
+}

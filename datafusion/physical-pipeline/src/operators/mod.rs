@@ -22,5 +22,6 @@ pub mod placeholder_row;
 pub mod projection;
 pub mod range_join;
 pub mod recursive_cte;
+pub mod streaming_merge;
 pub mod union;
 pub mod unnest;

@@ -48,6 +48,7 @@
 //! | `AsOfJoinExec`                                                                     | [`PhysicalAsOfJoin`]                               |
 //! | `MemDeleteExec`, `MemUpdateExec`                                                   | [`MemoryDmlSource`]                                |
 //! | `SortPreservingMergeExec` of other sorted partitions                               | [`PhysicalSort`] or [`PhysicalTopK`]               |
+//! | `SortPreservingMergeExec` of inputs that never end                                 | [`PhysicalStreamingMerge`]                         |
 //! | `RepartitionExec`, `CoalescePartitionsExec`, `CoalesceBatchesExec`                 | removed                                            |
 //! | `CooperativeExec`, `BufferExec`                                                    | removed                                            |
 //!
@@ -259,7 +260,7 @@ use crate::operators::materialized_cte::{
     hoist_materialized_ctes,
 };
 use crate::operators::partial_sort::{
-    PhysicalPartialSort, first_rows_of_merged_partitions,
+    PhysicalPartialSort, first_rows_of_merged_partitions, partitions_of,
 };
 use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::piecewise_merge_join::nested_loop_join_of;
@@ -267,6 +268,7 @@ use crate::operators::placeholder_row::PhysicalPlaceholderRow;
 use crate::operators::projection::PhysicalProjection;
 use crate::operators::range_join::PhysicalRangeJoin;
 use crate::operators::recursive_cte::{PhysicalRecursiveCte, WorkTableScanSource};
+use crate::operators::streaming_merge::PhysicalStreamingMerge;
 use crate::operators::union::PhysicalUnion;
 use crate::operators::unnest::PhysicalUnnest;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
@@ -662,6 +664,9 @@ impl Lowering<'_> {
             }
             if let Some(sort) = self.try_lower_merge_of_window(plan)? {
                 return Ok(sort);
+            }
+            if let Some(merge) = self.try_lower_streaming_merge(plan)? {
+                return Ok(merge);
             }
             if let Some(sort) = self.try_lower_merge(plan)? {
                 return Ok(sort);
@@ -1206,6 +1211,64 @@ impl Lowering<'_> {
         self.try_lower_sort(&sorted)
     }
 
+    /// Lower a `SortPreservingMergeExec` of inputs that never end (which the
+    /// native sort, which reads all of its input first, does not sort) to a
+    /// [`PhysicalStreamingMerge`] of the native operators of its partitions
+    /// (see [`partitions_of`]), every one sorted, through the repartitionings
+    /// that keep the order of every partition (which only distribute sorted
+    /// rows); to the native operators of its single partition if there is
+    /// one (with a limit for its fetch). Returns `Ok(None)` for any other
+    /// node, and for inputs whose partitions the planner does not split, or
+    /// whose native operators read the materialized CTEs around them (which
+    /// the merge, which runs every input in an execution of its own, does not
+    /// see).
+    fn try_lower_streaming_merge(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
+            return Ok(None);
+        };
+        if !merge.input().boundedness().is_unbounded() {
+            return Ok(None);
+        }
+        let mut input = merge.input();
+        while let Some(repartition) = input.downcast_ref::<RepartitionExec>()
+            && (repartition.preserve_order()
+                || repartition.input().output_partitioning().partition_count() == 1)
+        {
+            input = repartition.input();
+        }
+        let Some(partitions) = partitions_of(input)? else {
+            return Ok(None);
+        };
+        // A merge with a fetch stops once it has its rows.
+        let early_stop = self.early_stop.get() || merge.fetch().is_some();
+        let mut inputs = partitions
+            .iter()
+            .map(|partition| self.lower_in(partition, early_stop))
+            .collect::<Result<Vec<_>>>()?;
+        if let [input] = inputs.as_slice() {
+            let input = Arc::clone(input);
+            return Ok(Some(match merge.fetch() {
+                Some(fetch) => Arc::new(
+                    PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true),
+                ),
+                None => input,
+            }));
+        }
+        if inputs.iter().any(reads_materialized_ctes) {
+            return Ok(None);
+        }
+        let merge = PhysicalStreamingMerge::try_new(
+            std::mem::take(&mut inputs),
+            plan.schema(),
+            merge.expr().clone(),
+            merge.fetch(),
+        )?;
+        Ok(Some(Arc::new(merge)))
+    }
+
     /// Lower a nested loop join or a cross join with
     /// [`PhysicalNestedLoopJoin::try_lower`] or
     /// [`PhysicalCrossJoin::try_lower`], for a runtime whose memory pool has
@@ -1407,6 +1470,12 @@ fn redistributes_rows(repartition: &RepartitionExec) -> bool {
 #[expect(deprecated)]
 fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
+}
+
+/// Whether the operator tree `operator` scans a materialized CTE.
+fn reads_materialized_ctes(operator: &Arc<dyn PhysicalOperator>) -> bool {
+    operator.is::<MaterializedCteScan>()
+        || operator.children().iter().any(reads_materialized_ctes)
 }
 
 /// Whether `plan`, a node whose input is removed (see

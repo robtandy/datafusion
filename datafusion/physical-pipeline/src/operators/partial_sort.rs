@@ -24,6 +24,7 @@ use datafusion_physical_plan::limit::LocalLimitExec;
 use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::streaming::StreamingTableExec;
 use datafusion_physical_plan::union::UnionExec;
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
@@ -266,7 +267,8 @@ pub(crate) fn first_rows_of_merged_partitions(
 /// The plans of the partitions of `plan`, every one of a single partition
 /// with the rows of its partition, in their order: of a scan of in-memory
 /// batches (every partition with its batches), of a scan of files (every
-/// partition with its file group), and of the unions of them and of the
+/// partition with its file group), of a streaming table (every partition
+/// with its stream), and of the unions of them and of the
 /// projections, filters, limits of every partition and the nodes that only
 /// change the size of batches above them. `None` for any other plan of
 /// several partitions, whose partitions depend on how DataFusion distributes
@@ -297,6 +299,24 @@ pub(crate) fn partitions_of(
             return Ok(Some(partitions));
         }
         return Ok(None);
+    }
+    if let Some(streaming) = plan.downcast_ref::<StreamingTableExec>() {
+        let partitions = streaming
+            .partitions()
+            .iter()
+            .map(|partition| {
+                let exec = StreamingTableExec::try_new(
+                    Arc::clone(streaming.partition_schema()),
+                    vec![Arc::clone(partition)],
+                    streaming.projection().as_deref(),
+                    streaming.projected_output_ordering(),
+                    streaming.is_infinite(),
+                    streaming.limit(),
+                )?;
+                Ok(Arc::new(exec) as Arc<dyn ExecutionPlan>)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(partitions));
     }
     if plan.is::<UnionExec>() {
         let mut partitions = Vec::with_capacity(count);
