@@ -135,8 +135,7 @@ use arrow::array::{
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::{
-    SortOptions, concat_batches, interleave, prep_null_mask_filter, take,
-    take_record_batch,
+    SortOptions, interleave, interleave_record_batch, prep_null_mask_filter, take,
 };
 use arrow::datatypes::{
     DataType, Field, FieldRef, Float16Type, Float32Type, Float64Type, Int16Type,
@@ -3756,6 +3755,10 @@ struct PendingRun {
     bytes: usize,
 }
 
+/// The keys of the rows of a held run, the batch and the row of every row,
+/// and their reservation (see [`BufferedWindow::pending_keys`]).
+type PendingKeys = (Rows, Vec<(usize, usize)>, MemoryReservation);
+
 /// A join that reads its buffered input as a stream reads at most this many
 /// batches of buffered rows without output in a call of `execute` before it
 /// lets the other tasks run.
@@ -3929,23 +3932,29 @@ impl BufferedWindow {
             batches,
             bytes,
         };
-        let Some(first) = pending.batches.first() else {
+        if pending.batches.is_empty() {
             self.pending = Some(held(vec![], 0));
             return self.reserve(0);
+        }
+        // The rows of the run, and the copies of them that are gathered in the
+        // order of their keys (of their bytes at most, see `memory_size`), are
+        // reserved before the copies are made, until they are held or
+        // appended again.
+        self.reserve(2 * pending.bytes)?;
+        let (keys, positions, _evaluated) = self.pending_keys(spec, &pending)?;
+        let mut order = (0..positions.len()).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| keys.row(a).cmp(&keys.row(b)));
+        let released = order.partition_point(|&row| keys.row(row) <= bound);
+        let (now, later) = {
+            let batches = pending.batches.iter().collect::<Vec<_>>();
+            let gather = |rows: &[usize]| {
+                let rows = rows.iter().map(|&row| positions[row]).collect::<Vec<_>>();
+                interleave_record_batch(&batches, &rows)
+            };
+            let (now, later) = order.split_at(released);
+            (gather(now)?, gather(later)?)
         };
-        let batch = concat_batches(&first.schema(), &pending.batches)?;
-        // The rows of the run, and their copies, are reserved until they are
-        // held or appended again.
-        self.reserve(pending.bytes + memory_size(&batch))?;
-        let (keys, _evaluated) = self.keys_of(spec, &batch)?;
-        let rows = self.converter.convert_columns(&keys)?;
-        let mut order = (0..batch.num_rows() as u32).collect::<Vec<_>>();
-        order.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
-        let released = order.partition_point(|&row| rows.row(row as usize) <= bound);
-        let (now, later) = order.split_at(released);
-        let later = take_record_batch(&batch, &UInt32Array::from(later.to_vec()))?;
-        let now = take_record_batch(&batch, &UInt32Array::from(now.to_vec()))?;
-        drop((pending, batch, rows));
+        drop((pending, keys));
         let bytes = memory_size(&later);
         let later = match later.num_rows() {
             0 => vec![],
@@ -3990,21 +3999,54 @@ impl BufferedWindow {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
-        let Some(first) = pending.batches.first() else {
+        if pending.batches.is_empty() {
             return self.reserve(0);
-        };
-        let batch = concat_batches(&first.schema(), &pending.batches)?;
-        // The rows of the run, and their copies, are reserved until they are
-        // appended.
-        self.reserve(pending.bytes + memory_size(&batch))?;
-        let (keys, _evaluated) = self.keys_of(spec, &batch)?;
-        let rows = self.converter.convert_columns(&keys)?;
-        let mut order = (0..batch.num_rows() as u32).collect::<Vec<_>>();
-        order.sort_by(|&a, &b| rows.row(a as usize).cmp(&rows.row(b as usize)));
-        let sorted = take_record_batch(&batch, &UInt32Array::from(order))?;
-        drop((pending, batch, rows));
+        }
+        // The rows of the run, and the copies of them that are gathered in the
+        // order of their keys (of their bytes at most, see `memory_size`), are
+        // reserved before the copies are made, until they are appended.
+        self.reserve(2 * pending.bytes)?;
+        let (keys, positions, _evaluated) = self.pending_keys(spec, &pending)?;
+        let mut order = (0..positions.len()).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| keys.row(a).cmp(&keys.row(b)));
+        let rows = order
+            .into_iter()
+            .map(|row| positions[row])
+            .collect::<Vec<_>>();
+        let sorted =
+            interleave_record_batch(&pending.batches.iter().collect::<Vec<_>>(), &rows)?;
+        drop((pending, keys, positions, rows));
         let (keys, _evaluated) = self.keys_of(spec, &sorted)?;
         self.append(sorted, &keys, spec)
+    }
+
+    /// The keys of the rows of the held run `pending` (with `-0.0` as `+0.0`),
+    /// in the row format, in the order of the run, with the batch of every row
+    /// and its row in it, and the reservation of the keys (evaluated, if
+    /// computed, and encoded, see [`key_memory`]) and of these positions (and
+    /// of their order), to hold while the rows are sorted.
+    fn pending_keys(
+        &self,
+        spec: &MergeJoinSpec,
+        pending: &PendingRun,
+    ) -> Result<PendingKeys> {
+        let rows = pending
+            .batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>();
+        let reservation = self.reservation.new_empty();
+        reservation
+            .try_grow(rows * (size_of::<(usize, usize)>() + 2 * size_of::<usize>()))?;
+        let mut keys = self.converter.empty_rows(rows, 0);
+        let mut positions = Vec::with_capacity(rows);
+        for (index, batch) in pending.batches.iter().enumerate() {
+            let arrays = evaluate_keys(spec.buffered_keys(), batch)?;
+            reservation.try_grow(key_memory(&arrays, batch))?;
+            self.converter.append(&mut keys, &arrays)?;
+            positions.extend((0..batch.num_rows()).map(|row| (index, row)));
+        }
+        Ok((keys, positions, reservation))
     }
 
     /// Append `batch`, buffered rows whose keys are `keys`, to the rows.
@@ -5223,7 +5265,9 @@ pub(crate) mod tests {
         ListViewArray, MapBuilder, RunArray, StringArray, StringViewArray, StructArray,
         TimestampNanosecondArray,
     };
-    use arrow::compute::{SortColumn, lexsort_to_indices};
+    use arrow::compute::{
+        SortColumn, concat_batches, lexsort_to_indices, take_record_batch,
+    };
     use arrow::datatypes::{Field, Fields, TimeUnit, UnionFields};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -8374,6 +8418,190 @@ pub(crate) mod tests {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// A stream that produces the batch that `rows` builds as it is read (so
+    /// that it is allocated by the query, on the thread that reads it), and
+    /// then ends.
+    #[derive(Debug)]
+    struct BuiltPartition {
+        schema: SchemaRef,
+        rows: fn() -> RecordBatch,
+    }
+
+    impl PartitionStream for BuiltPartition {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+            let rows = self.rows;
+            Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                futures::stream::once(async move { Ok(rows()) }),
+            ))
+        }
+    }
+
+    /// The schema of the rows `(<side>id, <side>a, <side>b, <side>s)` of the
+    /// joins of held runs of wide rows.
+    fn wide_run_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}a"), DataType::Float64, false),
+            Field::new(format!("{side}b"), DataType::Int32, false),
+            Field::new(format!("{side}s"), DataType::Utf8, false),
+        ]))
+    }
+
+    /// 4,096 right rows with strings of 2 KiB (8 MiB), of the keys
+    /// `(a(row), b(row))`.
+    fn wide_run_rows(a: impl Fn(i32) -> f64, b: impl Fn(i32) -> i32) -> RecordBatch {
+        let rows = 0..4096;
+        RecordBatch::try_new(
+            wide_run_schema("r"),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.clone().map(i64::from))),
+                Arc::new(Float64Array::from_iter_values(rows.clone().map(a))),
+                Arc::new(Int32Array::from_iter_values(rows.clone().map(b))),
+                Arc::new(StringArray::from_iter_values(
+                    rows.map(|_| "x".repeat(2048)),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn held_runs_are_sorted_within_their_reservation() -> Result<()> {
+        // A merge join of streams sorted by `(a, b)` whose right (buffered)
+        // stream produces 4,096 rows with strings of 2 KiB (8 MiB), all of
+        // them a run of signed zeros, which the join holds and sorts by its
+        // keys (as `-0.0` is `+0.0`) once the run ended: of the keys
+        // `(-0.0, i)`, then `(+0.0, i)` (which the last row ends), or
+        // `(-0.0, i)` only (which the end of the stream ends). The join
+        // reserves the rows, and the copies of them that it gathers in order,
+        // before it gathers them: in a pool of 64 MiB, it allocates no more
+        // than it reserves (on the thread of the test, as a runtime of the
+        // current thread runs all tasks of the query there); in one of 12 MiB,
+        // which holds the rows but not their copies, it fails with
+        // `ResourcesExhausted` before it copies them.
+        fn released_run() -> RecordBatch {
+            wide_run_rows(|row| if row < 2048 { -0.0 } else { 0.0 }, |row| row % 2048)
+        }
+        fn appended_run() -> RecordBatch {
+            wide_run_rows(|_| -0.0, |row| row)
+        }
+        let order = |side: &str| {
+            let schema = wide_run_schema(side);
+            LexOrdering::new([
+                PhysicalSortExpr::new(
+                    col(&format!("{side}a"), &schema).unwrap(),
+                    SortOptions::default(),
+                ),
+                PhysicalSortExpr::new(
+                    col(&format!("{side}b"), &schema).unwrap(),
+                    SortOptions::default(),
+                ),
+            ])
+            .unwrap()
+        };
+        let join_of = |rows: fn() -> RecordBatch| -> Result<Arc<dyn ExecutionPlan>> {
+            let left_rows = RecordBatch::try_new(
+                wide_run_schema("l"),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..4)),
+                    Arc::new(Float64Array::from(vec![0.0; 4])),
+                    Arc::new(Int32Array::from_iter_values(0..4)),
+                    Arc::new(StringArray::from_iter_values(
+                        (0..4).map(|i| i.to_string()),
+                    )),
+                ],
+            )?;
+            let left: Arc<dyn PartitionStream> = Arc::new(StreamPartition {
+                schema: wide_run_schema("l"),
+                batches: vec![left_rows],
+                forever: false,
+            });
+            let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
+                schema: wide_run_schema("r"),
+                rows,
+            });
+            let stream = |side: &str, partition: Arc<dyn PartitionStream>| {
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        wide_run_schema(side),
+                        vec![partition],
+                        None,
+                        [order(side)],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            let (left, right) = (stream("l", left), stream("r", right));
+            let on = vec![
+                (col("la", &left.schema())?, col("ra", &right.schema())?),
+                (col("lb", &left.schema())?, col("rb", &right.schema())?),
+            ];
+            Ok(Arc::new(SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Inner,
+                vec![SortOptions::default(); 2],
+                NullEquality::NullEqualsNothing,
+            )?))
+        };
+        // The name of the run, its rows, and the rows that the join matches.
+        type Run = (&'static str, fn() -> RecordBatch, usize);
+        let runs: [Run; 2] = [
+            ("released by its last row", released_run, 8),
+            ("appended at the end", appended_run, 4),
+        ];
+        for (name, rows, matches) in runs {
+            let pool = Arc::new(PeakPool::new(64 << 20));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                .build_arc()?;
+            let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+            let plan = join_of(rows)?;
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            assert_streaming_merge_join(&root, name);
+            allocations::reset_peak();
+            let before = allocations::held();
+            let output = run_native(&root, plan, ctx).await?;
+            let allocated = allocations::peak() - before;
+            let reserved = pool.peak.load(Ordering::Relaxed) as isize;
+            assert_eq!(num_rows(&output.batches), matches, "{name}");
+            assert!(
+                allocated < reserved + (1 << 20),
+                "{name}: the query allocated {allocated} bytes, and reserved {reserved}"
+            );
+            let plan = join_of(rows)?;
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            allocations::reset_peak();
+            let before = allocations::held();
+            let err = run_native(&root, plan, limited_task_ctx(12 << 20)?)
+                .await
+                .unwrap_err();
+            let allocated = allocations::peak() - before;
+            assert!(
+                matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{name}: {err}"
+            );
+            assert!(
+                err.to_string().contains("PhysicalMergeJoin"),
+                "{name}: {err}"
+            );
+            assert!(
+                allocated < 12 << 20,
+                "{name}: the query allocated {allocated} bytes"
+            );
         }
         Ok(())
     }
