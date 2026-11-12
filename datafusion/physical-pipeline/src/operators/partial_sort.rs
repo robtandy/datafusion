@@ -7,8 +7,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch};
+use arrow::array::{Array, ArrayRef, RecordBatch, make_array};
+use arrow::compute::{
+    SortColumn, concat, concat_batches, lexsort_to_indices, take, take_record_batch,
+};
 use arrow::datatypes::SchemaRef;
 use arrow_ord::ord::make_comparator;
 use datafusion_common::utils::evaluate_partition_ranges;
@@ -17,7 +19,7 @@ use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuil
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::async_func::AsyncFuncExec;
 use datafusion_physical_plan::buffer::BufferExec;
@@ -278,70 +280,177 @@ impl PhysicalPartialSort {
         })
     }
 
-    /// The ranges of the rows of `batch` with the same prefix, in order.
+    /// `batch`, with the values of its sort keys, which are evaluated once,
+    /// as its rows arrive (see [`KeyedRows`]).
+    pub(crate) fn keyed(&self, batch: RecordBatch) -> Result<KeyedRows> {
+        KeyedRows::try_new(&self.expr, batch)
+    }
+
+    /// The ranges of the rows of `rows` with the same prefix, in order.
     pub(crate) fn prefix_ranges(
         &self,
-        batch: &RecordBatch,
+        rows: &KeyedRows,
     ) -> Result<Vec<std::ops::Range<usize>>> {
-        let keys = self.expr[..self.common_prefix_length]
-            .iter()
-            .map(|expr| expr.evaluate_to_sort_column(batch))
-            .collect::<Result<Vec<_>>>()?;
-        evaluate_partition_ranges(batch.num_rows(), &keys)
+        let keys = rows.sort_columns(&self.expr[..self.common_prefix_length]);
+        evaluate_partition_ranges(rows.num_rows(), &keys)
     }
 
     /// Whether the first row of `next` has the prefix of the last row of
     /// `previous`.
     pub(crate) fn same_prefix(
         &self,
-        previous: &RecordBatch,
-        next: &RecordBatch,
+        previous: &KeyedRows,
+        next: &KeyedRows,
     ) -> Result<bool> {
-        let last = previous.slice(previous.num_rows() - 1, 1);
-        let first = next.slice(0, 1);
-        for expr in &self.expr[..self.common_prefix_length] {
-            let last = expr.evaluate_to_sort_column(&last)?;
-            let first = expr.evaluate_to_sort_column(&first)?;
+        let last = previous.num_rows() - 1;
+        for (index, expr) in self.expr[..self.common_prefix_length].iter().enumerate() {
             let comparator = make_comparator(
-                last.values.as_ref(),
-                first.values.as_ref(),
+                previous.keys[index].as_ref(),
+                next.keys[index].as_ref(),
                 expr.options,
             )?;
-            if !comparator(0, 0).is_eq() {
+            if !comparator(last, 0).is_eq() {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// The memory that sorting `rows` (see [`Self::sort`]) holds and
-    /// allocates at most: the rows, their concatenation, their sort keys and
-    /// sort indices, and the sorted rows.
-    pub(crate) fn sort_memory(&self, rows: &[RecordBatch]) -> usize {
-        let memory = rows
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .sum::<usize>();
-        let count = rows.iter().map(RecordBatch::num_rows).sum::<usize>();
-        3 * memory + count * (size_of::<u32>() + size_of::<u64>() * self.expr.len())
+    /// The memory that sorting `rows` allocates at most: see
+    /// [`KeyedRows::sort_memory`].
+    pub(crate) fn sort_memory(&self, rows: &[KeyedRows]) -> usize {
+        KeyedRows::sort_memory(rows)
     }
 
     /// `rows` (of complete groups), sorted by all keys, at most `limit` of
     /// them.
     pub(crate) fn sort(
         &self,
-        rows: &[RecordBatch],
+        rows: &[KeyedRows],
         limit: Option<usize>,
     ) -> Result<RecordBatch> {
-        let schema = self.children[0].schema();
-        let batch = concat_batches(&schema, rows)?;
-        let keys = self
-            .expr
+        Ok(KeyedRows::sorted(&self.expr, &self.children[0].schema(), rows, limit)?.batch)
+    }
+}
+
+/// Rows that a partial sort (or a TopK of partitions) holds, with the values
+/// of their sort keys, which are evaluated once, for every chunk as its rows
+/// arrive (and reserved with them), rather than for all rows of a group once
+/// it is complete: computed keys may take more memory than the rows.
+#[derive(Debug, Clone)]
+pub(crate) struct KeyedRows {
+    pub(crate) batch: RecordBatch,
+    /// The values of the sort keys of the rows of `batch`.
+    pub(crate) keys: Vec<ArrayRef>,
+}
+
+impl KeyedRows {
+    /// The rows of `batch`, with the values of the keys of `expr`.
+    pub(crate) fn try_new(expr: &LexOrdering, batch: RecordBatch) -> Result<Self> {
+        let keys = expr
             .iter()
-            .map(|expr| expr.evaluate_to_sort_column(&batch))
+            .map(|key| key.expr.evaluate(&batch)?.into_array(batch.num_rows()))
             .collect::<Result<Vec<_>>>()?;
-        let indices = lexsort_to_indices(&keys, limit)?;
-        Ok(take_record_batch(&batch, &indices)?)
+        Ok(Self { batch, keys })
+    }
+
+    pub(crate) fn num_rows(&self) -> usize {
+        self.batch.num_rows()
+    }
+
+    /// The rows `offset..offset + len`.
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> Self {
+        Self {
+            batch: self.batch.slice(offset, len),
+            keys: self.keys.iter().map(|key| key.slice(offset, len)).collect(),
+        }
+    }
+
+    /// The memory that the rows hold: their batch (see [`batch_overhead`]),
+    /// and the keys that are not columns of the batch.
+    pub(crate) fn memory(&self) -> usize {
+        let keys = self
+            .keys
+            .iter()
+            .filter(|key| {
+                !self
+                    .batch
+                    .columns()
+                    .iter()
+                    .any(|column| Arc::ptr_eq(column, key))
+            })
+            .map(|key| key.get_array_memory_size())
+            .sum::<usize>();
+        self.batch.get_array_memory_size() + batch_overhead(&self.batch) + keys
+    }
+
+    /// The sort columns of the first `expr.len()` keys.
+    fn sort_columns(&self, expr: &[PhysicalSortExpr]) -> Vec<SortColumn> {
+        expr.iter()
+            .zip(&self.keys)
+            .map(|(key, values)| SortColumn {
+                values: Arc::clone(values),
+                options: Some(key.options),
+            })
+            .collect()
+    }
+
+    /// The memory that sorting `rows` (see [`Self::sorted`]) allocates at
+    /// most, besides the memory that they hold: the concatenation of their
+    /// batches and of their keys, the sort indices, and the sorted rows and
+    /// keys.
+    pub(crate) fn sort_memory(rows: &[Self]) -> usize {
+        let batches = rows
+            .iter()
+            .map(|rows| rows.batch.get_array_memory_size() + batch_overhead(&rows.batch))
+            .sum::<usize>();
+        let keys = rows
+            .iter()
+            .flat_map(|rows| &rows.keys)
+            .map(|key| key.get_array_memory_size())
+            .sum::<usize>();
+        let count = rows.iter().map(Self::num_rows).sum::<usize>();
+        2 * (batches + keys) + count * size_of::<u32>()
+    }
+
+    /// `rows` (with the schema `schema`), sorted by `expr`, the keys of
+    /// their values, at most `limit` of them, with their keys.
+    pub(crate) fn sorted(
+        expr: &LexOrdering,
+        schema: &SchemaRef,
+        rows: &[Self],
+        limit: Option<usize>,
+    ) -> Result<Self> {
+        let batch = concat_batches(schema, rows.iter().map(|rows| &rows.batch))?;
+        let keys = (0..expr.len())
+            .map(|index| {
+                let values = rows
+                    .iter()
+                    .map(|rows| rows.keys[index].as_ref())
+                    .collect::<Vec<_>>();
+                Ok(match values.as_slice() {
+                    [values] => make_array(values.to_data()),
+                    values => concat(values)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let columns = expr
+            .iter()
+            .zip(&keys)
+            .map(|(key, values)| SortColumn {
+                values: Arc::clone(values),
+                options: Some(key.options),
+            })
+            .collect::<Vec<_>>();
+        let indices = lexsort_to_indices(&columns, limit)?;
+        let keys = keys
+            .iter()
+            .map(|key| Ok(take(key.as_ref(), &indices, None)?))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            batch: take_record_batch(&batch, &indices)?,
+            keys,
+        })
     }
 }
 
@@ -621,7 +730,7 @@ impl PhysicalOperator for PlaceholderSink {
     }
 }
 
-/// The memory that buffering `batch` holds: its arrays, and the batch in the
+/// The memory that holding `batch` takes: its arrays, and the batch in the
 /// list of batches.
 fn batch_memory(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size() + batch_overhead(batch)
@@ -630,9 +739,9 @@ fn batch_memory(batch: &RecordBatch) -> usize {
 /// The state of the thread of a [`PhysicalPartialSort`].
 struct PartialSortState {
     /// The rows of the last group of rows with the same prefix, which may
-    /// continue in the next chunk.
-    group: Vec<RecordBatch>,
-    /// The memory of `group` (see [`batch_memory`]).
+    /// continue in the next chunk, with their sort keys.
+    group: Vec<KeyedRows>,
+    /// The memory of `group` (see [`KeyedRows::memory`]).
     group_memory: usize,
     /// The sorted rows that are not emitted yet, and the first of them.
     sorted: Option<RecordBatch>,
@@ -662,14 +771,14 @@ impl PartialSortState {
             .try_resize(self.group_memory + self.sorted_memory + extra)
     }
 
-    /// Buffer `batch`, which continues the last group.
-    fn push_group(&mut self, batch: RecordBatch) {
-        self.group_memory += batch_memory(&batch);
-        self.group.push(batch);
+    /// Buffer `rows`, which continue the last group.
+    fn push_group(&mut self, rows: KeyedRows) {
+        self.group_memory += rows.memory();
+        self.group.push(rows);
     }
 
     /// Take the rows of the last group.
-    fn take_group(&mut self) -> Vec<RecordBatch> {
+    fn take_group(&mut self) -> Vec<KeyedRows> {
         self.group_memory = 0;
         std::mem::take(&mut self.group)
     }
@@ -771,31 +880,34 @@ impl PhysicalOperator for PhysicalPartialSort {
             downcast_state_mut::<PartialSortState>(lstate.as_any_mut(), self.name())?;
         if !state.consumed {
             state.consumed = true;
-            // The rows of the chunk, which the operator holds.
+            // The rows of the chunk, which the operator holds, and then the
+            // values of their sort keys too (as large as the chunk at most).
             state.reserve_with(chunk_memory(input))?;
-            let batch = input.compact()?;
-            let ranges = self.prefix_ranges(&batch)?;
+            let rows = self.keyed(input.compact()?)?;
+            state.reserve_with(rows.memory())?;
+            let ranges = self.prefix_ranges(&rows)?;
             let Some(last) = ranges.last() else {
                 return internal_err!(
                     "PhysicalPartialSort received a chunk without rows"
                 );
             };
             let continues = match state.group.last() {
-                Some(previous) => self.same_prefix(previous, &batch)?,
+                Some(previous) => self.same_prefix(previous, &rows)?,
                 None => true,
             };
             if ranges.len() == 1 && continues {
                 // The chunk continues the last group.
-                state.push_group(batch);
+                state.push_group(rows);
             } else {
                 // The groups before the last group of the chunk are complete.
                 let mut complete = state.take_group();
                 if last.start > 0 {
-                    complete.push(batch.slice(0, last.start));
+                    complete.push(rows.slice(0, last.start));
                 }
-                state.push_group(batch.slice(last.start, last.len()));
+                state.push_group(rows.slice(last.start, last.len()));
                 if !complete.is_empty() {
-                    state.reserve_with(self.sort_memory(&complete))?;
+                    let held = complete.iter().map(KeyedRows::memory).sum::<usize>();
+                    state.reserve_with(held + self.sort_memory(&complete))?;
                     let sorted = self.sort(&complete, state.remaining)?;
                     state.set_sorted(sorted);
                 }
@@ -829,7 +941,8 @@ impl PhysicalOperator for PhysicalPartialSort {
         // The last group is complete once the input ends.
         if !state.group.is_empty() && state.remaining != Some(0) {
             let group = state.take_group();
-            state.reserve_with(self.sort_memory(&group))?;
+            let held = group.iter().map(KeyedRows::memory).sum::<usize>();
+            state.reserve_with(held + self.sort_memory(&group))?;
             let sorted = self.sort(&group, state.remaining)?;
             state.set_sorted(sorted);
             state.reserve()?;
@@ -1398,6 +1511,144 @@ mod tests {
             .map(|(_, b)| b)
             .collect::<Vec<_>>();
         assert_eq!(b, (0..20_000).collect::<Vec<_>>());
+    }
+
+    /// The schema `k: Int32, v: Utf8` of the rows of the tests of computed
+    /// sort keys.
+    fn kv_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    /// The physical expression `repeat(v, 10000)` over rows of `kv_schema`,
+    /// a computed sort key of 10 KB for every row.
+    async fn repeated_v() -> Result<Arc<dyn datafusion_physical_expr::PhysicalExpr>> {
+        let ctx = SessionContext::new();
+        let batch = RecordBatch::try_new(
+            kv_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            ],
+        )?;
+        ctx.register_batch("t", batch)?;
+        let mut plan = ctx
+            .sql("SELECT k, repeat(v, 10000) AS r FROM t")
+            .await?
+            .create_physical_plan()
+            .await?;
+        while !plan.is::<ProjectionExec>() {
+            plan = Arc::clone(plan.children()[0]);
+        }
+        let projection = plan.downcast_ref::<ProjectionExec>().unwrap();
+        Ok(Arc::clone(&projection.expr()[1].expr))
+    }
+
+    /// 5,000 rows of `kv_schema` with the same `k` (one group of ten chunks),
+    /// in ten batches.
+    fn one_group_of_ten_chunks() -> Result<Vec<RecordBatch>> {
+        (0..10)
+            .map(|batch| {
+                Ok(RecordBatch::try_new(
+                    kv_schema(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![0; 500])),
+                        Arc::new(arrow::array::StringArray::from_iter_values(
+                            (0..500).map(|row| format!("{}", (batch * 500 + row) % 7)),
+                        )),
+                    ],
+                )?)
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computed_sort_keys_of_a_group_reserve_memory_as_they_arrive() -> Result<()> {
+        // A group of 5,000 rows in ten chunks, sorted by `k` and by a key of
+        // 10 KB for every row (50 MB of keys), in a pool of 1 MiB: the keys
+        // of every chunk are evaluated, and reserved, as the chunk arrives.
+        let schema = kv_schema();
+        let expr = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("k", &schema)?),
+            PhysicalSortExpr::new_default(repeated_v().await?),
+        ])
+        .unwrap();
+        let sort = |batches: Vec<RecordBatch>| -> Result<Arc<dyn PhysicalOperator>> {
+            let source = MemoryScanSource::try_new(&[batches], kv_schema(), None, None)?
+                .with_preserve_order(true);
+            Ok(Arc::new(PhysicalPartialSort::try_new(
+                Arc::new(source),
+                expr.clone(),
+                1,
+                None,
+            )?))
+        };
+        let output = Executor::collect(
+            sort(one_group_of_ten_chunks()?)?,
+            task_context_with_memory_limit(1 << 20),
+            4,
+        )
+        .await;
+        assert_exhausted(output);
+        // In a pool that holds them, the rows sorted by their keys, and
+        // nothing stays reserved.
+        let ctx = task_context_with_memory_limit(1 << 30);
+        let output =
+            Executor::collect(sort(one_group_of_ten_chunks()?)?, Arc::clone(&ctx), 4)
+                .await?;
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                let v = batch.column(1).as_string::<i32>();
+                (0..batch.num_rows())
+                    .map(|row| v.value(row).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 5000);
+        assert!(values.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(ctx.memory_pool().reserved(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn computed_sort_keys_of_the_partitions_of_repartitionings_reserve_memory()
+    -> Result<()> {
+        // The partitions of a hash repartitioning of two partitions of these
+        // rows, every one keeping its first 3,000 rows by `k` and a key of
+        // 10 KB: the keys are evaluated, and reserved, as the rows arrive.
+        let schema = kv_schema();
+        let mut batches = one_group_of_ten_chunks()?;
+        let second = batches.split_off(5);
+        let input =
+            MemorySourceConfig::try_new_exec(&[batches, second], kv_schema(), None)?;
+        let hash = Partitioning::Hash(vec![col("v", &schema)?], 2);
+        let repartition = Arc::new(RepartitionExec::try_new(input, hash)?);
+        let expr = LexOrdering::new(vec![
+            PhysicalSortExpr::new_default(col("k", &schema)?),
+            PhysicalSortExpr::new_default(repeated_v().await?),
+        ])
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            PartialSortExec::new(expr, repartition, 1)
+                .with_preserve_partitioning(true)
+                .with_fetch(Some(3000)),
+        );
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            plan,
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert_eq!(count::<PhysicalTopKOfPartitions>(root.operator()), 1);
+        let operator = Arc::clone(root.operator());
+        let output =
+            Executor::collect(operator, task_context_with_memory_limit(1 << 20), 4).await;
+        assert_exhausted(output);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

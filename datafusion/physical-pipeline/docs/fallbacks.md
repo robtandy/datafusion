@@ -208,8 +208,9 @@ runs out (they do not spill):
   estimate of these rows, before it allocates them (it unnests a single level
   in windows of at most 2048 rows, also of a row that expands into many
   rows), and the rows it did not emit yet; `PhysicalPartialSort` reserves the
-  rows of the groups it buffers, and what sorting them allocates, before it
-  sorts them; and `PhysicalDataSink` the rows that wait for its writer (and,
+  rows of the groups it buffers with the values of their sort keys (which it
+  evaluates once, for every chunk as it arrives), and what sorting them
+  allocates, before it sorts them; and `PhysicalDataSink` the rows that wait for its writer (and,
   for a memory table, which holds them until it commits them, all rows until
   the writer completes);
 - `MaterializedCteBody` reserves the rows of the body of a CTE until the

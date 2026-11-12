@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
-use arrow::compute::{concat_batches, lexsort_to_indices, take_record_batch};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -27,7 +26,7 @@ use crate::operator::{
     OperatorState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
     downcast_state, downcast_state_mut,
 };
-use crate::operators::partial_sort::PhysicalPartialSort;
+use crate::operators::partial_sort::{KeyedRows, PhysicalPartialSort};
 use crate::sources::batches::{batch_overhead, chunk_memory};
 
 /// Keeps the first `fetch` rows by `expr` of every partition of the hash or
@@ -78,25 +77,9 @@ impl PhysicalTopKOfPartitions {
         })
     }
 
-    /// The first `fetch` rows of `rows`, sorted.
-    fn first_rows(&self, rows: &[RecordBatch]) -> Result<RecordBatch> {
-        let batch = concat_batches(&self.schema(), rows)?;
-        let keys = self
-            .expr
-            .iter()
-            .map(|expr| expr.evaluate_to_sort_column(&batch))
-            .collect::<Result<Vec<_>>>()?;
-        let indices = lexsort_to_indices(&keys, Some(self.fetch))?;
-        Ok(take_record_batch(&batch, &indices)?)
-    }
-
-    /// The memory that sorting `rows` holds and allocates at most: the rows,
-    /// their concatenation, their sort keys and sort indices, and the sorted
-    /// rows.
-    fn sort_memory(&self, rows: &[RecordBatch]) -> usize {
-        let memory = rows.iter().map(batch_memory).sum::<usize>();
-        let count = rows.iter().map(RecordBatch::num_rows).sum::<usize>();
-        3 * memory + count * (size_of::<u32>() + size_of::<u64>() * self.expr.len())
+    /// The first `fetch` rows of `rows`, sorted, with their keys.
+    fn first_rows(&self, rows: &[KeyedRows]) -> Result<KeyedRows> {
+        KeyedRows::sorted(&self.expr, &self.schema(), rows, Some(self.fetch))
     }
 }
 
@@ -105,10 +88,10 @@ fn batch_memory(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size() + batch_overhead(batch)
 }
 
-/// The rows of a partition.
+/// The rows of a partition, with their sort keys.
 #[derive(Default)]
 struct PartitionRows {
-    batches: Vec<RecordBatch>,
+    batches: Vec<KeyedRows>,
     rows: usize,
     memory: usize,
 }
@@ -214,13 +197,11 @@ impl PhysicalOperator for PhysicalTopKOfPartitions {
         for part in router.0.partition_iter(batch)? {
             let (partition, rows) = part?;
             if rows.num_rows() > 0 {
-                routed.push((partition, rows));
+                // The values of the sort keys of the rows, evaluated once.
+                routed.push((partition, KeyedRows::try_new(&self.expr, rows)?));
             }
         }
-        let held = routed
-            .iter()
-            .map(|(_, rows)| batch_memory(rows))
-            .sum::<usize>();
+        let held = routed.iter().map(|(_, rows)| rows.memory()).sum::<usize>();
         state.reservation.try_grow(held)?;
         state.reservation.shrink(estimate);
         for (partition, rows) in routed {
@@ -232,20 +213,17 @@ impl PhysicalOperator for PhysicalTopKOfPartitions {
             };
             let mut partition = partition.lock();
             partition.rows += rows.num_rows();
-            partition.memory += batch_memory(&rows);
+            partition.memory += rows.memory();
             partition.batches.push(rows);
             // Cut to the first rows once the partition holds more than twice
             // as many.
             if partition.rows > (2 * self.fetch).max(self.fetch + DEFAULT_VECTOR_SIZE) {
-                state
-                    .reservation
-                    .try_grow(self.sort_memory(&partition.batches))?;
+                let sort_memory = KeyedRows::sort_memory(&partition.batches);
+                state.reservation.try_grow(sort_memory)?;
                 let first = self.first_rows(&partition.batches)?;
-                state
-                    .reservation
-                    .shrink(self.sort_memory(&partition.batches) + partition.memory);
+                state.reservation.shrink(sort_memory + partition.memory);
                 partition.rows = first.num_rows();
-                partition.memory = batch_memory(&first);
+                partition.memory = first.memory();
                 state.reservation.try_grow(partition.memory)?;
                 partition.batches = vec![first];
             }
@@ -264,15 +242,12 @@ impl PhysicalOperator for PhysicalTopKOfPartitions {
             if partition.batches.is_empty() {
                 continue;
             }
-            state
-                .reservation
-                .try_grow(self.sort_memory(&partition.batches))?;
+            let sort_memory = KeyedRows::sort_memory(&partition.batches);
+            state.reservation.try_grow(sort_memory)?;
             let first = self.first_rows(&partition.batches)?;
-            state
-                .reservation
-                .shrink(self.sort_memory(&partition.batches) + partition.memory);
+            state.reservation.shrink(sort_memory + partition.memory);
             partition.rows = first.num_rows();
-            partition.memory = batch_memory(&first);
+            partition.memory = first.memory();
             state.reservation.try_grow(partition.memory)?;
             partition.batches = vec![first];
         }
@@ -298,7 +273,14 @@ impl PhysicalOperator for PhysicalTopKOfPartitions {
         let batches = state
             .partitions
             .iter()
-            .flat_map(|partition| partition.lock().batches.clone())
+            .flat_map(|partition| {
+                let partition = partition.lock();
+                partition
+                    .batches
+                    .iter()
+                    .map(|rows| rows.batch.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let chunks = batches
             .iter()
@@ -393,7 +375,7 @@ impl PhysicalPartialSortOfPartitions {
         &self,
         state: &mut SortState,
         partition: usize,
-        rows: RecordBatch,
+        rows: KeyedRows,
     ) -> Result<()> {
         let fetch = self.fetch;
         let Some(group) = state.partitions.get_mut(partition) else {
@@ -411,7 +393,7 @@ impl PhysicalPartialSortOfPartitions {
             None => true,
         };
         if ranges.len() == 1 && continues {
-            group.memory += batch_memory(&rows);
+            group.memory += rows.memory();
             group.rows.push(rows);
             return Ok(());
         }
@@ -421,14 +403,13 @@ impl PhysicalPartialSortOfPartitions {
             complete.push(rows.slice(0, last.start));
         }
         let rest = rows.slice(last.start, last.len());
-        let held = std::mem::replace(&mut group.memory, batch_memory(&rest));
+        let held = std::mem::replace(&mut group.memory, rest.memory());
         group.rows.push(rest);
         let limit = fetch - group.emitted;
-        state
-            .reservation
-            .try_grow(self.sort.sort_memory(&complete))?;
+        let sort_memory = self.sort.sort_memory(&complete);
+        state.reservation.try_grow(sort_memory)?;
         let sorted = self.sort.sort(&complete, Some(limit))?;
-        let sorted_memory = self.sort.sort_memory(&complete) + held;
+        let sorted_memory = sort_memory + held;
         state
             .reservation
             .shrink(sorted_memory.min(state.reservation.size()));
@@ -468,7 +449,7 @@ impl PhysicalPartialSortOfPartitions {
 /// and the number of rows that the partition emitted.
 #[derive(Default)]
 struct PartitionGroup {
-    rows: Vec<RecordBatch>,
+    rows: Vec<KeyedRows>,
     memory: usize,
     emitted: usize,
 }
@@ -574,14 +555,12 @@ impl PhysicalOperator for PhysicalPartialSortOfPartitions {
             for part in state.partitioner.partition_iter(batch)? {
                 let (partition, rows) = part?;
                 if rows.num_rows() > 0 {
-                    routed.push((partition, rows));
+                    // The values of the sort keys of the rows, evaluated once.
+                    routed.push((partition, self.sort.keyed(rows)?));
                 }
             }
             state.reservation.shrink(2 * chunk_memory(input));
-            let held = routed
-                .iter()
-                .map(|(_, rows)| batch_memory(rows))
-                .sum::<usize>();
+            let held = routed.iter().map(|(_, rows)| rows.memory()).sum::<usize>();
             state.reservation.try_grow(held)?;
             for (partition, rows) in routed {
                 self.add(state, partition, rows)?;
@@ -626,11 +605,12 @@ impl PhysicalOperator for PhysicalPartialSortOfPartitions {
             let rows = std::mem::take(&mut group.rows);
             let held = std::mem::take(&mut group.memory);
             let limit = self.fetch - group.emitted;
-            state.reservation.try_grow(self.sort.sort_memory(&rows))?;
+            let sort_memory = self.sort.sort_memory(&rows);
+            state.reservation.try_grow(sort_memory)?;
             let sorted = self.sort.sort(&rows, Some(limit))?;
-            state.reservation.shrink(
-                (self.sort.sort_memory(&rows) + held).min(state.reservation.size()),
-            );
+            state
+                .reservation
+                .shrink((sort_memory + held).min(state.reservation.size()));
             state.partitions[partition].emitted += sorted.num_rows();
             state.queue(sorted)?;
         }
