@@ -892,14 +892,16 @@ async fn sorted_reference(
             .filter(|row| returnable.next_if_eq(&row).is_none())
             .collect::<Vec<_>>()
     };
-    match reference.compute(ctx, &sorted, &others).await {
-        _ if others.is_empty() => {}
-        Ok(batches) => outputs.extend(batches),
-        Err(_) => failures.extend(others.iter().map(|&row| {
-            let reason = "the query cannot return it, as its keys cannot tie with \
-                          the keys of the rows that it returns within the tolerance";
-            (row, reason.to_string())
-        })),
+    if !others.is_empty() {
+        match reference.compute(ctx, &sorted, &others).await {
+            Ok(batches) => outputs.extend(batches),
+            Err(_) => failures.extend(others.iter().map(|&row| {
+                let reason = "the query cannot return it, as its keys cannot tie \
+                              with the keys of the rows that it returns within the \
+                              tolerance";
+                (row, reason.to_string())
+            })),
+        }
     }
 
     // The output columns of the sorted rows, at their positions.
