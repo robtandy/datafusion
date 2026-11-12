@@ -1288,6 +1288,8 @@ mod tests {
         {
             assert_eq!(name, expected_name);
             assert_eq!(sql, expected_sql);
+            // `;` terminates the queries of the script.
+            assert!(!sql.contains(';'), "{name}");
         }
         let names = queries.iter().map(|(name, _)| name.as_str());
         assert_eq!(
