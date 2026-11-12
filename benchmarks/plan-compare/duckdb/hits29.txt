@@ -13,12 +13,11 @@
 │ ~1 row                                │
 ╰───────────────────┬───────────────────╯
 ╭─ Ungrouped Aggregate ─────────────────╮
-│ Aggregates: sum(#0), count(#1)        │
+│ Aggregates: sum(#0), count(#0)        │
 │ ~1 row                                │
 ╰───────────────────┬───────────────────╯
 ╭─ Projection ──────┴───────────────────╮
-│ Projections: ResolutionWidth,         │
-│              ResolutionWidth          │
+│ Projections: ResolutionWidth          │
 │ ~1,000,000 rows                       │
 ╰───────────────────┬───────────────────╯
 ╭─ Read Parquet ────┴───────────────────╮

@@ -9,14 +9,14 @@
 │ Groups: #0, #1                │
 │ Aggregates: count_star(),     │
 │             sum(#2), avg(#3)  │
-│ ~199,999 rows                 │
+│ ~799,999 rows                 │
 ╰───────────────┬───────────────╯
 ╭─ Projection ──┴───────────────╮
 │ Projections: SearchEngineID,  │
 │              ClientIP,        │
 │              IsRefresh,       │
 │              ResolutionWidth  │
-│ ~200,000 rows                 │
+│ ~800,000 rows                 │
 ╰───────────────┬───────────────╯
 ╭─ Read Parquet ┴───────────────╮
 │ Function: READ_PARQUET        │
@@ -25,5 +25,5 @@
 │              IsRefresh,       │
 │              ResolutionWidth  │
 │ Filters: SearchPhrase != ''   │
-│ ~200,000 rows                 │
+│ ~800,000 rows                 │
 ╰───────────────────────────────╯

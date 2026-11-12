@@ -14,15 +14,14 @@
 │ Groups: #0, #1                               │
 │ Aggregates: sum(#2), sum(#3), sum(#4),       │
 │             sum(#5), avg(#6), count_star(),  │
-│             count(#7), count(#8)             │
+│             count(#2), count(#3)             │
 │ ~120,251 rows                                │
 ╰───────────────────────┬──────────────────────╯
 ╭─ Projection ──────────┴──────────────────────╮
 │ Projections: l_returnflag, l_linestatus,     │
 │              l_quantity, l_extendedprice,    │
 │              #4, #4 * (1.00 + l_tax),        │
-│              l_discount, l_quantity,         │
-│              l_extendedprice                 │
+│              l_discount                      │
 │ ~120,252 rows                                │
 ╰───────────────────────┬──────────────────────╯
 ╭─ Projection ──────────┴──────────────────────╮

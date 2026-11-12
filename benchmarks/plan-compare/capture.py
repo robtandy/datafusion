@@ -24,7 +24,7 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 
 #: The commit of DuckDB whose plans are captured, see build_duckdb.sh.
-DUCKDB_COMMIT = "e55f794cae98443cfaf302f41ce8a83a95a7872a"
+DUCKDB_COMMIT = "5d254ad870763a9724af68b937ebf4e1440ad040"
 
 #: The tables of the benchmark: a directory of Parquet files in the data
 #: directory, and a view over them in DuckDB.
@@ -182,9 +182,11 @@ def main() -> None:
         "--duckdb",
         type=pathlib.Path,
         default=os.environ.get(
-            "DUCKDB", pathlib.Path.home() / "github/duckdb/build/release/duckdb"
+            "DUCKDB",
+            pathlib.Path.home() / "github/duckdb-plan-compare/build/release/duckdb",
         ),
-        help="the DuckDB CLI (default: $DUCKDB or ~/github/duckdb/build/release/duckdb)",
+        help="the DuckDB CLI of build_duckdb.sh (default: $DUCKDB or "
+        "~/github/duckdb-plan-compare/build/release/duckdb)",
     )
     parser.add_argument(
         "--data-dir",

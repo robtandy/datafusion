@@ -1,15 +1,14 @@
-╭─ Ungrouped Aggregate ───╮
-│ Aggregates: min(#0),    │
-│             max(#1)     │
-│ ~1 row                  │
-╰────────────┬────────────╯
-╭─ Projection ────────────╮
-│ Projections: EventDate, │
-│              EventDate  │
-│ ~1,000,000 rows         │
-╰────────────┬────────────╯
-╭─ Read Parquet ──────────╮
-│ Function: READ_PARQUET  │
-│ Projections: EventDate  │
-│ ~1,000,000 rows         │
-╰─────────────────────────╯
+╭─ Ungrouped Aggregate ──╮
+│ Aggregates: min(#0),   │
+│             max(#0)    │
+│ ~1 row                 │
+╰────────────┬───────────╯
+╭─ Projection ───────────╮
+│ Projections: EventDate │
+│ ~1,000,000 rows        │
+╰────────────┬───────────╯
+╭─ Read Parquet ─────────╮
+│ Function: READ_PARQUET │
+│ Projections: EventDate │
+│ ~1,000,000 rows        │
+╰────────────────────────╯

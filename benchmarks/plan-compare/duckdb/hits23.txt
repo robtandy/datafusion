@@ -1,14 +1,14 @@
 ╭─ Order By ─────────────────────────╮
 │ Order By: EventTime ASC,           │
 │           WatchID ASC              │
-│ ~10 rows                           │
+│ ~1,000,000 rows                    │
 ╰──────────────────┬─────────────────╯
 ╭─ Hash Join ──────┴─────────────────╮
 │ Join Type: SEMI                    │
 │ Conditions:                        │
 │ file_index = file_index,           │
 │ file_row_number = file_row_number  │
-│ ~10 rows                           │
+│ ~1,000,000 rows                    │
 ╰──────────────────┬─────────────────╯
                    ├────────────────────────────────────────╮
 ╭─ Read Parquet ───┴─────────────────╮  ╭─ Top N ───────────┴───────────────────╮
@@ -27,5 +27,5 @@
 │              MobilePhoneModel      │
 │ Filters:                           │
 │ optional: contains(URL, 'google')  │
-│ ~1 row                             │
+│ ~1,000,000 rows                    │
 ╰────────────────────────────────────╯

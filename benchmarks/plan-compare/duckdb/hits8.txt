@@ -7,15 +7,15 @@
 ╭─ Hash Group By ─────────╮
 │ Groups: #0              │
 │ Aggregates: count(#1)   │
-│ ~250,000 rows           │
+│ ~999,999 rows           │
 ╰────────────┬────────────╯
 ╭─ Projection ────────────╮
 │ Projections: #0, #1     │
-│ ~500,000 rows           │
+│ ~999,999 rows           │
 ╰────────────┬────────────╯
 ╭─ Hash Group By ─────────╮
 │ Groups: #0, #1          │
-│ ~500,000 rows           │
+│ ~999,999 rows           │
 ╰────────────┬────────────╯
 ╭─ Projection ────────────╮
 │ Projections: RegionID,  │

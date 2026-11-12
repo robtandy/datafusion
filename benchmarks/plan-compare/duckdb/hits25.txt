@@ -8,5 +8,5 @@
 │ Projections: SearchPhrase                                        │
 │ Filters:                                                         │
 │ (SearchPhrase != '') AND optional: Dynamic Filter (SearchPhrase) │
-│ ~200,000 rows                                                    │
+│ ~800,000 rows                                                    │
 ╰──────────────────────────────────────────────────────────────────╯

@@ -4,37 +4,40 @@
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 # Build the DuckDB CLI whose plans are captured (see README.md): DuckDB's
-# release build, `GEN=ninja make release`, of a checkout at DUCKDB_COMMIT.
+# release build, `GEN=ninja make release`, of a checkout of
+# github.com/duckdb/duckdb at DUCKDB_COMMIT.
 #
 # Usage: benchmarks/plan-compare/build_duckdb.sh [DUCKDB_SOURCE_DIR]
 #
-# DUCKDB_SOURCE_DIR defaults to ~/github/duckdb. If it does not exist, the
-# script clones DUCKDB_COMMIT from https://github.com/duckdb/duckdb (shallow,
-# like ~/github/duckdb, so that `PRAGMA version` reports the same version). An
-# existing checkout must be at DUCKDB_COMMIT without local changes: the script
-# does not move it (other users may read it). The CLI is
+# DUCKDB_SOURCE_DIR defaults to ~/github/duckdb-plan-compare. If it does not
+# exist, the script clones the history of `main` of
+# https://github.com/duckdb/duckdb into it (without the files of other
+# commits) and checks out DUCKDB_COMMIT: the version of DuckDB counts the
+# commits of its history, which a shallow clone does not have. An existing
+# checkout must be at DUCKDB_COMMIT, without local changes: the script does not
+# move it, as others may read or build it (~/github/duckdb, which ~/github/dduck
+# builds, is at an older commit). The CLI is
 # DUCKDB_SOURCE_DIR/build/release/duckdb.
 
 set -euo pipefail
 
-# The head of `main` of ~/github/duckdb after `git fetch origin main` when the
-# plans were captured (see README.md). capture.py checks that the CLI is built
-# from it.
-DUCKDB_COMMIT=e55f794cae98443cfaf302f41ce8a83a95a7872a
+# The head of `main` of github.com/duckdb/duckdb when the plans were captured
+# (fetched on 2026-11-12, see README.md). capture.py checks that the CLI is
+# built from it.
+DUCKDB_COMMIT=5d254ad870763a9724af68b937ebf4e1440ad040
 DUCKDB_REPOSITORY=${DUCKDB_REPOSITORY:-https://github.com/duckdb/duckdb.git}
-DUCKDB_SOURCE_DIR=${1:-$HOME/github/duckdb}
+DUCKDB_SOURCE_DIR=${1:-$HOME/github/duckdb-plan-compare}
 
 if [ ! -e "$DUCKDB_SOURCE_DIR" ]; then
-  git init --quiet "$DUCKDB_SOURCE_DIR"
-  git -C "$DUCKDB_SOURCE_DIR" remote add origin "$DUCKDB_REPOSITORY"
-  git -C "$DUCKDB_SOURCE_DIR" fetch --depth 1 origin "$DUCKDB_COMMIT"
-  git -C "$DUCKDB_SOURCE_DIR" checkout --quiet --detach FETCH_HEAD
+  git clone --filter=tree:0 --single-branch --branch main --no-checkout \
+    "$DUCKDB_REPOSITORY" "$DUCKDB_SOURCE_DIR"
+  git -C "$DUCKDB_SOURCE_DIR" checkout --quiet --detach "$DUCKDB_COMMIT"
 fi
 
 head=$(git -C "$DUCKDB_SOURCE_DIR" rev-parse HEAD)
 if [ "$head" != "$DUCKDB_COMMIT" ]; then
   echo "error: $DUCKDB_SOURCE_DIR is at $head, not at $DUCKDB_COMMIT:" >&2
-  echo "  git -C $DUCKDB_SOURCE_DIR fetch origin $DUCKDB_COMMIT" >&2
+  echo "  git -C $DUCKDB_SOURCE_DIR fetch $DUCKDB_REPOSITORY main" >&2
   echo "  git -C $DUCKDB_SOURCE_DIR checkout $DUCKDB_COMMIT" >&2
   exit 1
 fi

@@ -1,62 +1,56 @@
-╭─ Top N ─────────────────────────────╮
-│ Top: 100                            │
-│ Order By: numwait DESC, s_name ASC  │
-│ ~100 rows                           │
-╰──────────────────┬──────────────────╯
-╭─ Hash Group By ──┴──────────────────╮
-│ Groups: #0                          │
-│ Aggregates: count_star()            │
-│ ~984 rows                           │
-╰──────────────────┬──────────────────╯
-╭─ Projection ─────┴──────────────────╮
-│ Projections: s_name                 │
-│ ~4,810 rows                         │
-╰──────────────────┬──────────────────╯
-╭─ Hash Join ──────┴──────────────────╮
-│ Join Type: INNER                    │
-│ Conditions: o_orderkey = l_orderkey │
-│ ~4,810 rows                         │
-╰──────────────────┬──────────────────╯
-                   ├─────────────────────────────────────────╮
-╭─ Read Parquet ───┴──────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
-│ Function: READ_PARQUET              │  │ Join Type: INNER                      │
-│ Projections: o_orderkey             │  │ Conditions: l_suppkey = s_suppkey     │
-│ Filters: o_orderstatus = 'F'        │  │ ~4,810 rows                           │
-│ ~30,000 rows                        │  ╰───────────────────┬───────────────────╯
-╰─────────────────────────────────────╯                      ├───────────────────────────────────────────────────────────────────────────────────────────╮
-                                         ╭─ Hash Join ───────┴───────────────────╮                                                   ╭─ Hash Join ───────┴───────────────────╮
-                                         │ Join Type: RIGHT_SEMI                 │                                                   │ Join Type: INNER                      │
-                                         │ Conditions:                           │                                                   │ Conditions: s_nationkey = n_nationkey │
-                                         │ l_orderkey = l_orderkey,              │                                                   │ ~992 rows                             │
-                                         │ l_suppkey IS DISTINCT FROM l_suppkey  │                                                   ╰───────────────────┬───────────────────╯
-                                         │ ~4,810 rows                           │                                                                       ├────────────────────────────────────────╮
-                                         ╰───────────────────┬───────────────────╯                                                   ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ──┴────────────────╮
-                                                             ├─────────────────────────────────────────────╮                         │ Function: READ_PARQUET                │  │ Function: READ_PARQUET           │
-                                         ╭─ Projection ──────┴───────────────────╮  ╭─ Hash Join ──────────┴──────────────────────╮  │ Projections: s_suppkey, s_name,       │  │ Projections: n_nationkey         │
-                                         │ Projections: l_suppkey, l_orderkey    │  │ Join Type: ANTI                             │  │              s_nationkey              │  │ Filters: n_name = 'SAUDI ARABIA' │
-                                         │ ~120,252 rows                         │  │ Conditions:                                 │  │ ~992 rows                             │  │ ~3 rows                          │
-                                         ╰───────────────────┬───────────────────╯  │ l_orderkey IS NOT DISTINCT FROM l_orderkey, │  ╰───────────────────────────────────────╯  ╰──────────────────────────────────╯
-                                         ╭─ Read Parquet ────┴───────────────────╮  │ l_suppkey IS DISTINCT FROM l_suppkey        │
-                                         │ Function: READ_PARQUET                │  │ ~24,050 rows                                │
-                                         │ Projections: l_orderkey, l_suppkey    │  ╰──────────────────────┬──────────────────────╯
-                                         │ Filters: l_orderkey IS NOT NULL,      │                         ├───────────────────────────────────────────────╮
-                                         │          l_suppkey IS NOT NULL        │  ╭─ Projection ─────────┴──────────────────────╮  ╭─ Projection ────────┴────────────────────╮
-                                         │ ~120,252 rows                         │  │ Projections: #0, #1                         │  │ Projections: l_suppkey, l_orderkey       │
-                                         ╰───────────────────────────────────────╯  │ ~120,252 rows                               │  │ ~24,050 rows                             │
-                                                                                    ╰──────────────────────┬──────────────────────╯  ╰─────────────────────┬────────────────────╯
-                                                                                    ╭─ Filter ─────────────┴──────────────────────╮  ╭─ Projection ────────┴────────────────────╮
-                                                                                    │ Expression: l_receiptdate > l_commitdate    │  │ Projections: #0, #1                      │
-                                                                                    │ ~120,252 rows                               │  │ ~24,050 rows                             │
-                                                                                    ╰──────────────────────┬──────────────────────╯  ╰─────────────────────┬────────────────────╯
-                                                                                    ╭─ Read Parquet ───────┴──────────────────────╮  ╭─ Filter ────────────┴────────────────────╮
-                                                                                    │ Function: READ_PARQUET                      │  │ Expression: l_receiptdate > l_commitdate │
-                                                                                    │ Projections: l_orderkey, l_suppkey,         │  │ ~24,050 rows                             │
-                                                                                    │              l_commitdate, l_receiptdate    │  ╰─────────────────────┬────────────────────╯
-                                                                                    │ ~601,264 rows                               │  ╭─ Read Parquet ──────┴────────────────────╮
-                                                                                    ╰─────────────────────────────────────────────╯  │ Function: READ_PARQUET                   │
-                                                                                                                                     │ Projections: l_orderkey, l_suppkey,      │
-                                                                                                                                     │              l_commitdate, l_receiptdate │
-                                                                                                                                     │ Filters: l_orderkey IS NOT NULL,         │
-                                                                                                                                     │          l_suppkey IS NOT NULL           │
-                                                                                                                                     │ ~120,252 rows                            │
-                                                                                                                                     ╰──────────────────────────────────────────╯
+╭─ Top N ───────────────────────────────╮
+│ Top: 100                              │
+│ Order By: numwait DESC, s_name ASC    │
+│ ~100 rows                             │
+╰───────────────────┬───────────────────╯
+╭─ Hash Group By ───┴───────────────────╮
+│ Groups: #0                            │
+│ Aggregates: count_star()              │
+│ ~123 rows                             │
+╰───────────────────┬───────────────────╯
+╭─ Projection ──────┴───────────────────╮
+│ Projections: s_name                   │
+│ ~180 rows                             │
+╰───────────────────┬───────────────────╯
+╭─ Hash Join ───────┴───────────────────╮
+│ Join Type: RIGHT_SEMI                 │
+│ Conditions:                           │
+│ l_orderkey = l_orderkey,              │
+│ l_suppkey IS DISTINCT FROM l_suppkey  │
+│ ~180 rows                             │
+╰───────────────────┬───────────────────╯
+                    ├─────────────────────────────────────────────╮
+╭─ Projection ──────┴───────────────────╮  ╭─ Hash Join ──────────┴──────────────────────╮
+│ Projections: l_suppkey, l_orderkey    │  │ Join Type: RIGHT_ANTI                       │
+│ ~481,011 rows                         │  │ Conditions:                                 │
+╰───────────────────┬───────────────────╯  │ l_orderkey IS NOT DISTINCT FROM l_orderkey, │
+╭─ Read Parquet ────┴───────────────────╮  │ l_suppkey IS DISTINCT FROM l_suppkey        │
+│ Function: READ_PARQUET                │  │ ~901 rows                                   │
+│ Projections: l_orderkey, l_suppkey    │  ╰──────────────────────┬──────────────────────╯
+│ Filters: l_orderkey IS NOT NULL,      │                         ├───────────────────────────────────────────────╮
+│          l_suppkey IS NOT NULL        │  ╭─ Projection ─────────┴──────────────────────╮  ╭─ Hash Join ─────────┴────────────────────╮
+│ ~481,011 rows                         │  │ Projections: l_suppkey, l_orderkey          │  │ Join Type: INNER                         │
+╰───────────────────────────────────────╯  │ ~96,202 rows                                │  │ Conditions: l_orderkey = o_orderkey      │
+                                           ╰──────────────────────┬──────────────────────╯  │ ~4,509 rows                              │
+                                           ╭─ Projection ─────────┴──────────────────────╮  ╰─────────────────────┬────────────────────╯
+                                           │ Projections: #0, #1                         │                        ├──────────────────────────────────────────────────────────────╮
+                                           │ ~96,202 rows                                │  ╭─ Hash Join ─────────┴────────────────────╮                         ╭─ Read Parquet ┴──────────────╮
+                                           ╰──────────────────────┬──────────────────────╯  │ Join Type: INNER                         │                         │ Function: READ_PARQUET       │
+                                           ╭─ Filter ─────────────┴──────────────────────╮  │ Conditions: l_suppkey = s_suppkey        │                         │ Projections: o_orderkey      │
+                                           │ Expression: l_receiptdate > l_commitdate    │  │ ~22,547 rows                             │                         │ Filters: o_orderstatus = 'F' │
+                                           │ ~96,202 rows                                │  ╰─────────────────────┬────────────────────╯                         │ ~30,000 rows                 │
+                                           ╰──────────────────────┬──────────────────────╯                        ├───────────────────────────────────────────╮  ╰──────────────────────────────╯
+                                           ╭─ Read Parquet ───────┴──────────────────────╮  ╭─ Projection ────────┴────────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+                                           │ Function: READ_PARQUET                      │  │ Projections: #0, #1                      │  │ Join Type: INNER                      │
+                                           │ Projections: l_orderkey, l_suppkey,         │  │ ~120,252 rows                            │  │ Conditions: s_nationkey = n_nationkey │
+                                           │              l_commitdate, l_receiptdate    │  ╰─────────────────────┬────────────────────╯  │ ~186 rows                             │
+                                           │ Filters: l_orderkey IS NOT NULL,            │  ╭─ Filter ────────────┴────────────────────╮  ╰───────────────────┬───────────────────╯
+                                           │          l_suppkey IS NOT NULL              │  │ Expression: l_receiptdate > l_commitdate │                      ├────────────────────────────────────────╮
+                                           │ ~481,011 rows                               │  │ ~120,252 rows                            │  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ──┴────────────────╮
+                                           ╰─────────────────────────────────────────────╯  ╰─────────────────────┬────────────────────╯  │ Function: READ_PARQUET                │  │ Function: READ_PARQUET           │
+                                                                                            ╭─ Read Parquet ──────┴────────────────────╮  │ Projections: s_suppkey, s_name,       │  │ Projections: n_nationkey         │
+                                                                                            │ Function: READ_PARQUET                   │  │              s_nationkey              │  │ Filters: n_name = 'SAUDI ARABIA' │
+                                                                                            │ Projections: l_orderkey, l_suppkey,      │  │ ~992 rows                             │  │ ~3 rows                          │
+                                                                                            │              l_commitdate, l_receiptdate │  ╰───────────────────────────────────────╯  ╰──────────────────────────────────╯
+                                                                                            │ ~601,264 rows                            │
+                                                                                            ╰──────────────────────────────────────────╯

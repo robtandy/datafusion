@@ -1,25 +1,25 @@
 ╭─ Order By ─────────────────────────╮
 │ Order By: custdist DESC,           │
 │           c_count DESC             │
-│ ~8,195 rows                        │
+│ ~14,992 rows                       │
 ╰──────────────────┬─────────────────╯
 ╭─ Hash Group By ──┴─────────────────╮
 │ Groups: #0                         │
 │ Aggregates: count_star()           │
-│ ~8,195 rows                        │
+│ ~14,992 rows                       │
 ╰──────────────────┬─────────────────╯
 ╭─ Projection ─────┴─────────────────╮
 │ Projections: c_count               │
-│ ~12,965 rows                       │
+│ ~14,992 rows                       │
 ╰──────────────────┬─────────────────╯
 ╭─ Projection ─────┴─────────────────╮
 │ Projections: count(o_orderkey)     │
-│ ~12,965 rows                       │
+│ ~14,992 rows                       │
 ╰──────────────────┬─────────────────╯
 ╭─ Hash Group By ──┴─────────────────╮
 │ Groups: #0                         │
 │ Aggregates: count(#1)              │
-│ ~12,965 rows                       │
+│ ~14,992 rows                       │
 ╰──────────────────┬─────────────────╯
 ╭─ Projection ─────┴─────────────────╮
 │ Projections: c_custkey, o_orderkey │

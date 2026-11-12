@@ -6,12 +6,11 @@
 ╰───────────────────────┬──────────────────────╯
 ╭─ Ungrouped Aggregate ─┴──────────────────────╮
 │ Aggregates: sum(#0), count_star(), sum(#1),  │
-│             count(#2)                        │
+│             count(#1)                        │
 │ ~1 row                                       │
 ╰───────────────────────┬──────────────────────╯
 ╭─ Projection ──────────┴──────────────────────╮
-│ Projections: AdvEngineID, ResolutionWidth,   │
-│              ResolutionWidth                 │
+│ Projections: AdvEngineID, ResolutionWidth    │
 │ ~1,000,000 rows                              │
 ╰───────────────────────┬──────────────────────╯
 ╭─ Read Parquet ────────┴──────────────────────╮

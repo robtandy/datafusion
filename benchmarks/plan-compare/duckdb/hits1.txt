@@ -4,10 +4,10 @@
 ╰─────────────┬─────────────╯
 ╭─ Projection ┴─────────────╮
 │ Projections: 42           │
-│ ~200,000 rows             │
+│ ~800,000 rows             │
 ╰─────────────┬─────────────╯
 ╭─ Read Parquet ────────────╮
 │ Function: READ_PARQUET    │
 │ Filters: AdvEngineID != 0 │
-│ ~200,000 rows             │
+│ ~800,000 rows             │
 ╰───────────────────────────╯

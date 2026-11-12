@@ -8,48 +8,37 @@
 │              revenue, c_acctbal,       │
 │              n_name, c_address,        │
 │              c_phone, c_comment        │
-│ ~120,252 rows                          │
-╰────────────────────┬───────────────────╯
-╭─ Projection ───────┴───────────────────╮
-│ Projections: #0, #1, #2, #3, #4, #5,   │
-│              #6, finalize(#7)          │
-│ ~120,252 rows                          │
+│ ~24,050 rows                           │
 ╰────────────────────┬───────────────────╯
 ╭─ Hash Group By ────┴───────────────────╮
 │ Groups: #0, #1, #2, #3, #4, #5, #6     │
-│ Aggregates: combine_aggr(#7)           │
-│ ~120,252 rows                          │
+│ Aggregates: sum(#7)                    │
+│ ~24,050 rows                           │
 ╰────────────────────┬───────────────────╯
 ╭─ Projection ───────┴───────────────────╮
-│ Projections: c_custkey, c_name,        │
-│              c_acctbal, c_phone,       │
-│              n_name, c_address,        │
-│              c_comment, #0             │
-│ ~120,252 rows                          │
+│ Projections:                           │
+│ c_custkey, c_name, c_acctbal, c_phone, │
+│ n_name, c_address, c_comment,          │
+│ l_extendedprice * (1.00 - l_discount)  │
+│ ~24,050 rows                           │
 ╰────────────────────┬───────────────────╯
 ╭─ Hash Join ────────┴───────────────────╮
 │ Join Type: INNER                       │
-│ Conditions: #0 = o_orderkey            │
-│ ~120,252 rows                          │
+│ Conditions: c_custkey = o_custkey      │
+│ ~24,050 rows                           │
 ╰────────────────────┬───────────────────╯
-                     ├──────────────────────────────────────────╮
-╭─ Hash Group By ────┴───────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
-│ Groups: #0                             │  │ Join Type: INNER                      │
-│ Aggregates: sum(#1) EXPORT_STATE       │  │ Conditions: c_custkey = o_custkey     │
-│ ~120,252 rows                          │  │ ~30,000 rows                          │
-╰────────────────────┬───────────────────╯  ╰───────────────────┬───────────────────╯
-╭─ Projection ───────┴───────────────────╮                      ├────────────────────────────────────────────────────────────────────────────────────────────╮
-│ Projections:                           │  ╭─ Hash Join ───────┴───────────────────╮                                 ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮
-│ #0,                                    │  │ Join Type: INNER                      │                                 │ Function: READ_PARQUET                                                     │
-│ l_extendedprice * (1.00 - l_discount)  │  │ Conditions: c_nationkey = n_nationkey │                                 │ Projections: o_orderkey, o_custkey                                         │
-│ ~120,252 rows                          │  │ ~14,992 rows                          │                                 │ Filters:                                                                   │
-╰────────────────────┬───────────────────╯  ╰───────────────────┬───────────────────╯                                 │ (o_orderdate >= '1993-10-01'::DATE) AND (o_orderdate < '1994-01-01'::DATE) │
-╭─ Read Parquet ─────┴───────────────────╮                      ├────────────────────────────────────╮                │ ~30,000 rows                                                               │
-│ Function: READ_PARQUET                 │  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ────────────╮  ╰────────────────────────────────────────────────────────────────────────────╯
-│ Projections: l_orderkey,               │  │ Function: READ_PARQUET                │  │ Function: READ_PARQUET    │
-│              l_extendedprice,          │  │ Projections: c_custkey, c_name,       │  │ Projections: n_nationkey, │
-│              l_discount                │  │              c_address, c_nationkey,  │  │              n_name       │
-│ Filters: l_returnflag = 'R'            │  │              c_phone, c_acctbal,      │  │ ~16 rows                  │
-│ ~120,252 rows                          │  │              c_comment                │  ╰───────────────────────────╯
-╰────────────────────────────────────────╯  │ ~14,992 rows                          │
-                                            ╰───────────────────────────────────────╯
+                     ├────────────────────────────────────────────────────────────────────────╮
+╭─ Hash Join ────────┴───────────────────╮                                 ╭─ Hash Join ──────┴──────────────────╮
+│ Join Type: INNER                       │                                 │ Join Type: INNER                    │
+│ Conditions: c_nationkey = n_nationkey  │                                 │ Conditions: l_orderkey = o_orderkey │
+│ ~14,992 rows                           │                                 │ ~24,050 rows                        │
+╰────────────────────┬───────────────────╯                                 ╰──────────────────┬──────────────────╯
+                     ├────────────────────────────────────╮                                   ├────────────────────────────────────────────────────────────╮
+╭─ Read Parquet ─────┴───────────────────╮  ╭─ Read Parquet ────────────╮  ╭─ Read Parquet ───┴──────────────────╮  ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮
+│ Function: READ_PARQUET                 │  │ Function: READ_PARQUET    │  │ Function: READ_PARQUET              │  │ Function: READ_PARQUET                                                     │
+│ Projections: c_custkey, c_name,        │  │ Projections: n_nationkey, │  │ Projections: l_orderkey,            │  │ Projections: o_orderkey, o_custkey                                         │
+│              c_address, c_nationkey,   │  │              n_name       │  │              l_extendedprice,       │  │ Filters:                                                                   │
+│              c_phone, c_acctbal,       │  │ ~16 rows                  │  │              l_discount             │  │ (o_orderdate >= '1993-10-01'::DATE) AND (o_orderdate < '1994-01-01'::DATE) │
+│              c_comment                 │  ╰───────────────────────────╯  │ Filters: l_returnflag = 'R'         │  │ ~30,000 rows                                                               │
+│ ~14,992 rows                           │                                 │ ~120,252 rows                       │  ╰────────────────────────────────────────────────────────────────────────────╯
+╰────────────────────────────────────────╯                                 ╰─────────────────────────────────────╯

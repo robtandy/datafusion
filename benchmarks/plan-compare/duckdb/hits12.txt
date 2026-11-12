@@ -7,15 +7,15 @@
 ╭─ Hash Group By ─────────────╮
 │ Groups: #0                  │
 │ Aggregates: count_star()    │
-│ ~126,424 rows               │
+│ ~800,000 rows               │
 ╰──────────────┬──────────────╯
 ╭─ Projection ─┴──────────────╮
 │ Projections: SearchPhrase   │
-│ ~200,000 rows               │
+│ ~800,000 rows               │
 ╰──────────────┬──────────────╯
 ╭─ Read Parquet ──────────────╮
 │ Function: READ_PARQUET      │
 │ Projections: SearchPhrase   │
 │ Filters: SearchPhrase != '' │
-│ ~200,000 rows               │
+│ ~800,000 rows               │
 ╰─────────────────────────────╯

@@ -7,25 +7,25 @@
 ╭─ Hash Group By ┴────────────────╮
 │ Groups: #0                      │
 │ Aggregates: count(#1)           │
-│ ~50,000 rows                    │
+│ ~799,999 rows                   │
 ╰────────────────┬────────────────╯
 ╭─ Projection ───┴────────────────╮
 │ Projections: #0, #1             │
-│ ~100,000 rows                   │
+│ ~799,999 rows                   │
 ╰────────────────┬────────────────╯
 ╭─ Hash Group By ┴────────────────╮
 │ Groups: #0, #1                  │
-│ ~100,000 rows                   │
+│ ~799,999 rows                   │
 ╰────────────────┬────────────────╯
 ╭─ Projection ───┴────────────────╮
 │ Projections: MobilePhoneModel,  │
 │              UserID             │
-│ ~200,000 rows                   │
+│ ~800,000 rows                   │
 ╰────────────────┬────────────────╯
 ╭─ Read Parquet ─┴────────────────╮
 │ Function: READ_PARQUET          │
 │ Projections: UserID,            │
 │              MobilePhoneModel   │
 │ Filters: MobilePhoneModel != '' │
-│ ~200,000 rows                   │
+│ ~800,000 rows                   │
 ╰─────────────────────────────────╯

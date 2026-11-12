@@ -10,12 +10,12 @@
 │              ClientIP - 2, │
 │              ClientIP - 3, │
 │              #1            │
-│ ~632,120 rows              │
+│ ~1,000,000 rows            │
 ╰──────────────┬─────────────╯
 ╭─ Hash Group By ────────────╮
 │ Groups: #0                 │
 │ Aggregates: count_star()   │
-│ ~632,120 rows              │
+│ ~1,000,000 rows            │
 ╰──────────────┬─────────────╯
 ╭─ Projection ─┴─────────────╮
 │ Projections: ClientIP      │

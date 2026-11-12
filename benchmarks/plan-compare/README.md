@@ -26,29 +26,31 @@ plan shapes, no timings and no comparison.
 
 ## DuckDB
 
-All plans were captured with one build of DuckDB, the head of `main`:
+All plans were captured with one build of DuckDB, the head of `main` of
+`github.com/duckdb/duckdb`:
 
-- **Commit**: `e55f794cae98443cfaf302f41ce8a83a95a7872a` (2026-10-20, "Test:
-  replace deprecated `__TEST_DIR__` placeholder with `{TEST_DIR}` (#27533)").
-  It is the head of `main` of `~/github/duckdb` on dduck1 (a shallow clone of
-  `github.com/robtandy/duckdb`, a fork of `github.com/duckdb/duckdb`) after
-  `git fetch origin main` on 2026-11-12, and a commit of the `main` of
-  `github.com/duckdb/duckdb`. `~/github/duckdb` is the DuckDB source that
-  the work on the pipeline engine reads.
+- **Commit**: `5d254ad870763a9724af68b937ebf4e1440ad040` (2026-11-12,
+  "Release the read-ahead memory reservation when the scan is exhausted
+  (#28687)"), the head of `main` when it was fetched on 2026-11-12 at 23:36
+  UTC (`git ls-remote https://github.com/duckdb/duckdb refs/heads/main`).
+  `build_duckdb.sh` clones it into `~/github/duckdb-plan-compare`. The clone
+  `~/github/duckdb` on dduck1 is not used: it is a clone of the fork
+  `github.com/robtandy/duckdb`, whose `main` (`e55f794cae`, 2026-10-20) is
+  4,192 commits behind, and `~/github/dduck` builds against it, so it is not
+  moved to another commit. The source of DuckDB that made these plans is the
+  checkout of `build_duckdb.sh`.
 - **`PRAGMA version`**:
 
   | library_version | source_id  | codename            |
   | --------------- | ---------- | ------------------- |
-  | v2.1.0-dev1     | e55f794cae | Development Version |
+  | v2.1.0-dev93719 | 5d254ad870 | Development Version |
 
-  This is DuckDB 2, not 1.5.x: DuckDB releases 2.0 from the branch
-  `v2.0-cyanoptera` (where it tagged v2.0.0 on 2026-10-20), and `main` has
-  been versioned 2.1 since 2026-09-02, so builds of `main` report
-  `v2.1.0-dev<N>`. This commit of `main` contains the release branch up to
-  2026-10-16 (their merge base; v2.0.0 has 108 more commits) and 1,021
-  commits that v2.0.0 does not. `<N>` is the number of commits in the history
-  of the checkout, 1 in a shallow clone; a full clone reports a larger `<N>`
-  with the same `source_id`.
+  This is DuckDB 2, not 1.5.x: the history of this commit contains DuckDB
+  v2.0.0 (released on 2026-10-20 from the branch `v2.0-cyanoptera`, which
+  `main` merged), and `main` has been versioned 2.1 since 2026-09-02, so
+  builds of `main` report `v2.1.0-dev<N>`, where `<N>` is the number of
+  commits in the history of the checkout: 93,719 (a shallow clone reports 1,
+  with the same `source_id`).
 
 - **Build command**, in the DuckDB checkout, with `ninja` on the `PATH`
   (`~/.local/bin/ninja` on dduck1):
@@ -65,7 +67,7 @@ All plans were captured with one build of DuckDB, the head of `main`:
 
   and built the CLI `build/release/duckdb` with the extensions
   `core_functions`, `parquet`, `json` and `icu` linked in, with GCC 13.3.0,
-  CMake 3.28.3 and Ninja 1.11.1, in 12 minutes on dduck1 (16-core
+  CMake 3.28.3 and Ninja 1.11.1, in 11 minutes on dduck1 (16-core
   Neoverse-N1, aarch64). `build_duckdb.sh` runs this command (see
   [Reproduce](#reproduce-from-a-clean-workspace)).
 
@@ -140,14 +142,14 @@ which `capture.py` applies (see `ADJUSTMENTS`):
 ## Capture
 
 ```bash
-benchmarks/plan-compare/capture.py --duckdb ~/github/duckdb/build/release/duckdb
+benchmarks/plan-compare/capture.py --duckdb ~/github/duckdb-plan-compare/build/release/duckdb
 ```
 
-`capture.py` first checks that the CLI is built from the commit above
-(`PRAGMA version`) and that the data directory holds the data above (16 files
-and the rows of every table), and then runs, for every query of
-`queries.sql`, the DuckDB CLI on an in-memory database in the data directory,
-`duckdb -batch -bail -no-init -no-agent`, with the script
+(`--duckdb` defaults to that path.) `capture.py` first checks that the CLI is
+built from the commit above (`PRAGMA version`) and that the data directory
+holds the data above (16 files and the rows of every table), and then runs,
+for every query of `queries.sql`, the DuckDB CLI on an in-memory database in
+the data directory, `duckdb -batch -bail -no-init -no-agent`, with the script
 
 ```sql
 SET threads = 16;
@@ -180,10 +182,11 @@ Needs git, CMake, Ninja, a C++ compiler, Python 3 and the Rust toolchain of the
 repository. From the root of a checkout of this repository:
 
 ```bash
-# 1. Build the DuckDB CLI at the commit of the plans (12 minutes on 16 cores).
-#    Clones it to the directory if the directory does not exist; an existing
-#    checkout must be at the commit already.
-benchmarks/plan-compare/build_duckdb.sh ~/github/duckdb
+# 1. Build the DuckDB CLI at the commit of the plans (11 minutes on 16
+#    cores). If the directory does not exist, clones the history of `main` of
+#    github.com/duckdb/duckdb into it (without the files of other commits)
+#    and checks out the commit; an existing checkout must be at the commit.
+benchmarks/plan-compare/build_duckdb.sh ~/github/duckdb-plan-compare
 
 # 2. Write the data to benchmarks/plan-compare/data and the queries to
 #    benchmarks/plan-compare/queries.sql (builds the benchmark with the
@@ -191,7 +194,7 @@ benchmarks/plan-compare/build_duckdb.sh ~/github/duckdb
 benchmarks/plan-compare/materialize.sh
 
 # 3. Capture the plans in benchmarks/plan-compare/duckdb.
-benchmarks/plan-compare/capture.py --duckdb ~/github/duckdb/build/release/duckdb
+benchmarks/plan-compare/capture.py --duckdb ~/github/duckdb-plan-compare/build/release/duckdb
 
 # Nothing changed: the queries and plans are reproduced.
 git status --short benchmarks/plan-compare
