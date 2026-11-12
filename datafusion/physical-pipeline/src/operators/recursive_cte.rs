@@ -3511,6 +3511,123 @@ mod tests {
         Ok(())
     }
 
+    /// A recursive query whose recursive term has a partial `MIN`/`MAX`
+    /// aggregation below a window. In a session with a memory limit, the
+    /// planner leaves the window to DataFusion, with its subtree, so
+    /// DataFusion's aggregation sets its dynamic filter (`k < min OR k >
+    /// max`), which the scan of `nums` reads, from the bounds of its
+    /// aggregates. Every iteration aggregates the rows `n + 250` and `n + 750`
+    /// of its `n`, so the bounds of the iterations differ.
+    const AGGREGATION_IN_A_WINDOW: &str = "WITH RECURSIVE w(n) AS (SELECT 1 UNION ALL \
+        SELECT lo - 249 FROM (SELECT lo, hi, row_number() OVER () AS rn FROM \
+          (SELECT min(t.k) AS lo, max(t.k) AS hi FROM w \
+           JOIN nums t ON t.k = w.n + 250 OR t.k = w.n + 750) m) \
+        WHERE hi = lo + 500 AND lo < 280 AND rn = 1) \
+        SELECT * FROM w";
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_executions_of_a_plan_have_aggregation_bounds_of_their_own()
+    -> Result<()> {
+        // The values 1 to 1,000 in row groups of 10 rows, which the dynamic
+        // filters of the aggregation prune.
+        let dir = tempfile::tempdir()?;
+        let dir = dir.path().to_str().unwrap();
+        execute(
+            &datafusion_context(test_session_config()),
+            &format!(
+                "COPY (SELECT value AS k FROM generate_series(1, 1000)) \
+                 TO '{dir}/nums.parquet' STORED AS PARQUET \
+                 OPTIONS (MAX_ROW_GROUP_SIZE 10)"
+            ),
+        )
+        .await?;
+        let mut config = test_session_config()
+            .with_target_partitions(4)
+            .with_batch_size(16);
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        let pool = Arc::new(GreedyMemoryPool::new(1 << 30));
+        let ctx = pipeline_context_with_pool(config, pool)?;
+        execute(
+            &ctx,
+            &format!(
+                "CREATE EXTERNAL TABLE nums STORED AS PARQUET LOCATION '{dir}/nums.parquet'"
+            ),
+        )
+        .await?;
+        let sql = AGGREGATION_IN_A_WINDOW;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_recursion_is_native(root.operator(), sql);
+        // DataFusion executes the window, with the partial aggregation, whose
+        // filter the scan reads.
+        let [window] = bridged_plans(root.operator()).try_into().unwrap();
+        let mut partial_aggregations = vec![];
+        window.apply(|node| {
+            if let Some(aggregate) = node.downcast_ref::<AggregateExec>()
+                && *aggregate.mode() == AggregateMode::Partial
+                && !aggregate.dynamic_expressions_produced().is_empty()
+            {
+                partial_aggregations.push(Arc::clone(node));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        let window_plan = datafusion_physical_plan::displayable(window.as_ref())
+            .indent(true)
+            .to_string();
+        let [aggregate] = partial_aggregations.try_into().expect(&window_plan);
+        let (produced, read) = dynamic_filters_of(&window)?;
+        assert!(
+            produced.iter().all(|id| read.contains(id)),
+            "{produced:?} {read:?}"
+        );
+        // The copy of that aggregation that an execution runs has bounds of
+        // its own: with the bounds of the plan, after DataFusion ran the copy
+        // (over the values 1 to 100), the aggregation itself would find its
+        // bounds set already, and leave its filter `true`.
+        let input_schema = aggregate.children()[0].schema();
+        let columns = input_schema
+            .fields()
+            .iter()
+            .map(|_| Arc::new(Int64Array::from_iter_values(1..=100)) as ArrayRef)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&input_schema), columns)?;
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None)?;
+        let aggregate = aggregate.replace_children(
+            vec![input],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?;
+        let filter_of = |plan: &Arc<dyn ExecutionPlan>| -> Result<String> {
+            let [filter] = plan.dynamic_expressions_produced().try_into().unwrap();
+            let filter = filter.downcast_ref::<DynamicFilterPhysicalExpr>().unwrap();
+            Ok(filter.current()?.to_string())
+        };
+        let copy = with_own_dynamic_filters(&aggregate)?;
+        collect(Arc::clone(&copy), ctx.task_ctx()).await?;
+        assert_ne!(filter_of(&copy)?, "true");
+        assert_eq!(filter_of(&aggregate)?, "true");
+        collect(Arc::clone(&aggregate), ctx.task_ctx()).await?;
+        assert_eq!(filter_of(&aggregate)?, filter_of(&copy)?);
+        // The executions of one plan must not prune their rows with the
+        // bounds of each other's iterations.
+        for _ in 0..4 {
+            let executions = (0..8)
+                .map(|_| {
+                    let (plan, task_ctx) = (Arc::clone(&plan), ctx.task_ctx());
+                    SpawnedTask::spawn(async move { collect(plan, task_ctx).await })
+                })
+                .collect::<Vec<_>>();
+            for execution in executions {
+                let batches = with_timeout(execution.join())
+                    .await
+                    .expect("the execution panicked")?;
+                assert_eq!(sorted_values(&batches), (1..=30).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_errors_of_an_iteration_fail_the_query() -> Result<()> {
         // The fourth iteration divides by zero.
