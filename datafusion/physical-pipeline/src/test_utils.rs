@@ -2290,7 +2290,7 @@ fn tied_classes(
     // Of the same shape and floating-point values but the last, which are
     // within twice the tolerance (but for rounding) if their values may cross
     // or meet.
-    let mut members_of: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
+    let mut members_of: HashMap<ShapeAndFloats<'_>, Vec<usize>> = HashMap::new();
     let mut last = vec![0.0; classes.len()];
     for (index, class) in classes.iter().enumerate() {
         let mut floats = floats(&class.keys);
@@ -2337,7 +2337,7 @@ fn tied_classes(
             prefixes.push((index, prefix, negative));
         }
     }
-    let mut signs_of: HashMap<(Shape<'_>, Vec<u64>), Vec<(usize, bool)>> = HashMap::new();
+    let mut signs_of: HashMap<ShapeAndFloats<'_>, Vec<(usize, bool)>> = HashMap::new();
     for (index, prefix, negative) in &prefixes {
         signs_of
             .entry((Shape(prefix), bits(&floats(prefix))))
@@ -3265,6 +3265,9 @@ impl fmt::Display for Value {
 /// floating-point values: values that are equal within a tolerance have the
 /// same shape.
 struct Shape<'a>(&'a [Value]);
+
+/// The [`Shape`] of values, and some of their floating-point values, as bits.
+type ShapeAndFloats<'a> = (Shape<'a>, Vec<u64>);
 
 impl PartialEq for Shape<'_> {
     fn eq(&self, other: &Self) -> bool {
