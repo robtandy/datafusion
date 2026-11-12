@@ -53,10 +53,18 @@
 //! reset and lowered again, so that the state that its nodes keep between
 //! their executions starts afresh in every iteration: the dynamic filters of
 //! hash joins, TopKs and aggregations, the results of scalar subqueries, the
-//! generators of `generate_series` (which DataFusion executes), the files of
-//! the scans. The recursive term that is lowered with the query is a child
-//! of the operator only for `EXPLAIN` (and the plans it bridges, see
+//! buffers of materialized CTEs and the generators of `generate_series`
+//! (which DataFusion executes), the files of the scans. The recursive term
+//! that is lowered with the query is a child of the operator only for
+//! `EXPLAIN` (and the plans it bridges, see
 //! [`crate::bridge::bridged_plans`]): it is never executed.
+//!
+//! Every execution of the plan shares some of that state, which
+//! `reset_plan_states` resets in place. So that concurrent executions of a
+//! query (of one plan) do not reset and read each other's, every execution
+//! of the operator runs a copy of the recursive term with materialized CTEs
+//! and dynamic filters of its own (see `with_own_materialized_ctes` and
+//! `with_own_dynamic_filters`).
 //!
 //! # The working table
 //!
@@ -134,6 +142,9 @@ use datafusion_physical_plan::execution_plan::{
 };
 use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::materialized_cte::{
+    MaterializedCteBuffer, MaterializedCteExec, MaterializedCteScanExec,
+};
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -692,10 +703,10 @@ struct Iterations {
 impl Iterations {
     /// What the iterations of the CTE `name`, with the recursive term
     /// `recursive_plan`, run with in an execution with the task context
-    /// `task_ctx`: a copy of `recursive_plan` with dynamic filters of their
-    /// own, and `task_ctx`, whose session config also holds the working table
-    /// of the CTE, in front of those of the recursive queries around it (in
-    /// the session config of `task_ctx`).
+    /// `task_ctx`: a copy of `recursive_plan` with materialized CTEs and
+    /// dynamic filters of its own, and `task_ctx`, whose session config also
+    /// holds the working table of the CTE, in front of those of the recursive
+    /// queries around it (in the session config of `task_ctx`).
     fn try_new(
         name: &str,
         task_ctx: &TaskContext,
@@ -718,13 +729,124 @@ impl Iterations {
             task_ctx.window_functions().clone(),
             task_ctx.runtime_env(),
         );
+        // The materialized CTEs first: `MaterializedCteExec::new` (also when
+        // the filters are copied) gives the buffer of the CTE its body.
+        let recursive_plan = with_own_materialized_ctes(recursive_plan)?;
         Ok(Self {
-            recursive_plan: with_own_dynamic_filters(recursive_plan)?,
+            recursive_plan: with_own_dynamic_filters(&recursive_plan)?,
             task_ctx: Arc::new(task_ctx),
             work_tables,
             count: 0,
         })
     }
+}
+
+/// The new buffers of the materialized CTEs of a copy of a plan, by the ids of
+/// the buffers of the plan that they replace.
+type NewBuffers = HashMap<u64, Arc<MaterializedCteBuffer>>;
+
+/// A copy of `plan` (a DataFusion plan) with materialized CTEs of its own:
+/// every `MaterializedCteExec` of `plan` (of `WITH x AS MATERIALIZED (...)`,
+/// which DataFusion executes) is built again with a new buffer, with the same
+/// id, to which the scans of the CTE (`MaterializedCteScanExec`s) in `plan`
+/// are bound.
+///
+/// A `MaterializedCteExec` and its scans share the buffer into which the
+/// first of them to run computes the body of the CTE. Every execution of the
+/// plan shares it too, and `reset_plan_states` resets it in place (so that
+/// every iteration computes the body again, which may read the working table),
+/// and gives it the body of the new plan: the iterations of concurrent
+/// executions of a recursive query (of one plan) would reset each other's
+/// buffers, read each other's rows, and run each other's plans, which then
+/// fail. So every execution of a [`PhysicalRecursiveCte`] runs a copy of its
+/// recursive term with materialized CTEs of its own, which its iterations
+/// reset.
+///
+/// A CTE declared in the recursive term is only scanned in it. The scans of a
+/// CTE declared around the recursive query keep the buffer of that CTE, which
+/// is computed once for the whole query. If a node of `plan` cannot be built
+/// again (e.g. a hash join with a prepared build side, with other children),
+/// `plan` is kept as it is.
+fn with_own_materialized_ctes(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut buffers = NewBuffers::new();
+    plan.apply(|node| {
+        if let Some(cte) = node.downcast_ref::<MaterializedCteExec>() {
+            let id = cte.buffer().id();
+            buffers.entry(id).or_insert_with(|| {
+                Arc::new(MaterializedCteBuffer::new(id, materialized_cte_name(cte)))
+            });
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if buffers.is_empty() {
+        return Ok(Arc::clone(plan));
+    }
+    Ok(with_new_buffers(plan, &buffers).unwrap_or_else(|error| {
+        log::debug!("The materialized CTEs of a recursive term are shared: {error}");
+        Arc::clone(plan)
+    }))
+}
+
+/// The name of `cte`, for the memory consumers and the errors of the new
+/// buffer of a copy: `MaterializedCteExec` only shows it in its display
+/// (`name=<name>` in a tree render), whatever it shows otherwise.
+fn materialized_cte_name(cte: &MaterializedCteExec) -> String {
+    struct TreeRender<'a>(&'a MaterializedCteExec);
+    impl fmt::Display for TreeRender<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt_as(DisplayFormatType::TreeRender, f)
+        }
+    }
+    let display = TreeRender(cte).to_string();
+    match display.strip_prefix("name=") {
+        Some(name) => name.to_owned(),
+        None => display,
+    }
+}
+
+/// `plan` with the new buffers of `buffers` in place of the buffers that they
+/// replace, in the `MaterializedCteExec`s and their scans (see
+/// [`with_own_materialized_ctes`]).
+fn with_new_buffers(
+    plan: &Arc<dyn ExecutionPlan>,
+    buffers: &NewBuffers,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(scan) = plan.downcast_ref::<MaterializedCteScanExec>()
+        && let Some(buffer) = buffers.get(&scan.id())
+    {
+        return Ok(Arc::new(scan.bind(Arc::clone(buffer))));
+    }
+    let children = plan.children();
+    let mut replaced = false;
+    let mut new_children = Vec::with_capacity(children.len());
+    for child in children {
+        let new_child = with_new_buffers(child, buffers)?;
+        replaced |= !Arc::ptr_eq(&new_child, child);
+        new_children.push(new_child);
+    }
+    if let Some(cte) = plan.downcast_ref::<MaterializedCteExec>()
+        && let Some(buffer) = buffers.get(&cte.buffer().id())
+    {
+        // Built with its new buffer, not with `replace_children`, which would
+        // give the buffer of `plan` the new body.
+        let Ok([body, continuation]) = <[_; 2]>::try_from(new_children) else {
+            return internal_err!("MaterializedCteExec has a body and a continuation");
+        };
+        return Ok(Arc::new(MaterializedCteExec::new(
+            body,
+            continuation,
+            Arc::clone(buffer),
+        )));
+    }
+    if !replaced {
+        return Ok(Arc::clone(plan));
+    }
+    Arc::clone(plan).replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 /// The new dynamic filters of a copy of a plan, by the `expression_id`s of the
@@ -1677,6 +1799,7 @@ mod tests {
     use datafusion::physical_planner::DefaultPhysicalPlanner;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::DataFusionError;
+    use datafusion_common::config::Dialect;
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::memory_pool::GreedyMemoryPool;
@@ -2175,6 +2298,169 @@ mod tests {
         config.options_mut().execution.parquet.pushdown_filters = true;
         assert_native_recursion(CTE_SLT_QUERIES.last().unwrap(), config, &setup).await;
         Ok(())
+    }
+
+    /// The recursive queries of `cte_materialized.slt` (whose results do not
+    /// depend on the values of `random()`), and whether the recursion is
+    /// native: DataFusion executes the `MaterializedCteExec`s (which the
+    /// planner does not lower yet) with their whole subtrees, so the
+    /// recursions in their bodies and continuations are only compared.
+    const CTE_MATERIALIZED_SLT_QUERIES: &[(&str, bool)] = &[
+        // a recursive CTE that is also materialized
+        (
+            "WITH RECURSIVE r AS MATERIALIZED ( \
+               SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) \
+             SELECT count(*) FROM r a, r b",
+            false,
+        ),
+        // a recursive CTE that reads a materialized CTE of the same block
+        (
+            "WITH RECURSIVE m AS MATERIALIZED (SELECT 3 AS lim), \
+               r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r, m WHERE n < m.lim) \
+             SELECT n FROM r",
+            false,
+        ),
+        // a volatile CTE declared outside the recursive CTE, read by its
+        // recursive term: evaluated once if materialized, else in every
+        // iteration
+        (
+            "WITH RECURSIVE m AS MATERIALIZED (SELECT random() AS x), \
+               r AS (SELECT 1 AS n, x FROM m \
+                 UNION ALL SELECT n + 1, m.x FROM r, m WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r",
+            false,
+        ),
+        (
+            "WITH RECURSIVE m AS NOT MATERIALIZED (SELECT random() AS x), \
+               r AS (SELECT 1 AS n, x FROM m \
+                 UNION ALL SELECT n + 1, m.x FROM r, m WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r",
+            true,
+        ),
+        (
+            "WITH RECURSIVE m AS (SELECT random() AS x), \
+               r AS (SELECT 1 AS n, x FROM m \
+                 UNION ALL SELECT n + 1, m.x FROM r, m WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r",
+            true,
+        ),
+        // a volatile CTE declared inside the recursive term: evaluated again
+        // in every iteration
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, CAST(0 AS DOUBLE PRECISION) AS x UNION ALL \
+               SELECT n + 1, s.x FROM r, \
+                 (WITH m AS MATERIALIZED (SELECT random() AS x) SELECT x FROM m) s \
+               WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r WHERE n > 1",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, CAST(0 AS DOUBLE PRECISION) AS x UNION ALL \
+               SELECT n + 1, s.x FROM r, \
+                 (WITH m AS NOT MATERIALIZED (SELECT random() AS x) SELECT x FROM m) s \
+               WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r WHERE n > 1",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, CAST(0 AS DOUBLE PRECISION) AS x UNION ALL \
+               SELECT n + 1, s.x FROM r, \
+                 (WITH m AS (SELECT random() AS x) SELECT x FROM m) s \
+               WHERE n < 4) \
+             SELECT count(DISTINCT x) FROM r WHERE n > 1",
+            true,
+        ),
+        // two references, inside one iteration, to a CTE declared in the
+        // recursive term
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, true AS same UNION ALL \
+               SELECT n + 1, s.same FROM r, (WITH m AS MATERIALIZED \
+                 (SELECT random() AS x) SELECT a.x = b.x AS same FROM m a, m b) s \
+               WHERE n < 4) \
+             SELECT n, same FROM r",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, true AS same UNION ALL \
+               SELECT n + 1, s.same FROM r, (WITH m AS NOT MATERIALIZED \
+                 (SELECT random() AS x) SELECT a.x = b.x AS same FROM m a, m b) s \
+               WHERE n < 4) \
+             SELECT n, same FROM r",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT 1 AS n, true AS same UNION ALL \
+               SELECT n + 1, s.same FROM r, (WITH m AS \
+                 (SELECT random() AS x) SELECT a.x = b.x AS same FROM m a, m b) s \
+               WHERE n < 4) \
+             SELECT n, same FROM r",
+            true,
+        ),
+        // a CTE in the recursive term whose body reads the recursive CTE: it
+        // is evaluated again in every iteration, or the query does not end
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM \
+               (WITH m AS MATERIALIZED (SELECT n FROM r) SELECT n FROM m) WHERE n < 4) \
+             SELECT n FROM r",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM \
+               (WITH m AS NOT MATERIALIZED (SELECT n FROM r) SELECT n FROM m) \
+               WHERE n < 4) \
+             SELECT n FROM r",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM \
+               (WITH m AS (SELECT n FROM r) SELECT n FROM m) WHERE n < 4) \
+             SELECT n FROM r",
+            true,
+        ),
+        // a recursive CTE referenced two times, with a volatile static term:
+        // evaluated once if materialized, else once per reference
+        (
+            "WITH RECURSIVE r AS MATERIALIZED ( \
+               SELECT random() AS x, 1 AS n UNION ALL SELECT x, n + 1 FROM r WHERE n < 3) \
+             SELECT count(DISTINCT x) FROM (SELECT x FROM r UNION ALL SELECT x FROM r)",
+            false,
+        ),
+        (
+            "WITH RECURSIVE r AS NOT MATERIALIZED ( \
+               SELECT random() AS x, 1 AS n UNION ALL SELECT x, n + 1 FROM r WHERE n < 3) \
+             SELECT count(DISTINCT x) FROM (SELECT x FROM r UNION ALL SELECT x FROM r)",
+            true,
+        ),
+        (
+            "WITH RECURSIVE r AS ( \
+               SELECT random() AS x, 1 AS n UNION ALL SELECT x, n + 1 FROM r WHERE n < 3) \
+             SELECT count(DISTINCT x) FROM (SELECT x FROM r UNION ALL SELECT x FROM r)",
+            true,
+        ),
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recursive_queries_of_cte_materialized_slt() {
+        // sqlparser only parses `[NOT] MATERIALIZED` for the PostgreSQL
+        // dialect, as `cte_materialized.slt` sets it.
+        let mut config = test_session_config();
+        config.options_mut().sql_parser.dialect = Dialect::PostgreSQL;
+        let setup = async |_: &SessionContext| Ok(());
+        for (sql, native) in CTE_MATERIALIZED_SLT_QUERIES {
+            let datafusion = datafusion_context(config.clone());
+            let pipeline = pipeline_context(config.clone());
+            if *native {
+                assert_native_recursion_in(sql, datafusion, pipeline, setup).await;
+            } else {
+                assert_same_results_in(sql, datafusion, pipeline, setup).await;
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -3118,6 +3404,91 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let ctx = nums_session(dir.path().to_str().unwrap()).await?;
         let sql = JOIN_WITH_DYNAMIC_FILTER;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let root = plan
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan");
+        assert_recursion_is_native(root.operator(), sql);
+        for _ in 0..4 {
+            let executions = (0..8)
+                .map(|_| {
+                    let (plan, task_ctx) = (Arc::clone(&plan), ctx.task_ctx());
+                    SpawnedTask::spawn(async move { collect(plan, task_ctx).await })
+                })
+                .collect::<Vec<_>>();
+            for execution in executions {
+                let batches = with_timeout(execution.join())
+                    .await
+                    .expect("the execution panicked")?;
+                assert_eq!(sorted_values(&batches), (1..=50).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
+    }
+
+    /// A recursive query whose recursive term computes a materialized CTE
+    /// from the working table, in every iteration.
+    const MATERIALIZED_CTE_IN_RECURSIVE_TERM: &str = "WITH RECURSIVE r AS ( \
+           SELECT 1 AS n UNION ALL SELECT n + 1 FROM \
+           (WITH m AS MATERIALIZED (SELECT n FROM r) SELECT n FROM m) WHERE n < 50) \
+         SELECT n FROM r";
+
+    #[tokio::test]
+    async fn copies_of_recursive_terms_have_materialized_ctes_of_their_own() -> Result<()>
+    {
+        let mut config = test_session_config();
+        config.options_mut().sql_parser.dialect = Dialect::PostgreSQL;
+        let ctx = datafusion_context(config);
+        let sql = MATERIALIZED_CTE_IN_RECURSIVE_TERM;
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let recursion = recursive_query(&plan).expect("a recursive query");
+        let term = recursion.children()[1];
+        let buffers = |plan: &Arc<dyn ExecutionPlan>| {
+            let mut buffers = vec![];
+            let _ = plan.apply(|node| {
+                if let Some(cte) = node.downcast_ref::<MaterializedCteExec>() {
+                    buffers.push((Arc::clone(cte.buffer()), materialized_cte_name(cte)));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            buffers
+        };
+        let [(buffer, name)] = buffers(term).try_into().unwrap();
+        assert_eq!(name, "m");
+        // Every copy has a buffer of its own, with the id and the name of the
+        // buffer of the plan, which keeps its own.
+        let copies = [
+            with_own_materialized_ctes(term)?,
+            with_own_materialized_ctes(term)?,
+        ];
+        let copies = copies.each_ref().map(|copy| {
+            let [(copy_buffer, copy_name)] = buffers(copy).try_into().unwrap();
+            assert!(!Arc::ptr_eq(&copy_buffer, &buffer));
+            assert_eq!((copy_buffer.id(), copy_name.as_str()), (buffer.id(), "m"));
+            copy_buffer
+        });
+        assert!(!Arc::ptr_eq(&copies[0], &copies[1]));
+        let [(unchanged, _)] = buffers(term).try_into().unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &buffer));
+        // A plan without materialized CTEs is its own copy.
+        let unmaterialized = recursion.children()[0];
+        assert!(Arc::ptr_eq(
+            &with_own_materialized_ctes(unmaterialized)?,
+            unmaterialized
+        ));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_executions_of_a_plan_have_materialized_ctes_of_their_own()
+    -> Result<()> {
+        // The executions of one plan must not read the rows that a
+        // materialized CTE of its recursive term (which DataFusion executes)
+        // buffers for the iterations of the others.
+        let mut config = test_session_config();
+        config.options_mut().sql_parser.dialect = Dialect::PostgreSQL;
+        let ctx = pipeline_context(config);
+        let sql = MATERIALIZED_CTE_IN_RECURSIVE_TERM;
         let plan = ctx.sql(sql).await?.create_physical_plan().await?;
         let root = plan
             .downcast_ref::<PipelineRootExec>()
