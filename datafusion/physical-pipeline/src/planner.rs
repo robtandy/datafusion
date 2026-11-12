@@ -38,6 +38,7 @@
 //! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                               | the sources of [`try_create_scan_source`]          |
 //! | `DataSourceExec` (of other files: JSON, Avro, Arrow IPC, ...)                      | [`FileScanSource`]                                 |
 //! | `LazyMemoryExec`, `StreamingTableExec`, `ExplainExec`                              | [`LazyMemorySource`], [`StreamingTableSource`], [`ExplainSource`] |
+//! | `AnalyzeExec` (of the native plan of the query)                                   | [`PhysicalAnalyze`]                                |
 //! | `UnnestExec`, `AsyncFuncExec`, `PartialSortExec`                                   | [`PhysicalUnnest`], [`PhysicalAsyncFunc`], [`PhysicalPartialSort`] |
 //! | `DataSinkExec`                                                                     | [`PhysicalDataSink`]                               |
 //! | `MaterializedCteExec`, `MaterializedCteScanExec`                                   | [`PhysicalMaterializedCte`], [`MaterializedCteScan`] |
@@ -219,6 +220,7 @@ use crate::operator::{
     OperatorResult, OperatorState, PhysicalOperator, SinkFinalize, SinkResult,
     downcast_state,
 };
+use crate::operators::analyze::{AnalyzeRendering, AnalyzedInput, PhysicalAnalyze};
 use crate::operators::async_func::PhysicalAsyncFunc;
 use crate::operators::caching::CachingOperator;
 use crate::operators::data_sink::PhysicalDataSink;
@@ -322,12 +324,25 @@ impl PipelineQueryPlanner {
             session.config_options(),
             session.runtime_env(),
         )?;
-        // Shown with the metrics of its operators that the statement selects.
+        // Shown with the metrics of its operators that the statement selects,
+        // and rendered by `PhysicalAnalyze` with the metric types and the
+        // statistics registry of DataFusion's `AnalyzeExec`.
         let input: Arc<dyn ExecutionPlan> = match logical_plan {
-            LogicalPlan::Analyze(statement) => Arc::new(AnalyzedPipelineExec::new(
-                root,
-                MetricSelection::of_analyze(statement, session.config_options()),
-            )),
+            LogicalPlan::Analyze(statement) => {
+                let options = session.config_options();
+                let analyzed = Arc::new(AnalyzedPipelineExec::new(
+                    root,
+                    MetricSelection::of_analyze(statement, options),
+                ));
+                let level = statement
+                    .analyze_level
+                    .unwrap_or(options.explain.analyze_level);
+                let registry = session.statistics_registry().cloned().unwrap_or_default();
+                Arc::new(AnalyzedInput::new(
+                    analyzed,
+                    AnalyzeRendering::new(level.included_types(), registry),
+                ))
+            }
             _ => root,
         };
         Arc::clone(&plan).replace_children(vec![input], recompute())
@@ -680,6 +695,11 @@ impl Lowering<'_> {
         }
         if let Some(scan) = try_create_scan_source(plan)? {
             return Ok(scan);
+        }
+        if let Some(analyze) =
+            PhysicalAnalyze::try_lower(plan, self.options, self.runtime)?
+        {
+            return Ok(Arc::new(analyze));
         }
         if let Some(explain) = ExplainSource::try_lower(plan)? {
             return Ok(Arc::new(explain));

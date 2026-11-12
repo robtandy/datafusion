@@ -32,7 +32,7 @@ schedules its tasks cooperatively).
 | `ExecutionPlan`                                            | Native operator                                                                                       |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `AggregateExec`                                            | `PhysicalHashAggregate` (with the stages of a two-stage aggregation)                                  |
-| `AnalyzeExec` (`EXPLAIN ANALYZE`)                          | stays in DataFusion, see [below](#nodes-that-stay-in-datafusion); the analyzed query is native        |
+| `AnalyzeExec` (`EXPLAIN ANALYZE`)                          | `PhysicalAnalyze` (which runs the native plan of the query)                                           |
 | `AsOfJoinExec` (`ASOF JOIN`)                               | stays in DataFusion, see [below](#nodes-that-stay-in-datafusion)                                      |
 | `AsyncFuncExec` (async UDFs)                               | `PhysicalAsyncFunc`                                                                                   |
 | `BoundedWindowAggExec`, `WindowAggExec`                    | `PhysicalWindow` (with the sorts and repartitionings below them)                                      |
@@ -116,16 +116,10 @@ user-defined plans to the pipeline engine.
     condition (its comparison operator) and its projection;
   - `MemDeleteExec` and `MemUpdateExec` are private types of
     `datafusion-catalog`, as are the partitions of the `MemTable` that they
-    change;
-  - `AnalyzeExec` has no accessors for the metric types (`LEVEL`) and the
-    statistics registry with which it renders the plan it analyzes. The plan
-    it analyzes, the query of the `EXPLAIN ANALYZE`, is native: its input is
-    the `PipelineRootExec` of the query, which the pipeline engine executes.
-    `AnalyzeExec` only counts its rows and renders its metrics.
+    change.
 
-  Lowering them takes accessors in their crates (e.g.
-  `AsOfJoinExec::on`, `AsOfJoinExec::match_condition`,
-  `AsOfJoinExec::projection`, `AnalyzeExec::metric_types`, and public
+  Lowering them takes accessors in their crates (`AsOfJoinExec::on`,
+  `AsOfJoinExec::match_condition` and `AsOfJoinExec::projection`, and public
   `MemDeleteExec` and `MemUpdateExec`).
 
 - A `MaterializedCteExec` one of whose scans stays in DataFusion (e.g. below
@@ -167,7 +161,8 @@ runs out (they do not spill):
 
 - the sources (`LazyMemorySource`, `StreamingTableSource`, `ExplainSource`)
   reserve the batch that a thread emits; `FileScanSource` reads with the
-  `Morselizer` of its files, as the other file scans do;
+  `Morselizer` of its files, as the other file scans do, and
+  `PhysicalAnalyze` holds no rows (it counts the rows of its plan);
 - `PhysicalAsyncFunc` reserves the rows of the chunk it evaluates, and their
   results, `PhysicalUnnest` the unnested rows it did not emit yet,
   `PhysicalPartialSort` the rows of the groups it buffers and sorts, and
