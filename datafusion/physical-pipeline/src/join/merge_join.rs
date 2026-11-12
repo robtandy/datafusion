@@ -130,10 +130,11 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, DictionaryArray,
-    FixedSizeListArray, GenericListArray, GenericListViewArray, Int8Array, MapArray,
-    OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, RunArray,
-    StructArray, UInt32Array, UnionArray, make_array, new_empty_array, new_null_array,
+    AnyDictionaryArray, Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder,
+    DictionaryArray, FixedSizeListArray, GenericListArray, GenericListViewArray,
+    Int8Array, MapArray, OffsetSizeTrait, PrimitiveArray, RecordBatch,
+    RecordBatchOptions, RunArray, StructArray, UInt32Array, UnionArray, make_array,
+    new_empty_array, new_null_array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::{
@@ -1933,8 +1934,7 @@ fn encoded_row_bytes(array: &dyn Array) -> Vec<usize> {
             let dictionary = array.as_any_dictionary();
             let values = encoded_row_bytes(dictionary.values().as_ref());
             let null = null_row_bytes(values_type);
-            dictionary
-                .normalized_keys()
+            dictionary_indices(dictionary)
                 .into_iter()
                 .enumerate()
                 .map(|(row, key)| match array.is_valid(row) {
@@ -2450,8 +2450,7 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
             let dictionary = array.as_any_dictionary();
             let values = nested_row_bytes(dictionary.values().as_ref());
             let key = key.primitive_width().unwrap_or(size_of::<u64>()) + validity;
-            dictionary
-                .normalized_keys()
+            dictionary_indices(dictionary)
                 .into_iter()
                 .map(|value| key + values.get(value).copied().unwrap_or_default())
                 .collect()
@@ -4916,8 +4915,7 @@ fn zero_prefixes(array: &dyn Array) -> Result<Vec<Option<Vec<u8>>>> {
         DataType::Dictionary(_, _) => {
             let dictionary = array.as_any_dictionary();
             let values = zero_prefixes(dictionary.values().as_ref())?;
-            dictionary
-                .normalized_keys()
+            dictionary_indices(dictionary)
                 .into_iter()
                 .enumerate()
                 .map(|(row, key)| match array.is_valid(row) {
@@ -4956,6 +4954,17 @@ fn zero_prefixes(array: &dyn Array) -> Result<Vec<Option<Vec<u8>>>> {
         data_type => vec![has_float_leaf(data_type).then(Vec::new); rows],
     };
     Ok(prefixes)
+}
+
+/// The index of the value of every row of `dictionary` (also of its NULL
+/// rows, of some value): as `AnyDictionaryArray::normalized_keys`, which
+/// panics for a dictionary without values (whose keys are all NULL, which is
+/// valid), for which they are all 0 (of no value).
+fn dictionary_indices(dictionary: &dyn AnyDictionaryArray) -> Vec<usize> {
+    match dictionary.values().is_empty() {
+        true => vec![0; dictionary.keys().len()],
+        false => dictionary.normalized_keys(),
+    }
 }
 
 /// The values of a run-end encoded `array` whose run ends are of the type
@@ -5050,8 +5059,7 @@ fn zero_value_rows(array: &dyn Array, sign: Option<bool>) -> Vec<bool> {
         DataType::Dictionary(_, _) => {
             let dictionary = array.as_any_dictionary();
             let values = zero_value_rows(dictionary.values().as_ref(), sign);
-            dictionary
-                .normalized_keys()
+            dictionary_indices(dictionary)
                 .into_iter()
                 .enumerate()
                 .map(|(row, key)| {
@@ -9535,6 +9543,145 @@ pub(crate) mod tests {
             1,
             "{tree}"
         );
+        Ok(())
+    }
+
+    /// A dictionary of strings without values, of `rows` NULL keys (which is
+    /// valid: no key addresses a value).
+    pub(crate) fn dictionary_without_values(rows: usize) -> ArrayRef {
+        Arc::new(DictionaryArray::new(
+            Int32Array::from(vec![None; rows]),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ))
+    }
+
+    /// A case of the joins of dictionaries without values: its name, the left
+    /// and the right rows, joined on `lk = rk`, their null equality, and the
+    /// rows of the (Inner) join.
+    pub(crate) type EmptyDictionaryCase =
+        (&'static str, [RecordBatch; 2], NullEquality, usize);
+
+    /// The joins of dictionaries without values (see
+    /// [`dictionary_without_values`]): as the payloads of the right rows of a
+    /// join on integer keys (a left row, and two right rows of its key), and
+    /// as the keys of both inputs (with either null equality).
+    pub(crate) fn empty_dictionary_cases() -> Vec<EmptyDictionaryCase> {
+        let ints = |keys: Vec<i32>| -> ArrayRef { Arc::new(Int32Array::from(keys)) };
+        let payloads = {
+            let payload = dictionary_without_values(2);
+            RecordBatch::try_new(
+                payload_schema("r", payload.data_type()),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..2)),
+                    ints(vec![1, 1]),
+                    payload,
+                ],
+            )
+            .unwrap()
+        };
+        let keys = || {
+            [
+                keyed_rows("l", &dictionary_without_values(1)),
+                keyed_rows("r", &dictionary_without_values(2)),
+            ]
+        };
+        vec![
+            (
+                "payloads",
+                [keyed_rows("l", &ints(vec![1])), payloads],
+                NullEquality::NullEqualsNothing,
+                2,
+            ),
+            ("keys", keys(), NullEquality::NullEqualsNull, 2),
+            ("keys", keys(), NullEquality::NullEqualsNothing, 0),
+        ]
+    }
+
+    /// DataFusion's hash join of the rows `rows` on `lk = rk`, of the null
+    /// equality `null_equality`.
+    pub(crate) async fn reference_join_of_rows(
+        rows: &[RecordBatch; 2],
+        null_equality: NullEquality,
+    ) -> Result<EngineOutput> {
+        let bounded = |batch: &RecordBatch| {
+            MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+                .unwrap() as Arc<dyn ExecutionPlan>
+        };
+        let (left, right) = (bounded(&rows[0]), bounded(&rows[1]));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            null_equality,
+            false,
+        )?);
+        Ok(EngineOutput {
+            schema: plan.schema(),
+            batches: with_timeout(collect(Arc::clone(&plan), task_ctx())).await?,
+            plan,
+            ordered: false,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dictionaries_without_values_are_merged() -> Result<()> {
+        // Dictionaries without values (whose keys are all NULL, which is
+        // valid; `normalized_keys` panics for them), as the payloads of the
+        // rows and as the keys of sorted streams: the merge join returns the
+        // rows of DataFusion's join.
+        for (name, rows, null_equality, matches) in empty_dictionary_cases() {
+            let context = format!("{name} {null_equality:?}");
+            let expected = reference_join_of_rows(&rows, null_equality).await?;
+            assert_eq!(num_rows(&expected.batches), matches, "{context}");
+            let stream = |batch: &RecordBatch, key: &str| -> Arc<dyn ExecutionPlan> {
+                let schema = batch.schema();
+                let order = LexOrdering::new([PhysicalSortExpr::new(
+                    col(key, &schema).unwrap(),
+                    SortOptions::default(),
+                )])
+                .unwrap();
+                let partition = StreamPartition {
+                    schema: Arc::clone(&schema),
+                    batches: vec![batch.clone()],
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        schema,
+                        vec![Arc::new(partition)],
+                        None,
+                        [order],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let (left, right) = (stream(&rows[0], "lk"), stream(&rows[1], "rk"));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Inner,
+                vec![SortOptions::default()],
+                null_equality,
+            )?);
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            assert_streaming_merge_join(&root, &context);
+            let actual = run_native(&root, plan, task_ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{context}: {e}"));
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!("Results differ: {message}\n{context}");
+            }
+        }
         Ok(())
     }
 

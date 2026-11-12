@@ -1880,9 +1880,10 @@ pub(crate) mod tests {
     use crate::join::merge_join::tests::{
         ALL_JOIN_TYPES, BuiltPartition, PeakPool, data_batch, data_schema,
         dictionary_batches, dictionary_layouts, dictionary_probe_rows, dictionary_schema,
-        dictionary_view_rows, join_filter, keyed_rows, layout_type, limited_task_ctx,
-        num_rows, payload_schema, reference_join_of_keys, run_native, union_key_layouts,
-        union_key_matches, with_timeout,
+        dictionary_view_rows, empty_dictionary_cases, join_filter, keyed_rows,
+        layout_type, limited_task_ctx, num_rows, payload_schema, reference_join_of_keys,
+        reference_join_of_rows, run_native, union_key_layouts, union_key_matches,
+        with_timeout,
     };
     use crate::operators::filter::PhysicalFilter;
     use crate::operators::union::test_support::count;
@@ -4756,6 +4757,59 @@ pub(crate) mod tests {
                     allocated < reserved + (512 << 10),
                     "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dictionaries_without_values_are_joined() -> Result<()> {
+        // Dictionaries without values (whose keys are all NULL, which is
+        // valid; `normalized_keys` panics for them), as the payloads of the
+        // rows and as the keys of streams: the symmetric join returns the rows
+        // of DataFusion's join.
+        for (name, rows, null_equality, matches) in empty_dictionary_cases() {
+            let context = format!("{name} {null_equality:?}");
+            let expected = reference_join_of_rows(&rows, null_equality).await?;
+            assert_eq!(num_rows(&expected.batches), matches, "{context}");
+            let stream = |batch: &RecordBatch| -> Arc<dyn ExecutionPlan> {
+                let partition = BatchesPartition {
+                    schema: batch.schema(),
+                    batches: vec![batch.clone()],
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        batch.schema(),
+                        vec![Arc::new(partition)],
+                        None,
+                        [],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let (left, right) = (stream(&rows[0]), stream(&rows[1]));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                &JoinType::Inner,
+                null_equality,
+                None,
+                None,
+                StreamJoinPartitionMode::SinglePartition,
+            )?);
+            let root = lower(&plan)?;
+            assert!(root.is::<PhysicalSymmetricHashJoin>(), "{context}");
+            let actual = run_native(&root, plan, task_ctx())
+                .await
+                .unwrap_or_else(|e| panic!("{context}: {e}"));
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!("Results differ: {message}\n{context}");
             }
         }
         Ok(())
