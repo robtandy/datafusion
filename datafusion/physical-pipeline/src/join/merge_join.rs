@@ -131,9 +131,9 @@ use std::task::{Context, Poll};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBufferBuilder, DictionaryArray,
-    GenericListArray, Int8Array, OffsetSizeTrait, PrimitiveArray, RecordBatch,
-    RecordBatchOptions, StructArray, UInt32Array, make_array, new_empty_array,
-    new_null_array,
+    FixedSizeListArray, GenericListArray, GenericListViewArray, Int8Array, MapArray,
+    OffsetSizeTrait, PrimitiveArray, RecordBatch, RecordBatchOptions, RunArray,
+    StructArray, UInt32Array, UnionArray, make_array, new_empty_array, new_null_array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow::compute::{
@@ -141,8 +141,9 @@ use arrow::compute::{
 };
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNativeType, DataType, Field, FieldRef, Float16Type,
-    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema,
-    SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type, UnionMode,
+    Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, RunEndIndexType,
+    Schema, SchemaRef, UInt8Type, UInt16Type, UInt32Type, UInt64Type, UnionFields,
+    UnionMode,
 };
 use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
 use datafusion_common::cast::as_boolean_array;
@@ -1252,7 +1253,28 @@ fn interleave_compact(
         DataType::LargeList(field) => {
             interleave_compact_lists::<i64>(arrays, indices, field)
         }
-        // Other layouts with dictionaries are gathered as `interleave` does.
+        DataType::FixedSizeList(field, size) => {
+            interleave_compact_fixed_size_lists(arrays, indices, field, *size)
+        }
+        DataType::ListView(field) => {
+            interleave_compact_list_views::<i32>(arrays, indices, field)
+        }
+        DataType::LargeListView(field) => {
+            interleave_compact_list_views::<i64>(arrays, indices, field)
+        }
+        DataType::Map(field, sorted) => {
+            interleave_compact_maps(arrays, indices, field, *sorted)
+        }
+        DataType::Union(fields, mode) => {
+            interleave_compact_unions(arrays, indices, fields, *mode)
+        }
+        DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
+            DataType::Int16 => interleave_compact_runs::<Int16Type>(arrays, indices),
+            DataType::Int32 => interleave_compact_runs::<Int32Type>(arrays, indices),
+            _ => interleave_compact_runs::<Int64Type>(arrays, indices),
+        },
+        // Other layouts (without dictionaries, see `has_dictionary`) are
+        // gathered as `interleave` does.
         _ => Ok(interleave(arrays, indices)?),
     }
 }
@@ -1351,6 +1373,216 @@ fn interleave_compact_lists<O: OffsetSizeTrait>(
         OffsetBuffer::new(offsets.into()),
         values,
         gathered_nulls(arrays, indices),
+    )?))
+}
+
+/// [`interleave_compact`] of fixed size lists (of items of `field`, `size` of
+/// them in every list): the items of the lists of the rows, gathered so.
+fn interleave_compact_fixed_size_lists(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    field: &FieldRef,
+    size: i32,
+) -> Result<ArrayRef> {
+    let lists = arrays
+        .iter()
+        .map(|array| array.as_fixed_size_list())
+        .collect::<Vec<_>>();
+    let length = usize::try_from(size).unwrap_or_default();
+    let items = indices
+        .iter()
+        .flat_map(|&(array, row)| {
+            let start = lists[array].value_offset_at(row);
+            (start..start + length).map(move |item| (array, item))
+        })
+        .collect::<Vec<_>>();
+    let values = lists
+        .iter()
+        .map(|list| list.values().as_ref())
+        .collect::<Vec<_>>();
+    let values = interleave_compact(&values, &items)?;
+    Ok(Arc::new(FixedSizeListArray::try_new(
+        Arc::clone(field),
+        size,
+        values,
+        gathered_nulls(arrays, indices),
+    )?))
+}
+
+/// [`interleave_compact`] of list views with offsets of type `O` (of items of
+/// `field`): the items of the lists of the rows, gathered so, one list after
+/// the other.
+fn interleave_compact_list_views<O: OffsetSizeTrait>(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    field: &FieldRef,
+) -> Result<ArrayRef> {
+    let lists = arrays
+        .iter()
+        .map(|array| array.as_list_view::<O>())
+        .collect::<Vec<_>>();
+    let mut items = vec![];
+    let mut offsets = Vec::with_capacity(indices.len());
+    let mut sizes = Vec::with_capacity(indices.len());
+    for &(array, row) in indices {
+        let list = lists[array];
+        let (start, size) = match list.is_valid(row) {
+            true => (
+                list.value_offsets()[row].as_usize(),
+                list.value_sizes()[row].as_usize(),
+            ),
+            false => (0, 0),
+        };
+        let (Some(offset), Some(length)) =
+            (O::from_usize(items.len()), O::from_usize(size))
+        else {
+            return internal_err!("Gathered list views with too many items");
+        };
+        offsets.push(offset);
+        sizes.push(length);
+        items.extend((start..start + size).map(|item| (array, item)));
+    }
+    let values = lists
+        .iter()
+        .map(|list| list.values().as_ref())
+        .collect::<Vec<_>>();
+    let values = interleave_compact(&values, &items)?;
+    Ok(Arc::new(GenericListViewArray::<O>::try_new(
+        Arc::clone(field),
+        offsets.into(),
+        sizes.into(),
+        values,
+        gathered_nulls(arrays, indices),
+    )?))
+}
+
+/// [`interleave_compact`] of maps (of entries of `field`, sorted if
+/// `sorted`): the entries of the maps of the rows, gathered so.
+fn interleave_compact_maps(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    field: &FieldRef,
+    sorted: bool,
+) -> Result<ArrayRef> {
+    let maps = arrays
+        .iter()
+        .map(|array| array.as_map())
+        .collect::<Vec<_>>();
+    let mut items = vec![];
+    let mut offsets = Vec::with_capacity(indices.len() + 1);
+    offsets.push(0i32);
+    for &(array, row) in indices {
+        let map = maps[array];
+        if map.is_valid(row) {
+            let ends = &map.value_offsets()[row..row + 2];
+            items.extend(
+                (ends[0].as_usize()..ends[1].as_usize()).map(|item| (array, item)),
+            );
+        }
+        let Ok(offset) = i32::try_from(items.len()) else {
+            return internal_err!("Gathered maps with too many entries");
+        };
+        offsets.push(offset);
+    }
+    let entries = maps
+        .iter()
+        .map(|map| map.entries() as &dyn Array)
+        .collect::<Vec<_>>();
+    let entries = interleave_compact(&entries, &items)?;
+    Ok(Arc::new(MapArray::try_new(
+        Arc::clone(field),
+        OffsetBuffer::new(offsets.into()),
+        entries.as_struct().clone(),
+        gathered_nulls(arrays, indices),
+        sorted,
+    )?))
+}
+
+/// [`interleave_compact`] of unions of `fields`, dense or sparse (`mode`):
+/// the type of every row, and the values of the children of the rows (of
+/// every row for a sparse union, of the rows of their type for a dense one).
+fn interleave_compact_unions(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    fields: &UnionFields,
+    mode: UnionMode,
+) -> Result<ArrayRef> {
+    let unions = arrays
+        .iter()
+        .map(|array| array.as_union())
+        .collect::<Vec<_>>();
+    let type_ids = indices
+        .iter()
+        .map(|&(array, row)| unions[array].type_id(row))
+        .collect::<Vec<_>>();
+    let mut offsets = vec![0i32; indices.len()];
+    let mut children = Vec::with_capacity(fields.len());
+    for (type_id, _) in fields.iter() {
+        let child_arrays = unions
+            .iter()
+            .map(|union| union.child(type_id).as_ref())
+            .collect::<Vec<_>>();
+        let rows = indices
+            .iter()
+            .zip(&type_ids)
+            .enumerate()
+            .filter(|&(_, (_, &id))| mode == UnionMode::Sparse || id == type_id)
+            .map(|(index, (&(array, row), _))| {
+                (index, (array, unions[array].value_offset(row)))
+            })
+            .collect::<Vec<_>>();
+        if mode == UnionMode::Dense {
+            for (offset, &(index, _)) in rows.iter().enumerate() {
+                let Ok(offset) = i32::try_from(offset) else {
+                    return internal_err!("Gathered unions with too many rows");
+                };
+                offsets[index] = offset;
+            }
+        }
+        let rows = rows.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+        children.push(match rows.is_empty() {
+            true => new_empty_array(child_arrays[0].data_type()),
+            false => interleave_compact(&child_arrays, &rows)?,
+        });
+    }
+    let offsets = (mode == UnionMode::Dense).then(|| offsets.into());
+    Ok(Arc::new(UnionArray::try_new(
+        fields.clone(),
+        type_ids.into(),
+        offsets,
+        children,
+    )?))
+}
+
+/// [`interleave_compact`] of run-end encoded values (with run ends of type
+/// `R`): every row a run of its own, of the value of its run (as `interleave`
+/// if the run ends cannot address the rows).
+fn interleave_compact_runs<R: RunEndIndexType>(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+) -> Result<ArrayRef> {
+    if R::Native::from_usize(indices.len()).is_none() {
+        return Ok(interleave(arrays, indices)?);
+    }
+    let runs = arrays
+        .iter()
+        .map(|array| array.as_run::<R>())
+        .collect::<Vec<_>>();
+    let items = indices
+        .iter()
+        .map(|&(array, row)| (array, runs[array].get_physical_index(row)))
+        .collect::<Vec<_>>();
+    let values = runs
+        .iter()
+        .map(|run| run.values().as_ref())
+        .collect::<Vec<_>>();
+    let values = interleave_compact(&values, &items)?;
+    let run_ends = PrimitiveArray::<R>::from_iter_values(
+        (1..=indices.len()).map(|end| R::Native::from_usize(end).unwrap_or_default()),
+    );
+    Ok(Arc::new(RunArray::<R>::try_new(
+        &run_ends,
+        values.as_ref(),
     )?))
 }
 
@@ -2258,6 +2490,20 @@ fn nested_row_bytes(array: &dyn Array) -> Vec<usize> {
                     })
                     .collect(),
             }
+        }
+        // A row of run-end encoded values is gathered as a run of its own, of
+        // the value of its run (see `interleave_compact`).
+        DataType::RunEndEncoded(run_ends, _) => {
+            let width = run_ends
+                .data_type()
+                .primitive_width()
+                .unwrap_or(size_of::<u64>());
+            let (values, physical) = run_values(array, run_ends.data_type());
+            let values = nested_row_bytes(values.as_ref());
+            physical
+                .into_iter()
+                .map(|index| width + values.get(index).copied().unwrap_or_default())
+                .collect()
         }
         data_type => match value_width(data_type) {
             (fixed, None) => vec![fixed; rows],
@@ -4334,10 +4580,28 @@ impl BufferedWindow {
             .map(|row| self.rows.keys.row(row).as_ref().len())
             .sum::<usize>();
         let rows_left = self.rows.keys.num_rows() - dropped;
+        // The bits of the rows that matched (of a `Full` join), of the rows that
+        // stay, from the first one.
+        let matched_words = match self.rows.matched.is_empty() {
+            true => 0,
+            false => rows_left.div_ceil(64),
+        };
         self.reserve(
-            retained + (rows_left + 1) * size_of::<usize>() + size_of::<Rows>(),
+            retained
+                + (rows_left + 1) * size_of::<usize>()
+                + size_of::<Rows>()
+                + matched_words * size_of::<AtomicU64>(),
         )?;
         let keys = retained_rows(&self.converter, &self.rows.keys, dropped, retained);
+        if matched_words > 0 {
+            let matched = (0..matched_words)
+                .map(|_| AtomicU64::new(0))
+                .collect::<Vec<_>>();
+            for row in (0..rows_left).filter(|&row| self.rows.is_matched(dropped + row)) {
+                matched[row / 64].fetch_or(1 << (row % 64), Ordering::Relaxed);
+            }
+            self.rows.matched = matched;
+        }
         self.rows.rows = rows;
         self.rows.keys = keys;
         let base = self.rows.gathered[dropped];
@@ -5402,15 +5666,29 @@ impl PhysicalOperator for PhysicalMergeJoin {
             } => {
                 let mut window = window.lock();
                 // The rows of the input that come after the last streamed row
-                // match none: all of them are read first.
-                while !window.input.is_done() {
+                // match none: the rows read so far are emitted (and their
+                // batches then dropped) before more are read, also of an input
+                // that never ends.
+                loop {
+                    // The rows of a held run need no order any more.
+                    window.append_pending(&self.spec)?;
+                    if let Some(batch) =
+                        self.next_unmatched_rows(&window.rows, next, reservation)?
+                    {
+                        let emitted = *next.lock();
+                        let dropped = window.drop_rows_before(emitted)?;
+                        *next.lock() -= dropped;
+                        break Some(batch);
+                    }
+                    if window.input.is_done() {
+                        break None;
+                    }
                     if window.poll_more(ctx, &self.spec)?.is_pending() {
                         return Ok(SourceResult::Blocked(
                             TaskInterrupt::waker_registered(),
                         ));
                     }
                 }
-                self.next_unmatched_rows(&window.rows, next, reservation)?
             }
         };
         Ok(match batch {
@@ -8356,7 +8634,7 @@ pub(crate) mod tests {
         };
         let sparse = mode == UnionMode::Sparse;
         Arc::new(
-            arrow::array::UnionArray::try_new(
+            UnionArray::try_new(
                 fields,
                 type_ids.into(),
                 offsets,
@@ -8627,10 +8905,17 @@ pub(crate) mod tests {
     /// A stream that produces the batches that `rows` builds as it is read
     /// (so that they are allocated by the query, on the thread that reads
     /// them), and then ends.
-    #[derive(Debug)]
     pub(crate) struct BuiltPartition {
         pub(crate) schema: SchemaRef,
-        pub(crate) rows: fn() -> Vec<RecordBatch>,
+        pub(crate) rows: Arc<dyn Fn() -> Vec<RecordBatch> + Send + Sync>,
+    }
+
+    impl fmt::Debug for BuiltPartition {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("BuiltPartition")
+                .field("schema", &self.schema)
+                .finish_non_exhaustive()
+        }
     }
 
     impl PartitionStream for BuiltPartition {
@@ -8639,7 +8924,7 @@ pub(crate) mod tests {
         }
 
         fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
-            let rows = self.rows;
+            let rows = Arc::clone(&self.rows);
             let batches = futures::stream::once(async move {
                 futures::stream::iter(rows().into_iter().map(Ok))
             })
@@ -8736,7 +9021,7 @@ pub(crate) mod tests {
             });
             let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
                 schema: wide_run_schema("r"),
-                rows,
+                rows: Arc::new(rows),
             });
             let stream = |side: &str, partition: Arc<dyn PartitionStream>| {
                 Arc::new(
@@ -8816,39 +9101,158 @@ pub(crate) mod tests {
     }
 
     /// The schema of the rows `(<side>id, <side>k, <side>d)` of the joins of
-    /// dictionaries: an id, a key and a dictionary of strings.
-    pub(crate) fn dictionary_schema(side: &str) -> SchemaRef {
+    /// dictionaries: an id, a key and a payload of type `payload`.
+    pub(crate) fn payload_schema(side: &str, payload: &DataType) -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(format!("{side}id"), DataType::Int64, false),
             Field::new(format!("{side}k"), DataType::Int32, false),
-            Field::new(
-                format!("{side}d"),
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                false,
-            ),
+            Field::new(format!("{side}d"), payload.clone(), true),
         ]))
     }
 
-    /// Two batches of 50 right rows of the key 1, each of which has a
-    /// dictionary of its own of the values `"a"` and a string of 1 MiB, but
-    /// whose rows all have `"a"`.
-    pub(crate) fn dictionary_batches() -> Vec<RecordBatch> {
+    /// The schema of the rows of the joins of dictionaries whose payload is a
+    /// dictionary of strings.
+    pub(crate) fn dictionary_schema(side: &str) -> SchemaRef {
+        payload_schema(
+            side,
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        )
+    }
+
+    /// A dictionary of `rows` rows of the values `"a"` and a string of 1 MiB
+    /// (of values of its own), whose rows all have `"a"`.
+    pub(crate) fn dictionary_column(rows: usize) -> ArrayRef {
         // The string of 1 MiB, copied into the values only (not built first).
         static BIG: [u8; 1 << 20] = [b'x'; 1 << 20];
         let big = std::str::from_utf8(&BIG).unwrap();
+        Arc::new(DictionaryArray::new(
+            Int32Array::from(vec![0; rows]),
+            Arc::new(StringArray::from(vec!["a", big])),
+        ))
+    }
+
+    /// A layout of the payloads of the joins of dictionaries: its name, and
+    /// the payload of the rows of a dictionary column in it.
+    pub(crate) type DictionaryLayout = (&'static str, fn(ArrayRef) -> ArrayRef);
+
+    /// The layouts of dictionaries that the joins gather: a dictionary, and
+    /// one in a struct, a list, a fixed size list, a list view, a map, a
+    /// sparse and a dense union, and run-end encoded values (a row a run).
+    pub(crate) fn dictionary_layouts() -> Vec<DictionaryLayout> {
+        fn item(values: &ArrayRef) -> FieldRef {
+            Arc::new(Field::new_list_field(values.data_type().clone(), true))
+        }
+        fn union_fields(values: &ArrayRef) -> UnionFields {
+            UnionFields::try_new([0], [Field::new("d", values.data_type().clone(), true)])
+                .unwrap()
+        }
+        vec![
+            ("dictionaries", |values| values),
+            ("structs", |values| {
+                let field = Field::new("d", values.data_type().clone(), true);
+                Arc::new(StructArray::new(
+                    Fields::from(vec![field]),
+                    vec![values],
+                    None,
+                ))
+            }),
+            ("lists", |values| {
+                let lengths = vec![1; values.len()];
+                Arc::new(ListArray::new(
+                    item(&values),
+                    OffsetBuffer::from_lengths(lengths),
+                    values,
+                    None,
+                ))
+            }),
+            ("fixed size lists", |values| {
+                Arc::new(FixedSizeListArray::new(item(&values), 1, values, None))
+            }),
+            ("list views", |values| {
+                let rows = values.len() as i32;
+                Arc::new(ListViewArray::new(
+                    item(&values),
+                    (0..rows).collect::<Vec<_>>().into(),
+                    vec![1; rows as usize].into(),
+                    values,
+                    None,
+                ))
+            }),
+            ("maps", |values| {
+                let rows = values.len();
+                let fields = Fields::from(vec![
+                    Field::new("keys", DataType::Int32, false),
+                    Field::new("values", values.data_type().clone(), true),
+                ]);
+                let keys = Arc::new(Int32Array::from_iter_values(0..rows as i32));
+                let entries = StructArray::new(fields.clone(), vec![keys, values], None);
+                Arc::new(MapArray::new(
+                    Arc::new(Field::new("entries", DataType::Struct(fields), false)),
+                    OffsetBuffer::from_lengths(vec![1; rows]),
+                    entries,
+                    None,
+                    false,
+                ))
+            }),
+            ("sparse unions", |values| {
+                let type_ids = vec![0i8; values.len()].into();
+                Arc::new(
+                    UnionArray::try_new(
+                        union_fields(&values),
+                        type_ids,
+                        None,
+                        vec![values],
+                    )
+                    .unwrap(),
+                )
+            }),
+            ("dense unions", |values| {
+                let rows = values.len() as i32;
+                let type_ids = vec![0i8; rows as usize].into();
+                let offsets = Some((0..rows).collect::<Vec<_>>().into());
+                Arc::new(
+                    UnionArray::try_new(
+                        union_fields(&values),
+                        type_ids,
+                        offsets,
+                        vec![values],
+                    )
+                    .unwrap(),
+                )
+            }),
+            // Of 64 bits, as the planner keeps the runs of fewer in DataFusion
+            // (see `addresses_more_than_their_memory`).
+            ("run-end encoded values", |values| {
+                let ends = Int64Array::from_iter_values(1..=values.len() as i64);
+                Arc::new(RunArray::<Int64Type>::try_new(&ends, values.as_ref()).unwrap())
+            }),
+        ]
+    }
+
+    /// The type of the payloads of the layout `wrap` (see
+    /// [`dictionary_layouts`]).
+    pub(crate) fn layout_type(wrap: fn(ArrayRef) -> ArrayRef) -> DataType {
+        let values = Arc::new(StringArray::from(vec!["a"]));
+        let dictionary =
+            Arc::new(DictionaryArray::new(Int32Array::from(vec![0]), values));
+        wrap(dictionary).data_type().clone()
+    }
+
+    /// Two batches of 50 right rows of the key 1 whose payloads, in the layout
+    /// `wrap`, have a dictionary of their own of the values `"a"` and a string
+    /// of 1 MiB, but whose rows all have `"a"`.
+    pub(crate) fn dictionary_batches(wrap: fn(ArrayRef) -> ArrayRef) -> Vec<RecordBatch> {
         (0..2)
             .map(|batch| {
-                let values = StringArray::from(vec!["a", big]);
-                let dictionary =
-                    DictionaryArray::new(Int32Array::from(vec![0; 50]), Arc::new(values));
+                let payload = wrap(dictionary_column(50));
                 RecordBatch::try_new(
-                    dictionary_schema("r"),
+                    payload_schema("r", payload.data_type()),
                     vec![
                         Arc::new(Int64Array::from_iter_values(
                             batch * 50..batch * 50 + 50,
                         )),
                         Arc::new(Int32Array::from(vec![1; 50])),
-                        Arc::new(dictionary),
+                        payload,
                     ],
                 )
                 .unwrap()
@@ -8954,6 +9358,16 @@ pub(crate) mod tests {
             ),
             ("keys that overflow", vec![narrow(), narrow()], wide),
         ];
+        // Every layout of `dictionary_layouts`, of the dictionaries above.
+        let mut cases = cases;
+        for (name, wrap) in dictionary_layouts().into_iter().skip(1) {
+            let rows = |column: &ArrayRef| wrap(Arc::clone(column));
+            cases.push((
+                name,
+                vec![rows(&first), rows(&second)],
+                vec![(0, 1), (1, 0), (0, 2), (0, 0), (1, 1), (0, 3)],
+            ));
+        }
         for (name, arrays, indices) in cases {
             let arrays = arrays.iter().map(AsRef::as_ref).collect::<Vec<_>>();
             let compact = interleave_compact(&arrays, &indices)?;
@@ -8967,73 +9381,160 @@ pub(crate) mod tests {
     async fn dictionaries_are_gathered_with_the_values_that_their_rows_use() -> Result<()>
     {
         // The right (buffered) stream produces two batches of 50 rows of the
-        // key 1 whose dictionaries have the values `"a"` and a string of 1 MiB
-        // (2 MiB in all, built as the stream is read), whose rows all have
-        // `"a"`, and the left stream two rows of the key 1: the merge join
-        // gathers the right rows of the 200 pairs from both batches, with the
-        // values of their dictionaries that they use only (`interleave` copies
-        // all values of all dictionaries), so that it allocates no more than
-        // it reserves (on the thread of the test, as a runtime of the current
-        // thread runs all tasks of the query there), also in a pool of 3 MiB.
-        let order = |side: &str| {
+        // key 1 whose payloads have dictionaries of the values `"a"` and a
+        // string of 1 MiB (2 MiB in all, built as the stream is read), whose
+        // rows all have `"a"` (in every layout of `dictionary_layouts`), and
+        // the left stream two rows of the key 1: the merge join gathers the
+        // right rows of the 200 pairs from both batches, with the values of
+        // their dictionaries that they use only (`interleave` copies all values
+        // of all dictionaries), so that it allocates no more than it reserves
+        // (on the thread of the test, as a runtime of the current thread runs
+        // all tasks of the query there), also in a pool of 3 MiB.
+        let order = |schema: &SchemaRef, side: &str| {
             LexOrdering::new([PhysicalSortExpr::new(
-                col(&format!("{side}k"), &dictionary_schema(side)).unwrap(),
+                col(&format!("{side}k"), schema).unwrap(),
                 SortOptions::default(),
             )])
             .unwrap()
         };
-        for pool_size in [64 << 20, 3 << 20] {
-            let left: Arc<dyn PartitionStream> = Arc::new(StreamPartition {
-                schema: dictionary_schema("l"),
-                batches: vec![dictionary_probe_rows()],
-                forever: false,
-            });
-            let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
-                schema: dictionary_schema("r"),
-                rows: dictionary_batches,
-            });
-            let stream = |side: &str, partition: Arc<dyn PartitionStream>| {
-                Arc::new(
-                    StreamingTableExec::try_new(
-                        dictionary_schema(side),
-                        vec![partition],
-                        None,
-                        [order(side)],
-                        true,
-                        None,
-                    )
-                    .unwrap(),
-                ) as Arc<dyn ExecutionPlan>
+        for (name, wrap) in dictionary_layouts() {
+            for pool_size in [64 << 20, 3 << 20] {
+                let context = format!("{name} in a pool of {pool_size} bytes");
+                let left: Arc<dyn PartitionStream> = Arc::new(StreamPartition {
+                    schema: dictionary_schema("l"),
+                    batches: vec![dictionary_probe_rows()],
+                    forever: false,
+                });
+                let right_schema = payload_schema("r", &layout_type(wrap));
+                let right: Arc<dyn PartitionStream> = Arc::new(BuiltPartition {
+                    schema: Arc::clone(&right_schema),
+                    rows: Arc::new(move || dictionary_batches(wrap)),
+                });
+                let stream = |schema: SchemaRef, side: &str, partition| {
+                    Arc::new(
+                        StreamingTableExec::try_new(
+                            Arc::clone(&schema),
+                            vec![partition],
+                            None,
+                            [order(&schema, side)],
+                            true,
+                            None,
+                        )
+                        .unwrap(),
+                    ) as Arc<dyn ExecutionPlan>
+                };
+                let left = stream(dictionary_schema("l"), "l", left);
+                let right = stream(right_schema, "r", right);
+                let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    None,
+                    JoinType::Inner,
+                    vec![SortOptions::default()],
+                    NullEquality::NullEqualsNothing,
+                )?);
+                let root = crate::planner::lower_execution_plan(&plan)?;
+                assert_streaming_merge_join(&root, &context);
+                let pool = Arc::new(PeakPool::new(pool_size));
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
+                    .build_arc()?;
+                let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+                allocations::reset_peak();
+                let before = allocations::held();
+                let output = run_native(&root, plan, ctx)
+                    .await
+                    .unwrap_or_else(|e| panic!("{context}: {e}"));
+                let allocated = allocations::peak() - before;
+                let reserved = pool.peak.load(Ordering::Relaxed) as isize;
+                assert_eq!(num_rows(&output.batches), 200, "{context}");
+                assert!(
+                    allocated < reserved + (512 << 10),
+                    "{context}: the query allocated {allocated} bytes, and reserved {reserved}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unmatched_rows_of_buffered_streams_that_never_end_are_emitted() -> Result<()>
+    {
+        // A `Full` join of an empty left input that ends (with a payload of
+        // dictionaries of dictionaries, which the hash join does not store, so
+        // that the planner lowers the join to a merge join) with a sorted right
+        // stream that produces rows and then nothing, forever: once the left
+        // input ended, no right row matches, so that the join emits the right
+        // rows as they come (it read all of them first, forever), and a limit
+        // above it ends the query (DataFusion's join waits for more right
+        // rows).
+        let strings =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let left_schema = payload_schema(
+            "l",
+            &DataType::Dictionary(Box::new(DataType::Int32), Box::new(strings)),
+        );
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("rk", DataType::Int32, false),
+        ]));
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let left: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
+                &[vec![]],
+                Arc::clone(&left_schema),
+                None,
+            )?;
+            let rows = RecordBatch::try_new(
+                Arc::clone(&right_schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..3)),
+                    Arc::new(Int32Array::from_iter_values(1..4)),
+                ],
+            )?;
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                col("rk", &right_schema)?,
+                SortOptions::default(),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: Arc::clone(&right_schema),
+                batches: vec![rows],
+                forever: true,
             };
-            let (left, right) = (stream("l", left), stream("r", right));
+            let right: Arc<dyn ExecutionPlan> = Arc::new(StreamingTableExec::try_new(
+                Arc::clone(&right_schema),
+                vec![Arc::new(partition)],
+                None,
+                [order],
+                true,
+                None,
+            )?);
             let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
-            let plan: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            let join = SortMergeJoinExec::try_new(
                 left,
                 right,
                 on,
                 None,
-                JoinType::Inner,
+                JoinType::Full,
                 vec![SortOptions::default()],
                 NullEquality::NullEqualsNothing,
-            )?);
-            let root = crate::planner::lower_execution_plan(&plan)?;
-            assert_streaming_merge_join(&root, "dictionaries");
-            let pool = Arc::new(PeakPool::new(pool_size));
-            let runtime = RuntimeEnvBuilder::new()
-                .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
-                .build_arc()?;
-            let ctx = Arc::new(TaskContext::default().with_runtime(runtime));
-            allocations::reset_peak();
-            let before = allocations::held();
-            let output = run_native(&root, plan, ctx).await?;
-            let allocated = allocations::peak() - before;
-            let reserved = pool.peak.load(Ordering::Relaxed) as isize;
-            assert_eq!(num_rows(&output.batches), 200);
-            assert!(
-                allocated < reserved + (512 << 10),
-                "the query allocated {allocated} bytes, and reserved {reserved}"
-            );
-        }
+            )?;
+            Ok(Arc::new(GlobalLimitExec::new(Arc::new(join), 0, Some(1))))
+        };
+        let plan = plan()?;
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        let tree = format_operator_tree(&root);
+        assert_eq!(count::<PhysicalMergeJoin>(&root), 1, "{tree}");
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        assert_eq!(num_rows(&actual.batches), 1, "{tree}");
+        let batch = &actual.batches[0];
+        assert_eq!(
+            batch.column_by_name("lid").unwrap().null_count(),
+            1,
+            "{tree}"
+        );
         Ok(())
     }
 
