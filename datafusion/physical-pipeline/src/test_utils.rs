@@ -954,10 +954,17 @@ pub async fn alternative_outcomes(
         Ok::<_, DataFusionError>((output, order))
     };
     match lineage_choices(ctx, plan, &nested, result, tolerance).await {
-        // The rows of the result show the rows of the nested limits.
-        Some(Some(choices)) => run(&choices).await.into_iter().collect(),
-        // They show none that the nested limits may return.
-        Some(None) => vec![],
+        // The rows of the result show the rows of the nested limits (maybe in
+        // several ways, if rows of other keys have equal values).
+        Some(shown) => {
+            let mut alternatives = vec![];
+            for choices in shown {
+                if let Ok(alternative) = run(&choices).await {
+                    alternatives.push(alternative);
+                }
+            }
+            alternatives
+        }
         None => {
             let choices = nested
                 .iter()
@@ -982,13 +989,13 @@ pub async fn alternative_outcomes(
     }
 }
 
-/// The rows that the nested limits `nested` of `plan` returned for the other
-/// engine, shown by the rows of its `result`: for each of them, the positions
-/// of its sorted rows. `None` if `plan` has other nodes than projections,
-/// filters, sorts (without a fetch), subquery aliases and inner joins above
-/// its nested limits (e.g. aggregates, limits or outer joins), so that its
-/// rows do not show them; `Some(None)` if its rows show none that the nested
-/// limits may return.
+/// The rows that the nested limits `nested` of `plan` may have returned for
+/// the other engine, shown by the rows of its `result`: up to 16 choices of
+/// rows, each the positions of the sorted rows of each nested limit. `None`
+/// if `plan` has other nodes than projections, filters, sorts (without a
+/// fetch), subquery aliases and inner joins above its nested limits (e.g.
+/// aggregates, limits or outer joins), so that its rows do not show them.
+/// No choices if its rows show none that the nested limits may return.
 ///
 /// The query runs with the rows that each nested limit may return in its
 /// place (see [`window_choices`]), with their positions as their lineage,
@@ -1002,7 +1009,7 @@ async fn lineage_choices(
     nested: &[NestedLimit],
     result: &EngineOutput,
     tolerance: f64,
-) -> Option<Option<Vec<Vec<usize>>>> {
+) -> Option<Vec<Vec<Vec<usize>>>> {
     let candidates = nested
         .iter()
         .map(|limit| candidates(&limit.sorted).0)
@@ -1085,6 +1092,7 @@ async fn lineage_choices(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let mut shown_choices = vec![];
     for choices in choices.into_iter().multi_cartesian_product().take(4096) {
         let selected = rows
             .iter()
@@ -1096,10 +1104,13 @@ async fn lineage_choices(
             .map(|(row_values, _)| row_values.clone())
             .collect::<Vec<_>>();
         if multiset_difference(&selected, &result, tolerance).is_empty() {
-            return Some(Some(choices));
+            shown_choices.push(choices);
+            if shown_choices.len() == 16 {
+                break;
+            }
         }
     }
-    Some(None)
+    Some(shown_choices)
 }
 
 /// `plan` with each of the nested limits of `replacements` replaced by its
