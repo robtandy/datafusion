@@ -33,6 +33,10 @@ pub(crate) fn count<T: PhysicalOperator>(operator: &Arc<dyn PhysicalOperator>) -
 /// have unambiguous results), and that the pipeline engine runs all of it
 /// natively: no part of its plan is left to DataFusion. Returns the operator
 /// tree of the pipeline engine.
+///
+/// The results are compared with `compare_outputs` until
+/// `test_utils::assert_same_results_as_datafusion` exists (#55), which
+/// compares them by meaning also where they are ambiguous.
 pub(crate) async fn assert_lowered<F>(
     sql: &str,
     config: SessionConfig,
