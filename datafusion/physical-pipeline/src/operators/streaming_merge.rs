@@ -13,7 +13,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::compute::interleave;
 use arrow::datatypes::SchemaRef;
 use arrow::row::{RowConverter, Rows, SortField};
-use datafusion_common::Result;
+use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_plan::ExecutionPlan;
@@ -148,6 +148,45 @@ impl PhysicalStreamingMerge {
             .collect()
     }
 
+    /// Poll the stream of the input `index`, which needs a batch, with `cx`:
+    /// a batch with rows puts the input on the heap of `state`, the end of the
+    /// stream ends it (`Poll::Ready(())` for both).
+    fn poll_batch(
+        &self,
+        state: &mut MergeState,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Result<Poll<()>> {
+        let input = &mut state.inputs[index];
+        while !input.ended {
+            match input.stream.poll_next_unpin(cx) {
+                Poll::Ready(Some(batch)) => {
+                    let batch = batch?;
+                    if batch.num_rows() == 0 {
+                        continue;
+                    }
+                    let keys = self
+                        .expr
+                        .iter()
+                        .map(|key| {
+                            key.expr.evaluate(&batch)?.into_array(batch.num_rows())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let keys = state.converter.convert_columns(&keys)?;
+                    input.batch = Some((batch, keys));
+                    input.next = 0;
+                    state.heap.push(index);
+                    let last = state.heap.len() - 1;
+                    sift_up(&mut state.heap, &state.inputs, last);
+                    return Ok(Poll::Ready(()));
+                }
+                Poll::Ready(None) => input.ended = true,
+                Poll::Pending => return Ok(Poll::Pending),
+            }
+        }
+        Ok(Poll::Ready(()))
+    }
+
     /// The row converter of the keys `expr` of rows with the schema `schema`.
     fn converter(expr: &LexOrdering, schema: &SchemaRef) -> Result<RowConverter> {
         let fields = expr
@@ -170,12 +209,72 @@ struct Input {
     batch: Option<(RecordBatch, Rows)>,
     next: usize,
     ended: bool,
+    /// The index of `batch` in the sources of the chunk that the merge
+    /// builds, once a row of it is in the chunk.
+    source: Option<usize>,
+}
+
+impl Input {
+    /// The keys of the next row (of an input with a batch).
+    fn key(&self) -> &[u8] {
+        match &self.batch {
+            Some((_, keys)) => keys.row(self.next).data(),
+            None => &[],
+        }
+    }
+}
+
+/// Whether the next row of the input `a` comes before the next row of the
+/// input `b` (of the same keys, the row of the first input).
+fn before(inputs: &[Input], a: usize, b: usize) -> bool {
+    match inputs[a].key().cmp(inputs[b].key()) {
+        std::cmp::Ordering::Equal => a < b,
+        ordering => ordering.is_lt(),
+    }
+}
+
+/// Restore the order of the heap `heap` of inputs (by their next rows) below
+/// its entry `index`.
+fn sift_down(heap: &mut [usize], inputs: &[Input], mut index: usize) {
+    loop {
+        let (left, right) = (2 * index + 1, 2 * index + 2);
+        let mut smallest = index;
+        if left < heap.len() && before(inputs, heap[left], heap[smallest]) {
+            smallest = left;
+        }
+        if right < heap.len() && before(inputs, heap[right], heap[smallest]) {
+            smallest = right;
+        }
+        if smallest == index {
+            return;
+        }
+        heap.swap(index, smallest);
+        index = smallest;
+    }
+}
+
+/// Restore the order of the heap `heap` of inputs above its entry `index`.
+fn sift_up(heap: &mut [usize], inputs: &[Input], mut index: usize) {
+    while index > 0 {
+        let parent = (index - 1) / 2;
+        if !before(inputs, heap[index], heap[parent]) {
+            return;
+        }
+        heap.swap(index, parent);
+        index = parent;
+    }
 }
 
 /// The state of the thread of a [`PhysicalStreamingMerge`].
 struct MergeState {
     converter: RowConverter,
     inputs: Vec<Input>,
+    /// The inputs with a row, a binary heap by their next rows (the first
+    /// row of all of them at its top).
+    heap: Vec<usize>,
+    /// The inputs that need a batch before the merge can go on (at first,
+    /// all of them).
+    refill: Vec<usize>,
     /// The rows that may still be emitted.
     remaining: Option<usize>,
     reservation: MemoryReservation,
@@ -245,6 +344,7 @@ impl PhysicalOperator for PhysicalStreamingMerge {
                     batch: None,
                     next: 0,
                     ended: false,
+                    source: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -252,6 +352,8 @@ impl PhysicalOperator for PhysicalStreamingMerge {
             .register(ctx.task_ctx.memory_pool());
         Ok(Box::new(MergeState {
             converter: Self::converter(&self.expr, &self.schema)?,
+            refill: (0..inputs.len()).rev().collect(),
+            heap: Vec::with_capacity(inputs.len()),
             inputs,
             remaining: self.fetch,
             reservation,
@@ -268,95 +370,74 @@ impl PhysicalOperator for PhysicalStreamingMerge {
         if state.remaining == Some(0) {
             return Ok(SourceResult::Finished);
         }
-        // Every input that did not end needs a row.
         let mut cx = Context::from_waker(ctx.waker());
-        for input in &mut state.inputs {
-            while !input.ended && input.batch.is_none() {
-                match input.stream.poll_next_unpin(&mut cx) {
-                    Poll::Ready(Some(batch)) => {
-                        let batch = batch?;
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-                        let keys = self
-                            .expr
-                            .iter()
-                            .map(|key| {
-                                key.expr.evaluate(&batch)?.into_array(batch.num_rows())
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        let keys = state.converter.convert_columns(&keys)?;
-                        input.batch = Some((batch, keys));
-                        input.next = 0;
-                    }
-                    Poll::Ready(None) => input.ended = true,
-                    Poll::Pending => {
-                        state.reserve()?;
-                        return Ok(SourceResult::Blocked(
-                            TaskInterrupt::waker_registered(),
-                        ));
-                    }
+        // Every input that did not end needs a row.
+        while let Some(&index) = state.refill.last() {
+            match self.poll_batch(state, index, &mut cx)? {
+                Poll::Pending => {
+                    state.reserve()?;
+                    return Ok(SourceResult::Blocked(TaskInterrupt::waker_registered()));
+                }
+                Poll::Ready(()) => {
+                    state.refill.pop();
                 }
             }
         }
         state.reserve()?;
-        if state.inputs.iter().all(|input| input.batch.is_none()) {
+        if state.heap.is_empty() {
             return Ok(SourceResult::Finished);
         }
-        // The smallest rows, until the batch of an input is consumed (its
-        // next batch may have smaller rows than the others).
+        // The first rows of all inputs, the input at the top of the heap
+        // every time, until the merge needs a batch that is not there yet.
         let limit = state
             .remaining
             .unwrap_or(usize::MAX)
             .min(DEFAULT_VECTOR_SIZE);
-        let mut rows = Vec::with_capacity(limit);
-        let mut consumed = false;
-        while rows.len() < limit && !consumed {
-            let (smallest, _) = state
-                .inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, input)| {
-                    let (_, keys) = input.batch.as_ref()?;
-                    Some((index, keys.row(input.next)))
-                })
-                .min_by(|(_, a), (_, b)| a.cmp(b))
-                .expect("an input has a row");
-            let input = &mut state.inputs[smallest];
-            rows.push((smallest, input.next));
+        let mut sources: Vec<RecordBatch> = vec![];
+        let mut indices = Vec::with_capacity(limit);
+        while indices.len() < limit {
+            let Some(&top) = state.heap.first() else {
+                break;
+            };
+            let input = &mut state.inputs[top];
+            let Some((batch, _)) = &input.batch else {
+                return internal_err!("{} merges an input without rows", self.name());
+            };
+            let source = match input.source {
+                Some(source) => source,
+                None => {
+                    sources.push(batch.clone());
+                    *input.source.insert(sources.len() - 1)
+                }
+            };
+            indices.push((source, input.next));
             input.next += 1;
-            let len = input
-                .batch
-                .as_ref()
-                .map_or(0, |(batch, _)| batch.num_rows());
-            consumed = input.next == len;
+            if input.next < batch.num_rows() {
+                sift_down(&mut state.heap, &state.inputs, 0);
+                continue;
+            }
+            // The batch is consumed (it stays a source of the chunk): the
+            // next row of the input may come before those of the others.
+            input.batch = None;
+            input.source = None;
+            let last = state.heap.pop().expect("the heap has the input");
+            if !state.heap.is_empty() {
+                state.heap[0] = last;
+                sift_down(&mut state.heap, &state.inputs, 0);
+            }
+            if self.poll_batch(state, top, &mut cx)?.is_pending() {
+                state.refill.push(top);
+                break;
+            }
         }
-        // The batches of the inputs, in the order of the inputs.
-        let batches = state
-            .inputs
-            .iter()
-            .map(|input| input.batch.as_ref().map(|(batch, _)| batch))
-            .collect::<Vec<_>>();
-        let present = batches
-            .iter()
-            .enumerate()
-            .filter_map(|(index, batch)| batch.map(|batch| (index, batch)))
-            .collect::<Vec<_>>();
-        let position = |input: usize| {
-            present
-                .iter()
-                .position(|&(index, _)| index == input)
-                .expect("the input of a row has a batch")
-        };
-        let indices = rows
-            .iter()
-            .map(|&(input, row)| (position(input), row))
-            .collect::<Vec<_>>();
+        for input in &mut state.inputs {
+            input.source = None;
+        }
         let columns = (0..self.schema.fields().len())
             .map(|column| {
-                let arrays = present
+                let arrays = sources
                     .iter()
-                    .map(|(_, batch)| batch.column(column).as_ref())
+                    .map(|batch| batch.column(column).as_ref())
                     .collect::<Vec<&dyn Array>>();
                 Ok(interleave(&arrays, &indices)?)
             })
@@ -366,16 +447,6 @@ impl PhysicalOperator for PhysicalStreamingMerge {
             columns,
             &arrow::array::RecordBatchOptions::new().with_row_count(Some(indices.len())),
         )?;
-        // The batches that are consumed are released.
-        for input in &mut state.inputs {
-            if input
-                .batch
-                .as_ref()
-                .is_some_and(|(batch, _)| input.next == batch.num_rows())
-            {
-                input.batch = None;
-            }
-        }
         if let Some(remaining) = &mut state.remaining {
             *remaining -= output.num_rows();
         }
@@ -1126,6 +1197,72 @@ mod tests {
         )
         .unwrap();
         Arc::new(table)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merges_of_many_partitions_select_every_row_in_logarithmic_time() -> Result<()>
+    {
+        // 512 sorted streams (of an unbounded table) of 256 rows each, in
+        // batches of 16 rows: the merge selects every row by a heap of the
+        // inputs, not by a scan of all of them.
+        let streams = (0..512)
+            .map(|partition| {
+                let values = (partition..131_072).step_by(512).collect::<Vec<i64>>();
+                let batches = values
+                    .chunks(16)
+                    .map(|values| {
+                        RecordBatch::try_new(
+                            pairs_schema(),
+                            vec![
+                                Arc::new(Int64Array::from(values.to_vec())),
+                                Arc::new(Int64Array::from(vec![0; values.len()])),
+                            ],
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                Arc::new(EndlessPairs(batches, true)) as Arc<dyn PartitionStream>
+            })
+            .collect();
+        let table = StreamingTableExec::try_new(
+            pairs_schema(),
+            streams,
+            None,
+            [ordering()],
+            true,
+            None,
+        )?;
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(ordering(), Arc::new(table)));
+        let ctx = datafusion_context(test_session_config());
+        let state = ctx.state();
+        let root = crate::planner::create_pipeline_plan_with_runtime(
+            plan,
+            state.config_options(),
+            state.runtime_env(),
+        )?;
+        assert_eq!(count::<PhysicalStreamingMerge>(root.operator()), 1);
+        let start = datafusion_common::instant::Instant::now();
+        let run = datafusion_physical_plan::collect(root, ctx.task_ctx());
+        let output = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("the merge of many partitions ends")?;
+        let elapsed = start.elapsed();
+        let values = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, (0..131_072).collect::<Vec<_>>());
+        // About a second in a debug build (a scan of all inputs for every
+        // row took 27 seconds).
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
