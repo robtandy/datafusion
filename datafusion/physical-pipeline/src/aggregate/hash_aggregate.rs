@@ -827,7 +827,7 @@ impl PhysicalHashAggregate {
             && soft_limit.is_none()
             && input_order.is_none()
             && rows_can_bypass_tables(&group_by, &update, &merge, &input_schema);
-        let dynamic_filter = AggregateFilter::of_aggregate_exec(raw);
+        let dynamic_filter = AggregateFilter::of_aggregate_exec(raw)?;
         Ok(Self {
             children: vec![input],
             table_capacity: TableCapacity::default(),

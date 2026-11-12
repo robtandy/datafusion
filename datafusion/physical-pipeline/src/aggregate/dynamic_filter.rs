@@ -62,6 +62,15 @@
 //! totally). The filters of other aggregations stay `true`, which prunes
 //! nothing.
 //!
+//! Nor are the filters set that a node of the input reads in a form that
+//! evaluates a volatile expression: a scan of Parquet files that projects
+//! `tick(k) AS x` rewrites a filter of `x` that is pushed into it into a
+//! filter of `tick(k)` and evaluates it on its rows (with `pushdown_filters`),
+//! i.e. evaluates `tick` once more, which changes the values that the scan
+//! produces. The native aggregation publishes no filter into such a scan, and
+//! leaves DataFusion's filters that it reads `true` (which DataFusion's own
+//! aggregations set, so that they return other values than without them).
+//!
 //! As DataFusion's, the filters are only updated in sessions that push the
 //! dynamic filters of aggregations down
 //! (`datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown`).
@@ -80,6 +89,7 @@ use std::sync::atomic::{self, AtomicUsize};
 use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{Accumulator, Operator};
 use datafusion_functions_aggregate::min_max;
@@ -87,6 +97,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, is_null, lit,
 };
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_physical_plan::execution_plan::{
@@ -167,16 +178,30 @@ impl AggregateFilter {
     /// The dynamic filters that `raw`, the `AggregateExec` that consumes the
     /// input rows of an aggregation, produces, if they are DataFusion's
     /// filters of the bounds of its `MIN` and `MAX` aggregates that the
-    /// native aggregation sets (see [`bounded_aggregates`]).
-    pub(crate) fn of_aggregate_exec(raw: &AggregateExec) -> Option<Self> {
-        let filters = dynamic_filters(raw)?;
+    /// native aggregation sets (see [`bounded_aggregates`]), unless a node of
+    /// the input reads them in a form that evaluates a volatile expression
+    /// (see [`reads_volatile_filters`]).
+    pub(crate) fn of_aggregate_exec(raw: &AggregateExec) -> Result<Option<Self>> {
+        let Some(filters) = dynamic_filters(raw) else {
+            return Ok(None);
+        };
         if filters.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(Self {
+        let Some(bounded) = bounded_aggregates(raw) else {
+            return Ok(None);
+        };
+        let produced = filters
+            .iter()
+            .map(|filter| Arc::clone(filter) as Arc<dyn PhysicalExpr>)
+            .collect::<Vec<_>>();
+        if reads_volatile_filters(raw.input(), &expression_ids(&produced)?)? {
+            return Ok(None);
+        }
+        Ok(Some(Self {
             filters,
-            kind: FilterKind::Bounds(bounded_aggregates(raw)?),
-        })
+            kind: FilterKind::Bounds(bounded),
+        }))
     }
 
     /// The filter that the aggregation whose stage that consumes the input
@@ -629,7 +654,13 @@ pub(crate) fn has_exact_bounds(data_type: &DataType) -> bool {
 ///
 /// The filters are not pushed into a node with a fetch (e.g. a limit, a TopK
 /// or a scan with a limit): it keeps the first rows of its input, which would
-/// be other rows if the filters pruned some of them.
+/// be other rows if the filters pruned some of them. Like the rule, a node
+/// does not push volatile filters into its children (e.g. a projection, which
+/// would rewrite a filter of a column it computes with a volatile function
+/// into a filter that calls the function). Nor does a leaf take filters that
+/// it would read in a form that evaluates a volatile expression (see
+/// [`reads_volatile_filters`]): a scan of files rewrites the filters through
+/// its own projection, which the rule does not check.
 ///
 /// Unlike the rule, only `filters` are pushed down, not the filters of the
 /// nodes themselves, which are already where the rule pushed them, and the
@@ -648,6 +679,7 @@ fn push_down(
     }
     let children = plan.children();
     if children.is_empty() {
+        let ids = expression_ids(&filters)?;
         let result = ChildPushdownResult {
             parent_filters: filters
                 .into_iter()
@@ -658,9 +690,15 @@ fn push_down(
                 .collect(),
             self_filters: vec![],
         };
-        return Ok(plan
+        let updated = plan
             .handle_child_pushdown_result(FilterPushdownPhase::Post, result, config)?
-            .updated_node);
+            .updated_node;
+        return match updated {
+            Some(updated) if !reads_volatile_filters(&updated, &ids)? => {
+                Ok(Some(updated))
+            }
+            _ => Ok(None),
+        };
     }
     let description =
         plan.gather_filters_for_pushdown(FilterPushdownPhase::Post, filters, config)?;
@@ -673,7 +711,10 @@ fn push_down(
     for (child, filters) in children.into_iter().zip(parent_filters) {
         let filters = filters
             .into_iter()
-            .filter(|filter| matches!(filter.discriminant, PushedDown::Yes))
+            .filter(|filter| {
+                matches!(filter.discriminant, PushedDown::Yes)
+                    && !is_volatile(&filter.predicate)
+            })
             .map(|filter| filter.predicate)
             .collect::<Vec<_>>();
         let new_child = match filters.is_empty() {
@@ -690,6 +731,49 @@ fn push_down(
         Arc::clone(plan),
         new_children,
     )?))
+}
+
+/// The expression ids of the dynamic filters in `filters` (see
+/// `PhysicalExpr::expression_id`).
+fn expression_ids(filters: &[Arc<dyn PhysicalExpr>]) -> Result<Vec<u64>> {
+    let mut ids = vec![];
+    for filter in filters {
+        filter.apply(|expr| {
+            ids.extend(expr.expression_id());
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    Ok(ids)
+}
+
+/// Whether a node of `plan` reads one of the dynamic filters with the
+/// expression ids `ids` in a form that evaluates a volatile expression, e.g. a
+/// scan of Parquet files whose projection computes the column that the filter
+/// compares with a volatile function (`tick(k) AS x`): the scan rewrites the
+/// filter for the columns of its files (`tick(k) >= 10`) and evaluates it on
+/// its rows (with `pushdown_filters`), which evaluates the function once more
+/// for every row, so that the scan produces other values than without the
+/// filter (e.g. of a function that numbers its calls).
+fn reads_volatile_filters(plan: &Arc<dyn ExecutionPlan>, ids: &[u64]) -> Result<bool> {
+    let mut volatile = false;
+    plan.apply(|node| {
+        node.apply_expressions(&mut |root| {
+            root.apply(|expr| {
+                if expr.expression_id().is_some_and(|id| ids.contains(&id))
+                    && is_volatile(expr)
+                {
+                    volatile = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(match volatile {
+            true => TreeNodeRecursion::Stop,
+            false => TreeNodeRecursion::Continue,
+        })
+    })?;
+    Ok(volatile)
 }
 
 #[cfg(test)]
@@ -1320,6 +1404,178 @@ mod tests {
                 let reference = without_limited_aggregations(config.clone());
                 assert_lowered_results_with_setup(sql, config.clone(), reference, &setup)
                     .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// `tick(k)`: a volatile function that numbers the rows it is evaluated
+    /// for, from 1, and counts them in `ticks` (its argument only makes it a
+    /// function of the rows).
+    #[derive(Debug)]
+    struct Tick {
+        ticks: Arc<AtomicUsize>,
+        signature: datafusion_expr::Signature,
+    }
+
+    impl PartialEq for Tick {
+        fn eq(&self, other: &Self) -> bool {
+            Arc::ptr_eq(&self.ticks, &other.ticks)
+        }
+    }
+
+    impl Eq for Tick {}
+
+    impl std::hash::Hash for Tick {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            Arc::as_ptr(&self.ticks).hash(state);
+        }
+    }
+
+    impl datafusion_expr::ScalarUDFImpl for Tick {
+        fn name(&self) -> &str {
+            "tick"
+        }
+
+        fn signature(&self) -> &datafusion_expr::Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn invoke_with_args(
+            &self,
+            args: datafusion_expr::ScalarFunctionArgs,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            let rows = args.number_rows;
+            let first = self.ticks.fetch_add(rows, atomic::Ordering::SeqCst) as i64;
+            let ticks = Int64Array::from_iter_values(first + 1..=first + rows as i64);
+            Ok(datafusion_expr::ColumnarValue::Array(Arc::new(ticks)))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_are_not_read_by_scans_that_project_volatile_values() -> Result<()> {
+        // A scan of Parquet files that projects `tick(k) AS x` rewrites a
+        // filter of `x` that is pushed into it into a filter of `tick(k)`,
+        // which evaluates `tick` once more for its rows (with
+        // `pushdown_filters`). `tick` numbers the rows it is evaluated for, so
+        // the scan would produce other values: the greatest was 229,376
+        // rather than 131,072 for the top-k aggregation on 1 thread. The
+        // native aggregations publish no filter into such scans, and leave
+        // DataFusion's filters that they read `true` (DataFusion's own
+        // aggregation sets them, on 4 threads, and its `MAX(x)` is then
+        // 229,376): `tick` is evaluated once for every row, whose values are 1
+        // to 131,072.
+        const ROWS: i64 = 131_072;
+        let dir = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batches = (0..ROWS)
+            .step_by(8_192)
+            .map(|start| {
+                let columns: Vec<ArrayRef> =
+                    vec![Arc::new(Int64Array::from_iter_values(start..start + 8_192))];
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8_192))
+            .build();
+        write_parquet(
+            &dir.path().join("v/data.parquet"),
+            Arc::clone(&schema),
+            &batches,
+            Some(properties),
+        )?;
+        let path = dir.path().join("v");
+        let path = path.to_str().expect("a UTF-8 path");
+        // Register `v` and a new `tick`, whose evaluations are counted.
+        let setup = async |ctx: &SessionContext| -> Result<Arc<AtomicUsize>> {
+            ctx.register_parquet("v", path, ParquetReadOptions::default())
+                .await?;
+            let ticks = Arc::new(AtomicUsize::new(0));
+            ctx.register_udf(datafusion_expr::ScalarUDF::new_from_impl(Tick {
+                ticks: Arc::clone(&ticks),
+                signature: datafusion_expr::Signature::exact(
+                    vec![DataType::Int64],
+                    datafusion_expr::Volatility::Volatile,
+                ),
+            }));
+            Ok(ticks)
+        };
+        // The values of the last column of `batches`, and the number of
+        // evaluations of `tick`.
+        let outcome = |batches: &[RecordBatch], ticks: &AtomicUsize| {
+            let mut values = vec![];
+            for batch in batches {
+                let column = batch.column(batch.num_columns() - 1);
+                for row in 0..column.len() {
+                    values
+                        .push(ScalarValue::try_from_array(column, row).expect("a value"));
+                }
+            }
+            (values, ticks.load(atomic::Ordering::SeqCst))
+        };
+        let expected = (vec![ScalarValue::Int64(Some(ROWS))], ROWS as usize);
+        for sql in [
+            "SELECT DISTINCT tick(k) AS x FROM v ORDER BY x DESC LIMIT 1",
+            "SELECT MAX(x) FROM (SELECT tick(k) AS x FROM v)",
+            "SELECT MIN(x), MAX(x) FROM (SELECT tick(k) AS x FROM v) WHERE x > 0",
+        ] {
+            for threads in [1, 4] {
+                for filters in [true, false] {
+                    let mut config = with_pushdown_filters(
+                        test_session_config().with_target_partitions(threads),
+                        true,
+                    );
+                    config
+                        .options_mut()
+                        .optimizer
+                        .enable_aggregate_dynamic_filter_pushdown = filters;
+                    let context = format!(
+                        "{sql} on {threads} threads, aggregate filters: {filters}"
+                    );
+                    // DataFusion, but where its own filters change the values.
+                    if sql.contains("DISTINCT") || !filters || threads == 1 {
+                        let ctx = datafusion_context(config.clone());
+                        let ticks = setup(&ctx).await?;
+                        let batches = ctx.sql(sql).await?.collect().await?;
+                        let actual = outcome(&batches, &ticks);
+                        assert_eq!(actual, expected, "DataFusion: {context}");
+                    }
+                    // Through the planner.
+                    let ctx = pipeline_context(config.clone());
+                    let ticks = setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let Some(root) = plan.downcast_ref::<PipelineRootExec>() else {
+                        panic!("The pipeline engine did not plan {context}");
+                    };
+                    let tree = format_operator_tree(root.operator());
+                    assert!(
+                        bridged_plans(root.operator()).is_empty(),
+                        "{context}\n{tree}"
+                    );
+                    assert!(
+                        native_filters(root.operator()).is_empty(),
+                        "{context}\n{tree}"
+                    );
+                    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+                    assert_eq!(outcome(&batches, &ticks), expected, "planner: {context}");
+                    // Through the lowering of the tests, with tiny thread-local
+                    // tables, which set the cutoff of the top-k aggregation
+                    // after a few rows.
+                    let ctx = datafusion_context(config.clone());
+                    let ticks = setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let root = lower_with_tiny_tables(&plan)?;
+                    assert!(native_filters(&root).is_empty(), "{context}");
+                    let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                    let batches = collect(exec as _, ctx.task_ctx()).await?;
+                    let actual = outcome(&batches, &ticks);
+                    assert_eq!(actual, expected, "tiny tables: {context}");
+                }
             }
         }
         Ok(())
