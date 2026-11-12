@@ -18,16 +18,24 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::LexOrdering;
+use datafusion_physical_plan::aggregates::AggregateExec;
+use datafusion_physical_plan::async_func::AsyncFuncExec;
+use datafusion_physical_plan::buffer::BufferExec;
+use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::filter::FilterExec;
 use datafusion_physical_plan::limit::LocalLimitExec;
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
+use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::streaming::StreamingTableExec;
 use datafusion_physical_plan::union::UnionExec;
+use datafusion_physical_plan::unnest::UnnestExec;
+use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{
-    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     ReplaceChildrenOptions,
 };
 
@@ -36,6 +44,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut, operator_key,
 };
+use crate::operators::routed_partition::RoutedPartitionExec;
 use crate::operators::union::PhysicalUnion;
 use crate::pipeline::PipelineGraph;
 use crate::sort::{PhysicalSort, PhysicalTopK};
@@ -268,11 +277,14 @@ pub(crate) fn first_rows_of_merged_partitions(
 /// with the rows of its partition, in their order: of a scan of in-memory
 /// batches (every partition with its batches), of a scan of files (every
 /// partition with its file group), of a streaming table (every partition
-/// with its stream), and of the unions of them and of the
-/// projections, filters, limits of every partition and the nodes that only
-/// change the size of batches above them. `None` for any other plan of
-/// several partitions, whose partitions depend on how DataFusion distributes
-/// its rows.
+/// with its stream), of a hash or range repartitioning (every partition
+/// with the rows that it routes to it, see [`RoutedPartitionExec`]), and of
+/// the unions of them and of the nodes above them that compute every
+/// partition of the same partition of their input (projections, filters,
+/// limits, sorts, aggregations and windows of every partition, and the
+/// nodes that only change the size of batches). `None` for any other plan of
+/// several partitions, e.g. of a round robin repartitioning, whose
+/// partitions depend on the batches in which DataFusion reads its rows.
 pub(crate) fn partitions_of(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Option<Vec<Arc<dyn ExecutionPlan>>>> {
@@ -318,6 +330,36 @@ pub(crate) fn partitions_of(
             .collect::<Result<Vec<_>>>()?;
         return Ok(Some(partitions));
     }
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>()
+        && matches!(
+            repartition.partitioning(),
+            Partitioning::Hash(..) | Partitioning::Range(_)
+        )
+    {
+        let input = repartition.input();
+        let ordering = input.output_ordering().cloned();
+        let several = input.output_partitioning().partition_count() > 1;
+        let partitions = (0..count)
+            .map(|partition| {
+                let routed: Arc<dyn ExecutionPlan> =
+                    Arc::new(RoutedPartitionExec::try_new(
+                        Arc::clone(input),
+                        repartition.partitioning().clone(),
+                        partition,
+                    )?);
+                // The rows of the partitions of the input, merged in their
+                // order if the repartitioning keeps it.
+                Ok(match (several, repartition.preserve_order(), &ordering) {
+                    (false, _, _) => routed,
+                    (true, true, Some(ordering)) => {
+                        Arc::new(SortPreservingMergeExec::new(ordering.clone(), routed))
+                    }
+                    (true, _, _) => Arc::new(CoalescePartitionsExec::new(routed)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(partitions));
+    }
     if plan.is::<UnionExec>() {
         let mut partitions = Vec::with_capacity(count);
         for input in plan.children() {
@@ -332,7 +374,16 @@ pub(crate) fn partitions_of(
         || plan.is::<FilterExec>()
         || plan.is::<LocalLimitExec>()
         || is_coalesce_batches(plan)
-        || plan.is::<CooperativeExec>();
+        || plan.is::<CooperativeExec>()
+        || plan.is::<BufferExec>()
+        || plan.is::<SortExec>()
+        || plan.is::<PartialSortExec>()
+        || plan.is::<AggregateExec>()
+        || plan.is::<BoundedWindowAggExec>()
+        || plan.is::<WindowAggExec>()
+        || plan.is::<UnnestExec>()
+        || plan.is::<AsyncFuncExec>()
+        || plan.is::<RoutedPartitionExec>();
     if of_every_partition
         && let [input] = plan.children()[..]
         && input.output_partitioning().partition_count() == count
@@ -898,6 +949,49 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetches_of_hash_repartitionings_limit_every_partition() -> Result<()> {
+        // The two partitions of `partitioned_partial_sort`, repartitioned by
+        // a hash of `b` into three partitions (merged in the order of `a`):
+        // every one of them keeps its first row, which DataFusion's
+        // partitioner decides.
+        let make_plan = |merge_fetch: Option<Option<usize>>| -> Arc<dyn ExecutionPlan> {
+            let sort = partitioned_partial_sort(Some(1), false, None);
+            let scan = Arc::clone(sort.children()[0]);
+            let schema = schema();
+            let hash = Partitioning::Hash(vec![col("b", &schema).unwrap()], 3);
+            let repartition = RepartitionExec::try_new(scan, hash)
+                .unwrap()
+                .with_preserve_order();
+            let ordering = LexOrdering::new(vec![
+                PhysicalSortExpr::new_default(col("a", &schema).unwrap()),
+                PhysicalSortExpr::new_default(col("b", &schema).unwrap()),
+            ])
+            .unwrap();
+            let sort: Arc<dyn ExecutionPlan> = Arc::new(
+                PartialSortExec::new(ordering.clone(), Arc::new(repartition), 1)
+                    .with_preserve_partitioning(true)
+                    .with_fetch(Some(1)),
+            );
+            match merge_fetch {
+                None => sort,
+                Some(fetch) => Arc::new(
+                    SortPreservingMergeExec::new(ordering, sort).with_fetch(fetch),
+                ),
+            }
+        };
+        for merge_fetch in [None, Some(None), Some(Some(2))] {
+            let root = assert_plan_lowered(
+                || make_plan(merge_fetch),
+                test_session_config(),
+                merge_fetch.is_some(),
+            )
+            .await;
+            assert_eq!(count::<PhysicalPartialSort>(&root), 3, "{merge_fetch:?}");
+        }
+        Ok(())
+    }
+
     /// Write the rows `rows` of [`write_sorted_csv`] to the CSV file `path`.
     fn write_sorted_csv_rows(path: &Path, rows: std::ops::Range<i32>) -> Result<()> {
         let mut csv = String::from("a,b,c,d\n");
@@ -974,11 +1068,7 @@ mod tests {
         };
         let schema = schema();
         let union = UnionExec::try_new(vec![scan(vec![5, 9]), scan(vec![1, 3])]).unwrap();
-        let coalesce = Arc::new(
-            datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
-                union,
-            ),
-        );
+        let coalesce = Arc::new(CoalescePartitionsExec::new(union));
         let ordering = LexOrdering::new(vec![
             PhysicalSortExpr::new_default(col("a", &schema).unwrap()),
             PhysicalSortExpr::new_default(col("b", &schema).unwrap()),

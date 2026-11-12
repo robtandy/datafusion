@@ -152,13 +152,18 @@ receives them, in a single pipeline:
   of every partition: it is lowered as the `PhysicalUnion` of a
   `PhysicalPartialSort` of every partition, with the fetch, of the plans of
   the partitions of its input. These are the partitions of scans of in-memory
-  batches and of files (a plan for every partition, or for every file group),
-  and of the unions, projections, filters, `LocalLimitExec`s and
-  `CoalesceBatchesExec`s above them. The partitions of other inputs (e.g. of
-  a `RepartitionExec`) depend on how DataFusion distributes their rows: the
-  pipeline engine does not keep them apart, and its partial sort keeps the
-  first rows of all of them. A merge above that keeps at most the rows of
-  every partition is the native TopK of the input of the partial sorts.
+  batches, of files (a plan for every file group) and of streaming tables;
+  of hash and range repartitionings (the rows that DataFusion's
+  `BatchPartitioner` routes to every partition, a `PhysicalRoutedPartition`,
+  merged in their order); and of the unions above them, and of the nodes
+  that compute every partition of the same partition of their input
+  (projections, filters, `LocalLimitExec`s, sorts, aggregations and windows
+  of every partition, and the nodes that only change the size of batches).
+  The partitions of other inputs (e.g. of a round robin repartitioning, whose
+  partitions depend on the batches in which DataFusion reads its rows, or of
+  a join) are not kept apart: the partial sort keeps the first rows of all of
+  them. A merge above that keeps at most the rows of every partition is the
+  native TopK of the input of the partial sorts.
 - The rows of an input that runs in several pipelines (e.g. of a union below
   a `CoalescePartitionsExec`) would reach several states of the partial
   sort: such an input is sorted by a `PhysicalSort` (or a `PhysicalTopK` with
