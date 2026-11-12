@@ -73,7 +73,10 @@
 //!   arithmetic of the filter (see [`ExprIntervalGraph`]; it supports
 //!   comparisons, `AND`, and the arithmetic that cannot overflow: not that of
 //!   integers, which wraps). The rows of the other input before that interval
-//!   (they arrived sorted) are determined.
+//!   (they arrived sorted) are determined. Interval arithmetic bounds real
+//!   numbers, which the arithmetic of floats is not (its NaN, of a NaN still
+//!   to come or of `inf - inf`, compares after or before every number): a
+//!   filter that computes with floats determines no rows by the orders.
 //!   The join does so after every chunk of either input (DataFusion's join
 //!   after the chunks of the other input only), so that the rows of an input
 //!   whose chunks come after those of the other input are determined, too,
@@ -522,14 +525,20 @@ impl SortedFilter {
         if !check_support(filter.expression(), filter.schema()) {
             return Ok(None);
         }
-        // The values are compared with `-0.0` as `+0.0` (see `Pruning`), but
-        // interval arithmetic orders `-0.0` before `+0.0`: an expression that
-        // turns a zero into `-0.0` (a negation, a product or a quotient, or the
-        // literal) of floats, also of floats that the filter computes (e.g. a
-        // cast of integers), would make it rule out rows that the filter
-        // matches.
+        // Interval arithmetic bounds real numbers, but the arithmetic of floats
+        // yields NaN (of a NaN still to come, of `inf - inf`, `0 * inf`, ...),
+        // which the comparisons of the filter order after (or, negative,
+        // before) every number: arithmetic of floats, also of floats that the
+        // filter computes (e.g. a cast of integers), would make it rule out
+        // rows that the filter matches. The comparisons of floats themselves
+        // order NaN as the order of the inputs does. The values are compared
+        // with `-0.0` as `+0.0` (see `Pruning`), but interval arithmetic orders
+        // `-0.0` before `+0.0`: the literal `-0.0` of floats would do so too.
         let floats = has_float_values(filter.expression(), filter.schema());
-        if floats && may_negate_zeros(filter.expression()) {
+        if floats
+            && (has_float_arithmetic(filter.expression(), filter.schema())
+                || may_negate_zeros(filter.expression()))
+        {
             return Ok(None);
         }
         let mut exprs = Vec::with_capacity(2);
@@ -624,6 +633,28 @@ fn has_float_values(expr: &PhysicalExprRef, schema: &Schema) -> bool {
             .children()
             .into_iter()
             .any(|child| has_float_values(child, schema))
+}
+
+/// Whether `expr`, or an expression below it, is arithmetic of floats (of the
+/// columns of `schema`): a negation, or a sum, difference, product, quotient
+/// or remainder of floats or into floats.
+fn has_float_arithmetic(expr: &PhysicalExprRef, schema: &Schema) -> bool {
+    let floating = |expr: &PhysicalExprRef| {
+        expr.data_type(schema)
+            .is_ok_and(|data_type| data_type.is_floating())
+    };
+    let arithmetic = match expr.downcast_ref::<BinaryExpr>() {
+        Some(binary) => {
+            binary.op().is_numerical_operators()
+                && (floating(expr) || floating(binary.left()) || floating(binary.right()))
+        }
+        None => expr.is::<NegativeExpr>() && floating(expr),
+    };
+    arithmetic
+        || expr
+            .children()
+            .into_iter()
+            .any(|child| has_float_arithmetic(child, schema))
 }
 
 /// Whether `expr` may evaluate to `-0.0` for operands that are `+0.0`: it has a
@@ -2399,7 +2430,7 @@ pub(crate) mod tests {
         Arc::new(Schema::new(vec![
             Field::new(format!("{side}id"), DataType::Int64, false),
             Field::new(format!("{side}k"), DataType::Int32, true),
-            Field::new(format!("{side}t"), DataType::Float64, true),
+            Field::new(format!("{side}t"), DataType::Int64, true),
             Field::new(format!("{side}s"), DataType::Utf8, true),
         ]))
     }
@@ -2410,7 +2441,7 @@ pub(crate) mod tests {
         side: &str,
         ids: Range<i64>,
         key: impl Fn(i64) -> Option<i32>,
-        time: impl Fn(i64) -> Option<f64>,
+        time: impl Fn(i64) -> Option<i64>,
         text: impl Fn(i64) -> String,
         batch_rows: usize,
     ) -> Vec<RecordBatch> {
@@ -2425,7 +2456,7 @@ pub(crate) mod tests {
                         column(Arc::new(Int32Array::from_iter(
                             ids.iter().map(|&id| key(id)),
                         ))),
-                        column(Arc::new(Float64Array::from_iter(
+                        column(Arc::new(Int64Array::from_iter(
                             ids.iter().map(|&id| time(id)),
                         ))),
                         column(Arc::new(StringArray::from_iter_values(
@@ -2483,8 +2514,8 @@ pub(crate) mod tests {
         expr: impl Fn(PhysicalExprRef, PhysicalExprRef) -> PhysicalExprRef,
     ) -> JoinFilter {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("lt", DataType::Float64, true),
-            Field::new("rt", DataType::Float64, true),
+            Field::new("lt", DataType::Int64, true),
+            Field::new("rt", DataType::Int64, true),
         ]));
         let (lt, rt) = (col("lt", &schema).unwrap(), col("rt", &schema).unwrap());
         JoinFilter::new(
@@ -2512,11 +2543,22 @@ pub(crate) mod tests {
         Arc::new(BinaryExpr::new(left, op, right))
     }
 
+    /// `left op right`, arithmetic that fails on overflow (which interval
+    /// arithmetic bounds, unlike arithmetic that wraps).
+    fn checked(
+        left: PhysicalExprRef,
+        op: Operator,
+        right: PhysicalExprRef,
+    ) -> PhysicalExprRef {
+        Arc::new(BinaryExpr::new(left, op, right).with_fail_on_overflow(true))
+    }
+
     /// The filters of the joins of timed inputs: `lt > rt` (no right row still
     /// to come matches a left row before the last right time), `lt < rt`, and
-    /// a band `rt - 7 < lt AND lt < rt + 5` (both). The times are floats:
-    /// interval arithmetic does not bound the integer arithmetic that may
-    /// overflow (which wraps).
+    /// a band `rt - 7 < lt AND lt < rt + 5` (both). The arithmetic of the band
+    /// fails on overflow: interval arithmetic does not bound the integer
+    /// arithmetic that wraps (nor that of floats, see
+    /// [`nan_of_arithmetic_determines_no_rows`]).
     fn time_filters() -> Vec<(&'static str, JoinFilter)> {
         vec![
             (
@@ -2530,8 +2572,8 @@ pub(crate) mod tests {
             (
                 "rt - 7 < lt AND lt < rt + 5",
                 time_filter(|lt, rt| {
-                    let low = binary(Arc::clone(&rt), Operator::Minus, lit(7.0));
-                    let high = binary(rt, Operator::Plus, lit(5.0));
+                    let low = checked(Arc::clone(&rt), Operator::Minus, lit(7i64));
+                    let high = checked(rt, Operator::Plus, lit(5i64));
                     binary(
                         binary(low, Operator::Lt, Arc::clone(&lt)),
                         Operator::And,
@@ -2578,7 +2620,7 @@ pub(crate) mod tests {
             side,
             0..rows,
             |id| (id % 13 != 4).then_some((id % 7) as i32),
-            |id| (id >= 3).then_some((id / every) as f64),
+            |id| (id >= 3).then_some(id / every),
             |id| format!("{side}{id}"),
             50,
         )
@@ -2682,7 +2724,7 @@ pub(crate) mod tests {
                             side,
                             0..100,
                             key,
-                            |id| Some(id as f64),
+                            Some,
                             |id| id.to_string(),
                             20,
                         );
@@ -2753,15 +2795,15 @@ pub(crate) mod tests {
                     side,
                     0..rows,
                     |id| Some((id % 10) as i32),
-                    |id| Some(id as f64),
+                    Some,
                     |id| format!("{side}{id}"),
                     100,
                 );
                 timed_stream(side, batches, sorted, false)
             };
             let filter = time_filter(|lt, rt| {
-                let low = binary(Arc::clone(&rt), Operator::Minus, lit(5.0));
-                let high = binary(rt, Operator::Plus, lit(5.0));
+                let low = checked(Arc::clone(&rt), Operator::Minus, lit(5i64));
+                let high = checked(rt, Operator::Plus, lit(5i64));
                 binary(
                     binary(low, Operator::Lt, Arc::clone(&lt)),
                     Operator::And,
@@ -2810,7 +2852,7 @@ pub(crate) mod tests {
                     side,
                     0..100,
                     |_| Some(1),
-                    |id| Some(id as f64),
+                    Some,
                     |id| format!("{id:>1024}"),
                     25,
                 );
@@ -2891,12 +2933,30 @@ pub(crate) mod tests {
         // of their times, which their filters compare: the native joins read
         // them in their orders (without the repartitionings of DataFusion's
         // plans), and determine their rows by their times.
-        for sql in [
-            "SELECT l.lid, r.rid FROM l LEFT JOIN r ON l.lk = r.rk AND l.lt > r.rt",
-            "SELECT l.lid, r.rid FROM l RIGHT JOIN r ON l.lk = r.rk AND l.lt < r.rt",
-            "SELECT l.lid, r.rid FROM l FULL JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
-            "SELECT l.lid, r.rid FROM l JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
-            "SELECT l.lid FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.rk = l.lk AND r.rt < l.lt)",
+        // The bands compute with floats (of the integer times), whose NaN
+        // interval arithmetic does not bound: their joins determine no rows
+        // (see `nan_of_arithmetic_determines_no_rows`), which DataFusion's do.
+        for (sql, determined) in [
+            (
+                "SELECT l.lid, r.rid FROM l LEFT JOIN r ON l.lk = r.rk AND l.lt > r.rt",
+                true,
+            ),
+            (
+                "SELECT l.lid, r.rid FROM l RIGHT JOIN r ON l.lk = r.rk AND l.lt < r.rt",
+                true,
+            ),
+            (
+                "SELECT l.lid, r.rid FROM l FULL JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
+                false,
+            ),
+            (
+                "SELECT l.lid, r.rid FROM l JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
+                false,
+            ),
+            (
+                "SELECT l.lid FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.rk = l.lk AND r.rt < l.lt)",
+                true,
+            ),
         ] {
             for partitions in [4, 1] {
                 let config = SessionConfig::new().with_target_partitions(partitions);
@@ -2920,7 +2980,11 @@ pub(crate) mod tests {
                 if let Err(message) = compare_outputs(&expected, &actual) {
                     panic!("Results differ: {message}\nquery: {sql}\nlowered: {tree}");
                 }
-                assert!(tree.contains("determined_by=["), "{sql}\n{tree}");
+                assert_eq!(
+                    tree.contains("determined_by=["),
+                    determined,
+                    "{sql}\n{tree}"
+                );
                 assert!(
                     bridged_plans(root)
                         .iter()
@@ -3076,7 +3140,7 @@ pub(crate) mod tests {
                 side,
                 0..rows,
                 key,
-                |id| (id >= 3).then_some(((rows - id) / every) as f64),
+                |id| (id >= 3).then_some((rows - id) / every),
                 |id| format!("{side}{id}"),
                 50,
             )
@@ -3189,40 +3253,165 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The schema of the rows `(id, k, t)` of the `side` input of the joins of
+    /// float times.
+    fn float_timed_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+            Field::new(format!("{side}t"), DataType::Float64, false),
+        ]))
+    }
+
+    /// The rows of the `side` input of the joins of float times: the times
+    /// `times`, all of the key 1, in batches of one row.
+    fn float_timed_batches(side: &str, times: &[f64]) -> Vec<RecordBatch> {
+        times
+            .iter()
+            .zip(0..)
+            .map(|(&time, id)| {
+                RecordBatch::try_new(
+                    float_timed_schema(side),
+                    vec![
+                        Arc::new(Int64Array::from(vec![id])),
+                        Arc::new(Int32Array::from(vec![1])),
+                        Arc::new(Float64Array::from(vec![time])),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// A filter of a join of float times, `expr` of their times `lt` and `rt`.
+    fn float_time_filter(
+        expr: impl Fn(PhysicalExprRef, PhysicalExprRef) -> PhysicalExprRef,
+    ) -> JoinFilter {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lt", DataType::Float64, false),
+            Field::new("rt", DataType::Float64, false),
+        ]));
+        let (lt, rt) = (col("lt", &schema).unwrap(), col("rt", &schema).unwrap());
+        JoinFilter::new(
+            expr(lt, rt),
+            vec![
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Right,
+                },
+            ],
+            schema,
+        )
+    }
+
+    /// Join the float times `left` and `right` (streams that end, of batches
+    /// of one row, sorted by their times, descending if `descending`) on their
+    /// keys with `filter`, and check the rows against DataFusion's hash join
+    /// of the same rows, and whether the join determines its rows by the
+    /// orders of its inputs against `determined`. Returns the number of rows.
+    async fn assert_float_time_join(
+        [left, right]: [&[f64]; 2],
+        descending: bool,
+        join_type: JoinType,
+        filter: JoinFilter,
+        determined: bool,
+        context: &str,
+    ) -> Result<usize> {
+        let order = |side: &str| {
+            let time = col(&format!("{side}t"), &float_timed_schema(side)).unwrap();
+            LexOrdering::new([PhysicalSortExpr::new(
+                time,
+                SortOptions::new(descending, true),
+            )])
+            .unwrap()
+        };
+        let bounded = |side: &str, times: &[f64]| {
+            MemorySourceConfig::try_new_exec(
+                &[float_timed_batches(side, times)],
+                float_timed_schema(side),
+                None,
+            )
+            .unwrap() as Arc<dyn ExecutionPlan>
+        };
+        let reference = hash_join(
+            bounded("l", left),
+            bounded("r", right),
+            join_type,
+            Some(filter.clone()),
+            NullEquality::NullEqualsNothing,
+        )?;
+        let expected = EngineOutput {
+            schema: reference.schema(),
+            batches: with_timeout(collect(Arc::clone(&reference), task_ctx())).await?,
+            plan: reference,
+            ordered: false,
+        };
+        let stream = |side: &str, times: &[f64]| {
+            let partition = BatchesPartition {
+                schema: float_timed_schema(side),
+                batches: float_timed_batches(side, times),
+                forever: false,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    float_timed_schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [order(side)],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            ) as Arc<dyn ExecutionPlan>
+        };
+        let (left, right) = (stream("l", left), stream("r", right));
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(filter),
+            &join_type,
+            NullEquality::NullEqualsNothing,
+            Some(order("l")),
+            Some(order("r")),
+            StreamJoinPartitionMode::SinglePartition,
+        )?);
+        let root = lower(&plan)?;
+        let tree = format_operator_tree(&root);
+        let join = root
+            .downcast_ref::<PhysicalSymmetricHashJoin>()
+            .unwrap_or_else(|| panic!("{context}\n{tree}"));
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        if let Err(message) = compare_outputs(&expected, &actual) {
+            panic!("Results differ: {message}\n{context}\n{tree}");
+        }
+        assert_eq!(
+            join.determines_rows_by_order(),
+            determined,
+            "{context}\n{tree}"
+        );
+        Ok(num_rows(&expected.batches))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn signed_zeros_are_equal_times() -> Result<()> {
         // The filter compares `-0.0` as `+0.0`: a left time `-0.0` matches the
         // right times `+0.0` that come after it, in batches of their own, also
         // once the bounds of the right times determine rows (DataFusion's hash
         // join is the reference).
-        let left = || {
-            timed_batches(
-                "l",
-                0..1,
-                |_| Some(1),
-                |_| Some(-0.0),
-                |id| id.to_string(),
-                1,
-            )
-        };
-        let right = || {
-            timed_batches(
-                "r",
-                0..3,
-                |_| Some(1),
-                |_| Some(0.0),
-                |id| id.to_string(),
-                1,
-            )
-        };
         let filters = [
             (
                 "lt = rt",
-                time_filter(|lt, rt| binary(lt, Operator::Eq, rt)),
+                float_time_filter(|lt, rt| binary(lt, Operator::Eq, rt)),
             ),
             (
                 "lt >= rt AND lt <= rt",
-                time_filter(|lt, rt| {
+                float_time_filter(|lt, rt| {
                     binary(
                         binary(Arc::clone(&lt), Operator::GtEq, Arc::clone(&rt)),
                         Operator::And,
@@ -3234,42 +3423,77 @@ pub(crate) mod tests {
         for (name, filter) in filters {
             for join_type in [JoinType::Inner, JoinType::Left, JoinType::Full] {
                 let context = format!("{join_type} {name}");
-                let bounded = |side: &str, batches: Vec<RecordBatch>| {
-                    MemorySourceConfig::try_new_exec(&[batches], timed_schema(side), None)
-                        .unwrap() as Arc<dyn ExecutionPlan>
-                };
-                let reference = hash_join(
-                    bounded("l", left()),
-                    bounded("r", right()),
+                let times: [&[f64]; 2] = [&[-0.0], &[0.0; 3]];
+                let rows = assert_float_time_join(
+                    times,
+                    false,
                     join_type,
-                    Some(filter.clone()),
-                    NullEquality::NullEqualsNothing,
-                )?;
-                let expected = EngineOutput {
-                    schema: reference.schema(),
-                    batches: with_timeout(collect(Arc::clone(&reference), task_ctx()))
-                        .await?,
-                    plan: reference,
-                    ordered: false,
-                };
-                assert_eq!(num_rows(&expected.batches), 3, "{context}");
-                let plan = timed_join(
-                    timed_stream("l", left(), true, false),
-                    timed_stream("r", right(), true, false),
-                    join_type,
-                    Some(filter.clone()),
-                    NullEquality::NullEqualsNothing,
+                    filter.clone(),
                     true,
-                )?;
-                let root = lower(&plan)?;
-                let tree = format_operator_tree(&root);
-                let join = root
-                    .downcast_ref::<PhysicalSymmetricHashJoin>()
-                    .unwrap_or_else(|| panic!("{context}\n{tree}"));
-                assert!(join.determines_rows_by_order(), "{context}\n{tree}");
-                let actual = run_native(&root, plan, task_ctx()).await?;
-                if let Err(message) = compare_outputs(&expected, &actual) {
-                    panic!("Results differ: {message}\n{context}\n{tree}");
+                    &context,
+                )
+                .await?;
+                assert_eq!(rows, 3, "{context}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nan_of_arithmetic_determines_no_rows() -> Result<()> {
+        // Both inputs have the times `0.0, 1.0, NaN` (in batches of one row, of
+        // the same key), and the filters compute with them: `0.0 - NaN` is NaN,
+        // which the comparisons order after every number, so that with
+        // `(lt - rt) > 0.0` the left `0.0` matches the right NaN, which
+        // interval arithmetic rules out once the right times reached `1.0` (it
+        // bounds real numbers). The joins determine no rows by the orders of
+        // their inputs (ascending or descending): their rows are those of
+        // DataFusion's hash join, also the rows without a match.
+        let filters = [
+            (
+                "(lt - rt) > 0.0",
+                float_time_filter(|lt, rt| {
+                    binary(binary(lt, Operator::Minus, rt), Operator::Gt, lit(0.0))
+                }),
+            ),
+            (
+                "(rt - lt) > 0.0",
+                float_time_filter(|lt, rt| {
+                    binary(binary(rt, Operator::Minus, lt), Operator::Gt, lit(0.0))
+                }),
+            ),
+        ];
+        for descending in [false, true] {
+            let times = match descending {
+                false => [0.0, 1.0, f64::NAN],
+                true => [f64::NAN, 1.0, 0.0],
+            };
+            for (name, filter) in &filters {
+                for join_type in [
+                    JoinType::Inner,
+                    JoinType::Left,
+                    JoinType::Right,
+                    JoinType::Full,
+                    JoinType::LeftSemi,
+                    JoinType::LeftAnti,
+                    JoinType::RightSemi,
+                    JoinType::RightAnti,
+                ] {
+                    let context = format!("{join_type} {name} descending={descending}");
+                    let rows = assert_float_time_join(
+                        [&times, &times],
+                        descending,
+                        join_type,
+                        filter.clone(),
+                        false,
+                        &context,
+                    )
+                    .await?;
+                    // `(0, NaN)`, `(1, 0)`, `(1, NaN)` and the NaN with every
+                    // time, by the left times (and the other way round).
+                    if join_type == JoinType::Inner {
+                        assert_eq!(rows, 6, "{context}");
+                    }
                 }
             }
         }
