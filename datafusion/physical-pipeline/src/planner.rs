@@ -88,11 +88,11 @@
 //! build key matches, which the join would drop anyway, also several joins
 //! below it: see `Lowering::try_lower_hash_join`.
 //!
-//! Windows, nested loop joins and cross joins keep all of their rows in
-//! memory without reserving it in the memory pool, while the DataFusion nodes
-//! they replace reserve their memory (and fail or spill once the pool is
-//! exhausted): they are only lowered for sessions whose memory pool has no
-//! limit, see [`lower_execution_plan_with_runtime`].
+//! The native operators reserve the memory that they hold in the memory pool
+//! of the session (the rows that joins build on, the tables of aggregations,
+//! the rows of sorts, TopKs and windows, ...), and fail with
+//! `ResourcesExhausted` when it runs out (they do not spill yet): the lowering
+//! is the same whatever the pool and its limit.
 //!
 //! A sort-merge join is a hash join unless a node above it relies on its order:
 //! a `SortPreservingMergeExec` that merges its sorted partitions (through
@@ -147,8 +147,6 @@
 //!   and user-defined `ExecutionPlan`s, see `docs/fallbacks.md`), and the
 //!   nodes that the native operators refuse themselves (see their `try_lower`
 //!   functions);
-//! * the windows and loop joins of sessions whose memory pool has a limit
-//!   (see above);
 //! * the sorts, windows, aggregations and joins of values that address more
 //!   than their memory, e.g. lists of `1 << 30` nulls (see
 //!   `gathers_values_beyond_their_memory`), which the native operators would
@@ -488,11 +486,11 @@ fn create_root(
 ///
 /// Whether some nodes can be lowered depends on the options of the session
 /// that executes them (e.g. a sort of strings, if DataFusion concatenates
-/// more than 2 GiB of them, see [`crate::sort::try_lower`]), and on its
-/// runtime (windows and loop joins, if its memory pool has no limit, see
-/// [`lower_execution_plan_with_runtime`]): this lowers them as if the session
-/// had the options and the runtime for which the fewest nodes can be lowered.
-/// The planner lowers with the options and the runtime of its session, see
+/// more than 2 GiB of them, see [`crate::sort::try_lower`]): this lowers them
+/// as if the session had the options for which the fewest nodes can be
+/// lowered. The lowering does not depend on the runtime of the session (the
+/// native operators reserve their memory in its memory pool, whatever its
+/// limit). The planner lowers with the options of its session, see
 /// [`lower_execution_plan_with_runtime`].
 pub fn lower_execution_plan(
     plan: &Arc<dyn ExecutionPlan>,
@@ -513,10 +511,6 @@ pub fn lower_execution_plan(
 /// report the nodes they do not implement without an error, so this is not
 /// expected) is executed by DataFusion too, with a warning: the lowering
 /// never fails, as DataFusion can execute every plan it created.
-///
-/// The runtime of the session is not known: windows, nested loop joins and
-/// cross joins, which are only lowered if its memory pool has no limit, are
-/// left to DataFusion, see [`lower_execution_plan_with_runtime`].
 pub fn lower_execution_plan_with_options(
     plan: &Arc<dyn ExecutionPlan>,
     options: &ConfigOptions,
@@ -528,13 +522,11 @@ pub fn lower_execution_plan_with_options(
 /// with the options `options` and the runtime `runtime`, into a
 /// [`PhysicalOperator`] tree (see [`lower_execution_plan_with_options`]).
 ///
-/// The native windows ([`PhysicalWindow`]), nested loop joins
-/// ([`PhysicalNestedLoopJoin`]) and cross joins ([`PhysicalCrossJoin`])
-/// keep their rows in memory without reserving it in the memory pool, while
-/// the DataFusion nodes they replace (the sorts below a window, the build
-/// sides of the joins) reserve memory as their input produces it, and fail or
-/// spill once the pool is exhausted: they are only lowered if the memory pool
-/// of `runtime` has no limit, in which this makes no difference.
+/// The lowering is the same for every runtime: the native operators reserve
+/// the memory that they hold in the memory pool of the runtime that executes
+/// them, whatever its limit, and fail with `ResourcesExhausted` when the pool
+/// cannot hold it. `runtime` is the runtime with which the plans of
+/// `EXPLAIN ANALYZE` (see [`PhysicalAnalyze`]) are lowered.
 pub fn lower_execution_plan_with_runtime(
     plan: &Arc<dyn ExecutionPlan>,
     options: &ConfigOptions,
@@ -577,9 +569,9 @@ fn any_session_options() -> ConfigOptions {
 /// [`lower_execution_plan_with_runtime`].
 struct Lowering<'a> {
     options: &'a ConfigOptions,
-    /// The runtime of the session that executes the plan, if known: windows
-    /// and loop joins are only lowered for runtimes whose memory pool has no
-    /// limit.
+    /// The runtime of the session that executes the plan, if known, with
+    /// which the plans of `EXPLAIN ANALYZE` are lowered (the lowering does not
+    /// depend on it).
     runtime: Option<&'a RuntimeEnv>,
     /// Whether the node being lowered is in a pipeline that may stop before
     /// its input ends (see [`Self::lower_in`]): below a limit, a filter with a
@@ -1193,9 +1185,7 @@ impl Lowering<'_> {
 
     /// Lower a window (a `WindowAggExec` or a `BoundedWindowAggExec`, with the
     /// nodes below it that partition and sort its input, and the windows
-    /// stacked below it) with [`PhysicalWindow::try_lower`], for a runtime
-    /// whose memory pool has no limit (see
-    /// [`lower_execution_plan_with_runtime`]).
+    /// stacked below it) with [`PhysicalWindow::try_lower`].
     ///
     /// DataFusion plans a projection of columns between the sort below a
     /// window (or the merge of its sorted partitions) and the input of the
@@ -1215,14 +1205,11 @@ impl Lowering<'_> {
         if !is_window(plan) || ends_unbounded_input_early_below(plan) {
             return Ok(None);
         }
-        let Some(runtime) = self.runtime else {
-            return Ok(None);
-        };
         let rewritten = with_projection_below_sort(plan)?;
         for plan in std::iter::once(plan).chain(rewritten.as_ref()) {
-            if let Some(window) = PhysicalWindow::try_lower(plan, runtime, |rows| {
-                self.lower_in(rows, false)
-            })? {
+            if let Some(window) =
+                PhysicalWindow::try_lower(plan, |rows| self.lower_in(rows, false))?
+            {
                 return Ok(Some(Arc::new(window)));
             }
         }
@@ -1235,10 +1222,8 @@ impl Lowering<'_> {
     /// [`PhysicalSort`] by the keys of the merge (with its fetch) of the native
     /// window: merging the sorted partitions of the window is sorting its rows.
     ///
-    /// Only over a window that is lowered to a native window, for a runtime
-    /// whose memory pool has no limit (see
-    /// [`lower_execution_plan_with_runtime`]), and if every partition of the
-    /// input of the merge is ordered by its keys (otherwise its output would
+    /// Only over a window that is lowered to a native window, and if every
+    /// partition of the input of the merge is ordered by its keys (otherwise its output would
     /// not be sorted), and by keys that are not of unions (which the native
     /// sort orders otherwise). A merge of no partitions, on which DataFusion
     /// fails, is not lowered either.
@@ -1249,9 +1234,7 @@ impl Lowering<'_> {
         let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
             return Ok(None);
         };
-        if self.runtime.is_none()
-            || merge.input().output_partitioning().partition_count() == 0
-        {
+        if merge.input().output_partitioning().partition_count() == 0 {
             return Ok(None);
         }
         let mut node = merge.input();
@@ -1411,8 +1394,7 @@ impl Lowering<'_> {
 
     /// Lower a nested loop join or a cross join with
     /// [`PhysicalNestedLoopJoin::try_lower`] or
-    /// [`PhysicalCrossJoin::try_lower`], for a runtime whose memory pool has
-    /// no limit (see [`lower_execution_plan_with_runtime`]).
+    /// [`PhysicalCrossJoin::try_lower`].
     fn try_lower_loop_join(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1421,16 +1403,13 @@ impl Lowering<'_> {
         if !nested_loop && !plan.is::<CrossJoinExec>() {
             return Ok(None);
         }
-        let Some(runtime) = self.runtime else {
-            return Ok(None);
-        };
         let lower_input =
             |input: &Arc<dyn ExecutionPlan>| self.lower_join_input(plan, input);
         let join: Option<Arc<dyn PhysicalOperator>> = if nested_loop {
-            PhysicalNestedLoopJoin::try_lower(plan, runtime, lower_input)?
+            PhysicalNestedLoopJoin::try_lower(plan, lower_input)?
                 .map(|join| Arc::new(join) as _)
         } else {
-            PhysicalCrossJoin::try_lower(plan, runtime, lower_input)?
+            PhysicalCrossJoin::try_lower(plan, lower_input)?
                 .map(|join| Arc::new(join) as _)
         };
         Ok(join)
@@ -1489,8 +1468,8 @@ impl Lowering<'_> {
 /// A few bytes of such values can stand for billions of values (e.g. a list
 /// of `1 << 30` nulls), which these operators would materialize as they
 /// gather their rows, before the memory pool could refuse them (the native
-/// operators do not reserve their memory yet): such nodes are left to
-/// DataFusion.
+/// operators reserve the rows they gather once they hold them): such nodes
+/// are left to DataFusion.
 fn gathers_values_beyond_their_memory(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let sorted = sort_of_chain(plan).map(|sort| sort.input().schema());
     std::iter::once(plan.schema())
@@ -3664,11 +3643,11 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_and_loop_joins_need_a_memory_pool_without_limit() -> Result<()> {
-        // The native windows and loop joins do not reserve the memory of their
-        // rows, the DataFusion nodes they replace do (and fail, or spill, once
-        // the pool is exhausted): they are native only for runtimes whose
-        // memory pool has no limit.
+    async fn windows_and_loop_joins_are_native_whatever_the_memory_pool() -> Result<()> {
+        // The native windows and loop joins reserve their memory in the memory
+        // pool of the session: they are native in sessions whose pool has a
+        // limit too, and so are the plans that are lowered without a runtime
+        // (and lowered again by `reset_state`).
         let limited = datafusion_execution::runtime_env::RuntimeEnvBuilder::new()
             .with_memory_limit(1 << 30, 1.0)
             .build_arc()?;
@@ -3686,21 +3665,26 @@ mod tests {
                     + count::<PhysicalNestedLoopJoin>(root)
                     + count::<PhysicalCrossJoin>(root)
             };
-            let unlimited = lower_execution_plan_with_runtime(
-                &plan,
-                &options,
-                &RuntimeEnv::default(),
-            )?;
-            assert_native(sql, &unlimited);
-            assert_eq!(natives(&unlimited), 1, "{sql}");
+            let reset: Arc<dyn ExecutionPlan> = create_pipeline_plan(Arc::clone(&plan))?;
+            let reset = Arc::clone(&reset).reset_state()?;
+            let reset = reset
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline");
             for root in [
+                lower_execution_plan_with_runtime(
+                    &plan,
+                    &options,
+                    &RuntimeEnv::default(),
+                )?,
                 lower_execution_plan_with_runtime(&plan, &options, &limited)?,
                 lower_execution_plan_with_options(&plan, &options)?,
                 lower_execution_plan(&plan)?,
+                Arc::clone(reset.operator()),
             ] {
-                assert_eq!(natives(&root), 0, "{sql}\n{}", format_operator_tree(&root));
+                assert_native(sql, &root);
+                assert_eq!(natives(&root), 1, "{sql}\n{}", format_operator_tree(&root));
             }
-            // The planner lowers with the runtime of its session.
+            // The planner lowers them in a session with a limited pool.
             let state = SessionStateBuilder::new()
                 .with_config(test_session_config())
                 .with_runtime_env(Arc::clone(&limited))
@@ -3713,7 +3697,114 @@ mod tests {
             register_view_tables(&ctx)?;
             let plan = ctx.sql(sql).await?.create_physical_plan().await?;
             let root = plan.downcast_ref::<PipelineRootExec>().expect("a pipeline");
-            assert_eq!(natives(root.operator()), 0, "{sql}");
+            assert_native(sql, root.operator());
+            assert_eq!(natives(root.operator()), 1, "{sql}");
+        }
+        Ok(())
+    }
+
+    /// A session of the pipeline engine with the configuration `config`, the
+    /// tables of [`register_view_tables`] and a memory pool of `limit` bytes,
+    /// and the pool.
+    fn pipeline_context_with_pool(
+        config: SessionConfig,
+        limit: usize,
+    ) -> Result<(
+        SessionContext,
+        Arc<dyn datafusion_execution::memory_pool::MemoryPool>,
+    )> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+        let runtime = datafusion_execution::runtime_env::RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+        let state = SessionStateBuilder::new()
+            .with_config(config)
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .with_query_planner(Arc::new(PipelineQueryPlanner::new(Arc::new(
+                datafusion::physical_planner::DefaultPhysicalPlanner::default(),
+            ))))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        register_view_tables(&ctx)?;
+        Ok((ctx, pool))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_operators_reserve_their_memory_in_the_memory_pool() -> Result<()> {
+        // Every native operator that holds rows reserves them in the memory
+        // pool of the session: in a session whose pool can hold them, a query
+        // returns the rows of DataFusion natively, and in one whose pool cannot,
+        // it fails with `ResourcesExhausted` (the native operators do not spill
+        // yet), from the operator that ran out of memory. Their memory is freed
+        // once the query ends, whatever its outcome.
+        let mut config = test_session_config();
+        // The joins build on their left inputs, the larger ones.
+        config.options_mut().optimizer.join_reordering = false;
+        for (sql, operator) in [
+            (
+                "SELECT a.id, a.h, b.d FROM t1 a JOIN t1 b ON a.id = b.id",
+                "PhysicalHashJoin",
+            ),
+            (
+                "SELECT id, h, COUNT(*) AS n FROM t1 GROUP BY id, h",
+                "PhysicalHashAggregate",
+            ),
+            (
+                "SELECT STRING_AGG(h, ',' ORDER BY id) AS hs FROM t1",
+                "PhysicalHashAggregate",
+            ),
+            ("SELECT * FROM t1 ORDER BY b, id", "PhysicalSort"),
+            ("SELECT * FROM t1 ORDER BY b, id LIMIT 4000", "PhysicalTopK"),
+            (
+                "SELECT id, h, ROW_NUMBER() OVER (PARTITION BY d ORDER BY id) AS rn FROM t1",
+                "PhysicalWindow",
+            ),
+            (
+                "SELECT a.id, b.k FROM t1 a JOIN t2 b ON a.a > b.k + 100",
+                "PhysicalNestedLoopJoin",
+            ),
+            (
+                "SELECT a.id, b.k FROM t1 a CROSS JOIN (SELECT k FROM t2 WHERE k = 7) b",
+                "PhysicalCrossJoin",
+            ),
+        ] {
+            // 64 MiB hold the rows of the tables many times.
+            let (ctx, pool) = pipeline_context_with_pool(config.clone(), 64 << 20)?;
+            let expected = {
+                let ctx = datafusion_context(config.clone());
+                register_view_tables(&ctx)?;
+                crate::test_utils::run_sql(&ctx, sql).await?
+            };
+            let actual = crate::test_utils::run_sql(&ctx, sql).await?;
+            let root = actual
+                .plan
+                .downcast_ref::<PipelineRootExec>()
+                .expect("a pipeline plan")
+                .operator();
+            assert_native(sql, root);
+            if let Err(message) = compare_outputs(&expected, &actual) {
+                panic!("Results differ: {message}\nquery: {sql}");
+            }
+            assert_eq!(pool.reserved(), 0, "{sql}");
+            // 32 KiB do not hold the rows of the operator.
+            let (ctx, pool) = pipeline_context_with_pool(config.clone(), 32 << 10)?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let root = plan.downcast_ref::<PipelineRootExec>().expect("a pipeline");
+            assert_native(sql, root.operator());
+            let Err(error) = collect(plan, ctx.task_ctx()).await else {
+                panic!("{sql} succeeds with a pool of 32 KiB");
+            };
+            assert!(
+                matches!(
+                    error.find_root(),
+                    datafusion_common::DataFusionError::ResourcesExhausted(_)
+                ),
+                "{sql}: {error}"
+            );
+            assert!(error.to_string().contains(operator), "{sql}: {error}");
+            crate::sort::test_support::assert_memory_freed(pool.as_ref()).await;
         }
         Ok(())
     }
@@ -3826,9 +3917,8 @@ mod tests {
         })
     }
 
-    /// Lower `plan` for a session with the default runtime (whose memory pool
-    /// has no limit, so that windows and loop joins can be native), configured
-    /// with `config`.
+    /// Lower `plan` for a session with the default runtime, configured with
+    /// `config`.
     fn lower_for_default_runtime(
         plan: Arc<dyn ExecutionPlan>,
         config: &SessionConfig,

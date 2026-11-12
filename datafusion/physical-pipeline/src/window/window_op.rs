@@ -96,8 +96,7 @@
 //! a bucket allocates before it allocates it, the sorted buckets until their
 //! rows were emitted, and the evaluated rows of a bucket until they are
 //! emitted. It fails with `ResourcesExhausted` when the pool cannot hold
-//! them. (Windows are still lowered for memory pools without a limit only,
-//! see [`PhysicalWindow::try_lower`].)
+//! them.
 //!
 //! It reads all rows of its input before it emits anything, so windows over
 //! inputs that never end are left to DataFusion, whose windows stream (see
@@ -121,8 +120,7 @@ use datafusion_common::utils::evaluate_partition_ranges;
 use datafusion_common::{
     DataFusionError, Result, internal_datafusion_err, internal_err, not_impl_err,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
-use datafusion_execution::runtime_env::RuntimeEnv;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::window::WindowExpr;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
@@ -694,8 +692,7 @@ impl PhysicalWindow {
     /// Lower a DataFusion `WindowAggExec` or `BoundedWindowAggExec`, with the
     /// nodes below it that only distribute and sort its input (and the window
     /// nodes it is stacked on), to a [`PhysicalWindow`] with the same
-    /// semantics and schema, for an execution with the runtime `runtime`.
-    /// `lower_input` lowers the input of these nodes.
+    /// semantics and schema. `lower_input` lowers the input of these nodes.
     ///
     /// The native window evaluates every window expression (of any window
     /// function or aggregate, built-in or user-defined, with any frame,
@@ -718,10 +715,6 @@ impl PhysicalWindow {
     /// Returns `Ok(None)` for any other node, without calling `lower_input`,
     /// and for the windows that are left to DataFusion:
     ///
-    /// * all windows if the memory pool of `runtime` has a limit (or an
-    ///   unknown one): the sorts that the native window replaces reserve
-    ///   memory (and fail, or spill, when the pool is exhausted), the native
-    ///   window does not;
     /// * windows with a `WindowStateObserver`, a callback that observes the
     ///   accumulators of DataFusion's window as its partitions close, which
     ///   the native window does not have;
@@ -740,15 +733,11 @@ impl PhysicalWindow {
     ///   order of the window.
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
-        runtime: &RuntimeEnv,
         mut lower_input: F,
     ) -> Result<Option<Self>>
     where
         F: FnMut(&Arc<dyn ExecutionPlan>) -> Result<Arc<dyn PhysicalOperator>>,
     {
-        if !matches!(runtime.memory_pool.memory_limit(), MemoryLimit::Infinite) {
-            return Ok(None);
-        }
         let Some((spec, rows)) = analyze(plan)? else {
             return Ok(None);
         };
@@ -2044,7 +2033,6 @@ mod tests {
         assert_native_parity_with_config, assert_native_parity_with_setup, lower,
     };
     use datafusion_datasource::memory::MemorySourceConfig;
-    use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_physical_plan::filter::FilterExec;
     use datafusion_physical_plan::union::UnionExec;
 
@@ -3282,8 +3270,7 @@ mod tests {
                 };
                 let case = format!("partitioned: {partitioned}, {mode:?}");
                 let plan = make()?;
-                let window =
-                    PhysicalWindow::try_lower(&plan, &RuntimeEnv::default(), lower)?;
+                let window = PhysicalWindow::try_lower(&plan, lower)?;
                 let window = window.unwrap_or_else(|| panic!("{case}: not lowered"));
                 assert_eq!(window.input().name(), "TestProjection", "{case}");
                 let root =
@@ -3666,10 +3653,7 @@ mod tests {
                 expected.is_some_and(|batch| batch.num_rows() > 0),
                 "plan {index}"
             );
-            assert!(
-                PhysicalWindow::try_lower(&plan, &RuntimeEnv::default(), lower)?
-                    .is_none()
-            );
+            assert!(PhysicalWindow::try_lower(&plan, lower)?.is_none());
             let root = lower(&plan)?;
             assert_eq!(count::<PhysicalWindow>(&root), 0, "plan {index}");
             let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
@@ -3862,55 +3846,6 @@ mod tests {
                 assert_eq!(count::<PhysicalWindow>(&root), 1, "fetch {fetch:?}");
             }
         }
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn windows_with_a_memory_limit_are_left_to_datafusion() -> Result<()> {
-        use crate::window::test_support::lower_for;
-        use datafusion_execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-        // The sort that a native window replaces reserves memory, and fails (or
-        // spills) once the pool is exhausted; the native window does not.
-        let runtime = || {
-            RuntimeEnvBuilder::new()
-                .with_memory_limit(64 * 1024, 1.0)
-                .with_disk_manager_builder(
-                    DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
-                )
-                .build_arc()
-        };
-        let make = || {
-            let sorted = sort_exec(hash_repartition(t1_scan()?)?, &["d", "id"], true)?;
-            row_number_plan(
-                sorted,
-                Some(datafusion_physical_plan::InputOrderMode::Sorted),
-            )
-        };
-        let plan = make()?;
-        assert!(PhysicalWindow::try_lower(&plan, &*runtime()?, lower)?.is_none());
-        assert!(
-            PhysicalWindow::try_lower(&plan, &RuntimeEnv::default(), lower)?.is_some()
-        );
-        let task_ctx = |runtime: Arc<RuntimeEnv>| {
-            Arc::new(
-                TaskContext::default()
-                    .with_session_config(test_session_config())
-                    .with_runtime(runtime),
-            )
-        };
-        let error = datafusion_physical_plan::collect(make()?, task_ctx(runtime()?))
-            .await
-            .expect_err("DataFusion fails");
-        assert!(error.to_string().contains("Resources exhausted"), "{error}");
-        let runtime_of_lowering = runtime()?;
-        let root = lower_for(&plan, &runtime_of_lowering)?;
-        assert_eq!(count::<PhysicalWindow>(&root), 0);
-        let exec = Arc::new(crate::bridge::PipelineRootExec::try_new(root, plan)?);
-        let error = datafusion_physical_plan::collect(exec, task_ctx(runtime()?))
-            .await
-            .expect_err("the pipeline engine fails");
-        assert!(error.to_string().contains("Resources exhausted"), "{error}");
         Ok(())
     }
 

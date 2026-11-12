@@ -67,11 +67,14 @@
 //! [`MetaPipelineBuilder::build_with_dependency`]), so that they do not run
 //! if the join cannot produce output.
 //!
-//! The build rows are charged to the memory pool. DataFusion charges the
-//! batches of its build side as its input produces them (and
-//! `NestedLoopJoinExec` spills them when the pool is exhausted), so the joins
-//! are only lowered for memory pools without a limit, in which this makes no
-//! difference.
+//! # Memory
+//!
+//! The build rows are reserved in the memory pool of the session as they
+//! arrive, and so is the bitmap of the build rows that matched before it is
+//! allocated: the join fails with `ResourcesExhausted` when the pool cannot
+//! hold them (it does not spill, while `NestedLoopJoinExec` spills its build
+//! side). What the probe side allocates is bounded by a block of pairs of
+//! rows and a chunk of output.
 
 use std::fmt::{self, Write};
 use std::marker::PhantomData;
@@ -91,8 +94,7 @@ use datafusion_common::{
     DataFusionError, JoinSide, JoinType, Result, internal_datafusion_err, internal_err,
     plan_err, resources_datafusion_err,
 };
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
-use datafusion_execution::runtime_env::RuntimeEnv;
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
@@ -393,17 +395,10 @@ impl PhysicalNestedLoopJoin {
     }
 
     /// Lower a DataFusion `NestedLoopJoinExec` to a [`PhysicalNestedLoopJoin`]
-    /// with the same semantics and schema, for an execution with the runtime
-    /// `runtime`. `lower_input` lowers the inputs of the join. Returns
-    /// `Ok(None)` for any other node, and for the joins that are left to
-    /// DataFusion:
+    /// with the same semantics and schema. `lower_input` lowers the inputs of
+    /// the join. Returns `Ok(None)` for any other node, and for the joins that
+    /// are left to DataFusion:
     ///
-    /// * all joins if the memory pool of `runtime` has a limit (or an unknown
-    ///   one): DataFusion charges the memory of the batches of its build side
-    ///   as its input produces them (and spills it when the pool is
-    ///   exhausted), the native join the memory of the chunks it collects,
-    ///   which are other rows (and does not spill), so that one of them could
-    ///   fail where the other does not;
     /// * a join without probe partitions that emits the build rows without a
     ///   match (a `Left`, `Full`, `LeftAnti` or `LeftMark` join): the join has
     ///   no output partitions, so its result has no rows, while the native
@@ -415,7 +410,11 @@ impl PhysicalNestedLoopJoin {
     /// * a join whose filter reads columns that its inputs do not have.
     ///
     /// Any other join is native, whatever its filter evaluates (also if it may
-    /// fail), the partitions of its inputs, and the types of their columns.
+    /// fail), the partitions of its inputs, the types of their columns, and
+    /// the memory pool of the session: the native join reserves the rows of
+    /// its build side as they arrive, and the build rows that matched (see
+    /// [`PhysicalNestedLoopJoin`]), and fails with `ResourcesExhausted` when
+    /// the pool cannot hold them (DataFusion's join may spill them instead).
     ///
     /// The build side is lowered without the `CoalescePartitionsExec`s
     /// (without limit) that DataFusion puts on it: the build side of the
@@ -425,7 +424,6 @@ impl PhysicalNestedLoopJoin {
     /// side of the join (see [`MetaPipelineBuilder::build_with_dependency`]).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
-        runtime: &RuntimeEnv,
         mut lower_input: F,
     ) -> Result<Option<Self>>
     where
@@ -434,7 +432,7 @@ impl PhysicalNestedLoopJoin {
         let Some(join) = plan.downcast_ref::<NestedLoopJoinExec>() else {
             return Ok(None);
         };
-        if !unbounded_memory(runtime) || !plan.dynamic_expressions_produced().is_empty() {
+        if !plan.dynamic_expressions_produced().is_empty() {
             return Ok(None);
         }
         let spec = match JoinSpec::try_new(
@@ -479,18 +477,16 @@ impl PhysicalCrossJoin {
     }
 
     /// Lower a DataFusion `CrossJoinExec` to a [`PhysicalCrossJoin`] with the
-    /// same semantics and schema, for an execution with the runtime `runtime`.
-    /// `lower_input` lowers the inputs of the join. Returns `Ok(None)` for any
-    /// other node, and, as [`PhysicalNestedLoopJoin::try_lower`], for all
-    /// joins if the memory pool of `runtime` has a limit (or an unknown one).
-    /// Any other cross join is native, whatever the partitions of its inputs
-    /// and the types of their columns.
+    /// same semantics and schema. `lower_input` lowers the inputs of the join.
+    /// Returns `Ok(None)` for any other node. Every cross join is native,
+    /// whatever the partitions of its inputs, the types of their columns and
+    /// the memory pool of the session (the native join reserves the rows of
+    /// its build side, as [`PhysicalNestedLoopJoin::try_lower`] says).
     ///
     /// The inputs are lowered like those of a nested loop join, see
     /// [`PhysicalNestedLoopJoin::try_lower`].
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
-        runtime: &RuntimeEnv,
         mut lower_input: F,
     ) -> Result<Option<Self>>
     where
@@ -499,9 +495,6 @@ impl PhysicalCrossJoin {
         let Some(join) = plan.downcast_ref::<CrossJoinExec>() else {
             return Ok(None);
         };
-        if !unbounded_memory(runtime) {
-            return Ok(None);
-        }
         let spec = JoinSpec::cross(&join.left.schema(), &join.right.schema());
         if spec.schema != plan.schema() {
             return internal_err!(
@@ -512,14 +505,6 @@ impl PhysicalCrossJoin {
         }
         Self::lower_inputs(spec, &join.left, &join.right, &mut lower_input)
     }
-}
-
-/// Whether the memory pool of `runtime` has no limit: DataFusion's joins and
-/// the native joins charge the memory of their build sides differently (see
-/// [`PhysicalNestedLoopJoin::try_lower`]), which only makes no difference
-/// without a limit.
-fn unbounded_memory(runtime: &RuntimeEnv) -> bool {
-    matches!(runtime.memory_pool.memory_limit(), MemoryLimit::Infinite)
 }
 
 impl<K: LoopJoinKind> LoopJoin<K> {
@@ -1526,7 +1511,7 @@ mod tests {
     };
     use crate::test_utils::test_session_config;
     use crate::window::test_support::{
-        assert_native_parity, assert_native_parity_with_config, lower, lower_for,
+        assert_native_parity, assert_native_parity_with_config, lower,
     };
 
     const ALL_JOIN_TYPES: [JoinType; 10] = [
@@ -2304,13 +2289,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn joins_that_datafusion_executes_otherwise_are_native() -> Result<()> {
-        let runtime = RuntimeEnv::default();
         let lower_nested_loop = |plan: &Arc<dyn ExecutionPlan>| {
-            PhysicalNestedLoopJoin::try_lower(plan, &runtime, lower)
-                .map(|join| join.is_some())
+            PhysicalNestedLoopJoin::try_lower(plan, lower).map(|join| join.is_some())
         };
         let lower_cross = |plan: &Arc<dyn ExecutionPlan>| {
-            PhysicalCrossJoin::try_lower(plan, &runtime, lower).map(|join| join.is_some())
+            PhysicalCrossJoin::try_lower(plan, lower).map(|join| join.is_some())
         };
         // A filter that can fail on some pairs (`lk / rk`): both engines
         // divide by zero.
@@ -2515,11 +2498,11 @@ mod tests {
         )
     }
 
-    /// Execute the plan `make` creates in DataFusion and lowered for (and
-    /// executed with) the runtime `runtime` creates (one per engine: an
-    /// executed plan may keep its reservations), and assert that both return
-    /// the same rows, or both fail with an error containing `message` if
-    /// there is one. Returns the lowered operator tree.
+    /// Execute the plan `make` creates in DataFusion and natively, with the
+    /// runtime `runtime` creates (one per engine: an executed plan may keep
+    /// its reservations), and assert that both return the same rows, or both
+    /// fail with an error containing `message` if there is one. Returns the
+    /// lowered operator tree.
     async fn assert_same_outcome(
         make: impl Fn() -> Result<Arc<dyn ExecutionPlan>>,
         runtime: impl Fn() -> Result<Arc<RuntimeEnv>>,
@@ -2531,7 +2514,7 @@ mod tests {
         let expected = collect(Arc::clone(&expected_plan), context_of(&runtime()?)).await;
         let runtime = runtime()?;
         let plan = make()?;
-        let root = lower_for(&plan, &runtime)?;
+        let root = lower(&plan)?;
         let exec: Arc<dyn ExecutionPlan> = Arc::new(
             crate::bridge::PipelineRootExec::try_new(Arc::clone(&root), plan)?,
         );
@@ -2593,43 +2576,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn joins_with_a_memory_limit_are_left_to_datafusion() -> Result<()> {
-        // DataFusion charges the memory of the batches of its build side (32
-        // rows of `Int64`: their buffer and the array), the native join the
-        // memory of the chunks it collects: with a memory limit, the joins
-        // are left to DataFusion, also at the limit, and for build batches
-        // that the native join would collect in several chunks (3000 rows).
-        for rows in [32, 3000] {
-            let charged = int64_batch(rows).get_array_memory_size();
-            for (limit, message) in
-                [(charged - 1, Some("Resources exhausted")), (charged, None)]
-            {
-                let root = assert_same_outcome(
-                    || int64_cross_join(rows),
-                    || limited_runtime(limit, true),
-                    message,
-                )
-                .await?;
-                assert_eq!(count::<PhysicalCrossJoin>(&root), 0, "{rows} rows");
-            }
-        }
-        // DataFusion's nested loop join spills its build side when it can, or
-        // fails.
+    async fn joins_reserve_their_build_side_in_the_memory_pool() -> Result<()> {
+        use crate::operators::lowering_tests::assert_exhausted;
+        use crate::sort::test_support::assert_memory_freed;
+        // The joins are native whatever the memory pool of the session: they
+        // reserve the rows of their build side as they arrive (and the build
+        // rows that matched), and fail with `ResourcesExhausted` once the pool
+        // cannot hold them. (DataFusion's nested loop join spills its build
+        // side when it can.)
         let filter = Some(compare("lk", Operator::Lt, "rk"));
-        let join = || nested_loop_plan(JoinType::Left, filter.clone(), None, 2000, 30);
-        for (spill, message) in [(true, None), (false, Some("Resources exhausted"))] {
+        let nested_loop =
+            || nested_loop_plan(JoinType::Left, filter.clone(), None, 2000, 30);
+        let cross = || int64_cross_join(20_000);
+        type MakePlan<'a> = &'a dyn Fn() -> Result<Arc<dyn ExecutionPlan>>;
+        for (name, make) in [
+            ("PhysicalNestedLoopJoin", &nested_loop as MakePlan<'_>),
+            ("PhysicalCrossJoin", &cross),
+        ] {
+            let plan = make()?;
+            let root = lower(&plan)?;
+            let native = count::<PhysicalNestedLoopJoin>(&root)
+                + count::<PhysicalCrossJoin>(&root);
+            assert_eq!(native, 1, "{name}: {}", format_operator_tree(&root));
+            // 64 KiB do not hold the build side.
+            let runtime = limited_runtime(64 * 1024, false)?;
+            let exec: Arc<dyn ExecutionPlan> =
+                Arc::new(crate::bridge::PipelineRootExec::try_new(root, plan)?);
+            let result =
+                datafusion_physical_plan::collect(exec, context_of(&runtime)).await;
+            let error = result.as_ref().map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+            assert_exhausted(result);
+            assert_memory_freed(runtime.memory_pool.as_ref()).await;
+            // 64 MiB do: the join returns the rows of DataFusion's.
             let root =
-                assert_same_outcome(join, || limited_runtime(64 * 1024, spill), message)
+                assert_same_outcome(make, || limited_runtime(64 << 20, false), None)
                     .await?;
-            assert_eq!(count::<PhysicalNestedLoopJoin>(&root), 0);
+            assert_eq!(
+                count::<PhysicalNestedLoopJoin>(&root)
+                    + count::<PhysicalCrossJoin>(&root),
+                1,
+                "{name}"
+            );
         }
-        // Without a limit, the joins are native.
-        let unlimited = || Ok(Arc::new(RuntimeEnv::default()));
-        let root =
-            assert_same_outcome(|| int64_cross_join(3000), unlimited, None).await?;
-        assert_eq!(count::<PhysicalCrossJoin>(&root), 1);
-        let root = assert_same_outcome(join, unlimited, None).await?;
-        assert_eq!(count::<PhysicalNestedLoopJoin>(&root), 1);
         Ok(())
     }
 
