@@ -1109,12 +1109,17 @@ impl StoredRows {
                 UInt32Array::from_iter_values(located.iter().map(|&(_, row)| row as u32));
             return take_rows(self.batches[first].column(column), &rows);
         }
-        let nulls = new_null_array(field.data_type(), 1);
+        // A row of NULLs for the NULL positions, if any (it can be big, e.g.
+        // of a fixed size list).
+        let nulls = positions
+            .iter()
+            .any(Option::is_none)
+            .then(|| new_null_array(field.data_type(), 1));
         let arrays = self
             .batches
             .iter()
             .map(|batch| batch.column(column).as_ref())
-            .chain(std::iter::once(nulls.as_ref()))
+            .chain(nulls.as_deref())
             .collect::<Vec<_>>();
         Ok(interleave(&arrays, &located)?)
     }
@@ -1210,6 +1215,9 @@ pub(crate) struct GatherWidths {
     /// For the filter and for the output: the columns whose values have bytes
     /// of their own, and how to count them.
     variable: [Vec<(usize, VariableWidth)>; 2],
+    /// For the filter and for the output: the bytes of a row of NULLs (see
+    /// [`null_value_bytes`]).
+    nulls: [usize; 2],
 }
 
 /// A join gathers about this many bytes of rows for a batch of candidate
@@ -1253,6 +1261,7 @@ impl GatherWidths {
     ) -> Self {
         let mut fixed = [0; 2];
         let mut variable = [vec![], vec![]];
+        let mut nulls = [0_usize; 2];
         let columns = [
             filter.into_iter().collect::<Vec<_>>(),
             output.into_iter().collect(),
@@ -1267,9 +1276,15 @@ impl GatherWidths {
                 if let Some(width) = width {
                     variable[which].push((column, width));
                 }
+                nulls[which] =
+                    nulls[which].saturating_add(null_value_bytes(field.data_type()));
             }
         }
-        Self { fixed, variable }
+        Self {
+            fixed,
+            variable,
+            nulls,
+        }
     }
 
     /// For every row of `batch`, a batch of the input: the bytes of its values
@@ -1294,9 +1309,65 @@ impl GatherWidths {
     }
 
     /// The bytes of a row of NULLs in the batch `which` (e.g. for the other
-    /// input of the rows without a match of an outer join).
+    /// input of the rows without a match of an outer join), as
+    /// `new_null_array` allocates them: of the values nested in the NULLs,
+    /// too (see [`null_value_bytes`]).
     pub(crate) fn null_row_bytes(&self, which: usize) -> usize {
-        self.fixed[which]
+        self.nulls[which]
+    }
+}
+
+/// The bytes that `new_null_array` allocates for a NULL of `data_type` (with
+/// a byte for its validity): those of its offsets, and of the NULLs of its
+/// children that it has (a fixed size list has its size of them, a struct one
+/// of every field, a sparse union one of every child). Lists, maps and
+/// strings have no values.
+fn null_value_bytes(data_type: &DataType) -> usize {
+    let validity = 1;
+    match data_type {
+        DataType::Null => 0,
+        DataType::Boolean => 1 + validity,
+        DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(_, _) => {
+            size_of::<i32>() + validity
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary | DataType::LargeList(_) => {
+            size_of::<i64>() + validity
+        }
+        DataType::ListView(_) => 2 * size_of::<i32>() + validity,
+        DataType::LargeListView(_) => 2 * size_of::<i64>() + validity,
+        DataType::Utf8View | DataType::BinaryView => size_of::<u128>() + validity,
+        DataType::FixedSizeBinary(width) => {
+            usize::try_from(*width).unwrap_or_default() + validity
+        }
+        DataType::FixedSizeList(field, size) => usize::try_from(*size)
+            .unwrap_or_default()
+            .saturating_mul(null_value_bytes(field.data_type()))
+            .saturating_add(validity),
+        DataType::Struct(fields) => fields
+            .iter()
+            .map(|field| null_value_bytes(field.data_type()))
+            .fold(validity, usize::saturating_add),
+        DataType::Union(fields, mode) => {
+            let offsets = match mode {
+                UnionMode::Sparse => 0,
+                UnionMode::Dense => size_of::<i32>(),
+            };
+            fields
+                .iter()
+                .map(|(_, field)| null_value_bytes(field.data_type()))
+                .fold(size_of::<i8>() + offsets, usize::saturating_add)
+        }
+        DataType::Dictionary(key, _) => {
+            key.primitive_width().unwrap_or(size_of::<u64>()) + validity
+        }
+        DataType::RunEndEncoded(run_ends, values) => {
+            run_ends
+                .data_type()
+                .primitive_width()
+                .unwrap_or(size_of::<u64>())
+                + null_value_bytes(values.data_type())
+        }
+        data_type => data_type.primitive_width().unwrap_or(size_of::<u64>()) + validity,
     }
 }
 
@@ -2459,6 +2530,13 @@ impl PhysicalMergeJoin {
         // The bytes of the rows that the batch gathers.
         let mut bytes = 0;
         let null_buffered_bytes = spec.null_row_bytes(true);
+        // The row of NULLs that the buffered rows of the streamed rows without a
+        // match are taken from (see `StoredRows::gather`), reserved with the
+        // rows (it does not bound them: a batch has a row at least).
+        let null_template_bytes = match join_type {
+            JoinType::Left | JoinType::Right | JoinType::Full => null_buffered_bytes,
+            _ => 0,
+        };
         while cost < DEFAULT_VECTOR_SIZE && bytes < PART_BYTES {
             let mut progress = match chunk.in_progress.take() {
                 Some(progress) => progress,
@@ -2585,7 +2663,7 @@ impl PhysicalMergeJoin {
         // The rows gathered for the filter and the output are reserved while
         // they are joined.
         let transient = reservation.new_empty();
-        transient.try_grow(bytes)?;
+        transient.try_grow(bytes + null_template_bytes)?;
 
         // The filter, on all pairs at once.
         let mask = match &spec.filter {
@@ -5081,6 +5159,48 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nulls_of_outer_joins_are_reserved() -> Result<()> {
+        // As the symmetric join's: the left row of a `Left` join of an empty
+        // right input has NULLs of a fixed size list of a million integers
+        // (8 MB), which the merge join reserves before it builds them.
+        use crate::join::symmetric_hash_join::tests::{big_null_schema, one_left_row};
+        let join = || -> Result<Arc<dyn PhysicalOperator>> {
+            let left = one_left_row();
+            let left: Arc<dyn PhysicalOperator> = Arc::new(TestSource::with_schema(
+                left.schema(),
+                vec![DataChunk::from_record_batch(left)],
+            ));
+            let right: Arc<dyn PhysicalOperator> =
+                Arc::new(TestSource::with_schema(big_null_schema(), vec![]));
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            Ok(Arc::new(PhysicalMergeJoin::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::Left,
+                &[SortOptions::default()],
+                NullEquality::NullEqualsNothing,
+                false,
+                None,
+            )?))
+        };
+        let err =
+            with_timeout(Executor::collect(join()?, limited_task_ctx(64 * 1024)?, 4))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let batches =
+            with_timeout(Executor::collect(join()?, limited_task_ctx(64 << 20)?, 4))
+                .await?;
+        assert_eq!(num_rows(&batches), 1);
+        Ok(())
+    }
+
     /// A partition of a stream that produces `batches`, and then ends, or
     /// never produces anything again if `forever`.
     #[derive(Debug)]
@@ -5643,17 +5763,16 @@ pub(crate) mod tests {
     }
 
     /// A stream of `batches` of the `side` input with struct keys, sorted by
-    /// them, which never ends if `forever`.
+    /// them with `options`, which never ends if `forever`.
     fn struct_key_stream(
         side: &str,
         batches: Vec<RecordBatch>,
+        options: SortOptions,
         forever: bool,
     ) -> Arc<dyn ExecutionPlan> {
         let schema = struct_key_schema(side);
         let key = col(&format!("{side}k"), &schema).unwrap();
-        let order =
-            LexOrdering::new([PhysicalSortExpr::new(key, SortOptions::new(false, true))])
-                .unwrap();
+        let order = LexOrdering::new([PhysicalSortExpr::new(key, options)]).unwrap();
         let partition = StreamPartition {
             schema: Arc::clone(&schema),
             batches,
@@ -5695,7 +5814,25 @@ pub(crate) mod tests {
             ),
             (&[(0.0, 1), (0.0, 5)], &[(-0.0, 5), (-0.0, 9), (0.0, 1)]),
         ];
-        for (left_keys, right_keys) in cases {
+        // The keys of a case in their order, ascending or descending (in
+        // which `+0.0` comes before `-0.0`).
+        let sorted = |keys: &[(f64, i32)], descending: bool| {
+            let mut keys = keys.to_vec();
+            keys.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            if descending {
+                keys.reverse();
+            }
+            keys
+        };
+        for ((left_keys, right_keys), descending) in cases
+            .into_iter()
+            .flat_map(|case| [(case, false), (case, true)])
+        {
+            let (left_keys, right_keys) = (
+                &sorted(left_keys, descending)[..],
+                &sorted(right_keys, descending)[..],
+            );
+            let options = SortOptions::new(descending, true);
             for join_type in [
                 JoinType::Inner,
                 JoinType::Left,
@@ -5706,8 +5843,9 @@ pub(crate) mod tests {
                 JoinType::RightAnti,
             ] {
                 for split in [true, false] {
-                    let context =
-                        format!("{join_type} {left_keys:?} {right_keys:?} {split}");
+                    let context = format!(
+                        "{join_type} {left_keys:?} {right_keys:?} {split} {descending}"
+                    );
                     let batches = |side: &str, keys: &[(f64, i32)]| match split {
                         true => keys
                             .iter()
@@ -5761,8 +5899,10 @@ pub(crate) mod tests {
                         plan: reference,
                         ordered: false,
                     };
-                    let left = struct_key_stream("l", batches("l", left_keys), false);
-                    let right = struct_key_stream("r", batches("r", right_keys), false);
+                    let left =
+                        struct_key_stream("l", batches("l", left_keys), options, false);
+                    let right =
+                        struct_key_stream("r", batches("r", right_keys), options, false);
                     let on = on(&left, &right);
                     let plan: Arc<dyn ExecutionPlan> =
                         Arc::new(SortMergeJoinExec::try_new(
@@ -5771,7 +5911,7 @@ pub(crate) mod tests {
                             on,
                             None,
                             join_type,
-                            vec![SortOptions::new(false, true)],
+                            vec![options],
                             NullEquality::NullEqualsNothing,
                         )?);
                     let root = lower_join(&plan, false)?;
@@ -5829,7 +5969,7 @@ pub(crate) mod tests {
                             struct_key_rows(side, keys, batch as i64 * 10)
                         })
                         .collect();
-                    struct_key_stream(side, batches, true)
+                    struct_key_stream(side, batches, SortOptions::new(false, true), true)
                 };
                 let (left, right) = (stream("l"), stream("r"));
                 let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];

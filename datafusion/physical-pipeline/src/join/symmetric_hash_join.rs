@@ -3471,4 +3471,82 @@ pub(crate) mod tests {
         }
         Ok(())
     }
+
+    /// The schema of the right input of the outer joins whose NULLs are big:
+    /// its rows have a fixed size list of a million integers (8 MB).
+    pub(crate) fn big_null_schema() -> SchemaRef {
+        let item = Arc::new(Field::new_list_field(DataType::Int64, true));
+        Arc::new(Schema::new(vec![
+            Field::new("rid", DataType::Int64, false),
+            Field::new("rk", DataType::Int32, false),
+            Field::new("rl", DataType::FixedSizeList(item, 1_000_000), true),
+        ]))
+    }
+
+    /// The left input of the outer joins whose NULLs are big: a row of the key
+    /// 1.
+    pub(crate) fn one_left_row() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("lid", DataType::Int64, false),
+                Field::new("lk", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nulls_of_outer_joins_are_reserved() -> Result<()> {
+        // The left row of a `Left` join of an empty right input has NULLs for
+        // the right columns, of a fixed size list of a million integers: the
+        // NULLs take 8 MB, which the join reserves before it builds them, so
+        // that it fails in a pool of 64 KiB, and runs in one of 64 MiB.
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |batches: Vec<RecordBatch>, schema: SchemaRef| {
+                let partition = BatchesPartition {
+                    schema: Arc::clone(&schema),
+                    batches,
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        schema,
+                        vec![Arc::new(partition)],
+                        None,
+                        vec![],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            let left = one_left_row();
+            symmetric_join(
+                stream(vec![left.clone()], left.schema()),
+                stream(vec![], big_null_schema()),
+                JoinType::Left,
+                None,
+                NullEquality::NullEqualsNothing,
+            )
+        };
+        let join = plan()?;
+        let root = lower(&join)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        let err = run_native(&root, join, limited_task_ctx(64 * 1024)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let join = plan()?;
+        let root = lower(&join)?;
+        let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 1);
+        Ok(())
+    }
 }
