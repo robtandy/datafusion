@@ -90,9 +90,9 @@
 //! NULL key only if the buffered input is empty.
 //!
 //! The module also holds the parts that the merge join shares with the
-//! [`PhysicalSymmetricHashJoin`]: the output of a join ([`JoinOutput`]), the
-//! rows that it gathers ([`JoinRows`], [`StoredRows`]) and the evaluation of
-//! its residual filter ([`filter_mask`]).
+//! [`PhysicalSymmetricHashJoin`]: the output of a join (`JoinOutput`), the
+//! rows that it gathers (`JoinRows`, `StoredRows`) and the evaluation of its
+//! residual filter (`filter_mask`).
 //!
 //! [`PhysicalSymmetricHashJoin`]: super::symmetric_hash_join::PhysicalSymmetricHashJoin
 

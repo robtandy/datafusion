@@ -66,6 +66,8 @@
 //! join is arbitrary). Join keys are equal with DataFusion's join key
 //! equality: `-0.0 = +0.0`, NaNs with the same bits are equal, and NULLs are
 //! equal only with [`NullEquality::NullEqualsNull`].
+//!
+//! [`PhysicalHashJoin`]: crate::join::PhysicalHashJoin
 
 use std::collections::VecDeque;
 use std::sync::Arc;
