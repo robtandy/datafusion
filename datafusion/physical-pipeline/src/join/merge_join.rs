@@ -5295,29 +5295,49 @@ pub(crate) mod tests {
         // The keys of the buffered rows that a merge join keeps when it drops
         // the rows before them are copied into keys of their size: dropping
         // rows again and again keeps the memory of the keys bounded, rather
-        // than growing with the capacity of the keys before them.
-        let converter = RowConverter::new(vec![SortField::new(DataType::Utf8)])?;
-        let mut keys = converter.empty_rows(0, 0);
-        let mut sizes = vec![];
-        for round in 0..50 {
-            let values = StringArray::from_iter_values(
-                (0..1000).map(|i| format!("{round:04}{i:060}")),
-            );
-            converter.append(&mut keys, &[Arc::new(values)])?;
-            let from = keys.num_rows() - 1000;
-            let data = (from..keys.num_rows())
-                .map(|row| keys.row(row).as_ref().len())
-                .sum::<usize>();
-            keys = retained_rows(&converter, &keys, from, data);
-            assert_eq!(keys.num_rows(), 1000);
+        // than growing with the capacity of the keys before them (with which
+        // 65,536 integer keys grew from 0.85 MB to 13.76 MB in 12 rounds).
+        let strings = |round: usize, rows: usize| -> ArrayRef {
+            Arc::new(StringArray::from_iter_values(
+                (0..rows).map(|i| format!("{round:04}{i:060}")),
+            ))
+        };
+        let integers = |round: usize, rows: usize| -> ArrayRef {
+            Arc::new(Int32Array::from_iter_values(
+                (0..rows).map(|i| (round * rows + i) as i32),
+            ))
+        };
+        type Keys = fn(usize, usize) -> ArrayRef;
+        let cases: [(DataType, Keys, usize, usize); 2] = [
+            (DataType::Utf8, strings, 1000, 50),
+            (DataType::Int32, integers, 65_536, 12),
+        ];
+        for (data_type, keys_of, kept, rounds) in cases {
+            let converter = RowConverter::new(vec![SortField::new(data_type.clone())])?;
+            let mut keys = converter.empty_rows(0, 0);
+            let mut sizes = vec![];
+            for round in 0..rounds {
+                converter.append(&mut keys, &[keys_of(round, kept)])?;
+                let from = keys.num_rows() - kept;
+                let data = (from..keys.num_rows())
+                    .map(|row| keys.row(row).as_ref().len())
+                    .sum::<usize>();
+                keys = retained_rows(&converter, &keys, from, data);
+                assert_eq!(keys.num_rows(), kept);
+                // The data of the rows, their offsets, and the rows.
+                let size = data + (kept + 1) * size_of::<usize>() + size_of::<Rows>();
+                assert!(
+                    keys.size() <= size,
+                    "{data_type} {round}: {} for {data} bytes",
+                    keys.size()
+                );
+                sizes.push(keys.size());
+            }
             assert!(
-                keys.size() <= data + 1001 * size_of::<usize>() + size_of::<Rows>(),
-                "{round}: {} for {data} bytes",
-                keys.size()
+                sizes.iter().all(|&size| size == sizes[0]),
+                "{data_type}: {sizes:?}"
             );
-            sizes.push(keys.size());
         }
-        assert!(sizes.iter().all(|&size| size == sizes[0]), "{sizes:?}");
         Ok(())
     }
 
