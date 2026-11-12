@@ -1473,9 +1473,10 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow::array::TimestampNanosecondArray;
     use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::compute::SortOptions;
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::{DataFusionError, internal_datafusion_err};
@@ -2830,5 +2831,124 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn determined_rows_of_streams_of_timestamps_are_emitted() -> Result<()> {
+        // As `determined_rows_of_streams_that_never_end_are_emitted`, with
+        // ascending timestamps (in nanoseconds, of a time zone), as the rows
+        // of streams of events have.
+        let schema = |side: &str| -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Int32, false),
+                Field::new(
+                    format!("{side}time"),
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                    false,
+                ),
+            ]))
+        };
+        let stream = |side: &str, key: fn(i64) -> i32| -> Arc<dyn ExecutionPlan> {
+            let batches = (0..5)
+                .map(|batch| {
+                    let ids = (batch * 20..batch * 20 + 20).collect::<Vec<i64>>();
+                    let times = TimestampNanosecondArray::from_iter_values(
+                        ids.iter()
+                            .map(|id| 1_700_000_000_000_000_000 + id * 1_000_000_000),
+                    )
+                    .with_timezone("UTC");
+                    RecordBatch::try_new(
+                        schema(side),
+                        vec![
+                            Arc::new(Int64Array::from(ids.clone())),
+                            Arc::new(Int32Array::from_iter_values(
+                                ids.iter().map(|&id| key(id)),
+                            )),
+                            Arc::new(times),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let partition = BatchesPartition {
+                schema: schema(side),
+                batches,
+                forever: true,
+            };
+            let time = col(&format!("{side}time"), &schema(side)).unwrap();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                time,
+                SortOptions::new(false, false),
+            )])
+            .unwrap();
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let order = |plan: &Arc<dyn ExecutionPlan>| plan.output_ordering().cloned();
+        for join_type in [JoinType::Left, JoinType::LeftAnti, JoinType::LeftMark] {
+            let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+                let left = stream("l", |id| (id * 2) as i32);
+                let right = stream("r", |id| (id * 2 + 1) as i32);
+                let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+                let filter_schema = Arc::new(Schema::new(vec![
+                    left.schema().field(2).clone(),
+                    right.schema().field(2).clone(),
+                ]));
+                let filter = JoinFilter::new(
+                    binary(
+                        col("ltime", &filter_schema)?,
+                        Operator::Gt,
+                        col("rtime", &filter_schema)?,
+                    ),
+                    vec![
+                        ColumnIndex {
+                            index: 2,
+                            side: JoinSide::Left,
+                        },
+                        ColumnIndex {
+                            index: 2,
+                            side: JoinSide::Right,
+                        },
+                    ],
+                    filter_schema,
+                );
+                let (left_order, right_order) = (order(&left), order(&right));
+                let join = Arc::new(SymmetricHashJoinExec::try_new(
+                    left,
+                    right,
+                    on,
+                    Some(filter),
+                    &join_type,
+                    NullEquality::NullEqualsNothing,
+                    left_order,
+                    right_order,
+                    StreamJoinPartitionMode::SinglePartition,
+                )?);
+                Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
+            };
+            let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+            assert_eq!(num_rows(&expected), 1, "{join_type}");
+            let plan = plan()?;
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            let join = root.children()[0]
+                .downcast_ref::<PhysicalSymmetricHashJoin>()
+                .unwrap_or_else(|| {
+                    panic!("{join_type}\n{}", format_operator_tree(&root))
+                });
+            assert!(join.determines_rows_by_order(), "{join_type}");
+            let actual = run_native(&root, plan, task_ctx()).await?;
+            assert_eq!(num_rows(&actual.batches), 1, "{join_type}");
+        }
+        Ok(())
     }
 }
