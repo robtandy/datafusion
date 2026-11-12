@@ -29,6 +29,7 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkResult, SourceResult, downcast_state,
 };
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
+use crate::sources::batches::chunk_memory;
 
 /// The bodies of the materialized CTEs whose continuations are being lowered,
 /// by the id of their buffer, which their scans read (see
@@ -323,8 +324,15 @@ impl PhysicalOperator for MaterializedCteBody {
         _lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         let state = downcast_state::<BodyRows>(gstate.as_any(), self.name())?;
+        // At most the memory of the chunk, before it is compacted.
+        let estimate = chunk_memory(input);
+        state.reservation.try_grow(estimate)?;
         let batch = input.compact()?;
-        state.reservation.try_grow(batch.get_array_memory_size())?;
+        let size = batch.get_array_memory_size();
+        match size.checked_sub(estimate) {
+            Some(more) => state.reservation.try_grow(more)?,
+            None => state.reservation.shrink(estimate - size),
+        }
         state.batches.lock().push(batch);
         Ok(SinkResult::NeedMoreInput)
     }

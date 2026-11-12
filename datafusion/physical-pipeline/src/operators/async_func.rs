@@ -24,6 +24,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorResult, OperatorState,
     PhysicalOperator, TaskInterrupt, downcast_state_mut,
 };
+use crate::sources::batches::chunk_memory;
 
 /// Evaluates asynchronous scalar functions (async UDFs) on the rows of its
 /// input and appends their results to them, as `AsyncFuncExec` does: its
@@ -37,7 +38,8 @@ use crate::operator::{
 /// thread waits for ([`TaskInterrupt::wait_for`]), without blocking its
 /// thread: the threads of the pipeline evaluate the functions of their
 /// chunks concurrently. The memory of the rows that a thread evaluates, and
-/// of their results, is reserved in the memory pool of the session.
+/// of their results, is reserved in the memory pool of the session (an
+/// estimate of the results before they are evaluated).
 #[derive(Debug)]
 pub struct PhysicalAsyncFunc {
     /// The input, the only child.
@@ -202,10 +204,23 @@ impl PhysicalOperator for PhysicalAsyncFunc {
             *output = DataChunk::from_record_batch(batch);
             return Ok(OperatorResult::NeedMoreInput);
         }
+        // The rows of the chunk, and an estimate of the results of the
+        // functions, before they are allocated.
+        let rows = input.len();
+        let results = self
+            .schema
+            .fields()
+            .iter()
+            .skip(self.children[0].schema().fields().len())
+            .map(|field| rows * field.data_type().primitive_width().unwrap_or(16))
+            .sum::<usize>();
+        state
+            .reservation
+            .try_resize(chunk_memory(input) + results)?;
         let batch = input.compact()?;
         state
             .reservation
-            .try_resize(batch.get_array_memory_size())?;
+            .try_resize(batch.get_array_memory_size() + results)?;
         let evaluated: Evaluated = Arc::default();
         let slot = Arc::clone(&evaluated);
         let functions = self.functions.clone();

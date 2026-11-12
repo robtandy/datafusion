@@ -27,6 +27,7 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
     TaskInterrupt, downcast_state, downcast_state_mut,
 };
+use crate::sources::batches::chunk_memory;
 
 /// The number of batches that may wait for the writer of a
 /// [`PhysicalDataSink`], besides one for every thread.
@@ -244,14 +245,26 @@ impl PhysicalOperator for PhysicalDataSink {
         let queued = match local.pending.take() {
             Some(queued) => queued,
             None => {
+                // At most the memory of the chunk, before it is compacted.
+                let estimate = chunk_memory(input);
+                state.reservation.try_grow(estimate)?;
                 let batch = input.compact()?;
+                let size = batch.get_array_memory_size();
+                match size.checked_sub(estimate) {
+                    Some(more) => state.reservation.try_grow(more)?,
+                    None => state.reservation.shrink(estimate - size),
+                }
                 let batch = if self.not_null_columns.is_empty() {
                     batch
                 } else {
-                    check_not_null_constraints(batch, &self.not_null_columns)?
+                    match check_not_null_constraints(batch, &self.not_null_columns) {
+                        Ok(batch) => batch,
+                        Err(error) => {
+                            state.reservation.shrink(size);
+                            return Err(error);
+                        }
+                    }
                 };
-                let size = batch.get_array_memory_size();
-                state.reservation.try_grow(size)?;
                 (batch, size)
             }
         };

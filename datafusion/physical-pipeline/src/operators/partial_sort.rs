@@ -24,6 +24,7 @@ use crate::operator::{
     ExecutionContext, GlobalOperatorState, OperatorFinalizeResult, OperatorResult,
     OperatorState, PhysicalOperator, downcast_state_mut,
 };
+use crate::sources::batches::chunk_memory;
 
 /// Sorts an input whose rows are sorted by a prefix of its sort keys (the
 /// first `common_prefix_length` keys), as `PartialSortExec` does: it buffers
@@ -44,7 +45,8 @@ use crate::operator::{
 /// lower (see [`PhysicalPartialSort::try_lower`]).
 ///
 /// The memory of the rows that it buffers, and of the sorted rows that it
-/// did not emit yet, is reserved in the memory pool of the session.
+/// did not emit yet, is reserved in the memory pool of the session, and so is
+/// the memory that sorting a group allocates, before it is allocated.
 #[derive(Debug)]
 pub struct PhysicalPartialSort {
     /// The input, the only child.
@@ -141,6 +143,18 @@ impl PhysicalPartialSort {
         Ok(true)
     }
 
+    /// The memory that sorting `rows` (see [`Self::sort`]) holds and
+    /// allocates at most: the rows, their concatenation, their sort keys and
+    /// sort indices, and the sorted rows.
+    fn sort_memory(&self, rows: &[RecordBatch]) -> usize {
+        let memory = rows
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum::<usize>();
+        let count = rows.iter().map(RecordBatch::num_rows).sum::<usize>();
+        3 * memory + count * (size_of::<u32>() + size_of::<u64>() * self.expr.len())
+    }
+
     /// `rows` (of complete groups), sorted by all keys, at most `limit` of
     /// them.
     fn sort(&self, rows: &[RecordBatch], limit: Option<usize>) -> Result<RecordBatch> {
@@ -222,13 +236,19 @@ impl OperatorState for PartialSortState {}
 impl PartialSortState {
     /// Reserve the memory of the buffered and the sorted rows.
     fn reserve(&self) -> Result<()> {
+        self.reserve_with(0)
+    }
+
+    /// Reserve the memory of the buffered and the sorted rows, and `extra`
+    /// bytes, before the operator allocates them.
+    fn reserve_with(&self, extra: usize) -> Result<()> {
         let size = self
             .group
             .iter()
             .chain(&self.sorted)
             .map(RecordBatch::get_array_memory_size)
-            .sum();
-        self.reservation.try_resize(size)
+            .sum::<usize>();
+        self.reservation.try_resize(size + extra)
     }
 
     /// Emit the next chunk of the sorted rows into `output`. Returns whether
@@ -324,6 +344,8 @@ impl PhysicalOperator for PhysicalPartialSort {
             downcast_state_mut::<PartialSortState>(lstate.as_any_mut(), self.name())?;
         if !state.consumed {
             state.consumed = true;
+            // The rows of the chunk, which the operator holds.
+            state.reserve_with(chunk_memory(input))?;
             let batch = input.compact()?;
             let ranges = self.prefix_ranges(&batch)?;
             let Some(last) = ranges.last() else {
@@ -346,6 +368,7 @@ impl PhysicalOperator for PhysicalPartialSort {
                 }
                 state.group.push(batch.slice(last.start, last.len()));
                 if !complete.is_empty() {
+                    state.reserve_with(self.sort_memory(&complete))?;
                     let sorted = self.sort(&complete, state.remaining)?;
                     state.set_sorted(sorted);
                 }
@@ -379,6 +402,7 @@ impl PhysicalOperator for PhysicalPartialSort {
         // The last group is complete once the input ends.
         if !state.group.is_empty() && state.remaining != Some(0) {
             let group = std::mem::take(&mut state.group);
+            state.reserve_with(self.sort_memory(&group))?;
             let sorted = self.sort(&group, state.remaining)?;
             state.set_sorted(sorted);
             state.reserve()?;
