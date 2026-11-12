@@ -62,14 +62,18 @@
 //! totally). The filters of other aggregations stay `true`, which prunes
 //! nothing.
 //!
-//! Nor are the filters set that a node of the input reads in a form that
-//! evaluates a volatile expression: a scan of Parquet files that projects
-//! `tick(k) AS x` rewrites a filter of `x` that is pushed into it into a
-//! filter of `tick(k)` and evaluates it on its rows (with `pushdown_filters`),
-//! i.e. evaluates `tick` once more, which changes the values that the scan
-//! produces. The native aggregation publishes no filter into such a scan, and
-//! leaves DataFusion's filters that it reads `true` (which DataFusion's own
-//! aggregations set, so that they return other values than without them).
+//! Nor are the filters set that a node of the input reads through other
+//! expressions than columns: a scan of Parquet files that projects `tick(k)
+//! AS x` or `1000 / k AS x` rewrites a filter of `x` that is pushed into it
+//! into a filter of `tick(k)` or `1000 / k`, which it evaluates on its rows
+//! (with `pushdown_filters`). It evaluates the volatile `tick` once more for
+//! every row, which changes the values that it produces, or divides on the
+//! rows that the query does not divide on, e.g. on the rows that a `WHERE`
+//! that it evaluates after the filter (with `reorder_filters`) rules out,
+//! which may fail. The native aggregation publishes no filter into such a
+//! scan, and leaves DataFusion's filters that it reads `true` (which
+//! DataFusion's own aggregations set, so that they return other values, or
+//! fail).
 //!
 //! As DataFusion's, the filters are only updated in sessions that push the
 //! dynamic filters of aggregations down
@@ -179,8 +183,8 @@ impl AggregateFilter {
     /// input rows of an aggregation, produces, if they are DataFusion's
     /// filters of the bounds of its `MIN` and `MAX` aggregates that the
     /// native aggregation sets (see [`bounded_aggregates`]), unless a node of
-    /// the input reads them in a form that evaluates a volatile expression
-    /// (see [`reads_volatile_filters`]).
+    /// the input reads them through other expressions than columns (see
+    /// [`reads_filters_through_expressions`]).
     pub(crate) fn of_aggregate_exec(raw: &AggregateExec) -> Result<Option<Self>> {
         let Some(filters) = dynamic_filters(raw) else {
             return Ok(None);
@@ -195,7 +199,7 @@ impl AggregateFilter {
             .iter()
             .map(|filter| Arc::clone(filter) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
-        if reads_volatile_filters(raw.input(), &expression_ids(&produced)?)? {
+        if reads_filters_through_expressions(raw.input(), &expression_ids(&produced)?)? {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -658,9 +662,9 @@ pub(crate) fn has_exact_bounds(data_type: &DataType) -> bool {
 /// does not push volatile filters into its children (e.g. a projection, which
 /// would rewrite a filter of a column it computes with a volatile function
 /// into a filter that calls the function). Nor does a leaf take filters that
-/// it would read in a form that evaluates a volatile expression (see
-/// [`reads_volatile_filters`]): a scan of files rewrites the filters through
-/// its own projection, which the rule does not check.
+/// it would read through other expressions than columns (see
+/// [`reads_filters_through_expressions`]): a scan of files rewrites the
+/// filters through its own projection, which the rule does not check.
 ///
 /// Unlike the rule, only `filters` are pushed down, not the filters of the
 /// nodes themselves, which are already where the rule pushed them, and the
@@ -694,7 +698,7 @@ fn push_down(
             .handle_child_pushdown_result(FilterPushdownPhase::Post, result, config)?
             .updated_node;
         return match updated {
-            Some(updated) if !reads_volatile_filters(&updated, &ids)? => {
+            Some(updated) if !reads_filters_through_expressions(&updated, &ids)? => {
                 Ok(Some(updated))
             }
             _ => Ok(None),
@@ -747,33 +751,41 @@ fn expression_ids(filters: &[Arc<dyn PhysicalExpr>]) -> Result<Vec<u64>> {
 }
 
 /// Whether a node of `plan` reads one of the dynamic filters with the
-/// expression ids `ids` in a form that evaluates a volatile expression, e.g. a
-/// scan of Parquet files whose projection computes the column that the filter
-/// compares with a volatile function (`tick(k) AS x`): the scan rewrites the
-/// filter for the columns of its files (`tick(k) >= 10`) and evaluates it on
-/// its rows (with `pushdown_filters`), which evaluates the function once more
-/// for every row, so that the scan produces other values than without the
-/// filter (e.g. of a function that numbers its calls).
-fn reads_volatile_filters(plan: &Arc<dyn ExecutionPlan>, ids: &[u64]) -> Result<bool> {
-    let mut volatile = false;
+/// expression ids `ids` through other expressions than columns (their
+/// children, which the filters compare with their values), e.g. a scan of
+/// Parquet files whose projection computes the column that the filter
+/// compares (`tick(k) AS x`, `1000 / k AS x`): the scan rewrites the filter
+/// for the columns of its files (`tick(k) >= 10`, `1000 / k >= 10`), and
+/// evaluates it on its rows (with `pushdown_filters`). So it evaluates a
+/// volatile function once more for every row, and produces other values than
+/// without the filter (e.g. of a function that numbers its calls), or it
+/// evaluates an expression on rows that the query does not evaluate it on
+/// (e.g. that a `WHERE` that it evaluates after the filter rules out), on
+/// which it may fail. The filters compare the values of columns only: they
+/// cannot fail, and the scans prune with the statistics of the columns.
+fn reads_filters_through_expressions(
+    plan: &Arc<dyn ExecutionPlan>,
+    ids: &[u64],
+) -> Result<bool> {
+    let mut through_expressions = false;
     plan.apply(|node| {
         node.apply_expressions(&mut |root| {
             root.apply(|expr| {
                 if expr.expression_id().is_some_and(|id| ids.contains(&id))
-                    && is_volatile(expr)
+                    && !expr.children().iter().all(|child| child.is::<Column>())
                 {
-                    volatile = true;
+                    through_expressions = true;
                     return Ok(TreeNodeRecursion::Stop);
                 }
                 Ok(TreeNodeRecursion::Continue)
             })
         })?;
-        Ok(match volatile {
+        Ok(match through_expressions {
             true => TreeNodeRecursion::Stop,
             false => TreeNodeRecursion::Continue,
         })
     })?;
-    Ok(volatile)
+    Ok(through_expressions)
 }
 
 #[cfg(test)]
@@ -1575,6 +1587,126 @@ mod tests {
                     let batches = collect(exec as _, ctx.task_ctx()).await?;
                     let actual = outcome(&batches, &ticks);
                     assert_eq!(actual, expected, "tiny tables: {context}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_are_not_read_by_scans_through_expressions_that_may_fail()
+    -> Result<()> {
+        // A scan of Parquet files that projects `1000 / k AS x` rewrites a
+        // filter of `x` that is pushed into it into a filter of `1000 / k`,
+        // which it evaluates on its rows (with `pushdown_filters`), and, with
+        // `reorder_filters`, before its `WHERE s <> 'skip'`, which rules out
+        // the only row of `k` 0: it would divide by zero, on a row that the
+        // query never divides on ("Error evaluating filter predicate" on 1
+        // thread, and with DataFusion's own filter on 4 threads, also in
+        // DataFusion). The native aggregations publish no filter into such
+        // scans, and leave DataFusion's filters that they read `true`.
+        let dir = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        // `k` from 1 to 131,071 with long strings `s`, then `k` 0 with `skip`.
+        let keys = (1..131_072).chain([0]).collect::<Vec<i64>>();
+        let batches = keys
+            .chunks(8_192)
+            .map(|keys| {
+                let strings = keys.iter().map(|&k| match k {
+                    0 => "skip".to_string(),
+                    k => format!("a value that is longer than the key {k}"),
+                });
+                let columns: Vec<ArrayRef> = vec![
+                    Arc::new(Int64Array::from(keys.to_vec())),
+                    Arc::new(StringArray::from_iter_values(strings)),
+                ];
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(8_192))
+            .build();
+        write_parquet(
+            &dir.path().join("w/data.parquet"),
+            Arc::clone(&schema),
+            &batches,
+            Some(properties),
+        )?;
+        let path = dir.path().join("w");
+        let path = path.to_str().expect("a UTF-8 path");
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("w", path, ParquetReadOptions::default())
+                .await
+        };
+        // The values of the last column of `batches`.
+        let values = |batches: &[RecordBatch]| {
+            let mut values = vec![];
+            for batch in batches {
+                let column = batch.column(batch.num_columns() - 1);
+                for row in 0..column.len() {
+                    values
+                        .push(ScalarValue::try_from_array(column, row).expect("a value"));
+                }
+            }
+            values
+        };
+        let expected = vec![ScalarValue::Int64(Some(1000))];
+        for sql in [
+            "SELECT MAX(x) FROM (SELECT 1000 / k AS x FROM w WHERE s <> 'skip')",
+            "SELECT DISTINCT x FROM (SELECT 1000 / k AS x FROM w WHERE s <> 'skip') \
+             ORDER BY x DESC LIMIT 1",
+        ] {
+            for threads in [1, 4] {
+                for filters in [true, false] {
+                    let mut config = with_pushdown_filters(
+                        test_session_config().with_target_partitions(threads),
+                        true,
+                    );
+                    config.options_mut().execution.parquet.reorder_filters = true;
+                    config
+                        .options_mut()
+                        .optimizer
+                        .enable_aggregate_dynamic_filter_pushdown = filters;
+                    let context = format!(
+                        "{sql} on {threads} threads, aggregate filters: {filters}"
+                    );
+                    if !filters {
+                        let ctx = datafusion_context(config.clone());
+                        setup(&ctx).await?;
+                        let batches = ctx.sql(sql).await?.collect().await?;
+                        assert_eq!(values(&batches), expected, "DataFusion: {context}");
+                    }
+                    // Through the planner.
+                    let ctx = pipeline_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let Some(root) = plan.downcast_ref::<PipelineRootExec>() else {
+                        panic!("The pipeline engine did not plan {context}");
+                    };
+                    let tree = format_operator_tree(root.operator());
+                    assert!(
+                        bridged_plans(root.operator()).is_empty(),
+                        "{context}\n{tree}"
+                    );
+                    assert!(
+                        native_filters(root.operator()).is_empty(),
+                        "{context}\n{tree}"
+                    );
+                    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+                    assert_eq!(values(&batches), expected, "planner: {context}");
+                    // Through the lowering of the tests, with tiny thread-local
+                    // tables.
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let root = lower_with_tiny_tables(&plan)?;
+                    assert!(native_filters(&root).is_empty(), "{context}");
+                    let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                    let batches = collect(exec as _, ctx.task_ctx()).await?;
+                    assert_eq!(values(&batches), expected, "tiny tables: {context}");
                 }
             }
         }
