@@ -146,7 +146,7 @@ use arrow::array::{
     Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, RunArray, UInt32Array,
     new_null_array,
 };
-use arrow::compute::{cast, concat_batches, take};
+use arrow::compute::{SortOptions, cast, concat_batches, take};
 use arrow::datatypes::{
     ArrowNativeType, ArrowPrimitiveType, DataType, Field, Float16Type, Float32Type,
     Float64Type, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema, SchemaRef,
@@ -813,6 +813,9 @@ pub struct SortedReference {
     /// subquery), as the rows that tie on the keys before it may come in any
     /// order.
     pub keys: Vec<String>,
+    /// The sort options of [`SortedReference::keys`] (ascending with nulls last
+    /// if missing).
+    pub sort_options: Vec<SortOptions>,
     /// The number of sorted rows that the query skips (`OFFSET`).
     pub skip: usize,
     /// The maximum number of sorted rows that the query returns (`LIMIT`).
@@ -875,7 +878,13 @@ async fn sorted_reference(
     }
     let rows = sorted.num_rows();
     let window = reference.window.rows(rows);
-    let returnable = returnable_rows(&sorted, width, window.clone(), tolerance)?;
+    let returnable = returnable_rows(
+        &sorted,
+        width,
+        window.clone(),
+        &reference.sort_options,
+        tolerance,
+    )?;
     // The rows closest to the rows that the query returns first.
     let mut closest = returnable.clone();
     closest.sort_by_key(|&row| {
@@ -969,6 +978,7 @@ async fn sorted_reference(
         batches: vec![batch],
         columns: output.len(),
         keys: reference.keys,
+        sort_options: reference.sort_options,
         skip: reference.window.skip,
         fetch: reference.window.fetch,
         uncomputed,
@@ -985,16 +995,22 @@ fn returnable_rows(
     sorted: &RecordBatch,
     width: usize,
     window: Range<usize>,
+    options: &[SortOptions],
     tolerance: f64,
 ) -> Result<Vec<usize>> {
-    let keys = (0..sorted.num_rows()).map(|row| {
-        sorted.columns()[width..]
-            .iter()
-            .map(|column| Value::try_new(column.as_ref(), row))
-            .collect::<Result<Row>>()
-    });
-    let (classes, _, varies) = classes(keys, tolerance)?;
-    let tied = tied_classes(&classes, &varies, tolerance);
+    let keys = (0..sorted.num_rows())
+        .map(|row| {
+            sorted.columns()[width..]
+                .iter()
+                .map(|column| Value::try_new(column.as_ref(), row))
+                .collect::<Result<Row>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (classes, tied) = classes_and_ties(&keys, options, tolerance);
+    let classes = classes
+        .into_iter()
+        .map(|class| (class.rows, class.keys))
+        .collect::<Vec<_>>();
     Ok(classes
         .iter()
         .zip(bounds(&classes, &tied))
@@ -1064,6 +1080,8 @@ struct ReferencePlan {
     /// The `ORDER BY` keys whose values the sort has, see
     /// [`SortedReference::keys`].
     keys: Vec<String>,
+    /// Their sort options.
+    sort_options: Vec<SortOptions>,
     /// The projections and subquery aliases between the sort and the root of
     /// the query, from the sort up.
     above: Vec<LogicalPlan>,
@@ -1230,10 +1248,18 @@ fn reference_plan(plan: &LogicalPlan, state: &SessionState) -> Result<ReferenceP
                 input: Arc::new(LogicalPlan::Projection(input)),
                 fetch: None,
             });
+            let sort_options = sort.expr[..keys.len()]
+                .iter()
+                .map(|sort_expr| SortOptions {
+                    descending: !sort_expr.asc,
+                    nulls_first: sort_expr.nulls_first,
+                })
+                .collect();
             Ok(ReferencePlan {
                 sort: sorted,
                 input: Arc::clone(schema),
                 keys: keys.iter().map(ToString::to_string).collect(),
+                sort_options,
                 above: vec![],
                 window: Window {
                     skip: 0,
@@ -1601,9 +1627,9 @@ struct SortedRows {
     classes: Vec<(Range<usize>, Row)>,
     /// For each class, whether its rows have keys after these keys.
     truncated: Vec<bool>,
-    /// For each class, whether the last floating-point value of its keys may
-    /// vary within the tolerance (see [`may_vary`]).
-    varies: Vec<bool>,
+    /// For each class, the other classes that it ties with, in their order
+    /// (see [`classes_and_ties`]).
+    tied: Vec<Vec<usize>>,
     /// The sorted rows that the query returns.
     window: Range<usize>,
 }
@@ -1716,8 +1742,21 @@ enum Precision {
 }
 
 impl Precision {
+    /// The value of this precision that is the nearest to `value`.
+    fn round(self, value: f64) -> f64 {
+        match self {
+            Self::Double => value,
+            // `f32` values are `f64` values.
+            #[expect(clippy::cast_possible_truncation)]
+            Self::Single => f64::from(value as f32),
+            Self::Half => {
+                <Float16Type as ArrowPrimitiveType>::Native::from_f64(value).to_f64()
+            }
+        }
+    }
+
     /// The next larger and the next smaller value of this precision than
-    /// `value`, a finite value of this precision.
+    /// `value`, a value of this precision.
     fn neighbors(self, value: f64) -> [f64; 2] {
         match self {
             Self::Double => [value.next_up(), value.next_down()],
@@ -1745,38 +1784,289 @@ impl Precision {
     }
 }
 
-/// The classes of sorted rows (see [`SortedRows::classes`]), the keys of each
-/// class, whether its rows have keys after them, and whether their last
-/// floating-point value may vary: the ranges of rows whose `ORDER BY` keys
-/// (`keys`, of each sorted row in their order) are exactly equal up to their
-/// first floating-point value that may vary within the tolerance `tolerance`
-/// (their [`decision_keys`]).
-type Classes = (Vec<(Range<usize>, Row)>, Vec<bool>, Vec<bool>);
+/// A class of sorted rows, see [`classes_and_ties`].
+#[derive(Debug, Clone)]
+struct Class {
+    /// The sorted rows of the class.
+    rows: Range<usize>,
+    /// Their [`decision_keys`].
+    keys: Row,
+    /// Whether the rows have keys after `keys`.
+    truncated: bool,
+    /// Whether all their keys are equal, not only `keys`.
+    equal: bool,
+}
 
-/// The [`Classes`] of the sorted rows whose `ORDER BY` keys are `keys`, within
-/// the tolerance `tolerance`.
-fn classes(
-    keys: impl IntoIterator<Item = Result<Row>>,
+/// The classes of the sorted rows whose `ORDER BY` keys are `keys` (of each
+/// sorted row, in their order), and for each class the other classes that it
+/// ties with (in their order), within the tolerance `tolerance`. `options`
+/// are the sort options of the keys.
+///
+/// A class has the consecutive rows whose keys are exactly equal up to their
+/// first floating-point value that may vary within the tolerance (their
+/// [`decision_keys`]): they may come in any order, and the order of other
+/// rows relative to them does not depend on their later keys. Unless the
+/// values that the engines may have for this floating-point value meet
+/// those of another class without crossing them: then the later keys of the
+/// rows decide, and the rows of both classes are in classes of rows whose
+/// keys are all equal.
+fn classes_and_ties(
+    keys: &[Row],
+    options: &[SortOptions],
     tolerance: f64,
-) -> Result<Classes> {
-    let (mut classes, mut truncated, mut varies): Classes = Default::default();
-    for (position, keys) in keys.into_iter().enumerate() {
-        let (keys, truncates, may) = decision_keys(&keys?, &|value, precision| {
-            may_vary(value, precision, tolerance)
-        });
-        match classes.last_mut() {
-            Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
-                range.end = position + 1;
-                *truncated.last_mut().expect("a class") |= truncates;
-            }
-            _ => {
-                classes.push((position..position + 1, keys));
-                truncated.push(truncates);
-                varies.push(may);
+) -> (Vec<Class>, Vec<Vec<usize>>) {
+    let decisions = keys
+        .iter()
+        .map(|keys| {
+            decision_keys(keys, &|value, precision| {
+                may_vary(value, precision, tolerance)
+            })
+        })
+        .collect::<Vec<_>>();
+    // The runs of the rows `rows` whose decision keys (or all keys) are equal.
+    let runs = |rows: Range<usize>, all_keys: bool| {
+        let mut classes: Vec<Class> = vec![];
+        for row in rows {
+            let (decision, truncated, _) = &decisions[row];
+            match classes.last_mut() {
+                Some(class)
+                    if (if all_keys {
+                        rows_equal(&keys[class.rows.start], &keys[row], 0.0)
+                    } else {
+                        rows_equal(&class.keys, decision, 0.0)
+                    }) =>
+                {
+                    class.rows.end = row + 1;
+                    class.truncated |= truncated;
+                    class.equal &= rows_equal(&keys[class.rows.start], &keys[row], 0.0);
+                }
+                _ => classes.push(Class {
+                    rows: row..row + 1,
+                    keys: decision.clone(),
+                    truncated: *truncated,
+                    equal: true,
+                }),
             }
         }
+        classes
+    };
+    let classes = runs(0..keys.len(), false);
+    let (tied, meeting) = tied_classes(&classes, keys, options, tolerance);
+    if !meeting.contains(&true) {
+        return (classes, tied);
     }
-    Ok((classes, truncated, varies))
+    let classes = classes
+        .into_iter()
+        .zip(meeting)
+        .flat_map(|(class, meets)| {
+            if meets && !class.equal {
+                runs(class.rows, true)
+            } else {
+                vec![class]
+            }
+        })
+        .collect::<Vec<_>>();
+    let (tied, _) = tied_classes(&classes, keys, options, tolerance);
+    (classes, tied)
+}
+
+/// The smallest and the largest values of the precision `precision` that are
+/// equal to the finite value `value` within the relative tolerance
+/// `tolerance` (see [`floats_equal`]): the values that another engine may
+/// have for it. The zeros of both signs are one value, and, within a
+/// tolerance of at least 1, all finite values are equal to each other.
+fn interval(value: f64, precision: Precision, tolerance: f64) -> (f64, f64) {
+    let value = normalized(value);
+    if tolerance >= 1.0 {
+        return (f64::MIN, f64::MAX);
+    }
+    let equal = |other: f64| other.is_finite() && floats_equal(value, other, tolerance);
+    // Estimates of the bounds, which are `value * (1 - tolerance)` and
+    // `value / (1 - tolerance)` but for rounding, moved to the last values
+    // that are equal to `value`.
+    let (near, far) = (value * (1.0 - tolerance), value / (1.0 - tolerance));
+    let (low, high) = if value >= 0.0 {
+        (near, far)
+    } else {
+        (far, near)
+    };
+    let (mut low, mut high) = (precision.round(low), precision.round(high));
+    for _ in 0..64 {
+        if high <= value || equal(high) {
+            break;
+        }
+        high = precision.neighbors(high)[1];
+    }
+    for _ in 0..64 {
+        let next = precision.neighbors(high)[0];
+        if !equal(next) {
+            break;
+        }
+        high = next;
+    }
+    for _ in 0..64 {
+        if low >= value || equal(low) {
+            break;
+        }
+        low = precision.neighbors(low)[0];
+    }
+    for _ in 0..64 {
+        let next = precision.neighbors(low)[1];
+        if !equal(next) {
+            break;
+        }
+        low = next;
+    }
+    (low.min(value), high.max(value))
+}
+
+/// How the values that the engines may have for two floating-point values
+/// (see [`interval`]) compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Meeting {
+    /// Either may be smaller.
+    Cross,
+    /// They may be equal, but neither smaller than the other.
+    Meet,
+    /// They are always in the same order.
+    Apart,
+}
+
+/// How the values that the engines may have for the floating-point values
+/// `a` and `b` compare, within the tolerance `tolerance`. `NaN`s are equal.
+fn meeting(a: (f64, Precision), b: (f64, Precision), tolerance: f64) -> Meeting {
+    if a.0.is_nan() || b.0.is_nan() {
+        return if a.0.is_nan() && b.0.is_nan() {
+            Meeting::Meet
+        } else {
+            Meeting::Apart
+        };
+    }
+    if !a.0.is_finite() || !b.0.is_finite() {
+        return if a.0 == b.0 {
+            Meeting::Meet
+        } else {
+            Meeting::Apart
+        };
+    }
+    let ((a_low, a_high), (b_low, b_high)) =
+        (interval(a.0, a.1, tolerance), interval(b.0, b.1, tolerance));
+    // The largest value of the smaller one, and the smallest of the other.
+    let (high, low) = if normalized(a.0) <= normalized(b.0) {
+        (a_high, b_low)
+    } else {
+        (b_high, a_low)
+    };
+    if low < high {
+        Meeting::Cross
+    } else if low == high {
+        Meeting::Meet
+    } else {
+        Meeting::Apart
+    }
+}
+
+/// How a value of a key of a row may sort relative to the value of another
+/// row, within the tolerance, see [`precedence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precedence {
+    /// It may sort before it.
+    Before,
+    /// It may be equal to it, but not sort before it.
+    Equal,
+    /// It sorts after it.
+    After,
+}
+
+/// How the value `later` of a key may sort relative to the value `earlier`,
+/// in the values that the engines may have for them within the tolerance
+/// `tolerance` (see [`interval`]), with the sort options `options` of the
+/// key. Lists and structs are compared lexicographically.
+fn precedence(
+    later: &Value,
+    earlier: &Value,
+    options: SortOptions,
+    tolerance: f64,
+) -> Precedence {
+    // The precedence of `later` if it compares as `ordering` to `earlier` in
+    // ascending order.
+    let ordered = |ordering: std::cmp::Ordering| match ordering {
+        std::cmp::Ordering::Equal => Precedence::Equal,
+        std::cmp::Ordering::Less if !options.descending => Precedence::Before,
+        std::cmp::Ordering::Greater if options.descending => Precedence::Before,
+        _ => Precedence::After,
+    };
+    let nulls = |later_is_null: bool| {
+        if later_is_null == options.nulls_first {
+            Precedence::Before
+        } else {
+            Precedence::After
+        }
+    };
+    match (later, earlier) {
+        (Value::Null, Value::Null) => Precedence::Equal,
+        (Value::Null, _) => nulls(true),
+        (_, Value::Null) => nulls(false),
+        (Value::Float(y, y_precision), Value::Float(x, x_precision)) => {
+            if !y.is_finite() || !x.is_finite() {
+                return match meeting((*y, *y_precision), (*x, *x_precision), tolerance) {
+                    Meeting::Meet => Precedence::Equal,
+                    _ => ordered(y.total_cmp(x)),
+                };
+            }
+            let (y_low, y_high) = interval(*y, *y_precision, tolerance);
+            let (x_low, x_high) = interval(*x, *x_precision, tolerance);
+            let (before, equal) = if options.descending {
+                (y_high > x_low, y_high == x_low)
+            } else {
+                (y_low < x_high, y_low == x_high)
+            };
+            if before {
+                Precedence::Before
+            } else if equal {
+                Precedence::Equal
+            } else {
+                Precedence::After
+            }
+        }
+        (Value::Scalar(y), Value::Scalar(x)) => {
+            y.partial_cmp(x).map_or(Precedence::After, ordered)
+        }
+        (Value::List(ys), Value::List(xs)) | (Value::Struct(ys), Value::Struct(xs)) => {
+            for (y, x) in ys.iter().zip(xs) {
+                match precedence(y, x, options, tolerance) {
+                    Precedence::Equal => {}
+                    other => return other,
+                }
+            }
+            ordered(ys.len().cmp(&xs.len()))
+        }
+        _ => Precedence::After,
+    }
+}
+
+/// Whether the row of `ORDER BY` keys `later` may sort before the row of keys
+/// `earlier`, or be equal to it, in the values that the engines may have for
+/// them within the tolerance `tolerance`. `options` are the sort options of
+/// the keys (ascending with nulls last if missing).
+fn may_precede(
+    later: &[Value],
+    earlier: &[Value],
+    options: &[SortOptions],
+    tolerance: f64,
+) -> bool {
+    for (i, (y, x)) in later.iter().zip(earlier).enumerate() {
+        let options = options.get(i).copied().unwrap_or(SortOptions {
+            descending: false,
+            nulls_first: false,
+        });
+        match precedence(y, x, options, tolerance) {
+            Precedence::Before => return true,
+            Precedence::After => return false,
+            Precedence::Equal => {}
+        }
+    }
+    true
 }
 
 /// The first and the last positions of sorted rows at which the rows of each
@@ -1829,8 +2119,14 @@ impl SortedReference {
             .flat_map(|batch| (0..batch.num_rows()).map(move |i| (batch, i)));
         let keys = rows
             .clone()
-            .map(|(batch, i)| row(batch, i, self.columns..width));
-        let (classes, truncated, varies) = classes(keys, tolerance)?;
+            .map(|(batch, i)| row(batch, i, self.columns..width))
+            .collect::<Result<Vec<_>>>()?;
+        let (classes, tied) = classes_and_ties(&keys, &self.sort_options, tolerance);
+        let truncated = classes.iter().map(|class| class.truncated).collect();
+        let classes = classes
+            .into_iter()
+            .map(|class| (class.rows, class.keys))
+            .collect();
         let mut values = vec![];
         for (position, (batch, i)) in rows.enumerate() {
             let next = self
@@ -1856,66 +2152,95 @@ impl SortedReference {
             uncomputed: self.uncomputed.clone(),
             classes,
             truncated,
-            varies,
+            tied,
             window,
         })
     }
 }
 
-/// For each class of sorted rows, the other classes whose keys tie with its
-/// keys (in their order), within the tolerance `tolerance`. The keys of the
-/// classes are their [`decision_keys`]: all but their last floating-point
-/// value cannot vary within the tolerance, and `varies` tells for each class
-/// whether its last one may (see [`may_vary`]).
+/// For each class of sorted rows (`classes`, of the rows of keys `keys`), the
+/// other classes whose keys tie with its keys (in their order), within the
+/// tolerance `tolerance`; and the classes whose keys meet the keys of
+/// another class, but whose ties with it depend on the later keys of their
+/// rows, which are not all equal. `options` are the sort options of the keys.
 ///
-/// Keys tie if they have the same [`Shape`] (their values but their
-/// floating-point values are equal), the same floating-point values but the
-/// last, and last values that are equal within the tolerance once for each
-/// of them that may vary: each engine's value may be off by the tolerance.
+/// The keys of the classes are their [`decision_keys`]: all but their last
+/// floating-point value cannot vary within the tolerance. Keys may tie if
+/// they have the same [`Shape`] (their values but their floating-point
+/// values are equal), and the same floating-point values but the last. Then
+/// they tie if the values that the engines may have for their last
+/// floating-point values cross (see [`meeting`]), or if they meet and the
+/// later keys may put the later row first (see [`may_precede`]).
 // The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
 // for memory accounting with the `arrow-buffer/pool` feature (enabled by
 // `--all-features`): it affects neither their equality nor their hashing. Not
 // `expect`: the lint only fires with that feature.
 #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
 fn tied_classes(
-    classes: &[(Range<usize>, Row)],
-    varies: &[bool],
+    classes: &[Class],
+    keys: &[Row],
+    options: &[SortOptions],
     tolerance: f64,
-) -> Vec<Vec<usize>> {
+) -> (Vec<Vec<usize>>, Vec<bool>) {
     let mut tied = vec![vec![]; classes.len()];
+    let mut meets = vec![false; classes.len()];
     // The classes of each shape and floating-point values but the last, and
     // the last floating-point value of each class.
     let mut members_of: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
-    let mut last = vec![0.0; classes.len()];
-    for (class, (_, keys)) in classes.iter().enumerate() {
+    let mut last = vec![(0.0, Precision::Double); classes.len()];
+    for (index, class) in classes.iter().enumerate() {
         let mut floats = vec![];
-        for value in keys {
-            value.collect_floats(&mut floats);
+        for value in &class.keys {
+            value.collect_floats_of_precision(&mut floats);
         }
         let Some(value) = floats.pop() else {
             continue;
         };
-        last[class] = normalized(value);
-        let others = floats.into_iter().map(|value| normalized(value).to_bits());
+        last[index] = value;
+        let others = floats
+            .into_iter()
+            .map(|(value, _)| normalized(value).to_bits());
         members_of
-            .entry((Shape(keys), others.collect()))
+            .entry((Shape(&class.keys), others.collect()))
             .or_default()
-            .push(class);
+            .push(index);
     }
+    // The values whose values may cross or meet are within twice the
+    // tolerance, but for rounding.
+    let reach = 2.0 * tolerance + 8.0 * f64::EPSILON;
     for members in members_of.values().filter(|members| members.len() > 1) {
         let values = members
             .iter()
-            .map(|&class| vec![last[class]])
+            .map(|&class| vec![normalized(last[class].0)])
             .collect::<Vec<_>>();
-        for (a, others) in equal_pairs(&values, &values, 2.0 * tolerance)
-            .into_iter()
-            .enumerate()
-        {
-            for b in others.into_iter().filter(|&b| b != a) {
-                let (a, b) = (members[a], members[b]);
-                let off = f64::from(u8::from(varies[a]) + u8::from(varies[b]));
-                if floats_equal(last[a], last[b], off * tolerance) {
+        for (i, others) in equal_pairs(&values, &values, reach).into_iter().enumerate() {
+            for j in others {
+                // Each pair once, the earlier class first.
+                let (a, b) = (members[i], members[j]);
+                if a >= b {
+                    continue;
+                }
+                let ties = match meeting(last[a], last[b], tolerance) {
+                    Meeting::Cross => true,
+                    Meeting::Meet if !classes[a].truncated && !classes[b].truncated => {
+                        true
+                    }
+                    Meeting::Meet if classes[a].equal && classes[b].equal => may_precede(
+                        &keys[classes[b].rows.start],
+                        &keys[classes[a].rows.start],
+                        options,
+                        tolerance,
+                    ),
+                    Meeting::Meet => {
+                        meets[a] = true;
+                        meets[b] = true;
+                        false
+                    }
+                    Meeting::Apart => false,
+                };
+                if ties {
                     tied[a].push(b);
+                    tied[b].push(a);
                 }
             }
         }
@@ -1924,7 +2249,7 @@ fn tied_classes(
         others.sort_unstable();
         others.dedup();
     }
-    tied
+    (tied, meets)
 }
 
 /// The normalized floating-point values of `row`, as bits: rows of the same
@@ -1982,7 +2307,7 @@ fn compare_sorted(
     let classes = &sorted.classes;
     // The keys of each engine may be off by the tolerance. Ties are not
     // transitive: two rows that tie with a row may not tie with each other.
-    let tied = tied_classes(classes, &sorted.varies, tolerance);
+    let tied = &sorted.tied;
     let ties = |a: usize, b: usize| a == b || tied[a].binary_search(&b).is_ok();
     let display = |row: &Row| {
         row.iter()
@@ -2012,7 +2337,7 @@ fn compare_sorted(
 
     // The first and the last positions of sorted rows at which the rows of
     // each class may be.
-    let bounds = bounds(classes, &tied);
+    let bounds = bounds(classes, tied);
 
     // The groups of sorted rows of a class with equal values, and the groups
     // of each class and shape.
@@ -2110,7 +2435,7 @@ fn compare_sorted(
         .map(|(rows, _)| rows.len())
         .collect::<Vec<_>>();
     let mut budget = MAX_SEARCHED_STATES;
-    for cluster in clusters(&tied) {
+    for cluster in clusters(tied) {
         let (first, end) = (
             classes[cluster.start].0.start,
             classes[cluster.end - 1].0.end,
@@ -2740,6 +3065,20 @@ impl Value {
                 values.iter().any(Self::has_floats)
             }
             Self::Null | Self::Scalar(_) => false,
+        }
+    }
+
+    /// Append the floating-point values of `self` to `floats`, with their
+    /// precisions.
+    fn collect_floats_of_precision(&self, floats: &mut Vec<(f64, Precision)>) {
+        match self {
+            Self::Float(value, precision) => floats.push((*value, *precision)),
+            Self::List(values) | Self::Struct(values) => {
+                for value in values {
+                    value.collect_floats_of_precision(floats);
+                }
+            }
+            Self::Null | Self::Scalar(_) => {}
         }
     }
 
@@ -4010,6 +4349,7 @@ mod tests {
             batches,
             columns,
             keys: keys.iter().map(ToString::to_string).collect(),
+            sort_options: vec![],
             skip,
             fetch,
             uncomputed: vec![],
@@ -4049,6 +4389,7 @@ mod tests {
             batches: vec![reference],
             columns: 1,
             keys: vec!["m.k".to_string()],
+            sort_options: vec![],
             skip,
             fetch,
             uncomputed: vec![],
@@ -4710,6 +5051,7 @@ mod tests {
             batches: vec![id_keys_batch(sorted)],
             columns: 1,
             keys: vec!["m.k1".to_string(), "m.k2".to_string()],
+            sort_options: vec![],
             skip,
             fetch,
             uncomputed: vec![],
