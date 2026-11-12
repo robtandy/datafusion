@@ -94,6 +94,7 @@ use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr::PhysicalExpr;
 use parking_lot::Mutex;
 
+use super::dynamic_filter::SharedCutoff;
 use super::grouped_ht::{GroupedHashTable, GroupedStates, evaluate_rows};
 use super::hash_aggregate::{
     AggregateSpec, InputBuffer, TopK, TopKOrder, rebuilt_literal,
@@ -192,17 +193,25 @@ struct RadixSinkState {
     partitions: Vec<Mutex<Partition>>,
     /// The partitions that have groups, set by `finalize`.
     non_empty: Mutex<Option<Vec<usize>>>,
+    /// For a top-k aggregation, the best cutoff of all threads, with which
+    /// every thread rules out rows (see [`RadixLocalState::flush`]).
+    cutoff: SharedCutoff,
+    /// Whether the threads update the dynamic filter of the aggregation, if
+    /// it has one (see `filters_enabled`).
+    filters: bool,
 }
 
 impl GlobalSinkState for RadixSinkState {}
 
 impl RadixSinkState {
-    fn new() -> Self {
+    fn new(filters: bool) -> Self {
         Self {
             partitions: (0..NUM_PARTITIONS)
                 .map(|_| Mutex::new(Partition::default()))
                 .collect(),
             non_empty: Mutex::new(None),
+            cutoff: SharedCutoff::default(),
+            filters,
         }
     }
 
@@ -273,9 +282,12 @@ struct RadixLocalState {
     hashes: Vec<u64>,
     partitions: Vec<u8>,
     /// For a top-k aggregation, the best cutoff of the groups that the thread
-    /// flushed so far (see [`TopK::cutoff`]): the input rows whose value is
-    /// worse are not aggregated.
+    /// flushed so far (see [`TopK::cutoff`]), or of those of another thread:
+    /// the input rows whose value is worse are not aggregated.
     cutoff: Option<ArrayRef>,
+    /// The generation of the best cutoff of all threads that the thread saw
+    /// last (see [`SharedCutoff::changed_since`]).
+    cutoff_generation: usize,
 }
 
 impl LocalSinkState for RadixLocalState {}
@@ -319,7 +331,10 @@ impl RadixLocalState {
     /// aggregate them), and its table is also flushed once it aggregated as
     /// many rows as it can hold groups, even if it is not full: the flush of a
     /// table keeps its top groups, whose values are better than those of the
-    /// other groups of the table. The thread of an
+    /// other groups of the table. The threads share their best cutoff (see
+    /// [`Self::flush`]): a thread rules out rows with the best cutoff of all
+    /// threads, which also sets the dynamic filter of the aggregation, if it
+    /// has one. The thread of an
     /// aggregation with a soft limit finishes once its table holds the groups
     /// of the limit.
     fn aggregate(
@@ -371,9 +386,14 @@ impl RadixLocalState {
             }
             return Ok(());
         }
-        // The rows of a top-k aggregation that its cutoff does not rule out,
-        // whose keys and arguments are evaluated once (see
-        // `top_k_candidates`).
+        // The rows of a top-k aggregation that its cutoff, or a better one of
+        // another thread, does not rule out, whose keys and arguments are
+        // evaluated once (see `top_k_candidates`).
+        if let Some(top_k) = &spec.top_k
+            && let Some(cutoff) = global.cutoff.changed_since(&mut self.cutoff_generation)
+        {
+            self.adopt_cutoff(top_k, cutoff)?;
+        }
         let candidates = match (&spec.top_k, &self.cutoff) {
             (Some(top_k), Some(cutoff)) => {
                 Some(top_k_candidates(spec, top_k, cutoff, batch)?)
@@ -450,6 +470,15 @@ impl RadixLocalState {
 
     /// Flush the groups of the table into the partitions of `global`: for a
     /// top-k aggregation, only the groups that may be among its top groups.
+    ///
+    /// The cutoff of the groups that a top-k aggregation flushes, if it is
+    /// better than the cutoff of the thread, becomes the cutoff of the
+    /// thread, and is offered to the other threads (see [`SharedCutoff`]):
+    /// a cutoff rules out the rows that cannot make their groups among the
+    /// top groups, whichever thread sees them. If it is the best cutoff of all
+    /// threads, it also sets the dynamic filter of the aggregation, so that
+    /// the nodes of the input that read it (e.g. scans of Parquet files) skip
+    /// these rows too (see [`super::dynamic_filter`]).
     fn flush(&mut self, spec: &AggregateSpec, global: &RadixSinkState) -> Result<()> {
         self.table_rows = 0;
         let Some(mut states) = self.table.emit_states()? else {
@@ -459,22 +488,31 @@ impl RadixLocalState {
             if let Some(indices) = top_k.select(top_k_values(top_k, &states)?)? {
                 states = states.take(&indices)?;
             }
-            if let Some(cutoff) = top_k.cutoff(top_k_values(top_k, &states)?)? {
-                let better = match &self.cutoff {
-                    Some(current) => {
-                        top_k.is_better(cutoff.as_ref(), current.as_ref())?
-                    }
-                    None => true,
-                };
-                if better {
-                    self.cutoff = Some(cutoff);
-                }
+            if let Some(cutoff) = top_k.cutoff(top_k_values(top_k, &states)?)?
+                && self.adopt_cutoff(top_k, Arc::clone(&cutoff))?
+            {
+                let filter = spec.dynamic_filter.as_ref().filter(|_| global.filters);
+                global.cutoff.offer(top_k, &cutoff, filter)?;
             }
         }
         hash_keys(&states.keys, &mut self.hashes, &mut self.partitions)?;
         self.flushed += states.num_groups();
         self.distinct_flushed.add(&self.hashes);
         global.add_states(states, &self.partitions)
+    }
+
+    /// Make `cutoff`, a cutoff of the top-k aggregation `top_k`, the cutoff of
+    /// the thread if it is better than the current one. Returns whether it
+    /// is.
+    fn adopt_cutoff(&mut self, top_k: &TopK, cutoff: ArrayRef) -> Result<bool> {
+        let better = match &self.cutoff {
+            Some(current) => top_k.is_better(cutoff.as_ref(), current.as_ref())?,
+            None => true,
+        };
+        if better {
+            self.cutoff = Some(cutoff);
+        }
+        Ok(better)
     }
 }
 
@@ -794,8 +832,11 @@ struct RadixLocalSource {
 impl LocalSourceState for RadixLocalSource {}
 
 impl RadixHashAggregate {
-    pub(crate) fn global_sink_state() -> Result<Arc<dyn GlobalSinkState>> {
-        Ok(Arc::new(RadixSinkState::new()))
+    /// The global sink state of an execution, whose threads update the
+    /// dynamic filter of the aggregation, if it has one, if `filters` (see
+    /// `filters_enabled`).
+    pub(crate) fn global_sink_state(filters: bool) -> Result<Arc<dyn GlobalSinkState>> {
+        Ok(Arc::new(RadixSinkState::new(filters)))
     }
 
     /// The local sink state of a thread, with a table of capacity `capacity`,
@@ -836,6 +877,7 @@ impl RadixHashAggregate {
             hashes: vec![],
             partitions: vec![],
             cutoff: None,
+            cutoff_generation: 0,
         }))
     }
 
@@ -1540,7 +1582,7 @@ mod tests {
     fn groups_are_scattered_to_the_partitions_of_their_hashes() -> Result<()> {
         for n in [1, 2, 63, 64, 1000, 5000] {
             let states = groups(n);
-            let global = RadixSinkState::new();
+            let global = RadixSinkState::new(false);
             global.add_states(states.clone(), &partitions_of(&states.keys)?)?;
             let mut seen = vec![false; n as usize];
             for (partition, data) in global.partitions.iter().enumerate() {
@@ -1574,7 +1616,7 @@ mod tests {
         }
         // 5000 groups are spread over all partitions.
         let states = groups(5000);
-        let global = RadixSinkState::new();
+        let global = RadixSinkState::new(false);
         global.add_states(states.clone(), &partitions_of(&states.keys)?)?;
         assert!(global.partitions.iter().all(|data| !data.lock().is_empty()));
         Ok(())
@@ -1848,7 +1890,7 @@ mod tests {
         let spec = two_stage_spec(&aggregate)?;
         assert!(spec.bypass);
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state()?))
+        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
     }
 
     /// The sink of `COUNT(*) GROUP BY k`, with tables of capacity `capacity`.
@@ -2047,7 +2089,7 @@ mod tests {
         let mut spec = two_stage_spec(&aggregate)?;
         Arc::get_mut(&mut spec).expect("a single owner").bypass = true;
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state()?))
+        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
     }
 
     /// A batch of keys `keys`, with binaries of `len` bytes.
@@ -3654,7 +3696,7 @@ mod tests {
                 TableCapacity::default(),
                 true,
             )?;
-            let mut sink = (spec, local, RadixHashAggregate::global_sink_state()?);
+            let mut sink = (spec, local, RadixHashAggregate::global_sink_state(false)?);
             let (spec, local, global) = &mut sink;
             let error = batches
                 .iter()
@@ -3868,7 +3910,7 @@ mod tests {
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
-        let global = RadixHashAggregate::global_sink_state()?;
+        let global = RadixHashAggregate::global_sink_state(false)?;
         // Two threads.
         let mut locals = (0..2)
             .map(|_| {
@@ -3960,7 +4002,7 @@ mod tests {
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state()?))
+        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
     }
 
     /// Combine the local sink state of `sink`, finalize the aggregation and
@@ -4233,7 +4275,7 @@ mod tests {
             aggregate.input(),
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
-        let global = RadixHashAggregate::global_sink_state()?;
+        let global = RadixHashAggregate::global_sink_state(false)?;
         let mut locals = (0..2)
             .map(|_| {
                 RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, spec.bypass)
@@ -4476,7 +4518,7 @@ mod tests {
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert_eq!(spec.soft_limit, Some(5));
         assert!(spec.top_k.is_none() && !spec.bypass);
-        let global = RadixHashAggregate::global_sink_state()?;
+        let global = RadixHashAggregate::global_sink_state(false)?;
         let mut local = RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, false)?;
         let mut sink = |keys: Vec<i64>| {
             RadixHashAggregate::sink(
