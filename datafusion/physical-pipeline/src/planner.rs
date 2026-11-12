@@ -34,6 +34,7 @@
 //! | `UnionExec`, `InterleaveExec`                                                      | [`PhysicalUnion`]                                  |
 //! | `PlaceholderRowExec`                                                               | [`PhysicalPlaceholderRow`]                         |
 //! | `FilterExec`                                                                       | [`PhysicalFilter`] in a [`CachingOperator`]        |
+//! | `FilterExec` directly above a Parquet scan                                         | the scan, with the filter folded into it, in a [`CachingOperator`] (see `Lowering::try_fold_filter`) |
 //! | `ProjectionExec`                                                                   | [`PhysicalProjection`]                             |
 //! | `ScalarSubqueryExec` (of uncorrelated scalar subqueries)                           | [`PhysicalScalarSubquery`]                         |
 //! | `DataSourceExec` (memory, Parquet, CSV), `EmptyExec`                               | the sources of [`try_create_scan_source`]          |
@@ -1019,7 +1020,8 @@ impl Lowering<'_> {
     /// * a Parquet scan reads them in its predicate, like the dynamic filters
     ///   that DataFusion pushes into it: it skips the files, row groups and
     ///   pages (by their statistics, page indexes and bloom filters) that they
-    ///   reject, and filters its rows with them with `pushdown_filters`. Its
+    ///   reject, and filters its rows with them where that pays off (see
+    ///   [`crate::sources::ParquetScanSource`]). Its
     ///   predicate is evaluated on the columns of its files, before its
     ///   projection: its filters are of keys that are columns of its files (see
     ///   [`route_join_filters`]), which its projection does not compute;
@@ -1327,6 +1329,9 @@ impl Lowering<'_> {
     /// A filter with a fetch stops its pipeline once it has produced its
     /// rows, as a limit does: its input is lowered in a pipeline that may stop
     /// early. (Its own cache, if any, is emitted when it stops.)
+    ///
+    /// A filter directly above a Parquet scan is folded into the scan (see
+    /// [`Self::try_fold_filter`]).
     fn lower_filter(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1335,6 +1340,12 @@ impl Lowering<'_> {
         if !PhysicalFilter::supports_filter_exec(filter) {
             return Ok(bridge(plan));
         }
+        if let Some(scan) = self.try_fold_filter(filter)? {
+            if self.early_stop.get() {
+                return Ok(scan);
+            }
+            return Ok(Arc::new(CachingOperator::new(scan)));
+        }
         let early_stop = self.early_stop.get() || filter.fetch().is_some();
         let input = self.lower_in(filter.input(), early_stop)?;
         let filter = Arc::new(PhysicalFilter::try_from_filter_exec(filter, input)?);
@@ -1342,6 +1353,41 @@ impl Lowering<'_> {
             return Ok(filter);
         }
         Ok(Arc::new(CachingOperator::new(filter)))
+    }
+
+    /// Fold `filter`, a `FilterExec` without a fetch, into the Parquet scan
+    /// directly below it (also through nodes that only distribute or schedule
+    /// its rows, which are removed anyway), if the scan has no limit: the
+    /// scan, lowered as any scan (see [`Self::lower_scan`]), produces the
+    /// output of the filter, which it applies with row filters and late
+    /// materialization where they pay off, and natively after decoding
+    /// otherwise (see [`crate::sources::ParquetScanSource::try_with_filter`]),
+    /// like DuckDB's scans apply the filters of a query, whatever
+    /// `datafusion.execution.parquet.pushdown_filters` says.
+    fn try_fold_filter(
+        &self,
+        filter: &FilterExec,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        if filter.fetch().is_some() {
+            return Ok(None);
+        }
+        let mut scan = filter.input();
+        while let Some(input) =
+            redistributed_input(scan).or_else(|| scheduled_input(scan))
+        {
+            scan = input;
+        }
+        if !crate::sources::ParquetScanSource::can_fold_filter_into(scan) {
+            return Ok(None);
+        }
+        let Some(lowered) = self.lower_scan(scan)? else {
+            return Ok(None);
+        };
+        let Some(source) = lowered.downcast_ref::<crate::sources::ParquetScanSource>()
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(source.try_with_filter(filter)?)))
     }
 
     /// Lower a `ProjectionExec` to a [`PhysicalProjection`], unless the native
@@ -9489,7 +9535,8 @@ mod join_filters {
         // and in a CSV file, below a cross join and an aggregation: DataFusion
         // pushes the filter of the join into neither, while the planner routes
         // it to both. The Parquet scan prunes the 38 row groups of the other
-        // keys of its 40, and the CSV scan filters its rows.
+        // keys of its 40 (and filters the rows of the other 2), and the CSV
+        // scan filters its rows.
         let dir = tempfile::tempdir()?;
         let generator = datafusion_context(test_session_config());
         let fact = generator
@@ -9529,7 +9576,7 @@ mod join_filters {
                    (SELECT ov FROM other WHERE ok < 2) o) x \
                  ON d.dk = x.fk WHERE d.dname IN ('d0', 'd1', 'd2')",
                 "fk",
-                200,
+                120,
                 (38, 40),
             ),
             (
