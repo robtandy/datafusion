@@ -65,7 +65,10 @@
 //! of the operator runs a copy of the recursive term with scalar subqueries,
 //! materialized CTEs and dynamic filters of its own (see
 //! `with_own_scalar_subqueries`, `with_own_materialized_ctes` and
-//! `with_own_dynamic_filters`).
+//! `with_own_dynamic_filters`). Where a copy cannot have state of its own
+//! (e.g. a container of scalar subquery results that a node reads that the
+//! copy does not build again), the iterations of the executions that share
+//! it take turns (see `shares_state`).
 //!
 //! # The working table
 //!
@@ -137,7 +140,9 @@ use datafusion_expr::physical_planning_context::ScalarSubqueryResults;
 use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
 use datafusion_physical_expr::projection::ProjectionExpr;
 use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{
+    EquivalenceProperties, LexOrdering, Partitioning, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion_physical_plan::aggregates::AggregateExec;
 use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_values};
 use datafusion_physical_plan::aggregates::order::GroupClustering;
@@ -189,6 +194,10 @@ pub struct PhysicalRecursiveCte {
     /// The DataFusion plan of the recursive term, with
     /// [`PipelineWorkTableExec`]s, which every iteration resets and lowers.
     recursive_plan: Arc<dyn ExecutionPlan>,
+    /// Taken by every iteration of the executions whose copies of the
+    /// recursive term share state with `recursive_plan` (see
+    /// [`shares_state`]), so that they run one at a time.
+    turns: Arc<futures::lock::Mutex<()>>,
 }
 
 impl PhysicalRecursiveCte {
@@ -245,6 +254,7 @@ impl PhysicalRecursiveCte {
             is_distinct: exec.is_distinct(),
             children: vec![static_term, recursive_term],
             recursive_plan,
+            turns: Arc::default(),
         }))
     }
 
@@ -308,27 +318,48 @@ impl PhysicalRecursiveCte {
         // The scans of the working table read the rows of the last term.
         *iterations.work_tables.table.lock() = Some(working_table);
         iterations.count += 1;
-        let term =
-            Self::lower_recursive_term(&iterations.recursive_plan, &iterations.task_ctx)?;
-        let sink: Arc<dyn PhysicalOperator> = Arc::new(RecursiveTermSink::try_new(
-            term,
-            Arc::clone(&state.collector),
-            ctx.metrics(self),
-        )?);
-        let executor =
-            Executor::try_new(sink, Arc::clone(&iterations.task_ctx), state.num_threads)?;
         log::trace!(
             "{}: iteration {} over {} rows",
             self.description(),
             iterations.count,
             recursion.current.as_ref().map_or(0, |table| table.rows)
         );
+        let (plan, task_ctx) = (
+            Arc::clone(&iterations.recursive_plan),
+            Arc::clone(&iterations.task_ctx),
+        );
+        let (collector, metrics) = (Arc::clone(&state.collector), ctx.metrics(self));
+        let num_threads = state.num_threads;
+        let executor = move || {
+            let term = Self::lower_recursive_term(&plan, &task_ctx)?;
+            let sink: Arc<dyn PhysicalOperator> =
+                Arc::new(RecursiveTermSink::try_new(term, collector, metrics)?);
+            Executor::try_new(sink, task_ctx, num_threads)
+        };
         let outcome = Arc::new(Mutex::new(None));
-        recursion.phase = Phase::Iterating(Arc::clone(&outcome));
-        Ok(Box::pin(async move {
-            let result = executor.execute().await;
-            *outcome.lock() = Some(result);
-        }))
+        let iteration: BoxFuture<'static, ()> = if iterations.takes_turns {
+            // Reset and lowered in its turn too: the reset clears the state
+            // that the iteration shares.
+            let turns = Arc::clone(&self.turns);
+            let outcome = Arc::clone(&outcome);
+            Box::pin(async move {
+                let _turn = turns.lock().await;
+                let result = match executor() {
+                    Ok(executor) => executor.execute().await,
+                    Err(error) => Err(error),
+                };
+                *outcome.lock() = Some(result);
+            })
+        } else {
+            let executor = executor()?;
+            let outcome = Arc::clone(&outcome);
+            Box::pin(async move {
+                let result = executor.execute().await;
+                *outcome.lock() = Some(result);
+            })
+        };
+        recursion.phase = Phase::Iterating(outcome);
+        Ok(iteration)
     }
 }
 
@@ -695,9 +726,14 @@ enum Phase {
 /// with.
 #[derive(Debug)]
 struct Iterations {
-    /// The DataFusion plan of the recursive term, with dynamic filters of
-    /// this execution (see [`with_own_dynamic_filters`]).
+    /// The DataFusion plan of the recursive term, with scalar subqueries,
+    /// materialized CTEs and dynamic filters of this execution (see
+    /// [`Iterations::try_new`]).
     recursive_plan: Arc<dyn ExecutionPlan>,
+    /// Whether `recursive_plan` still shares state with the plan of the
+    /// recursive term (see [`shares_state`]): its iterations then take turns
+    /// with those of the other executions of the plan.
+    takes_turns: bool,
     /// The task context of the executions of the iterations, with
     /// `work_tables` in its session config.
     task_ctx: Arc<TaskContext>,
@@ -711,10 +747,11 @@ impl Iterations {
     /// What the iterations of the CTE `name`, with the recursive term
     /// `recursive_plan`, run with in an execution with the task context
     /// `task_ctx`: a copy of `recursive_plan` with scalar subqueries,
-    /// materialized CTEs and dynamic filters of its own, and `task_ctx`, whose
-    /// session config also holds the working table of the CTE, in front of
-    /// those of the recursive queries around it (in the session config of
-    /// `task_ctx`).
+    /// materialized CTEs and dynamic filters of its own (whose iterations
+    /// take turns with those of the other executions if it shares some with
+    /// `recursive_plan` after all), and `task_ctx`, whose session config also
+    /// holds the working table of the CTE, in front of those of the recursive
+    /// queries around it (in the session config of `task_ctx`).
     fn try_new(
         name: &str,
         task_ctx: &TaskContext,
@@ -737,18 +774,73 @@ impl Iterations {
             task_ctx.window_functions().clone(),
             task_ctx.runtime_env(),
         );
-        let recursive_plan = with_own_scalar_subqueries(recursive_plan)?;
+        let copy = with_own_scalar_subqueries(recursive_plan)?;
         // The materialized CTEs before the filters: `MaterializedCteExec::new`
         // (also when the filters are copied) gives the buffer of the CTE its
         // body.
-        let recursive_plan = with_own_materialized_ctes(&recursive_plan)?;
+        let copy = with_own_materialized_ctes(&copy)?;
+        let copy = with_own_dynamic_filters(&copy)?;
         Ok(Self {
-            recursive_plan: with_own_dynamic_filters(&recursive_plan)?,
+            takes_turns: shares_state(&copy, recursive_plan)?,
+            recursive_plan: copy,
             task_ctx: Arc::new(task_ctx),
             work_tables,
             count: 0,
         })
     }
+}
+
+/// Whether `copy`, the copy of `plan` with state of its own that an execution
+/// runs (see [`Iterations::try_new`]), shares state with `plan` after all,
+/// and so with the copies of the other executions: a container of the results
+/// of a scalar subquery that a node reads that the copy cannot rebuild, the
+/// buffer of a materialized CTE, or a dynamic filter, in the nodes that could
+/// not be built again.
+///
+/// Every iteration resets that state in place, and then reads it: the
+/// iterations of the executions that share some take turns, so that one does
+/// not reset what another reads.
+fn shares_state(
+    copy: &Arc<dyn ExecutionPlan>,
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<bool> {
+    #[derive(Default)]
+    struct State {
+        results: Vec<ScalarSubqueryResults>,
+        buffers: Vec<Arc<MaterializedCteBuffer>>,
+        filters: Vec<u64>,
+    }
+    let state_of = |plan: &Arc<dyn ExecutionPlan>| -> Result<State> {
+        let mut state = State::default();
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<ScalarSubqueryExec>() {
+                state.results.push(exec.results().clone());
+            }
+            if let Some(cte) = node.downcast_ref::<MaterializedCteExec>() {
+                state.buffers.push(Arc::clone(cte.buffer()));
+            }
+            state.filters.extend(
+                node.dynamic_expressions_produced()
+                    .iter()
+                    .filter_map(|filter| filter.expression_id()),
+            );
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(state)
+    };
+    let (copy, plan) = (state_of(copy)?, state_of(plan)?);
+    Ok(copy.results.iter().any(|results| {
+        plan.results
+            .iter()
+            .any(|plan| ScalarSubqueryResults::ptr_eq(plan, results))
+    }) || copy
+        .buffers
+        .iter()
+        .any(|buffer| plan.buffers.iter().any(|plan| Arc::ptr_eq(plan, buffer)))
+        || copy
+            .filters
+            .iter()
+            .any(|filter| plan.filters.contains(filter)))
 }
 
 /// The new result containers of the scalar subqueries of a copy of a plan,
@@ -781,11 +873,12 @@ fn new_results_of<'a>(
 /// have some in a recursive term.
 ///
 /// The expressions are built again in the predicates of `FilterExec`s and of
-/// Parquet scans, and in the expressions of `ProjectionExec`s. A container
+/// Parquet scans, and in the expressions of `ProjectionExec`s and of
+/// `SortExec`s. A container
 /// that another node of `plan` reads is kept, with its `ScalarSubqueryExec`
-/// (whose executions then share it), and so is `plan` if a node cannot be
-/// built again (e.g. a hash join with a prepared build side, with other
-/// children).
+/// (whose executions then share it, and take turns: see [`shares_state`]),
+/// and so is `plan` if a node cannot be built again (e.g. a hash join with a
+/// prepared build side, with other children).
 fn with_own_scalar_subqueries(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -812,6 +905,7 @@ fn with_own_scalar_subqueries(
     plan.apply(|node| {
         let rebuilt = node.is::<FilterExec>()
             || node.is::<ProjectionExec>()
+            || node.is::<SortExec>()
             || node.downcast_ref::<DataSourceExec>().is_some_and(|scan| {
                 scan.downcast_to_file_source::<ParquetSource>().is_some()
             });
@@ -901,7 +995,11 @@ fn with_new_results(
 
 /// `node` reading the results of the new containers of `new_results` in place
 /// of those of the containers that they replace, if it is a `FilterExec`, a
-/// `ProjectionExec` or a scan of Parquet files that reads some of them.
+/// `ProjectionExec`, a `SortExec` or a scan of Parquet files that reads some
+/// of them.
+// `with_dynamic_filter_expr` is deprecated: DataFusion only uses it to restore
+// the filters of the plans that it decodes, and this to copy plans.
+#[expect(deprecated)]
 fn with_new_results_read(
     node: Arc<dyn ExecutionPlan>,
     new_results: &NewResults,
@@ -944,6 +1042,37 @@ fn with_new_results_read(
         )?;
         if rebuilt.schema() != schema {
             return internal_err!("The projection does not keep its schema");
+        }
+        return Ok(Arc::new(rebuilt));
+    }
+    if let Some(sort) = node.downcast_ref::<SortExec>() {
+        let mut rewritten = false;
+        let ordering = sort
+            .expr()
+            .iter()
+            .map(|sort_expr| {
+                Ok(match with_new_results_in(&sort_expr.expr, new_results)? {
+                    Some(expr) => {
+                        rewritten = true;
+                        PhysicalSortExpr::new(expr, sort_expr.options)
+                    }
+                    None => sort_expr.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !rewritten {
+            return Ok(node);
+        }
+        let Some(ordering) = LexOrdering::new(ordering) else {
+            return internal_err!("A sort has an ordering");
+        };
+        // With the fetch, the partitioning and (for a TopK) the dynamic
+        // filter of the sort, which the copy of the filters replaces.
+        let mut rebuilt = SortExec::new(ordering, Arc::clone(sort.input()))
+            .with_preserve_partitioning(sort.preserve_partitioning())
+            .with_fetch(sort.fetch());
+        if let Some(filter) = sort.dynamic_filter_expr() {
+            rebuilt = rebuilt.with_dynamic_filter_expr(filter)?;
         }
         return Ok(Arc::new(rebuilt));
     }
@@ -1014,7 +1143,8 @@ type NewBuffers = HashMap<u64, Arc<MaterializedCteBuffer>>;
 /// CTE declared around the recursive query keep the buffer of that CTE, which
 /// is computed once for the whole query. If a node of `plan` cannot be built
 /// again (e.g. a hash join with a prepared build side, with other children),
-/// `plan` is kept as it is.
+/// `plan` is kept as it is (its executions then take turns: see
+/// [`shares_state`]).
 fn with_own_materialized_ctes(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -1154,7 +1284,7 @@ fn with_own_dynamic_filters(
 /// failing the query: the new filters that the readers of its filters read
 /// are then set by nothing, so they prune nothing, and a subtree that cannot
 /// be built again keeps the filters of `plan`, shared with its other
-/// executions.
+/// executions (which then take turns: see [`shares_state`]).
 fn with_new_filters(
     plan: &Arc<dyn ExecutionPlan>,
     filters: &NewFilters,
@@ -2046,8 +2176,8 @@ mod tests {
     use datafusion::functions_aggregate::min_max::max_udaf;
     use datafusion::physical_planner::DefaultPhysicalPlanner;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::DataFusionError;
     use datafusion_common::config::Dialect;
+    use datafusion_common::{DataFusionError, ScalarValue};
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::memory_pool::GreedyMemoryPool;
@@ -3469,6 +3599,10 @@ mod tests {
             &with_own_dynamic_filters(&unfiltered)?,
             &unfiltered
         ));
+        // The copy of an execution shares no state with the plan: its
+        // iterations take no turns.
+        let iterations = Iterations::try_new("w", &ctx.task_ctx(), term)?;
+        assert!(!iterations.takes_turns);
         Ok(())
     }
 
@@ -3712,7 +3846,7 @@ mod tests {
     }
 
     /// The containers of the results of the `ScalarSubqueryExec`s of `plan`,
-    /// and of the `ScalarSubqueryExpr`s that its `FilterExec`s read.
+    /// and of the `ScalarSubqueryExpr`s that its nodes read.
     fn scalar_subquery_results_of(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<(Vec<ScalarSubqueryResults>, Vec<ScalarSubqueryResults>)> {
@@ -3721,93 +3855,162 @@ mod tests {
             if let Some(exec) = node.downcast_ref::<ScalarSubqueryExec>() {
                 execs.push(exec.results().clone());
             }
-            if let Some(filter) = node.downcast_ref::<FilterExec>() {
-                filter.predicate().apply(|expr| {
+            node.apply_expressions(&mut |root| {
+                root.apply(|expr| {
                     if let Some(read) = expr.downcast_ref::<ScalarSubqueryExpr>() {
                         reads.push(read.results().clone());
                     }
                     Ok(TreeNodeRecursion::Continue)
-                })?;
-            }
-            Ok(TreeNodeRecursion::Continue)
+                })
+            })
         })?;
         Ok((execs, reads))
     }
 
-    #[tokio::test]
-    async fn copies_of_recursive_terms_have_scalar_subqueries_of_their_own() -> Result<()>
-    {
+    /// The plan of [`scalar_subquery_in_the_recursive_term`], whose recursive
+    /// term also reads the result of the scalar subquery, in the node
+    /// `reader(read, input)` over the input of the scalar subquery.
+    async fn scalar_subquery_also_read_by(
+        reader: impl Fn(
+            Arc<dyn PhysicalExpr>,
+            Arc<dyn ExecutionPlan>,
+        ) -> Arc<dyn ExecutionPlan>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let plan = scalar_subquery_in_the_recursive_term().await?;
-        let term = plan.children()[1];
-        let (execs, reads) = scalar_subquery_results_of(term)?;
-        let ([results], [read]) = (&execs[..], &reads[..]) else {
-            panic!("a scalar subquery read by a filter");
-        };
-        assert!(ScalarSubqueryResults::ptr_eq(results, read));
-        // Every copy has a container of its own, which its filter reads, and
-        // the plan keeps its own.
-        let copies = [
-            with_own_scalar_subqueries(term)?,
-            with_own_scalar_subqueries(term)?,
-        ];
-        let copies = copies.each_ref().map(|copy| {
-            let (execs, reads) = scalar_subquery_results_of(copy).unwrap();
-            let ([copy_results], [copy_read]) = (&execs[..], &reads[..]) else {
-                panic!("a scalar subquery read by a filter");
-            };
-            assert!(ScalarSubqueryResults::ptr_eq(copy_results, copy_read));
-            assert!(!ScalarSubqueryResults::ptr_eq(copy_results, results));
-            copy_results.clone()
-        });
-        assert!(!ScalarSubqueryResults::ptr_eq(&copies[0], &copies[1]));
-        let (execs, _) = scalar_subquery_results_of(term)?;
-        assert!(ScalarSubqueryResults::ptr_eq(&execs[0], results));
-        // A container that a node reads that this does not build again (here
-        // the expression of a sort) is shared.
-        let exec = term.downcast_ref::<ScalarSubqueryExec>().unwrap();
+        let recursion = plan.downcast_ref::<RecursiveQueryExec>().unwrap();
+        let exec = recursion
+            .recursive_term()
+            .downcast_ref::<ScalarSubqueryExec>()
+            .unwrap();
         let read: Arc<dyn PhysicalExpr> = Arc::new(ScalarSubqueryExpr::new(
             DataType::Int64,
             true,
             exec.subqueries()[0].index,
-            results.clone(),
+            exec.results().clone(),
         ));
-        let sort = Arc::new(SortExec::new(
-            [PhysicalSortExpr::new_default(read)].into(),
-            Arc::clone(exec.input()),
-        ));
-        let sorted: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
-            sort,
+        let term = Arc::new(ScalarSubqueryExec::new(
+            reader(read, Arc::clone(exec.input())),
             exec.subqueries().to_vec(),
-            results.clone(),
+            exec.results().clone(),
         ));
-        let (execs, _) =
-            scalar_subquery_results_of(&with_own_scalar_subqueries(&sorted)?)?;
-        assert!(ScalarSubqueryResults::ptr_eq(&execs[0], results));
-        Ok(())
+        Ok(Arc::new(RecursiveQueryExec::try_new(
+            recursion.name().to_owned(),
+            recursion.schema(),
+            Arc::clone(recursion.static_term()),
+            term,
+            recursion.is_distinct(),
+        )?))
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_executions_of_a_plan_have_scalar_subqueries_of_their_own()
-    -> Result<()> {
-        // DataFusion runs the hand-built plan, one execution at a time.
-        let plan = scalar_subquery_in_the_recursive_term().await?;
+    /// A sort of `input` by `read`.
+    fn sort_by(
+        read: Arc<dyn PhysicalExpr>,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(SortExec::new(
+            [PhysicalSortExpr::new_default(read)].into(),
+            input,
+        ))
+    }
+
+    /// A node that DataFusion executes (as every user-defined node): it
+    /// evaluates `expr` on every batch of its input, and passes them on.
+    #[derive(Debug)]
+    struct EvaluatesExpr {
+        expr: Arc<dyn PhysicalExpr>,
+        input: Arc<dyn ExecutionPlan>,
+    }
+
+    impl DisplayAs for EvaluatesExpr {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut fmt::Formatter<'_>,
+        ) -> fmt::Result {
+            write!(f, "EvaluatesExpr: {}", self.expr)
+        }
+    }
+
+    impl ExecutionPlan for EvaluatesExpr {
+        fn name(&self) -> &str {
+            "EvaluatesExpr"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            f(&self.expr)
+        }
+
+        fn replace_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+            _options: ReplaceChildrenOptions,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self {
+                expr: Arc::clone(&self.expr),
+                input: children.swap_remove(0),
+            }))
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            self.replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let expr = Arc::clone(&self.expr);
+            let input = self.input.execute(partition, context)?;
+            let schema = input.schema();
+            let output = input.map(move |batch| {
+                let batch = batch?;
+                expr.evaluate(&batch)?;
+                Ok(batch)
+            });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, output)))
+        }
+    }
+
+    /// The executions of `plan` (a DataFusion plan with a recursive query)
+    /// return `expected` (as the first column of their rows), in DataFusion,
+    /// and in the pipeline engine (natively), `executions` at a time, twice.
+    async fn assert_concurrent_executions_return(
+        plan: Arc<dyn ExecutionPlan>,
+        expected: Vec<i64>,
+        executions: usize,
+    ) -> Result<()> {
         let ctx = datafusion_context(test_session_config());
-        let expected = (1..=55).collect::<Vec<_>>();
         let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
         assert_eq!(sorted_values(&batches), expected);
-        // The executions of one plan must not clear the results that each
-        // other's iterations read.
         let state = ctx.state();
         let root = lower_execution_plan_with_runtime(
             &plan,
             state.config_options(),
             state.runtime_env(),
         )?;
-        assert_recursion_is_native(&root, "a scalar subquery in the recursive term");
+        assert_recursion_is_native(&root, "a plan built by hand");
         let plan: Arc<dyn ExecutionPlan> =
             Arc::new(PipelineRootExec::try_new(root, plan)?);
         for _ in 0..2 {
-            let executions = (0..64)
+            let executions = (0..executions)
                 .map(|_| {
                     let (plan, task_ctx) = (Arc::clone(&plan), ctx.task_ctx());
                     SpawnedTask::spawn(async move { collect(plan, task_ctx).await })
@@ -3821,6 +4024,114 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn copies_of_recursive_terms_have_scalar_subqueries_of_their_own() -> Result<()>
+    {
+        let task_ctx = datafusion_context(test_session_config()).task_ctx();
+        // The scalar subquery of the recursive term, read by a filter, and
+        // also by a sort.
+        let plans = [
+            scalar_subquery_in_the_recursive_term().await?,
+            scalar_subquery_also_read_by(sort_by).await?,
+        ];
+        for (plan, readers) in plans.iter().zip([1, 2]) {
+            let term = plan.children()[1];
+            let (execs, reads) = scalar_subquery_results_of(term)?;
+            let [results] = &execs[..] else {
+                panic!("a scalar subquery");
+            };
+            assert_eq!(reads.len(), readers);
+            assert!(
+                reads
+                    .iter()
+                    .all(|read| ScalarSubqueryResults::ptr_eq(results, read))
+            );
+            // Every copy has a container of its own, which all of its readers
+            // read, and the plan keeps its own.
+            let copy_plans = [
+                with_own_scalar_subqueries(term)?,
+                with_own_scalar_subqueries(term)?,
+            ];
+            let copies = copy_plans.each_ref().map(|copy| {
+                let (execs, reads) = scalar_subquery_results_of(copy).unwrap();
+                let [copy_results] = &execs[..] else {
+                    panic!("a scalar subquery");
+                };
+                assert_eq!(reads.len(), readers);
+                assert!(
+                    reads
+                        .iter()
+                        .all(|read| ScalarSubqueryResults::ptr_eq(copy_results, read))
+                );
+                assert!(!ScalarSubqueryResults::ptr_eq(copy_results, results));
+                copy_results.clone()
+            });
+            assert!(!ScalarSubqueryResults::ptr_eq(&copies[0], &copies[1]));
+            let (execs, reads) = scalar_subquery_results_of(term)?;
+            assert!(ScalarSubqueryResults::ptr_eq(&execs[0], results));
+            assert!(
+                reads
+                    .iter()
+                    .all(|read| ScalarSubqueryResults::ptr_eq(results, read))
+            );
+            // Once the subquery of one copy has its result, the resets of the
+            // other copy and of the plan (by the iterations of other
+            // executions) leave it to the readers of the first.
+            let exec = term.downcast_ref::<ScalarSubqueryExec>().unwrap();
+            let index = exec.subqueries()[0].index;
+            let result = ScalarValue::Int64(Some(55));
+            copies[0].set(index, result.clone())?;
+            reset_plan_states(Arc::clone(&copy_plans[1]))?;
+            reset_plan_states(Arc::clone(term))?;
+            assert_eq!(copies[0].get(index), Some(result));
+            // So the copy of an execution shares no state with the plan: its
+            // iterations take no turns.
+            assert!(!Iterations::try_new("t", &task_ctx, term)?.takes_turns);
+        }
+        // A container that a node reads that the copy does not build again
+        // (here a user-defined node) is shared: the iterations of the
+        // executions take turns.
+        let plan = scalar_subquery_also_read_by(|expr, input| {
+            Arc::new(EvaluatesExpr { expr, input })
+        })
+        .await?;
+        let term = plan.children()[1];
+        let (execs, _) = scalar_subquery_results_of(term)?;
+        let (copy_execs, _) =
+            scalar_subquery_results_of(&with_own_scalar_subqueries(term)?)?;
+        assert!(ScalarSubqueryResults::ptr_eq(&copy_execs[0], &execs[0]));
+        assert!(Iterations::try_new("t", &task_ctx, term)?.takes_turns);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_executions_of_a_plan_have_scalar_subqueries_of_their_own()
+    -> Result<()> {
+        // The executions of one plan must not clear the results that each
+        // other's iterations read: in a filter, and in a sort (whose
+        // iterations clear them less often while another reads them).
+        let expected = (1..=55).collect::<Vec<_>>();
+        let plan = scalar_subquery_in_the_recursive_term().await?;
+        assert_concurrent_executions_return(plan, expected.clone(), 64).await?;
+        let plan = scalar_subquery_also_read_by(sort_by).await?;
+        assert_concurrent_executions_return(plan, expected, 256).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn executions_that_share_state_take_turns() -> Result<()> {
+        // The copies of a recursive term whose scalar subquery a user-defined
+        // node reads share its results with the plan: the iterations of
+        // their executions take turns, so that none clears the results that
+        // another reads.
+        let plan = scalar_subquery_also_read_by(|expr, input| {
+            Arc::new(EvaluatesExpr { expr, input })
+        })
+        .await?;
+        let task_ctx = datafusion_context(test_session_config()).task_ctx();
+        assert!(Iterations::try_new("t", &task_ctx, plan.children()[1])?.takes_turns);
+        assert_concurrent_executions_return(plan, (1..=55).collect(), 64).await
     }
 
     /// A recursive query whose recursive term computes a materialized CTE
