@@ -93,8 +93,9 @@
 //! only has projections, filters, sorts, subquery aliases and inner joins
 //! above its nested limits, the rows of the result of the pipeline engine
 //! show which rows its nested limits returned, which may be any rows that
-//! they may return. Otherwise (e.g. for an aggregate over them), DataFusion
-//! tries up to 64 choices of their rows, of one or several at once.
+//! they may return. Otherwise (e.g. for an aggregate over them), one physical
+//! plan of the query runs for up to 20,000 choices of their rows, of one or
+//! several at once. Each occurrence of a nested limit may return other rows.
 //!
 //! Queries must still define their results: no `LIMIT` without `ORDER BY`,
 //! and no aggregates that depend on the order of their input without an
@@ -844,11 +845,6 @@ where
     })
 }
 
-/// The maximum number of choices of the rows that the nested
-/// `ORDER BY … LIMIT`s of a query return, for which [`alternative_outcomes`]
-/// runs the query, if the rows of its result do not show them.
-const MAX_ALTERNATIVES: usize = 64;
-
 /// The name of the column of the lineage of the rows of the `i`th nested
 /// limit of a query, see [`lineage_choices`].
 fn lineage_column(i: usize) -> String {
@@ -866,36 +862,56 @@ struct NestedLimit {
 }
 
 impl NestedLimit {
-    /// The sorted rows `rows` (positions), as a plan of the output schema of
-    /// the limit, followed by their positions in the column `lineage`.
-    fn rows(&self, rows: &[usize], lineage: Option<&str>) -> Result<LogicalPlan> {
-        let positions = rows
+    /// The fields of the output schema of the limit, with their qualifiers.
+    fn fields(&self) -> Vec<(Option<TableReference>, FieldRef)> {
+        self.plan
+            .schema()
             .iter()
-            .map(|&row| u32::try_from(row))
-            .collect::<std::result::Result<UInt32Array, _>>()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map(|(qualifier, field)| (qualifier.cloned(), Arc::clone(field)))
+            .collect()
+    }
+
+    /// The output columns of the sorted rows `rows` (positions).
+    fn columns(&self, rows: &[usize]) -> Result<Vec<ArrayRef>> {
+        let positions = positions_array(rows)?;
         let batch = self
             .reference
             .batches
             .first()
             .ok_or_else(|| DataFusionError::Internal("no sorted rows".to_string()))?;
-        let mut columns = batch.columns()[..self.reference.columns]
+        Ok(batch.columns()[..self.reference.columns]
             .iter()
             .map(|column| take(column, &positions, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut fields = self
-            .plan
-            .schema()
-            .iter()
-            .map(|(qualifier, field)| (qualifier.cloned(), Arc::clone(field)))
-            .collect::<Vec<_>>();
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The sorted rows `rows` (positions), as a plan of the output schema of
+    /// the limit, followed by their positions in the column `lineage`.
+    fn rows(&self, rows: &[usize], lineage: Option<&str>) -> Result<LogicalPlan> {
+        let mut columns = self.columns(rows)?;
+        let mut fields = self.fields();
         if let Some(lineage) = lineage {
-            columns.push(Arc::new(positions));
+            columns.push(Arc::new(positions_array(rows)?));
             fields.push((None, Arc::new(Field::new(lineage, DataType::UInt32, false))));
         }
-        rows_plan(columns, &fields)
+        let batch = rows_batch(columns, &fields)?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        rows_plan(Arc::new(table), &fields)
     }
 }
+
+/// The positions `rows`, as an array.
+fn positions_array(rows: &[usize]) -> Result<UInt32Array> {
+    rows.iter()
+        .map(|&row| u32::try_from(row))
+        .collect::<std::result::Result<UInt32Array, _>>()
+        .map_err(|e| DataFusionError::External(Box::new(e)))
+}
+
+/// The maximum number of choices of the rows of the nested limits of a query
+/// for which [`alternative_outcomes`] runs its plan, if the rows of its result
+/// do not show them.
+const MAX_CHOICE_RUNS: usize = 20_000;
 
 /// Other outputs of DataFusion for `plan`, planned by `ctx`, with the order of
 /// their rows, to be compared with `options`, for other rows that the nested
@@ -907,9 +923,10 @@ impl NestedLimit {
 /// inner joins above its nested limits, the rows of `result` (the output of
 /// the other engine) show which rows they returned (see
 /// [`lineage_choices`]): the query runs for these rows, if they may be
-/// returned. Otherwise, it runs for up to [`MAX_ALTERNATIVES`] choices of
-/// rows of the nested limits, of one or several of them at once (see
-/// [`window_choices`]).
+/// returned. Otherwise, one physical plan runs for up to [`MAX_CHOICE_RUNS`]
+/// choices of rows of the nested limits, of one or several of them at once
+/// (see [`slot_choices`]), and the query runs again for those whose rows are
+/// the rows of `result`.
 pub async fn alternative_outcomes(
     ctx: &SessionContext,
     plan: &LogicalPlan,
@@ -935,19 +952,12 @@ pub async fn alternative_outcomes(
         return vec![];
     }
     let run = async |choices: &[Vec<usize>]| {
-        let mut replaced = plan.clone();
-        for (limit, choice) in nested.iter().zip(choices) {
-            let rows = limit.rows(choice, None)?;
-            replaced = replaced
-                .transform_up_with_subqueries(|node| {
-                    Ok(if node == limit.plan {
-                        Transformed::yes(rows.clone())
-                    } else {
-                        Transformed::no(node)
-                    })
-                })?
-                .data;
-        }
+        let rows = nested
+            .iter()
+            .zip(choices)
+            .map(|(limit, choice)| limit.rows(choice, None))
+            .collect::<Result<Vec<_>>>()?;
+        let replaced = replace_nested_limits(plan, &mut |i, _| rows.get(i).cloned())?;
         let output =
             run_dataframe(ctx, DataFrame::new(ctx.state(), replaced.clone())).await?;
         let order = result_order(ctx, &replaced, options).await;
@@ -966,20 +976,11 @@ pub async fn alternative_outcomes(
             alternatives
         }
         None => {
-            let choices = nested
-                .iter()
-                .map(|limit| {
-                    std::iter::once(limit.sorted.window.clone().collect())
-                        .chain(window_choices(&limit.sorted, MAX_ALTERNATIVES))
-                        .collect::<Vec<Vec<usize>>>()
-                })
-                .multi_cartesian_product()
-                // Not the rows of DataFusion.
-                .skip(1)
-                .take(MAX_ALTERNATIVES)
-                .collect::<Vec<_>>();
+            let shown = slot_choices(ctx, plan, &nested, result, tolerance)
+                .await
+                .unwrap_or_default();
             let mut alternatives = vec![];
-            for choices in choices {
+            for choices in shown {
                 if let Ok(alternative) = run(&choices).await {
                     alternatives.push(alternative);
                 }
@@ -987,6 +988,73 @@ pub async fn alternative_outcomes(
             alternatives
         }
     }
+}
+
+/// Up to 16 choices of the rows of the nested limits `nested` of `plan` for
+/// which the rows of the query are the rows of `result` (the output of the
+/// other engine), as a multiset: of one or several nested limits at once, up
+/// to [`MAX_CHOICE_RUNS`] choices in all. One physical plan, whose nested
+/// limits read their rows from [`Slot`]s, runs for each choice.
+async fn slot_choices(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    nested: &[NestedLimit],
+    result: &EngineOutput,
+    tolerance: f64,
+) -> Result<Vec<Vec<Vec<usize>>>> {
+    let result = result_rows(&result.batches)?;
+    let mut slots = vec![];
+    let mut tables = vec![];
+    for limit in nested {
+        let fields = limit.fields();
+        let empty = rows_batch(limit.columns(&[])?, &fields)?;
+        let slot = Arc::new(Slot {
+            schema: empty.schema(),
+            batch: Mutex::new(empty.clone()),
+        });
+        let partition = Arc::clone(&slot) as Arc<dyn PartitionStream>;
+        let table = StreamingTable::try_new(empty.schema(), vec![partition])?;
+        tables.push(rows_plan(Arc::new(table), &fields)?);
+        slots.push((slot, fields));
+    }
+    let replaced = replace_nested_limits(plan, &mut |i, _| tables.get(i).cloned())?;
+    let state = ctx.state();
+    let physical = state.create_physical_plan(&replaced).await?;
+    let per_limit = nested
+        .iter()
+        .map(|limit| {
+            std::iter::once(limit.sorted.window.clone().collect())
+                .chain(window_choices(&limit.sorted, MAX_CHOICE_RUNS))
+                .collect::<Vec<Vec<usize>>>()
+        })
+        .collect::<Vec<_>>();
+    let mut shown = vec![];
+    // Not the rows of DataFusion, which are the first ones.
+    for choices in per_limit
+        .into_iter()
+        .multi_cartesian_product()
+        .skip(1)
+        .take(MAX_CHOICE_RUNS)
+    {
+        for ((slot, fields), (limit, choice)) in
+            slots.iter().zip(nested.iter().zip(&choices))
+        {
+            *slot.batch.lock().expect("the slot is not poisoned") =
+                rows_batch(limit.columns(choice)?, fields)?;
+        }
+        let Ok(batches) =
+            collect(reset_plan_states(Arc::clone(&physical))?, state.task_ctx()).await
+        else {
+            continue;
+        };
+        if multiset_difference(&result_rows(&batches)?, &result, tolerance).is_empty() {
+            shown.push(choices);
+            if shown.len() == 16 {
+                break;
+            }
+        }
+    }
+    Ok(shown)
 }
 
 /// The rows that the nested limits `nested` of `plan` may have returned for
@@ -1016,12 +1084,22 @@ async fn lineage_choices(
         .collect::<Vec<_>>();
     let mut replacements = vec![];
     for (i, (limit, candidates)) in nested.iter().zip(&candidates).enumerate() {
-        replacements.push((
-            &limit.plan,
-            limit.rows(candidates, Some(&lineage_column(i))).ok()?,
-        ));
+        replacements.push(limit.rows(candidates, Some(&lineage_column(i))).ok()?);
     }
-    let lineage = lineage_plan(plan, &replacements).ok()??;
+    let replaced =
+        replace_nested_limits(plan, &mut |i, _| replacements.get(i).cloned()).ok()?;
+    let lineage = lineage_plan(&replaced).ok()??;
+    // The lineage of every nested limit must reach the rows of the query (not
+    // if a nested limit is in a subquery).
+    let names = lineage
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<HashSet<_>>();
+    if (0..nested.len()).any(|i| !names.contains(&lineage_column(i))) {
+        return None;
+    }
     let batches = ctx
         .execute_logical_plan(lineage)
         .await
@@ -1113,81 +1191,61 @@ async fn lineage_choices(
     Some(shown_choices)
 }
 
-/// `plan` with each of the nested limits of `replacements` replaced by its
-/// plan, whose last column is its lineage (see [`lineage_column`]), and with
-/// the lineage columns below each node after its columns. `None` if a node
-/// above a nested limit does not keep the lineage of its rows (only
-/// projections, filters, sorts without a fetch, subquery aliases and inner
-/// joins do), or if a nested limit is not one of its nodes (e.g. in a
-/// subquery).
-fn lineage_plan(
-    plan: &LogicalPlan,
-    replacements: &[(&LogicalPlan, LogicalPlan)],
-) -> Result<Option<LogicalPlan>> {
-    fn rewrite(
-        node: &LogicalPlan,
-        replacements: &[(&LogicalPlan, LogicalPlan)],
-        found: &mut HashSet<usize>,
-    ) -> Result<Option<(LogicalPlan, bool)>> {
-        if let Some(i) = replacements.iter().position(|(limit, _)| *limit == node) {
-            found.insert(i);
-            return Ok(Some((replacements[i].1.clone(), true)));
-        }
-        let mut inputs = vec![];
-        let mut lineage = false;
-        for input in node.inputs() {
-            let Some((input, has_lineage)) = rewrite(input, replacements, found)? else {
-                return Ok(None);
-            };
-            lineage |= has_lineage;
-            inputs.push(input);
-        }
-        if !lineage {
-            return Ok(Some((node.clone(), false)));
-        }
-        let rebuilt = match node {
-            LogicalPlan::Projection(projection) => {
-                let input = inputs.remove(0);
-                let mut exprs = projection.expr.clone();
-                exprs.extend(
-                    input
-                        .schema()
-                        .iter()
-                        .filter(|(_, field)| {
-                            field.name().starts_with("__test_utils_lineage_")
-                        })
-                        .map(|(qualifier, field)| {
-                            Expr::Column(Column::new(qualifier.cloned(), field.name()))
-                        }),
-                );
-                LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?)
-            }
-            LogicalPlan::Sort(sort) if sort.fetch.is_some() => return Ok(None),
-            LogicalPlan::Join(join) if join.join_type != JoinType::Inner => {
-                return Ok(None);
-            }
-            LogicalPlan::Filter(_)
-            | LogicalPlan::Sort(_)
-            | LogicalPlan::SubqueryAlias(_)
-            | LogicalPlan::Join(_) => node.with_new_exprs(node.expressions(), inputs)?,
-            _ => return Ok(None),
-        };
-        Ok(Some((rebuilt, true)))
-    }
-    let mut found = HashSet::new();
-    let rewritten = rewrite(plan, replacements, &mut found)?;
-    Ok(rewritten
-        .filter(|_| found.len() == replacements.len())
-        .map(|(plan, _)| plan))
+/// Whether the rows of `plan` have lineage columns (see [`lineage_column`]).
+fn has_lineage(plan: &LogicalPlan) -> bool {
+    plan.schema()
+        .fields()
+        .iter()
+        .any(|field| field.name().starts_with("__test_utils_lineage_"))
 }
 
-/// The nested `ORDER BY … LIMIT`s of `plan`: its limits over sorts (through
-/// projections, subquery aliases and limits) and its sorts with a fetch,
-/// below its top-level sort (see [`has_top_level_order_by`]), also in
-/// subqueries, but not inside each other.
-fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
-    // A limit over a sort, or a sort with a fetch.
-    let limits_a_sort = |node: &LogicalPlan| match node {
+/// `plan`, in which nested limits are replaced by their rows with their
+/// lineage (see [`lineage_column`]), with the lineage columns below each node
+/// after its columns. `None` if a node above a nested limit does not keep the
+/// lineage of its rows: only projections, filters, sorts without a fetch,
+/// subquery aliases and inner joins do.
+fn lineage_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    let mut inputs = vec![];
+    for input in plan.inputs() {
+        let Some(input) = lineage_plan(input)? else {
+            return Ok(None);
+        };
+        inputs.push(input);
+    }
+    if !inputs.iter().any(has_lineage) {
+        return Ok(Some(plan.clone()));
+    }
+    Ok(Some(match plan {
+        LogicalPlan::Projection(projection) => {
+            let input = inputs.remove(0);
+            let mut exprs = projection.expr.clone();
+            exprs.extend(
+                input
+                    .schema()
+                    .iter()
+                    .filter(|(_, field)| {
+                        field.name().starts_with("__test_utils_lineage_")
+                    })
+                    .map(|(qualifier, field)| {
+                        Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                    }),
+            );
+            LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?)
+        }
+        LogicalPlan::Sort(sort) if sort.fetch.is_some() => return Ok(None),
+        LogicalPlan::Join(join) if join.join_type != JoinType::Inner => return Ok(None),
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Join(_) => plan.with_new_exprs(plan.expressions(), inputs)?,
+        _ => return Ok(None),
+    }))
+}
+
+/// Whether `node` is a limit over a sort (through projections, subquery
+/// aliases and limits), or a sort with a fetch.
+fn limits_a_sort(node: &LogicalPlan) -> bool {
+    match node {
         LogicalPlan::Sort(sort) => sort.fetch.is_some(),
         LogicalPlan::Limit(limit) => {
             let mut input = limit.input.as_ref();
@@ -1202,55 +1260,89 @@ fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
             }
         }
         _ => false,
-    };
-    // The sorted reference of the query compares its top-level sort and the
-    // limits above it.
-    let mut below = plan;
+    }
+}
+
+/// `plan` with the nested `ORDER BY … LIMIT`s that `replace` replaces (given
+/// their index, see [`nested_limits`], and their plan).
+fn replace_nested_limits(
+    plan: &LogicalPlan,
+    replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    // The limits above the top-level sort of the query, and the sort, which
+    // the sorted reference of the query compares, come first.
+    let mut top_level = 0;
     if has_top_level_order_by(plan) {
-        while let LogicalPlan::Projection(_)
-        | LogicalPlan::SubqueryAlias(_)
-        | LogicalPlan::Limit(_) = below
-        {
-            below = below.inputs()[0];
-        }
-        match below {
-            LogicalPlan::Sort(sort) => below = sort.input.as_ref(),
-            LogicalPlan::Distinct(Distinct::On(distinct)) => {
-                below = distinct.input.as_ref()
+        let mut node = plan;
+        loop {
+            top_level += usize::from(limits_a_sort(node));
+            match node {
+                LogicalPlan::Projection(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::Limit(_) => node = node.inputs()[0],
+                _ => break,
             }
-            _ => {}
         }
     }
-    let mut limits = vec![];
-    let _ = below.apply_with_subqueries(|node| {
-        Ok(if limits_a_sort(node) {
-            if !limits.contains(node) {
-                limits.push(node.clone());
+    let mut index = 0;
+    Ok(plan
+        .clone()
+        .transform_down_with_subqueries(|node| {
+            if !limits_a_sort(&node) {
+                return Ok(Transformed::no(node));
             }
-            TreeNodeRecursion::Jump
-        } else {
-            TreeNodeRecursion::Continue
-        })
+            if top_level > 0 {
+                top_level -= 1;
+                return Ok(Transformed::no(node));
+            }
+            index += 1;
+            Ok(match replace(index - 1, &node) {
+                Some(rows) => Transformed::new(rows, true, TreeNodeRecursion::Jump),
+                None => Transformed::new(node, false, TreeNodeRecursion::Jump),
+            })
+        })?
+        .data)
+}
+
+/// The nested `ORDER BY … LIMIT`s of `plan`, each occurrence of them: its
+/// limits over sorts (through projections, subquery aliases and limits) and
+/// its sorts with a fetch, below its top-level sort (see
+/// [`has_top_level_order_by`]), also in subqueries, but not inside each
+/// other.
+fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
+    let mut limits = vec![];
+    let _ = replace_nested_limits(plan, &mut |_, node| {
+        limits.push(node.clone());
+        None
     });
     limits
 }
 
-/// The rows of `columns` (of the fields `fields`, which may have qualifiers),
-/// as a plan.
-fn rows_plan(
+/// The rows of `columns` (of the fields `fields`), as a batch of columns
+/// named `c0`, `c1`, …
+fn rows_batch(
     columns: Vec<ArrayRef>,
     fields: &[(Option<TableReference>, FieldRef)],
-) -> Result<LogicalPlan> {
+) -> Result<RecordBatch> {
     let schema = fields
         .iter()
         .enumerate()
         .map(|(i, (_, field))| field.as_ref().clone().with_name(format!("c{i}")))
         .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(schema)), columns)?;
-    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
-    let scan =
-        LogicalPlanBuilder::scan(SORTED_ROWS, provider_as_source(Arc::new(table)), None)?
-            .build()?;
+    Ok(RecordBatch::try_new(
+        Arc::new(Schema::new(schema)),
+        columns,
+    )?)
+}
+
+/// The rows of `table` (see [`rows_batch`]), as a plan of the fields
+/// `fields`, which may have qualifiers.
+fn rows_plan(
+    table: Arc<dyn TableProvider>,
+    fields: &[(Option<TableReference>, FieldRef)],
+) -> Result<LogicalPlan> {
+    let scan = LogicalPlanBuilder::scan(SORTED_ROWS, provider_as_source(table), None)?
+        .build()?;
     let exprs = fields
         .iter()
         .enumerate()
@@ -7642,6 +7734,65 @@ mod tests {
              JOIN (SELECT v - 9 AS v FROM n ORDER BY k LIMIT 1) b ON a.v = b.v",
             "SELECT v FROM (SELECT v FROM l ORDER BY k LIMIT 1) s ORDER BY v",
             "SELECT v + 1 AS w FROM (SELECT v FROM l ORDER BY k LIMIT 2) s ORDER BY w DESC",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn alternative_outcomes_choose_the_rows_of_each_occurrence_of_a_nested_limit()
+    -> Result<()> {
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", kv_int_batch(&[(1, 1), (1, 2)]))?;
+        let options = ComparisonOptions::default();
+        let ab = |rows: &[(i32, i32)]| {
+            let column = |i: usize| {
+                Arc::new(Int32Array::from_iter_values(
+                    rows.iter().map(|row| [row.0, row.1][i]),
+                )) as ArrayRef
+            };
+            output(
+                vec![batch_of(vec![("a", column(0)), ("b", column(1))])],
+                true,
+            )
+        };
+        let limit = "(SELECT v FROM m ORDER BY k LIMIT 1)";
+        for sql in [
+            // The rows of the result show the rows of both occurrences.
+            format!(
+                "SELECT a.v AS a, b.v AS b FROM {limit} a CROSS JOIN {limit} b ORDER BY a, b"
+            ),
+            // They do not, through the aggregate.
+            format!(
+                "SELECT min(a.v) AS a, max(b.v) AS b FROM {limit} a CROSS JOIN {limit} b"
+            ),
+        ] {
+            let plan = ctx.sql(&sql).await?.logical_plan().clone();
+            for (valid, rows) in [(true, [(1, 2)]), (true, [(2, 1)]), (false, [(2, 3)])] {
+                let result = ab(&rows);
+                let alternatives =
+                    alternative_outcomes(&ctx, &plan, &options, &result).await;
+                let accepted = alternatives.iter().any(|(expected, order)| {
+                    compare_results(expected, &result, order, &options).is_ok()
+                });
+                assert_eq!(accepted, valid, "{sql}: {rows:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_other_rows_of_nested_limits_below_aggregates()
+     {
+        // Any of the 67 rows that tie, in other orders in the tables of both
+        // engines, through an aggregate (which does not keep the lineage of the
+        // rows).
+        let rows = (1..=67).map(|v| (1, v)).collect::<Vec<_>>();
+        let reversed = rows.iter().rev().copied().collect::<Vec<_>>();
+        let setup = per_engine_tables(kv_int_batch(&rows), kv_int_batch(&reversed));
+        for sql in [
+            "SELECT sum(v) AS total FROM (SELECT v FROM m ORDER BY k LIMIT 1) s",
+            "SELECT count(*) AS n, max(v) AS top FROM (SELECT v FROM m ORDER BY k LIMIT 2) s",
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
