@@ -148,8 +148,9 @@ use arrow::array::{
 };
 use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{
-    ArrowNativeType, DataType, Field, Float16Type, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, RunEndIndexType, Schema, SchemaRef, UInt32Type,
+    ArrowNativeType, ArrowPrimitiveType, DataType, Field, Float16Type, Float32Type,
+    Float64Type, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema, SchemaRef,
+    UInt32Type,
 };
 use arrow::downcast_dictionary_array;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -965,7 +966,7 @@ fn returnable_rows(
                 .iter()
                 .map(|column| Value::try_new(column.as_ref(), row))
                 .collect::<Result<Row>>()?;
-            Ok(decision_keys(&keys, &|_| true).0)
+            Ok(decision_keys(&keys, &|_, _| true).0)
         })
         .collect::<Result<Vec<_>>>()?;
     let shapes = keys[window.clone()]
@@ -1605,20 +1606,23 @@ impl SortedRows {
 /// values that may vary, and whose first such values are close, either may be
 /// first, whatever their later keys. Floating-point values that the tolerance
 /// does not let vary (see [`may_vary`]) are compared like other values.
-fn decision_keys(keys: &[Value], may_vary: &dyn Fn(f64) -> bool) -> (Row, bool) {
+fn decision_keys(
+    keys: &[Value],
+    may_vary: &dyn Fn(f64, Precision) -> bool,
+) -> (Row, bool) {
     /// Push the values of `values` up to their first floating-point value
     /// that may vary (included) to `prefix`. Returns `None` if they have none,
     /// or whether they have values after it.
     fn push_prefix(
         values: &[Value],
-        may_vary: &dyn Fn(f64) -> bool,
+        may_vary: &dyn Fn(f64, Precision) -> bool,
         prefix: &mut Vec<Value>,
     ) -> Option<bool> {
         for (i, value) in values.iter().enumerate() {
             let found = match value {
-                Value::Float(float) => {
+                Value::Float(float, precision) => {
                     prefix.push(value.clone());
-                    may_vary(*float).then_some(false)
+                    may_vary(*float, *precision).then_some(false)
                 }
                 Value::List(elements) | Value::Struct(elements) => {
                     let mut inner = vec![];
@@ -1645,16 +1649,60 @@ fn decision_keys(keys: &[Value], may_vary: &dyn Fn(f64) -> bool) -> (Row, bool) 
     (prefix, truncated)
 }
 
-/// Whether the floating-point value `value` is equal within the relative
-/// tolerance `tolerance` to other values (see [`floats_equal`]), so that the
-/// value of another engine may be smaller or larger. Zeros, infinities and
-/// `NaN`s are not (zeros unless `tolerance` is at least 1), nor is any value
-/// if `tolerance` is smaller than the distance to its neighbors (e.g. `0`).
-fn may_vary(value: f64, tolerance: f64) -> bool {
+/// Whether the floating-point value `value` of the precision `precision` is
+/// equal within the relative tolerance `tolerance` to other values of this
+/// precision (see [`floats_equal`]), so that the value of another engine may
+/// be smaller or larger. Zeros, infinities and `NaN`s are not (zeros unless
+/// `tolerance` is at least 1), nor is any value if `tolerance` is smaller than
+/// the distance to its neighbors (e.g. `0`, or the default tolerance for
+/// `Float32` and `Float16` values).
+fn may_vary(value: f64, precision: Precision, tolerance: f64) -> bool {
     value.is_finite()
-        && [value.next_up(), value.next_down()]
+        && precision
+            .neighbors(value)
             .into_iter()
             .any(|other| floats_equal(value, other, tolerance))
+}
+
+/// The precision of a floating-point value, see [`Value::Float`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    /// A `Float16` value.
+    Half,
+    /// A `Float32` value.
+    Single,
+    /// A `Float64` value.
+    Double,
+}
+
+impl Precision {
+    /// The next larger and the next smaller value of this precision than
+    /// `value`, a finite value of this precision.
+    fn neighbors(self, value: f64) -> [f64; 2] {
+        match self {
+            Self::Double => [value.next_up(), value.next_down()],
+            // `f32` values are `f64` values.
+            #[expect(clippy::cast_possible_truncation)]
+            Self::Single => {
+                let value = value as f32;
+                [f64::from(value.next_up()), f64::from(value.next_down())]
+            }
+            Self::Half => {
+                type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+                let bits = F16::from_f64(value).to_bits();
+                // The bits of the values of the sign of `value` follow their
+                // magnitude; the neighbors of zeros are the smallest values.
+                let (up, down) = if value == 0.0 {
+                    (0x0001, 0x8001)
+                } else if value > 0.0 {
+                    (bits + 1, bits - 1)
+                } else {
+                    (bits - 1, bits + 1)
+                };
+                [F16::from_bits(up).to_f64(), F16::from_bits(down).to_f64()]
+            }
+        }
+    }
 }
 
 impl SortedReference {
@@ -1684,8 +1732,9 @@ impl SortedReference {
         for batch in &self.batches {
             for i in 0..batch.num_rows() {
                 let keys = row(batch, i, self.columns..width)?;
-                let (keys, truncates) =
-                    decision_keys(&keys, &|value| may_vary(value, tie_tolerance));
+                let (keys, truncates) = decision_keys(&keys, &|value, precision| {
+                    may_vary(value, precision, tie_tolerance)
+                });
                 let position = values.len();
                 match classes.last_mut() {
                     Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
@@ -2449,8 +2498,8 @@ type Row = Vec<Value>;
 #[derive(Debug, Clone)]
 enum Value {
     Null,
-    /// A `Float16`, `Float32` or `Float64` value.
-    Float(f64),
+    /// A `Float16`, `Float32` or `Float64` value, and its precision.
+    Float(f64, Precision),
     /// Any other scalar value (not null), compared exactly.
     Scalar(ScalarValue),
     /// The elements of a list (of any list type), or the entries of a map.
@@ -2467,14 +2516,17 @@ impl Value {
         }
         Ok(match array.data_type() {
             DataType::Float16 => {
-                Self::Float(array.as_primitive::<Float16Type>().value(row).to_f64())
+                let value = array.as_primitive::<Float16Type>().value(row);
+                Self::Float(value.to_f64(), Precision::Half)
             }
             DataType::Float32 => {
-                Self::Float(f64::from(array.as_primitive::<Float32Type>().value(row)))
+                let value = array.as_primitive::<Float32Type>().value(row);
+                Self::Float(f64::from(value), Precision::Single)
             }
-            DataType::Float64 => {
-                Self::Float(array.as_primitive::<Float64Type>().value(row))
-            }
+            DataType::Float64 => Self::Float(
+                array.as_primitive::<Float64Type>().value(row),
+                Precision::Double,
+            ),
             DataType::List(_) => {
                 let list = array.as_list::<i32>();
                 let offsets = &list.value_offsets()[row..=row + 1];
@@ -2563,7 +2615,7 @@ impl Value {
     fn equals(&self, other: &Self, tolerance: f64) -> bool {
         match (self, other) {
             (Self::Null, Self::Null) => true,
-            (Self::Float(a), Self::Float(b)) => floats_equal(*a, *b, tolerance),
+            (Self::Float(a, _), Self::Float(b, _)) => floats_equal(*a, *b, tolerance),
             (Self::Scalar(a), Self::Scalar(b)) => a == b,
             (Self::List(a), Self::List(b)) | (Self::Struct(a), Self::Struct(b)) => {
                 rows_equal(a, b, tolerance)
@@ -2576,7 +2628,7 @@ impl Value {
     /// floating-point values, see [`Shape`].
     fn same_shape(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Null, Self::Null) | (Self::Float(_), Self::Float(_)) => true,
+            (Self::Null, Self::Null) | (Self::Float(..), Self::Float(..)) => true,
             (Self::Scalar(a), Self::Scalar(b)) => a == b,
             (Self::List(a), Self::List(b)) | (Self::Struct(a), Self::Struct(b)) => {
                 Shape(a) == Shape(b)
@@ -2589,7 +2641,7 @@ impl Value {
     fn hash_shape<H: Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         match self {
-            Self::Null | Self::Float(_) => {}
+            Self::Null | Self::Float(..) => {}
             Self::Scalar(scalar) => scalar.hash(state),
             Self::List(values) | Self::Struct(values) => Shape(values).hash(state),
         }
@@ -2597,7 +2649,7 @@ impl Value {
 
     fn has_floats(&self) -> bool {
         match self {
-            Self::Float(_) => true,
+            Self::Float(..) => true,
             Self::List(values) | Self::Struct(values) => {
                 values.iter().any(Self::has_floats)
             }
@@ -2608,7 +2660,7 @@ impl Value {
     /// Append the floating-point values of `self` to `floats`.
     fn collect_floats(&self, floats: &mut Vec<f64>) {
         match self {
-            Self::Float(value) => floats.push(*value),
+            Self::Float(value, _) => floats.push(*value),
             Self::List(values) | Self::Struct(values) => {
                 for value in values {
                     value.collect_floats(floats);
@@ -2629,7 +2681,7 @@ impl fmt::Display for Value {
         };
         match self {
             Self::Null => write!(f, "NULL"),
-            Self::Float(value) => write!(f, "{value:?}"),
+            Self::Float(value, _) => write!(f, "{value:?}"),
             Self::Scalar(scalar) => match scalar.try_as_str() {
                 Some(Some(string)) => write!(f, "{string:?}"),
                 _ => write!(f, "{scalar}"),
@@ -3941,6 +3993,57 @@ mod tests {
     }
 
     const UNORDERED: &ResultOrder = &ResultOrder::Unordered;
+
+    #[test]
+    fn floats_may_vary_within_a_tolerance_larger_than_the_distance_to_their_neighbors() {
+        let t = 2e-9;
+        for (value, precision, tolerance, varies) in [
+            (1.0, Precision::Double, t, true),
+            (-3.5e300, Precision::Double, t, true),
+            (1e-310, Precision::Double, t, true),
+            (1.0, Precision::Double, 0.0, false),
+            (0.0, Precision::Double, t, false),
+            (-0.0, Precision::Double, t, false),
+            (0.0, Precision::Double, 1.0, true),
+            (f64::INFINITY, Precision::Double, t, false),
+            (f64::NEG_INFINITY, Precision::Double, 1.0, false),
+            (f64::NAN, Precision::Double, 1.0, false),
+            (1.0, Precision::Single, t, false),
+            (1.0, Precision::Single, 2e-7, true),
+            (-1.0, Precision::Single, 2e-7, true),
+            (0.0, Precision::Single, 2e-7, false),
+            (1.0, Precision::Half, 2e-7, false),
+            (1.0, Precision::Half, 2e-3, true),
+            (-1.0, Precision::Half, 2e-3, true),
+            (0.0, Precision::Half, 2e-3, false),
+        ] {
+            assert_eq!(
+                may_vary(value, precision, tolerance),
+                varies,
+                "{value} {precision:?} {tolerance}"
+            );
+        }
+        // The neighbors are values of the precision.
+        let eps = |bits: i32| 2f64.powi(-bits);
+        assert_eq!(
+            Precision::Double.neighbors(1.0),
+            [1.0 + eps(52), 1.0 - eps(53)]
+        );
+        assert_eq!(
+            Precision::Single.neighbors(1.0),
+            [1.0 + eps(23), 1.0 - eps(24)]
+        );
+        assert_eq!(
+            Precision::Half.neighbors(1.0),
+            [1.0 + eps(10), 1.0 - eps(11)]
+        );
+        assert_eq!(
+            Precision::Half.neighbors(-1.0),
+            [-1.0 + eps(11), -1.0 - eps(10)]
+        );
+        assert_eq!(Precision::Half.neighbors(0.0), [eps(24), -eps(24)]);
+        assert_eq!(Precision::Half.neighbors(-0.0), [eps(24), -eps(24)]);
+    }
 
     #[test]
     fn floats_are_equal_within_a_relative_tolerance() {
@@ -5586,6 +5689,27 @@ mod tests {
                 "{sql}: {err}"
             );
             same_results(expected, actual, &order).unwrap();
+        }
+        // `Float32` values cannot vary within the default tolerance, which is
+        // smaller than the distance to their neighbors, but can within a larger
+        // tolerance.
+        for sql in [
+            "SELECT id FROM m ORDER BY CAST(1 AS REAL), id",
+            "SELECT id FROM m ORDER BY CAST(1 AS REAL), id LIMIT 1",
+        ] {
+            let order = order_of(m(), sql).await?;
+            let (expected, actual) = if sql.ends_with("LIMIT 1") {
+                (ids(&[1]), ids(&[2]))
+            } else {
+                (ids(&[1, 2]), ids(&[2, 1]))
+            };
+            let err = same_results(expected.clone(), actual.clone(), &order).unwrap_err();
+            assert!(
+                err.starts_with("row 0 of the pipeline engine is out of order"),
+                "{sql}: {err}"
+            );
+            let coarse = ComparisonOptions::default().with_float_tolerance(1e-6);
+            same_results_with(expected, actual, &order, coarse).unwrap();
         }
         // The keys after a float that cannot vary are shown.
         let order =
