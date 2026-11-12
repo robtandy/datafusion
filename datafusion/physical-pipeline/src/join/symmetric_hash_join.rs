@@ -1541,11 +1541,12 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::TimestampNanosecondArray;
+    use arrow::array::UnionArray;
     use arrow::array::{
         Array, AsArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
     };
     use arrow::compute::SortOptions;
-    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use arrow::datatypes::{DataType, Field, TimeUnit, UnionFields, UnionMode};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_common::{DataFusionError, internal_datafusion_err};
@@ -3360,6 +3361,114 @@ pub(crate) mod tests {
         let big = big_lists(&output.batches);
         assert_eq!(big.iter().sum::<usize>(), 200);
         assert!(big.iter().all(|&big| big <= 2), "{big:?}");
+        Ok(())
+    }
+
+    /// The rows of the `side` input of the joins of sparse unions: 100 rows
+    /// of the key 1 (`<side>k`) whose sparse unions (`<side>u`) are integers,
+    /// of a union whose other child has strings of 1 KiB.
+    pub(crate) fn sparse_union_batch(side: &str) -> RecordBatch {
+        let fields = UnionFields::try_new(
+            vec![0, 1],
+            vec![
+                Field::new("i", DataType::Int32, false),
+                Field::new("s", DataType::Utf8, false),
+            ],
+        )
+        .unwrap();
+        let union = UnionArray::try_new(
+            fields.clone(),
+            vec![0_i8; 100].into(),
+            None,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..100)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..100).map(|id| format!("{id:>1024}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, false),
+            Field::new(
+                format!("{side}u"),
+                DataType::Union(fields, UnionMode::Sparse),
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int32Array::from(vec![1; 100])),
+                Arc::new(union),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sparse_unions_are_reserved_with_all_their_children() -> Result<()> {
+        // 100 rows on either side with the same key and sparse unions whose
+        // values are integers, of a union whose other child has strings of 1
+        // KiB: the join gathers the strings of both children of every row (as
+        // the kernels gather sparse unions), 2 KiB a pair, which it reserves,
+        // in parts of about a MiB. A pool of 512 KiB holds the tables, but not
+        // a part; one of 4 MiB holds both.
+        let plan = |limit: Option<usize>| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |side: &str| -> Arc<dyn ExecutionPlan> {
+                let batch = sparse_union_batch(side);
+                let batches = (0..4).map(|batch_| batch.slice(batch_ * 25, 25)).collect();
+                let partition = BatchesPartition {
+                    schema: batch.schema(),
+                    batches,
+                    forever: limit.is_some(),
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        batch.schema(),
+                        vec![Arc::new(partition)],
+                        None,
+                        vec![],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                )
+            };
+            let join = symmetric_join(
+                stream("l"),
+                stream("r"),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+            )?;
+            Ok(match limit {
+                Some(limit) => Arc::new(GlobalLimitExec::new(join, 0, Some(limit))),
+                None => join,
+            })
+        };
+        let limited = plan(Some(1))?;
+        let root = crate::planner::lower_execution_plan(&limited)?;
+        let err = run_native(&root, limited, limited_task_ctx(512 * 1024)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let all = plan(None)?;
+        let root = lower(&all)?;
+        let output = run_native(&root, all, limited_task_ctx(4 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 10_000);
+        for batch in &output.batches {
+            assert!(
+                batch.num_rows() <= PART_BYTES / 2048 + 1,
+                "{}",
+                batch.num_rows()
+            );
+        }
         Ok(())
     }
 }
