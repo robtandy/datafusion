@@ -1,0 +1,40 @@
+╭─ Order By ─────────────────────────╮
+│ Order By: custdist DESC,           │
+│           c_count DESC             │
+│ ~8,195 rows                        │
+╰──────────────────┬─────────────────╯
+╭─ Hash Group By ──┴─────────────────╮
+│ Groups: #0                         │
+│ Aggregates: count_star()           │
+│ ~8,195 rows                        │
+╰──────────────────┬─────────────────╯
+╭─ Projection ─────┴─────────────────╮
+│ Projections: c_count               │
+│ ~12,965 rows                       │
+╰──────────────────┬─────────────────╯
+╭─ Projection ─────┴─────────────────╮
+│ Projections: count(o_orderkey)     │
+│ ~12,965 rows                       │
+╰──────────────────┬─────────────────╯
+╭─ Hash Group By ──┴─────────────────╮
+│ Groups: #0                         │
+│ Aggregates: count(#1)              │
+│ ~12,965 rows                       │
+╰──────────────────┬─────────────────╯
+╭─ Projection ─────┴─────────────────╮
+│ Projections: c_custkey, o_orderkey │
+│ ~30,000 rows                       │
+╰──────────────────┬─────────────────╯
+╭─ Hash Join ──────┴─────────────────╮
+│ Join Type: RIGHT                   │
+│ Conditions: o_custkey = c_custkey  │
+│ ~30,000 rows                       │
+╰──────────────────┬─────────────────╯
+                   ├─────────────────────────────────╮
+╭─ Read Parquet ───┴─────────────────╮  ╭─ Read Parquet ─────────╮
+│ Function: READ_PARQUET             │  │ Function: READ_PARQUET │
+│ Projections: o_orderkey, o_custkey │  │ Projections: c_custkey │
+│ Filters:                           │  │ ~14,992 rows           │
+│ o_comment !~~ '%special%requests%' │  ╰────────────────────────╯
+│ ~30,000 rows                       │
+╰────────────────────────────────────╯

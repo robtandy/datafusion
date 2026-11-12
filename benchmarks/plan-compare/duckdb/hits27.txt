@@ -1,0 +1,31 @@
+╭─ Top N ────────────────────────╮
+│ Top: 25                        │
+│ Order By: l DESC,              │
+│           CounterID ASC        │
+│ ~25 rows                       │
+╰────────────────┬───────────────╯
+╭─ Projection ───┴───────────────╮
+│ Projections: CounterID, l, c   │
+│ ~25,284 rows                   │
+╰────────────────┬───────────────╯
+╭─ Filter ───────┴───────────────╮
+│ Expression: count_star() > 100 │
+│ ~25,284 rows                   │
+╰────────────────┬───────────────╯
+╭─ Hash Group By ┴───────────────╮
+│ Groups: #0                     │
+│ Aggregates: count_star(),      │
+│             avg(#1)            │
+│ ~126,424 rows                  │
+╰────────────────┬───────────────╯
+╭─ Projection ───┴───────────────╮
+│ Projections: CounterID,        │
+│              length(URL)       │
+│ ~200,000 rows                  │
+╰────────────────┬───────────────╯
+╭─ Read Parquet ─┴───────────────╮
+│ Function: READ_PARQUET         │
+│ Projections: CounterID, URL    │
+│ Filters: URL != ''             │
+│ ~200,000 rows                  │
+╰────────────────────────────────╯

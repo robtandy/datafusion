@@ -1,0 +1,64 @@
+╭─ Order By ────────────────────────────╮
+│ Order By: revenue DESC                │
+│ ~16 rows                              │
+╰───────────────────┬───────────────────╯
+╭─ Projection ──────┴───────────────────╮
+│ Projections: #0, finalize(#1)         │
+│ ~16 rows                              │
+╰───────────────────┬───────────────────╯
+╭─ Hash Group By ───┴───────────────────╮
+│ Groups: #0                            │
+│ Aggregates: combine_aggr(#1, #2)      │
+│ ~16 rows                              │
+╰───────────────────┬───────────────────╯
+╭─ Projection ──────┴───────────────────╮
+│ Projections: #0, #2, #1               │
+│ ~1 row                                │
+╰───────────────────┬───────────────────╯
+╭─ Hash Join ───────┴───────────────────╮
+│ Join Type: INNER                      │
+│ Conditions: #0 = #0, #1 = #0, #2 = #1 │
+│ ~1 row                                │
+╰───────────────────┬───────────────────╯
+                    ├──────────────────────────────────────────────────────────────────────────────────────╮
+╭─ Projection ──────┴───────────────────╮                                             ╭─ Hash Group By ────┴───────────────────╮
+│ Projections: #0, #0, #1, #2,          │                                             │ Groups: #0, #1                         │
+│              finalize(#3)             │                                             │ Aggregates: sum(#2) EXPORT_STATE       │
+│ ~1 row                                │                                             │ ~1 row                                 │
+╰───────────────────┬───────────────────╯                                             ╰────────────────────┬───────────────────╯
+╭─ Hash Group By ───┴───────────────────╮                                             ╭─ Projection ───────┴───────────────────╮
+│ Groups: #0, #1, #2                    │                                             │ Projections:                           │
+│ Aggregates: combine_aggr(#3, #4)      │                                             │ #3, #0,                                │
+│ ~1 row                                │                                             │ l_extendedprice * (1.00 - l_discount)  │
+╰───────────────────┬───────────────────╯                                             │ ~601,264 rows                          │
+╭─ Projection ──────┴───────────────────╮                                             ╰────────────────────┬───────────────────╯
+│ Projections: #2, #3, #0, #4, #1       │                                             ╭─ Hash Join ────────┴───────────────────╮
+│ ~1 row                                │                                             │ Join Type: INNER                       │
+╰───────────────────┬───────────────────╯                                             │ Conditions: l_orderkey = o_orderkey    │
+╭─ Hash Join ───────┴───────────────────╮                                             │ ~601,264 rows                          │
+│ Join Type: INNER                      │                                             ╰────────────────────┬───────────────────╯
+│ Conditions: #0 = #0                   │                                                                  ├─────────────────────────────────────────────────────────────╮
+│ ~1 row                                │                                             ╭─ Read Parquet ─────┴───────────────────╮  ╭─ Hash Join ──────────────────────────┴─────────────────────────────────────╮
+╰───────────────────┬───────────────────╯                                             │ Function: READ_PARQUET                 │  │ Join Type: INNER                                                           │
+                    ├──────────────────────────────────────────╮                      │ Projections: l_orderkey, l_suppkey,    │  │ Conditions: o_custkey = c_custkey                                          │
+╭─ Hash Group By ───┴───────────────────╮  ╭─ Hash Group By ───┴───────────────────╮  │              l_extendedprice,          │  │ ~30,000 rows                                                               │
+│ Groups: #0, #1                        │  │ Groups: #0, #1                        │  │              l_discount                │  ╰──────────────────────────────────────┬─────────────────────────────────────╯
+│ Aggregates: count_star()              │  │ Aggregates: count_star() EXPORT_STATE │  │ ~601,264 rows                          │                                         ├──────────────────────────────────────────────────────╮
+│ ~1 row                                │  │ ~1 row                                │  ╰────────────────────────────────────────╯  ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮  ╭─ Read Parquet ────────────╮
+╰───────────────────┬───────────────────╯  ╰───────────────────┬───────────────────╯                                              │ Function: READ_PARQUET                                                     │  │ Function: READ_PARQUET    │
+╭─ Projection ──────┴───────────────────╮  ╭─ Projection ──────┴───────────────────╮                                              │ Projections: o_orderkey, o_custkey                                         │  │ Projections: c_custkey,   │
+│ Projections: #0, #1                   │  │ Projections: #1, #0                   │                                              │ Filters:                                                                   │  │              c_nationkey  │
+│ ~16 rows                              │  │ ~992 rows                             │                                              │ (o_orderdate >= '1994-01-01'::DATE) AND (o_orderdate < '1995-01-01'::DATE) │  │ ~14,992 rows              │
+╰───────────────────┬───────────────────╯  ╰───────────────────┬───────────────────╯                                              │ ~30,000 rows                                                               │  ╰───────────────────────────╯
+╭─ Hash Join ───────┴───────────────────╮  ╭─ Read Parquet ────┴───────────────────╮                                              ╰────────────────────────────────────────────────────────────────────────────╯
+│ Join Type: INNER                      │  │ Function: READ_PARQUET                │
+│ Conditions: n_regionkey = r_regionkey │  │ Projections: s_suppkey, s_nationkey   │
+│ ~16 rows                              │  │ ~992 rows                             │
+╰───────────────────┬───────────────────╯  ╰───────────────────────────────────────╯
+                    ├────────────────────────────────────╮
+╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ───────────╮
+│ Function: READ_PARQUET                │  │ Function: READ_PARQUET   │
+│ Projections: n_nationkey, n_name,     │  │ Projections: r_regionkey │
+│              n_regionkey              │  │ Filters: r_name = 'ASIA' │
+│ ~16 rows                              │  │ ~0 rows                  │
+╰───────────────────────────────────────╯  ╰──────────────────────────╯

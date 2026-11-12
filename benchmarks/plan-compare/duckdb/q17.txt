@@ -1,0 +1,63 @@
+╭─ Projection ───────────────────────╮
+│ Projections: avg_yearly            │
+│ ~1 row                             │
+╰──────────────────┬─────────────────╯
+╭─ Ungrouped Aggregate ──────────────╮
+│ Aggregates: sum(#0)                │
+│ ~1 row                             │
+╰──────────────────┬─────────────────╯
+╭─ Projection ─────┴─────────────────╮
+│ Projections: l_extendedprice       │
+│ ~601,264 rows                      │
+╰──────────────────┬─────────────────╯
+╭─ CTE ────────────┴─────────────────╮
+│ CTE Name: __duckdb_delim_37        │
+│ Table Index: 37                    │
+│ Execution Mode: PIPELINE_DEPENDENT │
+│ ~601,264 rows                      │
+╰──────────────────┬─────────────────╯
+                   ├─────────────────────────────────────────────────────────────────────────────────╮
+╭─ Projection ─────┴─────────────────╮                                         ╭─ Projection ────────┴─────────────────────╮
+│ Projections: #1, #2, #0            │                                         │ Projections: #0                           │
+│ ~601,264 rows                      │                                         │ ~601,264 rows                             │
+╰──────────────────┬─────────────────╯                                         ╰─────────────────────┬─────────────────────╯
+╭─ Hash Join ──────┴─────────────────╮                                         ╭─ Hash Join ─────────┴─────────────────────╮
+│ Join Type: INNER                   │                                         │ Join Type: INNER                          │
+│ Conditions: l_partkey = p_partkey  │                                         │ Conditions:                               │
+│ ~601,264 rows                      │                                         │ p_partkey IS NOT DISTINCT FROM p_partkey, │
+╰──────────────────┬─────────────────╯                                         │ CAST(l_quantity AS DOUBLE) < SUBQUERY     │
+                   ├──────────────────────────────────────╮                    │ ~601,264 rows                             │
+╭─ Read Parquet ───┴─────────────────╮  ╭─ Read Parquet ──┴─────────────────╮  ╰─────────────────────┬─────────────────────╯
+│ Function: READ_PARQUET             │  │ Function: READ_PARQUET            │                        ├───────────────────────────────────────────╮
+│ Projections: l_partkey,            │  │ Projections: p_partkey            │  ╭─ CTE Scan ──────────┴─────────────────────╮  ╭─ Projection ─────┴──────────────────╮
+│              l_quantity,           │  │ Filters: p_brand = 'Brand#23',    │  │ CTE Index: 37                             │  │ Projections: 0.2 * avg(l_quantity), │
+│              l_extendedprice       │  │          p_container = 'MED BOX'  │  │ ~601,264 rows                             │  │              p_partkey              │
+│ ~601,264 rows                      │  │ ~4,000 rows                       │  ╰───────────────────────────────────────────╯  │ ~60,126 rows                        │
+╰────────────────────────────────────╯  ╰───────────────────────────────────╯                                                 ╰──────────────────┬──────────────────╯
+                                                                                                                              ╭─ Hash Group By ──┴──────────────────╮
+                                                                                                                              │ Groups: #0                          │
+                                                                                                                              │ Aggregates: avg(#1)                 │
+                                                                                                                              │ ~60,126 rows                        │
+                                                                                                                              ╰──────────────────┬──────────────────╯
+                                                                                                                              ╭─ Projection ─────┴──────────────────╮
+                                                                                                                              │ Projections: p_partkey, l_quantity  │
+                                                                                                                              │ ~120,252 rows                       │
+                                                                                                                              ╰──────────────────┬──────────────────╯
+                                                                                                                              ╭─ Hash Join ──────┴──────────────────╮
+                                                                                                                              │ Join Type: SEMI                     │
+                                                                                                                              │ Conditions: l_partkey = p_partkey   │
+                                                                                                                              │ ~120,252 rows                       │
+                                                                                                                              ╰──────────────────┬──────────────────╯
+                                                                                                                                                 ├────────────────────────────────╮
+                                                                                                                              ╭─ Read Parquet ───┴──────────────────╮  ╭─ Hash Group By ─────╮
+                                                                                                                              │ Function: READ_PARQUET              │  │ Groups: #0          │
+                                                                                                                              │ Projections: l_partkey, l_quantity  │  │ ~300,632 rows       │
+                                                                                                                              │ ~601,264 rows                       │  ╰──────────┬──────────╯
+                                                                                                                              ╰─────────────────────────────────────╯  ╭─ Projection ────────╮
+                                                                                                                                                                       │ Projections: #[8.0] │
+                                                                                                                                                                       │ ~601,264 rows       │
+                                                                                                                                                                       ╰──────────┬──────────╯
+                                                                                                                                                                       ╭─ CTE Scan ──────────╮
+                                                                                                                                                                       │ CTE Index: 37       │
+                                                                                                                                                                       │ ~601,264 rows       │
+                                                                                                                                                                       ╰─────────────────────╯

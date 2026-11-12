@@ -1,0 +1,44 @@
+╭─ Order By ───────────────────────────────────╮
+│ Order By: l_returnflag ASC, l_linestatus ASC │
+│ ~120,251 rows                                │
+╰───────────────────────┬──────────────────────╯
+╭─ Projection ──────────┴──────────────────────╮
+│ Projections:                                 │
+│ #0, #1, #2, #3, #4, #5,                      │
+│ "/"(CAST(#2 AS DOUBLE), CAST(#8 AS DOUBLE)), │
+│ "/"(CAST(#3 AS DOUBLE), CAST(#9 AS DOUBLE)), │
+│ #6, #7                                       │
+│ ~120,251 rows                                │
+╰───────────────────────┬──────────────────────╯
+╭─ Hash Group By ───────┴──────────────────────╮
+│ Groups: #0, #1                               │
+│ Aggregates: sum(#2), sum(#3), sum(#4),       │
+│             sum(#5), avg(#6), count_star(),  │
+│             count(#7), count(#8)             │
+│ ~120,251 rows                                │
+╰───────────────────────┬──────────────────────╯
+╭─ Projection ──────────┴──────────────────────╮
+│ Projections: l_returnflag, l_linestatus,     │
+│              l_quantity, l_extendedprice,    │
+│              #4, #4 * (1.00 + l_tax),        │
+│              l_discount, l_quantity,         │
+│              l_extendedprice                 │
+│ ~120,252 rows                                │
+╰───────────────────────┬──────────────────────╯
+╭─ Projection ──────────┴──────────────────────╮
+│ Projections:                                 │
+│ l_returnflag, l_linestatus, l_quantity,      │
+│ l_extendedprice,                             │
+│ l_extendedprice * (1.00 - l_discount),       │
+│ l_tax, l_discount                            │
+│ ~120,252 rows                                │
+╰───────────────────────┬──────────────────────╯
+╭─ Read Parquet ────────┴──────────────────────╮
+│ Function: READ_PARQUET                       │
+│ Projections: l_quantity, l_extendedprice,    │
+│              l_discount, l_tax,              │
+│              l_returnflag, l_linestatus      │
+│ Filters:                                     │
+│ l_shipdate <= '1998-09-02'::DATE             │
+│ ~120,252 rows                                │
+╰──────────────────────────────────────────────╯

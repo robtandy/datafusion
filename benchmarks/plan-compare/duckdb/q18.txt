@@ -1,0 +1,59 @@
+╭─ Top N ─────────────────────────────╮
+│ Top: 100                            │
+│ Order By: o_totalprice DESC,        │
+│           o_orderdate ASC           │
+│ ~100 rows                           │
+╰──────────────────┬──────────────────╯
+╭─ Hash Group By ──┴──────────────────╮
+│ Groups: #0, #1, #2, #3, #4          │
+│ Aggregates: sum(#5)                 │
+│ ~120,252 rows                       │
+╰──────────────────┬──────────────────╯
+╭─ Projection ─────┴──────────────────╮
+│ Projections: c_name, c_custkey,     │
+│              o_orderkey,            │
+│              o_orderdate,           │
+│              o_totalprice,          │
+│              l_quantity             │
+│ ~120,252 rows                       │
+╰──────────────────┬──────────────────╯
+╭─ Hash Join ──────┴──────────────────╮
+│ Join Type: INNER                    │
+│ Conditions: l_orderkey = o_orderkey │
+│ ~120,252 rows                       │
+╰──────────────────┬──────────────────╯
+                   ├───────────────────────────────────────╮
+╭─ Read Parquet ───┴──────────────────╮  ╭─ Hash Join ─────┴─────────────────╮
+│ Function: READ_PARQUET              │  │ Join Type: INNER                  │
+│ Projections: l_orderkey, l_quantity │  │ Conditions: o_custkey = c_custkey │
+│ ~601,264 rows                       │  │ ~30,000 rows                      │
+╰─────────────────────────────────────╯  ╰─────────────────┬─────────────────╯
+                                                           ├────────────────────────────────────────────────────────╮
+                                         ╭─ Hash Join ─────┴─────────────────╮                         ╭─ Read Parquet ──────────╮
+                                         │ Join Type: SEMI                   │                         │ Function: READ_PARQUET  │
+                                         │ Conditions: o_orderkey = #0       │                         │ Projections: c_custkey, │
+                                         │ ~30,000 rows                      │                         │              c_name     │
+                                         ╰─────────────────┬─────────────────╯                         │ ~14,992 rows            │
+                                                           ├────────────────────────────────────────╮  ╰─────────────────────────╯
+                                         ╭─ Read Parquet ──┴─────────────────╮  ╭─ Projection ──────┴──────────────────╮
+                                         │ Function: READ_PARQUET            │  │ Projections: #0                      │
+                                         │ Projections: o_orderkey,          │  │ ~76,014 rows                         │
+                                         │              o_custkey,           │  ╰───────────────────┬──────────────────╯
+                                         │              o_totalprice,        │  ╭─ Filter ──────────┴──────────────────╮
+                                         │              o_orderdate          │  │ Expression: sum(l_quantity) > 300.00 │
+                                         │ ~150,000 rows                     │  │ ~76,014 rows                         │
+                                         ╰───────────────────────────────────╯  ╰───────────────────┬──────────────────╯
+                                                                                ╭─ Hash Group By ───┴──────────────────╮
+                                                                                │ Groups: #0                           │
+                                                                                │ Aggregates: sum(#1)                  │
+                                                                                │ ~380,071 rows                        │
+                                                                                ╰───────────────────┬──────────────────╯
+                                                                                ╭─ Projection ──────┴──────────────────╮
+                                                                                │ Projections: l_orderkey, l_quantity  │
+                                                                                │ ~601,264 rows                        │
+                                                                                ╰───────────────────┬──────────────────╯
+                                                                                ╭─ Read Parquet ────┴──────────────────╮
+                                                                                │ Function: READ_PARQUET               │
+                                                                                │ Projections: l_orderkey, l_quantity  │
+                                                                                │ ~601,264 rows                        │
+                                                                                ╰──────────────────────────────────────╯

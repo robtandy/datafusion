@@ -1,0 +1,48 @@
+╭─ Top N ──────────────────────────────────╮
+│ Top: 10                                  │
+│ Order By: revenue DESC, o_orderdate ASC  │
+│ ~10 rows                                 │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections: l_orderkey, revenue,        │
+│              o_orderdate, o_shippriority │
+│ ~120,252 rows                            │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections: #0, #1, #2, finalize(#3)    │
+│ ~120,252 rows                            │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Group By ─────┴────────────────────╮
+│ Groups: #0, #1, #2                       │
+│ Aggregates: combine_aggr(#3)             │
+│ ~120,252 rows                            │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections: #1, o_orderdate,            │
+│              o_shippriority, #0          │
+│ ~120,252 rows                            │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Join ─────────┴────────────────────╮
+│ Join Type: INNER                         │
+│ Conditions: #0 = o_orderkey              │
+│ ~120,252 rows                            │
+╰─────────────────────┬────────────────────╯
+                      ├─────────────────────────────────────────╮
+╭─ Hash Group By ─────┴────────────────────╮  ╭─ Hash Join ─────┴─────────────────╮
+│ Groups: #0                               │  │ Join Type: INNER                  │
+│ Aggregates: sum(#1) EXPORT_STATE         │  │ Conditions: o_custkey = c_custkey │
+│ ~120,252 rows                            │  │ ~30,000 rows                      │
+╰─────────────────────┬────────────────────╯  ╰─────────────────┬─────────────────╯
+╭─ Projection ────────┴────────────────────╮                    ├───────────────────────────────────────╮
+│ Projections:                             │  ╭─ Read Parquet ──┴─────────────────╮  ╭─ Read Parquet ───┴─────────────────╮
+│ #0,                                      │  │ Function: READ_PARQUET            │  │ Function: READ_PARQUET             │
+│ l_extendedprice * (1.00 - l_discount)    │  │ Projections: o_orderkey,          │  │ Projections: c_custkey             │
+│ ~120,252 rows                            │  │              o_custkey,           │  │ Filters: c_mktsegment = 'BUILDING' │
+╰─────────────────────┬────────────────────╯  │              o_orderdate,         │  │ ~2,998 rows                        │
+╭─ Read Parquet ──────┴────────────────────╮  │              o_shippriority       │  ╰────────────────────────────────────╯
+│ Function: READ_PARQUET                   │  │ Filters:                          │
+│ Projections: l_orderkey,                 │  │ o_orderdate < '1995-03-15'::DATE  │
+│              l_extendedprice, l_discount │  │ ~30,000 rows                      │
+│ Filters: l_shipdate > '1995-03-15'::DATE │  ╰───────────────────────────────────╯
+│ ~120,252 rows                            │
+╰──────────────────────────────────────────╯

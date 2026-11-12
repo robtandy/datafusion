@@ -1,0 +1,31 @@
+╭─ Order By ─────────────────────────╮
+│ Order By: EventTime ASC,           │
+│           WatchID ASC              │
+│ ~10 rows                           │
+╰──────────────────┬─────────────────╯
+╭─ Hash Join ──────┴─────────────────╮
+│ Join Type: SEMI                    │
+│ Conditions:                        │
+│ file_index = file_index,           │
+│ file_row_number = file_row_number  │
+│ ~10 rows                           │
+╰──────────────────┬─────────────────╯
+                   ├────────────────────────────────────────╮
+╭─ Read Parquet ───┴─────────────────╮  ╭─ Top N ───────────┴───────────────────╮
+│ Function: READ_PARQUET             │  │ Top: 10                               │
+│ Projections: WatchID, UserID,      │  │ Order By: EventTime ASC, WatchID ASC  │
+│              CounterID, RegionID,  │  │ ~10 rows                              │
+│              ClientIP, EventTime,  │  ╰───────────────────┬───────────────────╯
+│              EventDate,            │  ╭─ Read Parquet ────┴───────────────────╮
+│              AdvEngineID,          │  │ Function: READ_PARQUET                │
+│              SearchEngineID,       │  │ Projections: WatchID, EventTime       │
+│              SearchPhrase, URL,    │  │ Filters:                              │
+│              Title, IsRefresh,     │  │ optional: Dynamic Filter (EventTime), │
+│              DontCountHits,        │  │ contains(URL, 'google')               │
+│              ResolutionWidth,      │  │ ~200,000 rows                         │
+│              MobilePhone,          │  ╰───────────────────────────────────────╯
+│              MobilePhoneModel      │
+│ Filters:                           │
+│ optional: contains(URL, 'google')  │
+│ ~1 row                             │
+╰────────────────────────────────────╯

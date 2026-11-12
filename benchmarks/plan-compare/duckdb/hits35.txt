@@ -1,0 +1,28 @@
+╭─ Top N ────────────────────╮
+│ Top: 10                    │
+│ Order By: c DESC,          │
+│           ClientIP ASC     │
+│ ~10 rows                   │
+╰──────────────┬─────────────╯
+╭─ Projection ─┴─────────────╮
+│ Projections: #0,           │
+│              ClientIP - 1, │
+│              ClientIP - 2, │
+│              ClientIP - 3, │
+│              #1            │
+│ ~632,120 rows              │
+╰──────────────┬─────────────╯
+╭─ Hash Group By ────────────╮
+│ Groups: #0                 │
+│ Aggregates: count_star()   │
+│ ~632,120 rows              │
+╰──────────────┬─────────────╯
+╭─ Projection ─┴─────────────╮
+│ Projections: ClientIP      │
+│ ~1,000,000 rows            │
+╰──────────────┬─────────────╯
+╭─ Read Parquet ─────────────╮
+│ Function: READ_PARQUET     │
+│ Projections: ClientIP      │
+│ ~1,000,000 rows            │
+╰────────────────────────────╯

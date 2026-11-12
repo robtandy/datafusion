@@ -1,0 +1,23 @@
+╭─ Top N ──────────────────────╮
+│ Top: 10                      │
+│ Order By: count_star() DESC, │
+│           UserID ASC,        │
+│           SearchPhrase ASC   │
+│ ~10 rows                     │
+╰───────────────┬──────────────╯
+╭─ Hash Group By ──────────────╮
+│ Groups: #0, #1               │
+│ Aggregates: count_star()     │
+│ ~999,999 rows                │
+╰───────────────┬──────────────╯
+╭─ Projection ──┴──────────────╮
+│ Projections: UserID,         │
+│              SearchPhrase    │
+│ ~1,000,000 rows              │
+╰───────────────┬──────────────╯
+╭─ Read Parquet ┴──────────────╮
+│ Function: READ_PARQUET       │
+│ Projections: UserID,         │
+│              SearchPhrase    │
+│ ~1,000,000 rows              │
+╰──────────────────────────────╯

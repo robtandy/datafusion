@@ -1,0 +1,44 @@
+╭─ Order By ──────────────────────────╮
+│ Order By: nation ASC, o_year DESC   │
+│ ~2,268,322 rows                     │
+╰──────────────────┬──────────────────╯
+╭─ Hash Group By ──┴──────────────────╮
+│ Groups: #0, #1                      │
+│ Aggregates: sum(#2)                 │
+│ ~2,268,322 rows                     │
+╰──────────────────┬──────────────────╯
+╭─ Projection ─────┴──────────────────╮
+│ Projections: nation, o_year, amount │
+│ ~12,025,280 rows                    │
+╰──────────────────┬──────────────────╯
+╭─ Hash Join ──────┴──────────────────╮
+│ Join Type: INNER                    │
+│ Conditions: l_partkey = p_partkey,  │
+│             l_suppkey = s_suppkey   │
+│ ~12,025,280 rows                    │
+╰──────────────────┬──────────────────╯
+                   ├───────────────────────────────────────────────────────────────────────╮
+╭─ Hash Join ──────┴──────────────────╮                                 ╭─ Hash Join ──────┴─────────────────╮
+│ Join Type: INNER                    │                                 │ Join Type: INNER                   │
+│ Conditions: l_orderkey = o_orderkey │                                 │ Conditions: ps_partkey = p_partkey │
+│ ~601,264 rows                       │                                 │ ~80,000 rows                       │
+╰──────────────────┬──────────────────╯                                 ╰──────────────────┬─────────────────╯
+                   ├───────────────────────────────────╮                                   ├──────────────────────────────────────────────────────────────╮
+╭─ Read Parquet ───┴──────────────────╮  ╭─ Read Parquet ────────────╮  ╭─ Hash Join ──────┴─────────────────╮                         ╭─ Read Parquet ───┴─────────────────╮
+│ Function: READ_PARQUET              │  │ Function: READ_PARQUET    │  │ Join Type: INNER                   │                         │ Function: READ_PARQUET             │
+│ Projections: l_orderkey, l_partkey, │  │ Projections: o_orderkey,  │  │ Conditions: ps_suppkey = s_suppkey │                         │ Projections: p_partkey             │
+│              l_suppkey, l_quantity, │  │              o_orderdate  │  │ ~80,000 rows                       │                         │ Filters: contains(p_name, 'green') │
+│              l_extendedprice,       │  │ ~150,000 rows             │  ╰──────────────────┬─────────────────╯                         │ ~4,000 rows                        │
+│              l_discount             │  ╰───────────────────────────╯                     ├────────────────────────────────────────╮  ╰────────────────────────────────────╯
+│ ~601,264 rows                       │                                 ╭─ Read Parquet ───┴─────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+╰─────────────────────────────────────╯                                 │ Function: READ_PARQUET             │  │ Join Type: INNER                      │
+                                                                        │ Projections: ps_partkey,           │  │ Conditions: s_nationkey = n_nationkey │
+                                                                        │              ps_suppkey,           │  │ ~992 rows                             │
+                                                                        │              ps_supplycost         │  ╰───────────────────┬───────────────────╯
+                                                                        │ ~80,000 rows                       │                      ├────────────────────────────────────╮
+                                                                        ╰────────────────────────────────────╯  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ────────────╮
+                                                                                                                │ Function: READ_PARQUET                │  │ Function: READ_PARQUET    │
+                                                                                                                │ Projections: s_suppkey, s_nationkey   │  │ Projections: n_nationkey, │
+                                                                                                                │ ~992 rows                             │  │              n_name       │
+                                                                                                                ╰───────────────────────────────────────╯  │ ~16 rows                  │
+                                                                                                                                                           ╰───────────────────────────╯

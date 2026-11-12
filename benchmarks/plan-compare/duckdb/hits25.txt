@@ -1,0 +1,12 @@
+╭─ Top N ──────────────────────────────────────────────────────────╮
+│ Top: 10                                                          │
+│ Order By: SearchPhrase ASC                                       │
+│ ~10 rows                                                         │
+╰─────────────────────────────────┬────────────────────────────────╯
+╭─ Read Parquet ──────────────────┴────────────────────────────────╮
+│ Function: READ_PARQUET                                           │
+│ Projections: SearchPhrase                                        │
+│ Filters:                                                         │
+│ (SearchPhrase != '') AND optional: Dynamic Filter (SearchPhrase) │
+│ ~200,000 rows                                                    │
+╰──────────────────────────────────────────────────────────────────╯

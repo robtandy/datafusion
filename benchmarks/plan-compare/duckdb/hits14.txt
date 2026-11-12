@@ -1,0 +1,24 @@
+╭─ Top N ───────────────────────╮
+│ Top: 10                       │
+│ Order By: c DESC,             │
+│           SearchEngineID ASC, │
+│           SearchPhrase ASC    │
+│ ~10 rows                      │
+╰───────────────┬───────────────╯
+╭─ Hash Group By ───────────────╮
+│ Groups: #0, #1                │
+│ Aggregates: count_star()      │
+│ ~199,999 rows                 │
+╰───────────────┬───────────────╯
+╭─ Projection ──┴───────────────╮
+│ Projections: SearchEngineID,  │
+│              SearchPhrase     │
+│ ~200,000 rows                 │
+╰───────────────┬───────────────╯
+╭─ Read Parquet ┴───────────────╮
+│ Function: READ_PARQUET        │
+│ Projections: SearchEngineID,  │
+│              SearchPhrase     │
+│ Filters: SearchPhrase != ''   │
+│ ~200,000 rows                 │
+╰───────────────────────────────╯

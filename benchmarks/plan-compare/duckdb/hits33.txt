@@ -1,0 +1,20 @@
+╭─ Top N ──────────────────╮
+│ Top: 10                  │
+│ Order By: c DESC,        │
+│           URL ASC        │
+│ ~10 rows                 │
+╰─────────────┬────────────╯
+╭─ Hash Group By ──────────╮
+│ Groups: #0               │
+│ Aggregates: count_star() │
+│ ~632,120 rows            │
+╰─────────────┬────────────╯
+╭─ Projection ┴────────────╮
+│ Projections: URL         │
+│ ~1,000,000 rows          │
+╰─────────────┬────────────╯
+╭─ Read Parquet ───────────╮
+│ Function: READ_PARQUET   │
+│ Projections: URL         │
+│ ~1,000,000 rows          │
+╰──────────────────────────╯

@@ -1,0 +1,21 @@
+╭─ Projection ─────────────────────────────────╮
+│ Projections:                                 │
+│ #0, #1,                                      │
+│ "/"(CAST(#2 AS DOUBLE), CAST(#3 AS DOUBLE))  │
+│ ~1 row                                       │
+╰───────────────────────┬──────────────────────╯
+╭─ Ungrouped Aggregate ─┴──────────────────────╮
+│ Aggregates: sum(#0), count_star(), sum(#1),  │
+│             count(#2)                        │
+│ ~1 row                                       │
+╰───────────────────────┬──────────────────────╯
+╭─ Projection ──────────┴──────────────────────╮
+│ Projections: AdvEngineID, ResolutionWidth,   │
+│              ResolutionWidth                 │
+│ ~1,000,000 rows                              │
+╰───────────────────────┬──────────────────────╯
+╭─ Read Parquet ────────┴──────────────────────╮
+│ Function: READ_PARQUET                       │
+│ Projections: AdvEngineID, ResolutionWidth    │
+│ ~1,000,000 rows                              │
+╰──────────────────────────────────────────────╯

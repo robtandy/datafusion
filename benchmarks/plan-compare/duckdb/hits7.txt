@@ -1,0 +1,20 @@
+╭─ Order By ───────────────────╮
+│ Order By: count_star() DESC, │
+│           AdvEngineID ASC    │
+│ ~126,424 rows                │
+╰───────────────┬──────────────╯
+╭─ Hash Group By ──────────────╮
+│ Groups: #0                   │
+│ Aggregates: count_star()     │
+│ ~126,424 rows                │
+╰───────────────┬──────────────╯
+╭─ Projection ──┴──────────────╮
+│ Projections: AdvEngineID     │
+│ ~200,000 rows                │
+╰───────────────┬──────────────╯
+╭─ Read Parquet ┴──────────────╮
+│ Function: READ_PARQUET       │
+│ Projections: AdvEngineID     │
+│ Filters: AdvEngineID != 0    │
+│ ~200,000 rows                │
+╰──────────────────────────────╯
