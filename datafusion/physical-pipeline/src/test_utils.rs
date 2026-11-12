@@ -58,10 +58,15 @@
 //!      and `-0.0` equals `0.0`, but `NULL` only equals `NULL`.
 //!
 //! To know which rows tie and which rows `LIMIT` and `OFFSET` cut, DataFusion
-//! also runs the query without its `LIMIT` and `OFFSET`, with the values of
-//! its `ORDER BY` keys after its output columns (also of the keys that the
-//! query does not select), and both results are compared with these sorted
-//! rows, its [`SortedReference`] (see [`result_order`]). The keys from the
+//! also sorts all rows of the top-level sort of the query (without its
+//! `LIMIT` and `OFFSET`), with the values of its `ORDER BY` keys (also of the
+//! keys that the query does not select), and both results are compared with
+//! these sorted rows, its [`SortedReference`] (see [`result_order`]). The
+//! output columns of the query (its expressions above the sort) are only
+//! computed for the sorted rows that it may return: the rows that it returns,
+//! and the rows whose keys may tie with theirs. So they are not evaluated on
+//! rows that the query cuts, and the query returns no rows on which they fail
+//! (e.g. on a division by zero). The keys from the
 //! first key whose values depend on a volatile function (e.g. `random()`,
 //! also through the columns of a subquery) are not compared, as their values
 //! change from one run to the next: the rows that tie on the keys before it
@@ -136,11 +141,12 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, RunArray, UInt32Array,
+    new_null_array,
 };
 use arrow::compute::{cast, concat_batches, take};
 use arrow::datatypes::{
     ArrowNativeType, DataType, Field, Float16Type, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, RunEndIndexType, Schema, SchemaRef,
+    Int32Type, Int64Type, RunEndIndexType, Schema, SchemaRef, UInt32Type,
 };
 use arrow::downcast_dictionary_array;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -148,19 +154,20 @@ use arrow::util::pretty::pretty_format_batches;
 use arrow_ipc::writer::StreamWriter;
 use arrow_row::{RowConverter, SortField};
 use datafusion::dataframe::DataFrame;
-use datafusion::datasource::MemTable;
+use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, Result, ScalarValue, internal_err, not_impl_err,
+    Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, internal_err,
+    not_impl_err,
 };
 use datafusion_expr::logical_plan::{
     Distinct, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
 };
-use datafusion_expr::{ColumnarValue, Expr, LogicalPlan};
+use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
 
@@ -787,7 +794,8 @@ pub enum ResultOrder {
 #[derive(Debug, Clone)]
 pub struct SortedReference {
     /// The sorted rows of the query without its `LIMIT` and `OFFSET`: the
-    /// output columns of the query, followed by the values of
+    /// output columns of the query (null in the rows of
+    /// [`SortedReference::uncomputed`]), followed by the values of
     /// [`SortedReference::keys`].
     pub batches: Vec<RecordBatch>,
     /// The number of output columns of `batches`.
@@ -802,12 +810,19 @@ pub struct SortedReference {
     pub skip: usize,
     /// The maximum number of sorted rows that the query returns (`LIMIT`).
     pub fetch: Option<usize>,
+    /// The ranges of sorted rows whose output columns are not computed, with
+    /// the reason: the query cannot return them, as their keys cannot tie
+    /// with the keys of the rows that it returns, whatever the tolerance, or
+    /// it fails on them (e.g. on a division by zero above its `LIMIT`). The
+    /// query returns none of these rows.
+    pub uncomputed: Vec<(Range<usize>, String)>,
 }
 
 /// How the rows of the result of `plan`, planned by `ctx`, are ordered. For a
-/// query with a top-level `ORDER BY`, `ctx` runs `plan` without its `LIMIT`
-/// and `OFFSET`, with the values of its `ORDER BY` keys after its output
-/// columns, to compute its [`SortedReference`].
+/// query with a top-level `ORDER BY`, `ctx` sorts all rows of its top-level
+/// sort (without its `LIMIT` and `OFFSET`), with the values of its `ORDER BY`
+/// keys, and computes the output columns of the sorted rows that the query
+/// may return, to compute its [`SortedReference`].
 pub async fn result_order(ctx: &SessionContext, plan: &LogicalPlan) -> ResultOrder {
     if !has_top_level_order_by(plan) {
         return ResultOrder::Unordered;
@@ -822,27 +837,141 @@ async fn sorted_reference(
     ctx: &SessionContext,
     plan: &LogicalPlan,
 ) -> Result<SortedReference> {
-    let (reference, keys, window) = reference_plan(plan, &ctx.state())?;
-    let output = plan.schema().fields();
-    let fields = reference.schema().fields();
-    if fields.len() != output.len() + keys.len()
-        || output
-            .iter()
-            .zip(fields)
-            .any(|(output, field)| output.data_type() != field.data_type())
-    {
-        return internal_err!(
-            "the sorted rows do not have the output columns of the query"
-        );
+    let reference = reference_plan(plan, &ctx.state())?;
+    let sorted = ctx
+        .execute_logical_plan(reference.sort.clone())
+        .await?
+        .collect()
+        .await?;
+    let schema = sorted.first().map_or_else(
+        || Arc::new(reference.sort.schema().as_arrow().clone()),
+        RecordBatch::schema,
+    );
+    let sorted = concat_batches(&schema, &sorted)?;
+    let width = reference.input.fields().len();
+    if sorted.num_columns() != width + reference.keys.len() {
+        return internal_err!("the sorted rows do not have the columns of the sort");
     }
-    let batches = ctx.execute_logical_plan(reference).await?.collect().await?;
+    let rows = sorted.num_rows();
+    let returnable = returnable_rows(&sorted, width, reference.window.rows(rows))?;
+    let (outputs, failures) = reference.outputs(ctx, &sorted, &returnable).await?;
+
+    // The output columns of the sorted rows, at their positions.
+    let output = plan.schema().fields();
+    let mut index = vec![None; rows];
+    let outputs = match outputs.first() {
+        Some(first) => Some(concat_batches(&first.schema(), &outputs)?),
+        None => None,
+    };
+    if let Some(outputs) = &outputs {
+        let fields = outputs.schema().fields().clone();
+        if fields.len() != output.len() + 1
+            || output
+                .iter()
+                .zip(&fields)
+                .any(|(output, field)| output.data_type() != field.data_type())
+        {
+            return internal_err!(
+                "the sorted rows do not have the output columns of the query"
+            );
+        }
+        let positions = outputs.column(output.len()).as_primitive::<UInt32Type>();
+        for (i, &position) in positions.values().iter().enumerate() {
+            let Some(slot @ None) = index.get_mut(position.as_usize()) else {
+                return internal_err!(
+                    "the output columns of a sorted row are computed twice"
+                );
+            };
+            *slot = Some(u32::try_from(i).expect("rows fit in u32"));
+        }
+    }
+    let failed = failures.iter().map(|(row, _)| *row).collect::<HashSet<_>>();
+    if returnable
+        .iter()
+        .any(|row| index[*row].is_none() && !failed.contains(row))
+    {
+        return internal_err!("the output columns of a sorted row are not computed");
+    }
+    let index = UInt32Array::from(index);
+    let mut fields = vec![];
+    let mut columns = vec![];
+    for (i, field) in output.iter().enumerate() {
+        columns.push(match &outputs {
+            Some(outputs) => take(outputs.column(i), &index, None)?,
+            None => new_null_array(field.data_type(), rows),
+        });
+        fields.push(Field::new(field.name(), field.data_type().clone(), true));
+    }
+    for i in width..sorted.num_columns() {
+        fields.push(sorted.schema().field(i).clone());
+        columns.push(Arc::clone(sorted.column(i)));
+    }
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+
+    // The rows whose output columns are not computed, with the reason.
+    let mut failures = failures
+        .into_iter()
+        .map(|(row, e)| (row, format!("the query fails on it: {e}")))
+        .collect::<HashMap<_, _>>();
+    let mut returnable = returnable.into_iter().peekable();
+    let mut uncomputed: Vec<(Range<usize>, String)> = vec![];
+    for row in 0..rows {
+        let reason = match returnable.next_if_eq(&row) {
+            Some(_) => failures.remove(&row),
+            None => Some(
+                "the query cannot return it, as its keys cannot tie with the keys of \
+                 the rows that it returns"
+                    .to_string(),
+            ),
+        };
+        let Some(reason) = reason else { continue };
+        match uncomputed.last_mut() {
+            Some((range, last)) if range.end == row && *last == reason => range.end += 1,
+            _ => uncomputed.push((row..row + 1, reason)),
+        }
+    }
     Ok(SortedReference {
-        batches,
+        batches: vec![batch],
         columns: output.len(),
-        keys,
-        skip: window.skip,
-        fetch: window.fetch,
+        keys: reference.keys,
+        skip: reference.window.skip,
+        fetch: reference.window.fetch,
+        uncomputed,
     })
+}
+
+/// The sorted rows (`sorted`, whose columns from `width` are the values of the
+/// `ORDER BY` keys) that a query may return if it returns the sorted rows
+/// `window`, whatever the tolerance: these rows, and the rows whose keys may
+/// tie with their keys, which are the same up to their first floating-point
+/// value but for this value (they have the same [`Shape`], see
+/// [`decision_keys`]).
+// The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
+// for memory accounting with the `arrow-buffer/pool` feature (enabled by
+// `--all-features`): it affects neither their equality nor their hashing. Not
+// `expect`: the lint only fires with that feature.
+#[allow(clippy::allow_attributes, clippy::mutable_key_type)]
+fn returnable_rows(
+    sorted: &RecordBatch,
+    width: usize,
+    window: Range<usize>,
+) -> Result<Vec<usize>> {
+    let keys = (0..sorted.num_rows())
+        .map(|row| {
+            let keys = sorted.columns()[width..]
+                .iter()
+                .map(|column| Value::try_new(column.as_ref(), row))
+                .collect::<Result<Row>>()?;
+            Ok(decision_keys(&keys).0)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let shapes = keys[window.clone()]
+        .iter()
+        .map(|keys| Shape(keys))
+        .collect::<HashSet<_>>();
+    Ok((0..keys.len())
+        .filter(|row| window.contains(row) || shapes.contains(&Shape(&keys[*row])))
+        .collect())
 }
 
 /// The rows of its sorted rows that a query returns.
@@ -864,6 +993,15 @@ impl Window {
             },
         }
     }
+
+    /// The positions of the rows of this window among `rows` sorted rows.
+    fn rows(self, rows: usize) -> Range<usize> {
+        let start = self.skip.min(rows);
+        start
+            ..self
+                .fetch
+                .map_or(rows, |fetch| start.saturating_add(fetch).min(rows))
+    }
 }
 
 /// The name of the column of the values of the `i`th `ORDER BY` key in the
@@ -872,16 +1010,162 @@ fn key_column(i: usize) -> String {
     format!("__test_utils_order_by_key_{i}")
 }
 
-/// The plan of the [`SortedReference`] of `plan`, a query with a top-level
-/// `ORDER BY` (see [`has_top_level_order_by`]): `plan` without the limits
-/// above its top-level sort, with the values of the `ORDER BY` keys after its
-/// output columns. Also returns the keys (displayed), and the window of the
-/// sorted rows that `plan` returns. `state` evaluates the expressions of the
-/// limits.
-fn reference_plan(
-    plan: &LogicalPlan,
-    state: &SessionState,
-) -> Result<(LogicalPlan, Vec<String>, Window)> {
+/// The name of the table of the sorted rows whose output columns
+/// [`ReferencePlan::compute`] computes.
+const SORTED_ROWS: &str = "__test_utils_sorted_rows";
+
+/// The name of the column of the positions of the sorted rows whose output
+/// columns [`ReferencePlan::compute`] computes.
+const SORTED_POSITION: &str = "__test_utils_sorted_position";
+
+/// The maximum number of times that [`ReferencePlan::outputs`] computes the
+/// output columns of sorted rows, as it looks for the rows on which the query
+/// fails.
+const MAX_OUTPUT_COMPUTATIONS: usize = 256;
+
+/// The plans of the [`SortedReference`] of a query with a top-level `ORDER BY`
+/// (see [`has_top_level_order_by`]), see [`reference_plan`].
+struct ReferencePlan {
+    /// The top-level sort of the query without its `fetch`, over its input
+    /// with the values of the `ORDER BY` keys after its columns (see
+    /// [`key_column`]).
+    sort: LogicalPlan,
+    /// The schema of the input of the sort.
+    input: DFSchemaRef,
+    /// The `ORDER BY` keys whose values the sort has, see
+    /// [`SortedReference::keys`].
+    keys: Vec<String>,
+    /// The projections and subquery aliases between the sort and the root of
+    /// the query, from the sort up.
+    above: Vec<LogicalPlan>,
+    /// The window of the sorted rows that the query returns.
+    window: Window,
+}
+
+impl ReferencePlan {
+    /// The output columns of the sorted rows `rows` of `sorted` (the rows of
+    /// [`ReferencePlan::sort`]), each followed by its position, and the rows
+    /// on which the query fails, with the error. They are computed for all
+    /// rows at once, or, if the query fails, for each half of them, down to
+    /// the single rows on which it fails.
+    async fn outputs(
+        &self,
+        ctx: &SessionContext,
+        sorted: &RecordBatch,
+        rows: &[usize],
+    ) -> Result<(Vec<RecordBatch>, Vec<(usize, DataFusionError)>)> {
+        let (mut outputs, mut failures) = (vec![], vec![]);
+        let (mut pending, mut computations, mut planned) = (vec![rows], 0, false);
+        while let Some(rows) = pending.pop() {
+            if rows.is_empty() {
+                continue;
+            }
+            computations += 1;
+            if computations > MAX_OUTPUT_COMPUTATIONS {
+                return not_impl_err!(
+                    "the output columns of the sorted rows: the query fails on too many \
+                     of them (computed more than {MAX_OUTPUT_COMPUTATIONS} times)"
+                );
+            }
+            match self.compute(ctx, sorted, rows).await {
+                Ok(batches) => outputs.extend(batches),
+                Err(e) => {
+                    // Without rows, the query must not fail: its errors come from
+                    // its rows.
+                    if !planned {
+                        self.compute(ctx, sorted, &[]).await?;
+                        planned = true;
+                    }
+                    if let [row] = rows {
+                        failures.push((*row, e));
+                    } else {
+                        let (first, second) = rows.split_at(rows.len() / 2);
+                        pending.extend([second, first]);
+                    }
+                }
+            }
+        }
+        Ok((outputs, failures))
+    }
+
+    /// The output columns of the sorted rows `rows` of `sorted`, each followed
+    /// by its position ([`SORTED_POSITION`]): the projections and subquery
+    /// aliases above the sort, over these rows.
+    async fn compute(
+        &self,
+        ctx: &SessionContext,
+        sorted: &RecordBatch,
+        rows: &[usize],
+    ) -> Result<Vec<RecordBatch>> {
+        let positions = rows
+            .iter()
+            .map(|&row| u32::try_from(row))
+            .collect::<std::result::Result<UInt32Array, _>>()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let schema = sorted.schema();
+        let width = self.input.fields().len();
+        let mut fields = vec![];
+        let mut columns = vec![];
+        for i in 0..width {
+            fields.push(schema.field(i).clone().with_name(format!("c{i}")));
+            columns.push(take(sorted.column(i), &positions, None)?);
+        }
+        fields.push(Field::new(SORTED_POSITION, DataType::UInt32, false));
+        columns.push(Arc::new(positions) as ArrayRef);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let scan = LogicalPlanBuilder::scan(
+            SORTED_ROWS,
+            provider_as_source(Arc::new(table)),
+            None,
+        )?
+        .build()?;
+        // The columns of the input of the sort, with their qualifiers.
+        let column = |name: &str| Expr::Column(Column::new(Some(SORTED_ROWS), name));
+        let exprs = self
+            .input
+            .iter()
+            .enumerate()
+            .map(|(i, (qualifier, field))| {
+                column(&format!("c{i}")).alias_qualified(qualifier.cloned(), field.name())
+            })
+            .chain([column(SORTED_POSITION).alias(SORTED_POSITION)])
+            .collect();
+        let rows = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(scan))?);
+        let plan = self.above(rows)?;
+        ctx.execute_logical_plan(plan).await?.collect().await
+    }
+
+    /// The projections and subquery aliases above the sort over `rows`, which
+    /// has the columns of the input of the sort and [`SORTED_POSITION`], with
+    /// this column after their columns.
+    fn above(&self, rows: LogicalPlan) -> Result<LogicalPlan> {
+        self.above.iter().try_fold(rows, |input, node| {
+            Ok(match node {
+                LogicalPlan::Projection(projection) => {
+                    let position = {
+                        let (qualifier, field) = input
+                            .schema()
+                            .qualified_field_with_unqualified_name(SORTED_POSITION)?;
+                        Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                    };
+                    let mut exprs = projection.expr.clone();
+                    exprs.push(position);
+                    LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(input))?)
+                }
+                LogicalPlan::SubqueryAlias(alias) => LogicalPlan::SubqueryAlias(
+                    SubqueryAlias::try_new(Arc::new(input), alias.alias.clone())?,
+                ),
+                _ => return internal_err!("a node above the sort: {}", node.display()),
+            })
+        })
+    }
+}
+
+/// The [`ReferencePlan`] of `plan`, a query with a top-level `ORDER BY` (see
+/// [`has_top_level_order_by`]). `state` evaluates the expressions of the
+/// limits above its top-level sort.
+fn reference_plan(plan: &LogicalPlan, state: &SessionState) -> Result<ReferencePlan> {
     match plan {
         LogicalPlan::Sort(sort) => {
             // The values of a key that depends on a volatile function, also
@@ -912,15 +1196,19 @@ fn reference_plan(
                 input: Arc::new(LogicalPlan::Projection(input)),
                 fetch: None,
             });
-            let keys = keys.iter().map(ToString::to_string).collect();
-            let window = Window {
-                skip: 0,
-                fetch: sort.fetch,
-            };
-            Ok((sorted, keys, window))
+            Ok(ReferencePlan {
+                sort: sorted,
+                input: Arc::clone(schema),
+                keys: keys.iter().map(ToString::to_string).collect(),
+                above: vec![],
+                window: Window {
+                    skip: 0,
+                    fetch: sort.fetch,
+                },
+            })
         }
         LogicalPlan::Limit(limit) => {
-            let (input, keys, window) = reference_plan(&limit.input, state)?;
+            let mut reference = reference_plan(&limit.input, state)?;
             // The limits may be constant expressions, e.g. `LIMIT 1 + 1`.
             let evaluate = |expr: &Option<Box<Expr>>| {
                 expr.as_deref()
@@ -939,24 +1227,14 @@ fn reference_plan(
             else {
                 return not_impl_err!("a LIMIT or an OFFSET that is not a constant");
             };
-            Ok((input, keys, window.then(skip, fetch)))
+            reference.window = reference.window.then(skip, fetch);
+            Ok(reference)
         }
-        LogicalPlan::SubqueryAlias(alias) => {
-            let (input, keys, window) = reference_plan(&alias.input, state)?;
-            let alias = SubqueryAlias::try_new(Arc::new(input), alias.alias.clone())?;
-            Ok((LogicalPlan::SubqueryAlias(alias), keys, window))
-        }
-        LogicalPlan::Projection(projection) => {
-            let (input, keys, window) = reference_plan(&projection.input, state)?;
-            let mut exprs = projection.expr.clone();
-            for i in 0..keys.len() {
-                let (qualifier, field) = input
-                    .schema()
-                    .qualified_field_with_unqualified_name(&key_column(i))?;
-                exprs.push(Expr::Column(Column::new(qualifier.cloned(), field.name())));
-            }
-            let projection = Projection::try_new(exprs, Arc::new(input))?;
-            Ok((LogicalPlan::Projection(projection), keys, window))
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        | LogicalPlan::Projection(Projection { input, .. }) => {
+            let mut reference = reference_plan(input, state)?;
+            reference.above.push(plan.clone());
+            Ok(reference)
         }
         _ => internal_err!("the query has no top-level ORDER BY"),
     }
@@ -1269,8 +1547,12 @@ fn schema_difference(expected: &Schema, actual: &Schema) -> String {
 
 /// The rows of a [`SortedReference`], read for comparisons.
 struct SortedRows {
-    /// The output columns of all sorted rows.
-    values: Vec<Row>,
+    /// The output columns of all sorted rows, unless they are not computed
+    /// (see [`SortedReference::uncomputed`]).
+    values: Vec<Option<Row>>,
+    /// The ranges of rows whose output columns are not computed, with the
+    /// reason.
+    uncomputed: Vec<(Range<usize>, String)>,
     /// The classes of the sorted rows: the ranges of rows whose keys are
     /// exactly equal up to their first floating-point value, and these keys
     /// (see [`decision_keys`]).
@@ -1279,6 +1561,32 @@ struct SortedRows {
     truncated: Vec<bool>,
     /// The sorted rows that the query returns.
     window: Range<usize>,
+}
+
+impl SortedRows {
+    /// The output columns of the sorted row `row`, which must be computed.
+    fn computed(&self, row: usize) -> &Row {
+        self.values[row]
+            .as_ref()
+            .expect("the output columns of the row are computed")
+    }
+
+    /// The output columns of the sorted row `row`, displayed, or why they are
+    /// not computed.
+    fn display(&self, row: usize) -> String {
+        match &self.values[row] {
+            Some(values) => values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => {
+                let i = self.uncomputed.partition_point(|(rows, _)| rows.end <= row);
+                let reason = self.uncomputed.get(i).map_or("", |(_, reason)| reason);
+                format!("not computed: {reason}")
+            }
+        }
+    }
 }
 
 /// The keys of a row (the values of its `ORDER BY` keys, `keys`) that decide
@@ -1328,7 +1636,8 @@ fn decision_keys(keys: &[Value]) -> (Row, bool) {
 }
 
 impl SortedReference {
-    /// All sorted rows, in classes of rows whose keys are exactly equal.
+    /// All sorted rows, in classes of rows whose keys are exactly equal up to
+    /// their first floating-point value.
     fn sorted_rows(&self) -> Result<SortedRows> {
         let width = self.columns + self.keys.len();
         if let Some(batch) = self
@@ -1364,19 +1673,31 @@ impl SortedReference {
                         truncated.push(truncates);
                     }
                 }
-                values.push(row(batch, i, 0..self.columns)?);
+                let next = self
+                    .uncomputed
+                    .partition_point(|(rows, _)| rows.end <= position);
+                let computed = self
+                    .uncomputed
+                    .get(next)
+                    .is_none_or(|(rows, _)| !rows.contains(&position));
+                values.push(
+                    computed
+                        .then(|| row(batch, i, 0..self.columns))
+                        .transpose()?,
+                );
             }
         }
-        let len = values.len();
-        let start = self.skip.min(len);
-        let end = self
-            .fetch
-            .map_or(len, |fetch| start.saturating_add(fetch).min(len));
+        let window = Window {
+            skip: self.skip,
+            fetch: self.fetch,
+        }
+        .rows(values.len());
         Ok(SortedRows {
             values,
+            uncomputed: self.uncomputed.clone(),
             classes,
             truncated,
-            window: start..end,
+            window,
         })
     }
 }
@@ -1537,8 +1858,9 @@ fn compare_sorted(
     let mut group_of = HashMap::new();
     let mut groups_of: HashMap<(usize, Shape<'_>), Vec<usize>> = HashMap::new();
     for (class, (rows, _)) in classes.iter().enumerate() {
-        for row in rows.clone() {
-            let values = &sorted.values[row];
+        // The query returns no rows whose output columns are not computed.
+        for row in rows.clone().filter(|&row| sorted.values[row].is_some()) {
+            let values = sorted.computed(row);
             let group = *group_of
                 .entry((class, Shape(values), float_bits(values)))
                 .or_insert_with(|| {
@@ -1570,7 +1892,7 @@ fn compare_sorted(
         let mut groups_of_row = vec![];
         for &class in &active {
             for &group in groups_of.get(&(class, Shape(row))).into_iter().flatten() {
-                if !floats || rows_equal(&sorted.values[groups[group].1], row, tolerance)
+                if !floats || rows_equal(sorted.computed(groups[group].1), row, tolerance)
                 {
                     groups_of_row.push(group);
                 }
@@ -1588,7 +1910,7 @@ fn compare_sorted(
         let floats = row.iter().any(Value::has_floats);
         // Whether sorted rows of other positions have its values.
         let elsewhere = groups.iter().find(|&&(_, group_row, _)| {
-            let values = &sorted.values[group_row];
+            let values = sorted.computed(group_row);
             Shape(values) == Shape(row) && (!floats || rows_equal(values, row, tolerance))
         });
         let position = window.start + i;
@@ -1604,7 +1926,7 @@ fn compare_sorted(
                  row {position} of {reference_name}: ({}), keys: ({})",
                 display(row),
                 display_keys(class),
-                display(&sorted.values[position]),
+                sorted.display(position),
                 display_keys(position_class)
             ),
             _ => format!(
@@ -1613,7 +1935,7 @@ fn compare_sorted(
                  their multiplicities)\ncolumns: ({columns})\n  row {i}: ({})\n  sorted \
                  row {position} of {reference_name}: ({})",
                 display(row),
-                display(&sorted.values[position])
+                sorted.display(position)
             ),
         });
     }
@@ -1662,7 +1984,7 @@ fn compare_sorted(
                  ({})",
                 display(&result[i]),
                 window.start + i,
-                display(&sorted.values[window.start + i])
+                sorted.display(window.start + i)
             ),
             ClusterFailure::Order {
                 row,
@@ -3525,6 +3847,7 @@ mod tests {
             keys: keys.iter().map(ToString::to_string).collect(),
             skip,
             fetch,
+            uncomputed: vec![],
         })
     }
 
@@ -3562,6 +3885,7 @@ mod tests {
             keys: vec!["m.k".to_string()],
             skip,
             fetch,
+            uncomputed: vec![],
         })
     }
 
@@ -4169,6 +4493,7 @@ mod tests {
             keys: vec!["m.k1".to_string(), "m.k2".to_string()],
             skip,
             fetch,
+            uncomputed: vec![],
         })
     }
 
@@ -5087,6 +5412,115 @@ mod tests {
         let order = result_order(&ctx, df.logical_plan()).await;
         assert!(matches!(&order, ResultOrder::Exact(_)), "{order:?}");
         Ok(())
+    }
+
+    /// A batch of `(k INT, v INT)` rows.
+    fn kv_int_batch(rows: &[(i32, i32)]) -> RecordBatch {
+        batch_of(vec![
+            (
+                "k",
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.0)))
+                    as ArrayRef,
+            ),
+            (
+                "v",
+                Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ),
+        ])
+    }
+
+    /// The order of `sql` over the table `m` of the `(k, v)` rows `rows`.
+    async fn order_over(rows: &[(i32, i32)], sql: &str) -> Result<ResultOrder> {
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", kv_int_batch(rows))?;
+        let df = ctx.sql(sql).await?;
+        Ok(result_order(&ctx, df.logical_plan()).await)
+    }
+
+    #[tokio::test]
+    async fn result_order_computes_the_output_columns_of_rows_that_the_query_may_return()
+    -> Result<()> {
+        let sql = "SELECT 10 / v AS x FROM (SELECT v FROM m ORDER BY k LIMIT 2) t";
+        let x = |values: &[i64]| {
+            let x = Int64Array::from(values.to_vec());
+            vec![batch_of(vec![("x", Arc::new(x) as ArrayRef)])]
+        };
+        // The query cannot return the row of `v = 0`, whose key does not tie with
+        // the keys of the rows that it returns: its output columns are not
+        // computed (which would fail), and the rows that tie may come in any
+        // order.
+        let order = order_over(&[(1, 1), (1, 2), (2, 0)], sql).await?;
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        let cannot_return = "the query cannot return it, as its keys cannot tie with \
+                             the keys of the rows that it returns";
+        assert_eq!(reference.uncomputed, [(2..3, cannot_return.to_string())]);
+        same_results(x(&[10, 5]), x(&[5, 10]), &order).unwrap();
+        let err = same_results(x(&[10, 5]), x(&[10, 10]), &order).unwrap_err();
+        assert!(
+            err.starts_with("row 1 of the pipeline engine differs"),
+            "{err}"
+        );
+
+        // The query fails on the row of `v = 0`, which ties with the rows that
+        // it returns: it may only return the other rows.
+        let order = order_over(&[(1, 1), (1, 2), (1, 0)], sql).await?;
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        let [(rows, reason)] = reference.uncomputed.as_slice() else {
+            panic!("{:?}", reference.uncomputed);
+        };
+        assert_eq!(rows.len(), 1);
+        assert!(reason.starts_with("the query fails on it: "), "{reason}");
+        assert!(reason.contains("Divide by zero"), "{reason}");
+        same_results(x(&[10, 5]), x(&[5, 10]), &order).unwrap();
+        same_results(x(&[5, 10]), x(&[10, 5]), &order).unwrap();
+
+        // The query fails on the second row that it returns, whatever the order.
+        let order = order_over(&[(1, 1), (2, 0), (3, 5)], sql).await?;
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        assert_eq!(reference.uncomputed.len(), 2, "{:?}", reference.uncomputed);
+        assert_eq!(reference.uncomputed[1], (2..3, cannot_return.to_string()));
+        let err = same_results(x(&[10, 2]), x(&[10, 2]), &order).unwrap_err();
+        assert!(
+            err.contains(
+                "row 1 of DataFusion differs: it is not among the sorted rows of the \
+                 sorted reference of DataFusion that the query may return at its \
+                 position"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "sorted row 1 of the sorted reference of DataFusion: (not computed: the \
+                 query fails on it: "
+            ),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_evaluate_no_expressions_on_rows_that_are_cut() {
+        // The query divides by the `v` of the rows that tie on `k = 1`, in other
+        // orders in the tables of both engines, but not by the `0` of the row
+        // that its LIMIT, or its OFFSET, cuts.
+        let setup = per_engine_tables(
+            kv_int_batch(&[(1, 1), (1, 2), (2, 0)]),
+            kv_int_batch(&[(1, 2), (1, 1), (2, 0)]),
+        );
+        for sql in [
+            "SELECT 10 / v AS x FROM (SELECT v FROM m ORDER BY k LIMIT 2) t",
+            "SELECT k, 10 / v AS x FROM (SELECT k, v FROM m ORDER BY k LIMIT 2)",
+            "SELECT 10 / x AS y FROM (SELECT 10 / v AS x FROM \
+             (SELECT v FROM m ORDER BY k DESC OFFSET 1)) t",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
