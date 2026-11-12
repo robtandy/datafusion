@@ -679,9 +679,10 @@ impl Lowering<'_> {
         {
             return Ok(Arc::new(unnest));
         }
-        if let Some(sort) =
-            PhysicalPartialSort::try_lower(plan, |input| self.lower(input))?
-        {
+        // A partial sort with a fetch stops its pipeline once it has its rows.
+        if let Some(sort) = PhysicalPartialSort::try_lower(plan, |input| {
+            self.lower_in(input, early_stop)
+        })? {
             return Ok(Arc::new(sort));
         }
         // A sink reads all of its input.
