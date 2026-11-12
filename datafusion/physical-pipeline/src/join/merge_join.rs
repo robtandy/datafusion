@@ -1637,9 +1637,20 @@ pub(crate) fn evaluate_keys(
     reservation: &MemoryReservation,
 ) -> Result<Vec<ArrayRef>> {
     let rows = batch.num_rows();
+    // The keys of a single value are made comparable as a value (of a row),
+    // and then made arrays (once reserved).
     let values = keys
         .into_iter()
-        .map(|key| key.evaluate(batch))
+        .map(|key| match key.evaluate(batch)? {
+            ColumnarValue::Scalar(scalar) => {
+                Ok(ColumnarValue::Scalar(scalar_with(&scalar, |row| {
+                    comparable_unions(&normalize_floats(row))
+                })?))
+            }
+            ColumnarValue::Array(array) => Ok(ColumnarValue::Array(comparable_unions(
+                &normalize_floats(&array),
+            )?)),
+        })
         .collect::<Result<Vec<_>>>()?;
     reservation.try_grow(
         values
@@ -1652,8 +1663,17 @@ pub(crate) fn evaluate_keys(
     )?;
     values
         .into_iter()
-        .map(|value| comparable_unions(&normalize_floats(&value.into_array(rows)?)))
+        .map(|value| value.into_array(rows))
         .collect()
+}
+
+/// `scalar` changed by `change` (of an array of it, of a row).
+fn scalar_with(
+    scalar: &ScalarValue,
+    change: impl FnOnce(&ArrayRef) -> Result<ArrayRef>,
+) -> Result<ScalarValue> {
+    let row = scalar.to_array_of_size(1)?;
+    ScalarValue::try_from_array(&change(&row)?, 0)
 }
 
 /// An upper bound of the memory of an array of the value `scalar` for `rows`
@@ -2652,9 +2672,19 @@ impl PhysicalExpr for NormalizedFloats {
         self.expr.nullable(input_schema)
     }
 
+    /// A single value (e.g. a literal) stays one (to be made an array once it
+    /// is reserved, see `expression_memory`).
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let values = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-        Ok(ColumnarValue::Array(normalize_floats(&values)))
+        Ok(match self.expr.evaluate(batch)? {
+            ColumnarValue::Scalar(scalar) => {
+                ColumnarValue::Scalar(scalar_with(&scalar, |row| {
+                    Ok(normalize_floats(row))
+                })?)
+            }
+            ColumnarValue::Array(values) => {
+                ColumnarValue::Array(normalize_floats(&values))
+            }
+        })
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
@@ -2721,9 +2751,17 @@ impl PhysicalExpr for ComparableUnions {
             || matches!(self.expr.data_type(input_schema)?, DataType::Union(_, _)))
     }
 
+    /// A single value (e.g. a literal) stays one (to be made an array once it
+    /// is reserved, see `expression_memory`).
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let values = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-        Ok(ColumnarValue::Array(comparable_unions(&values)?))
+        Ok(match self.expr.evaluate(batch)? {
+            ColumnarValue::Scalar(scalar) => {
+                ColumnarValue::Scalar(scalar_with(&scalar, comparable_unions)?)
+            }
+            ColumnarValue::Array(values) => {
+                ColumnarValue::Array(comparable_unions(&values)?)
+            }
+        })
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
@@ -10176,6 +10214,88 @@ pub(crate) mod tests {
                 "{name}: the query allocated {allocated} bytes"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn literal_keys_of_floats_are_sorted_within_their_reservation() -> Result<()> {
+        // A merge of the partitions of a sort-merge join of 1,024 left rows and
+        // a right row (inputs that end, sorted by their ids) on a literal list
+        // of 2,048 floats (16 KiB) and the ids: the planner lowers it to a
+        // merge join whose sorts sort by the keys with `-0.0` as `+0.0`
+        // (`NormalizedFloats` of the literal, a single value), whose rows (16
+        // MB as values, and as much encoded) they reserve before they make
+        // them, so that in a pool of 256 KiB the query fails with
+        // `ResourcesExhausted` before it allocates them (on the thread of the
+        // test, as a runtime of the current thread runs all tasks of the query
+        // there).
+        let floats = Float64Array::from_iter_values((0..2048).map(f64::from));
+        let item = Arc::new(Field::new_list_field(DataType::Float64, false));
+        let list = ListArray::new(
+            item,
+            OffsetBuffer::from_lengths([2048]),
+            Arc::new(floats),
+            None,
+        );
+        let key =
+            datafusion_physical_expr::expressions::lit(ScalarValue::List(Arc::new(list)));
+        let bounded = |side: &str, rows: i64| -> Arc<dyn ExecutionPlan> {
+            let batch = keyed_rows(
+                side,
+                &(Arc::new(Int32Array::from_iter_values(0..rows as i32)) as ArrayRef),
+            );
+            let schema = batch.schema();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                col(&format!("{side}id"), &schema).unwrap(),
+                SortOptions::default(),
+            )])
+            .unwrap();
+            let source = MemorySourceConfig::try_new(&[vec![batch]], schema, None)
+                .unwrap()
+                .try_with_sort_information(vec![order])
+                .unwrap();
+            datafusion_datasource::source::DataSourceExec::from_data_source(source)
+                as Arc<dyn ExecutionPlan>
+        };
+        let (left, right) = (bounded("l", 1024), bounded("r", 1));
+        let on = vec![
+            (Arc::clone(&key), Arc::clone(&key)),
+            (col("lid", &left.schema())?, col("rid", &right.schema())?),
+        ];
+        let join: Arc<dyn ExecutionPlan> = Arc::new(SortMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            JoinType::Inner,
+            vec![SortOptions::default(); 2],
+            NullEquality::NullEqualsNothing,
+        )?);
+        let order = LexOrdering::new([PhysicalSortExpr::new(
+            col("lid", &join.schema())?,
+            SortOptions::default(),
+        )])
+        .unwrap();
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(SortPreservingMergeExec::new(order, join));
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        let tree = format_operator_tree(&root);
+        assert_eq!(count::<PhysicalMergeJoin>(&root), 1, "{tree}");
+        assert_eq!(count::<MergeJoinSort>(&root), 2, "{tree}");
+        allocations::reset_peak();
+        let before = allocations::held();
+        let err = run_native(&root, plan, limited_task_ctx(256 << 10)?)
+            .await
+            .unwrap_err();
+        let allocated = allocations::peak() - before;
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}\n{tree}"
+        );
+        assert!(
+            allocated < 1 << 20,
+            "the query allocated {allocated} bytes\n{tree}"
+        );
         Ok(())
     }
 
