@@ -50,6 +50,9 @@
 //!      infinities and `NaN`s, and any value whose neighbors are farther than
 //!      the tolerance, e.g. within a tolerance of `0`) are compared like other
 //!      values: rows that are equal on them are ordered by their later keys.
+//!      DataFusion sorts `-0.0` before `0.0`, but they are equal, so rows
+//!      whose zeros only differ in sign may also be ordered by their later
+//!      keys.
 //!      Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
 //!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
@@ -1097,18 +1100,31 @@ impl ReferencePlan {
     /// The output columns of the sorted rows `rows` of `sorted` (the rows of
     /// [`ReferencePlan::sort`]), each followed by its position, and the rows
     /// whose output columns are not computed, with the reason. They are
-    /// computed for all rows at once, or, if the query fails, for each half of
-    /// them (the first rows first), down to the single rows on which it
-    /// fails. After [`MAX_OUTPUT_COMPUTATIONS`] computations, the rows that
-    /// are left are not computed.
+    /// computed for all rows at once, or, if the query fails, for each row
+    /// alone (see [`ReferencePlan::compute_each`]). If the plan of the query
+    /// does not compute each row alone, they are computed for each half of
+    /// the rows (the first rows first), down to the single rows on which it
+    /// fails, and after [`MAX_OUTPUT_COMPUTATIONS`] computations, the rows
+    /// that are left are not computed.
     async fn outputs(
         &self,
         ctx: &SessionContext,
         sorted: &RecordBatch,
         rows: &[usize],
     ) -> Result<(Vec<RecordBatch>, Vec<(usize, String)>)> {
+        if rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+        if let Ok(batches) = self.compute(ctx, sorted, rows).await {
+            return Ok((batches, vec![]));
+        }
+        // Without rows, the query must not fail: its errors come from its rows.
+        self.compute(ctx, sorted, &[]).await?;
+        if let Some(outputs) = self.compute_each(ctx, sorted, rows).await? {
+            return Ok(outputs);
+        }
         let (mut outputs, mut uncomputed) = (vec![], vec![]);
-        let (mut pending, mut computations, mut planned) = (vec![rows], 0, false);
+        let (mut pending, mut computations) = (vec![rows], 0);
         while let Some(rows) = pending.pop() {
             if rows.is_empty() {
                 continue;
@@ -1126,12 +1142,6 @@ impl ReferencePlan {
             match self.compute(ctx, sorted, rows).await {
                 Ok(batches) => outputs.extend(batches),
                 Err(e) => {
-                    // Without rows, the query must not fail: its errors come from
-                    // its rows.
-                    if !planned {
-                        self.compute(ctx, sorted, &[]).await?;
-                        planned = true;
-                    }
                     if let [row] = rows {
                         uncomputed.push((*row, format!("the query fails on it: {e}")));
                     } else {
@@ -1153,6 +1163,61 @@ impl ReferencePlan {
         sorted: &RecordBatch,
         rows: &[usize],
     ) -> Result<Vec<RecordBatch>> {
+        let plan = self.over(sorted, rows, false)?;
+        ctx.execute_logical_plan(plan).await?.collect().await
+    }
+
+    /// The output columns of each of the sorted rows `rows` of `sorted` (each
+    /// followed by its position), or the error of the query on it. They are
+    /// computed by one plan over a partition of each row, which computes each
+    /// partition alone: `None` if the plan does not keep the partitions of
+    /// its input apart (e.g. if it joins them).
+    async fn compute_each(
+        &self,
+        ctx: &SessionContext,
+        sorted: &RecordBatch,
+        rows: &[usize],
+    ) -> Result<Option<(Vec<RecordBatch>, Vec<(usize, String)>)>> {
+        let plan = self.over(sorted, rows, true)?;
+        // A single target partition, so that the planner does not repartition
+        // the rows.
+        let config = ctx.copied_config().with_target_partitions(1);
+        let state = SessionStateBuilder::new_from_existing(ctx.state())
+            .with_config(config)
+            .build();
+        let plan = state.create_physical_plan(&plan).await?;
+        let mut node = Arc::clone(&plan);
+        while let [child] = node.children().as_slice() {
+            node = Arc::clone(child);
+        }
+        if !node.children().is_empty()
+            || plan.properties().output_partitioning().partition_count() != rows.len()
+        {
+            return Ok(None);
+        }
+        let (mut outputs, mut failures) = (vec![], vec![]);
+        for (partition, &row) in rows.iter().enumerate() {
+            let batches = match plan.execute(partition, state.task_ctx()) {
+                Ok(stream) => datafusion_physical_plan::common::collect(stream).await,
+                Err(e) => Err(e),
+            };
+            match batches {
+                Ok(batches) => outputs.extend(batches),
+                Err(e) => failures.push((row, format!("the query fails on it: {e}"))),
+            }
+        }
+        Ok(Some((outputs, failures)))
+    }
+
+    /// The projections and subquery aliases above the sort, over the sorted
+    /// rows `rows` of `sorted`, each followed by its position: in one
+    /// partition, or in one partition each (`each`).
+    fn over(
+        &self,
+        sorted: &RecordBatch,
+        rows: &[usize],
+        each: bool,
+    ) -> Result<LogicalPlan> {
         let positions = rows
             .iter()
             .map(|&row| u32::try_from(row))
@@ -1169,7 +1234,14 @@ impl ReferencePlan {
         fields.push(Field::new(SORTED_POSITION, DataType::UInt32, false));
         columns.push(Arc::new(positions) as ArrayRef);
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let partitions = if each {
+            (0..batch.num_rows())
+                .map(|row| vec![batch.slice(row, 1)])
+                .collect()
+        } else {
+            vec![vec![batch.clone()]]
+        };
+        let table = MemTable::try_new(batch.schema(), partitions)?;
         let scan = LogicalPlanBuilder::scan(
             SORTED_ROWS,
             provider_as_source(Arc::new(table)),
@@ -1188,8 +1260,7 @@ impl ReferencePlan {
             .chain([column(SORTED_POSITION).alias(SORTED_POSITION)])
             .collect();
         let rows = LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(scan))?);
-        let plan = self.above(rows)?;
-        ctx.execute_logical_plan(plan).await?.collect().await
+        self.above(rows)
     }
 
     /// The projections and subquery aliases above the sort over `rows`, which
@@ -2049,28 +2120,39 @@ fn precedence(
     }
 }
 
-/// Whether the row of `ORDER BY` keys `later` may sort before the row of keys
-/// `earlier`, or be equal to it, in the values that the engines may have for
-/// them within the tolerance `tolerance`. `options` are the sort options of
-/// the keys (ascending with nulls last if missing).
-fn may_precede(
+/// How the row of `ORDER BY` keys `later` may sort relative to the row of
+/// keys `earlier`, in the values that the engines may have for them within
+/// the tolerance `tolerance` (see [`precedence`]): the first key that is not
+/// equal decides. `options` are the sort options of the keys (ascending with
+/// nulls last if missing).
+fn row_precedence(
     later: &[Value],
     earlier: &[Value],
     options: &[SortOptions],
     tolerance: f64,
-) -> bool {
+) -> Precedence {
     for (i, (y, x)) in later.iter().zip(earlier).enumerate() {
         let options = options.get(i).copied().unwrap_or(SortOptions {
             descending: false,
             nulls_first: false,
         });
         match precedence(y, x, options, tolerance) {
-            Precedence::Before => return true,
-            Precedence::After => return false,
             Precedence::Equal => {}
+            other => return other,
         }
     }
-    true
+    Precedence::Equal
+}
+
+/// Whether the row of `ORDER BY` keys `later` may sort before the row of keys
+/// `earlier`, or be equal to it, see [`row_precedence`].
+fn may_precede(
+    later: &[Value],
+    earlier: &[Value],
+    options: &[SortOptions],
+    tolerance: f64,
+) -> bool {
+    row_precedence(later, earlier, options, tolerance) != Precedence::After
 }
 
 /// The first and the last positions of sorted rows at which the rows of each
@@ -2169,12 +2251,15 @@ impl SortedReference {
 /// rows, which are not all equal. `options` are the sort options of the keys.
 ///
 /// The keys of the classes are their [`decision_keys`]: all but their last
-/// floating-point value cannot vary within the tolerance. Keys may tie if
-/// they have the same [`Shape`] (their values but their floating-point
-/// values are equal), and the same floating-point values but the last. Then
-/// they tie if the values that the engines may have for their last
-/// floating-point values cross (see [`meeting`]), or if they meet and the
-/// later keys may put the later row first (see [`may_precede`]).
+/// floating-point value cannot vary within the tolerance. Of two classes, the
+/// later one ties with the earlier one if its keys may sort before them, or
+/// be equal to them (see [`row_precedence`]). That is only possible:
+/// * if their keys have the same [`Shape`] (their values but their
+///   floating-point values are equal), and the same floating-point values but
+///   the last, which are close; or
+/// * if they are equal up to a zero, which has another sign in each class:
+///   DataFusion sorts `-0.0` before `0.0`, but they are equal, so the later
+///   keys may order them otherwise.
 // The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
 // for memory accounting with the `arrow-buffer/pool` feature (enabled by
 // `--all-features`): it affects neither their equality nor their hashing. Not
@@ -2186,67 +2271,113 @@ fn tied_classes(
     options: &[SortOptions],
     tolerance: f64,
 ) -> (Vec<Vec<usize>>, Vec<bool>) {
-    let mut tied = vec![vec![]; classes.len()];
-    let mut meets = vec![false; classes.len()];
-    // The classes of each shape and floating-point values but the last, and
-    // the last floating-point value of each class.
-    let mut members_of: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
-    let mut last = vec![(0.0, Precision::Double); classes.len()];
-    for (index, class) in classes.iter().enumerate() {
+    // The floating-point values of each class, as bits but the last.
+    let floats = |row: &[Value]| {
         let mut floats = vec![];
-        for value in &class.keys {
+        for value in row {
             value.collect_floats_of_precision(&mut floats);
         }
-        let Some(value) = floats.pop() else {
+        floats
+    };
+    let bits = |floats: &[(f64, Precision)]| {
+        floats
+            .iter()
+            .map(|(value, _)| normalized(*value).to_bits())
+            .collect::<Vec<_>>()
+    };
+    // The pairs of classes that may tie (each once, the earlier class first).
+    let mut pairs = HashSet::new();
+    // Of the same shape and floating-point values but the last, which are
+    // within twice the tolerance (but for rounding) if their values may cross
+    // or meet.
+    let mut members_of: HashMap<(Shape<'_>, Vec<u64>), Vec<usize>> = HashMap::new();
+    let mut last = vec![0.0; classes.len()];
+    for (index, class) in classes.iter().enumerate() {
+        let mut floats = floats(&class.keys);
+        let Some((value, _)) = floats.pop() else {
             continue;
         };
-        last[index] = value;
-        let others = floats
-            .into_iter()
-            .map(|(value, _)| normalized(value).to_bits());
+        last[index] = normalized(value);
         members_of
-            .entry((Shape(&class.keys), others.collect()))
+            .entry((Shape(&class.keys), bits(&floats)))
             .or_default()
             .push(index);
     }
-    // The values whose values may cross or meet are within twice the
-    // tolerance, but for rounding.
     let reach = 2.0 * tolerance + 8.0 * f64::EPSILON;
     for members in members_of.values().filter(|members| members.len() > 1) {
         let values = members
             .iter()
-            .map(|&class| vec![normalized(last[class].0)])
+            .map(|&class| vec![last[class]])
             .collect::<Vec<_>>();
         for (i, others) in equal_pairs(&values, &values, reach).into_iter().enumerate() {
             for j in others {
-                // Each pair once, the earlier class first.
                 let (a, b) = (members[i], members[j]);
-                if a >= b {
-                    continue;
-                }
-                let ties = match meeting(last[a], last[b], tolerance) {
-                    Meeting::Cross => true,
-                    Meeting::Meet if !classes[a].truncated && !classes[b].truncated => {
-                        true
-                    }
-                    Meeting::Meet if classes[a].equal && classes[b].equal => may_precede(
-                        &keys[classes[b].rows.start],
-                        &keys[classes[a].rows.start],
-                        options,
-                        tolerance,
-                    ),
-                    Meeting::Meet => {
-                        meets[a] = true;
-                        meets[b] = true;
-                        false
-                    }
-                    Meeting::Apart => false,
-                };
-                if ties {
-                    tied[a].push(b);
-                    tied[b].push(a);
+                if a < b {
+                    pairs.insert((a, b));
                 }
             }
+        }
+    }
+    // Equal up to the `n`th zero of their keys, which has another sign.
+    let mut prefixes = vec![];
+    for (index, class) in classes.iter().enumerate() {
+        let zeros = floats(&class.keys)
+            .iter()
+            .filter(|(value, _)| *value == 0.0)
+            .count();
+        for n in 1..=zeros {
+            let seen = std::cell::Cell::new(0);
+            let (prefix, _, _) = decision_keys(&class.keys, &|value, _| {
+                seen.set(seen.get() + usize::from(value == 0.0));
+                value == 0.0 && seen.get() == n
+            });
+            let negative = floats(&prefix)
+                .last()
+                .is_some_and(|(value, _)| value.is_sign_negative());
+            prefixes.push((index, prefix, negative));
+        }
+    }
+    let mut signs_of: HashMap<(Shape<'_>, Vec<u64>), Vec<(usize, bool)>> = HashMap::new();
+    for (index, prefix, negative) in &prefixes {
+        signs_of
+            .entry((Shape(prefix), bits(&floats(prefix))))
+            .or_default()
+            .push((*index, *negative));
+    }
+    for members in signs_of.values() {
+        for (i, &(a, a_negative)) in members.iter().enumerate() {
+            for &(b, b_negative) in &members[i + 1..] {
+                if a_negative != b_negative && a != b {
+                    pairs.insert((a.min(b), a.max(b)));
+                }
+            }
+        }
+    }
+
+    let mut tied = vec![vec![]; classes.len()];
+    let mut meets = vec![false; classes.len()];
+    for (a, b) in pairs {
+        let (earlier, later) = (&classes[a], &classes[b]);
+        let ties = match row_precedence(&later.keys, &earlier.keys, options, tolerance) {
+            Precedence::Before => true,
+            Precedence::After => false,
+            // The values of their last floating-point values meet.
+            Precedence::Equal if !earlier.truncated && !later.truncated => true,
+            Precedence::Equal if earlier.equal && later.equal => may_precede(
+                &keys[later.rows.start],
+                &keys[earlier.rows.start],
+                options,
+                tolerance,
+            ),
+            Precedence::Equal => {
+                meets[a] = true;
+                meets[b] = true;
+                false
+            }
+        };
+        if ties {
+            tied[a].push(b);
+            tied[b].push(a);
         }
     }
     for others in &mut tied {
@@ -6581,52 +6712,170 @@ mod tests {
         assert_eq!(reference.uncomputed, [(2..202, cannot_return.to_string())]);
     }
 
+    /// `(k, v)` rows that all tie on `k = 1`: `first`, 300 rows of `v = 0`, then
+    /// `last`.
+    fn rows_around_zeros(
+        first: [(i32, i32); 2],
+        last: [(i32, i32); 2],
+    ) -> Vec<(i32, i32)> {
+        first
+            .into_iter()
+            .chain(std::iter::repeat_n((1, 0), 300))
+            .chain(last)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn result_order_keeps_the_ties_if_it_stops_looking_for_the_rows_that_fail()
-    -> Result<()> {
-        // All rows tie on `k`, whatever `v`: the query may return any 2 of them,
-        // but fails on the 300 rows of `v = 0`, which follow the 2 others. After
-        // too many computations, the reference stops looking for the rows on
-        // which it fails, but compares the rows that tie.
-        let batch = float_kv_batch(&[(1.0, 1), (1.0, 2)], 300, 1.0);
-        let sql =
-            "SELECT 10 / v AS x FROM (SELECT v FROM m ORDER BY k, v DESC LIMIT 2) t";
-        let order = order_of(batch, sql).await?;
+    async fn result_order_finds_each_row_on_which_the_query_fails() -> Result<()> {
+        // The query may return any 2 rows, but fails on the 300 rows of `v = 0`:
+        // the reference finds each of them, and computes the output columns of
+        // the others, also of the last ones.
+        let rows = rows_around_zeros([(1, 1), (1, 2)], [(1, 4), (1, 5)]);
+        let sql = "SELECT 100 / v AS x FROM (SELECT v FROM m ORDER BY k LIMIT 2) t";
+        let order = order_over(&rows, sql).await?;
         let ResultOrder::Sorted(reference) = &order else {
             panic!("not sorted: {order:?}");
         };
-        let reasons = reference
-            .uncomputed
-            .iter()
-            .map(|(_, reason)| reason.split(':').next().unwrap_or_default())
-            .collect::<HashSet<_>>();
-        assert!(
-            reasons.contains(
-                "the query fails on some of the rows near it, and the reference stopped \
-                 looking for them after 256 computations"
-            ),
-            "{:?}",
-            reference.uncomputed
-        );
-        assert!(
-            reasons.contains("the query fails on it"),
-            "{:?}",
-            reference.uncomputed
-        );
-        let uncomputed = reference.uncomputed.iter().map(|(rows, _)| rows.len());
-        assert_eq!(uncomputed.sum::<usize>(), 300);
+        let mut failing = 0;
+        for (rows, reason) in &reference.uncomputed {
+            assert!(reason.starts_with("the query fails on it: "), "{reason}");
+            failing += rows.len();
+        }
+        assert_eq!(failing, 300);
         let x = |values: &[i64]| {
             let x = Int64Array::from(values.to_vec());
             vec![batch_of(vec![("x", Arc::new(x) as ArrayRef)])]
         };
-        same_results(x(&[5, 10]), x(&[10, 5]), &order).unwrap();
-        same_results(x(&[5, 10]), x(&[5, 10]), &order).unwrap();
-        let err = same_results(x(&[5, 10]), x(&[5, 5]), &order).unwrap_err();
+        for valid in [[50, 100], [100, 50], [25, 20], [20, 100]] {
+            same_results(x(&[100, 50]), x(&valid), &order)
+                .unwrap_or_else(|e| panic!("{valid:?}: {e}"));
+        }
+        let err = same_results(x(&[100, 50]), x(&[25, 25]), &order).unwrap_err();
         assert!(
             err.starts_with("row 1 of the pipeline engine differs"),
             "{err}"
         );
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_return_any_rows_that_tie_among_rows_that_fail() {
+        // Both engines return the first 2 rows of their tables.
+        let setup = per_engine_tables(
+            kv_int_batch(&rows_around_zeros([(1, 1), (1, 2)], [(1, 4), (1, 5)])),
+            kv_int_batch(&rows_around_zeros([(1, 4), (1, 5)], [(1, 1), (1, 2)])),
+        );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT 100 / v AS x FROM (SELECT v FROM m ORDER BY k LIMIT 2) t",
+            &setup,
+        )
+        .await;
+    }
+
+    /// A batch of `(k DOUBLE, id BIGINT)` rows.
+    fn k_id_batch(rows: &[(f64, i64)]) -> RecordBatch {
+        batch_of(vec![
+            (
+                "k",
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0)))
+                    as ArrayRef,
+            ),
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn same_results_order_rows_by_later_keys_after_zeros_of_other_signs()
+    -> Result<()> {
+        // DataFusion sorts `-0.0` before `0.0`, but they are equal: another
+        // engine may order the rows by `id`, but zeros of the same sign keep
+        // the order of `id`.
+        for (rows, sql, expected, other, valid) in [
+            (
+                [(0.0, 1), (-0.0, 2)],
+                "SELECT id FROM m ORDER BY k, id",
+                [2, 1].as_slice(),
+                [1, 2].as_slice(),
+                true,
+            ),
+            (
+                [(0.0, 1), (-0.0, 2)],
+                "SELECT id FROM m ORDER BY k, id LIMIT 1",
+                &[2],
+                &[1],
+                true,
+            ),
+            (
+                [(0.0, 2), (-0.0, 1)],
+                "SELECT id FROM m ORDER BY k, id",
+                &[1, 2],
+                &[2, 1],
+                false,
+            ),
+            (
+                [(0.0, 2), (-0.0, 1)],
+                "SELECT id FROM m ORDER BY k DESC, id",
+                &[2, 1],
+                &[1, 2],
+                true,
+            ),
+            (
+                [(0.0, 1), (-0.0, 2)],
+                "SELECT id FROM m ORDER BY k DESC, id",
+                &[1, 2],
+                &[2, 1],
+                false,
+            ),
+            (
+                [(0.0, 1), (0.0, 2)],
+                "SELECT id FROM m ORDER BY k, id",
+                &[1, 2],
+                &[2, 1],
+                false,
+            ),
+            (
+                [(0.0, 1), (0.0, 2)],
+                "SELECT id FROM m ORDER BY k, id LIMIT 1",
+                &[1],
+                &[2],
+                false,
+            ),
+            // A zero of another sign after equal keys.
+            (
+                [(1.0, 1), (1.0, 2)],
+                "SELECT id FROM m ORDER BY CAST(1 AS INT), CASE WHEN id = 2 THEN -0.0 ELSE 0.0 END, id",
+                &[2, 1],
+                &[1, 2],
+                true,
+            ),
+        ] {
+            let order = order_of(k_id_batch(&rows), sql).await?;
+            same_results(ids(expected), ids(expected), &order)
+                .unwrap_or_else(|e| panic!("{rows:?} {sql}: {e}"));
+            let result = same_results(ids(expected), ids(other), &order);
+            assert_eq!(result.is_ok(), valid, "{rows:?} {sql}: {result:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_zeros_of_other_signs() {
+        // The keys of DataFusion are `0.0` and `-0.0`, those of the pipeline
+        // engine `0.0` and `0.0`: it orders the rows by `id`.
+        let setup = per_engine_tables(
+            k_id_batch(&[(0.0, 1), (-0.0, 2)]),
+            k_id_batch(&[(0.0, 1), (0.0, 2)]),
+        );
+        for sql in [
+            "SELECT id FROM m ORDER BY k, id",
+            "SELECT id FROM m ORDER BY k, id LIMIT 1",
+            "SELECT id, k FROM m ORDER BY k, id",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
