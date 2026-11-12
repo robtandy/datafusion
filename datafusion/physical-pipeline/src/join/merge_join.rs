@@ -1909,8 +1909,24 @@ impl MergeJoinSort {
             return Ok(());
         }
         let batches = std::mem::take(&mut local.batches);
+        // The working memory of the sort, reserved while it sorts: the keys
+        // that it evaluates (if computed), their encoding and its sorted copy,
+        // and the sorted copy of the rows (the run).
+        let mut working = 0;
+        for batch in &batches {
+            let keys = self.keys.evaluate(batch)?;
+            working += key_memory(&keys, batch)
+                + keys
+                    .iter()
+                    .map(|key| encoded_bytes(key.as_ref()))
+                    .sum::<usize>()
+                + memory_size(batch);
+        }
+        let sorting = reservation.new_empty();
+        sorting.try_grow(working)?;
         let runs = self.keys.sort(&self.schema, &batches, None)?;
         reservation.try_grow(runs.iter().map(run_memory_size).sum())?;
+        drop(sorting);
         drop(batches);
         reservation.shrink(std::mem::take(&mut local.bytes));
         local.rows = 0;
@@ -3273,6 +3289,11 @@ impl BufferedWindow {
             return Ok(Poll::Ready(()));
         }
         let (keys, _evaluated) = self.keys_of(spec, &batch)?;
+        // A NULL key proves a null-aware join empty: the join learns of it now,
+        // also if the row is held in a run.
+        if spec.null_aware && keys.iter().any(|key| key.logical_null_count() > 0) {
+            self.rows.has_null_key = true;
+        }
         let Some(runs) = ZeroRuns::of(spec, &keys)? else {
             if self.pending.is_some() {
                 self.append_pending(spec)?;
@@ -3606,18 +3627,27 @@ impl KeyComponent {
         }
     }
 
-    /// The values of the component of the rows whose keys are `keys`.
+    /// The values of the component of the rows whose keys are `keys`: NULL
+    /// where a struct above it is (its fields do not count then, as the row
+    /// format compares them).
     fn array(&self, keys: &[ArrayRef]) -> ArrayRef {
         let mut array = Arc::clone(&keys[self.key]);
+        let mut nulls = array.logical_nulls();
         for &field in &self.path {
-            array = Arc::clone(array.as_struct().column(field));
+            let child = Arc::clone(array.as_struct().column(field));
+            nulls = NullBuffer::union(nulls.as_ref(), child.logical_nulls().as_ref());
+            array = child;
         }
-        match self.validity {
-            true => Arc::new(match array.logical_nulls() {
-                Some(nulls) => BooleanArray::new(nulls.into_inner(), None),
-                None => BooleanArray::from(vec![true; array.len()]),
-            }),
-            false => array,
+        match (self.validity, nulls) {
+            (true, Some(nulls)) => Arc::new(BooleanArray::new(nulls.into_inner(), None)),
+            (true, None) => Arc::new(BooleanArray::from(vec![true; array.len()])),
+            (false, Some(nulls)) if !self.path.is_empty() => array
+                .to_data()
+                .into_builder()
+                .nulls(Some(nulls))
+                .build()
+                .map_or(array, make_array),
+            (false, _) => array,
         }
     }
 }
@@ -3777,6 +3807,10 @@ fn zero_value_rows(array: &dyn Array, sign: Option<bool>) -> Vec<bool> {
                     *zero |= column_zero;
                 }
             }
+            // The fields of a NULL struct do not count.
+            for (row, zero) in zeros.iter_mut().enumerate() {
+                *zero &= array.is_valid(row);
+            }
             zeros
         }
         DataType::List(_)
@@ -3787,12 +3821,15 @@ fn zero_value_rows(array: &dyn Array, sign: Option<bool>) -> Vec<bool> {
         | DataType::Map(_, _) => {
             let (values, ranges) = list_ranges(array);
             let values = zero_value_rows(values, sign);
+            // The values of a NULL list do not count.
             ranges
                 .into_iter()
-                .map(|(start, end)| {
-                    values
-                        .get(start..end)
-                        .is_some_and(|zeros| zeros.contains(&true))
+                .enumerate()
+                .map(|(row, (start, end))| {
+                    array.is_valid(row)
+                        && values
+                            .get(start..end)
+                            .is_some_and(|zeros| zeros.contains(&true))
                 })
                 .collect()
         }
@@ -3802,7 +3839,10 @@ fn zero_value_rows(array: &dyn Array, sign: Option<bool>) -> Vec<bool> {
             dictionary
                 .normalized_keys()
                 .into_iter()
-                .map(|key| values.get(key).copied().unwrap_or_default())
+                .enumerate()
+                .map(|(row, key)| {
+                    array.is_valid(row) && values.get(key).copied().unwrap_or_default()
+                })
                 .collect()
         }
         DataType::RunEndEncoded(run_ends, _) => {
@@ -5876,6 +5916,133 @@ pub(crate) mod tests {
             with_timeout(Executor::collect(join(8)?, limited_task_ctx(64 << 20)?, 4))
                 .await?;
         assert_eq!(num_rows(&batches), 8);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn null_aware_joins_of_streams_end_at_a_null_struct_key() -> Result<()> {
+        // The `NOT IN` of streams that never end, of struct keys `(f, i)`: the
+        // buffered (right) stream produces a NULL struct (whose fields are
+        // `(-0.0, 5)`, which do not count) and then nothing, forever. The NULL
+        // proves the result empty: the join ends at once (it neither takes the
+        // fields for a zero, nor waits for a run to end), as DataFusion's does.
+        let fields = Fields::from(vec![
+            Field::new("f", DataType::Float64, false),
+            Field::new("i", DataType::Int32, false),
+        ]);
+        let schema = |side: &str| {
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Struct(fields.clone()), true),
+            ])) as SchemaRef
+        };
+        let rows = |side: &str, keys: &[(f64, i32)], nulls: Option<NullBuffer>| {
+            let key = StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(Float64Array::from_iter_values(
+                        keys.iter().map(|key| key.0),
+                    )),
+                    Arc::new(Int32Array::from_iter_values(keys.iter().map(|key| key.1))),
+                ],
+                nulls,
+            );
+            RecordBatch::try_new(
+                schema(side),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(0..keys.len() as i64)),
+                    Arc::new(key),
+                ],
+            )
+            .unwrap()
+        };
+        let stream = |side: &str, batch: RecordBatch| -> Arc<dyn ExecutionPlan> {
+            let key = col(&format!("{side}k"), &schema(side)).unwrap();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                key,
+                SortOptions::new(false, true),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: schema(side),
+                batches: vec![batch],
+                forever: true,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema(side),
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let left = stream("l", rows("l", &[(1.0, 1), (2.0, 2)], None));
+            let right = stream(
+                "r",
+                rows("r", &[(-0.0, 5)], Some(NullBuffer::from(vec![false]))),
+            );
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let join = SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::LeftAnti,
+                vec![SortOptions::new(false, true)],
+                NullEquality::NullEqualsNothing,
+            )?
+            .with_null_aware(true)?;
+            Ok(Arc::new(GlobalLimitExec::new(Arc::new(join), 0, Some(1))))
+        };
+        let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+        assert_eq!(num_rows(&expected), 0);
+        let plan = plan()?;
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        assert_streaming_merge_join(&root.children()[0], "NOT IN");
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        assert_eq!(num_rows(&actual.batches), 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_working_memory_of_merge_join_sorts_is_reserved() -> Result<()> {
+        // A sort of 1,024 rows by a computed key, a string of 16 KiB, and an
+        // integer: while it sorts, it holds the computed keys (16 MB), their
+        // encoding (16 MB) and its sorted copy (16 MB), which it reserves, so
+        // that it fails in a pool of 20 MiB, and sorts in one of 128 MiB.
+        use crate::join::symmetric_hash_join::tests::{id_rows, wide_key};
+        let sort = || -> Result<Arc<dyn PhysicalOperator>> {
+            let batch = id_rows("l", 1024);
+            let id = col("lid", &batch.schema())?;
+            let source: Arc<dyn PhysicalOperator> = Arc::new(TestSource::with_schema(
+                batch.schema(),
+                vec![DataChunk::from_record_batch(batch)],
+            ));
+            let ordering = LexOrdering::new([
+                PhysicalSortExpr::new(wide_key(), SortOptions::default()),
+                PhysicalSortExpr::new(id, SortOptions::default()),
+            ])
+            .unwrap();
+            Ok(Arc::new(MergeJoinSort::try_new(source, ordering)?))
+        };
+        let err =
+            with_timeout(Executor::collect(sort()?, limited_task_ctx(20 << 20)?, 4))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("MergeJoinSort"), "{err}");
+        let batches =
+            with_timeout(Executor::collect(sort()?, limited_task_ctx(128 << 20)?, 4))
+                .await?;
+        assert_eq!(num_rows(&batches), 1024);
         Ok(())
     }
 
