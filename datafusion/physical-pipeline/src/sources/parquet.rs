@@ -6,7 +6,7 @@
 //! which filters its rows with adaptive row filters and late
 //! materialization.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -31,7 +31,8 @@ use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadataCache,
 };
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::{is_volatile, snapshot_generation};
@@ -45,7 +46,7 @@ use super::{
     EmptyScanSource, FileScan, FileScanGlobalState, FileScanLocalState, FileScanMode,
     file_scan_config, push_file_ranges,
 };
-use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     ExecutionContext, GlobalOperatorState, GlobalSourceState, LocalSourceState,
     OperatorState, PhysicalOperator, SourceResult, TaskInterrupt, downcast_state,
@@ -110,7 +111,8 @@ const MIN_UNIT_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
 /// # Row filters and late materialization
 ///
 /// Like DuckDB's scans, which apply the filters of a query while they read,
-/// the scan filters its rows with
+/// the scan filters its rows, whatever
+/// `datafusion.execution.parquet.pushdown_filters` says, with
 ///
 /// * the predicate of the `FilterExec` directly above it, which the planner
 ///   folds into it (see [`Self::try_with_filter`]): then the scan produces
@@ -118,48 +120,47 @@ const MIN_UNIT_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
 /// * the conjuncts of the predicate of its [`ParquetSource`]: the dynamic
 ///   filters of the TopKs and hash joins above it, and the filters that
 ///   DataFusion pushed into it to prune its files, row groups and pages.
-///   No row has to be filtered by them (the nodes above apply them, or
-///   prune the rows that they reject), so the scan only applies them where
-///   that pays off; but with `pushdown_filters`, DataFusion relies on the
+///   No row has to be filtered by them (the nodes above evaluate them too,
+///   or drop the rows that they reject), so the scan only evaluates them
+///   where that pays off. With `pushdown_filters`, DataFusion relies on the
 ///   scan to apply its static conjuncts, which it then always does.
 ///
-/// whatever `datafusion.execution.parquet.pushdown_filters` says. A conjunct
-/// is evaluated either by the row filter of the Parquet decoder, which
-/// decodes the columns of its conjuncts first, one conjunct after the other
-/// on the rows that the conjuncts before it selected, and the other columns
-/// of a row group only for the rows that pass all of them (late
-/// materialization), or natively, on the decoded chunks. Which one pays off
-/// depends on the data: the decoder only saves work by skipping long runs
-/// of rows (it decodes the rows of short runs, which it then filters out),
-/// and every conjunct in the row filter costs the decoder a pass over its
-/// row groups. So the scan measures, on all of its threads, the rows that
-/// every conjunct rejects, how long the runs of rows that it selects or
-/// rejects are, and how long it takes, and evaluates it where it pays off
-/// (see [`ConjunctMeter`]):
+/// The scan evaluates a conjunct in the row filter of the Parquet decoder,
+/// or natively on the decoded chunks. The row filter decodes the columns of
+/// its conjuncts first, evaluates them one after the other on the rows that
+/// the conjuncts before them selected, and decodes the other columns of a
+/// row group only for the rows that pass all of them (late
+/// materialization); the columns that only the conjuncts that it applies
+/// read are not decoded for the output at all. Whether that pays off
+/// depends on the data: every conjunct in the row filter costs the decoder
+/// a pass over the row groups of its unit, and the decoder still decodes the
+/// rows of short runs that the conjuncts reject. So the scan measures, on
+/// all of its threads, the rows that every conjunct rejects and how long it
+/// takes, and evaluates it (see [`ConjunctMeter`])
 ///
-/// * in the row filter, if it rejects many rows in long runs;
-/// * natively, after decoding, otherwise: the conjuncts of the folded
-///   filter, and the optional conjuncts that reject enough rows (like
-///   [`JoinFilteredScan`](crate::planner) does for memory scans);
-/// * not at all, for the other optional conjuncts.
+/// * in the row filter, if it rejects at least a quarter of its rows;
+/// * otherwise natively after decoding, for the conjuncts of the folded
+///   filter, and not at all for the optional ones.
 ///
 /// The row filter of a unit evaluates its conjuncts in decreasing order of
 /// rank, the fraction of rows that a conjunct rejects per nanosecond that it
 /// costs on a row (its measured evaluation, and the estimated decoding of
 /// its columns), like DuckDB's adaptive filters order their conjuncts. The
-/// threads take a new order, and new placements, whenever they claim a unit.
+/// threads take new placements and orders when they claim a unit (see
+/// [`ScanVersion`]).
 ///
-/// The scan also measures how long its units take with and without row
-/// filters (per row), reading one in eight units in the configuration that
-/// it does not prefer while it has at least two units per thread, and
-/// switches to filtering natively after decoding if the row filters make it
-/// slower (see [`UnitTimings`]).
+/// The scan also measures how long its units take, per row, with and
+/// without row filters (from when a thread claims a unit until it finished
+/// it, also in the operators above the scan), reading one in eight units in
+/// the configuration that it does not prefer while it has at least two
+/// units per thread, and filters natively after decoding once that is
+/// faster than with row filters (see [`UnitTimings`]).
 ///
-/// The folded filter is always evaluated natively on the decoded chunks, by
-/// a [`PhysicalFilter`], also on the rows that the row filter selected: the
-/// row filter only removes rows, which cannot change the result, and
-/// conjuncts that may fail on some rows (e.g. `10 / x > 1`, which a
-/// conjunct `x <> 0` may guard) are never evaluated by the row filter.
+/// The folded filter evaluates natively, with a [`PhysicalFilter`], the
+/// conjuncts that the row filter of a unit does not apply to every row: the
+/// conjuncts that may fail on some rows (e.g. `10 / x > 1`, which a conjunct
+/// `x <> 0` may guard) and the other ones that the row filter cannot
+/// evaluate are never in the row filter.
 #[derive(Debug)]
 pub struct ParquetScanSource {
     scan: FileScan,
@@ -219,9 +220,9 @@ impl ParquetScanSource {
     /// This scan with the `FilterExec` `filter` folded into it: the scan
     /// produces the output of `filter`, whose input must produce the rows of
     /// this scan (e.g. this scan, or a repartitioning of it). The scan
-    /// evaluates the predicate of `filter` with its row filters, and always
-    /// natively on the decoded chunks, and applies the projection of
-    /// `filter` (see the [type documentation](Self)).
+    /// evaluates every conjunct of the predicate of `filter` with its row
+    /// filters or natively on the decoded chunks, where that pays off, and
+    /// applies the projection of `filter` (see the [type documentation](Self)).
     ///
     /// Fails if `filter` has a fetch, if a filter is folded into the scan
     /// already, if the scan has a limit (which applies to the rows of the
@@ -239,8 +240,7 @@ impl ParquetScanSource {
         let input: Arc<dyn PhysicalOperator> =
             Arc::new(EmptyScanSource::new(self.schema()));
         let native = PhysicalFilter::try_from_filter_exec(filter, input)?;
-        let predicate =
-            ScanPredicate::try_new(&self.scan.config, Some(filter.predicate()))?;
+        let predicate = ScanPredicate::try_new(&self.scan.config, Some(filter))?;
         let mut scan = FileScan::new(
             self.scan.name,
             self.scan.config.clone(),
@@ -383,90 +383,110 @@ impl ParquetScanSource {
     }
 
     /// The next chunk of the units of this thread (not filtered by the
-    /// folded filter yet), and whether its unit was read with a row filter.
+    /// folded filter yet), with the version of the row filters that its unit
+    /// is read with (none for a scan without row filters).
     ///
     /// A scan with row filters claims its units itself, so that it can pick
-    /// the row filter of every unit (see [`RowFilterState::claim_unit`]), and
+    /// the version of every unit (see [`RowFilterState::claim_unit`]), and
     /// lets the [`FileScan`] read one unit at a time.
     fn read(
         &self,
         ctx: &ExecutionContext,
         gstate: &ParquetScanState,
         lstate: &mut ParquetScanLocalState,
-    ) -> Result<(SourceResult, bool)> {
+    ) -> Result<(SourceResult, Option<Arc<ScanVersion>>)> {
         let Some(row_filters) = &gstate.row_filters else {
             let result =
                 self.scan
                     .get_data(ctx, gstate.scan.as_ref(), lstate.scan.as_mut())?;
-            return Ok((result, false));
+            return Ok((result, None));
         };
         let queue =
             downcast_state::<FileScanGlobalState>(gstate.scan.as_any(), self.name())?;
         loop {
             if lstate.unit.is_none() {
                 let Some(unit) = row_filters.claim_unit(self, ctx, queue, lstate)? else {
-                    return Ok((SourceResult::Finished, false));
+                    return Ok((SourceResult::Finished, None));
                 };
                 lstate.unit = Some(unit);
             }
             let Some(unit) = lstate.unit.as_mut() else {
                 return internal_err!("ParquetScanSource lost its unit");
             };
-            let start = Instant::now();
-            let result = self.scan.get_data(ctx, &unit.state, lstate.scan.as_mut());
-            unit.nanos += elapsed_nanos(start);
-            match result? {
+            match self.scan.get_data(ctx, &unit.state, lstate.scan.as_mut())? {
                 SourceResult::Finished => {
                     if let Some(unit) = lstate.unit.take() {
                         row_filters.finish_unit(&unit);
                     }
                 }
                 SourceResult::Chunk(chunk) => {
-                    if unit.row_filter {
+                    if unit.version.row_filter {
                         row_filters.metrics.row_filter_output_rows.add(chunk.len());
                     }
-                    return Ok((SourceResult::Chunk(chunk), unit.row_filter));
+                    let version = Arc::clone(&unit.version);
+                    return Ok((SourceResult::Chunk(chunk), Some(version)));
                 }
-                result => return Ok((result, false)),
+                result => return Ok((result, None)),
             }
         }
     }
 
-    /// Filter `chunk`, a decoded chunk of the scan (which a row filter
-    /// filtered already if `row_filtered`), with the optional conjuncts that
-    /// the scan evaluates natively, and with the folded filter (which also
-    /// projects it).
+    /// Filter `chunk`, a decoded chunk of the scan, read with `version` of
+    /// its row filters if it has any, natively with the folded filter (which
+    /// also projects it): with the conjuncts of the folded filter that the
+    /// row filter of `version` does not apply to every row (see
+    /// [`RowFilterState::version_filter`]).
     fn filter_chunk(
         &self,
         ctx: &ExecutionContext,
         gstate: &ParquetScanState,
         lstate: &mut ParquetScanLocalState,
         chunk: DataChunk,
-        row_filtered: bool,
+        version: Option<&ScanVersion>,
     ) -> Result<DataChunk> {
-        let chunk = match &gstate.row_filters {
-            Some(row_filters) if !chunk.is_empty() => {
-                row_filters.filter_natively(&self.predicate, chunk, row_filtered)?
-            }
-            _ => chunk,
+        if let Some(row_filters) = &gstate.row_filters {
+            row_filters.record_passed(chunk.len());
+        }
+        let version_filter = version.and_then(|version| {
+            let filter = version.filter.as_ref()?;
+            Some((filter.filter.as_ref(), filter.gstate.as_ref(), version.id))
+        });
+        let (filter, filter_gstate, key) = match version_filter {
+            Some(filter) => filter,
+            None => match (self.filter.as_deref(), gstate.filter.as_deref()) {
+                (Some(filter), Some(filter_gstate)) => {
+                    (filter, filter_gstate, BASE_FILTER)
+                }
+                _ => return Ok(chunk),
+            },
         };
-        let (Some(filter), Some(filter_gstate), Some(filter_lstate)) = (
-            self.filter.as_deref(),
-            gstate.filter.as_deref(),
-            lstate.filter.as_deref_mut(),
-        ) else {
-            return Ok(chunk);
+        if chunk.is_empty() {
+            return Ok(DataChunk::empty(self.schema()));
+        }
+        // The state of the filter in this thread.
+        if lstate
+            .filter
+            .as_ref()
+            .is_none_or(|(state_key, _)| *state_key != key)
+        {
+            lstate.filter = Some((key, filter.get_operator_state(ctx, filter_gstate)?));
+        }
+        let Some((_, filter_lstate)) = lstate.filter.as_mut() else {
+            return internal_err!("ParquetScanSource lost the state of its filter");
         };
         let mut output = DataChunk::empty(self.schema());
-        if !chunk.is_empty() {
-            filter.execute(ctx, &chunk, &mut output, filter_gstate, filter_lstate)?;
-        }
+        filter.execute(
+            ctx,
+            &chunk,
+            &mut output,
+            filter_gstate,
+            filter_lstate.as_mut(),
+        )?;
         Ok(output)
     }
 
     /// The next chunk of a thread that reads units (see [`Self::read`]),
-    /// filtered (see [`Self::filter_chunk`]), with the time spent filtering
-    /// it added to its unit.
+    /// filtered (see [`Self::filter_chunk`]).
     fn next_filtered(
         &self,
         ctx: &ExecutionContext,
@@ -474,20 +494,47 @@ impl ParquetScanSource {
         lstate: &mut ParquetScanLocalState,
     ) -> Result<SourceResult> {
         Ok(match self.read(ctx, gstate, lstate)? {
-            (SourceResult::Chunk(chunk), row_filtered) => {
+            (SourceResult::Chunk(chunk), version) => {
                 if gstate.row_filters.is_none() && self.filter.is_none() {
                     return Ok(SourceResult::Chunk(chunk));
                 }
-                let start = Instant::now();
                 let chunk =
-                    self.filter_chunk(ctx, gstate, lstate, chunk, row_filtered)?;
-                if let Some(unit) = lstate.unit.as_mut() {
-                    unit.nanos += elapsed_nanos(start);
-                }
+                    self.filter_chunk(ctx, gstate, lstate, chunk, version.as_deref())?;
                 SourceResult::Chunk(chunk)
             }
             (result, _) => result,
         })
+    }
+
+    /// The next chunk of a thread of a scan that shares its chunks (see
+    /// [`ChunkSharing`]): a reader claims units, and hands its chunks to the
+    /// idle threads that wait for one; an idle thread takes the chunks of
+    /// readers.
+    fn next_shared(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &ParquetScanState,
+        lstate: &mut ParquetScanLocalState,
+        sharing: &ChunkSharing,
+    ) -> Result<SourceResult> {
+        while lstate.sharing.is_some() {
+            match self.next_filtered(ctx, gstate, lstate)? {
+                SourceResult::Chunk(chunk) if !chunk.is_empty() => {
+                    // Hand the chunk to an idle thread if one waits, and
+                    // read on.
+                    if let Some(chunk) = sharing.offer(chunk) {
+                        return Ok(SourceResult::Chunk(chunk));
+                    }
+                }
+                SourceResult::Finished => {
+                    // No unit is left: the thread becomes idle.
+                    lstate.sharing = None;
+                    sharing.remove_reader();
+                }
+                result => return Ok(result),
+            }
+        }
+        Ok(sharing.take(ctx.thread_id, ctx.waker()))
     }
 }
 
@@ -702,18 +749,12 @@ impl PhysicalOperator for ParquetScanSource {
             sharing.add_reader();
             Arc::clone(sharing)
         });
-        let filter = match (&self.filter, &gstate.filter) {
-            (Some(filter), Some(filter_gstate)) => {
-                Some(filter.get_operator_state(ctx, filter_gstate.as_ref())?)
-            }
-            _ => None,
-        };
         Ok(Box::new(ParquetScanLocalState {
             scan,
             sharing,
             unit: None,
             morselizer: None,
-            filter,
+            filter: None,
         }))
     }
 
@@ -728,28 +769,10 @@ impl PhysicalOperator for ParquetScanSource {
             lstate.as_any_mut(),
             self.name(),
         )?;
-        let Some(sharing) = gstate.sharing.as_deref() else {
-            return self.next_filtered(ctx, gstate, lstate);
-        };
-        // A reader claims units, an idle thread takes the chunks of readers.
-        while lstate.sharing.is_some() {
-            match self.next_filtered(ctx, gstate, lstate)? {
-                SourceResult::Chunk(chunk) if !chunk.is_empty() => {
-                    // Hand the chunk to an idle thread if one waits, and
-                    // read on.
-                    if let Some(chunk) = sharing.offer(chunk) {
-                        return Ok(SourceResult::Chunk(chunk));
-                    }
-                }
-                SourceResult::Finished => {
-                    // No unit is left: the thread becomes idle.
-                    lstate.sharing = None;
-                    sharing.remove_reader();
-                }
-                result => return Ok(result),
-            }
+        match gstate.sharing.as_deref() {
+            None => self.next_filtered(ctx, gstate, lstate),
+            Some(sharing) => self.next_shared(ctx, gstate, lstate, sharing),
         }
-        Ok(sharing.take(ctx.thread_id, ctx.waker()))
     }
 }
 
@@ -775,6 +798,10 @@ impl GlobalSourceState for ParquetScanState {
     }
 }
 
+/// The key of the state of the folded filter of a scan without row filters
+/// (see [`ParquetScanLocalState::filter`]).
+const BASE_FILTER: u64 = u64::MAX;
+
 /// The local state of a [`ParquetScanSource`]: the state of its [`FileScan`].
 struct ParquetScanLocalState {
     scan: Box<dyn LocalSourceState>,
@@ -787,8 +814,10 @@ struct ParquetScanLocalState {
     /// With row filters: the version of the row filters (see
     /// [`ScanVersion`]) that the morselizer of the thread reads with.
     morselizer: Option<u64>,
-    /// The state of the folded filter in this thread, if any.
-    filter: Option<Box<dyn OperatorState>>,
+    /// The state of the folded filter in this thread, with the version of the
+    /// row filters whose filter it is the state of (see
+    /// [`ScanVersion::filter`]), or [`BASE_FILTER`].
+    filter: Option<(u64, Box<dyn OperatorState>)>,
 }
 
 impl LocalSourceState for ParquetScanLocalState {}
@@ -917,19 +946,12 @@ impl ChunkSharing {
 const SAMPLE_ROWS: usize = 8 * DEFAULT_VECTOR_SIZE;
 
 /// A conjunct stays in the row filter if it rejects at least one in this
-/// many of the rows that it is evaluated on...
+/// many of the rows that it is evaluated on. A conjunct that rejects fewer
+/// rows saves little: every conjunct in the row filter costs the decoder a
+/// pass over the row groups of its unit, and the decoder still decodes the
+/// rows of short runs that a conjunct rejects (which it then filters out,
+/// see arrow's `RowSelectionPolicy`).
 const ROW_FILTER_MIN_REJECTED: usize = 4;
-
-/// ...in runs of consecutive rows that it selects or rejects of at least this
-/// many rows on average. The Parquet decoder skips the runs of rows that a
-/// row filter rejects if they are this long on average; it decodes all rows
-/// of shorter runs, which it then filters out (see arrow's
-/// `RowSelectionPolicy`), which saves no decoding.
-const ROW_FILTER_MIN_RUN_ROWS: usize = 32;
-
-/// An optional conjunct is evaluated natively if it rejects at least one in
-/// this many rows (as the planner's `JoinFilteredScan` does).
-const NATIVE_MIN_REJECTED: usize = 8;
 
 /// A conjunct that is not evaluated by the row filter is sampled in the row
 /// filter again once this many rows passed it (and an optional dynamic
@@ -971,17 +993,16 @@ const EXPLORE_MIN_UNITS_PER_THREAD: usize = 2;
 /// Why the scan may evaluate a conjunct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConjunctKind {
-    /// A conjunct of the folded filter: the scan evaluates it natively after
-    /// decoding (with the folded filter), and in the row filter if that pays
-    /// off.
+    /// A conjunct of the folded filter: the scan evaluates it in the row
+    /// filter if that pays off, and natively after decoding otherwise.
     Folded,
     /// A conjunct of a scan with `pushdown_filters`, which DataFusion relies
     /// on the scan to apply: always in the row filter.
     Exact,
     /// A conjunct that no row has to be filtered by: a dynamic filter, or a
     /// conjunct that DataFusion pushed into the scan to prune it, which a
-    /// node above the scan evaluates. Evaluated in the row filter or
-    /// natively if that pays off, otherwise not at all.
+    /// node above the scan evaluates. Evaluated in the row filter if that
+    /// pays off, and otherwise not at all.
     Optional,
 }
 
@@ -991,12 +1012,20 @@ struct RowFilterConjunct {
     /// The conjunct, over the table schema of the scan (its file and
     /// partition columns).
     expr: Arc<dyn PhysicalExpr>,
-    /// An optional conjunct over the columns of the decoded chunks, to
-    /// evaluate it natively, if they have all of its columns.
-    native: Option<Arc<dyn PhysicalExpr>>,
     kind: ConjunctKind,
     /// The columns of the table schema that it reads.
     columns: Vec<usize>,
+}
+
+/// A conjunct of the filter folded into a [`ParquetScanSource`].
+#[derive(Debug, Clone)]
+struct FoldedConjunct {
+    /// The conjunct, over the output schema of the scan (the columns of its
+    /// decoded chunks).
+    expr: Arc<dyn PhysicalExpr>,
+    /// The candidate (see [`ScanPredicate::candidates`]) that it is, if the
+    /// row filter may evaluate it.
+    candidate: Option<usize>,
 }
 
 /// The conjuncts that a [`ParquetScanSource`] may filter its rows with: those
@@ -1014,57 +1043,35 @@ struct ScanPredicate {
     /// The other conjuncts of the predicate, which the row filter never
     /// evaluates: they only prune.
     pruning_only: Vec<Arc<dyn PhysicalExpr>>,
+    /// The conjuncts of the folded filter, if any, in its order.
+    folded: Vec<FoldedConjunct>,
     /// Whether the row filter may reorder the candidates: not if an `Exact`
     /// conjunct may fail, which DataFusion evaluates in the order of the
     /// predicate.
     reorder: bool,
-    /// The columns of the table schema that the projection of the scan
-    /// reads.
-    projected_columns: Vec<usize>,
 }
 
 impl ScanPredicate {
     /// The conjuncts of the predicate of the scan of `config`, and of
-    /// `folded`, the predicate of a filter folded into it (over the output
-    /// schema of the scan). None if the scan has a limit (which the decoder
-    /// would apply to the rows of the row filter), or if a conjunct reads a
-    /// virtual column (which DataFusion cannot read in a row filter).
-    fn try_new(
-        config: &FileScanConfig,
-        folded: Option<&Arc<dyn PhysicalExpr>>,
-    ) -> Result<Self> {
+    /// `folded`, a filter folded into it. No candidates if the scan has a
+    /// limit (which the decoder would apply to the rows of the row filter),
+    /// or if a conjunct reads a virtual column (which DataFusion cannot read
+    /// in a row filter).
+    fn try_new(config: &FileScanConfig, folded: Option<&FilterExec>) -> Result<Self> {
         let Some(source) = config.file_source().downcast_ref::<ParquetSource>() else {
             return Ok(Self::default());
         };
-        let table = source.table_schema();
-        let table_schema = table.table_schema();
-        let projected_columns = match source.projection() {
-            Some(projection) => {
-                let mut columns = projection
-                    .expr_iter()
-                    .flat_map(|expr| collect_columns(&expr))
-                    .map(|column| column.index())
-                    .collect::<Vec<_>>();
-                columns.sort_unstable();
-                columns.dedup();
-                columns
-            }
-            None => (0..table_schema.fields().len()).collect(),
-        };
         let mut predicate = Self {
             reorder: true,
-            projected_columns,
             ..Self::default()
         };
         if config.limit.is_some() {
             return Ok(predicate);
         }
+        let table = source.table_schema();
+        let table_schema = table.table_schema();
         let pushable_schema = table.schema_without_virtual_columns();
         let exact = source.table_parquet_options().global.pushdown_filters;
-        // The output column of every table column that the projection of the
-        // scan produces as it is.
-        let output_columns = output_columns(source, table_schema.fields().len());
-        let output_schema = config.projected_schema()?;
         let conjuncts = source.filter();
         for conjunct in conjuncts.iter().flat_map(split_conjunction) {
             let dynamic = conjunct.is::<DynamicFilterPhysicalExpr>();
@@ -1075,6 +1082,7 @@ impl ScanPredicate {
             let infallible = dynamic
                 || (!is_dynamic(conjunct)
                     && fallibility(conjunct, table_schema) == Fallibility::Infallible);
+            let columns = column_indices(conjunct);
             if !can_expr_be_pushed_down_with_schemas(conjunct, pushable_schema)
                 || is_volatile(conjunct)
                 || (kind == ConjunctKind::Optional && !infallible)
@@ -1087,37 +1095,16 @@ impl ScanPredicate {
             }
             predicate.candidates.push(RowFilterConjunct {
                 expr: Arc::clone(conjunct),
-                native: native_form(conjunct, &output_columns, &output_schema),
                 kind,
-                columns: column_indices(conjunct),
+                columns,
             });
         }
-        for conjunct in folded.iter().flat_map(|folded| split_conjunction(folded)) {
-            let expr = unproject(source, conjunct)?;
-            if let Some(candidate) = predicate
-                .candidates
-                .iter_mut()
-                .find(|candidate| candidate.expr.eq(&expr))
-            {
-                if candidate.kind == ConjunctKind::Optional {
-                    candidate.kind = ConjunctKind::Folded;
-                    candidate.native = None;
-                }
-                continue;
-            }
-            if predicate.pruning_only.contains(&expr)
-                || !can_expr_be_pushed_down_with_schemas(&expr, pushable_schema)
-                || is_volatile(&expr)
-                || is_dynamic(&expr)
-                || fallibility(&expr, table_schema) != Fallibility::Infallible
-            {
-                continue;
-            }
-            predicate.candidates.push(RowFilterConjunct {
-                columns: column_indices(&expr),
-                expr,
-                native: None,
-                kind: ConjunctKind::Folded,
+        let folded = folded.map(|filter| split_conjunction(filter.predicate()));
+        for conjunct in folded.into_iter().flatten() {
+            let candidate = predicate.folded_candidate(source, conjunct)?;
+            predicate.folded.push(FoldedConjunct {
+                expr: Arc::clone(conjunct),
+                candidate,
             });
         }
         let virtual_columns = table
@@ -1134,71 +1121,54 @@ impl ScanPredicate {
             .any(|column| virtual_columns.contains(&column));
         if reads_virtual_columns {
             predicate.candidates.clear();
+            predicate
+                .folded
+                .iter_mut()
+                .for_each(|conjunct| conjunct.candidate = None);
         }
         Ok(predicate)
     }
 
-    /// The columns of the table schema that the projection reads and that
-    /// none of the `in_row_filter` candidates read: the columns that the row
-    /// filter materializes late.
-    fn late_materialized_columns(&self, in_row_filter: &[usize]) -> usize {
-        self.projected_columns
+    /// The candidate that `conjunct`, a conjunct of the folded filter (over
+    /// the output schema of the scan of `source`), is, if the row filter may
+    /// evaluate it: a candidate of the predicate (now a folded one), or a new
+    /// candidate.
+    fn folded_candidate(
+        &mut self,
+        source: &ParquetSource,
+        conjunct: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<usize>> {
+        let table = source.table_schema();
+        let expr = unproject(source, conjunct)?;
+        if let Some(index) = self
+            .candidates
             .iter()
-            .filter(|column| {
-                !in_row_filter
-                    .iter()
-                    .any(|&candidate| self.candidates[candidate].columns.contains(column))
-            })
-            .count()
-    }
-}
-
-/// For every column of the table schema (of `columns` columns) of `source`,
-/// the output column of the scan that its projection produces it in, as it
-/// is, if any.
-fn output_columns(source: &ParquetSource, columns: usize) -> Vec<Option<usize>> {
-    let mut outputs = vec![None; columns];
-    match source.projection() {
-        Some(projection) => {
-            for (output, expr) in projection.expr_iter().enumerate() {
-                if let Some(column) = expr.downcast_ref::<Column>()
-                    && let Some(slot) = outputs.get_mut(column.index())
-                {
-                    slot.get_or_insert(output);
-                }
+            .position(|candidate| candidate.expr.eq(&expr))
+        {
+            let candidate = &mut self.candidates[index];
+            if candidate.kind == ConjunctKind::Optional {
+                candidate.kind = ConjunctKind::Folded;
             }
+            return Ok(Some(index));
         }
-        None => outputs
-            .iter_mut()
-            .enumerate()
-            .for_each(|(i, slot)| *slot = Some(i)),
+        if self.pruning_only.contains(&expr)
+            || !can_expr_be_pushed_down_with_schemas(
+                &expr,
+                table.schema_without_virtual_columns(),
+            )
+            || is_volatile(&expr)
+            || is_dynamic(&expr)
+            || fallibility(&expr, table.table_schema()) != Fallibility::Infallible
+        {
+            return Ok(None);
+        }
+        self.candidates.push(RowFilterConjunct {
+            columns: column_indices(&expr),
+            expr,
+            kind: ConjunctKind::Folded,
+        });
+        Ok(Some(self.candidates.len() - 1))
     }
-    outputs
-}
-
-/// `conjunct`, over the table schema, over the output columns of the scan
-/// (`output_schema`), if they have all of its columns (see
-/// [`output_columns`]).
-fn native_form(
-    conjunct: &Arc<dyn PhysicalExpr>,
-    output_columns: &[Option<usize>],
-    output_schema: &Schema,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    Arc::clone(conjunct)
-        .transform(|expr| {
-            let Some(column) = expr.downcast_ref::<Column>() else {
-                return Ok(Transformed::no(expr));
-            };
-            match output_columns.get(column.index()).copied().flatten() {
-                Some(output) => {
-                    let name = output_schema.field(output).name();
-                    Ok(Transformed::yes(Arc::new(Column::new(name, output)) as _))
-                }
-                None => internal_err!("column {column} is not an output of the scan"),
-            }
-        })
-        .data()
-        .ok()
 }
 
 /// `conjunct`, a conjunct of a filter above the scan of `source` (over its
@@ -1215,7 +1185,7 @@ fn unproject(
     reassign_expr_columns(unprojected, source.table_schema().table_schema())
 }
 
-/// The indices of the columns that `expr` reads.
+/// The indices of the columns that `expr` reads, in ascending order.
 fn column_indices(expr: &Arc<dyn PhysicalExpr>) -> Vec<usize> {
     let mut columns = collect_columns(expr)
         .iter()
@@ -1234,8 +1204,8 @@ fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
 
 /// The conjunct is evaluated by the row filter (also to sample it).
 const IN_ROW_FILTER: u8 = 0;
-/// The conjunct is evaluated natively after decoding: an optional one by the
-/// scan, a folded one by the folded filter.
+/// A folded conjunct that is evaluated natively after decoding, by the
+/// folded filter.
 const NATIVELY: u8 = 1;
 /// An optional conjunct that is not evaluated.
 const NOT_EVALUATED: u8 = 2;
@@ -1246,7 +1216,6 @@ const NOT_EVALUATED: u8 = 2;
 ///
 /// Every conjunct starts in the row filter. Once it was evaluated on
 /// [`SAMPLE_ROWS`] rows (by any threads), the scan decides from the rows it
-/// rejected and from the runs of consecutive rows that it selected or
 /// rejected where it evaluates it (see [`Self::decide`]), and again after
 /// every [`SAMPLE_ROWS`] rows that it evaluates. A conjunct that is not
 /// evaluated by the row filter any more is sampled in the row filter again
@@ -1255,9 +1224,6 @@ const NOT_EVALUATED: u8 = 2;
 #[derive(Debug)]
 struct ConjunctMeter {
     kind: ConjunctKind,
-    /// Whether the scan can evaluate the conjunct natively: a folded
-    /// conjunct, and an optional conjunct with a native form.
-    native: bool,
     /// The conjunct, over the table schema, for the generation of its
     /// dynamic filters.
     expr: Arc<dyn PhysicalExpr>,
@@ -1284,8 +1250,6 @@ struct MeterWindow {
     rows: usize,
     /// The rows it rejected (also those for which it is `NULL`).
     rejected: usize,
-    /// The runs of consecutive rows that it selected or rejected.
-    runs: usize,
     /// The time it took.
     nanos: u64,
     /// The rows, rejected rows and nanoseconds of the past windows, which
@@ -1303,7 +1267,6 @@ impl ConjunctMeter {
     ) -> Self {
         Self {
             kind: candidate.kind,
-            native: candidate.kind == ConjunctKind::Folded || candidate.native.is_some(),
             expr: Arc::clone(&candidate.expr),
             placement: AtomicU8::new(IN_ROW_FILTER),
             epoch,
@@ -1319,13 +1282,12 @@ impl ConjunctMeter {
         self.placement.load(Ordering::Relaxed)
     }
 
-    /// Record that the conjunct selected `selected` of `rows` rows, in `runs`
-    /// runs of consecutive rows that it selected or rejected, in `nanos`.
-    fn record(&self, rows: usize, selected: usize, runs: usize, nanos: u64) {
+    /// Record that the conjunct selected `selected` of `rows` rows in
+    /// `nanos`.
+    fn record(&self, rows: usize, selected: usize, nanos: u64) {
         let mut window = self.window.lock();
         window.rows += rows;
         window.rejected += rows.saturating_sub(selected);
-        window.runs += runs;
         window.nanos += nanos;
         if window.rows >= SAMPLE_ROWS {
             self.decide(&mut window);
@@ -1348,29 +1310,16 @@ impl ConjunctMeter {
     }
 
     /// Decide where to evaluate the conjunct from the statistics of its last
-    /// window:
-    ///
-    /// * in the row filter if it rejects at least one in
-    ///   [`ROW_FILTER_MIN_REJECTED`] rows, in runs of at least
-    ///   [`ROW_FILTER_MIN_RUN_ROWS`] rows on average (and always if the scan
-    ///   relies on its row filter, see [`ConjunctKind::Exact`]);
-    /// * otherwise natively, if it is a folded conjunct, or an optional
-    ///   conjunct that rejects at least one in [`NATIVE_MIN_REJECTED`] rows
-    ///   and that the scan can evaluate natively;
-    /// * otherwise not at all.
+    /// window: in the row filter if it rejects at least one in
+    /// [`ROW_FILTER_MIN_REJECTED`] rows (and always if the scan relies on its
+    /// row filter, see [`ConjunctKind::Exact`]), otherwise natively if it is
+    /// a folded conjunct, and not at all if it is optional.
     fn decide(&self, window: &mut MeterWindow) {
         let rows = window.rows.max(1);
-        let rejects_enough = window.rejected * ROW_FILTER_MIN_REJECTED >= rows;
-        let long_runs = rows >= ROW_FILTER_MIN_RUN_ROWS * window.runs.max(1);
         let placement = match self.kind {
             ConjunctKind::Exact => IN_ROW_FILTER,
-            _ if rejects_enough && long_runs => IN_ROW_FILTER,
+            _ if window.rejected * ROW_FILTER_MIN_REJECTED >= rows => IN_ROW_FILTER,
             ConjunctKind::Folded => NATIVELY,
-            ConjunctKind::Optional
-                if self.native && window.rejected * NATIVE_MIN_REJECTED >= rows =>
-            {
-                NATIVELY
-            }
             ConjunctKind::Optional => NOT_EVALUATED,
         };
         window.past_rows = window.past_rows * RANK_DECAY + window.rows as f64;
@@ -1378,12 +1327,23 @@ impl ConjunctMeter {
         window.past_nanos = window.past_nanos * RANK_DECAY + window.nanos as f64;
         window.rows = 0;
         window.rejected = 0;
-        window.runs = 0;
         window.nanos = 0;
         self.passed.store(0, Ordering::Relaxed);
         self.generation
             .store(snapshot_generation(&self.expr), Ordering::Relaxed);
         self.set_placement(placement);
+    }
+
+    /// Whether the row filter of a version applies the conjunct to every row
+    /// (see [`RowFilterState::version_filter`]): a conjunct that DataFusion
+    /// relies on the row filter for, and a folded conjunct in the row
+    /// filter.
+    fn applied(&self) -> bool {
+        match self.kind {
+            ConjunctKind::Exact => true,
+            ConjunctKind::Folded => self.placement() == IN_ROW_FILTER,
+            ConjunctKind::Optional => false,
+        }
     }
 
     fn set_placement(&self, placement: u8) {
@@ -1414,20 +1374,18 @@ impl ConjunctMeter {
     }
 }
 
-/// The selected rows of the result `value` of a conjunct on `rows` rows (a
-/// `NULL` does not select its row), and the number of runs of consecutive
-/// rows that it selects or rejects.
-fn selection_stats(value: &ColumnarValue, rows: usize) -> Result<(usize, usize)> {
+/// The rows that the result `value` of a conjunct on `rows` rows selects (a
+/// `NULL` does not select its row).
+fn selected_count(value: &ColumnarValue, rows: usize) -> Result<usize> {
     let array = match value {
-        ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => return Ok((rows, 1)),
-        ColumnarValue::Scalar(_) => return Ok((0, 1)),
+        ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => return Ok(rows),
+        ColumnarValue::Scalar(_) => return Ok(0),
         ColumnarValue::Array(array) => array,
     };
     let Some(array) = array.as_boolean_opt() else {
         return internal_err!("a filter returned a {} array", array.data_type());
     };
-    let selected = selected_rows(array);
-    Ok((selected.count_set_bits(), runs(&selected)))
+    Ok(selected_rows(array).count_set_bits())
 }
 
 /// The rows that `array` selects: those that are `true` (not `NULL`).
@@ -1438,33 +1396,19 @@ fn selected_rows(array: &BooleanArray) -> BooleanBuffer {
     }
 }
 
-/// The number of runs of consecutive equal bits of `bits`.
-fn runs(bits: &BooleanBuffer) -> usize {
-    let len = bits.len();
-    if len == 0 {
-        return 0;
-    }
-    let set_runs = bits.set_slices().count();
-    if set_runs == 0 {
-        return 1;
-    }
-    let starts_set = bits.value(0);
-    let ends_set = bits.value(len - 1);
-    let unset_runs = set_runs + 1 - usize::from(starts_set) - usize::from(ends_set);
-    set_runs + unset_runs
-}
-
 /// A conjunct of the predicate of a [`ParquetScanSource`] in the predicate of
 /// the [`ParquetSource`] that it reads a unit with: DataFusion evaluates it
 /// in the row filter of the decoder, and prunes with it.
 ///
-/// It evaluates its conjunct only where its [`ConjunctMeter`] places it in
-/// the row filter (and records the statistics of the meter), and selects
-/// every row otherwise (then the scan evaluates it natively, or not at all).
-/// A conjunct without a meter only prunes: the row filter never evaluates
-/// it. Its snapshot (see [`PhysicalExpr::snapshot`]) is its conjunct, which
-/// DataFusion prunes files, row groups and pages with (its pruning
-/// predicates are built from snapshots), as without the row filter.
+/// It evaluates its conjunct where its [`ConjunctMeter`] places it in the row
+/// filter (and records the statistics of the meter), and always if the row
+/// filter of its version applies it to every row (see
+/// [`RowFilterState::version_filter`]); it selects every row otherwise (then
+/// the scan evaluates it natively, or not at all). A conjunct without a meter
+/// only prunes: the row filter never evaluates it. Its snapshot (see
+/// [`PhysicalExpr::snapshot`]) is its conjunct, which DataFusion prunes files,
+/// row groups and pages with (its pruning predicates are built from
+/// snapshots), as without the row filter.
 ///
 /// It claims to be volatile, so that DataFusion's simplifier does not
 /// replace it by its value when its conjunct is a constant (e.g. after a
@@ -1474,20 +1418,28 @@ fn runs(bits: &BooleanBuffer) -> usize {
 struct RowFilterExpr {
     expr: Arc<dyn PhysicalExpr>,
     meter: Option<Arc<ConjunctMeter>>,
+    /// Whether it evaluates its conjunct wherever its meter places it.
+    always: bool,
 }
 
 impl RowFilterExpr {
     fn new_arc(
         expr: Arc<dyn PhysicalExpr>,
         meter: Option<Arc<ConjunctMeter>>,
+        always: bool,
     ) -> Arc<dyn PhysicalExpr> {
-        Arc::new(Self { expr, meter })
+        Arc::new(Self {
+            expr,
+            meter,
+            always,
+        })
     }
 }
 
 impl PartialEq for RowFilterExpr {
     fn eq(&self, other: &Self) -> bool {
         self.expr.eq(&other.expr)
+            && self.always == other.always
             && match (&self.meter, &other.meter) {
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 (None, None) => true,
@@ -1501,6 +1453,7 @@ impl Eq for RowFilterExpr {}
 impl Hash for RowFilterExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.expr.hash(state);
+        self.always.hash(state);
         self.meter
             .as_ref()
             .map(|meter| Arc::as_ptr(meter).addr())
@@ -1524,15 +1477,14 @@ impl PhysicalExpr for RowFilterExpr {
         let Some(meter) = self
             .meter
             .as_ref()
-            .filter(|meter| meter.placement() == IN_ROW_FILTER)
+            .filter(|meter| self.always || meter.placement() == IN_ROW_FILTER)
         else {
             return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))));
         };
         let start = Instant::now();
         let value = self.expr.evaluate(batch)?;
         let nanos = elapsed_nanos(start);
-        let (selected, runs) = selection_stats(&value, rows)?;
-        meter.record(rows, selected, runs, nanos);
+        meter.record(rows, selected_count(&value, rows)?, nanos);
         meter.row_filter_rows.add(rows);
         Ok(value)
     }
@@ -1551,7 +1503,7 @@ impl PhysicalExpr for RowFilterExpr {
                 children.len()
             )
         })?;
-        Ok(Self::new_arc(expr, self.meter.clone()))
+        Ok(Self::new_arc(expr, self.meter.clone(), self.always))
     }
 
     fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1580,7 +1532,7 @@ struct RowFilterMetrics {
     /// only.
     row_filter_output_rows: Count,
     /// `late_materialized_columns`: the columns that the last row filter of
-    /// the scan materializes late: the columns of the projection of the scan
+    /// the scan materializes late: the columns that its decoders produce and
     /// that none of its conjuncts reads.
     late_materialized_columns: Gauge,
     /// `row_filtered_units`: the units read with row filters.
@@ -1606,12 +1558,24 @@ impl RowFilterMetrics {
 }
 
 /// The predicate and the configuration of the decoder that a thread reads a
-/// unit with: the [`ParquetSource`] that it creates its morselizer with.
+/// unit with (the [`ParquetSource`] that it creates its morselizer with),
+/// and the folded filter of the chunks that it decodes.
 struct ScanVersion {
     id: u64,
     file_source: Arc<dyn FileSource>,
     /// Whether the decoder has a row filter.
     row_filter: bool,
+    /// The folded filter of the chunks that the decoder produces, if a
+    /// filter is folded into the scan: the conjuncts of the folded filter
+    /// that the row filter does not apply to every row, over the columns
+    /// that the decoder produces, and the projection of the folded filter.
+    filter: Option<VersionFilter>,
+}
+
+/// See [`ScanVersion::filter`].
+struct VersionFilter {
+    filter: Arc<PhysicalFilter>,
+    gstate: Arc<dyn GlobalOperatorState>,
 }
 
 /// The versions of the row filters of a scan.
@@ -1625,7 +1589,11 @@ struct ScanVersions {
 }
 
 /// The time per row of the units that a scan read with and without row
-/// filters, which the scan prefers the faster of.
+/// filters, which the scan prefers the faster of: the time from when a
+/// thread claimed a unit until it finished it, reading, decoding and
+/// filtering its rows, and pushing them through the operators above the
+/// scan (a row filter makes the decoder read the columns of its conjuncts
+/// first, and the other columns after).
 #[derive(Debug, Default)]
 struct UnitTimings {
     row_filter: UnitTiming,
@@ -1671,10 +1639,10 @@ struct UnitRead {
     state: FileScanGlobalState,
     /// The index of the unit.
     index: usize,
-    /// Whether the unit is read with a row filter.
-    row_filter: bool,
-    /// The time spent reading and filtering it.
-    nanos: u64,
+    /// The version of the row filters that the unit is read with.
+    version: Arc<ScanVersion>,
+    /// When the thread claimed the unit.
+    claimed: Instant,
 }
 
 /// The state of the row filters of an execution of a [`ParquetScanSource`]
@@ -1734,7 +1702,8 @@ impl RowFilterState {
             .batch_size
             .unwrap_or_else(|| ctx.task_ctx.session_config().batch_size());
         // The version without row filters prunes with all conjuncts (also
-        // those of the folded filter).
+        // those of the folded filter), and evaluates the folded filter on
+        // the columns of the scan.
         let mut native = source.clone();
         if let Some(predicate) = conjunction_opt(
             predicate
@@ -1745,6 +1714,16 @@ impl RowFilterState {
         ) {
             native = native.with_predicate(predicate);
         }
+        let native_filter = scan
+            .filter
+            .as_ref()
+            .map(|filter| {
+                Ok::<_, datafusion_common::DataFusionError>(VersionFilter {
+                    filter: Arc::clone(filter),
+                    gstate: filter.get_global_operator_state(ctx)?,
+                })
+            })
+            .transpose()?;
         let native_allowed = predicate
             .candidates
             .iter()
@@ -1763,6 +1742,7 @@ impl RowFilterState {
                         .with_pushdown_filters(false)
                         .with_batch_size(batch_size),
                     row_filter: false,
+                    filter: native_filter,
                 }),
             }),
             timings: Mutex::default(),
@@ -1791,7 +1771,7 @@ impl RowFilterState {
         let Some(files) = queue.units.get(index) else {
             return Ok(None);
         };
-        let version = self.version(scan, index)?;
+        let version = self.version(scan, ctx, index)?;
         if lstate.morselizer != Some(version.id) {
             let scan_state = downcast_state_mut::<FileScanLocalState>(
                 lstate.scan.as_any_mut(),
@@ -1820,8 +1800,8 @@ impl RowFilterState {
                 file_source: Arc::clone(&version.file_source),
             },
             index,
-            row_filter: version.row_filter,
-            nanos: 0,
+            version,
+            claimed: Instant::now(),
         }))
     }
 
@@ -1833,10 +1813,11 @@ impl RowFilterState {
         if rows == 0 {
             return;
         }
+        let nanos = elapsed_nanos(unit.claimed);
         let mut timings = self.timings.lock();
-        match unit.row_filter {
-            true => timings.row_filter.record(rows, unit.nanos),
-            false => timings.native.record(rows, unit.nanos),
+        match unit.version.row_filter {
+            true => timings.row_filter.record(rows, nanos),
+            false => timings.native.record(rows, nanos),
         }
     }
 
@@ -1845,7 +1826,12 @@ impl RowFilterState {
     /// conjuncts that the meters place in the row filter (built again
     /// whenever their epoch changed), unless none is, or the scan reads
     /// the unit without row filters (see [`Self::reads_with_row_filter`]).
-    fn version(&self, scan: &ParquetScanSource, unit: usize) -> Result<Arc<ScanVersion>> {
+    fn version(
+        &self,
+        scan: &ParquetScanSource,
+        ctx: &ExecutionContext,
+        unit: usize,
+    ) -> Result<Arc<ScanVersion>> {
         // The epoch before the placements: a version is built again if they
         // change after.
         let epoch = self.epoch.load(Ordering::Relaxed);
@@ -1863,7 +1849,7 @@ impl RowFilterState {
         }
         let id = versions.next_id;
         versions.next_id += 1;
-        let version = Arc::new(self.row_filter_version(scan, id, in_row_filter)?);
+        let version = Arc::new(self.row_filter_version(scan, ctx, id, in_row_filter)?);
         versions.row_filter = Some((epoch, Arc::clone(&version)));
         Ok(version)
     }
@@ -1890,17 +1876,24 @@ impl RowFilterState {
             true => EXPLORE_STRIDE,
             false => 4 * EXPLORE_STRIDE,
         };
-        preferred != (unit % stride == stride - 1)
+        // In the middle of every stride: the first two units that the scan
+        // explores are among the first units that the threads claim
+        // together, so that it compares the configurations from then on.
+        preferred != (unit % stride == stride / 2 - 1)
     }
 
     /// The version `id` of the row filters, whose row filter evaluates the
     /// candidates `in_row_filter`, by decreasing rank (unless the scan may
-    /// not reorder them), followed by the other candidates (which select
-    /// every row, unless they are sampled again) and the conjuncts that only
-    /// prune.
+    /// not reorder them), followed by the other optional candidates (which
+    /// select every row, unless they are sampled again) and the conjuncts
+    /// that only prune. It applies the folded conjuncts that the scan decided
+    /// to evaluate in the row filter, and the exact ones, to every row (see
+    /// [`ConjunctMeter::applied`]), and its folded filter evaluates the other
+    /// conjuncts of the folded filter (see [`Self::version_filter`]).
     fn row_filter_version(
         &self,
         scan: &ParquetScanSource,
+        ctx: &ExecutionContext,
         id: u64,
         mut in_row_filter: Vec<usize>,
     ) -> Result<ScanVersion> {
@@ -1918,105 +1911,194 @@ impl RowFilterState {
             // A stable sort: ties keep the order of the predicate.
             in_row_filter.sort_by(|&a, &b| ranks[b].total_cmp(&ranks[a]));
         }
-        self.metrics
-            .late_materialized_columns
-            .set(predicate.late_materialized_columns(&in_row_filter));
-        let others =
-            (0..self.meters.len()).filter(|candidate| !in_row_filter.contains(candidate));
-        let conjuncts = in_row_filter
+        // The folded (and exact) conjuncts that the row filter applies to
+        // every row.
+        let applied = in_row_filter
             .iter()
             .copied()
-            .chain(others)
-            .map(|candidate| {
+            .filter(|&candidate| self.meters[candidate].applied())
+            .collect::<Vec<_>>();
+        // The optional conjuncts that are not in the row filter prune (and
+        // are sampled again in the row filter, see
+        // `ConjunctMeter::record_passed`); the folded conjuncts that are not,
+        // the folded filter evaluates.
+        let others = (0..self.meters.len())
+            .filter(|&candidate| {
+                !in_row_filter.contains(&candidate)
+                    && predicate.candidates[candidate].kind == ConjunctKind::Optional
+            })
+            .collect::<Vec<_>>();
+        let conjuncts = in_row_filter
+            .iter()
+            .chain(&others)
+            .map(|&candidate| {
                 RowFilterExpr::new_arc(
                     Arc::clone(&predicate.candidates[candidate].expr),
                     Some(Arc::clone(&self.meters[candidate])),
+                    applied.contains(&candidate),
                 )
             })
-            .chain(
-                predicate
-                    .pruning_only
-                    .iter()
-                    .map(|conjunct| RowFilterExpr::new_arc(Arc::clone(conjunct), None)),
-            );
-        let file_source = source
+            .chain(predicate.pruning_only.iter().map(|conjunct| {
+                RowFilterExpr::new_arc(Arc::clone(conjunct), None, false)
+            }));
+        let source = source
             .with_predicate(conjunction(conjuncts))
             .with_pushdown_filters(true)
-            .with_reorder_filters(false)
-            .with_batch_size(self.batch_size);
+            .with_reorder_filters(false);
+        let (file_source, filter) = self.version_filter(scan, ctx, &source, &applied)?;
+        // The columns that the decoder produces and that no conjunct of the
+        // row filter reads.
+        let mut decoded = file_source
+            .projection()
+            .map(|projection| {
+                projection
+                    .expr_iter()
+                    .flat_map(|expr| column_indices(&expr))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        decoded.sort_unstable();
+        decoded.dedup();
+        let late = decoded
+            .iter()
+            .filter(|column| {
+                !in_row_filter.iter().any(|&candidate| {
+                    predicate.candidates[candidate].columns.contains(column)
+                })
+            })
+            .count();
+        self.metrics.late_materialized_columns.set(late);
         Ok(ScanVersion {
             id,
             file_source,
             row_filter: true,
+            filter,
         })
     }
 
-    /// Filter `chunk` natively with the optional candidates that the meters
-    /// place there (also with those that they place in the row filter, if
-    /// the chunk was not `row_filtered`), and record their statistics; record
-    /// the rows that passed the other candidates unevaluated.
-    fn filter_natively(
+    /// The source of a version of the row filters of `scan` whose row filter
+    /// applies the candidates `applied` to every row (with `source`), and
+    /// its folded filter (if `scan` has one): the other conjuncts of the
+    /// folded filter, and its projection. The decoder produces only the
+    /// columns of the scan that the folded filter reads (but not those that
+    /// only the conjuncts that the row filter applies read, which it decodes
+    /// for the row filter only), which the folded filter reads by their
+    /// positions among them.
+    fn version_filter(
         &self,
-        predicate: &ScanPredicate,
-        chunk: DataChunk,
-        row_filtered: bool,
-    ) -> Result<DataChunk> {
-        let rows = chunk.len();
-        let mut batch = None;
-        let mut selected: Option<BooleanBuffer> = None;
-        for (candidate, meter) in predicate.candidates.iter().zip(&self.meters) {
-            let placement = meter.placement();
-            let evaluated = match (&candidate.native, placement) {
-                (Some(_), NATIVELY) => true,
-                (Some(_), IN_ROW_FILTER) => !row_filtered,
-                _ => false,
-            };
-            if !evaluated {
-                if placement != IN_ROW_FILTER {
-                    meter.record_passed(rows);
-                }
-                continue;
-            }
-            let Some(native) = &candidate.native else {
-                continue;
-            };
-            let batch = match &batch {
-                Some(batch) => batch,
-                None => batch.insert(chunk.compact()?),
-            };
-            let start = Instant::now();
-            let value = native.evaluate(batch)?;
-            let nanos = elapsed_nanos(start);
-            let mask = match value {
-                ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => {
-                    BooleanBuffer::new_set(rows)
-                }
-                ColumnarValue::Scalar(_) => BooleanBuffer::new_unset(rows),
-                ColumnarValue::Array(array) => match array.as_boolean_opt() {
-                    Some(array) => selected_rows(array),
-                    None => {
-                        return internal_err!(
-                            "a filter returned a {} array",
-                            array.data_type()
-                        );
-                    }
-                },
-            };
-            meter.record(rows, mask.count_set_bits(), runs(&mask), nanos);
-            selected = Some(match selected {
-                Some(selected) => &selected & &mask,
-                None => mask,
-            });
-        }
-        let (Some(batch), Some(selected)) = (batch, selected) else {
-            return Ok(chunk);
+        scan: &ParquetScanSource,
+        ctx: &ExecutionContext,
+        source: &ParquetSource,
+        applied: &[usize],
+    ) -> Result<(Arc<dyn FileSource>, Option<VersionFilter>)> {
+        let Some(folded) = &scan.filter else {
+            return Ok((source.with_batch_size(self.batch_size), None));
         };
-        match selected.count_set_bits() {
-            count if count == rows => Ok(chunk),
-            0 => Ok(DataChunk::empty(Arc::clone(chunk.schema()))),
-            _ => DataChunk::from_record_batch(batch).with_selection(
-                SelectionVector::from_boolean_mask(&BooleanArray::new(selected, None)),
-            ),
+        let scan_schema = &scan.scan.schema;
+        let native = scan
+            .predicate
+            .folded
+            .iter()
+            .filter(|conjunct| {
+                conjunct
+                    .candidate
+                    .is_none_or(|candidate| !applied.contains(&candidate))
+            })
+            .map(|conjunct| &conjunct.expr)
+            .collect::<Vec<_>>();
+        let output = folded.projection().map_or_else(
+            || (0..scan_schema.fields().len()).collect::<Vec<_>>(),
+            <[usize]>::to_vec,
+        );
+        let mut decoded = output
+            .iter()
+            .copied()
+            .chain(native.iter().flat_map(|expr| column_indices(expr)))
+            .collect::<Vec<_>>();
+        decoded.sort_unstable();
+        decoded.dedup();
+        let narrowed = match decoded.len() < scan_schema.fields().len() {
+            true => {
+                let projection = ProjectionExprs::from_indices(&decoded, scan_schema);
+                source.try_pushdown_projection(&projection)?
+            }
+            false => None,
+        };
+        let Some(narrowed) = narrowed else {
+            // The columns of the scan.
+            let conjuncts = native.into_iter().cloned();
+            let filter = PhysicalFilter::try_new(
+                Arc::new(EmptyScanSource::new(Arc::clone(scan_schema))),
+                conjunction_opt(conjuncts).unwrap_or_else(|| lit(true)),
+                folded.projection().map(<[usize]>::to_vec),
+            )?;
+            let filter = self.checked_filter(scan, ctx, filter)?;
+            return Ok((source.with_batch_size(self.batch_size), filter));
+        };
+        // The position of every column of the scan among the decoded ones.
+        let position = |column: usize| decoded.binary_search(&column).ok();
+        let conjuncts = native
+            .into_iter()
+            .map(|expr| {
+                Arc::clone(expr)
+                    .transform(|expr| {
+                        let Some(column) = expr.downcast_ref::<Column>() else {
+                            return Ok(Transformed::no(expr));
+                        };
+                        let Some(position) = position(column.index()) else {
+                            return internal_err!("column {column} is not decoded");
+                        };
+                        let column = Column::new(column.name(), position);
+                        Ok(Transformed::yes(Arc::new(column) as _))
+                    })
+                    .data()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some(projection) = output
+            .iter()
+            .map(|&column| position(column))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return internal_err!("an output column of the filter is not decoded");
+        };
+        let decoded_schema = Arc::new(scan_schema.project(&decoded)?);
+        let filter = PhysicalFilter::try_new(
+            Arc::new(EmptyScanSource::new(decoded_schema)),
+            conjunction_opt(conjuncts).unwrap_or_else(|| lit(true)),
+            Some(projection),
+        )?;
+        let filter = self.checked_filter(scan, ctx, filter)?;
+        Ok((narrowed.with_batch_size(self.batch_size), filter))
+    }
+
+    /// `filter`, the folded filter of a version, with its global state, if
+    /// it produces exactly the schema of `scan`.
+    fn checked_filter(
+        &self,
+        scan: &ParquetScanSource,
+        ctx: &ExecutionContext,
+        filter: PhysicalFilter,
+    ) -> Result<Option<VersionFilter>> {
+        if filter.schema() != scan.schema() {
+            return internal_err!(
+                "The folded filter of a version of the row filters of {} has another schema than the scan",
+                scan.name()
+            );
+        }
+        let gstate = filter.get_global_operator_state(ctx)?;
+        Ok(Some(VersionFilter {
+            filter: Arc::new(filter),
+            gstate,
+        }))
+    }
+
+    /// Record that `rows` rows passed the candidates that are not in the row
+    /// filter unevaluated, see [`ConjunctMeter::record_passed`].
+    fn record_passed(&self, rows: usize) {
+        for meter in &self.meters {
+            if meter.placement() != IN_ROW_FILTER {
+                meter.record_passed(rows);
+            }
         }
     }
 }
@@ -2043,22 +2125,19 @@ fn decode_nanos(
             .iter()
             .map(|row_group| row_group.num_rows().max(0) as f64)
             .sum::<f64>();
-        let mut bytes = std::collections::HashMap::<String, f64>::new();
+        let mut bytes = HashMap::<String, f64>::new();
         for row_group in metadata.row_groups() {
             for column in row_group.columns() {
-                let root = column.column_path().parts().first().cloned();
-                if let Some(root) = root {
-                    *bytes.entry(root).or_default() +=
+                if let Some(root) = column.column_path().parts().first() {
+                    *bytes.entry(root.clone()).or_default() +=
                         column.uncompressed_size().max(0) as f64;
                 }
             }
         }
-        Some(
-            bytes
-                .into_iter()
-                .map(|(root, bytes)| (root, bytes / rows.max(1.0)))
-                .collect::<std::collections::HashMap<_, _>>(),
-        )
+        for bytes in bytes.values_mut() {
+            *bytes /= rows.max(1.0);
+        }
+        Some(bytes)
     });
     predicate
         .candidates
@@ -3395,12 +3474,20 @@ mod tests {
             "{bytes} vs {datafusion_bytes} bytes scanned"
         );
 
-        // `a % 2 = 0` rejects half of the rows in runs of about two rows: the
-        // decoder would decode all rows of the other columns anyway. The scan
-        // evaluates it in the row filter for a sample of rows, then natively
-        // after decoding.
-        let sql = "SELECT id, s FROM t WHERE a % 2 = 0";
-        let (expected, actual) = run_engines(sql, test_session_config(), &setup).await?;
+        // `a % 8 <> 0` rejects one in eight rows: a thread reads the first of
+        // the 4 units of `big` with a row filter (which applies the conjunct
+        // to every row of the unit), and decides to evaluate the conjunct
+        // natively after decoding once it evaluated it on `SAMPLE_ROWS` rows:
+        // the other units are read without row filters.
+        let big = tempfile::tempdir()?;
+        write_big_table(big.path())?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("big", big.path().to_str().unwrap(), Default::default())
+                .await
+        };
+        let sql = "SELECT id, s FROM big WHERE a % 8 <> 0";
+        let config = test_session_config().with_target_partitions(1);
+        let (expected, actual) = run_engines(sql, config, &setup).await?;
         compare_outputs(&expected, &actual).unwrap();
         let root = actual
             .plan
@@ -3410,21 +3497,20 @@ mod tests {
         let [scan] = parquet_scans(root)[..] else {
             panic!("one scan\n{}", format_operator_tree(root));
         };
-        let evaluated = metric(scan, "row_filter_evaluated_rows");
-        assert!(
-            (SAMPLE_ROWS..rows as usize / 2).contains(&evaluated),
-            "{evaluated} rows evaluated by the row filter"
+        assert_eq!(
+            metric(scan, "row_filter_evaluated_rows"),
+            BIG_FILE_ROWS as usize
         );
-        assert!(metric(scan, "row_filter_output_rows") > rows as usize / 2);
+        assert_eq!(metric(scan, "row_filtered_units"), 1);
+        assert_eq!(metric(scan, "natively_filtered_units"), 3);
+        assert_eq!(metric(scan, "late_materialized_columns"), 2);
         Ok(())
     }
 
     /// A candidate conjunct of `kind` for the meters of the tests.
-    fn candidate(kind: ConjunctKind, native: bool) -> RowFilterConjunct {
-        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+    fn candidate(kind: ConjunctKind) -> RowFilterConjunct {
         RowFilterConjunct {
-            native: native.then(|| Arc::clone(&expr)),
-            expr,
+            expr: Arc::new(Column::new("k", 0)),
             kind,
             columns: vec![0],
         }
@@ -3433,16 +3519,15 @@ mod tests {
     #[test]
     fn conjuncts_are_placed_where_they_pay_off() {
         let epoch = Arc::new(AtomicU64::new(0));
-        let meter = |kind, native| {
-            ConjunctMeter::new(&candidate(kind, native), Arc::clone(&epoch), Count::new())
-        };
+        let meter =
+            |kind| ConjunctMeter::new(&candidate(kind), Arc::clone(&epoch), Count::new());
         let rows = SAMPLE_ROWS;
-        // Rejects 31 in 32 rows, in 32 runs: in the row filter.
-        let folded = meter(ConjunctKind::Folded, false);
-        folded.record(rows, rows / 32, 32, 1000);
+        // Rejects a quarter of the rows: in the row filter.
+        let folded = meter(ConjunctKind::Folded);
+        folded.record(rows, rows - rows / 4, 1000);
         assert_eq!(folded.placement(), IN_ROW_FILTER);
-        // The same rows in short runs: natively.
-        folded.record(rows, rows / 32, rows / 16, 1000);
+        // Rejects fewer: natively, with the folded filter.
+        folded.record(rows, rows - rows / 4 + 1, 1000);
         assert_eq!(folded.placement(), NATIVELY);
         // ...until enough rows passed it to sample it again.
         folded.record_passed(RESAMPLE_ROWS - 1);
@@ -3450,58 +3535,40 @@ mod tests {
         folded.record_passed(1);
         assert_eq!(folded.placement(), IN_ROW_FILTER);
         // A decision needs a full window.
-        folded.record(rows - 1, 0, 1, 1000);
+        folded.record(rows - 1, rows - 1, 1000);
         assert_eq!(folded.placement(), IN_ROW_FILTER);
-        folded.record(1, 1, 1, 1);
-        assert_eq!(folded.placement(), IN_ROW_FILTER);
-        // Rejects few rows: natively.
-        folded.record(rows, rows - 10, 20, 1000);
+        folded.record(1, 1, 1);
         assert_eq!(folded.placement(), NATIVELY);
 
-        // An optional conjunct that rejects many rows in short runs is
-        // evaluated natively, if it can be; it is not evaluated if it rejects
-        // few rows.
-        let optional = meter(ConjunctKind::Optional, true);
-        optional.record(rows, rows / 4, rows / 2, 1000);
-        assert_eq!(optional.placement(), NATIVELY);
-        optional.record(rows, rows - rows / 16, rows / 8, 1000);
+        // An optional conjunct that rejects few rows is not evaluated.
+        let optional = meter(ConjunctKind::Optional);
+        optional.record(rows, rows / 2, 1000);
+        assert_eq!(optional.placement(), IN_ROW_FILTER);
+        optional.record(rows, rows - rows / 16, 1000);
         assert_eq!(optional.placement(), NOT_EVALUATED);
-        let without_native_form = meter(ConjunctKind::Optional, false);
-        without_native_form.record(rows, rows / 4, rows / 2, 1000);
-        assert_eq!(without_native_form.placement(), NOT_EVALUATED);
-        // With long runs, also an optional conjunct is in the row filter.
-        without_native_form.record_passed(RESAMPLE_ROWS);
-        assert_eq!(without_native_form.placement(), IN_ROW_FILTER);
-        without_native_form.record(rows, 0, 1, 1000);
-        assert_eq!(without_native_form.placement(), IN_ROW_FILTER);
+        optional.record_passed(RESAMPLE_ROWS);
+        assert_eq!(optional.placement(), IN_ROW_FILTER);
 
         // A conjunct that DataFusion relies on the row filter for stays there.
-        let exact = meter(ConjunctKind::Exact, false);
-        exact.record(rows, rows, 1, 1000);
+        let exact = meter(ConjunctKind::Exact);
+        exact.record(rows, rows, 1000);
         assert_eq!(exact.placement(), IN_ROW_FILTER);
 
         // Every decision bumps the epoch, so that the threads build their row
         // filters again.
-        assert!(epoch.load(Ordering::Relaxed) >= 10);
+        assert!(epoch.load(Ordering::Relaxed) >= 8);
     }
 
     #[test]
-    fn selections_count_their_runs() {
-        let bits = |values: &[bool]| BooleanBuffer::from(values.to_vec());
-        assert_eq!(runs(&bits(&[])), 0);
-        assert_eq!(runs(&bits(&[false, false])), 1);
-        assert_eq!(runs(&bits(&[true, true, true])), 1);
-        assert_eq!(runs(&bits(&[true, false, true])), 3);
-        assert_eq!(runs(&bits(&[false, true, true, false])), 3);
-        assert_eq!(runs(&bits(&[false, true, false, true])), 4);
+    fn conjuncts_select_their_true_rows() {
         let array = BooleanArray::from(vec![Some(true), None, Some(true), Some(false)]);
         let value = ColumnarValue::Array(Arc::new(array));
         // A `NULL` does not select its row.
-        assert_eq!(selection_stats(&value, 4).unwrap(), (2, 4));
+        assert_eq!(selected_count(&value, 4).unwrap(), 2);
         let all = ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)));
-        assert_eq!(selection_stats(&all, 7).unwrap(), (7, 1));
+        assert_eq!(selected_count(&all, 7).unwrap(), 7);
         let none = ColumnarValue::Scalar(ScalarValue::Boolean(None));
-        assert_eq!(selection_stats(&none, 7).unwrap(), (0, 1));
+        assert_eq!(selected_count(&none, 7).unwrap(), 0);
     }
 
     /// The global state of an execution of `source` on `threads` threads.
@@ -3579,45 +3646,73 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        let exec_ctx = ExecutionContext::new(ctx.task_ctx(), 0, 1);
         // Without statistics, by the estimated costs of decoding their
         // columns (from the sizes of the columns in the files).
-        let version = row_filters.version(&scan, 0)?;
+        let version = row_filters.version(&scan, &exec_ctx, 0)?;
         assert!(version.row_filter);
         let mut by_cost = vec![0, 1, 2];
         by_cost.sort_by(|&a, &b| {
             row_filters.decode_nanos[a].total_cmp(&row_filters.decode_nanos[b])
         });
         assert_eq!(order(&version), by_cost, "{:?}", row_filters.decode_nanos);
+        // The row filter applies its conjuncts to every row: the folded
+        // filter of the version evaluates none of them.
+        let filter = version.filter.as_ref().unwrap();
+        assert_eq!(filter.filter.predicate().to_string(), "true");
         // Once the meters decided (which builds the row filters again):
         // `a % 2 = 0` rejects 3 in 10 of its rows, and `k % 8192 < 256` all but
-        // one in 32, both in long runs: the row filter evaluates them by
-        // decreasing rank. `s <> 'x'` rejects no row: it is evaluated natively,
-        // after the conjuncts of the row filter (where it selects every row).
+        // one in 32: the row filter evaluates them by decreasing rank.
+        // `s <> 'x'` rejects no row: the folded filter evaluates it natively.
         let rows = SAMPLE_ROWS;
-        row_filters.meters[0].record(rows, rows * 7 / 10, 16, 2000);
-        row_filters.meters[1].record(rows, rows / 32, 16, 2000);
-        row_filters.meters[2].record(rows, rows, 1, 8000);
+        row_filters.meters[0].record(rows, rows * 7 / 10, 2000);
+        row_filters.meters[1].record(rows, rows / 32, 2000);
+        row_filters.meters[2].record(rows, rows, 8000);
         assert_eq!(row_filters.meters[2].placement(), NATIVELY);
         let rank = |candidate: usize| {
             row_filters.meters[candidate].rank(row_filters.decode_nanos[candidate])
         };
         let mut by_rank = vec![0, 1];
         by_rank.sort_by(|&a, &b| rank(b).total_cmp(&rank(a)));
-        by_rank.push(2);
-        let version = row_filters.version(&scan, 1)?;
+        let version = row_filters.version(&scan, &exec_ctx, 1)?;
         assert_eq!(order(&version), by_rank);
         // The rows rejected per nanosecond.
         assert!(rank(1) > rank(2));
         assert_eq!(rank(2), 0.0);
-        // `k % 8192 < 256` rejects its rows in short runs: natively too.
-        row_filters.meters[1].record(rows, rows / 32, rows / 4, 2000);
+        // The row filter applies the folded conjuncts that it evaluates to
+        // every row: the folded filter of the version evaluates the other one,
+        // `s <> 'x'`, on the columns that it needs, `id` and `s` (not `a` and
+        // `k`, which only the row filter reads).
+        let filter = version.filter.as_ref().unwrap();
+        assert_eq!(filter.filter.predicate().to_string(), "s@1 != x");
+        let decoded = filter.filter.children()[0].schema();
+        let decoded = decoded
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, ["id", "s"]);
+        // `k % 8192 < 256` rejects few rows now: natively too.
+        row_filters.meters[1].record(rows, rows - 10, 2000);
         assert_eq!(row_filters.meters[1].placement(), NATIVELY);
-        let version = row_filters.version(&scan, 2)?;
-        assert_eq!(order(&version), [0, 1, 2]);
+        let version = row_filters.version(&scan, &exec_ctx, 2)?;
+        assert_eq!(order(&version), [0]);
         // Without a conjunct in the row filter, the units are read without.
-        row_filters.meters[0].record(rows, rows / 2, rows / 2, 2000);
+        row_filters.meters[0].record(rows, rows, 2000);
         assert_eq!(row_filters.meters[0].placement(), NATIVELY);
-        assert!(!row_filters.version(&scan, 3)?.row_filter);
+        let version = row_filters.version(&scan, &exec_ctx, 3)?;
+        assert!(!version.row_filter);
+        // With all conjuncts in their folded filter.
+        assert_eq!(
+            version
+                .filter
+                .as_ref()
+                .unwrap()
+                .filter
+                .predicate()
+                .to_string(),
+            scan.filter().unwrap().predicate().to_string()
+        );
         Ok(())
     }
 
@@ -3626,11 +3721,11 @@ mod tests {
         let epoch = Arc::new(AtomicU64::new(0));
         let meter = |rejected: usize, nanos: u64| {
             let meter = ConjunctMeter::new(
-                &candidate(ConjunctKind::Folded, false),
+                &candidate(ConjunctKind::Folded),
                 Arc::clone(&epoch),
                 Count::new(),
             );
-            meter.record(1000, 1000 - rejected, 1, nanos);
+            meter.record(1000, 1000 - rejected, nanos);
             meter
         };
         // Rejects 90% of its rows, in a nanosecond per row.
@@ -3642,7 +3737,7 @@ mod tests {
         assert!((selective.rank(1.0) - 0.45).abs() < 1e-9);
         // Without statistics, half of the rows in a nanosecond per row.
         let unknown = ConjunctMeter::new(
-            &candidate(ConjunctKind::Folded, false),
+            &candidate(ConjunctKind::Folded),
             Arc::clone(&epoch),
             Count::new(),
         );
@@ -3691,14 +3786,12 @@ mod tests {
         let gstate = downcast_state::<ParquetScanState>(gstate.as_any(), "test")?;
         let row_filters = gstate.row_filters.as_ref().unwrap();
         assert!(row_filters.explores);
-        let schedule = (0..16)
-            .map(|unit| row_filters.reads_with_row_filter(unit))
+        // The units that it reads without row filters, before it timed any:
+        // two of the first units that the threads claim together.
+        let explored = (0..16)
+            .filter(|&unit| !row_filters.reads_with_row_filter(unit))
             .collect::<Vec<_>>();
-        assert_eq!(
-            schedule.iter().filter(|row_filter| !**row_filter).count(),
-            2,
-            "{schedule:?}"
-        );
+        assert_eq!(explored, [3, 11]);
         let output = Executor::collect(
             Arc::clone(&scan) as Arc<dyn PhysicalOperator>,
             ctx.task_ctx(),
