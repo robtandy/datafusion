@@ -2033,7 +2033,7 @@ impl RowFilterState {
                 folded.projection().map(<[usize]>::to_vec),
             )?;
             let filter = self.checked_filter(scan, ctx, filter)?;
-            return Ok((source.with_batch_size(self.batch_size), filter));
+            return Ok((source.with_batch_size(self.batch_size), Some(filter)));
         };
         // The position of every column of the scan among the decoded ones.
         let position = |column: usize| decoded.binary_search(&column).ok();
@@ -2067,18 +2067,26 @@ impl RowFilterState {
             conjunction_opt(conjuncts).unwrap_or_else(|| lit(true)),
             Some(projection),
         )?;
+        if filter.schema() != scan.schema() {
+            // Not expected: the folded filter of the scan, on all of its
+            // columns.
+            let filter = VersionFilter {
+                filter: Arc::clone(folded),
+                gstate: folded.get_global_operator_state(ctx)?,
+            };
+            return Ok((source.with_batch_size(self.batch_size), Some(filter)));
+        }
         let filter = self.checked_filter(scan, ctx, filter)?;
-        Ok((narrowed.with_batch_size(self.batch_size), filter))
+        Ok((narrowed.with_batch_size(self.batch_size), Some(filter)))
     }
 
-    /// `filter`, the folded filter of a version, with its global state, if
-    /// it produces exactly the schema of `scan`.
+    /// `filter`, the folded filter of a version, with its global state.
     fn checked_filter(
         &self,
         scan: &ParquetScanSource,
         ctx: &ExecutionContext,
         filter: PhysicalFilter,
-    ) -> Result<Option<VersionFilter>> {
+    ) -> Result<VersionFilter> {
         if filter.schema() != scan.schema() {
             return internal_err!(
                 "The folded filter of a version of the row filters of {} has another schema than the scan",
@@ -2086,10 +2094,10 @@ impl RowFilterState {
             );
         }
         let gstate = filter.get_global_operator_state(ctx)?;
-        Ok(Some(VersionFilter {
+        Ok(VersionFilter {
             filter: Arc::new(filter),
             gstate,
-        }))
+        })
     }
 
     /// Record that `rows` rows passed the candidates that are not in the row
