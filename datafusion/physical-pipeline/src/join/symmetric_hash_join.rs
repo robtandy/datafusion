@@ -892,7 +892,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::prelude::{SessionConfig, SessionContext};
-    use datafusion_common::internal_datafusion_err;
+    use datafusion_common::{DataFusionError, internal_datafusion_err};
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
@@ -1446,7 +1446,9 @@ mod tests {
         // candidates at a time. With a limit of a row, it stops after its first
         // chunk of candidates, within a memory pool that holds its tables, but
         // not the matches; without the limit, it emits all of them, in chunks,
-        // within the same pool.
+        // within the same pool. The candidates are reserved while they are
+        // joined: a pool of 64 KiB holds the tables (of about 20 KB), but not
+        // a chunk of candidates.
         let schema = |side: &str| {
             Arc::new(Schema::new(vec![
                 Field::new(format!("{side}id"), DataType::Int64, false),
@@ -1509,6 +1511,21 @@ mod tests {
                 None => join,
             })
         };
+        for limit in [Some(1), None] {
+            let plan = plan(limit)?;
+            let root = crate::planner::lower_execution_plan(&plan)?;
+            let err = run_native(&root, plan, limited_task_ctx(64 * 1024)?)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+                "{err}"
+            );
+            assert!(
+                err.to_string().contains("PhysicalSymmetricHashJoin"),
+                "{err}"
+            );
+        }
         let pool = 512 * 1024;
         for (limit, rows) in [(Some(1), 1), (None, 250_000)] {
             pairs.store(0, Ordering::SeqCst);
