@@ -36,11 +36,15 @@
 //!      [`has_top_level_order_by`]);
 //!    * in order if it has one: the result must be the rows that the query
 //!      returns from an order of all its rows in which a row is only out of
-//!      DataFusion's order relative to rows that it ties with. Rows tie if
-//!      their `ORDER BY` keys are equal, floating-point keys within twice the
-//!      tolerance (as the keys of each engine may be off by the tolerance).
-//!      Ties are not transitive: rows that tie with a row may not tie with
-//!      each other. So rows that tie may come in any order among themselves,
+//!      DataFusion's order relative to rows that it ties with. The keys are
+//!      compared in their order (lexicographically, also the elements of
+//!      lists and the fields of structs): rows tie if their `ORDER BY` keys
+//!      are equal up to their first floating-point value, and these values
+//!      are equal within twice the tolerance, whatever their later keys. As
+//!      the keys of each engine may be off by the tolerance, either row may
+//!      have the smaller value. Ties are not transitive: rows that tie with a
+//!      row may not tie with each other. So rows that tie may come in any
+//!      order among themselves,
 //!      and under `ORDER BY … LIMIT`, the last rows may be other rows that
 //!      tie with them (with their multiplicities), as may, under `OFFSET`,
 //!      the first rows;
@@ -1268,10 +1272,59 @@ struct SortedRows {
     /// The output columns of all sorted rows.
     values: Vec<Row>,
     /// The classes of the sorted rows: the ranges of rows whose keys are
-    /// exactly equal, and their keys.
+    /// exactly equal up to their first floating-point value, and these keys
+    /// (see [`decision_keys`]).
     classes: Vec<(Range<usize>, Row)>,
+    /// For each class, whether its rows have keys after these keys.
+    truncated: Vec<bool>,
     /// The sorted rows that the query returns.
     window: Range<usize>,
+}
+
+/// The keys of a row (the values of its `ORDER BY` keys, `keys`) that decide
+/// its order relative to rows of other keys, and whether `keys` has values
+/// after them: the keys up to their first floating-point value (included), in
+/// the order in which they are compared (lexicographically, also the
+/// elements of lists and the fields of structs).
+///
+/// The floating-point values of each engine may be off by the tolerance: of
+/// two rows whose keys are exactly equal before their first floating-point
+/// values, and whose first floating-point values are close, either may be
+/// first, whatever their later keys.
+fn decision_keys(keys: &[Value]) -> (Row, bool) {
+    /// Push the values of `values` up to their first floating-point value
+    /// (included) to `prefix`. Returns `None` if they have none, or whether
+    /// they have values after it.
+    fn push_prefix(values: &[Value], prefix: &mut Vec<Value>) -> Option<bool> {
+        for (i, value) in values.iter().enumerate() {
+            let found = match value {
+                Value::Float(_) => {
+                    prefix.push(value.clone());
+                    Some(false)
+                }
+                Value::List(elements) | Value::Struct(elements) => {
+                    let mut inner = vec![];
+                    let found = push_prefix(elements, &mut inner);
+                    prefix.push(match value {
+                        Value::List(_) => Value::List(inner),
+                        _ => Value::Struct(inner),
+                    });
+                    found
+                }
+                Value::Null | Value::Scalar(_) => {
+                    prefix.push(value.clone());
+                    None
+                }
+            };
+            if let Some(truncated) = found {
+                return Some(truncated || i + 1 < values.len());
+            }
+        }
+        None
+    }
+    let mut prefix = vec![];
+    let truncated = push_prefix(keys, &mut prefix).unwrap_or(false);
+    (prefix, truncated)
 }
 
 impl SortedReference {
@@ -1295,15 +1348,21 @@ impl SortedReference {
         };
         let mut values = vec![];
         let mut classes: Vec<(Range<usize>, Row)> = vec![];
+        let mut truncated = vec![];
         for batch in &self.batches {
             for i in 0..batch.num_rows() {
-                let keys = row(batch, i, self.columns..width)?;
+                let (keys, truncates) =
+                    decision_keys(&row(batch, i, self.columns..width)?);
                 let position = values.len();
                 match classes.last_mut() {
                     Some((range, class_keys)) if rows_equal(class_keys, &keys, 0.0) => {
                         range.end = position + 1;
+                        *truncated.last_mut().expect("a class") |= truncates;
                     }
-                    _ => classes.push((position..position + 1, keys)),
+                    _ => {
+                        classes.push((position..position + 1, keys));
+                        truncated.push(truncates);
+                    }
                 }
                 values.push(row(batch, i, 0..self.columns)?);
             }
@@ -1316,15 +1375,18 @@ impl SortedReference {
         Ok(SortedRows {
             values,
             classes,
+            truncated,
             window: start..end,
         })
     }
 }
 
 /// For each class of sorted rows, the other classes whose keys tie with its
-/// keys (in their order). Only keys with the same [`Shape`] can tie (their
-/// values but their floating-point values are equal): their floating-point
-/// values are compared within `tie_tolerance`.
+/// keys (in their order). The keys of the classes are their
+/// [`decision_keys`], which have at most one floating-point value. Only keys
+/// with the same [`Shape`] can tie (their values but their floating-point
+/// values are equal): their floating-point values are compared within
+/// `tie_tolerance`.
 // The keys of `Shape`s hold `ScalarValue`s, whose Arrow buffers have a `Mutex`
 // for memory accounting with the `arrow-buffer/pool` feature (enabled by
 // `--all-features`): it affects neither their equality nor their hashing. Not
@@ -1387,8 +1449,9 @@ fn float_bits(row: &[Value]) -> Vec<u64> {
 /// their sorted order relative to rows that they tie with.
 ///
 /// The sorted rows are divided into classes of rows whose keys are exactly
-/// equal. The rows of a class may be at the positions of its rows, and of the
-/// rows of the classes that it ties with. A maximum matching of the rows of
+/// equal up to their first floating-point value (their [`decision_keys`]).
+/// The rows of a class may be at the positions of its rows, and of the rows
+/// of the classes that it ties with. A maximum matching of the rows of
 /// `result` to the sorted rows with their values (within the tolerance) at
 /// their positions must match all rows of `result`. The classes are divided
 /// into clusters, which ties do not cross: in a cluster whose classes all tie
@@ -1429,12 +1492,22 @@ fn compare_sorted(
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // The keys of a class, `…` if its rows have later keys.
+    let display_keys = |class: usize| {
+        let keys = display(&classes[class].1);
+        if sorted.truncated[class] {
+            format!("{keys}, …")
+        } else {
+            keys
+        }
+    };
     let rule = if keys.is_empty() {
         "all rows tie, as the first ORDER BY key is volatile".to_string()
     } else {
         format!(
-            "rows tie if their ORDER BY keys ({keys}) are equal, floating-point keys \
-             within twice the tolerance"
+            "rows tie if their ORDER BY keys ({keys}) are equal up to their first \
+             floating-point value, and these values are equal within twice the \
+             tolerance, whatever their later keys"
         )
     };
 
@@ -1530,9 +1603,9 @@ fn compare_sorted(
                  ({rule})\ncolumns: ({columns})\n  row {i}: ({}), keys: ({})\n  sorted \
                  row {position} of {reference_name}: ({}), keys: ({})",
                 display(row),
-                display(&classes[class].1),
+                display_keys(class),
                 display(&sorted.values[position]),
-                display(&classes[position_class].1)
+                display_keys(position_class)
             ),
             _ => format!(
                 "row {i} of {result_name} differs: it is not among the sorted rows of \
@@ -1602,9 +1675,9 @@ fn compare_sorted(
                  ({columns})\n  row {earlier}: ({}), keys: ({})\n  row {row}: ({}), \
                  keys: ({})",
                 display(&result[earlier]),
-                display(&classes[later].1),
+                display_keys(later),
                 display(&result[row]),
-                display(&classes[class].1)
+                display_keys(class)
             ),
             ClusterFailure::Skipped {
                 row,
@@ -1617,8 +1690,8 @@ fn compare_sorted(
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the skipped rows: ({})",
                 display(&result[row]),
-                display(&classes[class].1),
-                display(&classes[skipped].1)
+                display_keys(class),
+                display_keys(skipped)
             ),
             ClusterFailure::Cut { row, class, cut } => format!(
                 "row {row} of {result_name} is not among the rows that the query \
@@ -1627,8 +1700,8 @@ fn compare_sorted(
                  ({rule})\ncolumns: ({columns})\n  row {row}: ({}), keys: ({})\n  keys of \
                  the cut rows: ({})",
                 display(&result[row]),
-                display(&classes[class].1),
-                display(&classes[cut].1)
+                display_keys(class),
+                display_keys(cut)
             ),
             ClusterFailure::SkippedAfterCut { skipped, cut } => format!(
                 "the rows of {result_name} are not among the rows that the query \
@@ -1636,8 +1709,8 @@ fn compare_sorted(
                  the query orders after sorted rows that the LIMIT would cut, and \
                  whose keys do not tie with theirs ({rule})\n  keys of the skipped rows: \
                  ({})\n  keys of the cut rows: ({})",
-                display(&classes[skipped].1),
-                display(&classes[cut].1)
+                display_keys(skipped),
+                display_keys(cut)
             ),
             ClusterFailure::NoOrder => format!(
                 "the rows of {result_name} are not among the rows that the query \
@@ -2848,6 +2921,7 @@ mod tests {
     };
     use arrow::buffer::{NullBuffer, ScalarBuffer};
     use arrow::datatypes::{Fields, Int8Type, UnionFields};
+    use itertools::Itertools;
 
     fn int_batch(values: &[Option<i32>]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
@@ -3695,8 +3769,9 @@ mod tests {
             err.starts_with(
                 "row 0 of the pipeline engine is out of order: the sorted rows of \
                  DataFusion with its values may not be at its position (rows tie if \
-                 their ORDER BY keys (k) are equal, floating-point keys within twice the \
-                 tolerance)"
+                 their ORDER BY keys (k) are equal up to their first floating-point \
+                 value, and these values are equal within twice the tolerance, whatever \
+                 their later keys)"
             ),
             "{err}"
         );
@@ -4080,87 +4155,209 @@ mod tests {
         ])
     }
 
+    /// The order of a query that selects the `id`s of the rows `sorted`
+    /// (`id_keys_batch`), ordered by `k1, k2`, of which it skips `skip` rows
+    /// and returns at most `fetch`.
+    fn id_order(
+        sorted: &[(i64, f64, f64)],
+        skip: usize,
+        fetch: Option<usize>,
+    ) -> ResultOrder {
+        ResultOrder::Sorted(SortedReference {
+            batches: vec![id_keys_batch(sorted)],
+            columns: 1,
+            keys: vec!["m.k1".to_string(), "m.k2".to_string()],
+            skip,
+            fetch,
+        })
+    }
+
+    /// A result of `id`s.
+    fn ids(ids: &[i64]) -> Vec<RecordBatch> {
+        let ids = Int64Array::from(ids.to_vec());
+        vec![batch_of(vec![("id", Arc::new(ids) as ArrayRef)])]
+    }
+
     #[test]
     fn same_results_search_the_rows_that_the_offset_skips() {
-        let t = 1e-9;
-        // On `(k1, k2)`, row 2 ties with rows 0 and 1, which do not tie with each
-        // other: `[2, 0, 1]` is an order, in which OFFSET 1 skips row 2, and
-        // LIMIT 1 cuts row 1.
-        let ties_with_both = [
+        let t: f64 = 1e-9;
+        // Rows `(id, k1, k2)` sorted on `(k1, k2)`, whose ids are their positions.
+        // The first floating-point key `k1` decides which rows tie, whatever `k2`,
+        // which is in the opposite order (but where `k1` is equal). The ties are
+        // not transitive: in `chain`, each row ties with the next one, but not
+        // with the one after.
+        let chain = [1.0, 1.0 + 1.5 * t, 1.0 + 3.0 * t, 1.0 + 4.5 * t];
+        // Row 0 ties with row 1, which ties with rows 2 and 3, which tie.
+        let fork = [1.0, 1.0 + t, 1.0 + 2.5 * t, 1.0 + 2.8 * t];
+        // Rows 0 and 1 are equal on `k1` (and in the order of `k2`), and tie with
+        // row 2, which ties with row 3.
+        let pair = [1.0, 1.0, 1.0 + 1.5 * t, 1.0 + 3.0 * t];
+        let all = [1.0, 1.0 + 0.5 * t, 1.0 + t, 1.0 + 1.5 * t];
+        for k1 in [&chain[..3], &chain, &fork, &pair, &all] {
+            let n = k1.len();
+            let k2 = |id: usize| {
+                if id > 0 && k1[id] == k1[id - 1] {
+                    1.0
+                } else {
+                    -(id as f64)
+                }
+            };
+            let sorted = (0..n)
+                .map(|id| (id as i64, k1[id], k2(id)))
+                .collect::<Vec<_>>();
+            let tie = |a: usize, b: usize| {
+                let (a, b) = (k1[a], k1[b]);
+                (a - b).abs() <= 2.0 * t * a.abs().max(b.abs())
+            };
+            // The orders of all rows in which rows are only out of their sorted
+            // order relative to rows that they tie with.
+            let orders = (0..n)
+                .permutations(n)
+                .filter(|order| {
+                    (0..n).all(|i| {
+                        (i + 1..n).all(|j| order[i] < order[j] || tie(order[i], order[j]))
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (skip, fetch) in [
+                (0, None),
+                (0, Some(1)),
+                (0, Some(2)),
+                (1, None),
+                (1, Some(1)),
+                (1, Some(2)),
+                (2, None),
+                (2, Some(1)),
+            ] {
+                let window = skip.min(n)..fetch.map_or(n, |fetch| (skip + fetch).min(n));
+                let valid = orders
+                    .iter()
+                    .map(|order| order[window.clone()].to_vec())
+                    .collect::<HashSet<_>>();
+                let order = id_order(&sorted, skip, fetch);
+                let expected = window.clone().map(|id| id as i64).collect::<Vec<_>>();
+                // Every result of distinct rows.
+                for result in (0..n).permutations(window.len()) {
+                    let ids_of_result =
+                        result.iter().map(|&id| id as i64).collect::<Vec<_>>();
+                    let comparison =
+                        same_results(ids(&expected), ids(&ids_of_result), &order);
+                    assert_eq!(
+                        comparison.is_ok(),
+                        valid.contains(&result),
+                        "{k1:?} OFFSET {skip} LIMIT {fetch:?} {result:?}: {comparison:?}"
+                    );
+                }
+            }
+        }
+
+        // With the keys of an earlier review, all rows tie on `k1`: `[0]` is the
+        // second row of the order `[2, 0, 1]`.
+        let sorted = [
             (0, 1.0, 1.0),
             (1, 1.0 + 0.1 * t, 1.0 + 3.0 * t),
             (2, 1.0 + 0.2 * t, 1.0 + 1.5 * t),
         ];
-        // Row 2 only ties with row 1.
-        let ties_with_one = [
-            (0, 1.0, 1.0),
-            (1, 1.0 + 0.1 * t, 1.0 + 3.0 * t),
-            (2, 1.0 + 0.2 * t, 1.0 + 2.5 * t),
-        ];
-        let ids = |ids: &[i64]| {
-            let ids = Int64Array::from(ids.to_vec());
-            vec![batch_of(vec![("id", Arc::new(ids) as ArrayRef)])]
-        };
-        let order = |sorted: &[(i64, f64, f64)], skip, fetch| {
-            ResultOrder::Sorted(SortedReference {
-                batches: vec![id_keys_batch(sorted)],
-                columns: 1,
-                keys: vec!["m.k1".to_string(), "m.k2".to_string()],
-                skip,
-                fetch,
-            })
-        };
-        let permutations = [
-            [0, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ];
-        // Check that the results that the comparison accepts are the orders of
-        // all rows, of the last two rows and of the second row, in which rows
-        // are only out of their sorted order relative to rows that they tie
-        // with.
-        let check = |sorted: &[(i64, f64, f64)],
-                     orders: &[[i64; 3]],
-                     last_two: &[[i64; 2]],
-                     second: &[i64]| {
-            let all = order(sorted, 0, None);
-            for permutation in permutations {
-                let result = same_results(ids(&[0, 1, 2]), ids(&permutation), &all);
-                let valid = orders.contains(&permutation);
-                assert_eq!(
-                    result.is_ok(),
-                    valid,
-                    "{sorted:?} {permutation:?}: {result:?}"
-                );
-            }
-            let offset_1 = order(sorted, 1, None);
-            for [a, b, _] in permutations {
-                let result = same_results(ids(&[1, 2]), ids(&[a, b]), &offset_1);
-                let valid = last_two.contains(&[a, b]);
-                assert_eq!(result.is_ok(), valid, "{sorted:?} [{a}, {b}]: {result:?}");
-            }
-            let limit_1_offset_1 = order(sorted, 1, Some(1));
-            for id in 0..3 {
-                let result = same_results(ids(&[1]), ids(&[id]), &limit_1_offset_1);
-                let valid = second.contains(&id);
-                assert_eq!(result.is_ok(), valid, "{sorted:?} [{id}]: {result:?}");
-            }
-        };
-        check(
-            &ties_with_both,
-            &[[0, 1, 2], [0, 2, 1], [2, 0, 1]],
-            &[[0, 1], [1, 2], [2, 1]],
-            &[0, 1, 2],
+        same_results(ids(&[1]), ids(&[0]), &id_order(&sorted, 1, Some(1))).unwrap();
+    }
+
+    /// A batch of `(id BIGINT, k DOUBLE, s VARCHAR)` rows.
+    fn id_k_s_batch(rows: &[(i64, f64, &str)]) -> RecordBatch {
+        batch_of(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|row| row.0)))
+                    as ArrayRef,
+            ),
+            (
+                "k",
+                Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.1))),
+            ),
+            (
+                "s",
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|row| row.2))),
+            ),
+        ])
+    }
+
+    #[test]
+    fn same_results_order_rows_lexicographically_within_the_tolerance() {
+        let rows = |rows: &[(i64, f64, &str)]| vec![id_k_s_batch(rows)];
+        let close = 1.0 + 0.5e-9;
+        // The values of `k` of the pipeline engine may be the values of
+        // DataFusion swapped (within the tolerance), which reverses the order of
+        // the rows on `(k, s)`, whatever `s`: with and without LIMIT 1.
+        let sorted = || rows(&[(0, 1.0, "a"), (1, close, "b")]);
+        let swapped = || rows(&[(1, 1.0, "b"), (0, close, "a")]);
+        let by_k_s = sorted_by(&sorted(), &["k", "s"], 0, None);
+        same_results(sorted(), swapped(), &by_k_s).unwrap();
+        let first_by_k_s = sorted_by(&sorted(), &["k", "s"], 0, Some(1));
+        let first = rows(&[(0, 1.0, "a")]);
+        same_results(first.clone(), rows(&[(1, 1.0, "b")]), &first_by_k_s).unwrap();
+        // Also if the values of `k` are equal.
+        let equal = || rows(&[(0, 1.0, "a"), (1, 1.0, "b")]);
+        let by_k_s = sorted_by(&equal(), &["k", "s"], 0, None);
+        same_results(equal(), rows(&[(1, 1.0, "b"), (0, 1.0, "a")]), &by_k_s).unwrap();
+        // On `(s, k)`, `s` decides, unless it is equal.
+        let by_s_k = sorted_by(&sorted(), &["s", "k"], 0, None);
+        let err = same_results(sorted(), swapped(), &by_s_k).unwrap_err();
+        assert!(
+            err.starts_with("row 0 of the pipeline engine is out of order"),
+            "{err}"
         );
-        check(
-            &ties_with_one,
-            &[[0, 1, 2], [0, 2, 1]],
-            &[[1, 2], [2, 1]],
-            &[1, 2],
+        assert!(err.contains("keys: (\"b\", 1.0000000005)"), "{err}");
+        let same_s = || rows(&[(0, 1.0, "a"), (1, close, "a")]);
+        let by_s_k = sorted_by(&same_s(), &["s", "k"], 0, Some(1));
+        same_results(rows(&[(0, 1.0, "a")]), rows(&[(1, 1.0, "a")]), &by_s_k).unwrap();
+        // Values of `k` that are not close decide.
+        let far = || rows(&[(0, 1.0, "a"), (1, 1.5, "b")]);
+        let by_k_s = sorted_by(&far(), &["k", "s"], 0, None);
+        let err = same_results(far(), rows(&[(1, 1.5, "b"), (0, 1.0, "a")]), &by_k_s)
+            .unwrap_err();
+        assert!(
+            err.starts_with(
+                "row 0 of the pipeline engine is out of order: the sorted rows of \
+                 DataFusion with its values may not be at its position (rows tie if \
+                 their ORDER BY keys (k, s) are equal up to their first floating-point \
+                 value"
+            ),
+            "{err}"
         );
+        // The keys of the rows are shown up to their first floating-point value.
+        assert!(
+            err.contains("row 0: (1, 1.5, \"b\"), keys: (1.5, …)"),
+            "{err}"
+        );
+        let first_by_k_s = sorted_by(&far(), &["k", "s"], 0, Some(1));
+        let err = same_results(first, rows(&[(1, 1.5, "b")]), &first_by_k_s).unwrap_err();
+        assert!(
+            err.starts_with("row 0 of the pipeline engine is out of order"),
+            "{err}"
+        );
+
+        // Lists are compared element by element.
+        let lists = |lists: &[(i64, [f64; 2])]| {
+            let ids = Int64Array::from_iter_values(lists.iter().map(|list| list.0));
+            let values = lists
+                .iter()
+                .map(|list| Some(list.1.iter().copied().map(Some).collect::<Vec<_>>()));
+            vec![batch_of(vec![
+                ("id", Arc::new(ids) as ArrayRef),
+                (
+                    "l",
+                    Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(values)),
+                ),
+            ])]
+        };
+        let sorted = lists(&[(0, [1.0, 2.0]), (1, [close, 1.0])]);
+        let by_l = sorted_by(&sorted, &["l"], 0, None);
+        let reversed = lists(&[(1, [1.0, 1.0]), (0, [close, 2.0])]);
+        same_results(sorted.clone(), reversed, &by_l).unwrap();
+        let sorted = lists(&[(0, [1.0, 2.0]), (1, [1.5, 1.0])]);
+        let by_l = sorted_by(&sorted, &["l"], 0, None);
+        let reversed = lists(&[(1, [1.5, 1.0]), (0, [1.0, 2.0])]);
+        let err = same_results(sorted, reversed, &by_l).unwrap_err();
+        assert!(err.contains("keys: ([1.5], …)"), "{err}");
     }
 
     #[test]
@@ -5130,6 +5327,26 @@ mod tests {
             "SELECT id FROM m ORDER BY k1, k2 LIMIT 1 OFFSET 1",
             "SELECT id FROM m ORDER BY k1, k2 OFFSET 1",
             "SELECT id FROM m ORDER BY k1, k2",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_order_rows_lexicographically_within_the_tolerance()
+     {
+        // The values of `k` of the pipeline engine are the values of DataFusion
+        // swapped, within the tolerance: it orders the rows `[1, 0]` on `(k, s)`.
+        let close = 1.0 + 0.5e-9;
+        let setup = per_engine_tables(
+            id_k_s_batch(&[(0, 1.0, "a"), (1, close, "b")]),
+            id_k_s_batch(&[(0, close, "a"), (1, 1.0, "b")]),
+        );
+        for sql in [
+            "SELECT id, k, s FROM m ORDER BY k, s",
+            "SELECT id, k, s FROM m ORDER BY k, s LIMIT 1",
+            "SELECT id, s FROM m ORDER BY k, s",
+            "SELECT id FROM m ORDER BY k, s LIMIT 1",
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
