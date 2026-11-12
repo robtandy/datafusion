@@ -125,8 +125,8 @@ use parking_lot::Mutex;
 
 use super::merge_join::{
     EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
-    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, computed_key_bytes, evaluate_keys,
-    filter_mask, is_smaller, matchable_rows, probe_role, without_reordering,
+    PAIR_INDEX_BYTES, PART_BYTES, StoredRows, evaluate_keys, filter_mask, is_smaller,
+    key_memory, matchable_rows, probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -988,14 +988,14 @@ impl PhysicalSymmetricHashJoin {
         side: usize,
         batch: RecordBatch,
     ) -> Result<ChunkJoin> {
-        // The computed keys are reserved while they are encoded, and the
-        // encoded keys while the chunk is joined.
+        // The computed keys, and their encoding, are reserved before they are
+        // encoded (see `key_memory`), and the encoded keys while the chunk is
+        // joined.
         let arrays = evaluate_keys(self.spec.keys(side), &batch)?;
         let reservation = run.reservation.new_empty();
-        reservation.try_grow(computed_key_bytes(&arrays, &batch))?;
+        reservation.try_grow(key_memory(&arrays, &batch))?;
         let matchable = matchable_rows(&arrays, self.spec.null_equality);
         let keys = run.converter.convert_columns(&arrays)?;
-        reservation.try_grow(keys.size())?;
         drop(arrays);
         let matchable_bytes = matchable.as_ref().map_or(0, |nulls| nulls.buffer().len());
         reservation.try_resize(keys.size() + matchable_bytes)?;
@@ -1335,9 +1335,8 @@ impl PhysicalSymmetricHashJoin {
             // are looked up.
             let arrays = evaluate_keys(self.spec.keys(side), batch)?;
             let evaluated = reservation.new_empty();
-            evaluated.try_grow(computed_key_bytes(&arrays, batch))?;
+            evaluated.try_grow(key_memory(&arrays, batch))?;
             let keys = converter.convert_columns(&arrays)?;
-            evaluated.try_grow(keys.size())?;
             for row in 0..batch.num_rows() {
                 let key = keys.row(row);
                 let position = table.base + start + row;
@@ -1561,6 +1560,7 @@ pub(crate) mod tests {
     use arrow::array::UnionArray;
     use arrow::array::{
         Array, AsArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+        StringViewArray,
     };
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, TimeUnit, UnionFields, UnionMode};
@@ -3791,6 +3791,77 @@ pub(crate) mod tests {
         let root = lower(&join)?;
         let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
         assert_eq!(num_rows(&output.batches), 1024);
+        Ok(())
+    }
+
+    /// The rows `(id, k)` of the `side` input of the joins of shared views:
+    /// `rows` rows whose keys are the same string of 1 MiB, views of a single
+    /// buffer.
+    pub(crate) fn shared_view_rows(side: &str, rows: usize) -> RecordBatch {
+        let one = StringViewArray::from(vec!["v".repeat(1 << 20)]);
+        let keys =
+            arrow::compute::take(&one, &UInt32Array::from(vec![0; rows]), None).unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Utf8View, false),
+            ])),
+            vec![Arc::new(Int64Array::from_iter_values(0..rows as i64)), keys],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn encoded_keys_of_shared_views_are_reserved() -> Result<()> {
+        // 128 keys that are views of the same string of 1 MiB take 1 MiB as
+        // values, but 128 MiB encoded (the encoding copies the bytes of every
+        // view): the join reserves the encoding before it encodes them, so
+        // that it fails in a pool of 8 MiB, also against an empty input; 8
+        // such keys join in a pool of 64 MiB.
+        let plan = |rows: usize| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |batch: RecordBatch, empty: bool| {
+                let partition = BatchesPartition {
+                    schema: batch.schema(),
+                    batches: match empty {
+                        true => vec![],
+                        false => vec![batch.clone()],
+                    },
+                    forever: false,
+                };
+                Arc::new(
+                    StreamingTableExec::try_new(
+                        batch.schema(),
+                        vec![Arc::new(partition)],
+                        None,
+                        vec![],
+                        true,
+                        None,
+                    )
+                    .unwrap(),
+                ) as Arc<dyn ExecutionPlan>
+            };
+            symmetric_join(
+                stream(shared_view_rows("l", rows), false),
+                stream(shared_view_rows("r", 1), rows > 8),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+            )
+        };
+        let join = plan(128)?;
+        let root = lower(&join)?;
+        assert!(root.is::<PhysicalSymmetricHashJoin>());
+        let err = run_native(&root, join, limited_task_ctx(8 << 20)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        let join = plan(8)?;
+        let root = lower(&join)?;
+        let output = run_native(&root, join, limited_task_ctx(64 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 8);
         Ok(())
     }
 }
