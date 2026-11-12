@@ -38,15 +38,19 @@
 //!      returns from an order of all its rows in which a row is only out of
 //!      DataFusion's order relative to rows that it ties with. The keys are
 //!      compared in their order (lexicographically, also the elements of
-//!      lists and the fields of structs): rows tie if their `ORDER BY` keys
-//!      are equal up to their first floating-point value that may vary
-//!      within the tolerance, and these values are equal within twice the
-//!      tolerance, whatever their later keys. As the keys of each engine may
-//!      be off by the tolerance, either row may have the smaller value.
+//!      lists and the fields of structs), and the keys of each engine may be
+//!      off by the tolerance: another engine may have for a floating-point
+//!      value any value of its precision that is equal to it within the
+//!      tolerance. So rows tie if their `ORDER BY` keys are equal up to their
+//!      first floating-point value that may vary within the tolerance, and
+//!      the values that the engines may have for these values cross (either
+//!      may be smaller), whatever their later keys. If they only meet (they
+//!      may be equal, but neither smaller), the later keys decide.
 //!      Floating-point values that the tolerance does not let vary (zeros,
-//!      infinities and `NaN`s, or any value with a tolerance of `0`) are
-//!      compared like other values: rows that are equal on them are ordered
-//!      by their later keys. Ties are not transitive: rows that tie with a
+//!      infinities and `NaN`s, and any value whose neighbors are farther than
+//!      the tolerance, e.g. within a tolerance of `0`) are compared like other
+//!      values: rows that are equal on them are ordered by their later keys.
+//!      Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
 //!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
 //!      may be other rows that tie with them (with their multiplicities), as
@@ -2330,8 +2334,9 @@ fn compare_sorted(
         format!(
             "rows tie if their ORDER BY keys ({keys}) are equal up to their first \
              floating-point value that may vary within the tolerance (not a zero, an \
-             infinity or NaN), and these values are equal within twice the \
-             tolerance, whatever their later keys"
+             infinity or NaN), and either of these values may be the smaller one \
+             within the tolerance, whatever their later keys (if they may only be \
+             equal, their later keys decide)"
         )
     };
 
@@ -4475,6 +4480,154 @@ mod tests {
     }
 
     #[test]
+    fn intervals_of_floats_are_the_values_equal_within_the_tolerance() {
+        // The values around `value` of the precision, `steps` neighbors away.
+        let around = |value: f64, precision: Precision, steps: usize| {
+            let (mut up, mut down) = (vec![value], vec![]);
+            let (mut high, mut low) = (value, value);
+            for _ in 0..steps {
+                high = precision.neighbors(high)[0];
+                low = precision.neighbors(low)[1];
+                up.push(high);
+                down.push(low);
+            }
+            down.into_iter().rev().chain(up).collect::<Vec<_>>()
+        };
+        for (precision, values, tolerances) in [
+            (
+                Precision::Double,
+                vec![1.0, -1.0, 1.0f64.next_down(), 3.5e300, -1e-310],
+                vec![0.0, 8e-17, 1.5e-16, 3e-16, 1e-15],
+            ),
+            (Precision::Single, vec![1.0, -2.5], vec![4e-8, 6e-8, 2e-7]),
+            (Precision::Half, vec![1.0, -0.5], vec![4e-4, 1e-3, 3e-3]),
+        ] {
+            for (value, tolerance) in values.iter().copied().cartesian_product(tolerances)
+            {
+                let (low, high) = interval(value, precision, tolerance);
+                // The interval is exactly the values that are equal to `value`.
+                let equal = around(value, precision, 40)
+                    .into_iter()
+                    .filter(|&other| floats_equal(value, other, tolerance))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    (low, high),
+                    (equal[0], equal[equal.len() - 1]),
+                    "{value} {precision:?} {tolerance}"
+                );
+                // Values that cross, meet, or are apart, by brute force.
+                for other in around(value, precision, 12) {
+                    let others = around(other, precision, 40)
+                        .into_iter()
+                        .filter(|&x| floats_equal(other, x, tolerance))
+                        .collect::<Vec<_>>();
+                    let (smaller, larger) = if value <= other {
+                        (&equal, &others)
+                    } else {
+                        (&others, &equal)
+                    };
+                    let expected = if smaller.iter().any(|a| larger.iter().any(|b| b < a))
+                        || (value == other && equal.len() > 1)
+                    {
+                        Meeting::Cross
+                    } else if smaller.iter().any(|a| larger.contains(a)) {
+                        Meeting::Meet
+                    } else {
+                        Meeting::Apart
+                    };
+                    assert_eq!(
+                        meeting((value, precision), (other, precision), tolerance),
+                        expected,
+                        "{value} {other} {precision:?} {tolerance}"
+                    );
+                }
+            }
+        }
+        // Zeros of both signs are one value, which cannot vary below a
+        // tolerance of 1.
+        assert_eq!(interval(-0.0, Precision::Double, 1e-9), (0.0, 0.0));
+        let zeros = ((0.0, Precision::Double), (-0.0, Precision::Double));
+        assert_eq!(meeting(zeros.0, zeros.1, 1e-9), Meeting::Meet);
+        let nan = (f64::NAN, Precision::Double);
+        assert_eq!(meeting(nan, nan, 1e-9), Meeting::Meet);
+        assert_eq!(meeting(nan, (1.0, Precision::Double), 1.0), Meeting::Apart);
+        let infinity = (f64::INFINITY, Precision::Double);
+        assert_eq!(meeting(infinity, infinity, 1e-9), Meeting::Meet);
+        let max = (f64::MAX, Precision::Double);
+        assert_eq!(meeting(infinity, max, 1e-9), Meeting::Apart);
+    }
+
+    #[test]
+    fn precedence_follows_the_sort_options_of_the_keys() {
+        let options = |descending, nulls_first| SortOptions {
+            descending,
+            nulls_first,
+        };
+        let int = |value: i32| Value::Scalar(ScalarValue::Int32(Some(value)));
+        let float = |value: f64| Value::Float(value, Precision::Double);
+        let (ascending, descending) = (options(false, false), options(true, true));
+        let t = 1e-9;
+        for (later, earlier, sort, expected) in [
+            (int(1), int(2), ascending, Precedence::Before),
+            (int(1), int(2), descending, Precedence::After),
+            (int(2), int(2), ascending, Precedence::Equal),
+            (Value::Null, int(2), ascending, Precedence::After),
+            (
+                Value::Null,
+                int(2),
+                options(false, true),
+                Precedence::Before,
+            ),
+            (int(2), Value::Null, descending, Precedence::After),
+            (Value::Null, Value::Null, descending, Precedence::Equal),
+            // Close floats may be in either order, others not.
+            (float(1.0 + 1e-9), float(1.0), ascending, Precedence::Before),
+            (float(1.5), float(1.0), ascending, Precedence::After),
+            (float(1.0), float(1.5), descending, Precedence::After),
+            (float(0.0), float(-0.0), ascending, Precedence::Equal),
+            (float(f64::NAN), float(1.0), ascending, Precedence::After),
+            // Lists are compared element by element, then by their lengths.
+            (
+                Value::List(vec![int(1), int(3)]),
+                Value::List(vec![int(1), int(2)]),
+                ascending,
+                Precedence::After,
+            ),
+            (
+                Value::List(vec![int(1)]),
+                Value::List(vec![int(1), int(2)]),
+                ascending,
+                Precedence::Before,
+            ),
+            (
+                Value::List(vec![int(1)]),
+                Value::List(vec![int(1), int(2)]),
+                descending,
+                Precedence::After,
+            ),
+        ] {
+            assert_eq!(
+                precedence(&later, &earlier, sort, t),
+                expected,
+                "{later} {earlier} {sort:?}"
+            );
+        }
+        // The first key that is not equal decides; missing sort options are
+        // ascending with nulls last.
+        let row =
+            |values: &[i32]| values.iter().map(|&value| int(value)).collect::<Row>();
+        assert!(may_precede(&row(&[1, 1]), &row(&[1, 2]), &[], t));
+        assert!(!may_precede(&row(&[1, 3]), &row(&[1, 2]), &[], t));
+        assert!(may_precede(
+            &row(&[1, 3]),
+            &row(&[1, 2]),
+            &[ascending, descending],
+            t
+        ));
+        assert!(may_precede(&row(&[1, 2]), &row(&[1, 2]), &[], t));
+    }
+
+    #[test]
     fn floats_are_equal_within_a_relative_tolerance() {
         let tolerance = ComparisonOptions::DEFAULT_FLOAT_TOLERANCE;
         for (a, b) in [
@@ -4654,8 +4807,9 @@ mod tests {
                  DataFusion with its values may not be at its position (rows tie if \
                  their ORDER BY keys (k) are equal up to their first floating-point \
                  value that may vary within the tolerance (not a zero, an infinity or \
-                 NaN), and these values are equal within twice the tolerance, whatever \
-                 their later keys)"
+                 NaN), and either of these values may be the smaller one within the \
+                 tolerance, whatever their later keys (if they may only be equal, their \
+                 later keys decide))"
             ),
             "{err}"
         );
@@ -6308,6 +6462,100 @@ mod tests {
                 Arc::new(Int32Array::from_iter_values(rows.iter().map(|row| row.1))),
             ),
         ])
+    }
+
+    #[tokio::test]
+    async fn same_results_order_rows_by_later_keys_where_floats_only_meet() -> Result<()>
+    {
+        // Within `1.5e-16`, `1 - 2.2e-16` and `1` may only become equal (at
+        // `1 - 1.1e-16`), not cross: the later key `v` decides, in its order.
+        let fine = ComparisonOptions::default().with_float_tolerance(1.5e-16);
+        let (a, b) = (1.0f64.next_down().next_down(), 1.0);
+        let v = |values: &[i32]| {
+            vec![int_batch(
+                &values.iter().copied().map(Some).collect::<Vec<_>>(),
+            )]
+        };
+        for (rows, sql, expected, other, valid) in [
+            (
+                [(a, 1), (b, 2)],
+                "SELECT v FROM m ORDER BY k, v",
+                [1, 2],
+                [2, 1],
+                false,
+            ),
+            (
+                [(a, 2), (b, 1)],
+                "SELECT v FROM m ORDER BY k, v",
+                [2, 1],
+                [1, 2],
+                true,
+            ),
+            (
+                [(a, 1), (b, 2)],
+                "SELECT v FROM m ORDER BY k, v DESC",
+                [1, 2],
+                [2, 1],
+                true,
+            ),
+            (
+                [(a, 1), (b, 2)],
+                "SELECT v FROM m ORDER BY k DESC, v",
+                [2, 1],
+                [1, 2],
+                true,
+            ),
+            (
+                [(a, 2), (b, 1)],
+                "SELECT v FROM m ORDER BY k DESC, v",
+                [1, 2],
+                [2, 1],
+                false,
+            ),
+            // Without later keys, the rows may be equal.
+            (
+                [(a, 1), (b, 2)],
+                "SELECT v FROM m ORDER BY k",
+                [1, 2],
+                [2, 1],
+                true,
+            ),
+        ] {
+            let order = order_with(float_kv_batch(&rows, 0, 0.0), sql, &fine).await?;
+            same_results_with(v(&expected), v(&expected), &order, fine).unwrap();
+            let result = same_results_with(v(&expected), v(&other), &order, fine);
+            assert_eq!(result.is_ok(), valid, "{rows:?} {sql}: {result:?}");
+            if !valid {
+                let err = result.unwrap_err();
+                assert!(
+                    err.starts_with("row 0 of the pipeline engine is out of order"),
+                    "{sql}: {err}"
+                );
+            }
+            // Within the default tolerance, the values cross.
+            let order = order_of(float_kv_batch(&rows, 0, 0.0), sql).await?;
+            same_results(v(&expected), v(&other), &order).unwrap();
+        }
+        // The rows of `k = a` may be in either order, as `a` may vary, but only
+        // the one of `v = 3` may be after the row of `k = b`, which meets them.
+        let rows = [(a, 3), (a, 1), (b, 2)];
+        let order = order_with(
+            float_kv_batch(&rows, 0, 0.0),
+            "SELECT v FROM m ORDER BY k, v",
+            &fine,
+        )
+        .await?;
+        for (result, valid) in [
+            ([1, 3, 2], true),
+            ([3, 1, 2], true),
+            ([1, 2, 3], true),
+            ([2, 1, 3], false),
+            ([3, 2, 1], false),
+        ] {
+            let comparison = same_results_with(v(&[1, 3, 2]), v(&result), &order, fine);
+            assert_eq!(comparison.is_ok(), valid, "{result:?}: {comparison:?}");
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
