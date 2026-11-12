@@ -75,6 +75,16 @@
 //! DataFusion's own aggregations set, so that they return other values, or
 //! fail).
 //!
+//! Nor are the filters set that a node of the input reads within or below a
+//! node that limits its rows by their positions (a fetch or an offset): such
+//! a node keeps (or drops) the first rows of its input, which are other rows
+//! if a filter prunes some of them. E.g. DataFusion pushes its filters into
+//! the scans of `(SELECT x FROM a ORDER BY x LIMIT 10) UNION ALL (SELECT x
+//! FROM b ORDER BY x LIMIT 10)` over files sorted by `x`, which stop after
+//! their first 10 rows: the bound of a `MAX(x)` above them would make them
+//! skip their first rows and produce later ones. The native aggregation
+//! publishes no filter below such nodes either.
+//!
 //! As DataFusion's, the filters are only updated in sessions that push the
 //! dynamic filters of aggregations down
 //! (`datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown`).
@@ -110,6 +120,7 @@ use datafusion_physical_plan::execution_plan::{
 use datafusion_physical_plan::filter_pushdown::{
     ChildFilterPushdownResult, ChildPushdownResult, FilterPushdownPhase, PushedDown,
 };
+use datafusion_physical_plan::limit::GlobalLimitExec;
 use parking_lot::Mutex;
 
 use super::hash_aggregate::{TopK, TopKOrder, implementation_type};
@@ -183,8 +194,10 @@ impl AggregateFilter {
     /// input rows of an aggregation, produces, if they are DataFusion's
     /// filters of the bounds of its `MIN` and `MAX` aggregates that the
     /// native aggregation sets (see [`bounded_aggregates`]), unless a node of
-    /// the input reads them through other expressions than columns (see
-    /// [`reads_filters_through_expressions`]).
+    /// the input reads them where pruning rows could change the result (see
+    /// [`reads_filters_unsafely`]): DataFusion pushes them there too (e.g.
+    /// into scans with a limit), and its own aggregation then returns other
+    /// values.
     pub(crate) fn of_aggregate_exec(raw: &AggregateExec) -> Result<Option<Self>> {
         let Some(filters) = dynamic_filters(raw) else {
             return Ok(None);
@@ -199,7 +212,7 @@ impl AggregateFilter {
             .iter()
             .map(|filter| Arc::clone(filter) as Arc<dyn PhysicalExpr>)
             .collect::<Vec<_>>();
-        if reads_filters_through_expressions(raw.input(), &expression_ids(&produced)?)? {
+        if reads_filters_unsafely(raw.input(), &expression_ids(&produced)?)? {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -285,7 +298,9 @@ impl AggregateFilter {
         let Some(id) = filter.expression_id() else {
             return internal_err!("A dynamic filter has no expression id");
         };
-        if !plan_contains_expression_id(&input, id)? {
+        if !plan_contains_expression_id(&input, id)?
+            || reads_filters_unsafely(&input, &[id])?
+        {
             return Ok(None);
         }
         Ok(Some((
@@ -748,6 +763,56 @@ fn expression_ids(filters: &[Arc<dyn PhysicalExpr>]) -> Result<Vec<u64>> {
         })?;
     }
     Ok(ids)
+}
+
+/// Whether a node of `plan` reads one of the dynamic filters with the
+/// expression ids `ids` where the rows that the filters prune could change
+/// the result of the aggregation that sets them: through other expressions
+/// than columns (see [`reads_filters_through_expressions`]), or within or
+/// below a node that limits its rows by their positions (see
+/// [`reads_filters_below_limits`]).
+fn reads_filters_unsafely(plan: &Arc<dyn ExecutionPlan>, ids: &[u64]) -> Result<bool> {
+    Ok(reads_filters_through_expressions(plan, ids)?
+        || reads_filters_below_limits(plan, ids, false)?)
+}
+
+/// Whether a node of `plan` reads one of the dynamic filters with the
+/// expression ids `ids` within or below a node that limits its rows by their
+/// positions (`limited` if a node above `plan` does): a node with a fetch,
+/// e.g. a limit, a TopK, or a scan with a limit, which keeps the first rows of
+/// its input, or with an offset, which drops them. If a filter pruned some of
+/// these rows, the node would keep or drop others. E.g. the scans of
+/// `(SELECT x FROM a ORDER BY x LIMIT 10) UNION ALL (SELECT x FROM b ORDER BY
+/// x LIMIT 10)` over files sorted by `x` stop after their first 10 rows: with
+/// the bound of a `MAX(x)` above them, they would skip their first rows and
+/// produce later ones, and the `MAX` would be greater.
+fn reads_filters_below_limits(
+    plan: &Arc<dyn ExecutionPlan>,
+    ids: &[u64],
+    limited: bool,
+) -> Result<bool> {
+    let limited = limited || plan.fetch().is_some() || plan.is::<GlobalLimitExec>();
+    if limited {
+        let mut reads = false;
+        plan.apply_expressions(&mut |root| {
+            root.apply(|expr| {
+                if expr.expression_id().is_some_and(|id| ids.contains(&id)) {
+                    reads = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        if reads {
+            return Ok(true);
+        }
+    }
+    for child in plan.children() {
+        if reads_filters_below_limits(child, ids, limited)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a node of `plan` reads one of the dynamic filters with the
@@ -1707,6 +1772,132 @@ mod tests {
                     let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
                     let batches = collect(exec as _, ctx.task_ctx()).await?;
                     assert_eq!(values(&batches), expected, "tiny tables: {context}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn filters_are_not_read_below_limits() -> Result<()> {
+        // Tables `a` (`x` from 100 to 119) and `b` (`x` from 0 to 199,999) of
+        // Parquet files declared sorted by `x`, in row groups of 1,024 rows:
+        // DataFusion plans the `ORDER BY x LIMIT 10` of each as a scan with a
+        // limit of 10 rows, into which it pushes the dynamic filter of the
+        // `MAX(x)` above their union. Set to the bound of the rows of `a`, it
+        // would make the scan of `a` skip its first rows and produce later
+        // ones: `MAX(x)` was 119, as in DataFusion with its own filter, rather
+        // than 109, on 1 thread. The native aggregations leave DataFusion's
+        // filters that nodes read within or below limits `true`, and publish
+        // none there.
+        let dir = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let properties = ::parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(1_024))
+            .build();
+        for (table, values) in [("a", 100..120), ("b", 0..200_000)] {
+            let values = values.collect::<Vec<i64>>();
+            let batches = values
+                .chunks(8_192)
+                .map(|values| {
+                    let columns: Vec<ArrayRef> =
+                        vec![Arc::new(Int64Array::from(values.to_vec()))];
+                    RecordBatch::try_new(Arc::clone(&schema), columns)
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            write_parquet(
+                &dir.path().join(format!("{table}/data.parquet")),
+                Arc::clone(&schema),
+                &batches,
+                Some(properties.clone()),
+            )?;
+        }
+        let setup = async |ctx: &SessionContext| -> Result<()> {
+            for table in ["a", "b"] {
+                let path = dir.path().join(table);
+                let options = ParquetReadOptions::default().file_sort_order(vec![vec![
+                    datafusion::prelude::col("x").sort(true, false),
+                ]]);
+                ctx.register_parquet(
+                    table,
+                    path.to_str().expect("a UTF-8 path"),
+                    options,
+                )
+                .await?;
+            }
+            Ok(())
+        };
+        let union = "(SELECT x FROM a ORDER BY x LIMIT 10) \
+             UNION ALL (SELECT x FROM b ORDER BY x LIMIT 10)";
+        let with_offset = "(SELECT x FROM a ORDER BY x LIMIT 10 OFFSET 5) \
+             UNION ALL (SELECT x FROM b ORDER BY x LIMIT 10)";
+        let queries = [
+            (format!("SELECT MAX(x) FROM ({union})"), vec!["109"]),
+            (
+                format!("SELECT MIN(x), MAX(x) FROM ({union})"),
+                vec!["0", "109"],
+            ),
+            (format!("SELECT MAX(x) FROM ({with_offset})"), vec!["114"]),
+        ];
+        // The values of the only row of `batches`.
+        let row = |batches: &[RecordBatch]| {
+            let mut values = vec![];
+            for batch in batches {
+                for column in batch.columns() {
+                    for row in 0..column.len() {
+                        let value =
+                            ScalarValue::try_from_array(column, row).expect("a value");
+                        values.push(value.to_string());
+                    }
+                }
+            }
+            values
+        };
+        for (sql, expected) in &queries {
+            for threads in [1, 4] {
+                for filters in [true, false] {
+                    let mut config = with_pushdown_filters(
+                        test_session_config().with_target_partitions(threads),
+                        true,
+                    );
+                    config
+                        .options_mut()
+                        .optimizer
+                        .enable_aggregate_dynamic_filter_pushdown = filters;
+                    let context = format!(
+                        "{sql} on {threads} threads, aggregate filters: {filters}"
+                    );
+                    // DataFusion without the aggregate filters.
+                    if !filters {
+                        let ctx = datafusion_context(config.clone());
+                        setup(&ctx).await?;
+                        let batches = ctx.sql(sql).await?.collect().await?;
+                        assert_eq!(&row(&batches), expected, "DataFusion: {context}");
+                    }
+                    // Through the planner.
+                    let ctx = pipeline_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let Some(root) = plan.downcast_ref::<PipelineRootExec>() else {
+                        panic!("The pipeline engine did not plan {context}");
+                    };
+                    let tree = format_operator_tree(root.operator());
+                    assert!(
+                        native_filters(root.operator()).is_empty(),
+                        "{context}\n{tree}"
+                    );
+                    let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+                    assert_eq!(&row(&batches), expected, "planner: {context}\n{tree}");
+                    // Through the lowering of the tests, with tiny thread-local
+                    // tables.
+                    let ctx = datafusion_context(config.clone());
+                    setup(&ctx).await?;
+                    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+                    let root = lower_with_tiny_tables(&plan)?;
+                    assert!(native_filters(&root).is_empty(), "{context}");
+                    let exec = Arc::new(PipelineRootExec::try_new(root, plan)?);
+                    let batches = collect(exec as _, ctx.task_ctx()).await?;
+                    assert_eq!(&row(&batches), expected, "tiny tables: {context}");
                 }
             }
         }
