@@ -30,6 +30,7 @@
 //! | `NestedLoopJoinExec`                                                               | [`PhysicalNestedLoopJoin`]                         |
 //! | `CrossJoinExec`                                                                    | [`PhysicalCrossJoin`]                              |
 //! | `GlobalLimitExec`, `LocalLimitExec`, `CoalescePartitionsExec` with a fetch         | [`PhysicalLimit`]                                  |
+//! | `CoalesceBatchesExec` with a fetch, of a single partition                         | [`PhysicalLimit`]                                  |
 //! | `UnionExec`, `InterleaveExec`                                                      | [`PhysicalUnion`]                                  |
 //! | `PlaceholderRowExec`                                                               | [`PhysicalPlaceholderRow`]                         |
 //! | `FilterExec`                                                                       | [`PhysicalFilter`] in a [`CachingOperator`]        |
