@@ -231,7 +231,9 @@ use crate::operators::materialized_cte::{
     MaterializedCteScan, MaterializedCtes, PhysicalMaterializedCte,
     hoist_materialized_ctes,
 };
-use crate::operators::partial_sort::PhysicalPartialSort;
+use crate::operators::partial_sort::{
+    LimitedPartitions, PhysicalPartialSort, limited_partitions_of,
+};
 use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::piecewise_merge_join::nested_loop_join_of;
 use crate::operators::placeholder_row::PhysicalPlaceholderRow;
@@ -991,6 +993,10 @@ impl Lowering<'_> {
     /// lowered as the merge of the sort of every partition, with
     /// [`Self::try_lower_sort`], which does not lower the sorts of inputs that
     /// never end, nor by keys that the native sort orders otherwise.
+    ///
+    /// A merge of `PartialSortExec`s that keep the first rows of every
+    /// partition is lowered as the TopK of their input if it keeps at most
+    /// these rows, and not at all otherwise (see [`limited_partitions_of`]).
     fn try_lower_merge(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -998,8 +1004,17 @@ impl Lowering<'_> {
         let Some(merge) = plan.downcast_ref::<SortPreservingMergeExec>() else {
             return Ok(None);
         };
-        let sort = SortExec::new(merge.expr().clone(), Arc::clone(merge.input()))
-            .with_preserve_partitioning(true);
+        // The merge of partial sorts that keep the first rows of every
+        // partition, of at most these rows, is the TopK of their input.
+        let (input, ordering) = match limited_partitions_of(merge) {
+            Some(LimitedPartitions::FirstRows { input, ordering }) => {
+                (input, ordering.clone())
+            }
+            Some(LimitedPartitions::PartitionRows) => return Ok(None),
+            None => (merge.input(), merge.expr().clone()),
+        };
+        let sort =
+            SortExec::new(ordering, Arc::clone(input)).with_preserve_partitioning(true);
         let sorted: Arc<dyn ExecutionPlan> = Arc::new(
             SortPreservingMergeExec::new(merge.expr().clone(), Arc::new(sort))
                 .with_fetch(merge.fetch()),

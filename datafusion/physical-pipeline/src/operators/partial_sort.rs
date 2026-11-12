@@ -15,8 +15,9 @@ use datafusion_common::utils::evaluate_partition_ranges;
 use datafusion_common::{Result, internal_err};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_physical_expr::LexOrdering;
-use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::sorts::partial_sort::PartialSortExec;
+use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -38,7 +39,9 @@ use crate::operator::{
 /// `PartialSortExec` that preserves its partitioning), whose rows the pipeline
 /// engine does not keep apart, it sorts the runs of rows with the same prefix
 /// as they arrive: no native operator depends on the order of the rows of
-/// several partitions, which they partition, merge or sort themselves.
+/// several partitions, which they partition, merge or sort themselves. But a
+/// fetch of several partitions limits every partition, which it does not
+/// lower (see [`PhysicalPartialSort::try_lower`]).
 ///
 /// The memory of the rows that it buffers, and of the sorted rows that it
 /// did not emit yet, is reserved in the memory pool of the session.
@@ -78,6 +81,14 @@ impl PhysicalPartialSort {
     /// Lower a `PartialSortExec` to a [`PhysicalPartialSort`], whose input
     /// is `lower_input` of the input of the node. Returns `Ok(None)` for any
     /// other node, without calling `lower_input`.
+    ///
+    /// A `PartialSortExec` with a fetch of several partitions (that preserves
+    /// its partitioning) keeps the first `fetch` rows of every partition,
+    /// which the native partial sort, which does not keep the rows of the
+    /// partitions apart, does not: it is not lowered (`Ok(None)`). The merge
+    /// above it, if it keeps at most `fetch` rows, keeps the first rows of
+    /// all rows of its input, which a native TopK does (see
+    /// [`limited_partitions_of`]).
     pub fn try_lower<F>(
         plan: &Arc<dyn ExecutionPlan>,
         lower_input: F,
@@ -88,6 +99,9 @@ impl PhysicalPartialSort {
         let Some(sort) = plan.downcast_ref::<PartialSortExec>() else {
             return Ok(None);
         };
+        if limits_every_partition(sort) {
+            return Ok(None);
+        }
         let input = lower_input(sort.input())?;
         Self::try_new(
             input,
@@ -140,6 +154,52 @@ impl PhysicalPartialSort {
         let indices = lexsort_to_indices(&keys, limit)?;
         Ok(take_record_batch(&batch, &indices)?)
     }
+}
+
+/// Whether `sort` keeps the first rows of every partition of several
+/// partitions: it has a fetch, and its input several partitions.
+fn limits_every_partition(sort: &PartialSortExec) -> bool {
+    sort.fetch().is_some() && sort.input().output_partitioning().partition_count() > 1
+}
+
+/// The rows that a merge of a `PartialSortExec` keeps, if the partial sort
+/// keeps the first `fetch` rows of every partition of several partitions
+/// (which the native partial sort does not lower, see
+/// [`PhysicalPartialSort::try_lower`]).
+pub(crate) enum LimitedPartitions<'a> {
+    /// The merge keeps at most `fetch` rows: they are the first rows of all
+    /// rows of `input` (the input of the partial sort) by `ordering` (the
+    /// keys of the partial sort, of which the keys of the merge are a
+    /// prefix), as every partition keeps its first `fetch` rows, among which
+    /// are its rows among the first rows of all partitions.
+    FirstRows {
+        input: &'a Arc<dyn ExecutionPlan>,
+        ordering: &'a LexOrdering,
+    },
+    /// The merge keeps more rows (or all of them): they include rows after
+    /// the first `fetch` rows of all rows, which only the partitions decide.
+    PartitionRows,
+}
+
+/// The rows that `merge` keeps if it merges a `PartialSortExec` that keeps
+/// the first rows of every partition of several partitions, see
+/// [`LimitedPartitions`]; `None` if it merges anything else.
+pub(crate) fn limited_partitions_of(
+    merge: &SortPreservingMergeExec,
+) -> Option<LimitedPartitions<'_>> {
+    let sort = merge.input().downcast_ref::<PartialSortExec>()?;
+    if !limits_every_partition(sort) {
+        return None;
+    }
+    Some(match (merge.fetch(), sort.fetch()) {
+        (Some(merged), Some(sorted)) if merged <= sorted => {
+            LimitedPartitions::FirstRows {
+                input: sort.input(),
+                ordering: sort.expr(),
+            }
+        }
+        _ => LimitedPartitions::PartitionRows,
+    })
 }
 
 /// The state of the thread of a [`PhysicalPartialSort`].
@@ -348,11 +408,12 @@ mod tests {
 
     use crate::executor::Executor;
     use crate::operators::lowering_tests::{
-        assert_lowered, assert_resources_exhausted, count, lowered,
+        assert_lowered, assert_plan_lowered, assert_resources_exhausted, count, lowered,
         pipeline_context_with_memory_limit,
     };
     use crate::sources::MemoryScanSource;
     use crate::test_utils::{register_test_tables, test_session_config};
+    use datafusion_physical_plan::collect;
 
     /// Write `rows` rows sorted by `a` and `b` (in groups of about 37 rows
     /// with the same `a` and `b`), whose `c` and `d` are not sorted, to the
@@ -495,6 +556,97 @@ mod tests {
             )
             .await?;
             assert_eq!(rows(&output), input[..fetch.min(input.len())], "{fetch}");
+        }
+        Ok(())
+    }
+
+    /// The plan of a partial sort by `a` (the prefix) and `b`, keeping `fetch`
+    /// rows of every one of two partitions (each sorted by `a`), merged with
+    /// a fetch of `merge_fetch` if `merged`.
+    fn partitioned_partial_sort(
+        fetch: Option<usize>,
+        merged: bool,
+        merge_fetch: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = schema();
+        let a = PhysicalSortExpr::new_default(col("a", &schema).unwrap());
+        let b = PhysicalSortExpr::new_default(col("b", &schema).unwrap());
+        let partitions = vec![
+            vec![batch(vec![100, 100, 100, 101, 102], vec![3, 1, 2, 0, 7])],
+            vec![
+                batch(vec![0, 0, 0], vec![5, 1, 4]),
+                batch(vec![0, 1, 1], vec![2, 9, 8]),
+            ],
+        ];
+        let source = datafusion_datasource::memory::MemorySourceConfig::try_new(
+            &partitions,
+            Arc::clone(&schema),
+            None,
+        )
+        .unwrap()
+        .try_with_sort_information(vec![LexOrdering::new(vec![a.clone()]).unwrap()])
+        .unwrap();
+        let scan =
+            datafusion_datasource::source::DataSourceExec::from_data_source(source);
+        let ordering = LexOrdering::new(vec![a, b]).unwrap();
+        let sort: Arc<dyn ExecutionPlan> = Arc::new(
+            PartialSortExec::new(ordering.clone(), scan, 1)
+                .with_preserve_partitioning(true)
+                .with_fetch(fetch),
+        );
+        if !merged {
+            return sort;
+        }
+        Arc::new(SortPreservingMergeExec::new(ordering, sort).with_fetch(merge_fetch))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetches_of_several_partitions_limit_every_partition() -> Result<()> {
+        // Merged with a fetch of at most the fetch of the partial sorts: the
+        // first rows of the merge are the first rows of all rows, which a
+        // native TopK of the input of the partial sorts keeps.
+        for (fetch, merge_fetch) in [(1, 1), (2, 1), (2, 2), (5, 3), (20, 20)] {
+            let make_plan =
+                || partitioned_partial_sort(Some(fetch), true, Some(merge_fetch));
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert_eq!(count::<crate::sort::PhysicalTopK>(&root), 1, "{fetch}");
+            assert_eq!(count::<PhysicalPartialSort>(&root), 0, "{fetch}");
+        }
+        let ctx = crate::test_utils::datafusion_context(test_session_config());
+        let first = collect(
+            partitioned_partial_sort(Some(2), true, Some(1)),
+            ctx.task_ctx(),
+        )
+        .await?;
+        assert_eq!(rows(&first), vec![(0, 1)]);
+        // Without a fetch, the partial sort of several partitions is native,
+        // also below a merge.
+        for merged in [false, true] {
+            let make_plan = || partitioned_partial_sort(None, merged, None);
+            let root =
+                assert_plan_lowered(make_plan, test_session_config(), merged).await;
+            assert_eq!(count::<PhysicalPartialSort>(&root), 1, "{merged}");
+        }
+        // A partial sort with a fetch of several partitions keeps the first
+        // rows of every partition, which the native partial sort, which does
+        // not keep the rows of the partitions apart, does not: it is left to
+        // DataFusion, alone or below a merge that keeps more rows.
+        for plan in [
+            partitioned_partial_sort(Some(2), false, None),
+            partitioned_partial_sort(Some(2), true, None),
+            partitioned_partial_sort(Some(2), true, Some(3)),
+        ] {
+            let operator = crate::planner::lower_execution_plan_with_runtime(
+                &plan,
+                ctx.state().config_options(),
+                ctx.state().runtime_env(),
+            )?;
+            assert!(
+                operator.is::<crate::bridge::BridgeOperator>(),
+                "{}",
+                operator.name()
+            );
+            assert_eq!(count::<PhysicalPartialSort>(&operator), 0);
         }
         Ok(())
     }
