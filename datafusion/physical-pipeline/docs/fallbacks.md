@@ -29,40 +29,40 @@ schedules its tasks cooperatively).
 
 ### `datafusion/physical-plan`
 
-| `ExecutionPlan`                                            | Native operator                                                                                                                                    |
-| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `AggregateExec`                                            | `PhysicalHashAggregate` (with the stages of a two-stage aggregation)                                                                               |
-| `AnalyzeExec` (`EXPLAIN ANALYZE`)                          | `PhysicalAnalyze` (which runs the native plan of the query)                                                                                        |
-| `AsOfJoinExec` (`ASOF JOIN`)                               | stays in DataFusion, see [below](#nodes-that-stay-in-datafusion)                                                                                   |
-| `AsyncFuncExec` (async UDFs)                               | `PhysicalAsyncFunc`                                                                                                                                |
-| `BoundedWindowAggExec`, `WindowAggExec`                    | `PhysicalWindow` (with the sorts and repartitionings below them)                                                                                   |
-| `BufferExec`                                               | removed                                                                                                                                            |
-| `CoalesceBatchesExec`                                      | removed, or `PhysicalLimit` with a fetch of a single partition (of several, see [conditions](#conditions-in-which-native-operators-refuse-a-node)) |
-| `CoalescePartitionsExec`                                   | removed, or `PhysicalLimit` with a fetch                                                                                                           |
-| `CooperativeExec`                                          | removed                                                                                                                                            |
-| `CrossJoinExec`                                            | `PhysicalCrossJoin`                                                                                                                                |
-| `EmptyExec`                                                | `EmptyScanSource`                                                                                                                                  |
-| `ExplainExec` (`EXPLAIN`)                                  | `ExplainSource`                                                                                                                                    |
-| `FilterExec`                                               | `PhysicalFilter` (in a `CachingOperator`)                                                                                                          |
-| `GlobalLimitExec`, `LocalLimitExec`                        | `PhysicalLimit`                                                                                                                                    |
-| `HashJoinExec`                                             | `PhysicalHashJoin`                                                                                                                                 |
-| `LazyMemoryExec` (`generate_series`, `range`)              | `LazyMemorySource`                                                                                                                                 |
-| `MaterializedCteExec`, `MaterializedCteScanExec`           | `PhysicalMaterializedCte`, `MaterializedCteBody`, `MaterializedCteScan`                                                                            |
-| `NestedLoopJoinExec`                                       | `PhysicalNestedLoopJoin`                                                                                                                           |
-| `PartialSortExec`                                          | `PhysicalPartialSort`                                                                                                                              |
-| `PartitionedTopKExec`                                      | `PhysicalPartitionedTopK` over a `PhysicalSort`                                                                                                    |
-| `PiecewiseMergeJoinExec`                                   | `PhysicalNestedLoopJoin` (the join of its range predicate)                                                                                         |
-| `PlaceholderRowExec`                                       | `PhysicalPlaceholderRow`                                                                                                                           |
-| `ProjectionExec`                                           | `PhysicalProjection`                                                                                                                               |
-| `RecursiveQueryExec`, `WorkTableExec`                      | not yet: native recursive queries are [#61](https://github.com/robtandy/datafusion/issues/61)                                                      |
-| `RepartitionExec`                                          | removed (by round robin, by hash or by range, and preserving the order of several partitions)                                                      |
-| `ScalarSubqueryExec`                                       | `PhysicalScalarSubquery`                                                                                                                           |
-| `SortExec`                                                 | `PhysicalSort`, or `PhysicalTopK` with a fetch                                                                                                     |
-| `SortMergeJoinExec`, `SymmetricHashJoinExec`               | not yet: native merge and symmetric joins are [#60](https://github.com/robtandy/datafusion/issues/60)                                              |
-| `SortPreservingMergeExec`                                  | `PhysicalSort` or `PhysicalTopK` of the merged partitions (a merge of sorted rows is their sort)                                                   |
-| `StreamingTableExec` (`information_schema`, `StreamTable`) | `StreamingTableSource`                                                                                                                             |
-| `UnionExec`, `InterleaveExec`                              | `PhysicalUnion`                                                                                                                                    |
-| `UnnestExec`                                               | `PhysicalUnnest`                                                                                                                                   |
+| `ExecutionPlan`                                            | Native operator                                                                                                                                                                                                |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AggregateExec`                                            | `PhysicalHashAggregate` (with the stages of a two-stage aggregation)                                                                                                                                           |
+| `AnalyzeExec` (`EXPLAIN ANALYZE`)                          | `PhysicalAnalyze` (which runs the native plan of the query)                                                                                                                                                    |
+| `AsOfJoinExec` (`ASOF JOIN`)                               | `PhysicalAsOfJoin` (the right rows sorted by their keys and match values, which every left row finds by a binary search)                                                                                       |
+| `AsyncFuncExec` (async UDFs)                               | `PhysicalAsyncFunc`                                                                                                                                                                                            |
+| `BoundedWindowAggExec`, `WindowAggExec`                    | `PhysicalWindow` (with the sorts and repartitionings below them)                                                                                                                                               |
+| `BufferExec`                                               | removed                                                                                                                                                                                                        |
+| `CoalesceBatchesExec`                                      | removed, or `PhysicalLimit` with a fetch of a single partition (of several, see [conditions](#conditions-in-which-native-operators-refuse-a-node))                                                             |
+| `CoalescePartitionsExec`                                   | removed, or `PhysicalLimit` with a fetch                                                                                                                                                                       |
+| `CooperativeExec`                                          | removed                                                                                                                                                                                                        |
+| `CrossJoinExec`                                            | `PhysicalCrossJoin`                                                                                                                                                                                            |
+| `EmptyExec`                                                | `EmptyScanSource`                                                                                                                                                                                              |
+| `ExplainExec` (`EXPLAIN`)                                  | `ExplainSource`                                                                                                                                                                                                |
+| `FilterExec`                                               | `PhysicalFilter` (in a `CachingOperator`)                                                                                                                                                                      |
+| `GlobalLimitExec`, `LocalLimitExec`                        | `PhysicalLimit`                                                                                                                                                                                                |
+| `HashJoinExec`                                             | `PhysicalHashJoin`                                                                                                                                                                                             |
+| `LazyMemoryExec` (`generate_series`, `range`)              | `LazyMemorySource`                                                                                                                                                                                             |
+| `MaterializedCteExec`, `MaterializedCteScanExec`           | `PhysicalMaterializedCte`, `MaterializedCteBody`, `MaterializedCteScan`                                                                                                                                        |
+| `NestedLoopJoinExec`                                       | `PhysicalNestedLoopJoin`                                                                                                                                                                                       |
+| `PartialSortExec`                                          | `PhysicalPartialSort` (with a fetch of several partitions, one for every partition, in a `PhysicalUnion`; of an input of several pipelines, a `PhysicalSort` or a `PhysicalTopK`, see [below](#partial-sorts)) |
+| `PartitionedTopKExec`                                      | `PhysicalPartitionedTopK` over a `PhysicalSort`                                                                                                                                                                |
+| `PiecewiseMergeJoinExec`                                   | `PhysicalNestedLoopJoin` (the join of its range predicate)                                                                                                                                                     |
+| `PlaceholderRowExec`                                       | `PhysicalPlaceholderRow`                                                                                                                                                                                       |
+| `ProjectionExec`                                           | `PhysicalProjection`                                                                                                                                                                                           |
+| `RecursiveQueryExec`, `WorkTableExec`                      | `PhysicalRecursiveCte`, `WorkTableScanSource` ([#61](https://github.com/robtandy/datafusion/issues/61))                                                                                                        |
+| `RepartitionExec`                                          | removed (by round robin, by hash or by range, and preserving the order of several partitions)                                                                                                                  |
+| `ScalarSubqueryExec`                                       | `PhysicalScalarSubquery`                                                                                                                                                                                       |
+| `SortExec`                                                 | `PhysicalSort`, or `PhysicalTopK` with a fetch                                                                                                                                                                 |
+| `SortMergeJoinExec`, `SymmetricHashJoinExec`               | not yet: native merge and symmetric joins are [#60](https://github.com/robtandy/datafusion/issues/60)                                                                                                          |
+| `SortPreservingMergeExec`                                  | `PhysicalSort` or `PhysicalTopK` of the merged partitions (a merge of sorted rows is their sort)                                                                                                               |
+| `StreamingTableExec` (`information_schema`, `StreamTable`) | `StreamingTableSource`                                                                                                                                                                                         |
+| `UnionExec`, `InterleaveExec`                              | `PhysicalUnion`                                                                                                                                                                                                |
+| `UnnestExec`                                               | `PhysicalUnnest`                                                                                                                                                                                               |
 
 The test plans of `datafusion_physical_plan::test` (`MockExec`, `BarrierExec`,
 `ErrorExec`, `StatisticsExec`, `BlockingExec`, `PanicExec`, `TestMemoryExec`)
@@ -70,25 +70,26 @@ and of the tests of the crate are user-defined plans to the planner.
 
 ### `datafusion/datasource*`
 
-| `ExecutionPlan`                            | Native operator                                                                                                                               |
-| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DataSourceExec` of a `MemorySourceConfig` | `MemoryScanSource`                                                                                                                            |
-| `DataSourceExec` of Parquet files          | `ParquetScanSource`                                                                                                                           |
-| `DataSourceExec` of CSV files              | `CsvScanSource`                                                                                                                               |
-| `DataSourceExec` of other files            | `FileScanSource`: JSON (newline-delimited and arrays), Avro, Arrow IPC (files and streams), and any other `FileSource`, with its `Morselizer` |
-| `DataSourceExec` of another `DataSource`   | stays in DataFusion: a user-defined `DataSource`                                                                                              |
-| `DataSinkExec` (`INSERT`, `COPY TO`)       | `PhysicalDataSink`, which writes with the `DataSink` of the node                                                                              |
+| `ExecutionPlan`                                                       | Native operator                                                                                                                               |
+| --------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DataSourceExec` of a `MemorySourceConfig`                            | `MemoryScanSource`                                                                                                                            |
+| `DataSourceExec` of Parquet files                                     | `ParquetScanSource`                                                                                                                           |
+| `DataSourceExec` of CSV files                                         | `CsvScanSource`                                                                                                                               |
+| `DataSourceExec` of other files                                       | `FileScanSource`: JSON (newline-delimited and arrays), Avro, Arrow IPC (files and streams), and any other `FileSource`, with its `Morselizer` |
+| `DataSourceExec` of another `DataSource`                              | stays in DataFusion: a user-defined `DataSource`                                                                                              |
+| `DataSinkExec` (`INSERT`, `COPY TO`)                                  | `PhysicalDataSink`, which writes with the `DataSink` of the node                                                                              |
+| `MemDeleteExec`, `MemUpdateExec` (`DELETE`, `UPDATE` of a `MemTable`) | `MemoryDmlSource`, which changes the partitions of the table under their locks, as these nodes do                                             |
 
 The crates `datafusion-datasource-{arrow,avro,csv,json,parquet}` implement
 `FileSource`s and `DataSink`s, but no `ExecutionPlan`.
 
 ### `datafusion/catalog*`
 
-| `ExecutionPlan`                                                       | Native operator                                                 |
-| --------------------------------------------------------------------- | --------------------------------------------------------------- |
-| `MemDeleteExec`, `MemUpdateExec` (`DELETE`, `UPDATE` of a `MemTable`) | stay in DataFusion, see [below](#nodes-that-stay-in-datafusion) |
-
-`datafusion-catalog-listing` implements no `ExecutionPlan`: its tables are
+`datafusion-catalog` implements no `ExecutionPlan`: the `DELETE` and `UPDATE`
+of a `MemTable` are the `MemDeleteExec` and `MemUpdateExec` of
+`datafusion-datasource` (next to the `MemSink` of its `INSERT`), which expose
+the partitions, predicates and `SET` expressions that they apply.
+`datafusion-catalog-listing` implements no `ExecutionPlan` either: its tables are
 scanned by `DataSourceExec`s and written by `DataSinkExec`s. The
 `information_schema` tables and the `StreamTable`s of `datafusion-catalog` are
 `StreamingTableExec`s.
@@ -105,26 +106,16 @@ user-defined plans to the pipeline engine.
 - **User-defined `ExecutionPlan`s** (e.g. of extension nodes, or of
   `TableProvider`s), and `DataSourceExec`s of user-defined `DataSource`s, with
   their subtrees: they are the user's own code.
-- **The nodes of [#60](https://github.com/robtandy/datafusion/issues/60) and
-  [#61](https://github.com/robtandy/datafusion/issues/61)**, until these issues
-  lower them: `SortMergeJoinExec`, `SymmetricHashJoinExec`, `RecursiveQueryExec`
-  and `WorkTableExec`.
-- **Nodes that do not expose what they compute.** Their definitions are
-  private to their crates, so that no other crate can implement them:
-
-  - `AsOfJoinExec` has no accessors for its equality keys, its match
-    condition (its comparison operator) and its projection;
-  - `MemDeleteExec` and `MemUpdateExec` are private types of
-    `datafusion-catalog`, as are the partitions of the `MemTable` that they
-    change.
-
-  Lowering them takes accessors in their crates (`AsOfJoinExec::on`,
-  `AsOfJoinExec::match_condition` and `AsOfJoinExec::projection`, and public
-  `MemDeleteExec` and `MemUpdateExec`).
+- **The nodes of [#60](https://github.com/robtandy/datafusion/issues/60)**,
+  until it lowers them: `SortMergeJoinExec` and `SymmetricHashJoinExec`.
 
 - A `MaterializedCteExec` one of whose scans stays in DataFusion (e.g. below
   a user-defined node): DataFusion runs the body of a CTE for such a scan,
   so the CTE stays in DataFusion, which runs its body once, for all scans.
+  So does a `MaterializedCteExec` that the recursive term of a recursive
+  query in its continuation scans: every iteration of a native recursive
+  query lowers its recursive term again, apart from the CTEs around it, and
+  leaves their scans to DataFusion.
 
 ## Conditions in which native operators refuse a node
 
@@ -149,12 +140,32 @@ accounting of all native operators):
 - `LocalLimitExec`s of several partitions (and `CoalesceBatchesExec`s with a
   fetch, which DataFusion does not plan any more, of several partitions) that
   a merge with a fetch does not make redundant: they limit every partition;
-- `PartialSortExec`s with a fetch of several partitions, which keep the first
-  rows of every partition, unless a merge above them keeps at most these rows
-  (the merge is then the native TopK of their input);
 - the sorts, windows, aggregations and joins of values that address more than
   their memory, and the filters and projections of rows that the native
   operators cannot gather (see the module documentation of `planner.rs`).
+
+## Partial sorts
+
+A `PhysicalPartialSort` sorts the rows of its input as a single thread
+receives them, in a single pipeline:
+
+- A `PartialSortExec` with a fetch of several partitions keeps the first rows
+  of every partition: it is lowered as the `PhysicalUnion` of a
+  `PhysicalPartialSort` of every partition, with the fetch, of the plans of
+  the partitions of its input. These are the partitions of scans of in-memory
+  batches and of files (a plan for every partition, or for every file group),
+  and of the unions, projections, filters, `LocalLimitExec`s and
+  `CoalesceBatchesExec`s above them. The partitions of other inputs (e.g. of
+  a `RepartitionExec`) depend on how DataFusion distributes their rows: the
+  pipeline engine does not keep them apart, and its partial sort keeps the
+  first rows of all of them. A merge above that keeps at most the rows of
+  every partition is the native TopK of the input of the partial sorts.
+- The rows of an input that runs in several pipelines (e.g. of a union below
+  a `CoalescePartitionsExec`) would reach several states of the partial
+  sort: such an input is sorted by a `PhysicalSort` (or a `PhysicalTopK` with
+  the fetch) instead. DataFusion orders the interleaved partitions of such an
+  input by a prefix only if all its rows have the same prefix, which makes
+  the partial sort a sort.
 
 ## Memory
 
@@ -165,6 +176,11 @@ runs out (they do not spill):
 - the sources (`LazyMemorySource`, `StreamingTableSource`, `ExplainSource`
   and `FileScanSource`) reserve the batch that a thread emits, and
   `PhysicalAnalyze` holds no rows (it counts the rows of its plan);
+- `PhysicalAsOfJoin` reserves the rows of its right input, their keys (in the
+  row format) and match values as they arrive, and their concatenations and
+  order before it allocates them; `MemoryDmlSource` reserves the rows that
+  replace those of a partition until they replace them (the table then holds
+  them);
 - `PhysicalAsyncFunc` reserves the rows of the chunk it evaluates, and an
   estimate of their results before it evaluates them; `PhysicalUnnest`
   reserves the indices that it takes the rows of an unnest with, and an
@@ -176,4 +192,7 @@ runs out (they do not spill):
 - `MaterializedCteBody` reserves the rows of the body of a CTE until the
   execution ends;
 - `PhysicalPartitionedTopK` holds no rows (the `PhysicalSort` below it does,
-  which, like the other native sorts, does not reserve its memory yet).
+  which, like the other native sorts, does not reserve its memory yet), but
+  reserves the keys of the last row it ranked, and, before it allocates them,
+  an estimate of the keys of a chunk in the row format, the indices and ranks
+  of the rows that it keeps and these rows.
