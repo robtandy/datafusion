@@ -24,12 +24,15 @@
 //!
 //! The nodes below the join that only distribute its rows over partitions
 //! (its partition mode) are removed: the native joins read all rows of both
-//! inputs, on all threads.
+//! inputs, on all threads. A symmetric join whose inputs are sorted by
+//! expressions of its filter (see below) reads each input in its order
+//! instead: a `SortPreservingMergeExec` merges the sorted partitions of an
+//! input that has several.
 //!
 //! # `PhysicalSymmetricHashJoin`
 //!
 //! The join is the source of its pipeline. Its inputs are executed by
-//! executors of their own (see [`NestedInput`]), on the threads of the
+//! executors of their own (see `NestedInput`), on the threads of the
 //! session, and the join reads both of them at the same time, as their rows
 //! come, whatever the operators above it (also those that are not parallel,
 //! e.g. a filter with a fetch, whose pipelines the executor runs one after the
@@ -48,38 +51,69 @@
 //!   the residual filter). So every pair of rows is joined exactly once, when
 //!   the later of the two arrives, whatever the order in which the rows of the
 //!   two inputs arrive. A chunk is joined in parts of at most
-//!   [`DEFAULT_VECTOR_SIZE`] candidate pairs, each of which is emitted at once
-//!   (the pairs that pass the filter, and the rows of a semi join when they
-//!   match for the first time): the join never buffers more than a chunk of
-//!   candidates, however many rows a row matches, and a limit above it stops
-//!   it after the rows it needs.
-//! * Once both inputs ended (for `Left`, `Right`, `Full`, anti and mark
-//!   joins), the join emits the rows that never matched (with NULLs for the
-//!   other input), or every row of its input with its mark.
+//!   [`DEFAULT_VECTOR_SIZE`] candidate pairs and about a MiB of the rows that
+//!   the join gathers for them, for its filter and its output (fewer pairs of
+//!   wide rows): the join reserves the bytes of these rows (those of their
+//!   strings, too) in the memory pool before it gathers them, and emits every
+//!   part at once (the pairs that pass the filter, and the rows of a semi
+//!   join when they match for the first time): the join never buffers more
+//!   than a part of candidates, however many rows a row matches, and a limit
+//!   above it stops it after the rows it needs.
+//! * A row is *determined* once no row of the other input still to come can
+//!   match it: the join emits its final row then (for `Left`, `Right`, `Full`,
+//!   anti and mark joins: the row without a match, with NULLs for the other
+//!   input, or the row with its mark), and drops it from its table, releasing
+//!   its memory. The rows of an input are determined once the other input
+//!   ended, and, if both inputs are sorted by expressions of the filter (e.g.
+//!   by times, with a filter `l.time > r.time`), as soon as the bounds of the
+//!   values still to come rule them out: like DataFusion's interval pruning,
+//!   the join derives from the last sorted value of either input (the values
+//!   of its rows still to come are not before it) the interval of the sorted
+//!   values of the other input that can still match, with the interval
+//!   arithmetic of the filter (see [`ExprIntervalGraph`]; it supports
+//!   comparisons, `AND`, and the arithmetic that cannot overflow: not that of
+//!   integers, which wraps). The rows of the other input before that interval
+//!   (they arrived sorted) are determined.
+//!   The join does so after every chunk of either input (DataFusion's join
+//!   after the chunks of the other input only), so that the rows of an input
+//!   whose chunks come after those of the other input are determined, too,
+//!   and it reads such inputs alternately (it reads no more than
+//!   `MAX_CHUNKS_AHEAD` chunks of either ahead of the other, as DataFusion's
+//!   join), so that the rows that wait for the other input are few.
+//!   So a limit above an outer, anti or mark join of streams that never end
+//!   ends the query, and a join of sorted streams keeps the rows that can
+//!   still match only.
 //!
-//! The tables keep all rows of both inputs, and reserve their memory in the
-//! memory pool of the session: the join fails with `ResourcesExhausted` when
-//! the pool refuses them. Unlike DataFusion's, the native join does not prune
-//! the rows that the filter of a join of sorted inputs rules out for the rows
-//! still to come (DataFusion's interval pruning): it emits the rows without a
-//! match once its inputs end, not when they are pruned. Join keys are equal
-//! with DataFusion's join key equality: `-0.0 = +0.0`, NaNs with the same bits
-//! are equal, and NULLs are equal only with [`NullEquality::NullEqualsNull`].
+//! The tables reserve their memory in the memory pool of the session: the
+//! join fails with `ResourcesExhausted` when the pool refuses them. Join keys
+//! are equal with DataFusion's join key equality: `-0.0 = +0.0`, NaNs with the
+//! same bits are equal, and NULLs are equal only with
+//! [`NullEquality::NullEqualsNull`].
 //!
 //! [`PhysicalHashJoin`]: crate::join::PhysicalHashJoin
 
+use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::task::Poll;
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array};
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow_row::{RowConverter, Rows, SortField};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow_row::{OwnedRow, Row, RowConverter, Rows, SortField};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
-    DataFusionError, JoinSide, JoinType, NullEquality, Result, internal_err, plan_err,
+    DataFusionError, JoinSide, JoinType, NullEquality, Result, ScalarValue, internal_err,
+    plan_err,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_expr::interval_arithmetic::Interval;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::intervals::cp_solver::{
+    ExprIntervalGraph, PropagationResult,
+};
+use datafusion_physical_expr::intervals::utils::check_support;
+use datafusion_physical_expr::{LexOrdering, PhysicalExprRef, PhysicalSortExpr};
 use datafusion_physical_plan::joins::SymmetricHashJoinExec;
 use datafusion_physical_plan::joins::utils::JoinFilter;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
@@ -87,8 +121,9 @@ use hashbrown::HashMap;
 use parking_lot::Mutex;
 
 use super::merge_join::{
-    EquiJoin, InputRole, JoinOutput, JoinRows, NestedInput, StoredRows, evaluate_keys,
-    filter_mask, is_smaller, matchable_rows, probe_role, without_reordering,
+    EquiJoin, FILTER, GatherWidths, InputRole, JoinOutput, JoinRows, NestedInput, OUTPUT,
+    StoredRows, evaluate_keys, filter_mask, is_smaller, matchable_rows, ordered_plan,
+    probe_role, without_reordering,
 };
 use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
@@ -137,7 +172,14 @@ where
     let unbounded =
         [join.left(), join.right()].map(|input| input.boundedness().is_unbounded());
     if unbounded == [true, true] {
-        return lower_symmetric(&equi_join, &mut lower_input);
+        let sorted = match (join.left_sort_exprs(), join.right_sort_exprs()) {
+            (Some(left), Some(right)) => Some(SortedInputs {
+                inputs: [join.left(), join.right()],
+                orders: [left, right],
+            }),
+            _ => None,
+        };
+        return lower_symmetric(&equi_join, sorted, &mut lower_input);
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
@@ -166,22 +208,46 @@ where
     })))
 }
 
+/// The inputs of a symmetric join (as its plan has them), whose rows are
+/// sorted, and their orders.
+pub(crate) struct SortedInputs<'a> {
+    pub(crate) inputs: [&'a Arc<dyn ExecutionPlan>; 2],
+    pub(crate) orders: [&'a LexOrdering; 2],
+}
+
 /// Lower `join`, a join of two inputs that never end, to a
 /// [`PhysicalSymmetricHashJoin`] of its inputs, lowered with `lower_input`
-/// as streams. `Ok(None)` if the symmetric join does not implement it (see
-/// [`try_lower`]).
+/// as streams. If the inputs are `sorted` by expressions of the filter of the
+/// join, the join reads them in their orders, and determines their rows by
+/// the bounds of the values still to come (see the [module
+/// documentation](self)). `Ok(None)` if the symmetric join does not implement
+/// it (see [`try_lower`]).
 pub(crate) fn lower_symmetric<F>(
     join: &EquiJoin<'_>,
+    sorted: Option<SortedInputs<'_>>,
     lower_input: &mut F,
 ) -> Result<Option<Arc<dyn PhysicalOperator>>>
 where
     F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
-    let Some(spec) = SymmetricJoinSpec::of(join)? else {
+    let Some(mut spec) = SymmetricJoinSpec::of(join)? else {
         return Ok(None);
     };
+    let mut inputs = [Arc::clone(join.left), Arc::clone(join.right)];
+    if let Some(sorted) = sorted
+        && let Some(sorted_filter) = SortedFilter::try_new(
+            join.filter,
+            [&join.left.schema(), &join.right.schema()],
+            sorted.orders,
+        )?
+        && let Some(left) = ordered_plan(sorted.inputs[0])?
+        && let Some(right) = ordered_plan(sorted.inputs[1])?
+    {
+        inputs = [left, right];
+        spec.sorted_filter = Some(sorted_filter);
+    }
     let mut children = Vec::with_capacity(2);
-    for input in [join.left, join.right] {
+    for input in &inputs {
         let lowered = lower_input(input, InputRole::Streamed)?;
         if lowered.schema() != input.schema() {
             return internal_err!(
@@ -208,6 +274,7 @@ pub struct PhysicalSymmetricHashJoin {
     children: Vec<Arc<dyn PhysicalOperator>>,
     spec: SymmetricJoinSpec,
 }
+
 /// Everything about a symmetric hash join that does not depend on its
 /// inputs, only on their schemas.
 #[derive(Debug)]
@@ -220,6 +287,12 @@ struct SymmetricJoinSpec {
     /// The fields of the keys in the row format, in which equal keys have
     /// equal bytes.
     key_fields: Vec<SortField>,
+    /// The bytes that gathering the rows of the left and of the right input
+    /// takes, for the filter and the output.
+    widths: [GatherWidths; 2],
+    /// If the inputs are read sorted by expressions of the filter: how the
+    /// join determines their rows by the bounds of the values still to come.
+    sorted_filter: Option<SortedFilter>,
 }
 
 impl SymmetricJoinSpec {
@@ -266,12 +339,29 @@ impl SymmetricJoinSpec {
                 column.side
             );
         }
+        let output = JoinOutput::try_new(left, right, join_type, projection)?;
+        let widths =
+            [(JoinSide::Left, left), (JoinSide::Right, right)].map(|(side, schema)| {
+                let filter_columns = filter
+                    .iter()
+                    .flat_map(|filter| filter.column_indices())
+                    .filter(|column| column.side == side)
+                    .map(|column| column.index);
+                let output_columns = output
+                    .column_indices
+                    .iter()
+                    .filter(|column| column.side == side)
+                    .map(|column| column.index);
+                GatherWidths::new(schema, filter_columns, output_columns)
+            });
         Ok(Self {
-            output: JoinOutput::try_new(left, right, join_type, projection)?,
+            output,
             on,
             filter,
             null_equality,
             key_fields,
+            widths,
+            sorted_filter: None,
         })
     }
 
@@ -321,9 +411,9 @@ impl SymmetricJoinSpec {
         })
     }
 
-    /// Whether the join emits the rows of input `side` once both inputs
-    /// ended: those without a match (outer and anti joins), or all of them
-    /// with their mark (mark joins).
+    /// Whether the join emits the rows of input `side` once they are
+    /// determined: those without a match (outer and anti joins), or all of
+    /// them with their mark (mark joins).
     fn emits_final_rows(&self, side: usize) -> bool {
         matches!(
             (self.join_type(), side),
@@ -358,27 +448,224 @@ impl SymmetricJoinSpec {
     }
 }
 
-/// The rows of one input of a symmetric hash join, and their hash table.
+/// How a symmetric join of inputs sorted by expressions of its filter
+/// determines their rows (see the [module documentation](self)), as
+/// DataFusion's `SymmetricHashJoinExec` prunes them: the interval graph of
+/// the filter, in which the first expression of the order of either input is
+/// a leaf.
+#[derive(Debug, Clone)]
+struct SortedFilter {
+    graph: ExprIntervalGraph,
+    /// The first expression of the order of the left and of the right input.
+    sides: [SortedExpr; 2],
+}
+
+/// The first expression of the order of an input of a symmetric join, see
+/// [`SortedFilter`].
+#[derive(Debug, Clone)]
+struct SortedExpr {
+    /// The expression, over the columns of the input, and its order.
+    order: PhysicalSortExpr,
+    /// The node of the expression, over the columns of the filter, in the
+    /// interval graph of the filter.
+    node: usize,
+    /// The type of its values.
+    data_type: DataType,
+}
+
+impl SortedFilter {
+    /// The determination of the rows of a join with the filter `filter`, of
+    /// inputs with the schemas `schemas` sorted by `orders`: `None` without a
+    /// filter, if interval arithmetic does not support the filter (see
+    /// [`check_support`]), or if the first expression of either order is not
+    /// an expression of the filter.
+    fn try_new(
+        filter: Option<&JoinFilter>,
+        schemas: [&SchemaRef; 2],
+        orders: [&LexOrdering; 2],
+    ) -> Result<Option<Self>> {
+        let Some(filter) = filter else {
+            return Ok(None);
+        };
+        if !check_support(filter.expression(), filter.schema()) {
+            return Ok(None);
+        }
+        let mut exprs = Vec::with_capacity(2);
+        for (side, (schema, order)) in [JoinSide::Left, JoinSide::Right]
+            .into_iter()
+            .zip(schemas.into_iter().zip(orders))
+        {
+            let order = order.first();
+            let Some(expr) = filter_expression(filter, side, &order.expr)? else {
+                return Ok(None);
+            };
+            exprs.push((order.clone(), order.expr.data_type(schema)?, expr));
+        }
+        let Ok(mut graph) =
+            ExprIntervalGraph::try_new(Arc::clone(filter.expression()), filter.schema())
+        else {
+            return Ok(None);
+        };
+        let filter_exprs = exprs
+            .iter()
+            .map(|(_, _, expr)| Arc::clone(expr))
+            .collect::<Vec<_>>();
+        let nodes = graph.gather_node_indices(&filter_exprs);
+        if nodes.iter().any(|&(_, node)| node == usize::MAX) {
+            return Ok(None);
+        }
+        let mut sides =
+            exprs
+                .into_iter()
+                .zip(nodes)
+                .map(|((order, data_type, _), (_, node))| SortedExpr {
+                    order,
+                    node,
+                    data_type,
+                });
+        let (Some(left), Some(right)) = (sides.next(), sides.next()) else {
+            return internal_err!("A symmetric hash join without two inputs");
+        };
+        Ok(Some(Self {
+            graph,
+            sides: [left, right],
+        }))
+    }
+}
+
+/// `expr`, an expression over the columns of the input `side` of a join, over
+/// the columns of its filter `filter`, if the filter has all its columns and
+/// the filter expression has it as a subexpression (as DataFusion's
+/// `convert_sort_expr_with_filter_schema`).
+fn filter_expression(
+    filter: &JoinFilter,
+    side: JoinSide,
+    expr: &PhysicalExprRef,
+) -> Result<Option<PhysicalExprRef>> {
+    let filter_columns = filter
+        .column_indices()
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.side == side)
+        .map(|(index, column)| {
+            let name = filter.schema().field(index).name();
+            (column.index, Column::new(name, index))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut complete = true;
+    let converted = Arc::clone(expr)
+        .transform_up(|node| {
+            let Some(column) = node.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(node));
+            };
+            Ok(match filter_columns.get(&column.index()) {
+                Some(filter_column) => {
+                    Transformed::yes(Arc::new(filter_column.clone()) as PhysicalExprRef)
+                }
+                None => {
+                    complete = false;
+                    Transformed::no(node)
+                }
+            })
+        })
+        .data()?;
+    let contains = |expr: &PhysicalExprRef| has_subexpression(expr, &converted);
+    Ok((complete && contains(filter.expression())).then_some(converted))
+}
+
+/// Whether `expr` is `subexpression`, or has it below it.
+fn has_subexpression(expr: &PhysicalExprRef, subexpression: &PhysicalExprRef) -> bool {
+    expr.eq(subexpression)
+        || expr
+            .children()
+            .into_iter()
+            .any(|child| has_subexpression(child, subexpression))
+}
+
+/// The rows of one input of a symmetric hash join, and their hash table. The
+/// rows have positions in the order in which they arrived; the rows before
+/// `determined` are determined (no row of the other input still to come can
+/// match them), and those before `emitted` emitted (their final rows, if
+/// any). The table drops the batches of emitted rows: it has the rows from
+/// `base` on.
 #[derive(Debug)]
 struct SideTable {
+    /// The rows at the positions from `base` on (at `position - base` in
+    /// `rows`).
     rows: StoredRows,
+    /// The position of the first row of `rows`.
+    base: usize,
+    /// The first row that is not determined.
+    determined: usize,
+    /// The first row that the join did not emit the final row of (or that
+    /// it did not skip, if it has none).
+    emitted: usize,
     /// The last row of every key (whose keys can match).
     heads: HashMap<Box<[u8]>, usize>,
-    /// For every row, the row before it with the same key (`usize::MAX` for
+    /// For every row, the row before it with the same key ([`NO_ROW`] for
     /// none).
-    previous: Vec<usize>,
+    previous: VecDeque<usize>,
     /// For every row, whether it matched a row of the other input.
-    matched: Vec<bool>,
+    matched: VecDeque<bool>,
+    /// For every row, the bytes of its values of their own, for the filter
+    /// and the output (see [`GatherWidths::variable_bytes`]).
+    variable_bytes: VecDeque<[u32; 2]>,
+    /// For every batch of `rows`, if the join determines rows by their order:
+    /// the values of the order of its rows, in the row format.
+    sort_rows: VecDeque<Rows>,
+    /// For every batch of `rows`: the memory that it reserved.
+    batch_bytes: VecDeque<usize>,
 }
 
 impl SideTable {
     fn new(schema: SchemaRef) -> Self {
         Self {
             rows: StoredRows::new(schema),
+            base: 0,
+            determined: 0,
+            emitted: 0,
             heads: HashMap::new(),
-            previous: vec![],
-            matched: vec![],
+            previous: VecDeque::new(),
+            matched: VecDeque::new(),
+            variable_bytes: VecDeque::new(),
+            sort_rows: VecDeque::new(),
+            batch_bytes: VecDeque::new(),
         }
+    }
+
+    /// The position after the last row.
+    fn end(&self) -> usize {
+        self.base + self.rows.len()
+    }
+
+    /// The first row at or after the position `from` whose value of the order
+    /// (in `sort_rows`) does not come before `bound`, as the rows are sorted.
+    fn first_not_before(&self, from: usize, bound: Row<'_>) -> usize {
+        let starts = self.rows.batch_starts();
+        let from = from - self.base;
+        let mut batch = starts
+            .partition_point(|&start| start <= from)
+            .saturating_sub(1);
+        while let (Some(rows), Some(&start)) =
+            (self.sort_rows.get(batch), starts.get(batch))
+        {
+            let len = rows.num_rows();
+            if len > 0 && rows.row(len - 1) < bound {
+                batch += 1;
+                continue;
+            }
+            let (mut low, mut high) = (from.saturating_sub(start).min(len), len);
+            while low < high {
+                let mid = low + (high - low) / 2;
+                if rows.row(mid) < bound {
+                    low = mid + 1;
+                } else {
+                    high = mid;
+                }
+            }
+            return self.base + start + low;
+        }
+        self.end()
     }
 }
 
@@ -388,6 +675,26 @@ const NO_ROW: usize = usize::MAX;
 /// The join reads at most this many chunks of its inputs that produce no
 /// output in a call of `get_data` before it lets the other tasks run.
 const CHUNKS_PER_CALL: usize = 16;
+
+/// The join gathers about this many bytes of rows for a part of a chunk (for
+/// its filter and its output), or for the final rows that it emits at once:
+/// fewer than [`DEFAULT_VECTOR_SIZE`] rows if they are wide. A part has a
+/// pair (or a row) at least.
+const PART_BYTES: usize = 1 << 20;
+
+/// The bytes of the indices of a candidate pair of rows of a part, and of a
+/// pair of the output.
+const PAIR_INDEX_BYTES: usize = 2 * (size_of::<u32>() + size_of::<Option<usize>>());
+
+/// The bytes of the index of a final row, and of its mark.
+const FINAL_ROW_INDEX_BYTES: usize = size_of::<Option<usize>>() + 1;
+
+/// A join that determines rows by the order of its inputs reads at most this
+/// many chunks of an input more than of the other one (unless the other one
+/// ended), as DataFusion's join reads them alternately: the rows of an input
+/// are determined as the other input advances, so that one that is read ahead
+/// of the other keeps its rows in its table.
+const MAX_CHUNKS_AHEAD: usize = 2;
 
 /// The global source state of a [`PhysicalSymmetricHashJoin`]: everything
 /// about its execution, read by a single thread.
@@ -409,8 +716,11 @@ struct SymmetricRun {
     job: Option<ChunkJoin>,
     /// The input to read the next chunk of first (the inputs alternate).
     next_side: usize,
-    /// Once both inputs ended: the rows that the join emits then.
-    final_rows: Option<FinalRows>,
+    /// The chunks read of the left and of the right input.
+    chunks_read: [usize; 2],
+    /// If the join determines rows by the order of its inputs: the interval
+    /// graph of its filter, and the orders of the rows read so far.
+    pruning: Option<Pruning>,
     /// The memory of the tables.
     reservation: MemoryReservation,
 }
@@ -447,12 +757,144 @@ impl ChunkJoin {
     }
 }
 
-/// The rows that a join emits once both inputs ended.
-struct FinalRows {
-    /// The rows to emit: of the left, then of the right input.
-    rows: [Vec<Option<usize>>; 2],
-    /// The next chunk of rows to emit, over both inputs.
-    next_chunk: usize,
+/// The determination of the rows of a symmetric join by the order of its
+/// inputs, in an execution (see [`SortedFilter`]).
+struct Pruning {
+    filter: SortedFilter,
+    /// Encode the values of the order of the left and of the right input
+    /// (in their order).
+    converters: [RowConverter; 2],
+    /// The value of the order of the last row of the left and of the right
+    /// input, as a value and in the row format.
+    last: [Option<(ScalarValue, OwnedRow)>; 2],
+}
+
+impl Pruning {
+    fn try_new(filter: SortedFilter) -> Result<Self> {
+        let converter = |sorted: &SortedExpr| {
+            RowConverter::new(vec![SortField::new_with_options(
+                sorted.data_type.clone(),
+                sorted.order.options,
+            )])
+        };
+        let converters = [converter(&filter.sides[0])?, converter(&filter.sides[1])?];
+        Ok(Self {
+            filter,
+            converters,
+            last: [None, None],
+        })
+    }
+
+    /// The values of the order of the input `side` of the rows of `batch`,
+    /// in the row format, after checking that they are sorted (also after the
+    /// rows before them); remembers the value of the last row.
+    fn sort_rows(&mut self, side: usize, batch: &RecordBatch) -> Result<Rows> {
+        let order = &self.filter.sides[side].order;
+        let values = order.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        let rows = self.converters[side].convert_columns(&[Arc::clone(&values)])?;
+        let after_last = match (&self.last[side], rows.num_rows()) {
+            (Some((_, last)), 1..) => last.row() <= rows.row(0),
+            _ => true,
+        };
+        if !after_last
+            || (1..rows.num_rows()).any(|row| rows.row(row) < rows.row(row - 1))
+        {
+            let input = ["left", "right"][side];
+            return internal_err!(
+                "The {input} input of PhysicalSymmetricHashJoin is not sorted by {order}"
+            );
+        }
+        if let Some(last) = rows.num_rows().checked_sub(1) {
+            let value = ScalarValue::try_from_array(&values, last)?;
+            self.last[side] = Some((value, rows.row(last).owned()));
+        }
+        Ok(rows)
+    }
+
+    /// The first row of `table`, the table of input `side`, that the rows of
+    /// the other input still to come may match: the interval of the values of
+    /// the order of the rows of `side` that can match, with the filter, the
+    /// rows of the other input whose values of its order are not before the
+    /// value of its last row (DataFusion's interval pruning). The rows of
+    /// `side` before that interval are determined.
+    fn first_undetermined(&mut self, side: usize, table: &SideTable) -> Result<usize> {
+        let from = table.determined;
+        let [own, other] = match side {
+            0 => [&self.filter.sides[0], &self.filter.sides[1]],
+            _ => [&self.filter.sides[1], &self.filter.sides[0]],
+        };
+        let first = self.value_at(side, table, from)?;
+        let own_values = values_from(first, own)?;
+        let other_values = match &self.last[1 - side] {
+            Some((last, _)) => values_from(last.clone(), other)?,
+            None => Interval::make_unbounded(&other.data_type)?,
+        };
+        let mut bounds = [(own.node, own_values), (other.node, other_values)];
+        match self
+            .filter
+            .graph
+            .update_ranges(&mut bounds, Interval::TRUE)?
+        {
+            // No row of `side` can match a row still to come.
+            PropagationResult::Infeasible => return Ok(table.end()),
+            PropagationResult::CannotPropagate => return Ok(from),
+            PropagationResult::Success => {}
+        }
+        let [(_, matchable), _] = bounds;
+        let bound = match own.order.options.descending {
+            true => matchable.upper(),
+            false => matchable.lower(),
+        };
+        if bound.is_null() || is_nan(bound) {
+            return Ok(from);
+        }
+        let bound = self.converters[side].convert_columns(&[bound.to_array()?])?;
+        Ok(table.first_not_before(from, bound.row(0)))
+    }
+
+    /// The value of the order of the row at `position` of `table`, the table
+    /// of input `side`.
+    fn value_at(
+        &self,
+        side: usize,
+        table: &SideTable,
+        position: usize,
+    ) -> Result<ScalarValue> {
+        let index = position - table.base;
+        let starts = table.rows.batch_starts();
+        let batch = starts
+            .partition_point(|&start| start <= index)
+            .saturating_sub(1);
+        let (Some(rows), Some(&start)) = (table.sort_rows.get(batch), starts.get(batch))
+        else {
+            return internal_err!("A row of PhysicalSymmetricHashJoin without its order");
+        };
+        let values = self.converters[side].convert_rows([rows.row(index - start)])?;
+        ScalarValue::try_from_array(&values[0], 0)
+    }
+}
+
+/// The interval of the values, in the order `sorted`, of the rows from a row
+/// whose value is `value` on: not before `value`.
+fn values_from(value: ScalarValue, sorted: &SortedExpr) -> Result<Interval> {
+    if is_nan(&value) {
+        return Interval::make_unbounded(&sorted.data_type);
+    }
+    let unbounded = ScalarValue::try_from(&sorted.data_type)?;
+    match sorted.order.options.descending {
+        false => Interval::try_new(value, unbounded),
+        true => Interval::try_new(unbounded, value),
+    }
+}
+
+/// Whether `value` is a floating point NaN, which intervals do not bound.
+fn is_nan(value: &ScalarValue) -> bool {
+    match value {
+        ScalarValue::Float16(Some(value)) => value.is_nan(),
+        ScalarValue::Float32(Some(value)) => value.is_nan(),
+        ScalarValue::Float64(Some(value)) => value.is_nan(),
+        _ => false,
+    }
 }
 
 impl PhysicalSymmetricHashJoin {
@@ -471,6 +913,13 @@ impl PhysicalSymmetricHashJoin {
         self.spec.join_type()
     }
 
+    /// Whether the join reads its inputs sorted by expressions of its filter,
+    /// and determines their rows by the bounds of the values still to come
+    /// (see the [module documentation](self)).
+    pub fn determines_rows_by_order(&self) -> bool {
+        self.spec.sorted_filter.is_some()
+    }
+
     /// Append the rows of `batch`, a chunk of the input `side`, to the table of
     /// their input, reserving their memory, and start joining them.
     fn start_chunk(
@@ -483,10 +932,15 @@ impl PhysicalSymmetricHashJoin {
         let matchable = matchable_rows(&keys, self.spec.null_equality);
         let keys = run.converter.convert_columns(&keys)?;
         let num_rows = batch.num_rows();
+        let variable_bytes = self.spec.widths[side].variable_bytes(&batch);
+        let sort_rows = match &mut run.pruning {
+            Some(pruning) => Some(pruning.sort_rows(side, &batch)?),
+            None => None,
+        };
         let is_matchable =
             |row: usize| matchable.as_ref().is_none_or(|valid| valid.is_valid(row));
         let table = &mut run.tables[side];
-        let first = table.rows.len();
+        let first = table.end();
         // Only the keys that are new to the table are copied into it.
         let mut key_bytes = 0;
         for row in 0..num_rows {
@@ -497,8 +951,7 @@ impl PhysicalSymmetricHashJoin {
                     match table.heads.get_mut(key.as_ref()) {
                         Some(head) => std::mem::replace(head, position),
                         None => {
-                            key_bytes +=
-                                key.as_ref().len() + size_of::<(Box<[u8]>, usize)>();
+                            key_bytes += key_entry_bytes(key.as_ref());
                             table.heads.insert(key.as_ref().into(), position);
                             NO_ROW
                         }
@@ -506,13 +959,16 @@ impl PhysicalSymmetricHashJoin {
                 }
                 false => NO_ROW,
             };
-            table.previous.push(previous);
+            table.previous.push_back(previous);
         }
-        table.matched.resize(first + num_rows, false);
+        table.matched.extend(std::iter::repeat_n(false, num_rows));
+        table.variable_bytes.extend(variable_bytes);
         let bytes = memory_size(&batch)
-            + key_bytes
-            + num_rows * (size_of::<usize>() + size_of::<bool>());
-        run.reservation.try_grow(bytes)?;
+            + sort_rows.as_ref().map_or(0, Rows::size)
+            + num_rows * (size_of::<usize>() + size_of::<bool>() + size_of::<[u32; 2]>());
+        run.reservation.try_grow(bytes + key_bytes)?;
+        table.batch_bytes.push_back(bytes);
+        table.sort_rows.extend(sort_rows);
         table.rows.push(batch.clone());
         Ok(ChunkJoin {
             side,
@@ -526,9 +982,11 @@ impl PhysicalSymmetricHashJoin {
     }
 
     /// The next output of the join of the rows of `job` with the rows of the
-    /// other input in `tables`: of at most [`DEFAULT_VECTOR_SIZE`] candidate
-    /// pairs (a row without candidates counts as one), with the filter
-    /// evaluated on all of them at once. `None` if they produce no output.
+    /// other input in `tables` that are not determined: of at most
+    /// [`DEFAULT_VECTOR_SIZE`] candidate pairs (a row without candidates
+    /// counts as one) and about [`PART_BYTES`] bytes of their rows, with the
+    /// filter evaluated on all of them at once. The rows that it gathers are
+    /// reserved while it gathers them. `None` if they produce no output.
     fn next_chunk_output(
         &self,
         job: &mut ChunkJoin,
@@ -542,11 +1000,33 @@ impl PhysicalSymmetricHashJoin {
             0 => (left, right),
             _ => (right, left),
         };
+        let (own_widths, other_widths) = (&spec.widths[side], &spec.widths[1 - side]);
+        // The bytes that a candidate pair gathers, for the filter and for the
+        // output (at most all candidates pass the filter), and its indices.
+        let pair_bytes = |own_index: usize, other_index: usize| {
+            let (own_bytes, other_bytes) = (
+                own.variable_bytes[own_index],
+                other.variable_bytes[other_index],
+            );
+            let filter = match spec.filter {
+                Some(_) => {
+                    own_widths.row_bytes(own_bytes, FILTER)
+                        + other_widths.row_bytes(other_bytes, FILTER)
+                }
+                None => 0,
+            };
+            filter
+                + own_widths.row_bytes(own_bytes, OUTPUT)
+                + other_widths.row_bytes(other_bytes, OUTPUT)
+                + PAIR_INDEX_BYTES
+        };
         let num_rows = job.batch.num_rows();
+        let own_first = job.first - own.base;
         let mut pairs_own = Vec::new();
         let mut pairs_other = Vec::new();
         let mut cost = 0;
-        while cost < DEFAULT_VECTOR_SIZE {
+        let mut bytes = 0;
+        while cost < DEFAULT_VECTOR_SIZE && bytes < PART_BYTES {
             let (row, mut position) = match job.chain.take() {
                 Some(chain) => chain,
                 None => {
@@ -563,13 +1043,20 @@ impl PhysicalSymmetricHashJoin {
                     (row, head.copied().unwrap_or(NO_ROW))
                 }
             };
-            while position != NO_ROW && cost < DEFAULT_VECTOR_SIZE {
+            // The determined rows of the other input (before its first row
+            // that is not, as the chain goes back) match no row any more.
+            let candidate =
+                |position: usize| position != NO_ROW && position >= other.determined;
+            while candidate(position) && cost < DEFAULT_VECTOR_SIZE && bytes < PART_BYTES
+            {
+                let index = position - other.base;
                 pairs_own.push(row as u32);
-                pairs_other.push(Some(position));
-                position = other.previous[position];
+                pairs_other.push(Some(index));
+                bytes += pair_bytes(own_first + row, index);
+                position = other.previous[index];
                 cost += 1;
             }
-            if position != NO_ROW {
+            if candidate(position) {
                 job.chain = Some((row, position));
                 break;
             }
@@ -577,26 +1064,10 @@ impl PhysicalSymmetricHashJoin {
         if pairs_other.is_empty() {
             return Ok(None);
         }
-        // The candidates, and the rows gathered for the filter and the output
-        // (at most a chunk of them), are reserved while they are joined.
-        let row_bytes = |schema: &SchemaRef| {
-            schema
-                .fields()
-                .iter()
-                .map(|field| field.data_type().primitive_width().unwrap_or(16))
-                .sum::<usize>()
-        };
+        // The rows gathered for the filter and the output are reserved while
+        // they are joined.
         let transient = reservation.new_empty();
-        transient.try_grow(
-            pairs_other.len()
-                * (size_of::<u32>()
-                    + size_of::<Option<usize>>()
-                    + row_bytes(&self.spec.output.schema)
-                    + spec
-                        .filter
-                        .as_ref()
-                        .map_or(0, |filter| row_bytes(filter.schema()))),
-        )?;
+        transient.try_grow(bytes)?;
         let own_rows = UInt32Array::from(pairs_own);
         let mask = match &spec.filter {
             Some(filter) => {
@@ -615,27 +1086,27 @@ impl PhysicalSymmetricHashJoin {
         let mut out_other = Vec::new();
         let mut first_own = Vec::new();
         let mut first_other = Vec::new();
-        for (pair, (&row, &position)) in
+        for (pair, (&row, &index)) in
             own_rows.values().iter().zip(&pairs_other).enumerate()
         {
             if mask.as_ref().is_some_and(|mask| !mask.value(pair)) {
                 continue;
             }
-            let Some(position) = position else {
+            let Some(index) = index else {
                 continue;
             };
-            let own_position = job.first + row as usize;
-            if !own.matched[own_position] {
-                own.matched[own_position] = true;
+            let own_index = own_first + row as usize;
+            if !own.matched[own_index] {
+                own.matched[own_index] = true;
                 first_own.push(row);
             }
-            if !other.matched[position] {
-                other.matched[position] = true;
-                first_other.push(Some(position));
+            if !other.matched[index] {
+                other.matched[index] = true;
+                first_other.push(Some(index));
             }
             if spec.emits_pairs() {
                 out_own.push(Some(row));
-                out_other.push(Some(position));
+                out_other.push(Some(index));
             }
         }
 
@@ -679,64 +1150,146 @@ impl PhysicalSymmetricHashJoin {
         Ok(None)
     }
 
-    /// The next chunk of the rows that the join emits once both inputs
-    /// ended: the rows without a match (with NULLs for the other input) of
-    /// the outer and anti joins, every row with its mark for the mark joins.
-    fn next_final_rows(&self, run: &mut SymmetricRun) -> Result<SourceResult> {
-        let mark = self.spec.output.is_mark_join();
-        let final_rows = run.final_rows.get_or_insert_with(|| FinalRows {
-            rows: [0, 1].map(|side| {
-                if !self.spec.emits_final_rows(side) {
-                    return vec![];
-                }
-                let table = &run.tables[side];
-                (0..table.rows.len())
-                    .filter(|&position| mark || !table.matched[position])
-                    .map(Some)
-                    .collect()
-            }),
-            next_chunk: 0,
-        });
-        let chunks = final_rows
-            .rows
-            .each_ref()
-            .map(|rows| rows.len().div_ceil(DEFAULT_VECTOR_SIZE));
-        let chunk = final_rows.next_chunk;
-        let (side, chunk) = match chunk < chunks[0] {
-            true => (0, chunk),
-            false if chunk - chunks[0] < chunks[1] => (1, chunk - chunks[0]),
-            false => return Ok(SourceResult::Finished),
-        };
-        final_rows.next_chunk += 1;
-        let rows = &final_rows.rows[side];
-        let start = chunk * DEFAULT_VECTOR_SIZE;
-        let positions = &rows[start..(start + DEFAULT_VECTOR_SIZE).min(rows.len())];
+    /// Determine more rows of input `side`: all of them once the other input
+    /// ended, or those that the bounds of the values of the other input still
+    /// to come rule out (see [`Pruning::first_undetermined`]).
+    fn determine(&self, run: &mut SymmetricRun, side: usize) {
         let table = &run.tables[side];
-        let other_schema = self.children[1 - side].schema();
-        let marks = mark.then(|| {
-            let marks = positions
-                .iter()
-                .map(|position| position.is_some_and(|position| table.matched[position]))
-                .collect::<Vec<_>>();
-            Arc::new(BooleanArray::from(marks)) as ArrayRef
+        let (from, end) = (table.determined, table.end());
+        if from == end {
+            return;
+        }
+        let determined = match &mut run.pruning {
+            _ if run.inputs[1 - side].is_done() => Ok(end),
+            Some(pruning) => pruning.first_undetermined(side, table),
+            None => Ok(from),
+        };
+        run.tables[side].determined = determined.unwrap_or_else(|_| {
+            // The bounds cannot be computed: the rows are determined once the
+            // other input ends.
+            run.pruning = None;
+            from
         });
-        let (left, right) = sides(
-            side,
-            JoinRows::Stored(&table.rows, positions),
-            JoinRows::Nulls(&other_schema, positions.len()),
-        );
-        let batch =
-            self.spec
-                .output
-                .batch(&left, &right, marks.as_ref(), positions.len())?;
-        Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)))
     }
 
-    /// The next output of the join: joins the chunk being joined, reads the
-    /// next chunk of an input (alternately, of the inputs that have one), and
-    /// emits the final rows once both inputs ended. `Blocked` while neither
-    /// input has a chunk (the waker of the task of `ctx` is registered with
-    /// both).
+    /// The next output of the determined rows that the join did not emit yet:
+    /// of at most [`DEFAULT_VECTOR_SIZE`] rows and about [`PART_BYTES`] bytes,
+    /// the rows without a match (with NULLs for the other input) of the outer
+    /// and anti joins, or every row with its mark for the mark joins. Drops
+    /// the batches of the rows that it emitted (or skipped, without a final
+    /// row) from their table. `None` if there are none.
+    fn next_determined_output(
+        &self,
+        run: &mut SymmetricRun,
+    ) -> Result<Option<RecordBatch>> {
+        let mark = self.spec.output.is_mark_join();
+        for side in 0..2 {
+            let table = &mut run.tables[side];
+            if !self.spec.emits_final_rows(side) {
+                table.emitted = table.determined;
+            }
+            let (widths, other_widths) =
+                (&self.spec.widths[side], &self.spec.widths[1 - side]);
+            while table.emitted < table.determined {
+                let mut positions = Vec::new();
+                let mut marks = Vec::new();
+                let mut bytes = 0;
+                let mut position = table.emitted;
+                while position < table.determined
+                    && positions.len() < DEFAULT_VECTOR_SIZE
+                    && bytes < PART_BYTES
+                {
+                    let index = position - table.base;
+                    let matched = table.matched[index];
+                    if mark || !matched {
+                        positions.push(Some(index));
+                        marks.push(matched);
+                        bytes += widths.row_bytes(table.variable_bytes[index], OUTPUT)
+                            + other_widths.null_row_bytes(OUTPUT)
+                            + FINAL_ROW_INDEX_BYTES;
+                    }
+                    position += 1;
+                }
+                table.emitted = position;
+                if positions.is_empty() {
+                    continue;
+                }
+                let transient = run.reservation.new_empty();
+                transient.try_grow(bytes)?;
+                let other_schema = self.children[1 - side].schema();
+                let marks = mark.then(|| Arc::new(BooleanArray::from(marks)) as ArrayRef);
+                let (left, right) = sides(
+                    side,
+                    JoinRows::Stored(&table.rows, &positions),
+                    JoinRows::Nulls(&other_schema, positions.len()),
+                );
+                let batch = self.spec.output.batch(
+                    &left,
+                    &right,
+                    marks.as_ref(),
+                    positions.len(),
+                )?;
+                return Ok(Some(batch));
+            }
+            self.drop_emitted_rows(run, side)?;
+        }
+        Ok(None)
+    }
+
+    /// Drop the batches of the table of input `side` whose rows the join
+    /// emitted (or skipped) all, with the keys of the hash table whose rows
+    /// they all are, releasing their memory.
+    fn drop_emitted_rows(&self, run: &mut SymmetricRun, side: usize) -> Result<()> {
+        let SymmetricRun {
+            tables,
+            converter,
+            reservation,
+            ..
+        } = run;
+        let table = &mut tables[side];
+        let emitted = table.emitted - table.base;
+        let starts = table.rows.batch_starts();
+        let batches = table.rows.batches();
+        let dropped = batches
+            .iter()
+            .zip(starts)
+            .take_while(|(batch, start)| *start + batch.num_rows() <= emitted)
+            .count();
+        if dropped == 0 {
+            return Ok(());
+        }
+        let rows = starts.get(dropped).copied().unwrap_or(table.rows.len());
+        // The keys whose last row is dropped: their rows are all dropped.
+        let mut released = 0;
+        for (batch, start) in batches[..dropped].iter().zip(starts) {
+            let keys = evaluate_keys(self.spec.keys(side), batch)?;
+            let keys = converter.convert_columns(&keys)?;
+            for row in 0..batch.num_rows() {
+                let key = keys.row(row);
+                let position = table.base + start + row;
+                if table.heads.get(key.as_ref()) == Some(&position) {
+                    table.heads.remove(key.as_ref());
+                    released += key_entry_bytes(key.as_ref());
+                }
+            }
+        }
+        table.rows = table.rows.without_first_batches(dropped);
+        table.base += rows;
+        table.previous.drain(..rows);
+        table.matched.drain(..rows);
+        table.variable_bytes.drain(..rows);
+        let sort_rows = dropped.min(table.sort_rows.len());
+        table.sort_rows.drain(..sort_rows);
+        released += table.batch_bytes.drain(..dropped).sum::<usize>();
+        reservation.shrink(released);
+        Ok(())
+    }
+
+    /// The next output of the join: joins the chunk being joined, emits the
+    /// final rows of the rows that are determined, and reads the next chunk of
+    /// an input (alternately, of the inputs that have one). Once both inputs
+    /// ended, all rows are determined. `Blocked` while neither input has a
+    /// chunk (the waker of the task of `ctx` is registered with both).
     fn next_output(
         &self,
         ctx: &ExecutionContext,
@@ -749,14 +1302,24 @@ impl PhysicalSymmetricHashJoin {
                     self.next_chunk_output(job, &mut run.tables, &run.reservation)?;
                 if job.is_done() {
                     run.job = None;
+                    self.determine(run, 0);
+                    self.determine(run, 1);
                 }
                 if let Some(batch) = output {
                     return Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)));
                 }
                 continue;
             }
+            if let Some(batch) = self.next_determined_output(run)? {
+                return Ok(SourceResult::Chunk(DataChunk::from_record_batch(batch)));
+            }
             if run.inputs.iter().all(NestedInput::is_done) {
-                return self.next_final_rows(run);
+                if run.tables.iter().all(|table| table.emitted == table.end()) {
+                    return Ok(SourceResult::Finished);
+                }
+                self.determine(run, 0);
+                self.determine(run, 1);
+                continue;
             }
             if chunks == CHUNKS_PER_CALL {
                 return Ok(SourceResult::Blocked(TaskInterrupt::yield_now()));
@@ -766,17 +1329,31 @@ impl PhysicalSymmetricHashJoin {
                 if run.inputs[side].is_done() {
                     continue;
                 }
+                let ahead =
+                    run.chunks_read[side].saturating_sub(run.chunks_read[1 - side]);
+                if run.pruning.is_some()
+                    && ahead >= MAX_CHUNKS_AHEAD
+                    && !run.inputs[1 - side].is_done()
+                {
+                    continue;
+                }
                 match run.inputs[side].poll_next(ctx) {
                     Poll::Ready(Ok(Some(batch))) => {
                         if batch.num_rows() > 0 {
                             run.job = Some(self.start_chunk(run, side, batch)?);
+                            run.chunks_read[side] += 1;
                         }
                         run.next_side = 1 - side;
                         chunks += 1;
                         read = true;
                         break;
                     }
-                    Poll::Ready(Ok(None)) => read = true,
+                    // No rows of the input are to come: the rows of the other
+                    // input are determined.
+                    Poll::Ready(Ok(None)) => {
+                        self.determine(run, 1 - side);
+                        read = true;
+                    }
                     Poll::Ready(Err(e)) => return Err(e),
                     Poll::Pending => {}
                 }
@@ -786,6 +1363,11 @@ impl PhysicalSymmetricHashJoin {
             }
         }
     }
+}
+
+/// The memory of the entry of a key in the hash table of a [`SideTable`].
+fn key_entry_bytes(key: &[u8]) -> usize {
+    key.len() + size_of::<(Box<[u8]>, usize)>()
 }
 
 /// The left and the right rows of pairs of rows of the input `side` and of
@@ -816,12 +1398,21 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
 
     fn description(&self) -> String {
         let spec = &self.spec;
-        spec.output.describe(
+        let mut description = spec.output.describe(
             self.name(),
             &spec.on,
             spec.filter.as_ref(),
             spec.null_equality,
-        )
+        );
+        if let Some(sorted) = &spec.sorted_filter {
+            let [left, right] = &sorted.sides;
+            let _ = write!(
+                description,
+                ", determined_by=[{}, {}]",
+                left.order, right.order
+            );
+        }
+        description
     }
 
     fn is_source(&self) -> bool {
@@ -839,6 +1430,10 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
     ) -> Result<Arc<dyn GlobalSourceState>> {
         let reservation = MemoryConsumer::new("PhysicalSymmetricHashJoin")
             .register(ctx.task_ctx.memory_pool());
+        let pruning = match &self.spec.sorted_filter {
+            Some(filter) => Some(Pruning::try_new(filter.clone())?),
+            None => None,
+        };
         let run = SymmetricRun {
             inputs: [
                 NestedInput::start(self.left(), ctx)?,
@@ -851,7 +1446,8 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
             converter: self.spec.key_converter()?,
             job: None,
             next_side: 0,
-            final_rows: None,
+            chunks_read: [0, 0],
+            pruning,
             reservation,
         };
         Ok(Arc::new(SymmetricJoinSource {
@@ -870,7 +1466,7 @@ impl PhysicalOperator for PhysicalSymmetricHashJoin {
     }
 
     /// The join is the source of its pipeline: its inputs are executions of
-    /// their own (see [`NestedInput`]), not pipelines of this execution.
+    /// their own, not pipelines of this execution.
     fn build_pipelines(
         &self,
         current: &mut PipelineBuilder,
@@ -887,7 +1483,7 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use arrow::array::{Array, Int64Array};
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field};
     use datafusion::catalog::streaming::StreamingTable;
@@ -1460,7 +2056,7 @@ mod tests {
                 schema(side),
                 vec![
                     Arc::new(Int64Array::from_iter_values(0..500)),
-                    Arc::new(arrow::array::Int32Array::from(vec![7; 500])),
+                    Arc::new(Int32Array::from(vec![7; 500])),
                 ],
             )?;
             let partition = Arc::new(BatchesPartition {
@@ -1706,5 +2302,543 @@ mod tests {
             .is_none()
         );
         Ok(())
+    }
+
+    /// The schema of the rows `(id, k, t, s)` of the `side` input of the joins
+    /// of sorted streams: an id, a key, a time and a string.
+    fn timed_schema(side: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(format!("{side}id"), DataType::Int64, false),
+            Field::new(format!("{side}k"), DataType::Int32, true),
+            Field::new(format!("{side}t"), DataType::Float64, true),
+            Field::new(format!("{side}s"), DataType::Utf8, true),
+        ]))
+    }
+
+    /// The rows `ids` of the `side` input, with the keys `key(id)`, the times
+    /// `time(id)` and the strings `text(id)`, in batches of `batch_rows` rows.
+    fn timed_batches(
+        side: &str,
+        ids: Range<i64>,
+        key: impl Fn(i64) -> Option<i32>,
+        time: impl Fn(i64) -> Option<f64>,
+        text: impl Fn(i64) -> String,
+        batch_rows: usize,
+    ) -> Vec<RecordBatch> {
+        let ids = ids.collect::<Vec<_>>();
+        ids.chunks(batch_rows)
+            .map(|ids| {
+                let column = |values: ArrayRef| values;
+                RecordBatch::try_new(
+                    timed_schema(side),
+                    vec![
+                        column(Arc::new(Int64Array::from(ids.to_vec()))),
+                        column(Arc::new(Int32Array::from_iter(
+                            ids.iter().map(|&id| key(id)),
+                        ))),
+                        column(Arc::new(Float64Array::from_iter(
+                            ids.iter().map(|&id| time(id)),
+                        ))),
+                        column(Arc::new(StringArray::from_iter_values(
+                            ids.iter().map(|&id| text(id)),
+                        ))),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The order of the timed streams of the `side` input: by `<side>t`, NULLs
+    /// first.
+    fn time_order(side: &str) -> LexOrdering {
+        let time = col(&format!("{side}t"), &timed_schema(side)).unwrap();
+        LexOrdering::new([PhysicalSortExpr::new(time, SortOptions::new(false, true))])
+            .unwrap()
+    }
+
+    /// A stream (that never ends, for DataFusion) of the `batches` of the
+    /// `side` input, of one partition, sorted by its times if `sorted`. It
+    /// ends unless `forever`.
+    fn timed_stream(
+        side: &str,
+        batches: Vec<RecordBatch>,
+        sorted: bool,
+        forever: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        let partition = BatchesPartition {
+            schema: timed_schema(side),
+            batches,
+            forever,
+        };
+        let orders = match sorted {
+            true => vec![time_order(side)],
+            false => vec![],
+        };
+        Arc::new(
+            StreamingTableExec::try_new(
+                timed_schema(side),
+                vec![Arc::new(partition)],
+                None,
+                orders,
+                true,
+                None,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A filter of a join of timed inputs, `expr` of their times `lt` and
+    /// `rt`.
+    fn time_filter(
+        expr: impl Fn(PhysicalExprRef, PhysicalExprRef) -> PhysicalExprRef,
+    ) -> JoinFilter {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lt", DataType::Float64, true),
+            Field::new("rt", DataType::Float64, true),
+        ]));
+        let (lt, rt) = (col("lt", &schema).unwrap(), col("rt", &schema).unwrap());
+        JoinFilter::new(
+            expr(lt, rt),
+            vec![
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Right,
+                },
+            ],
+            schema,
+        )
+    }
+
+    /// `left op right`.
+    fn binary(
+        left: PhysicalExprRef,
+        op: Operator,
+        right: PhysicalExprRef,
+    ) -> PhysicalExprRef {
+        Arc::new(BinaryExpr::new(left, op, right))
+    }
+
+    /// The filters of the joins of timed inputs: `lt > rt` (no right row still
+    /// to come matches a left row before the last right time), `lt < rt`, and
+    /// a band `rt - 7 < lt AND lt < rt + 5` (both). The times are floats:
+    /// interval arithmetic does not bound the integer arithmetic that may
+    /// overflow (which wraps).
+    fn time_filters() -> Vec<(&'static str, JoinFilter)> {
+        vec![
+            (
+                "lt > rt",
+                time_filter(|lt, rt| binary(lt, Operator::Gt, rt)),
+            ),
+            (
+                "lt < rt",
+                time_filter(|lt, rt| binary(lt, Operator::Lt, rt)),
+            ),
+            (
+                "rt - 7 < lt AND lt < rt + 5",
+                time_filter(|lt, rt| {
+                    let low = binary(Arc::clone(&rt), Operator::Minus, lit(7.0));
+                    let high = binary(rt, Operator::Plus, lit(5.0));
+                    binary(
+                        binary(low, Operator::Lt, Arc::clone(&lt)),
+                        Operator::And,
+                        binary(lt, Operator::Lt, high),
+                    )
+                }),
+            ),
+        ]
+    }
+
+    /// A `SymmetricHashJoinExec` of the timed inputs `left` and `right` on
+    /// `lk = rk`, which DataFusion prunes by their times if `sorted`.
+    fn timed_join(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        join_type: JoinType,
+        filter: Option<JoinFilter>,
+        null_equality: NullEquality,
+        sorted: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+        let (left_order, right_order) = match sorted {
+            true => (Some(time_order("l")), Some(time_order("r"))),
+            false => (None, None),
+        };
+        Ok(Arc::new(SymmetricHashJoinExec::try_new(
+            left,
+            right,
+            on,
+            filter,
+            &join_type,
+            null_equality,
+            left_order,
+            right_order,
+            StreamJoinPartitionMode::SinglePartition,
+        )?))
+    }
+
+    /// The rows of the timed `side` input of [`joins_of_sorted_streams_match_datafusion`]:
+    /// a few rows without a time first (the NULLs come first), then ascending
+    /// times, with keys of which some are NULL, in batches of 50 rows.
+    fn sorted_rows(side: &str, rows: i64, every: i64) -> Vec<RecordBatch> {
+        timed_batches(
+            side,
+            0..rows,
+            |id| (id % 13 != 4).then_some((id % 7) as i32),
+            |id| (id >= 3).then_some((id / every) as f64),
+            |id| format!("{side}{id}"),
+            50,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_of_sorted_streams_match_datafusion() {
+        // Streams sorted by their times, joined with filters of their times:
+        // the join determines the rows that no row still to come can match, as
+        // the rows come (also the rows of the input whose rows come later),
+        // emits their final rows and drops them. The reference is DataFusion's
+        // hash join of the same rows (in bounded inputs).
+        for join_type in ALL_JOIN_TYPES {
+            for null_equality in [
+                NullEquality::NullEqualsNothing,
+                NullEquality::NullEqualsNull,
+            ] {
+                for (name, filter) in time_filters() {
+                    let context = format!("{join_type} {null_equality:?} {name}");
+                    let bounded = |side: &str, rows: i64, every: i64| {
+                        MemorySourceConfig::try_new_exec(
+                            &[sorted_rows(side, rows, every)],
+                            timed_schema(side),
+                            None,
+                        )
+                        .unwrap() as Arc<dyn ExecutionPlan>
+                    };
+                    let reference = hash_join(
+                        bounded("l", 600, 2),
+                        bounded("r", 800, 3),
+                        join_type,
+                        Some(filter.clone()),
+                        null_equality,
+                    )
+                    .unwrap();
+                    let batches =
+                        with_timeout(collect(Arc::clone(&reference), task_ctx()))
+                            .await
+                            .unwrap();
+                    let expected = EngineOutput {
+                        schema: reference.schema(),
+                        plan: reference,
+                        batches,
+                        ordered: false,
+                    };
+                    let stream = |side: &str, rows: i64, every: i64| {
+                        timed_stream(side, sorted_rows(side, rows, every), true, false)
+                    };
+                    let plan = timed_join(
+                        stream("l", 600, 2),
+                        stream("r", 800, 3),
+                        join_type,
+                        Some(filter),
+                        null_equality,
+                        true,
+                    )
+                    .unwrap();
+                    let root = lower(&plan).unwrap();
+                    let tree = format_operator_tree(&root);
+                    let join = root
+                        .downcast_ref::<PhysicalSymmetricHashJoin>()
+                        .unwrap_or_else(|| panic!("{context}\n{tree}"));
+                    assert!(join.determines_rows_by_order(), "{context}\n{tree}");
+                    let actual = run_native(&root, plan, task_ctx())
+                        .await
+                        .unwrap_or_else(|e| panic!("{context}: {e}\n{tree}"));
+                    if let Err(message) = compare_outputs(&expected, &actual) {
+                        panic!("Results differ: {message}\n{context}\n{tree}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn determined_rows_of_streams_that_never_end_are_emitted() -> Result<()> {
+        // Streams sorted by their times, with keys that never match (even keys
+        // on the left, odd ones on the right), which produce their rows and
+        // then nothing, forever. With `lt > rt`, no right row still to come
+        // matches a left row whose time is not after the last right time, and
+        // with `lt < rt`, the other way round: the join emits these rows
+        // (without a match, or with their mark) as soon as they are
+        // determined, so that a limit above it ends the query, as with
+        // DataFusion's join, which prunes them.
+        let filters = [
+            ("lt > rt", Operator::Gt, JoinSide::Left),
+            ("lt < rt", Operator::Lt, JoinSide::Right),
+        ];
+        for (name, op, side) in filters {
+            let join_types = match side {
+                JoinSide::Left => {
+                    [JoinType::Left, JoinType::LeftAnti, JoinType::LeftMark]
+                }
+                _ => [JoinType::Right, JoinType::RightAnti, JoinType::RightMark],
+            };
+            for join_type in join_types.into_iter().chain([JoinType::Full]) {
+                let context = format!("{join_type} {name}");
+                let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+                    let stream = |side: &str, key: fn(i64) -> Option<i32>| {
+                        let batches = timed_batches(
+                            side,
+                            0..100,
+                            key,
+                            |id| Some(id as f64),
+                            |id| id.to_string(),
+                            20,
+                        );
+                        timed_stream(side, batches, true, true)
+                    };
+                    let join = timed_join(
+                        stream("l", |id| Some((id * 2) as i32)),
+                        stream("r", |id| Some((id * 2 + 1) as i32)),
+                        join_type,
+                        Some(time_filter(|lt, rt| binary(lt, op, rt))),
+                        NullEquality::NullEqualsNothing,
+                        true,
+                    )?;
+                    Ok(Arc::new(GlobalLimitExec::new(join, 0, Some(1))))
+                };
+                let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+                assert_eq!(num_rows(&expected), 1, "{context}");
+                let plan = plan()?;
+                let root = crate::planner::lower_execution_plan(&plan)?;
+                let join = root.children()[0]
+                    .downcast_ref::<PhysicalSymmetricHashJoin>()
+                    .unwrap_or_else(|| {
+                        panic!("{context}\n{}", format_operator_tree(&root))
+                    });
+                assert!(join.determines_rows_by_order(), "{context}");
+                let actual = run_native(&root, plan, task_ctx()).await?;
+                assert_eq!(num_rows(&actual.batches), 1, "{context}");
+                // A row of the input whose rows the filter determines, without
+                // a match.
+                let batch = &actual.batches[0];
+                let schema = batch.schema();
+                let preserved = match side {
+                    JoinSide::Left => "lid",
+                    _ => "rid",
+                };
+                assert!(schema.index_of(preserved).is_ok(), "{context}: {schema:?}");
+                for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                    let other = match side {
+                        JoinSide::Left => field.name().starts_with('r'),
+                        _ => field.name().starts_with('l'),
+                    };
+                    if other {
+                        assert_eq!(column.null_count(), 1, "{context}: {}", field.name());
+                    }
+                    if field.name() == "mark" {
+                        let marks =
+                            column.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        assert!(!marks.value(0), "{context}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joins_of_sorted_streams_keep_the_rows_that_can_still_match() -> Result<()> {
+        // A band join of long streams sorted by their times: a row matches the
+        // rows of the other input whose times are close to its own only, so
+        // that the join drops the rows of either input once the times of the
+        // other one passed them, and holds a few batches of rows at a time,
+        // within a memory pool that the rows of the inputs exceed. Without the
+        // orders of its inputs, it keeps them all, and fails.
+        let rows = 20_000;
+        let plan = |sorted: bool| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |side: &str| {
+                let batches = timed_batches(
+                    side,
+                    0..rows,
+                    |id| Some((id % 10) as i32),
+                    |id| Some(id as f64),
+                    |id| format!("{side}{id}"),
+                    100,
+                );
+                timed_stream(side, batches, sorted, false)
+            };
+            let filter = time_filter(|lt, rt| {
+                let low = binary(Arc::clone(&rt), Operator::Minus, lit(5.0));
+                let high = binary(rt, Operator::Plus, lit(5.0));
+                binary(
+                    binary(low, Operator::Lt, Arc::clone(&lt)),
+                    Operator::And,
+                    binary(lt, Operator::Lt, high),
+                )
+            });
+            timed_join(
+                stream("l"),
+                stream("r"),
+                JoinType::Left,
+                Some(filter),
+                NullEquality::NullEqualsNothing,
+                sorted,
+            )
+        };
+        // The tables of the join hold about 150 KB of rows at most, a part of
+        // its candidates 260 KB; the rows of the inputs have about 2 MB.
+        let pool = 1 << 20;
+        // Every left row matches the right row with its id only.
+        let sorted = plan(true)?;
+        let root = lower(&sorted)?;
+        let actual = run_native(&root, sorted, limited_task_ctx(pool)?).await?;
+        assert_eq!(num_rows(&actual.batches), rows as usize);
+        let unsorted = plan(false)?;
+        let root = lower(&unsorted)?;
+        let err = run_native(&root, unsorted, limited_task_ctx(pool)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn wide_rows_are_reserved_and_joined_in_fewer_pairs() -> Result<()> {
+        // 100 rows on either side with the same key and strings of 1 KiB: the
+        // 10,000 matches have 2 KiB of strings each, which the join reserves
+        // before it gathers them (also those that a limit does not need), in
+        // parts of about a MiB, not of 2,048 pairs. A pool of 512 KiB holds
+        // the tables, but not a part; one of 4 MiB holds both.
+        let plan = |limit: Option<usize>| -> Result<Arc<dyn ExecutionPlan>> {
+            let stream = |side: &str| {
+                let batches = timed_batches(
+                    side,
+                    0..100,
+                    |_| Some(1),
+                    |id| Some(id as f64),
+                    |id| format!("{id:>1024}"),
+                    25,
+                );
+                timed_stream(side, batches, false, limit.is_some())
+            };
+            let join = symmetric_join(
+                stream("l"),
+                stream("r"),
+                JoinType::Inner,
+                None,
+                NullEquality::NullEqualsNothing,
+            )?;
+            Ok(match limit {
+                Some(limit) => Arc::new(GlobalLimitExec::new(join, 0, Some(limit))),
+                None => join,
+            })
+        };
+        let plan_limit = plan(Some(1))?;
+        let root = crate::planner::lower_execution_plan(&plan_limit)?;
+        let err = run_native(&root, plan_limit, limited_task_ctx(512 * 1024)?)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("PhysicalSymmetricHashJoin"),
+            "{err}"
+        );
+        let plan_limit = plan(Some(1))?;
+        let root = crate::planner::lower_execution_plan(&plan_limit)?;
+        let output = run_native(&root, plan_limit, limited_task_ctx(4 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 1);
+        let plan = plan(None)?;
+        let root = lower(&plan)?;
+        let output = run_native(&root, plan, limited_task_ctx(4 << 20)?).await?;
+        assert_eq!(num_rows(&output.batches), 10_000);
+        for batch in &output.batches {
+            assert!(
+                batch.num_rows() <= PART_BYTES / 2048 + 1,
+                "{}",
+                batch.num_rows()
+            );
+        }
+        Ok(())
+    }
+
+    /// Register the timed streams `l` and `r` (see [`timed_stream`]) of the
+    /// rows `left` and `right`, sorted by their times, that never end for
+    /// DataFusion, and end unless `forever`.
+    fn register_timed_streams(
+        ctx: &SessionContext,
+        left: Vec<RecordBatch>,
+        right: Vec<RecordBatch>,
+        forever: bool,
+    ) -> Result<()> {
+        for (side, batches) in [("l", left), ("r", right)] {
+            let partition = BatchesPartition {
+                schema: timed_schema(side),
+                batches,
+                forever,
+            };
+            let table =
+                StreamingTable::try_new(timed_schema(side), vec![Arc::new(partition)])?
+                    .with_infinite_table(true)
+                    .with_sort_order(vec![
+                        datafusion_expr::col(format!("{side}t")).sort(true, true),
+                    ]);
+            ctx.register_table(side, Arc::new(table))?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn symmetric_hash_joins_of_sorted_streams_of_queries_determine_their_rows() {
+        // DataFusion plans symmetric hash joins of the streams with the orders
+        // of their times, which their filters compare: the native joins read
+        // them in their orders (without the repartitionings of DataFusion's
+        // plans), and determine their rows by their times.
+        for sql in [
+            "SELECT l.lid, r.rid FROM l LEFT JOIN r ON l.lk = r.rk AND l.lt > r.rt",
+            "SELECT l.lid, r.rid FROM l RIGHT JOIN r ON l.lk = r.rk AND l.lt < r.rt",
+            "SELECT l.lid, r.rid FROM l FULL JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
+            "SELECT l.lid, r.rid FROM l JOIN r ON l.lk = r.rk AND l.lt > r.rt - 7.0 AND l.lt < r.rt + 5.0",
+            "SELECT l.lid FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.rk = l.lk AND r.rt < l.lt)",
+        ] {
+            for partitions in [4, 1] {
+                let config = SessionConfig::new().with_target_partitions(partitions);
+                let setup = async |ctx: &SessionContext| {
+                    register_timed_streams(
+                        ctx,
+                        sorted_rows("l", 300, 2),
+                        sorted_rows("r", 400, 3),
+                        false,
+                    )
+                };
+                let (expected, actual) = with_timeout(run_engines(sql, config, setup))
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let root = actual
+                    .plan
+                    .downcast_ref::<PipelineRootExec>()
+                    .unwrap()
+                    .operator();
+                let tree = format_operator_tree(root);
+                if let Err(message) = compare_outputs(&expected, &actual) {
+                    panic!("Results differ: {message}\nquery: {sql}\nlowered: {tree}");
+                }
+                assert!(tree.contains("determined_by=["), "{sql}\n{tree}");
+                assert!(
+                    bridged_plans(root)
+                        .iter()
+                        .all(|plan| plan.is::<StreamingTableExec>()),
+                    "{sql}\n{tree}"
+                );
+            }
+        }
     }
 }

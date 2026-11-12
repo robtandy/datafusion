@@ -120,7 +120,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
+    Array, ArrayRef, AsArray, BooleanArray, RecordBatch, RecordBatchOptions, UInt32Array,
     new_empty_array, new_null_array,
 };
 use arrow::buffer::NullBuffer;
@@ -249,7 +249,7 @@ where
         if join.null_aware() {
             return Ok(None);
         }
-        return symmetric_hash_join::lower_symmetric(&equi_join, &mut lower_input);
+        return symmetric_hash_join::lower_symmetric(&equi_join, None, &mut lower_input);
     }
     // A hash join builds its table on an input that ends, on the smaller one
     // if both do.
@@ -689,6 +689,22 @@ fn ordered_input<F>(
 where
     F: FnMut(&Arc<dyn ExecutionPlan>, InputRole) -> Result<Arc<dyn PhysicalOperator>>,
 {
+    let Some(ordered) = ordered_plan(input)? else {
+        return Ok(None);
+    };
+    let lowered = lower_input(&ordered, InputRole::Streamed)?;
+    check_lowered_input(input, &lowered)?;
+    Ok(Some(lowered))
+}
+
+/// The plan that produces the rows of `input` in its order, on a single
+/// partition, for a join that reads them so (see [`ordered_input`]): `input`
+/// without the nodes that only sort or distribute its rows, whose partitions
+/// a `SortPreservingMergeExec` merges if it has several. `Ok(None)` if `input`
+/// has no order, or its partitions are not sorted by it.
+pub(crate) fn ordered_plan(
+    input: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     let Some(ordering) = input.output_ordering().cloned() else {
         return Ok(None);
     };
@@ -699,14 +715,12 @@ where
     {
         return Ok(None);
     }
-    let ordered: Arc<dyn ExecutionPlan> =
+    Ok(Some(
         match stripped.output_partitioning().partition_count() > 1 {
             true => Arc::new(SortPreservingMergeExec::new(ordering, stripped)),
             false => stripped,
-        };
-    let lowered = lower_input(&ordered, InputRole::Streamed)?;
-    check_lowered_input(input, &lowered)?;
-    Ok(Some(lowered))
+        },
+    ))
 }
 
 /// Check that `lowered` has the schema of `input`, which it was lowered from.
@@ -1004,13 +1018,18 @@ impl StoredRows {
     }
 
     /// The position of the first row of every batch.
-    fn batch_starts(&self) -> &[usize] {
+    pub(crate) fn batch_starts(&self) -> &[usize] {
         &self.starts
+    }
+
+    /// The batches of the rows, in order.
+    pub(crate) fn batches(&self) -> &[RecordBatch] {
+        &self.batches
     }
 
     /// The rows without the first `batches` batches, at positions decreased
     /// by the rows of these batches.
-    fn without_first_batches(&self, batches: usize) -> Self {
+    pub(crate) fn without_first_batches(&self, batches: usize) -> Self {
         let mut rows = Self::new(Arc::clone(&self.schema));
         for batch in self.batches.iter().skip(batches) {
             rows.push(batch.clone());
@@ -1152,6 +1171,193 @@ pub(crate) fn record_batch(
     Ok(RecordBatch::try_new_with_options(
         schema, columns, &options,
     )?)
+}
+
+/// The bytes that gathering rows of an input of a join takes, for the
+/// columns that the join gathers into the batch of its filter and into its
+/// output (see [`JoinRows`]): the bytes of every row that do not depend on its
+/// values, and, for the columns whose values have bytes of their own (e.g.
+/// strings), the bytes of the values of each row (see
+/// [`Self::variable_bytes`]). A join reserves the bytes of the rows that it
+/// gathers before it gathers them.
+#[derive(Debug, Clone)]
+pub(crate) struct GatherWidths {
+    /// For the filter and for the output (see [`FILTER`] and [`OUTPUT`]): the
+    /// bytes of every row that do not depend on its values.
+    fixed: [usize; 2],
+    /// For the filter and for the output: the columns whose values have bytes
+    /// of their own, and how to count them.
+    variable: [Vec<(usize, VariableWidth)>; 2],
+}
+
+/// The batch of the filter of a join, see [`GatherWidths`].
+pub(crate) const FILTER: usize = 0;
+
+/// The output of a join, see [`GatherWidths`].
+pub(crate) const OUTPUT: usize = 1;
+
+/// How [`GatherWidths`] counts the bytes of the values of a column whose
+/// values have bytes of their own.
+#[derive(Debug, Clone, Copy)]
+enum VariableWidth {
+    /// Strings or binaries with offsets of 32 bits: the bytes of every value.
+    Offsets32,
+    /// Strings or binaries with offsets of 64 bits: the bytes of every value.
+    Offsets64,
+    /// Other values (e.g. lists or structs): the average bytes of the rows of
+    /// their batch.
+    Average,
+}
+
+impl GatherWidths {
+    /// The widths of the rows of an input with the schema `schema`, whose
+    /// columns `filter` a join gathers for its filter and `output` for its
+    /// output (a column as often as it gathers it).
+    pub(crate) fn new(
+        schema: &Schema,
+        filter: impl IntoIterator<Item = usize>,
+        output: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        let mut fixed = [0; 2];
+        let mut variable = [vec![], vec![]];
+        let columns = [
+            filter.into_iter().collect::<Vec<_>>(),
+            output.into_iter().collect(),
+        ];
+        for (which, columns) in columns.into_iter().enumerate() {
+            for column in columns {
+                let Some(field) = schema.fields().get(column) else {
+                    continue;
+                };
+                let (bytes, width) = value_width(field.data_type());
+                fixed[which] += bytes;
+                if let Some(width) = width {
+                    variable[which].push((column, width));
+                }
+            }
+        }
+        Self { fixed, variable }
+    }
+
+    /// For every row of `batch`, a batch of the input: the bytes of its values
+    /// that have bytes of their own, for the filter and for the output.
+    pub(crate) fn variable_bytes(&self, batch: &RecordBatch) -> Vec<[u32; 2]> {
+        let mut bytes = vec![[0; 2]; batch.num_rows()];
+        for (which, columns) in self.variable.iter().enumerate() {
+            for &(column, width) in columns {
+                if let Some(array) = batch.columns().get(column) {
+                    add_value_bytes(array, width, which, &mut bytes);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// The bytes of a row in the batch `which` ([`FILTER`] or [`OUTPUT`]),
+    /// whose values have the bytes `variable` of their own (see
+    /// [`Self::variable_bytes`]).
+    pub(crate) fn row_bytes(&self, variable: [u32; 2], which: usize) -> usize {
+        self.fixed[which] + variable[which] as usize
+    }
+
+    /// The bytes of a row of NULLs in the batch `which` (e.g. for the other
+    /// input of the rows without a match of an outer join).
+    pub(crate) fn null_row_bytes(&self, which: usize) -> usize {
+        self.fixed[which]
+    }
+}
+
+/// The bytes of a value of `data_type` that do not depend on the value (with
+/// a byte for its validity), and how to count its bytes of its own, if it has
+/// some.
+fn value_width(data_type: &DataType) -> (usize, Option<VariableWidth>) {
+    match data_type {
+        DataType::Null => (0, None),
+        DataType::Boolean => (1, None),
+        DataType::Utf8 | DataType::Binary => {
+            (size_of::<i32>() + 1, Some(VariableWidth::Offsets32))
+        }
+        DataType::LargeUtf8 | DataType::LargeBinary => {
+            (size_of::<i64>() + 1, Some(VariableWidth::Offsets64))
+        }
+        // The gathered views share the buffers of the values.
+        DataType::Utf8View | DataType::BinaryView => (size_of::<u128>() + 1, None),
+        DataType::FixedSizeBinary(width) => {
+            (usize::try_from(*width).unwrap_or_default() + 1, None)
+        }
+        data_type => match data_type.primitive_width() {
+            Some(width) => (width + 1, None),
+            None => (1, Some(VariableWidth::Average)),
+        },
+    }
+}
+
+/// Add the bytes of the values of `array`, counted as `width` says, to the
+/// bytes `bytes[row][which]` of its rows.
+fn add_value_bytes(
+    array: &ArrayRef,
+    width: VariableWidth,
+    which: usize,
+    bytes: &mut [[u32; 2]],
+) {
+    let mut add = |row: usize, value: usize| {
+        if let Some(bytes) = bytes.get_mut(row) {
+            let value = u32::try_from(value).unwrap_or(u32::MAX);
+            bytes[which] = bytes[which].saturating_add(value);
+        }
+    };
+    match (width, array.data_type()) {
+        (VariableWidth::Offsets32, DataType::Utf8) => {
+            for (row, ends) in array
+                .as_string::<i32>()
+                .value_offsets()
+                .windows(2)
+                .enumerate()
+            {
+                add(row, usize::try_from(ends[1] - ends[0]).unwrap_or_default());
+            }
+        }
+        (VariableWidth::Offsets32, _) => {
+            for (row, ends) in array
+                .as_binary::<i32>()
+                .value_offsets()
+                .windows(2)
+                .enumerate()
+            {
+                add(row, usize::try_from(ends[1] - ends[0]).unwrap_or_default());
+            }
+        }
+        (VariableWidth::Offsets64, DataType::LargeUtf8) => {
+            for (row, ends) in array
+                .as_string::<i64>()
+                .value_offsets()
+                .windows(2)
+                .enumerate()
+            {
+                add(row, usize::try_from(ends[1] - ends[0]).unwrap_or_default());
+            }
+        }
+        (VariableWidth::Offsets64, _) => {
+            for (row, ends) in array
+                .as_binary::<i64>()
+                .value_offsets()
+                .windows(2)
+                .enumerate()
+            {
+                add(row, usize::try_from(ends[1] - ends[0]).unwrap_or_default());
+            }
+        }
+        (VariableWidth::Average, _) => {
+            let total = array
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap_or_else(|_| array.get_array_memory_size());
+            let average = total.div_ceil(array.len().max(1));
+            for row in 0..array.len() {
+                add(row, average);
+            }
+        }
+    }
 }
 
 /// `-0.0` replaced by `+0.0` in the values of `expr` (also in nested values),
@@ -2125,6 +2331,12 @@ impl PhysicalMergeJoin {
         let mut window = window.lock();
         let mut batches = 0;
         loop {
+            // A NULL buffered key (the NULLs come first) proves that a null-aware
+            // join (`NOT IN`) has no rows at all: it ends at once, whatever the
+            // rows of its inputs still to come.
+            if self.spec.null_aware && window.rows.has_null_key {
+                return Ok(StreamingStep::Finished);
+            }
             // The rows that no later streamed row matches are dropped.
             if progress
                 .chunk
@@ -2166,6 +2378,9 @@ enum StreamingStep {
     Wait,
     /// Let the other tasks run, after reading many buffered rows.
     Yield,
+    /// The join has no more output: a null-aware join (`NOT IN`) of a
+    /// buffered input with a NULL key.
+    Finished,
 }
 
 /// The output of [`PhysicalMergeJoin::next_output`].
@@ -2799,6 +3014,10 @@ impl PhysicalOperator for PhysicalMergeJoin {
                     StreamingStep::Output(batch) => batch,
                     StreamingStep::Yield => {
                         return Ok(OperatorResult::Blocked(TaskInterrupt::yield_now()));
+                    }
+                    StreamingStep::Finished => {
+                        state.progress.chunk = None;
+                        return Ok(OperatorResult::Finished);
                     }
                     StreamingStep::Wait => {
                         return Ok(OperatorResult::Blocked(
@@ -4002,6 +4221,73 @@ pub(crate) mod tests {
                 "{join_type}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn null_aware_joins_of_streams_end_at_a_null_buffered_key() -> Result<()> {
+        // The `NOT IN` of streams that never end: the streamed (left) one
+        // produces the keys 1, 2 and 3, the buffered (right) one a NULL key,
+        // and then both produce nothing, forever. The NULL proves the result
+        // empty: the join ends at once, as DataFusion's does, also under a
+        // limit that it never reaches.
+        let stream = |side: &str, keys: Vec<Option<i32>>| -> Arc<dyn ExecutionPlan> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(format!("{side}id"), DataType::Int64, false),
+                Field::new(format!("{side}k"), DataType::Int32, true),
+            ]));
+            let ids = Int64Array::from_iter_values(0..keys.len() as i64);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(ids), Arc::new(Int32Array::from(keys))],
+            )
+            .unwrap();
+            let key = col(&format!("{side}k"), &schema).unwrap();
+            let order = LexOrdering::new([PhysicalSortExpr::new(
+                key,
+                SortOptions::new(false, true),
+            )])
+            .unwrap();
+            let partition = StreamPartition {
+                schema: Arc::clone(&schema),
+                batches: vec![batch],
+                forever: true,
+            };
+            Arc::new(
+                StreamingTableExec::try_new(
+                    schema,
+                    vec![Arc::new(partition)],
+                    None,
+                    [order],
+                    true,
+                    None,
+                )
+                .unwrap(),
+            )
+        };
+        let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+            let left = stream("l", vec![Some(1), Some(2), Some(3)]);
+            let right = stream("r", vec![None]);
+            let on = vec![(col("lk", &left.schema())?, col("rk", &right.schema())?)];
+            let join = SortMergeJoinExec::try_new(
+                left,
+                right,
+                on,
+                None,
+                JoinType::LeftAnti,
+                vec![SortOptions::new(false, true)],
+                NullEquality::NullEqualsNothing,
+            )?
+            .with_null_aware(true)?;
+            Ok(Arc::new(GlobalLimitExec::new(Arc::new(join), 0, Some(1))))
+        };
+        let expected = with_timeout(collect(plan()?, task_ctx())).await?;
+        assert_eq!(num_rows(&expected), 0);
+        let plan = plan()?;
+        let root = crate::planner::lower_execution_plan(&plan)?;
+        assert_streaming_merge_join(&root.children()[0], "NOT IN");
+        let actual = run_native(&root, plan, task_ctx()).await?;
+        assert_eq!(num_rows(&actual.batches), 0);
         Ok(())
     }
 
