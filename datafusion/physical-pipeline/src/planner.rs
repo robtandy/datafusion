@@ -1223,10 +1223,10 @@ impl Lowering<'_> {
     /// window: merging the sorted partitions of the window is sorting its rows.
     ///
     /// Only over a window that is lowered to a native window, and if every
-    /// partition of the input of the merge is ordered by its keys (otherwise its output would
-    /// not be sorted), and by keys that are not of unions (which the native
-    /// sort orders otherwise). A merge of no partitions, on which DataFusion
-    /// fails, is not lowered either.
+    /// partition of the input of the merge is ordered by its keys (otherwise
+    /// its output would not be sorted), and by keys that are not of unions
+    /// (which the native sort orders otherwise). A merge of no partitions, on
+    /// which DataFusion fails, is not lowered either.
     fn try_lower_merge_of_window(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
