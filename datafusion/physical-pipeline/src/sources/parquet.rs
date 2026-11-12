@@ -6,6 +6,7 @@
 //! which filters its rows with adaptive row filters and late
 //! materialization.
 
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
@@ -32,13 +33,15 @@ use datafusion_execution::cache::cache_manager::{
 };
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
-use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
 use datafusion_physical_expr_common::physical_expr::{is_volatile, snapshot_generation};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::metrics::{Count, Gauge, MetricBuilder};
+use datafusion_physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder,
+};
 use parking_lot::Mutex;
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 
@@ -300,13 +303,8 @@ impl ParquetScanSource {
     /// scan, the files whose metadata `cache` holds split at the boundaries
     /// of their row groups (see [`push_row_group_units`]), and the other
     /// files into byte ranges of at least `range_bytes`, as
-    /// [`FileScan`] splits them. With the rows of every unit, if they are
-    /// known (for the units of row groups).
-    fn units(
-        &self,
-        cache: &FileMetadataCache,
-        range_bytes: u64,
-    ) -> (Vec<PartitionedFile>, Vec<Option<usize>>) {
+    /// [`FileScan`] splits them.
+    fn units(&self, cache: &FileMetadataCache, range_bytes: u64) -> Vec<PartitionedFile> {
         let assignment = self
             .scan
             .config
@@ -320,7 +318,6 @@ impl ParquetScanSource {
             })
             .unwrap_or_default();
         let mut units = Vec::with_capacity(self.scan.files.len());
-        let mut rows = Vec::with_capacity(self.scan.files.len());
         for file in &self.scan.files {
             // A file with extensions (e.g. a `ParquetAccessPlan` of its row
             // groups) is read as it is.
@@ -332,36 +329,31 @@ impl ParquetScanSource {
             match row_groups {
                 Some(row_groups) => push_row_group_units(
                     &mut units,
-                    &mut rows,
                     file,
                     &row_groups,
                     self.min_unit_rows,
                 ),
-                None => {
-                    push_file_ranges(&mut units, file, Some(range_bytes));
-                    rows.resize(units.len(), None);
-                }
+                None => push_file_ranges(&mut units, file, Some(range_bytes)),
             }
         }
-        (units, rows)
+        units
     }
 
     /// The global state of an execution that shares the files between all
     /// threads (shared mode, without a limit) and splits them, by default:
-    /// with the units of [`Self::units`], and their rows. `None` for the
-    /// scans that [`FileScan`] splits into byte ranges of a set size, or does
-    /// not split.
+    /// with the units of [`Self::units`]. `None` for the scans that
+    /// [`FileScan`] splits into byte ranges of a set size, or does not split.
     fn row_group_state(
         &self,
         ctx: &ExecutionContext,
-    ) -> Result<Option<(FileScanGlobalState, Vec<Option<usize>>)>> {
+    ) -> Result<Option<FileScanGlobalState>> {
         let scan = &self.scan;
         let (None, Some(range_bytes)) = (scan.range_bytes, scan.range_bytes(ctx)) else {
             return Ok(None);
         };
         let task_ctx = &ctx.task_ctx;
         let runtime = task_ctx.runtime_env();
-        let (files, rows) = self.units(
+        let files = self.units(
             runtime.cache_manager.get_file_metadata_cache().as_ref(),
             range_bytes,
         );
@@ -370,7 +362,7 @@ impl ParquetScanSource {
             .config
             .batch_size
             .unwrap_or_else(|| task_ctx.session_config().batch_size());
-        let state = FileScanGlobalState {
+        Ok(Some(FileScanGlobalState {
             units: (0..files.len()).map(|i| i..i + 1).collect(),
             files,
             next_unit: AtomicUsize::new(0),
@@ -378,8 +370,7 @@ impl ParquetScanSource {
             unit_limit: None,
             object_store,
             file_source: scan.config.file_source.with_batch_size(batch_size),
-        };
-        Ok(Some((state, rows)))
+        }))
     }
 
     /// The next chunk of the units of this thread (not filtered by the
@@ -413,13 +404,19 @@ impl ParquetScanSource {
             let Some(unit) = lstate.unit.as_mut() else {
                 return internal_err!("ParquetScanSource lost its unit");
             };
-            match self.scan.get_data(ctx, &unit.state, lstate.scan.as_mut())? {
+            // The rows that the decoder reads: those it produces, and those
+            // its row filter rejects.
+            let rejected = REJECTED_ROWS.with(Cell::get);
+            let result = self.scan.get_data(ctx, &unit.state, lstate.scan.as_mut());
+            unit.rows += REJECTED_ROWS.with(Cell::get).saturating_sub(rejected);
+            match result? {
                 SourceResult::Finished => {
                     if let Some(unit) = lstate.unit.take() {
                         row_filters.finish_unit(&unit);
                     }
                 }
                 SourceResult::Chunk(chunk) => {
+                    unit.rows += chunk.len();
                     if unit.version.row_filter {
                         row_filters.metrics.row_filter_output_rows.add(chunk.len());
                     }
@@ -604,18 +601,17 @@ fn row_group_offset(
     })
 }
 
-/// Push the units of `file` (a file or a byte range of a file) to `units`,
-/// and their rows to `unit_rows`: the byte ranges of `file` that each
-/// contain the offsets (see [`row_group_offset`]) of consecutive row groups
-/// of at least `min_rows` rows (fewer at the end of `file`), of the row
-/// groups `row_groups` of the file (offset and rows). The ranges cover
-/// `file` exactly, so DataFusion reads every row group of `file` in exactly
-/// one of them, whatever the row groups really are. A byte range that
-/// contains no row group (e.g. the last bytes of a file, which DataFusion
-/// assigns to a file group of their own) has no unit: it would read nothing.
+/// Push the units of `file` (a file or a byte range of a file) to `units`:
+/// the byte ranges of `file` that each contain the offsets (see
+/// [`row_group_offset`]) of consecutive row groups of at least `min_rows`
+/// rows (fewer at the end of `file`), of the row groups `row_groups` of the
+/// file (offset and rows). The ranges cover `file` exactly, so DataFusion
+/// reads every row group of `file` in exactly one of them, whatever the row
+/// groups really are. A byte range that contains no row group (e.g. the last
+/// bytes of a file, which DataFusion assigns to a file group of their own)
+/// has no unit: it would read nothing.
 fn push_row_group_units(
     units: &mut Vec<PartitionedFile>,
-    unit_rows: &mut Vec<Option<usize>>,
     file: &PartitionedFile,
     row_groups: &[(i64, usize)],
     min_rows: usize,
@@ -623,7 +619,6 @@ fn push_row_group_units(
     let (start, end) = file.range();
     let (Ok(start), Ok(end)) = (i64::try_from(start), i64::try_from(end)) else {
         units.push(file.clone());
-        unit_rows.push(None);
         return;
     };
     let mut in_range = row_groups
@@ -635,29 +630,23 @@ fn push_row_group_units(
         return;
     }
     in_range.sort_unstable();
-    // The offsets of the first row groups of the units after the first, and
-    // the rows of every unit.
+    // The offsets of the first row groups of the units after the first.
     let mut cuts = vec![];
-    let mut rows_of_units = vec![];
     let mut rows = 0;
     for (offset, row_group_rows) in in_range {
         if rows >= min_rows.max(1) {
             cuts.push(offset);
-            rows_of_units.push(rows);
             rows = 0;
         }
         rows += row_group_rows;
     }
-    rows_of_units.push(rows);
     if cuts.is_empty() {
         units.push(file.clone());
-        unit_rows.push(Some(rows));
         return;
     }
     let mut range_start = start;
-    for (range_end, rows) in cuts.into_iter().chain([end]).zip(rows_of_units) {
+    for range_end in cuts.into_iter().chain([end]) {
         units.push(file.clone().with_range(range_start, range_end));
-        unit_rows.push(Some(rows));
         range_start = range_end;
     }
 }
@@ -706,21 +695,23 @@ impl PhysicalOperator for ParquetScanSource {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
-        let (scan, unit_rows): (Arc<dyn GlobalSourceState>, Vec<Option<usize>>) =
-            match self.row_group_state(ctx)? {
-                Some((state, rows)) => (Arc::new(state), rows),
-                None => (self.scan.get_global_source_state(ctx)?, vec![]),
-            };
+        let scan: Arc<dyn GlobalSourceState> = match self.row_group_state(ctx)? {
+            Some(state) => Arc::new(state),
+            None => self.scan.get_global_source_state(ctx)?,
+        };
         // The threads of an ordered scan read their file groups in order, and
         // a limit may end a scan before its units do.
         let shares =
             self.scan.mode == FileScanMode::Shared && self.scan.config.limit.is_none();
-        let row_filters = match self.predicate.candidates.is_empty() {
+        let predicate = &self.predicate;
+        let row_filters = match predicate.candidates.is_empty()
+            && predicate.exact_native.is_empty()
+        {
             true => None,
             false => {
                 let queue =
                     downcast_state::<FileScanGlobalState>(scan.as_any(), self.name())?;
-                Some(RowFilterState::try_new(self, ctx, queue, unit_rows)?)
+                Some(RowFilterState::try_new(self, ctx, queue)?)
             }
         };
         let filter = self
@@ -997,8 +988,15 @@ enum ConjunctKind {
     /// filter if that pays off, and natively after decoding otherwise.
     Folded,
     /// A conjunct of a scan with `pushdown_filters`, which DataFusion relies
-    /// on the scan to apply: always in the row filter.
+    /// on the scan to apply (it removed the filter above the scan): the scan
+    /// evaluates it in the row filter if that pays off, and natively after
+    /// decoding otherwise, also if it does not produce its columns (see
+    /// [`RowFilterState::version_filter`]).
     Exact,
+    /// An exact conjunct of a scan that cannot decode the columns that it
+    /// does not produce (see [`ScanPredicate::widens`]): always in the row
+    /// filter.
+    Pinned,
     /// A conjunct that no row has to be filtered by: a dynamic filter, or a
     /// conjunct that DataFusion pushed into the scan to prune it, which a
     /// node above the scan evaluates. Evaluated in the row filter if that
@@ -1045,10 +1043,22 @@ struct ScanPredicate {
     pruning_only: Vec<Arc<dyn PhysicalExpr>>,
     /// The conjuncts of the folded filter, if any, in its order.
     folded: Vec<FoldedConjunct>,
-    /// Whether the row filter may reorder the candidates: not if an `Exact`
-    /// conjunct may fail, which DataFusion evaluates in the order of the
-    /// predicate.
+    /// The conjuncts that DataFusion relies on the scan to apply (see
+    /// [`ConjunctKind::Exact`]) that the row filter never evaluates (they may
+    /// fail on some rows, or are volatile), over the table schema, in the
+    /// order of the predicate: the scan evaluates them natively, after the
+    /// exact conjuncts before them (which cannot fail).
+    exact_native: Vec<Arc<dyn PhysicalExpr>>,
+    /// Whether the row filter may reorder the candidates: not if a pinned
+    /// conjunct may fail, or is volatile, which DataFusion evaluates in the
+    /// order of the predicate.
     reorder: bool,
+    /// Whether the scan may read units with a [`ParquetSource`] of its own
+    /// that decodes columns that the scan does not produce (see
+    /// [`widened_source`]), to evaluate its exact conjuncts natively: not if
+    /// its files are decrypted with an encryption factory, which that source
+    /// would not have.
+    widens: bool,
 }
 
 impl ScanPredicate {
@@ -1063,6 +1073,7 @@ impl ScanPredicate {
         };
         let mut predicate = Self {
             reorder: true,
+            widens: source.table_parquet_options().crypto.factory_id.is_none(),
             ..Self::default()
         };
         if config.limit.is_some() {
@@ -1074,29 +1085,42 @@ impl ScanPredicate {
         let exact = source.table_parquet_options().global.pushdown_filters;
         let conjuncts = source.filter();
         for conjunct in conjuncts.iter().flat_map(split_conjunction) {
-            let dynamic = conjunct.is::<DynamicFilterPhysicalExpr>();
-            let kind = match exact && !dynamic {
-                true => ConjunctKind::Exact,
-                false => ConjunctKind::Optional,
-            };
-            let infallible = dynamic
-                || (!is_dynamic(conjunct)
-                    && fallibility(conjunct, table_schema) == Fallibility::Infallible);
-            let columns = column_indices(conjunct);
-            if !can_expr_be_pushed_down_with_schemas(conjunct, pushable_schema)
-                || is_volatile(conjunct)
-                || (kind == ConjunctKind::Optional && !infallible)
-            {
+            // DataFusion's row filter does not evaluate the other conjuncts
+            // (which it does not rely on the scan for, either).
+            if !can_expr_be_pushed_down_with_schemas(conjunct, pushable_schema) {
                 predicate.pruning_only.push(Arc::clone(conjunct));
                 continue;
             }
-            if kind == ConjunctKind::Exact && !infallible {
-                predicate.reorder = false;
+            let dynamic = conjunct.is::<DynamicFilterPhysicalExpr>();
+            let kind = match (exact && !dynamic, predicate.widens) {
+                (false, _) => ConjunctKind::Optional,
+                (true, true) => ConjunctKind::Exact,
+                (true, false) => ConjunctKind::Pinned,
+            };
+            // Whether the row filter may evaluate the conjunct in any order:
+            // it neither fails on some rows nor is volatile.
+            let evaluable = !is_volatile(conjunct)
+                && (dynamic
+                    || (!is_dynamic(conjunct)
+                        && fallibility(conjunct, table_schema)
+                            == Fallibility::Infallible));
+            match kind {
+                ConjunctKind::Optional | ConjunctKind::Exact if !evaluable => {
+                    // It prunes, and the scan evaluates an exact one
+                    // natively.
+                    predicate.pruning_only.push(Arc::clone(conjunct));
+                    if kind == ConjunctKind::Exact {
+                        predicate.exact_native.push(Arc::clone(conjunct));
+                    }
+                    continue;
+                }
+                ConjunctKind::Pinned if !evaluable => predicate.reorder = false,
+                _ => {}
             }
             predicate.candidates.push(RowFilterConjunct {
                 expr: Arc::clone(conjunct),
                 kind,
-                columns,
+                columns: column_indices(conjunct),
             });
         }
         let folded = folded.map(|filter| split_conjunction(filter.predicate()));
@@ -1311,15 +1335,16 @@ impl ConjunctMeter {
 
     /// Decide where to evaluate the conjunct from the statistics of its last
     /// window: in the row filter if it rejects at least one in
-    /// [`ROW_FILTER_MIN_REJECTED`] rows (and always if the scan relies on its
-    /// row filter, see [`ConjunctKind::Exact`]), otherwise natively if it is
-    /// a folded conjunct, and not at all if it is optional.
+    /// [`ROW_FILTER_MIN_REJECTED`] rows (and always if the scan cannot
+    /// evaluate it otherwise, see [`ConjunctKind::Pinned`]), otherwise
+    /// natively if the scan must apply it (a folded or an exact conjunct),
+    /// and not at all if it is optional.
     fn decide(&self, window: &mut MeterWindow) {
         let rows = window.rows.max(1);
         let placement = match self.kind {
-            ConjunctKind::Exact => IN_ROW_FILTER,
+            ConjunctKind::Pinned => IN_ROW_FILTER,
             _ if window.rejected * ROW_FILTER_MIN_REJECTED >= rows => IN_ROW_FILTER,
-            ConjunctKind::Folded => NATIVELY,
+            ConjunctKind::Folded | ConjunctKind::Exact => NATIVELY,
             ConjunctKind::Optional => NOT_EVALUATED,
         };
         window.past_rows = window.past_rows * RANK_DECAY + window.rows as f64;
@@ -1335,13 +1360,14 @@ impl ConjunctMeter {
     }
 
     /// Whether the row filter of a version applies the conjunct to every row
-    /// (see [`RowFilterState::version_filter`]): a conjunct that DataFusion
-    /// relies on the row filter for, and a folded conjunct in the row
-    /// filter.
+    /// (see [`RowFilterState::version_filter`]): a folded or exact conjunct
+    /// in the row filter, and a pinned one.
     fn applied(&self) -> bool {
         match self.kind {
-            ConjunctKind::Exact => true,
-            ConjunctKind::Folded => self.placement() == IN_ROW_FILTER,
+            ConjunctKind::Pinned => true,
+            ConjunctKind::Folded | ConjunctKind::Exact => {
+                self.placement() == IN_ROW_FILTER
+            }
             ConjunctKind::Optional => false,
         }
     }
@@ -1394,6 +1420,15 @@ fn selected_rows(array: &BooleanArray) -> BooleanBuffer {
         Some(nulls) => array.values() & nulls.inner(),
         None => array.values().clone(),
     }
+}
+
+thread_local! {
+    /// The rows that the conjuncts of row filters rejected on this thread (see
+    /// [`RowFilterExpr`]). A thread of a scan reads the rows of its unit,
+    /// and evaluates their row filter, within its calls of
+    /// [`FileScan::get_data`], which count the rows they rejected (see
+    /// [`UnitRead::rows`]).
+    static REJECTED_ROWS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A conjunct of the predicate of a [`ParquetScanSource`] in the predicate of
@@ -1484,8 +1519,10 @@ impl PhysicalExpr for RowFilterExpr {
         let start = Instant::now();
         let value = self.expr.evaluate(batch)?;
         let nanos = elapsed_nanos(start);
-        meter.record(rows, selected_count(&value, rows)?, nanos);
+        let selected = selected_count(&value, rows)?;
+        meter.record(rows, selected, nanos);
         meter.row_filter_rows.add(rows);
+        REJECTED_ROWS.with(|rejected| rejected.set(rejected.get() + (rows - selected)));
         Ok(value)
     }
 
@@ -1572,6 +1609,14 @@ struct ScanVersion {
     filter: Option<VersionFilter>,
 }
 
+#[cfg(test)]
+impl ScanVersion {
+    /// The folded filter of the version.
+    fn version_filter_of_test(&self) -> &PhysicalFilter {
+        &self.filter.as_ref().expect("a folded filter").filter
+    }
+}
+
 /// See [`ScanVersion::filter`].
 struct VersionFilter {
     filter: Arc<PhysicalFilter>,
@@ -1584,8 +1629,8 @@ struct ScanVersions {
     /// The version with row filters, and the epoch of the meters that it was
     /// built in.
     row_filter: Option<(u64, Arc<ScanVersion>)>,
-    /// The version without row filters.
-    native: Arc<ScanVersion>,
+    /// The version without row filters, once a unit was read with it.
+    native: Option<Arc<ScanVersion>>,
 }
 
 /// The time per row of the units that a scan read with and without row
@@ -1637,12 +1682,15 @@ impl UnitTimings {
 struct UnitRead {
     /// The state that the [`FileScan`] reads the unit with: of a single unit.
     state: FileScanGlobalState,
-    /// The index of the unit.
-    index: usize,
     /// The version of the row filters that the unit is read with.
     version: Arc<ScanVersion>,
     /// When the thread claimed the unit.
     claimed: Instant,
+    /// The rows that the decoder read so far: those that it produced, and
+    /// those that its row filter rejected (but not the rows of the row groups
+    /// and pages that it pruned), whatever the unit is (row groups, byte
+    /// ranges or files) and whether the metadata of its files is cached.
+    rows: usize,
 }
 
 /// The state of the row filters of an execution of a [`ParquetScanSource`]
@@ -1657,10 +1705,8 @@ struct RowFilterState {
     decode_nanos: Vec<f64>,
     versions: Mutex<ScanVersions>,
     timings: Mutex<UnitTimings>,
-    /// The rows of every unit, if known.
-    unit_rows: Vec<Option<usize>>,
     /// Whether the scan may read units without row filters: not if it has
-    /// conjuncts that DataFusion relies on its row filter for.
+    /// pinned conjuncts (see [`ConjunctKind::Pinned`]).
     native_allowed: bool,
     /// Whether the scan reads some units in the configuration that it does
     /// not prefer (see [`EXPLORE_MIN_UNITS_PER_THREAD`]).
@@ -1668,6 +1714,22 @@ struct RowFilterState {
     /// The batch size of the decoders.
     batch_size: usize,
     metrics: RowFilterMetrics,
+    /// The metrics of the [`ParquetSource`] of the scan.
+    source_metrics: ExecutionPlanMetricsSet,
+    /// The metrics of the widened sources that the versions read units with
+    /// (see [`widened_source`]), which the metrics of the source of the scan
+    /// get once the execution ends.
+    widened_metrics: Mutex<Vec<ExecutionPlanMetricsSet>>,
+}
+
+impl Drop for RowFilterState {
+    fn drop(&mut self) {
+        for metrics in self.widened_metrics.get_mut().drain(..) {
+            for metric in metrics.clone_inner().iter() {
+                self.source_metrics.register(Arc::clone(metric));
+            }
+        }
+    }
 }
 
 impl RowFilterState {
@@ -1675,7 +1737,6 @@ impl RowFilterState {
         scan: &ParquetScanSource,
         ctx: &ExecutionContext,
         queue: &FileScanGlobalState,
-        unit_rows: Vec<Option<usize>>,
     ) -> Result<Self> {
         let config = &scan.scan.config;
         let Some(source) = config.file_source().downcast_ref::<ParquetSource>() else {
@@ -1701,9 +1762,48 @@ impl RowFilterState {
         let batch_size = config
             .batch_size
             .unwrap_or_else(|| ctx.task_ctx.session_config().batch_size());
-        // The version without row filters prunes with all conjuncts (also
-        // those of the folded filter), and evaluates the folded filter on
-        // the columns of the scan.
+        let native_allowed = predicate
+            .candidates
+            .iter()
+            .all(|candidate| candidate.kind != ConjunctKind::Pinned);
+        let units = queue.units.len();
+        Ok(Self {
+            meters,
+            epoch,
+            decode_nanos,
+            versions: Mutex::new(ScanVersions {
+                next_id: 1,
+                row_filter: None,
+                native: None,
+            }),
+            timings: Mutex::default(),
+            native_allowed,
+            explores: native_allowed
+                && units >= EXPLORE_MIN_UNITS_PER_THREAD * ctx.num_threads.max(1),
+            batch_size,
+            metrics,
+            source_metrics: source.metrics().clone(),
+            widened_metrics: Mutex::default(),
+        })
+    }
+
+    /// The version without row filters: it prunes with all conjuncts (also
+    /// those of the folded filter), and its folded filter evaluates all
+    /// conjuncts that the scan must apply (see [`Self::version_filter`]).
+    fn native_version(
+        &self,
+        scan: &ParquetScanSource,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<ScanVersion>> {
+        let mut versions = self.versions.lock();
+        if let Some(native) = &versions.native {
+            return Ok(Arc::clone(native));
+        }
+        let Some(source) = scan.config().file_source().downcast_ref::<ParquetSource>()
+        else {
+            return internal_err!("ParquetScanSource requires a ParquetSource");
+        };
+        let predicate = &scan.predicate;
         let mut native = source.clone();
         if let Some(predicate) = conjunction_opt(
             predicate
@@ -1714,45 +1814,16 @@ impl RowFilterState {
         ) {
             native = native.with_predicate(predicate);
         }
-        let native_filter = scan
-            .filter
-            .as_ref()
-            .map(|filter| {
-                Ok::<_, datafusion_common::DataFusionError>(VersionFilter {
-                    filter: Arc::clone(filter),
-                    gstate: filter.get_global_operator_state(ctx)?,
-                })
-            })
-            .transpose()?;
-        let native_allowed = predicate
-            .candidates
-            .iter()
-            .all(|candidate| candidate.kind != ConjunctKind::Exact);
-        let units = queue.units.len();
-        Ok(Self {
-            meters,
-            epoch,
-            decode_nanos,
-            versions: Mutex::new(ScanVersions {
-                next_id: 1,
-                row_filter: None,
-                native: Arc::new(ScanVersion {
-                    id: 0,
-                    file_source: native
-                        .with_pushdown_filters(false)
-                        .with_batch_size(batch_size),
-                    row_filter: false,
-                    filter: native_filter,
-                }),
-            }),
-            timings: Mutex::default(),
-            unit_rows,
-            native_allowed,
-            explores: native_allowed
-                && units >= EXPLORE_MIN_UNITS_PER_THREAD * ctx.num_threads.max(1),
-            batch_size,
-            metrics,
-        })
+        let native = native.with_pushdown_filters(false);
+        let (file_source, filter) = self.version_filter(scan, ctx, &native, &[])?;
+        let version = Arc::new(ScanVersion {
+            id: 0,
+            file_source,
+            row_filter: false,
+            filter,
+        });
+        versions.native = Some(Arc::clone(&version));
+        Ok(version)
     }
 
     /// Claim the next unit of `queue`, the units of the scan `scan`, for the
@@ -1799,25 +1870,23 @@ impl RowFilterState {
                 object_store: Arc::clone(&queue.object_store),
                 file_source: Arc::clone(&version.file_source),
             },
-            index,
             version,
             claimed: Instant::now(),
+            rows: 0,
         }))
     }
 
-    /// Record the time a thread spent on `unit`, which it finished reading.
+    /// Record the time a thread spent on `unit`, which it finished reading,
+    /// per row that it read.
     fn finish_unit(&self, unit: &UnitRead) {
-        let Some(rows) = self.unit_rows.get(unit.index).copied().flatten() else {
-            return;
-        };
-        if rows == 0 {
+        if unit.rows == 0 {
             return;
         }
         let nanos = elapsed_nanos(unit.claimed);
         let mut timings = self.timings.lock();
         match unit.version.row_filter {
-            true => timings.row_filter.record(rows, nanos),
-            false => timings.native.record(rows, nanos),
+            true => timings.row_filter.record(unit.rows, nanos),
+            false => timings.native.record(unit.rows, nanos),
         }
     }
 
@@ -1839,7 +1908,7 @@ impl RowFilterState {
             .filter(|&candidate| self.meters[candidate].placement() == IN_ROW_FILTER)
             .collect::<Vec<_>>();
         if in_row_filter.is_empty() || !self.reads_with_row_filter(unit) {
-            return Ok(Arc::clone(&self.versions.lock().native));
+            return self.native_version(scan, ctx);
         }
         let mut versions = self.versions.lock();
         if let Some((built, version)) = &versions.row_filter
@@ -1920,8 +1989,8 @@ impl RowFilterState {
             .collect::<Vec<_>>();
         // The optional conjuncts that are not in the row filter prune (and
         // are sampled again in the row filter, see
-        // `ConjunctMeter::record_passed`); the folded conjuncts that are not,
-        // the folded filter evaluates.
+        // `ConjunctMeter::record_passed`); the folded and exact conjuncts that
+        // are not, the folded filter evaluates.
         let others = (0..self.meters.len())
             .filter(|&candidate| {
                 !in_row_filter.contains(&candidate)
@@ -1976,14 +2045,23 @@ impl RowFilterState {
         })
     }
 
-    /// The source of a version of the row filters of `scan` whose row filter
-    /// applies the candidates `applied` to every row (with `source`), and
-    /// its folded filter (if `scan` has one): the other conjuncts of the
-    /// folded filter, and its projection. The decoder produces only the
-    /// columns of the scan that the folded filter reads (but not those that
-    /// only the conjuncts that the row filter applies read, which it decodes
-    /// for the row filter only), which the folded filter reads by their
-    /// positions among them.
+    /// The source that a version of the row filters of `scan` reads its units
+    /// with (`source`, with the predicate and the row filter of the version,
+    /// decoding the columns that the folded filter of the version reads), and
+    /// its folded filter, if `scan` has a folded filter or exact conjuncts
+    /// (see [`ConjunctKind::Exact`]): the required conjuncts that the row
+    /// filter does not apply to every row (it applies the candidates
+    /// `applied`), the exact ones first (which DataFusion would evaluate in
+    /// the scan, below the folded filter), and the projection of the folded
+    /// filter, over the decoded columns.
+    ///
+    /// The decoder produces the columns of the scan that the folded filter of
+    /// the version reads, but not those that only the conjuncts that the row
+    /// filter applies read (which it decodes for the row filter only), and
+    /// the columns of the table that its exact conjuncts read and that the
+    /// scan does not produce (e.g. with `pushdown_filters`, DataFusion does
+    /// not project the columns that only the conjuncts it pushed into the scan
+    /// read), with a widened source (see [`widened_source`]).
     fn version_filter(
         &self,
         scan: &ParquetScanSource,
@@ -1991,12 +2069,19 @@ impl RowFilterState {
         source: &ParquetSource,
         applied: &[usize],
     ) -> Result<(Arc<dyn FileSource>, Option<VersionFilter>)> {
-        let Some(folded) = &scan.filter else {
-            return Ok((source.with_batch_size(self.batch_size), None));
-        };
+        let predicate = &scan.predicate;
         let scan_schema = &scan.scan.schema;
-        let native = scan
-            .predicate
+        let exact = predicate
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|&(candidate, conjunct)| {
+                conjunct.kind == ConjunctKind::Exact && !applied.contains(&candidate)
+            })
+            .map(|(_, conjunct)| &conjunct.expr)
+            .chain(&predicate.exact_native)
+            .collect::<Vec<_>>();
+        let folded = predicate
             .folded
             .iter()
             .filter(|conjunct| {
@@ -2006,78 +2091,141 @@ impl RowFilterState {
             })
             .map(|conjunct| &conjunct.expr)
             .collect::<Vec<_>>();
-        let output = folded.projection().map_or_else(
-            || (0..scan_schema.fields().len()).collect::<Vec<_>>(),
-            <[usize]>::to_vec,
-        );
-        let mut decoded = output
+        if scan.filter.is_none() && exact.is_empty() {
+            return Ok((source.with_batch_size(self.batch_size), None));
+        }
+        // The columns of the scan that it outputs.
+        let outputs = match scan.filter.as_ref().and_then(|filter| filter.projection()) {
+            Some(outputs) => outputs.to_vec(),
+            None => (0..scan_schema.fields().len()).collect(),
+        };
+        let table_schema = source.table_schema().table_schema();
+        // The column of the scan that produces every column of the table as it
+        // is, if any.
+        let mut produced = vec![None; table_schema.fields().len()];
+        match source.projection() {
+            Some(projection) => {
+                for (output, expr) in projection.expr_iter().enumerate() {
+                    if let Some(column) = expr.downcast_ref::<Column>()
+                        && let Some(slot) = produced.get_mut(column.index())
+                    {
+                        slot.get_or_insert(output);
+                    }
+                }
+            }
+            None => produced
+                .iter_mut()
+                .enumerate()
+                .for_each(|(column, slot)| *slot = Some(column)),
+        }
+        let mut exact_columns = exact
+            .iter()
+            .flat_map(|expr| column_indices(expr))
+            .collect::<Vec<_>>();
+        exact_columns.sort_unstable();
+        exact_columns.dedup();
+        // The decoded columns of the scan, and the columns of the table that
+        // it does not produce.
+        let mut decoded = outputs
             .iter()
             .copied()
-            .chain(native.iter().flat_map(|expr| column_indices(expr)))
+            .chain(folded.iter().flat_map(|expr| column_indices(expr)))
+            .chain(exact_columns.iter().filter_map(|&column| produced[column]))
             .collect::<Vec<_>>();
         decoded.sort_unstable();
         decoded.dedup();
-        let narrowed = match decoded.len() < scan_schema.fields().len() {
-            true => {
-                let projection = ProjectionExprs::from_indices(&decoded, scan_schema);
-                source.try_pushdown_projection(&projection)?
-            }
-            false => None,
-        };
-        let Some(narrowed) = narrowed else {
-            // The columns of the scan.
-            let conjuncts = native.into_iter().cloned();
-            let filter = PhysicalFilter::try_new(
-                Arc::new(EmptyScanSource::new(Arc::clone(scan_schema))),
-                conjunction_opt(conjuncts).unwrap_or_else(|| lit(true)),
-                folded.projection().map(<[usize]>::to_vec),
-            )?;
-            let filter = self.checked_filter(scan, ctx, filter)?;
-            return Ok((source.with_batch_size(self.batch_size), Some(filter)));
-        };
-        // The position of every column of the scan among the decoded ones.
-        let position = |column: usize| decoded.binary_search(&column).ok();
-        let conjuncts = native
-            .into_iter()
-            .map(|expr| {
-                Arc::clone(expr)
-                    .transform(|expr| {
-                        let Some(column) = expr.downcast_ref::<Column>() else {
-                            return Ok(Transformed::no(expr));
-                        };
-                        let Some(position) = position(column.index()) else {
-                            return internal_err!("column {column} is not decoded");
-                        };
-                        let column = Column::new(column.name(), position);
-                        Ok(Transformed::yes(Arc::new(column) as _))
-                    })
-                    .data()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let Some(projection) = output
+        let extras = exact_columns
             .iter()
-            .map(|&column| position(column))
+            .copied()
+            .filter(|&column| produced[column].is_none())
+            .collect::<Vec<_>>();
+        let file_source: Arc<dyn FileSource> = match (
+            extras.is_empty(),
+            decoded.len() < scan_schema.fields().len(),
+        ) {
+            // The columns of the scan.
+            (true, false) => Arc::new(source.clone()),
+            (true, true) => {
+                let projection = ProjectionExprs::from_indices(&decoded, scan_schema);
+                match source.try_pushdown_projection(&projection)? {
+                    Some(narrowed) => narrowed,
+                    None => {
+                        return internal_err!(
+                            "ParquetSource did not take a narrowed projection"
+                        );
+                    }
+                }
+            }
+            (false, _) => {
+                let Some(projection) = source.projection() else {
+                    return internal_err!("a ParquetSource without a projection");
+                };
+                let exprs = projection.iter().collect::<Vec<_>>();
+                let projection = ProjectionExprs::new(
+                    decoded.iter().map(|&column| exprs[column].clone()).chain(
+                        extras.iter().map(|&column| {
+                            let name = table_schema.field(column).name();
+                            ProjectionExpr::new(
+                                Arc::new(Column::new(name, column)),
+                                name.clone(),
+                            )
+                        }),
+                    ),
+                );
+                let widened = widened_source(source, &projection)?;
+                self.widened_metrics.lock().push(widened.metrics().clone());
+                widened
+            }
+        };
+        let Some(decoded_projection) = file_source.projection() else {
+            return internal_err!("a ParquetSource without a projection");
+        };
+        let decoded_schema = Arc::new(decoded_projection.project_schema(table_schema)?);
+        // The positions of the columns of the scan and of the table among the
+        // decoded columns.
+        let scan_position = |column: usize| decoded.binary_search(&column).ok();
+        let table_position = |column: usize| match produced.get(column).copied().flatten()
+        {
+            Some(column) => scan_position(column),
+            None => extras
+                .binary_search(&column)
+                .ok()
+                .map(|extra| decoded.len() + extra),
+        };
+        let conjuncts = exact
+            .iter()
+            .map(|expr| decoded_columns(expr, table_position))
+            .chain(
+                folded
+                    .iter()
+                    .map(|expr| decoded_columns(expr, scan_position)),
+            )
+            .collect::<Result<Vec<_>>>()?;
+        let Some(projection) = outputs
+            .iter()
+            .map(|&column| scan_position(column))
             .collect::<Option<Vec<_>>>()
         else {
-            return internal_err!("an output column of the filter is not decoded");
+            return internal_err!("an output column of the scan is not decoded");
         };
-        let decoded_schema = Arc::new(scan_schema.project(&decoded)?);
         let filter = PhysicalFilter::try_new(
             Arc::new(EmptyScanSource::new(decoded_schema)),
             conjunction_opt(conjuncts).unwrap_or_else(|| lit(true)),
             Some(projection),
         )?;
-        if filter.schema() != scan.schema() {
+        if filter.schema() != scan.schema() && exact.is_empty() {
             // Not expected: the folded filter of the scan, on all of its
             // columns.
-            let filter = VersionFilter {
-                filter: Arc::clone(folded),
-                gstate: folded.get_global_operator_state(ctx)?,
-            };
-            return Ok((source.with_batch_size(self.batch_size), Some(filter)));
+            if let Some(folded) = &scan.filter {
+                let filter = VersionFilter {
+                    filter: Arc::clone(folded),
+                    gstate: folded.get_global_operator_state(ctx)?,
+                };
+                return Ok((source.with_batch_size(self.batch_size), Some(filter)));
+            }
         }
         let filter = self.checked_filter(scan, ctx, filter)?;
-        Ok((narrowed.with_batch_size(self.batch_size), Some(filter)))
+        Ok((file_source.with_batch_size(self.batch_size), Some(filter)))
     }
 
     /// `filter`, the folded filter of a version, with its global state.
@@ -2107,6 +2255,62 @@ impl RowFilterState {
             if meter.placement() != IN_ROW_FILTER {
                 meter.record_passed(rows);
             }
+        }
+    }
+}
+
+/// `expr` over the decoded columns: with every column at its `position`
+/// among them.
+fn decoded_columns(
+    expr: &Arc<dyn PhysicalExpr>,
+    position: impl Fn(usize) -> Option<usize>,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    Arc::clone(expr)
+        .transform(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(position) = position(column.index()) else {
+                return internal_err!("column {column} is not decoded");
+            };
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), position)) as _,
+            ))
+        })
+        .data()
+}
+
+/// A [`ParquetSource`] like `source` (with its table schema, options, file
+/// reader factory and predicate) that decodes `projection`, over the table
+/// schema, which may read columns that the projection of `source` does not
+/// produce. DataFusion can only narrow the projection of a source (see
+/// `ParquetSource::try_pushdown_projection`), so this is a new source: it has
+/// its own metrics (see [`RowFilterState::widened_metrics`]), and neither a
+/// schema provider (`ParquetSource::with_schema_provider`) nor an encryption
+/// factory of `source` (see [`ScanPredicate::widens`]), nor the order of the
+/// row groups that a sort pushed into `source` (which only matters to the
+/// pace of a TopK above the scan).
+fn widened_source(
+    source: &ParquetSource,
+    projection: &ProjectionExprs,
+) -> Result<Arc<dyn FileSource>> {
+    let options = source.table_parquet_options().clone();
+    let metadata_size_hint = options.global.metadata_size_hint;
+    let mut widened = ParquetSource::new(source.table_schema().clone())
+        .with_table_parquet_options(options);
+    if let Some(metadata_size_hint) = metadata_size_hint {
+        widened = widened.with_metadata_size_hint(metadata_size_hint);
+    }
+    if let Some(factory) = source.parquet_file_reader_factory() {
+        widened = widened.with_parquet_file_reader_factory(Arc::clone(factory));
+    }
+    if let Some(predicate) = source.filter() {
+        widened = widened.with_predicate(predicate);
+    }
+    match widened.try_pushdown_projection(projection)? {
+        Some(widened) => Ok(widened),
+        None => {
+            internal_err!("ParquetSource did not take the projection of a widened scan")
         }
     }
 }
@@ -2672,30 +2876,14 @@ mod tests {
         // The offsets (by which DataFusion assigns row groups to byte ranges)
         // and rows of the row groups of `file`, in any order.
         let row_groups = [(4000, 300), (4, 100), (2000, 200), (8000, 400)];
-        let units_and_rows = |file: &PartitionedFile, min_rows| {
+        let units = |file: &PartitionedFile, min_rows| {
             let mut units = vec![];
-            let mut rows = vec![];
-            push_row_group_units(&mut units, &mut rows, file, &row_groups, min_rows);
-            assert_eq!(units.len(), rows.len());
-            let units = units
+            push_row_group_units(&mut units, file, &row_groups, min_rows);
+            units
                 .iter()
                 .map(|unit| unit.range.as_ref().map(|range| (range.start, range.end)))
-                .collect::<Vec<_>>();
-            (units, rows)
+                .collect::<Vec<_>>()
         };
-        let units = |file: &PartitionedFile, min_rows| units_and_rows(file, min_rows).0;
-        // The rows of the units are those of their row groups.
-        let rows = |file: &PartitionedFile, min_rows| units_and_rows(file, min_rows).1;
-        assert_eq!(
-            rows(&file, 1),
-            vec![Some(100), Some(200), Some(300), Some(400)]
-        );
-        assert_eq!(rows(&file, 101), vec![Some(300), Some(300), Some(400)]);
-        assert_eq!(rows(&file, 601), vec![Some(1000)]);
-        assert_eq!(
-            rows(&file.clone().with_range(1000, 9000), 1),
-            vec![Some(200), Some(300), Some(400)]
-        );
         let every_row_group = vec![
             Some((0, 2000)),
             Some((2000, 4000)),
@@ -3557,10 +3745,16 @@ mod tests {
         optional.record_passed(RESAMPLE_ROWS);
         assert_eq!(optional.placement(), IN_ROW_FILTER);
 
-        // A conjunct that DataFusion relies on the row filter for stays there.
+        // A conjunct that DataFusion relies on the scan for (with
+        // `pushdown_filters`) is evaluated natively too if it rejects few
+        // rows; one whose columns the scan cannot decode stays in the row
+        // filter.
         let exact = meter(ConjunctKind::Exact);
         exact.record(rows, rows, 1000);
-        assert_eq!(exact.placement(), IN_ROW_FILTER);
+        assert_eq!(exact.placement(), NATIVELY);
+        let pinned = meter(ConjunctKind::Pinned);
+        pinned.record(rows, rows, 1000);
+        assert_eq!(pinned.placement(), IN_ROW_FILTER);
 
         // Every decision bumps the epoch, so that the threads build their row
         // filters again.
@@ -3862,6 +4056,237 @@ mod tests {
         let candidates =
             kinds("SELECT id FROM p WHERE year > a + 2000 AND s = 'x'").await?;
         assert_eq!(candidates.len(), 2, "{candidates:?}");
+        Ok(())
+    }
+
+    /// Read all units of `source` on a single thread, with the global state
+    /// `gstate` of an execution of `source` (see [`execution_state`]),
+    /// waiting for the reads that block. Returns the rows it produced.
+    async fn drain(
+        source: &ParquetScanSource,
+        ctx: &SessionContext,
+        gstate: &Arc<dyn GlobalSourceState>,
+    ) -> Result<Vec<RecordBatch>> {
+        let exec_ctx = ExecutionContext::new(ctx.task_ctx(), 0, 1);
+        let mut lstate = source.get_local_source_state(&exec_ctx, gstate.as_ref())?;
+        let mut batches = vec![];
+        loop {
+            match source.get_data(&exec_ctx, gstate.as_ref(), lstate.as_mut())? {
+                SourceResult::Chunk(chunk) if !chunk.is_empty() => {
+                    batches.push(chunk.into_record_batch()?);
+                }
+                SourceResult::Chunk(_) => {}
+                // The waker of the context wakes no one: poll again.
+                SourceResult::Blocked(_) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await
+                }
+                SourceResult::Finished => return Ok(batches),
+            }
+        }
+    }
+
+    /// The row filters of `gstate`, the global state of an execution of a
+    /// scan.
+    fn row_filters_of(gstate: &Arc<dyn GlobalSourceState>) -> &RowFilterState {
+        downcast_state::<ParquetScanState>(gstate.as_any(), "test")
+            .unwrap()
+            .row_filters
+            .as_ref()
+            .expect("row filters")
+    }
+
+    /// The sorted values of the first column (`Int64`) of `batches`.
+    fn first_column(batches: &[RecordBatch]) -> Vec<i64> {
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn units_are_timed_whatever_they_are() -> Result<()> {
+        // The scan times every unit per row that it read, whether its units
+        // are row groups, byte ranges or files, and whether the metadata of
+        // their files is cached.
+        let dir = tempfile::tempdir()?;
+        write_big_table(dir.path())?;
+        let ctx = SessionContext::new_with_config(test_session_config());
+        ctx.register_parquet("big", dir.path().to_str().unwrap(), Default::default())
+            .await?;
+        let sql = "SELECT k, id FROM big WHERE k % 8192 < 256";
+        let expected = (0..4 * BIG_FILE_ROWS)
+            .filter(|k| k % 8192 < 256)
+            .collect::<Vec<_>>();
+        let scan = folded_scan(&ctx, sql).await?;
+        // Byte ranges of 32 KiB (most of which hold no row group), and the
+        // files of a session that did not cache their metadata (the files are
+        // too small to be split into ranges of DataFusion's size).
+        let uncached = SessionContext::new_with_config(test_session_config());
+        for (source, session) in [
+            (
+                ParquetScanSource::try_from_config(scan.config().clone())?
+                    .with_range_bytes(32 * 1024)
+                    .try_with_filter(&filter_of(&ctx, sql).await?)?,
+                &ctx,
+            ),
+            (folded_scan(&ctx, sql).await?, &uncached),
+        ] {
+            let gstate = execution_state(&source, session, 1)?;
+            let output = drain(&source, session, &gstate).await?;
+            assert_eq!(first_column(&output), expected);
+            let row_filters = row_filters_of(&gstate);
+            let timings = row_filters.timings.lock();
+            // Every unit that read rows was timed, per row read.
+            let timed = timings.row_filter.units + timings.native.units;
+            assert!(timed >= 4, "{timed} units timed");
+            assert!(timings.row_filter.units > 0);
+            assert!(timings.row_filter.nanos_per_row() > 0.0);
+        }
+
+        // The timings drive the switch: once units without row filters took
+        // far less time per row, the scan reads its 16 units (row groups)
+        // without, but for one in 32 (unit 15), which it reads with row
+        // filters to time them again.
+        let source = folded_scan(&ctx, sql).await?.with_min_unit_rows(1);
+        let gstate = execution_state(&source, &ctx, 1)?;
+        let row_filters = row_filters_of(&gstate);
+        assert!(row_filters.explores);
+        prefer_native(row_filters);
+        let output = drain(&source, &ctx, &gstate).await?;
+        assert_eq!(first_column(&output), expected);
+        assert_eq!(metric(&source, "row_filtered_units"), 1);
+        assert_eq!(metric(&source, "natively_filtered_units"), 15);
+        Ok(())
+    }
+
+    /// Time units of `row_filters` as if those without row filters took a
+    /// millionth of the time per row of those with.
+    fn prefer_native(row_filters: &RowFilterState) {
+        let mut timings = row_filters.timings.lock();
+        for _ in 0..SWITCH_MIN_UNITS {
+            timings.row_filter.record(1000, 1_000_000_000);
+            timings.native.record(1000, 1000);
+        }
+        assert!(!timings.prefers_row_filter());
+    }
+
+    /// The `FilterExec` of the plan of `sql`.
+    async fn filter_of(ctx: &SessionContext, sql: &str) -> Result<FilterExec> {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let mut filter = None;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<FilterExec>() {
+                filter = Some(exec.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(filter.expect("a filter"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pushdown_filters_fall_back_to_native_filtering() -> Result<()> {
+        // With `pushdown_filters`, DataFusion relies on the scans to apply the
+        // filters that it pushed into them, and does not project the columns
+        // that only these filters read: here `k` and `a`. The scans still
+        // switch to filtering natively after decoding, decoding these columns
+        // too.
+        let dir = tempfile::tempdir()?;
+        write_big_table(dir.path())?;
+        let mut config = test_session_config();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        let ctx = SessionContext::new_with_config(config.clone());
+        ctx.register_parquet("big", dir.path().to_str().unwrap(), Default::default())
+            .await?;
+        let sql = "SELECT id FROM big WHERE k % 8192 < 256 AND a > -400";
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let exec = find_scan(&plan);
+        let exec = exec.downcast_ref::<DataSourceExec>().unwrap();
+        let source = ParquetScanSource::try_new(exec)?.with_min_unit_rows(1);
+        // DataFusion removed the filter, and the scan produces `id` only.
+        assert_eq!(source.schema().fields().len(), 1);
+        let kinds = source
+            .predicate
+            .candidates
+            .iter()
+            .map(|candidate| candidate.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [ConjunctKind::Exact, ConjunctKind::Exact]);
+        // The expected ids, from DataFusion's own plan.
+        let expected =
+            first_column(&datafusion_physical_plan::collect(plan, ctx.task_ctx()).await?);
+
+        // The version without row filters decodes `k` and `a` too, evaluates
+        // both conjuncts natively, and produces `id` only.
+        let gstate = execution_state(&source, &ctx, 1)?;
+        let row_filters = row_filters_of(&gstate);
+        assert!(row_filters.native_allowed && row_filters.explores);
+        let exec_ctx = ExecutionContext::new(ctx.task_ctx(), 0, 1);
+        let native = row_filters.native_version(&source, &exec_ctx)?;
+        assert!(!native.row_filter);
+        let filter = native.version_filter_of_test();
+        let decoded = filter.children()[0].schema();
+        let decoded = decoded
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, ["id", "k", "a"]);
+        assert_eq!(filter.schema(), source.schema());
+
+        // Once the units without row filters are faster, the scan reads them
+        // so (but unit 15, see `units_are_timed_whatever_they_are`), with
+        // the same results.
+        prefer_native(row_filters);
+        let output = drain(&source, &ctx, &gstate).await?;
+        assert_eq!(first_column(&output), expected);
+        assert_eq!(metric(&source, "row_filtered_units"), 1);
+        assert_eq!(metric(&source, "natively_filtered_units"), 15);
+
+        // With the row filters that it decides on, also on 4 threads (16
+        // units: one in eight is read without row filters). A new plan, for
+        // new metrics.
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let exec = find_scan(&plan);
+        let exec = exec.downcast_ref::<DataSourceExec>().unwrap();
+        let source = Arc::new(ParquetScanSource::try_new(exec)?.with_min_unit_rows(1));
+        for threads in [1, 4] {
+            let output = Executor::collect(
+                Arc::clone(&source) as Arc<dyn PhysicalOperator>,
+                ctx.task_ctx(),
+                threads,
+            )
+            .await?;
+            assert_eq!(first_column(&output), expected, "{threads} threads");
+        }
+        assert!(metric(&source, "natively_filtered_units") > 0);
+        assert!(metric(&source, "row_filtered_units") > 0);
+
+        // And through the planner, against DataFusion (also queries whose
+        // exact conjuncts may fail, which the scan evaluates natively only).
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("big", dir.path().to_str().unwrap(), Default::default())
+                .await
+        };
+        for sql in [
+            sql,
+            "SELECT id, s FROM big WHERE k % 8192 < 256",
+            "SELECT COUNT(*) FROM big WHERE a % 8 <> 0 AND c > 0",
+            "SELECT id FROM big WHERE k > 1000 AND 100000 / (k - 1000) > 50",
+            "SELECT id, k FROM big WHERE s <> 'v3' ORDER BY k DESC LIMIT 5",
+        ] {
+            for config in [config.clone(), config.clone().with_target_partitions(1)] {
+                assert_same_results(sql, config, &setup).await;
+            }
+        }
         Ok(())
     }
 }
