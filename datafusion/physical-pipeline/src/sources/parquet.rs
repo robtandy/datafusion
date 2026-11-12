@@ -56,7 +56,7 @@ const MIN_UNIT_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
 /// the threads share the work of a file by row groups: a thread that claimed
 /// a file of several row groups does not read all of them while the other
 /// threads wait for it at the end of the pipeline (the last of the threads
-/// finished as much as 40% of the time of a pipeline after the first one in
+/// finished 40% to 50% of the time of a pipeline after the first one in
 /// TPC-H SF 1 queries, whose files have three row groups), and the byte
 /// ranges of DataFusion's file groups that contain no row group (e.g. the
 /// last bytes of a file, which DataFusion assigns to the next file group)
