@@ -719,6 +719,18 @@ impl Lowering<'_> {
         if let Some(input) = scheduled_input(plan) {
             return self.lower(input);
         }
+        // A `CoalesceBatchesExec` with a fetch of a single partition is a limit
+        // of that partition (of several partitions, it limits every one).
+        if is_coalesce_batches(plan)
+            && let Some(fetch) = plan.fetch()
+            && let [input] = plan.children()[..]
+            && input.output_partitioning().partition_count() == 1
+        {
+            let input = self.lower_in(input, true)?;
+            let limit =
+                PhysicalLimit::new(input, 0, Some(fetch)).with_preserve_order(true);
+            return Ok(Arc::new(limit));
+        }
         if let Some(input) = redistributed_input(plan) {
             let lowered = self.lower(input)?;
             // DataFusion executes a bridged input anyway: keep a

@@ -274,6 +274,49 @@ mod merges_and_redistributions {
         }
     }
 
+    /// A `CoalesceBatchesExec` (which DataFusion does not plan any more) of
+    /// `input`, with a limit of `fetch` rows.
+    #[expect(deprecated)]
+    fn coalesce_batches(
+        input: Arc<dyn ExecutionPlan>,
+        fetch: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec::new(
+                input, 8192,
+            )
+            .with_fetch(fetch),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coalescings_with_a_fetch_of_a_partition_are_limits() {
+        let single = || -> Arc<dyn ExecutionPlan> {
+            let source = MemorySourceConfig::try_new(
+                &[vec![batch(0..3000), batch(3000..5000)]],
+                schema(),
+                None,
+            )
+            .unwrap();
+            datafusion_datasource::source::DataSourceExec::from_data_source(source)
+        };
+        for fetch in [1, 2047, 2049, 4000, 6000] {
+            let make_plan = || coalesce_batches(single(), Some(fetch));
+            let root = assert_plan_lowered(make_plan, test_session_config(), true).await;
+            assert!(
+                root.is::<crate::operators::limit::PhysicalLimit>(),
+                "{fetch}"
+            );
+        }
+        // Of several partitions, it limits every partition: DataFusion runs it.
+        let root = crate::planner::lower_execution_plan(&coalesce_batches(
+            sorted_scan(),
+            Some(10),
+        ))
+        .unwrap();
+        assert!(root.is::<crate::bridge::BridgeOperator>());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn repartitionings_that_preserve_the_order_or_by_range_are_removed() {
         let v = col("v", &schema()).unwrap();
