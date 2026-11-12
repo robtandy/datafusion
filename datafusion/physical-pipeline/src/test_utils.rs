@@ -154,7 +154,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, RunArray, UInt32Array,
@@ -171,8 +171,11 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow::util::pretty::pretty_format_batches;
 use arrow_ipc::writer::StreamWriter;
 use arrow_row::{RowConverter, SortField};
+use datafusion::catalog::TableProvider;
+use datafusion::catalog::streaming::StreamingTable;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{MemTable, provider_as_source};
+use datafusion::execution::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
@@ -187,7 +190,12 @@ use datafusion_expr::logical_plan::{
 };
 use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
-use datafusion_physical_plan::{ExecutionPlan, collect, displayable};
+use datafusion_physical_plan::execution_plan::reset_plan_states;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::streaming::PartitionStream;
+use datafusion_physical_plan::{
+    ExecutionPlan, SendableRecordBatchStream, collect, displayable,
+};
 use itertools::Itertools;
 
 /// The configuration of both sessions used by the harness.
@@ -1080,8 +1088,7 @@ pub struct SortedReference {
     pub fetch: Option<usize>,
     /// The ranges of sorted rows whose output columns are not computed, with
     /// the reason: the query fails on them (e.g. on a division by zero above
-    /// its `LIMIT`), or the reference stopped looking for the rows on which
-    /// it fails, or the query fails on the rows that it cannot return (whose
+    /// its `LIMIT`), or on the rows that it cannot return (whose
     /// keys cannot tie with the keys of the rows that it returns within
     /// [`SortedReference::tolerance`]: their output columns are only computed
     /// to describe differences). Results that have one of these rows differ
@@ -1143,14 +1150,8 @@ async fn sorted_reference(
         &reference.sort_options,
         tolerance,
     )?;
-    // The rows closest to the rows that the query returns first.
-    let mut closest = returnable.clone();
-    closest.sort_by_key(|&row| {
-        (row + 1)
-            .saturating_sub(window.end)
-            .max(window.start.saturating_sub(row))
-    });
-    let (mut outputs, mut failures) = reference.outputs(ctx, &sorted, &closest).await?;
+    let (mut outputs, mut failures) =
+        reference.outputs(ctx, &sorted, &returnable).await?;
     // The other rows, only to describe differences (e.g. a row out of order):
     // the query cannot return them, so it may fail on them.
     let others = {
@@ -1321,11 +1322,6 @@ const SORTED_ROWS: &str = "__test_utils_sorted_rows";
 /// columns [`ReferencePlan::compute`] computes.
 const SORTED_POSITION: &str = "__test_utils_sorted_position";
 
-/// The maximum number of times that [`ReferencePlan::outputs`] computes the
-/// output columns of sorted rows, as it looks for the rows on which the query
-/// fails: it does not compute the rows that are left.
-const MAX_OUTPUT_COMPUTATIONS: usize = 256;
-
 /// The plans of the [`SortedReference`] of a query with a top-level `ORDER BY`
 /// (see [`has_top_level_order_by`]), see [`reference_plan`].
 struct ReferencePlan {
@@ -1347,16 +1343,34 @@ struct ReferencePlan {
     window: Window,
 }
 
+/// A partition of one batch, which can be replaced from one run of a plan to
+/// the next, see [`ReferencePlan::compute_each`].
+#[derive(Debug)]
+struct Slot {
+    schema: SchemaRef,
+    batch: Mutex<RecordBatch>,
+}
+
+impl PartitionStream for Slot {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let batch = self.batch.lock().expect("the slot is not poisoned").clone();
+        Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            futures::stream::iter([Ok(batch)]),
+        ))
+    }
+}
+
 impl ReferencePlan {
     /// The output columns of the sorted rows `rows` of `sorted` (the rows of
     /// [`ReferencePlan::sort`]), each followed by its position, and the rows
-    /// whose output columns are not computed, with the reason. They are
-    /// computed for all rows at once, or, if the query fails, for each row
-    /// alone (see [`ReferencePlan::compute_each`]). If the plan of the query
-    /// does not compute each row alone, they are computed for each half of
-    /// the rows (the first rows first), down to the single rows on which it
-    /// fails, and after [`MAX_OUTPUT_COMPUTATIONS`] computations, the rows
-    /// that are left are not computed.
+    /// on which the query fails, with the error. They are computed for all
+    /// rows at once, or, if the query fails, for each row alone (see
+    /// [`ReferencePlan::compute_each`]).
     async fn outputs(
         &self,
         ctx: &SessionContext,
@@ -1371,38 +1385,7 @@ impl ReferencePlan {
         }
         // Without rows, the query must not fail: its errors come from its rows.
         self.compute(ctx, sorted, &[]).await?;
-        if let Some(outputs) = self.compute_each(ctx, sorted, rows).await? {
-            return Ok(outputs);
-        }
-        let (mut outputs, mut uncomputed) = (vec![], vec![]);
-        let (mut pending, mut computations) = (vec![rows], 0);
-        while let Some(rows) = pending.pop() {
-            if rows.is_empty() {
-                continue;
-            }
-            if computations == MAX_OUTPUT_COMPUTATIONS {
-                let reason = format!(
-                    "the query fails on some of the rows near it, and the reference \
-                     stopped looking for them after {MAX_OUTPUT_COMPUTATIONS} \
-                     computations"
-                );
-                uncomputed.extend(rows.iter().map(|&row| (row, reason.clone())));
-                continue;
-            }
-            computations += 1;
-            match self.compute(ctx, sorted, rows).await {
-                Ok(batches) => outputs.extend(batches),
-                Err(e) => {
-                    if let [row] = rows {
-                        uncomputed.push((*row, format!("the query fails on it: {e}")));
-                    } else {
-                        let (first, second) = rows.split_at(rows.len() / 2);
-                        pending.extend([second, first]);
-                    }
-                }
-            }
-        }
-        Ok((outputs, uncomputed))
+        self.compute_each(ctx, sorted, rows).await
     }
 
     /// The output columns of the sorted rows `rows` of `sorted`, each followed
@@ -1414,42 +1397,39 @@ impl ReferencePlan {
         sorted: &RecordBatch,
         rows: &[usize],
     ) -> Result<Vec<RecordBatch>> {
-        let plan = self.over(sorted, rows, false)?;
+        let batch = self.rows(sorted, rows)?;
+        let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        let plan = self.over(Arc::new(table))?;
         ctx.execute_logical_plan(plan).await?.collect().await
     }
 
-    /// The output columns of each of the sorted rows `rows` of `sorted` (each
-    /// followed by its position), or the error of the query on it. They are
-    /// computed by one plan over a partition of each row, which computes each
-    /// partition alone: `None` if the plan does not keep the partitions of
-    /// its input apart (e.g. if it joins them).
+    /// The output columns of each of the sorted rows `rows` of `sorted` alone
+    /// (each followed by its position), or the error of the query on it: one
+    /// physical plan, over a table whose rows are one row of a [`Slot`], runs
+    /// for each row.
     async fn compute_each(
         &self,
         ctx: &SessionContext,
         sorted: &RecordBatch,
         rows: &[usize],
-    ) -> Result<Option<(Vec<RecordBatch>, Vec<(usize, String)>)>> {
-        let plan = self.over(sorted, rows, true)?;
-        // A single target partition, so that the planner does not repartition
-        // the rows.
-        let config = ctx.copied_config().with_target_partitions(1);
-        let state = SessionStateBuilder::new_from_existing(ctx.state())
-            .with_config(config)
-            .build();
-        let plan = state.create_physical_plan(&plan).await?;
-        let mut node = Arc::clone(&plan);
-        while let [child] = node.children().as_slice() {
-            node = Arc::clone(child);
-        }
-        if !node.children().is_empty()
-            || plan.properties().output_partitioning().partition_count() != rows.len()
-        {
-            return Ok(None);
-        }
+    ) -> Result<(Vec<RecordBatch>, Vec<(usize, String)>)> {
+        let batch = self.rows(sorted, rows)?;
+        let slot = Arc::new(Slot {
+            schema: batch.schema(),
+            batch: Mutex::new(batch.slice(0, 0)),
+        });
+        let partition = Arc::clone(&slot) as Arc<dyn PartitionStream>;
+        let table = StreamingTable::try_new(batch.schema(), vec![partition])?;
+        let state = ctx.state();
+        let plan = state
+            .create_physical_plan(&self.over(Arc::new(table))?)
+            .await?;
         let (mut outputs, mut failures) = (vec![], vec![]);
-        for (partition, &row) in rows.iter().enumerate() {
-            let batches = match plan.execute(partition, state.task_ctx()) {
-                Ok(stream) => datafusion_physical_plan::common::collect(stream).await,
+        for (i, &row) in rows.iter().enumerate() {
+            *slot.batch.lock().expect("the slot is not poisoned") = batch.slice(i, 1);
+            // Joins keep the rows of their build side from one run to the next.
+            let batches = match reset_plan_states(Arc::clone(&plan)) {
+                Ok(plan) => collect(plan, state.task_ctx()).await,
                 Err(e) => Err(e),
             };
             match batches {
@@ -1457,18 +1437,12 @@ impl ReferencePlan {
                 Err(e) => failures.push((row, format!("the query fails on it: {e}"))),
             }
         }
-        Ok(Some((outputs, failures)))
+        Ok((outputs, failures))
     }
 
-    /// The projections and subquery aliases above the sort, over the sorted
-    /// rows `rows` of `sorted`, each followed by its position: in one
-    /// partition, or in one partition each (`each`).
-    fn over(
-        &self,
-        sorted: &RecordBatch,
-        rows: &[usize],
-        each: bool,
-    ) -> Result<LogicalPlan> {
+    /// The input columns of the sorted rows `rows` of `sorted` (named `c0`,
+    /// `c1`, …), followed by their positions ([`SORTED_POSITION`]).
+    fn rows(&self, sorted: &RecordBatch, rows: &[usize]) -> Result<RecordBatch> {
         let positions = rows
             .iter()
             .map(|&row| u32::try_from(row))
@@ -1484,21 +1458,18 @@ impl ReferencePlan {
         }
         fields.push(Field::new(SORTED_POSITION, DataType::UInt32, false));
         columns.push(Arc::new(positions) as ArrayRef);
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
-        let partitions = if each {
-            (0..batch.num_rows())
-                .map(|row| vec![batch.slice(row, 1)])
-                .collect()
-        } else {
-            vec![vec![batch.clone()]]
-        };
-        let table = MemTable::try_new(batch.schema(), partitions)?;
-        let scan = LogicalPlanBuilder::scan(
-            SORTED_ROWS,
-            provider_as_source(Arc::new(table)),
-            None,
-        )?
-        .build()?;
+        Ok(RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            columns,
+        )?)
+    }
+
+    /// The projections and subquery aliases above the sort, over the rows of
+    /// `table` (see [`ReferencePlan::rows`]).
+    fn over(&self, table: Arc<dyn TableProvider>) -> Result<LogicalPlan> {
+        let scan =
+            LogicalPlanBuilder::scan(SORTED_ROWS, provider_as_source(table), None)?
+                .build()?;
         // The columns of the input of the sort, with their qualifiers.
         let column = |name: &str| Expr::Column(Column::new(Some(SORTED_ROWS), name));
         let exprs = self
@@ -7026,6 +6997,53 @@ mod tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_find_each_row_that_fails_in_plans_that_join() {
+        // The scalar subquery joins the rows of the reference with the rows of
+        // `c`: the reference computes each row of `m` alone in a plan that joins.
+        let tables = per_engine_tables(
+            kv_int_batch(&rows_around_zeros([(1, 1), (1, 2)], [(1, 4), (1, 5)])),
+            kv_int_batch(&rows_around_zeros([(1, 4), (1, 5)], [(1, 1), (1, 2)])),
+        );
+        let setup = async |ctx: &SessionContext| {
+            tables(ctx).await?;
+            ctx.register_batch("c", int_batch(&[Some(1)]))?;
+            Ok(())
+        };
+        let sql = "SELECT 100 / v + (SELECT count(*) FROM c) AS x \
+                   FROM (SELECT v FROM m ORDER BY k LIMIT 2) t";
+        assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+
+        // The reference finds the 300 rows on which the query fails, and
+        // computes the others.
+        let ctx = datafusion_context(test_session_config());
+        let rows = rows_around_zeros([(1, 1), (1, 2)], [(1, 4), (1, 5)]);
+        ctx.register_batch("m", kv_int_batch(&rows)).unwrap();
+        ctx.register_batch("c", int_batch(&[Some(1)])).unwrap();
+        let df = ctx.sql(sql).await.unwrap();
+        let order =
+            result_order(&ctx, df.logical_plan(), &ComparisonOptions::default()).await;
+        let ResultOrder::Sorted(reference) = &order else {
+            panic!("not sorted: {order:?}");
+        };
+        let failing = reference
+            .uncomputed
+            .iter()
+            .map(|(rows, _)| rows.len())
+            .sum::<usize>();
+        assert_eq!(failing, 300, "{:?}", reference.uncomputed);
+        let x = |values: &[i64]| {
+            let x = Int64Array::from(values.to_vec());
+            vec![batch_of(vec![("x", Arc::new(x) as ArrayRef)])]
+        };
+        same_results(x(&[101, 51]), x(&[26, 21]), &order).unwrap();
+        let err = same_results(x(&[101, 51]), x(&[26, 26]), &order).unwrap_err();
+        assert!(
+            err.starts_with("row 1 of the pipeline engine differs"),
+            "{err}"
+        );
+    }
+
     /// A batch of `(k DOUBLE, id BIGINT)` rows.
     fn k_id_batch(rows: &[(f64, i64)]) -> RecordBatch {
         batch_of(vec![
@@ -7143,6 +7161,7 @@ mod tests {
             per_engine_tables(rows(&[(1, 0.5), (2, 0.5)]), rows(&[(2, 0.5), (1, 0.5)]));
         for sql in [
             "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1) s ORDER BY id",
+            "SELECT id AS v FROM (SELECT id FROM m ORDER BY k LIMIT 1) s ORDER BY v",
             "SELECT id FROM (SELECT id FROM m ORDER BY k LIMIT 1) s WHERE id > 0",
             "SELECT sum(id) AS total FROM (SELECT id FROM m ORDER BY k LIMIT 1) s",
             "SELECT id FROM m WHERE id IN (SELECT id FROM m ORDER BY k LIMIT 1)",
@@ -7150,6 +7169,15 @@ mod tests {
         ] {
             assert_same_results_as_datafusion_with_setup(sql, &setup).await;
         }
+        let setup = per_engine_tables(
+            kv_int_batch(&[(0, 1), (0, 2)]),
+            kv_int_batch(&[(0, 2), (0, 1)]),
+        );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT v FROM (SELECT v FROM m ORDER BY k LIMIT 1) s ORDER BY v",
+            &setup,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
