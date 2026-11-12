@@ -326,6 +326,7 @@ impl PhysicalOperator for MemoryDmlSource {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     use arrow::array::{Int64Array, StringArray};
@@ -422,14 +423,19 @@ mod tests {
         assert_eq!(count::<MemoryDmlSource>(&root), 1);
         // A scan holds the lock of the last partition.
         let scan = table.batches[2].read().await;
-        let delete = tokio::spawn({
-            let ctx = ctx.clone();
-            async move { ctx.sql("DELETE FROM t WHERE v > 5").await?.collect().await }
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!delete.is_finished());
-        drop(scan);
-        let count = delete.await.unwrap()?;
+        let finished = AtomicBool::new(false);
+        let delete = async {
+            let count = ctx.sql("DELETE FROM t WHERE v > 5").await?.collect().await;
+            finished.store(true, AtomicOrdering::SeqCst);
+            count
+        };
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!finished.load(AtomicOrdering::SeqCst));
+            drop(scan);
+        };
+        let (count, ()) = futures::join!(delete, release);
+        let count = count?;
         let count = count[0]
             .column(0)
             .as_any()

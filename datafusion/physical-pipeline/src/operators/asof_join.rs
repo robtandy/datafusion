@@ -704,6 +704,11 @@ mod tests {
             // Ordered, and below an aggregation.
             "SELECT t.id, t.sym, q.price FROM trades t ASOF JOIN quotes q \
              MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym ORDER BY t.id",
+            // In the order of the left input, which DataFusion sorts for the
+            // join (and does not sort again).
+            "SELECT t.sym, t.ts, q.price FROM trades t ASOF JOIN quotes q \
+             MATCH_CONDITION (t.ts >= q.ts) ON t.sym = q.sym \
+             WHERE t.ts IS NOT NULL AND t.sym IS NOT NULL ORDER BY t.sym, t.ts",
             "SELECT q.price IS NULL AS unmatched, COUNT(*) AS n FROM trades t \
              ASOF JOIN quotes q MATCH_CONDITION (t.ts <= q.ts) ON t.sym = q.sym \
              GROUP BY q.price IS NULL",

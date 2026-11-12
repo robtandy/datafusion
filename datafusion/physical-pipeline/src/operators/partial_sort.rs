@@ -281,7 +281,7 @@ pub(crate) fn partitions_of(
     if let Some(scan) = plan.downcast_ref::<DataSourceExec>() {
         let source = scan.data_source();
         if let Some(memory) = source.downcast_ref::<MemorySourceConfig>() {
-            return memory_partitions(memory, plan.schema()).map(Some);
+            return memory_partitions(memory, &plan.schema()).map(Some);
         }
         if let Some(files) = source.downcast_ref::<FileScanConfig>() {
             let partitions = files
@@ -343,7 +343,7 @@ fn is_coalesce_batches(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// `schema`: every one scans the (projected) batches of its partition.
 fn memory_partitions(
     config: &MemorySourceConfig,
-    schema: SchemaRef,
+    schema: &SchemaRef,
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
     config
         .partitions()
@@ -357,7 +357,7 @@ fn memory_partitions(
                 None => batches.clone(),
             };
             let partition =
-                MemorySourceConfig::try_new(&[batches], Arc::clone(&schema), None)?
+                MemorySourceConfig::try_new(&[batches], Arc::clone(schema), None)?
                     .with_limit(config.fetch())
                     .with_show_sizes(config.show_sizes())
                     .try_with_sort_information(config.sort_information().to_vec())?;
