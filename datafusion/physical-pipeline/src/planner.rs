@@ -259,7 +259,7 @@ use crate::operators::materialized_cte::{
     hoist_materialized_ctes,
 };
 use crate::operators::partial_sort::{
-    LimitedPartitions, PhysicalPartialSort, limited_partitions_of,
+    PhysicalPartialSort, first_rows_of_merged_partitions,
 };
 use crate::operators::partitioned_topk::PhysicalPartitionedTopK;
 use crate::operators::piecewise_merge_join::nested_loop_join_of;
@@ -733,7 +733,7 @@ impl Lowering<'_> {
         if let Some(sort) = PhysicalPartialSort::try_lower(plan, |input| {
             self.lower_in(input, early_stop)
         })? {
-            return Ok(Arc::new(sort));
+            return Ok(sort);
         }
         // A sink reads all of its input.
         if let Some(sink) =
@@ -1154,7 +1154,7 @@ impl Lowering<'_> {
     ///
     /// A merge of `PartialSortExec`s that keep the first rows of every
     /// partition is lowered as the TopK of their input if it keeps at most
-    /// these rows, and not at all otherwise (see [`limited_partitions_of`]).
+    /// these rows (see [`first_rows_of_merged_partitions`]).
     fn try_lower_merge(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
@@ -1164,11 +1164,8 @@ impl Lowering<'_> {
         };
         // The merge of partial sorts that keep the first rows of every
         // partition, of at most these rows, is the TopK of their input.
-        let (input, ordering) = match limited_partitions_of(merge) {
-            Some(LimitedPartitions::FirstRows { input, ordering }) => {
-                (input, ordering.clone())
-            }
-            Some(LimitedPartitions::PartitionRows) => return Ok(None),
+        let (input, ordering) = match first_rows_of_merged_partitions(merge) {
+            Some((input, ordering)) => (input, ordering.clone()),
             None => (merge.input(), merge.expr().clone()),
         };
         let sort =
