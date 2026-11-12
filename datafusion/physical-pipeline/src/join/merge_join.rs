@@ -100,10 +100,12 @@
 //! nested key) is a zero, the keys or values after it are sorted for either
 //! sign, not for both (e.g. `(-0.0, 5)` comes before `(+0.0, 1)`). The join
 //! sorts such runs of buffered rows by its keys as they come (it joins those
-//! that no row still to come comes before, so that a run of `+0.0` does not
-//! wait for its end), and the streamed rows of such a run (which keep their
-//! order) find the buffered rows of their keys from where the run started (see
-//! `ZeroRuns`).
+//! that no row still to come comes before: those up to a row without a zero of
+//! the sign that comes first in the order of its key, so that a run of `+0.0`
+//! of an ascending key, or of `-0.0` of a descending one, does not wait for
+//! its end; the rows of a run of the other sign wait for a row after them),
+//! and the streamed rows of such a run (which keep their order) find the
+//! buffered rows of their keys from where the run started (see `ZeroRuns`).
 //!
 //! Join keys are equal with DataFusion's join key equality: `-0.0 = +0.0`,
 //! NaNs with the same bits are equal, and NULLs are equal only with
@@ -2017,6 +2019,9 @@ struct MergeJoinSpec {
     /// which `-0.0` is `+0.0`) where such a key is (or has) a zero (see
     /// [`ZeroRuns`]).
     zero_keys: Vec<usize>,
+    /// For every key, whether the inputs are sorted by it in descending
+    /// order.
+    descending: Vec<bool>,
 }
 
 impl MergeJoinSpec {
@@ -2127,6 +2132,10 @@ impl MergeJoinSpec {
             key_fields,
             widths,
             zero_keys,
+            descending: sort_options
+                .iter()
+                .map(|options| options.descending)
+                .collect(),
         })
     }
 
@@ -3050,24 +3059,28 @@ impl BufferedWindow {
         }
         self.take_rows(batch.slice(start, batch.num_rows() - start), held, spec)?;
         // The rows still to come do not come before the last row if it has no
-        // `-0.0` (they come after it in the order of the input, and are equal
-        // or later once `-0.0` is `+0.0`): the held rows up to it are joined
-        // now, so that a run of `+0.0` does not wait for the rows after it.
+        // zero of the sign that comes first in the order of its key (`-0.0` if
+        // ascending, `+0.0` if descending), which a later row could have with
+        // the other sign: they come after it in the order of the input, and
+        // are equal or later once `-0.0` is `+0.0`. The held rows up to it are
+        // joined now, so that a run of `+0.0` (if ascending) does not wait for
+        // the rows after it.
         if held {
             let last = batch.slice(batch.num_rows() - 1, 1);
             let raw = evaluate_expressions_to_arrays(
                 &spec.buffered_keys().collect::<Vec<_>>(),
                 &last,
             )?;
-            let negative = spec.zero_keys.iter().any(|&key| {
+            let flips = spec.zero_keys.iter().any(|&key| {
+                let negative = !spec.descending.get(key).copied().unwrap_or_default();
                 raw.get(key).is_some_and(|key| {
-                    negative_zero_rows(key.as_ref())
+                    signed_zero_rows(key.as_ref(), negative)
                         .first()
                         .copied()
                         .unwrap_or_default()
                 })
             });
-            if !negative {
+            if !flips {
                 let keys = evaluate_keys(spec.buffered_keys(), &last)?;
                 let bound = self.converter.convert_columns(&keys)?.row(0).owned();
                 self.release_pending(bound.row(), spec)?;
@@ -3351,29 +3364,39 @@ fn zero_rows(array: &dyn Array) -> Vec<bool> {
 }
 
 /// For every row of `array`, a key as its input has it: whether it is a
-/// float `-0.0`, or has one (in a struct, a list, or a dictionary value).
-fn negative_zero_rows(array: &dyn Array) -> Vec<bool> {
+/// float zero with a negative sign if `negative` (`-0.0`), a positive one
+/// otherwise (`+0.0`), or has one (in a struct, a list, or a dictionary
+/// value).
+fn signed_zero_rows(array: &dyn Array, negative: bool) -> Vec<bool> {
     let rows = array.len();
     match array.data_type() {
         DataType::Float16 => array
             .as_primitive::<Float16Type>()
             .iter()
-            .map(|value| value.is_some_and(|v| v.to_f32() == 0.0 && v.is_sign_negative()))
+            .map(|value| {
+                value.is_some_and(|v| {
+                    v.to_f32() == 0.0 && v.is_sign_negative() == negative
+                })
+            })
             .collect(),
         DataType::Float32 => array
             .as_primitive::<Float32Type>()
             .iter()
-            .map(|value| value.is_some_and(|v| v == 0.0 && v.is_sign_negative()))
+            .map(|value| {
+                value.is_some_and(|v| v == 0.0 && v.is_sign_negative() == negative)
+            })
             .collect(),
         DataType::Float64 => array
             .as_primitive::<Float64Type>()
             .iter()
-            .map(|value| value.is_some_and(|v| v == 0.0 && v.is_sign_negative()))
+            .map(|value| {
+                value.is_some_and(|v| v == 0.0 && v.is_sign_negative() == negative)
+            })
             .collect(),
         DataType::Struct(_) => {
             let mut zeros = vec![false; rows];
             for column in array.as_struct().columns() {
-                let column_zeros = negative_zero_rows(column.as_ref());
+                let column_zeros = signed_zero_rows(column.as_ref(), negative);
                 for (zero, column_zero) in zeros.iter_mut().zip(column_zeros) {
                     *zero |= column_zero;
                 }
@@ -3382,7 +3405,7 @@ fn negative_zero_rows(array: &dyn Array) -> Vec<bool> {
         }
         DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
             let (values, ranges) = list_ranges(array);
-            let values = negative_zero_rows(values.as_ref());
+            let values = signed_zero_rows(values.as_ref(), negative);
             ranges
                 .into_iter()
                 .map(|(start, end)| {
@@ -3394,7 +3417,7 @@ fn negative_zero_rows(array: &dyn Array) -> Vec<bool> {
         }
         DataType::Dictionary(_, _) => {
             let dictionary = array.as_any_dictionary();
-            let values = negative_zero_rows(dictionary.values().as_ref());
+            let values = signed_zero_rows(dictionary.values().as_ref(), negative);
             dictionary
                 .normalized_keys()
                 .into_iter()
@@ -5399,7 +5422,25 @@ pub(crate) mod tests {
             ),
             (&[(0.0, 1), (0.0, 5)], &[(-0.0, 5), (-0.0, 9), (0.0, 1)]),
         ];
-        for (left_rows, right_rows) in cases {
+        // The rows of a case in the order of their keys, ascending or descending
+        // (in which `+0.0` comes before `-0.0`).
+        let sorted = |rows: &[(f64, i32)], descending: bool| {
+            let mut rows = rows.to_vec();
+            rows.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            if descending {
+                rows.reverse();
+            }
+            rows
+        };
+        for ((left_rows, right_rows), descending) in cases
+            .into_iter()
+            .flat_map(|case| [(case, false), (case, true)])
+        {
+            let (left_rows, right_rows) = (
+                &sorted(left_rows, descending)[..],
+                &sorted(right_rows, descending)[..],
+            );
+            let options = SortOptions::new(descending, true);
             for join_type in [
                 JoinType::Inner,
                 JoinType::Left,
@@ -5409,16 +5450,17 @@ pub(crate) mod tests {
                 JoinType::RightSemi,
                 JoinType::RightAnti,
             ] {
-                let context = format!("{join_type} {left_rows:?} {right_rows:?}");
+                let context =
+                    format!("{join_type} {left_rows:?} {right_rows:?} {descending}");
                 let order = |side: &str| {
                     LexOrdering::new([
                         PhysicalSortExpr::new(
                             col(&format!("{side}a"), &schema(side)).unwrap(),
-                            SortOptions::new(false, true),
+                            options,
                         ),
                         PhysicalSortExpr::new(
                             col(&format!("{side}b"), &schema(side)).unwrap(),
-                            SortOptions::new(false, true),
+                            options,
                         ),
                     ])
                     .unwrap()
@@ -5513,7 +5555,7 @@ pub(crate) mod tests {
                             on,
                             None,
                             join_type,
-                            vec![SortOptions::new(false, true); 2],
+                            vec![options; 2],
                             NullEquality::NullEqualsNothing,
                         )?);
                     let root = lower_join(&plan, false)?;
