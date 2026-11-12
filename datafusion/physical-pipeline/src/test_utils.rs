@@ -33,7 +33,8 @@
 //!    the plans and for every batch of the pipeline engine.
 //! 3. the rows are the same:
 //!    * as a multiset if the query has no top-level `ORDER BY` (see
-//!      [`has_top_level_order_by`]);
+//!      [`has_top_level_order_by`], which also sees the `ORDER BY` that a
+//!      `DISTINCT ON` absorbs);
 //!    * in order if it has one: the result must be the rows that the query
 //!      returns from an order of all its rows in which a row is only out of
 //!      DataFusion's order relative to rows that it ties with. The keys are
@@ -186,9 +187,9 @@ use datafusion_common::{
     not_impl_err,
 };
 use datafusion_expr::logical_plan::{
-    Distinct, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
+    Distinct, DistinctOn, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
 };
-use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -261,6 +262,8 @@ async fn run_dataframe(ctx: &SessionContext, df: DataFrame) -> Result<EngineOutp
 pub fn has_top_level_order_by(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Sort(_) => true,
+        // `DISTINCT ON` absorbs the `ORDER BY` of its query.
+        LogicalPlan::Distinct(Distinct::On(distinct)) => distinct.sort_expr.is_some(),
         LogicalPlan::Projection(_)
         | LogicalPlan::Limit(_)
         | LogicalPlan::SubqueryAlias(_) => plan
@@ -934,8 +937,12 @@ fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
         {
             below = below.inputs()[0];
         }
-        if let LogicalPlan::Sort(sort) = below {
-            below = sort.input.as_ref();
+        match below {
+            LogicalPlan::Sort(sort) => below = sort.input.as_ref(),
+            LogicalPlan::Distinct(Distinct::On(distinct)) => {
+                below = distinct.input.as_ref()
+            }
+            _ => {}
         }
     }
     let mut limits = vec![];
@@ -1561,6 +1568,62 @@ fn reference_plan(plan: &LogicalPlan, state: &SessionState) -> Result<ReferenceP
                 window: Window {
                     skip: 0,
                     fetch: sort.fetch,
+                },
+            })
+        }
+        LogicalPlan::Distinct(Distinct::On(distinct)) if distinct.sort_expr.is_some() => {
+            // DataFusion orders the rows of `DISTINCT ON` by the expressions of
+            // its `ORDER BY` that are its `ON` expressions.
+            let sort_expr = distinct.sort_expr.as_deref().unwrap_or_default();
+            let order = &sort_expr[..distinct.on_expr.len().min(sort_expr.len())];
+            let volatile = volatile_columns(&distinct.input);
+            let schema = distinct.input.schema();
+            let keys = order
+                .iter()
+                .take_while(|sort_expr| {
+                    !depends_on_volatile(&sort_expr.expr, schema, &volatile)
+                })
+                .collect::<Vec<_>>();
+            let mut select = distinct.select_expr.clone();
+            select.extend(
+                keys.iter()
+                    .enumerate()
+                    .map(|(i, key)| key.expr.clone().alias(key_column(i))),
+            );
+            let with_keys = DistinctOn::try_new(
+                distinct.on_expr.clone(),
+                select,
+                distinct.sort_expr.clone(),
+                Arc::clone(&distinct.input),
+            )?;
+            let sorted = LogicalPlan::Sort(Sort {
+                expr: keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| SortExpr {
+                        expr: Expr::Column(Column::from_name(key_column(i))),
+                        asc: key.asc,
+                        nulls_first: key.nulls_first,
+                    })
+                    .collect(),
+                input: Arc::new(LogicalPlan::Distinct(Distinct::On(with_keys))),
+                fetch: None,
+            });
+            Ok(ReferencePlan {
+                sort: sorted,
+                input: Arc::clone(&distinct.schema),
+                keys: keys.iter().map(|key| key.expr.to_string()).collect(),
+                sort_options: keys
+                    .iter()
+                    .map(|key| SortOptions {
+                        descending: !key.asc,
+                        nulls_first: key.nulls_first,
+                    })
+                    .collect(),
+                above: vec![],
+                window: Window {
+                    skip: 0,
+                    fetch: None,
                 },
             })
         }
@@ -7042,6 +7105,45 @@ mod tests {
             err.starts_with("row 1 of the pipeline engine differs"),
             "{err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_compare_the_rows_of_distinct_on_in_their_order() -> Result<()> {
+        // `DISTINCT ON` absorbs the `ORDER BY` of its query.
+        let sql = "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k DESC, v";
+        let order = order_over(&[(1, 10), (2, 20), (3, 30)], sql).await?;
+        assert!(matches!(order, ResultOrder::Sorted(_)), "{order:?}");
+        let rows = |rows: &[(i32, i32)]| vec![kv_int_batch(rows)];
+        let sorted = [(3, 30), (2, 20), (1, 10)];
+        same_results(rows(&sorted), rows(&sorted), &order).unwrap();
+        let err = same_results(rows(&sorted), rows(&[(1, 10), (2, 20), (3, 30)]), &order)
+            .unwrap_err();
+        assert!(
+            err.starts_with("row 0 of the pipeline engine is out of order"),
+            "{err}"
+        );
+        let order =
+            order_over(&[(1, 10), (2, 20), (3, 30)], &format!("{sql} LIMIT 2")).await?;
+        let err = same_results(rows(&sorted[..2]), rows(&[(2, 20), (3, 30)]), &order)
+            .unwrap_err();
+        assert!(
+            err.starts_with("row 0 of the pipeline engine is out of order"),
+            "{err}"
+        );
+
+        // End to end, of several rows of each key.
+        let setup = per_engine_tables(
+            kv_int_batch(&[(1, 10), (1, 5), (2, 20), (3, 30), (3, 1)]),
+            kv_int_batch(&[(3, 1), (3, 30), (2, 20), (1, 5), (1, 10)]),
+        );
+        for sql in [
+            sql,
+            "SELECT DISTINCT ON (k) k, v FROM m ORDER BY k, v DESC LIMIT 2",
+            "SELECT v FROM (SELECT DISTINCT ON (k) k, v FROM m ORDER BY k DESC, v) s",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+        Ok(())
     }
 
     /// A batch of `(k DOUBLE, id BIGINT)` rows.
