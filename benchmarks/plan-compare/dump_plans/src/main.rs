@@ -19,8 +19,13 @@
 //!
 //! ```text
 //! cargo run --locked --manifest-path benchmarks/plan-compare/dump_plans/Cargo.toml -- \
-//!     [--data-dir DIR] [--queries FILE] [--out DIR] [--threads N] [--full]
+//!     [--data-dir DIR] [--queries FILE] [--out DIR] [--threads N] [--full] [--set KEY=VALUE]...
 //! ```
+//!
+//! `--set` sets an option of the session (e.g.
+//! `--set datafusion.sql_parser.dialect=PostgreSQL`), to dump the plans of
+//! other configurations; the plans of `pipeline/` are those of the
+//! benchmark's configuration, without `--set`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +63,8 @@ struct Args {
     out: PathBuf,
     threads: usize,
     full: bool,
+    /// The options of the session to set: `(key, value)`.
+    options: Vec<(String, String)>,
 }
 
 impl Args {
@@ -73,6 +80,7 @@ impl Args {
             out: here.join("pipeline"),
             threads: 16,
             full: false,
+            options: vec![],
         };
         let mut argv = std::env::args().skip(1);
         while let Some(arg) = argv.next() {
@@ -93,10 +101,19 @@ impl Args {
                     })?
                 }
                 "--full" => args.full = true,
+                "--set" => {
+                    let option = value()?;
+                    let (key, value) = option.split_once('=').ok_or_else(|| {
+                        DataFusionError::Configuration(format!(
+                            "--set needs KEY=VALUE, not {option}"
+                        ))
+                    })?;
+                    args.options.push((key.to_string(), value.to_string()));
+                }
                 _ => {
                     return Err(DataFusionError::Configuration(format!(
                         "unknown argument {arg}: [--data-dir DIR] [--queries FILE] \
-                         [--out DIR] [--threads N] [--full]"
+                         [--out DIR] [--threads N] [--full] [--set KEY=VALUE]..."
                     )));
                 }
             }
@@ -148,17 +165,23 @@ fn parse_queries(script: &str) -> Result<Vec<(String, String)>> {
 /// benchmark (`BenchConfig::session_config` and `pipeline_context` of
 /// `src/test_utils.rs`): `threads` target partitions, trusting DataFusion's
 /// built-in scalar and aggregate functions, planned by `PipelineQueryPlanner`
-/// over DataFusion's default planner; with profiling on.
-fn session_context(threads: usize) -> SessionContext {
+/// over DataFusion's default planner; with profiling on, and `options`.
+fn session_context(
+    threads: usize,
+    options: &[(String, String)],
+) -> Result<SessionContext> {
     let trusted = TrustedFunctions::new(&datafusion::functions::all_default_functions());
     let aggregates = PhysicalHashAggregate::trusted_aggregate_functions(
         &datafusion::functions_aggregate::all_default_aggregate_functions(),
     );
-    let config = SessionConfig::new()
+    let mut config = SessionConfig::new()
         .with_target_partitions(threads)
         .with_option_extension(trusted)
         .with_option_extension(aggregates)
         .with_option_extension(ProfilingOptions::new(true));
+    for (key, value) in options {
+        config.options_mut().set(key, value)?;
+    }
     let planner = PipelineQueryPlanner::new(Arc::new(DefaultPhysicalPlanner::default()));
     let state = SessionStateBuilder::new()
         .with_config(config)
@@ -166,7 +189,7 @@ fn session_context(threads: usize) -> SessionContext {
         .with_default_features()
         .with_query_planner(Arc::new(planner))
         .build();
-    SessionContext::new_with_state(state)
+    Ok(SessionContext::new_with_state(state))
 }
 
 /// Keep `fields` of the JSON object `value`, in their order in the dump.
@@ -264,7 +287,7 @@ fn relative_paths(dump: &mut Value, data_dir: &str) {
 }
 
 async fn run(args: &Args) -> Result<()> {
-    let ctx = session_context(args.threads);
+    let ctx = session_context(args.threads, &args.options)?;
     let data_dir = std::fs::canonicalize(&args.data_dir).map_err(|error| {
         DataFusionError::Configuration(format!(
             "no data directory {}: run materialize.sh ({error})",
