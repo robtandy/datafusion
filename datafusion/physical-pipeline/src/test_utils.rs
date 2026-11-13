@@ -96,7 +96,9 @@
 //! show which rows its nested limits returned, which may be any rows that
 //! they may return. Otherwise (e.g. for an aggregate over them), one physical
 //! plan of the query runs for up to 20,000 choices of their rows, of one or
-//! several at once. Each occurrence of a nested limit may return other rows.
+//! several at once. Each occurrence of a nested limit may return other rows,
+//! and the rows that a nested limit may return also depend on the rows of the
+//! nested limits inside it: they are found for each choice of those rows.
 //!
 //! Queries must still define their results: no `LIMIT` without `ORDER BY`,
 //! and no aggregates that depend on the order of their input without an
@@ -159,6 +161,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
@@ -1138,26 +1141,62 @@ impl NestedLimit {
     }
 
     /// Up to `max` choices of the rows that the node may return (each the
-    /// positions of the rows, in their order), of the rows `pool` only (all
-    /// rows if `None`), but for the rows that DataFusion returns.
-    fn choices(&self, pool: Option<&BTreeSet<usize>>, max: usize) -> Vec<Vec<usize>> {
+    /// positions of the rows, in their order), but for the rows that
+    /// DataFusion returns: of the rows `required` and `optional` only (all
+    /// rows if `None`), with as many rows of `required` as they may have, first.
+    fn choices(
+        &self,
+        pools: Option<(&BTreeSet<usize>, &BTreeSet<usize>)>,
+        max: usize,
+    ) -> Vec<Vec<usize>> {
         let own = self.own();
-        let allowed = |row: &usize| pool.is_none_or(|pool| pool.contains(row));
         match &self.kind {
-            NestedKind::Limit { sorted, .. } => match pool {
-                None => window_choices(sorted, max),
-                Some(pool) => pool
-                    .iter()
-                    .copied()
-                    .combinations(sorted.window.len())
-                    .take(100_000)
-                    .filter(|choice| *choice != own && is_window_choice(sorted, choice))
-                    .take(max)
-                    .collect(),
-            },
+            NestedKind::Limit { sorted, .. } => {
+                let Some((required, optional)) = pools else {
+                    return window_choices(sorted, max);
+                };
+                let size = sorted.window.len();
+                let mut choices = vec![];
+                for count in (0..=required.len().min(size)).rev() {
+                    for chosen in required.iter().copied().combinations(count).take(4096)
+                    {
+                        for rest in optional
+                            .iter()
+                            .copied()
+                            .filter(|row| !chosen.contains(row))
+                            .combinations(size - count)
+                            .take(4096)
+                        {
+                            let mut choice =
+                                chosen.iter().copied().chain(rest).collect::<Vec<_>>();
+                            choice.sort_unstable();
+                            if choice != own && is_window_choice(sorted, &choice) {
+                                choices.push(choice);
+                                if choices.len() == max {
+                                    return choices;
+                                }
+                                // One completion of these rows is enough.
+                                break;
+                            }
+                        }
+                    }
+                }
+                choices
+            }
             NestedKind::DistinctOn { groups, .. } => groups
                 .iter()
-                .map(|group| group.iter().copied().filter(allowed).collect::<Vec<_>>())
+                .map(|group| match pools {
+                    None => group.clone(),
+                    // The rows of `required` first.
+                    Some((required, optional)) => group
+                        .iter()
+                        .copied()
+                        .filter(|row| required.contains(row))
+                        .chain(group.iter().copied().filter(|row| {
+                            !required.contains(row) && optional.contains(row)
+                        }))
+                        .collect(),
+                })
                 .multi_cartesian_product()
                 .filter(|choice| *choice != own)
                 .take(max)
@@ -1200,105 +1239,237 @@ pub async fn alternative_outcomes(
     result: &EngineOutput,
 ) -> Vec<(EngineOutput, ResultOrder)> {
     let tolerance = options.float_tolerance;
+    // Each occurrence, if the rows that it may return are known.
     let mut nested = vec![];
-    for limit in nested_limits(plan) {
-        if let Ok(limit) = NestedLimit::new(ctx, limit, tolerance).await {
-            nested.push(limit);
-        }
+    for occurrence in nested_limits(plan) {
+        nested.push(
+            possible_outputs(ctx, occurrence, tolerance, MAX_CHOICE_RUNS)
+                .await
+                .ok(),
+        );
     }
-    if nested.is_empty() {
+    if nested.iter().all(Option::is_none) {
         return vec![];
     }
-    let run = async |choices: &[Vec<usize>]| {
-        let rows = nested
-            .iter()
-            .zip(choices)
-            .map(|(limit, choice)| limit.rows(choice, None))
-            .collect::<Result<Vec<_>>>()?;
-        let replaced = replace_nested_limits(plan, &mut |i, _| rows.get(i).cloned())?;
+    // The query, with the chosen rows in place of each occurrence.
+    let run = async |chosen: &[Option<&Rows>]| {
+        let mut replacements = vec![];
+        for (entry, rows) in nested.iter().zip(chosen) {
+            replacements.push(match (entry, rows) {
+                (Some(possible), Some(rows)) => {
+                    let batch =
+                        rows_batch((*rows).clone(), &possible.limit.row_fields())?;
+                    let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+                    Some(possible.limit.plan_over(Arc::new(table), None)?)
+                }
+                _ => None,
+            });
+        }
+        let replaced = replace_nested_limits(plan, &mut |i, _| {
+            replacements.get(i).cloned().flatten()
+        })?;
         let output =
             run_dataframe(ctx, DataFrame::new(ctx.state(), replaced.clone())).await?;
         let order = result_order(ctx, &replaced, options).await;
         Ok::<_, DataFusionError>((output, order))
     };
-    match lineage_choices(ctx, plan, &nested, result, tolerance).await {
-        // The rows of the result show the rows of the nested limits (maybe in
-        // several ways, if rows of other keys have equal values).
-        Some(shown) => {
-            let mut alternatives = vec![];
-            for choices in shown {
-                if let Ok(alternative) = run(&choices).await {
-                    alternatives.push(alternative);
-                }
+    let mut alternatives = vec![];
+    // The rows of the result show the rows of the nested limits (maybe in
+    // several ways, if rows of other keys have equal values), unless rows of
+    // nested limits inside them decide which rows they may return.
+    let traced = nested
+        .iter()
+        .map(|entry| {
+            entry
+                .as_ref()
+                .filter(|possible| possible.traced)
+                .map(|possible| &possible.limit)
+        })
+        .collect::<Option<Vec<_>>>();
+    if let Some(limits) = traced
+        && let Some(shown) = lineage_choices(ctx, plan, &limits, result, tolerance).await
+    {
+        for choices in shown {
+            let Ok(rows) = limits
+                .iter()
+                .zip(&choices)
+                .map(|(limit, choice)| limit.columns(choice))
+                .collect::<Result<Vec<_>>>()
+            else {
+                continue;
+            };
+            let chosen = rows.iter().map(Some).collect::<Vec<_>>();
+            if let Ok(alternative) = run(&chosen).await {
+                alternatives.push(alternative);
             }
-            alternatives
         }
-        None => {
-            let shown = slot_choices(ctx, plan, &nested, result, tolerance)
-                .await
-                .unwrap_or_default();
-            let mut alternatives = vec![];
-            for choices in shown {
-                if let Ok(alternative) = run(&choices).await {
-                    alternatives.push(alternative);
-                }
-            }
-            alternatives
+        return alternatives;
+    }
+    let shown = slot_choices(ctx, plan, &nested, result, tolerance)
+        .await
+        .unwrap_or_default();
+    for combination in shown {
+        let chosen = nested
+            .iter()
+            .zip(&combination)
+            .map(|(entry, index)| {
+                entry
+                    .as_ref()
+                    .zip(*index)
+                    .map(|(possible, i)| &possible.outputs[i])
+            })
+            .collect::<Vec<_>>();
+        if let Ok(alternative) = run(&chosen).await {
+            alternatives.push(alternative);
         }
     }
+    alternatives
 }
 
-/// Up to 16 choices of the rows of the nested limits `nested` of `plan` for
-/// which the rows of the query are the rows of `result` (the output of the
-/// other engine), as a multiset: of one or several nested limits at once, up
-/// to [`MAX_CHOICE_RUNS`] choices in all. One physical plan, whose nested
-/// limits read their rows from [`Slot`]s, runs for each choice.
+/// The rows (the columns of [`NestedLimit::columns`]) that a nested limit or
+/// a `DISTINCT ON` returns.
+type Rows = Vec<ArrayRef>;
+
+/// The rows that an occurrence of a nested limit or of a `DISTINCT ON` may
+/// return, see [`possible_outputs`].
+struct PossibleOutputs {
+    /// The node, for the rows of the nested limits inside it that DataFusion
+    /// returns.
+    limit: NestedLimit,
+    /// The rows that it may return, those of DataFusion first.
+    outputs: Vec<Rows>,
+    /// Whether these are the rows of `limit` (no nested limits inside it
+    /// decide which rows it may return), so that the lineage of the rows of a
+    /// query shows which rows it returned (see [`lineage_choices`]).
+    traced: bool,
+}
+
+/// Up to `max` choices of the rows that the nested limit or the `DISTINCT ON`
+/// `plan` of a query, planned by `ctx`, may return within the tolerance
+/// `tolerance`: for each choice of the rows of the nested limits inside it
+/// (up to `max` of them, recursively), the rows that it may return.
+fn possible_outputs(
+    ctx: &SessionContext,
+    plan: LogicalPlan,
+    tolerance: f64,
+    max: usize,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<PossibleOutputs>> + Send + '_>> {
+    Box::pin(async move {
+        let inner = inner_limits(&plan);
+        let limit = NestedLimit::new(ctx, plan.clone(), tolerance).await?;
+        let mut outputs = vec![limit.columns(&limit.own())?];
+        if inner.is_empty() {
+            for choice in limit.choices(None, max) {
+                outputs.push(limit.columns(&choice)?);
+            }
+            return Ok(PossibleOutputs {
+                limit,
+                outputs,
+                traced: true,
+            });
+        }
+        let mut inners = vec![];
+        for occurrence in inner {
+            inners.push(possible_outputs(ctx, occurrence, tolerance, max).await?);
+        }
+        let combinations = inners
+            .iter()
+            .map(|inner| 0..inner.outputs.len())
+            .multi_cartesian_product()
+            // The rows of DataFusion, which come first, are those of `limit`.
+            .skip(1)
+            .take(max);
+        for combination in combinations {
+            let mut replacements = vec![];
+            for (inner, &i) in inners.iter().zip(&combination) {
+                let batch =
+                    rows_batch(inner.outputs[i].clone(), &inner.limit.row_fields())?;
+                let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
+                replacements.push(inner.limit.plan_over(Arc::new(table), None)?);
+            }
+            let replaced =
+                replace_inner_limits(&plan, &mut |i, _| replacements.get(i).cloned())?;
+            let Ok(variant) = NestedLimit::new(ctx, replaced, tolerance).await else {
+                continue;
+            };
+            let own = variant.own();
+            for choice in std::iter::once(own).chain(variant.choices(None, max)) {
+                outputs.push(variant.columns(&choice)?);
+                if outputs.len() >= max {
+                    break;
+                }
+            }
+            if outputs.len() >= max {
+                break;
+            }
+        }
+        Ok(PossibleOutputs {
+            limit,
+            outputs,
+            traced: false,
+        })
+    })
+}
+
+/// Up to 16 choices of the rows of the occurrences `nested` of nested limits of
+/// `plan` (each an index in their [`PossibleOutputs`], none for occurrences
+/// whose rows are not known) for which the rows of the query are the rows of
+/// `result` (the output of the other engine), as a multiset: of one or
+/// several of them at once, up to [`MAX_CHOICE_RUNS`] choices in all. One
+/// physical plan, whose nested limits read their rows from [`Slot`]s, runs
+/// for each choice.
 async fn slot_choices(
     ctx: &SessionContext,
     plan: &LogicalPlan,
-    nested: &[NestedLimit],
+    nested: &[Option<PossibleOutputs>],
     result: &EngineOutput,
     tolerance: f64,
-) -> Result<Vec<Vec<Vec<usize>>>> {
+) -> Result<Vec<Vec<Option<usize>>>> {
     let result = result_rows(&result.batches)?;
     let mut slots = vec![];
     let mut tables = vec![];
-    for limit in nested {
-        let fields = limit.row_fields();
-        let empty = rows_batch(limit.columns(&[])?, &fields)?;
+    for entry in nested {
+        let Some(possible) = entry else {
+            slots.push(None);
+            tables.push(None);
+            continue;
+        };
+        let fields = possible.limit.row_fields();
+        let empty = rows_batch(possible.limit.columns(&[])?, &fields)?;
         let slot = Arc::new(Slot {
             schema: empty.schema(),
             batch: Mutex::new(empty.clone()),
         });
         let partition = Arc::clone(&slot) as Arc<dyn PartitionStream>;
         let table = StreamingTable::try_new(empty.schema(), vec![partition])?;
-        tables.push(limit.plan_over(Arc::new(table), None)?);
-        slots.push((slot, fields));
+        tables.push(Some(possible.limit.plan_over(Arc::new(table), None)?));
+        slots.push(Some((slot, fields)));
     }
-    let replaced = replace_nested_limits(plan, &mut |i, _| tables.get(i).cloned())?;
+    let replaced =
+        replace_nested_limits(plan, &mut |i, _| tables.get(i).cloned().flatten())?;
     let state = ctx.state();
     let physical = state.create_physical_plan(&replaced).await?;
-    let per_limit = nested
+    let indices = nested
         .iter()
-        .map(|limit| {
-            std::iter::once(limit.own())
-                .chain(limit.choices(None, MAX_CHOICE_RUNS))
-                .collect::<Vec<Vec<usize>>>()
+        .map(|entry| match entry {
+            Some(possible) => (0..possible.outputs.len()).map(Some).collect(),
+            None => vec![None],
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<Vec<Option<usize>>>>();
     let mut shown = vec![];
     // Not the rows of DataFusion, which are the first ones.
-    for choices in per_limit
+    for combination in indices
         .into_iter()
         .multi_cartesian_product()
         .skip(1)
         .take(MAX_CHOICE_RUNS)
     {
-        for ((slot, fields), (limit, choice)) in
-            slots.iter().zip(nested.iter().zip(&choices))
-        {
-            *slot.batch.lock().expect("the slot is not poisoned") =
-                rows_batch(limit.columns(choice)?, fields)?;
+        for ((slot, entry), index) in slots.iter().zip(nested).zip(&combination) {
+            if let (Some((slot, fields)), Some(possible), Some(i)) = (slot, entry, index)
+            {
+                *slot.batch.lock().expect("the slot is not poisoned") =
+                    rows_batch(possible.outputs[*i].clone(), fields)?;
+            }
         }
         let Ok(batches) =
             collect(reset_plan_states(Arc::clone(&physical))?, state.task_ctx()).await
@@ -1306,7 +1477,7 @@ async fn slot_choices(
             continue;
         };
         if multiset_difference(&result_rows(&batches)?, &result, tolerance).is_empty() {
-            shown.push(choices);
+            shown.push(combination);
             if shown.len() == 16 {
                 break;
             }
@@ -1332,13 +1503,13 @@ async fn slot_choices(
 async fn lineage_choices(
     ctx: &SessionContext,
     plan: &LogicalPlan,
-    nested: &[NestedLimit],
+    nested: &[&NestedLimit],
     result: &EngineOutput,
     tolerance: f64,
 ) -> Option<Vec<Vec<Vec<usize>>>> {
     let candidates = nested
         .iter()
-        .map(NestedLimit::candidates)
+        .map(|limit| limit.candidates())
         .collect::<Vec<_>>();
     let mut replacements = vec![];
     for (i, (limit, candidates)) in nested.iter().zip(&candidates).enumerate() {
@@ -1420,10 +1591,13 @@ async fn lineage_choices(
         .iter()
         .zip(shown.iter().zip(&silent))
         .map(|(limit, (shown, silent))| {
-            let pool = shown.iter().chain(silent).copied().collect::<BTreeSet<_>>();
+            let silent = silent.iter().copied().collect::<BTreeSet<_>>();
             std::iter::once(limit.own())
-                .filter(|own| own.iter().all(|row| pool.contains(row)))
-                .chain(limit.choices(Some(&pool), 4096))
+                .filter(|own| {
+                    own.iter()
+                        .all(|row| shown.contains(row) || silent.contains(row))
+                })
+                .chain(limit.choices(Some((shown, &silent)), 4096))
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
@@ -1526,10 +1700,54 @@ fn replace_nested_limits(
     plan: &LogicalPlan,
     replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
 ) -> Result<LogicalPlan> {
+    replace_ambiguous(plan, true, replace)
+}
+
+/// The nested limits and `DISTINCT ON`s inside the occurrence `plan` of a
+/// nested limit or of a `DISTINCT ON` (see [`nested_limits`]).
+fn inner_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
+    let mut limits = vec![];
+    let _ = replace_inner_limits(plan, &mut |_, node| {
+        limits.push(node.clone());
+        None
+    });
+    limits
+}
+
+/// The occurrence `plan` of a nested limit or of a `DISTINCT ON`, with the
+/// nested limits and `DISTINCT ON`s inside it that `replace` replaces (given
+/// their index, see [`inner_limits`], and their plan).
+fn replace_inner_limits(
+    plan: &LogicalPlan,
+    replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    match plan {
+        // All of those of its input.
+        LogicalPlan::Distinct(Distinct::On(distinct)) => {
+            let input = replace_ambiguous(&distinct.input, false, replace)?;
+            Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn::try_new(
+                distinct.on_expr.clone(),
+                distinct.select_expr.clone(),
+                distinct.sort_expr.clone(),
+                Arc::new(input),
+            )?)))
+        }
+        _ => replace_ambiguous(plan, true, replace),
+    }
+}
+
+/// `plan` with the nested limits and `DISTINCT ON`s that `replace` replaces,
+/// but for the limits of its top-level path if `top_level` (see
+/// [`replace_nested_limits`]).
+fn replace_ambiguous(
+    plan: &LogicalPlan,
+    top_level_path: bool,
+    replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
+) -> Result<LogicalPlan> {
     // The limits above the top-level sort of the query, and the sort, which
     // the sorted reference of the query compares, come first.
     let mut top_level = 0;
-    if has_top_level_order_by(plan) {
+    if top_level_path && has_top_level_order_by(plan) {
         let mut node = plan;
         loop {
             top_level += usize::from(limits_a_sort(node));
@@ -8125,6 +8343,63 @@ mod tests {
             assert_eq!(accepted, valid, "{sql}: {rows:?}");
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_other_rows_of_nested_limits_inside_others()
+    {
+        // The inner limit may return any 2 of the 3 rows that tie, so the outer
+        // one `1` or `2`.
+        let setup = per_engine_tables(
+            kv_int_batch(&[(0, 1), (0, 2), (0, 3)]),
+            kv_int_batch(&[(0, 3), (0, 2), (0, 1)]),
+        );
+        let inner = "(SELECT v FROM m ORDER BY k LIMIT 2) a";
+        for sql in [
+            format!(
+                "SELECT sum(v) AS total FROM (SELECT v FROM {inner} ORDER BY v LIMIT 1) b"
+            ),
+            format!("SELECT v FROM (SELECT v FROM {inner} ORDER BY v LIMIT 1) b"),
+        ] {
+            assert_same_results_as_datafusion_with_setup(&sql, &setup).await;
+        }
+        // But never `3`.
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", kv_int_batch(&[(0, 1), (0, 2), (0, 3)]))
+            .unwrap();
+        let sql = format!("SELECT v FROM (SELECT v FROM {inner} ORDER BY v LIMIT 1) b");
+        let plan = ctx.sql(&sql).await.unwrap().logical_plan().clone();
+        let options = ComparisonOptions::default();
+        let expected = run_dataframe(&ctx, ctx.sql(&sql).await.unwrap())
+            .await
+            .unwrap();
+        let order = result_order(&ctx, &plan, &options).await;
+        for (v, valid) in [(1, true), (2, true), (3, false)] {
+            let result = output(vec![int_batch(&[Some(v)])], false);
+            let accepted = compare_results(&expected, &result, &order, &options).is_ok()
+                || alternative_outcomes(&ctx, &plan, &options, &result)
+                    .await
+                    .iter()
+                    .any(|(expected, order)| {
+                        compare_results(expected, &result, order, &options).is_ok()
+                    });
+            assert_eq!(accepted, valid, "{v}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_complete_the_rows_of_nested_limits_that_are_filtered_out()
+     {
+        // The rows that the filter keeps show 2 of the 3 rows of the nested
+        // limit, the third one is any row that the filter removes.
+        let rows = (0..100).map(|v| (0, v)).collect::<Vec<_>>();
+        let reversed = rows.iter().rev().copied().collect::<Vec<_>>();
+        let setup = per_engine_tables(kv_int_batch(&rows), kv_int_batch(&reversed));
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT v FROM (SELECT v FROM m ORDER BY k LIMIT 3) s WHERE v >= 98",
+            &setup,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
