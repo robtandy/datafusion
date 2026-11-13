@@ -13,8 +13,10 @@
 //! * **Sink**: every thread of the input pipeline collects the chunks it
 //!   pushes in its local sink state (compacting their selection vectors).
 //!   [`PhysicalSort`] sorts them into *runs* of bounded size
-//!   (`lexsort_to_indices` and `take` for a single sort key of a primitive,
-//!   boolean, string or binary type, the Arrow row format otherwise).
+//!   (`lexsort_to_indices` and `take` for a single sort key of a primitive or
+//!   boolean type, normalized keys of the strings or binary values of a
+//!   single key, of their encoding in the Arrow row format otherwise, see
+//!   [`normalized`]).
 //!   [`PhysicalTopK`] keeps the best `k` rows of the thread instead and
 //!   discards the rows that cannot make it into the result as they arrive,
 //!   see [`topk_sink`].
@@ -33,8 +35,11 @@
 //! encoded: the runs hold its sorted values, which the merge compares
 //! directly in the typed arrays (in the order of the row format, floats in
 //! their total order). The keys of all other sorts are encoded in the Arrow
-//! row format, in which comparing two keys is a `memcmp`, so the merge works
-//! for every sort key the row format supports.
+//! row format, in which two keys compare like their bytes, so the merge works
+//! for every sort key the row format supports. Keys that compare by their
+//! bytes are sorted by *normalized keys*, their first bytes as fixed-width
+//! integers, which compare inline (see [`normalized`]), and the merge
+//! compares their bytes as words, inline, too.
 //!
 //! Rows are materialized in runs and chunks that fit into Arrow arrays: rows
 //! whose values do not fit into one array (e.g. more than the 2 GiB of
@@ -89,7 +94,7 @@ use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err};
+use datafusion_common::{Result, exec_err, internal_err};
 use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::LexOrdering;
@@ -112,6 +117,7 @@ use crate::operator::{
 use crate::sources::batches::batch_overhead;
 
 pub mod merge;
+mod normalized;
 pub mod sort_sink;
 pub mod topk_sink;
 
@@ -503,10 +509,12 @@ fn has_union(data_type: &DataType) -> bool {
 ///
 /// A single sort key of a type that [`compares_directly`] (e.g. an integer,
 /// float, decimal, date, timestamp or string) is sorted with the sort kernel
-/// (`lexsort_to_indices`), and its runs hold the sorted key values
+/// (`lexsort_to_indices`), or by the normalized keys of its values if they
+/// are strings or binary values, and its runs hold the sorted key values
 /// ([`RunKeys::Column`]), which the merge compares directly: the keys are
 /// never encoded. Other sort keys are encoded in the Arrow row format, with
-/// the same [`RowConverter`] for all runs, so that they can be merged.
+/// the same [`RowConverter`] for all runs, so that they can be merged, and
+/// sorted by the normalized keys of the encoded rows (see [`normalized`]).
 #[derive(Debug)]
 pub(crate) struct SortKeys {
     ordering: LexOrdering,
@@ -684,8 +692,13 @@ impl SortKeys {
                     (indices.values().to_vec(), sorted_keys)
                 }
                 None => {
-                    let (order, _) =
-                        self.order_by_rows(&key_values, num_rows, len, &mut working)?;
+                    let (order, _) = self.order_by_rows(
+                        &key_values,
+                        num_rows,
+                        len,
+                        false,
+                        &mut working,
+                    )?;
                     let sorted_keys = match self.key_column {
                         Some(column) => SortedKeys::Column(column),
                         None => SortedKeys::Gather,
@@ -694,14 +707,11 @@ impl SortKeys {
                 }
             },
             false => {
-                let (order, rows) =
-                    self.order_by_rows(&key_values, num_rows, len, &mut working)?;
-                let data_len = order.iter().map(|&i| rows.row_len(i as usize)).sum();
-                working.try_grow(data_len + (len + 1) * size_of::<usize>())?;
-                let mut sorted_rows = self.converter.empty_rows(len, data_len);
-                for &i in &order {
-                    sorted_rows.push(rows.row(i as usize));
-                }
+                let (order, sorted_rows) =
+                    self.order_by_rows(&key_values, num_rows, len, true, &mut working)?;
+                let Some(sorted_rows) = sorted_rows else {
+                    return internal_err!("The sorted rows of a sort were not copied");
+                };
                 (order, SortedKeys::Rows(sorted_rows))
             }
         };
@@ -812,18 +822,28 @@ impl SortKeys {
 
     /// The positions of the first `len` rows (of `num_rows`) in the
     /// concatenation of the batches whose sort keys are `keys`, sorted by
-    /// their keys encoded in the row format, and the encoded keys of all
-    /// rows.
+    /// their keys encoded in the row format, and, if `copy`, the encoded keys
+    /// of these rows, in order.
+    ///
+    /// The rows are sorted by the normalized keys of their encoded keys (see
+    /// [`normalized`]), which compare as integers: only the rows whose
+    /// normalized keys are equal and do not hold all of their bytes compare
+    /// their encoded keys.
     ///
     /// The encoded keys are reserved in `working` as they are encoded, batch
-    /// by batch, and the order before it is allocated.
+    /// by batch, and the normalized keys, the order and the copy before they
+    /// are allocated.
     fn order_by_rows(
         &self,
         keys: &[Vec<ArrayRef>],
         num_rows: usize,
         len: usize,
+        copy: bool,
         working: &mut ReservedMemory<'_>,
-    ) -> Result<(Vec<u32>, arrow_row::Rows)> {
+    ) -> Result<(Vec<u32>, Option<arrow_row::Rows>)> {
+        if u32::try_from(num_rows).is_err() {
+            return exec_err!("Cannot sort {num_rows} rows at once");
+        }
         working.try_grow((num_rows + 1) * size_of::<usize>())?;
         let mut rows = self.converter.empty_rows(num_rows, 0);
         let mut encoded = rows.size();
@@ -832,27 +852,18 @@ impl SortKeys {
             working.try_grow(rows.size().saturating_sub(encoded))?;
             encoded = encoded.max(rows.size());
         }
-        let num_rows_u32 = u32::try_from(num_rows)
-            .map_err(|_| exec_datafusion_err!("Cannot sort {num_rows} rows at once"))?;
-        working.try_grow(num_rows * size_of::<u32>())?;
-        let mut order = (0..num_rows_u32).collect::<Vec<_>>();
-        let compare =
-            |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
-        if len < num_rows {
-            order.select_nth_unstable_by(len - 1, compare);
-            order.truncate(len);
-        }
-        order.sort_unstable_by(compare);
-        Ok((order, rows))
+        normalized::sort_rows(&rows, len, copy.then_some(&self.converter), working)
     }
 
     /// Sort the single sort key `keys` (of every batch) with
-    /// `lexsort_to_indices`: the positions of the first `limit` rows in the
-    /// concatenation of the batches, and the concatenated keys. `None` if
-    /// the keys of all batches do not fit into one array (then they are sorted
-    /// by their encoded rows, which have no such limit).
+    /// `lexsort_to_indices`, or by their normalized keys if they are strings
+    /// or binary values (see [`normalized::sort_values`]): the positions of
+    /// the first `limit` rows in the concatenation of the batches, and the
+    /// concatenated keys. `None` if the keys of all batches do not fit into
+    /// one array (then they are sorted by their encoded rows, which have no
+    /// such limit).
     ///
-    /// The concatenated keys and what the kernel allocates are reserved in
+    /// The concatenated keys and what the sort allocates are reserved in
     /// `working` before they are allocated.
     fn sort_with_kernel(
         &self,
@@ -881,12 +892,20 @@ impl SortKeys {
                 }
             }
         };
-        let column = SortColumn {
-            values: Arc::clone(&key),
-            options: Some(self.ordering[0].options),
-        };
+        let options = self.ordering[0].options;
         working.try_grow(num_rows * KERNEL_SORT_BYTES_PER_ROW)?;
-        let indices = lexsort_to_indices(&[column], limit)?;
+        // Strings and binary values are sorted by their normalized keys,
+        // which compare as integers, rather than byte by byte.
+        let indices = match normalized::sort_values(key.as_ref(), options, limit) {
+            Some(order) => UInt32Array::from(order),
+            None => {
+                let column = SortColumn {
+                    values: Arc::clone(&key),
+                    options: Some(options),
+                };
+                lexsort_to_indices(&[column], limit)?
+            }
+        };
         Ok(Some((indices, key)))
     }
 }

@@ -21,14 +21,16 @@
 //! of their runs, and within a run in the order of the run.
 //!
 //! The keys of the runs ([`RunKeys`]) are either encoded in the Arrow row
-//! format, in which comparing two rows is a `memcmp` of their bytes, or, for
-//! a single sort key of a type that [`compares_directly`] (integers, floats,
-//! decimals, temporal values, booleans, strings and binary values), the
-//! sorted key values themselves ([`KeyColumn`]), which the tree compares
-//! directly in the typed arrays, without encoding them: in the order of the
-//! row format and of the sort kernel (floats in their total order, `-0.0`
-//! before `0.0`). The merger dispatches on the type of the keys once per
-//! chunk, so that its matches are monomorphized for every key type.
+//! format, in which two rows compare like their bytes, or, for a single sort
+//! key of a type that [`compares_directly`] (integers, floats, decimals,
+//! temporal values, booleans, strings and binary values), the sorted key
+//! values themselves ([`KeyColumn`]), which the tree compares directly in the
+//! typed arrays, without encoding them: in the order of the row format and of
+//! the sort kernel (floats in their total order, `-0.0` before `0.0`). The
+//! merger dispatches on the type of the keys once per chunk, so that its
+//! matches are monomorphized for every key type. Encoded rows, strings and
+//! binary values compare their bytes as big-endian words, inline (see
+//! [`compare_bytes`]), rather than with calls of `memcmp`.
 //!
 //! Materializing rows can need more bytes than a single Arrow array
 //! addresses (e.g. 2 GiB of `Utf8` values, whose offsets are 32-bit), also
@@ -55,6 +57,8 @@ use arrow_ord::ord::make_comparator;
 use arrow_row::{Row, Rows};
 use arrow_select::interleave::interleave;
 use datafusion_common::{Result, internal_err};
+
+use super::normalized::compare_bytes;
 
 /// Whether `error` says that rows do not fit into one array: its offsets
 /// (32-bit for `Utf8`, `Binary`, `List`, ..., also in nested and run-end
@@ -213,7 +217,7 @@ impl KeyColumn {
 pub enum RunKeys {
     /// The keys encoded in the Arrow row format, with the same
     /// [`RowConverter`](arrow_row::RowConverter) for all runs that are merged
-    /// together: comparing two keys is a `memcmp`.
+    /// together: two keys compare like their bytes.
     Rows(Rows),
     /// The values of a single sort key, which are compared directly.
     Column(KeyColumn),
@@ -719,7 +723,9 @@ fn play<T: Tournament>(
                 })
                 .collect::<Vec<_>>();
             tournament.play(|a, row_a, b, row_b| match (rows[a], rows[b]) {
-                (Some(rows_a), Some(rows_b)) => rows_a.row(row_a).cmp(&rows_b.row(row_b)),
+                (Some(rows_a), Some(rows_b)) => {
+                    compare_bytes(rows_a.row(row_a).data(), rows_b.row(row_b).data())
+                }
                 _ => Ordering::Equal,
             });
             return Ok(());
@@ -757,7 +763,7 @@ fn play<T: Tournament>(
         DataType::FixedSizeBinary(_) => {
             let arrays = typed(&columns, |array| array.as_fixed_size_binary_opt());
             play_columns(&arrays, options, tournament, |a, i, b, j| {
-                a.value(i).cmp(b.value(j))
+                compare_bytes(a.value(i), b.value(j))
             });
         }
         data_type => {
@@ -803,7 +809,8 @@ fn play_primitive<P: ArrowPrimitiveType, T: Tournament>(
     });
 }
 
-/// [`play`] with keys of strings or binary values, compared byte by byte.
+/// [`play`] with keys of strings or binary values, compared byte by byte
+/// (see [`compare_bytes`]).
 fn play_bytes<B: ByteArrayType, T: Tournament>(
     columns: &[Option<&dyn Array>],
     options: SortOptions,
@@ -815,9 +822,7 @@ fn play_bytes<B: ByteArrayType, T: Tournament>(
         options,
         tournament,
         |a: &GenericByteArray<B>, i, b: &GenericByteArray<B>, j| {
-            let (value_a, value_b): (&[u8], &[u8]) =
-                (a.value(i).as_ref(), b.value(j).as_ref());
-            value_a.cmp(value_b)
+            compare_bytes(a.value(i).as_ref(), b.value(j).as_ref())
         },
     );
 }
@@ -852,11 +857,7 @@ fn compare_views<V: ByteViewType>(
     // The first 4 bytes, in big-endian order (zero padded for short values).
     let prefix = |view: u128| ((view >> 32) as u32).swap_bytes();
     match prefix(view_a).cmp(&prefix(view_b)) {
-        Ordering::Equal => {
-            let (value_a, value_b): (&[u8], &[u8]) =
-                (a.value(i).as_ref(), b.value(j).as_ref());
-            value_a.cmp(value_b)
-        }
+        Ordering::Equal => compare_bytes(a.value(i).as_ref(), b.value(j).as_ref()),
         ordering => ordering,
     }
 }
