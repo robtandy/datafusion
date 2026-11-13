@@ -53,12 +53,34 @@
 //! | `PIPELINE_BENCH_SOURCE`     | `memory` (`MemTable`s), `parquet` (files in a `TempDir`), `both` | `both`                            |
 //! | `PIPELINE_BENCH_QUERIES`    | comma-separated names of the queries to run, e.g. `q1,q18,hits4` | all                               |
 //! | `PIPELINE_BENCH_TRUSTED_AGGREGATES` | whether the sessions trust DataFusion's built-in aggregate functions (`true` / `false`) | `true`        |
+//! | `PIPELINE_BENCH_DATA_DIR`   | directory of the Parquet files, which is kept (see below)        | a `TempDir`                       |
+//! | `PIPELINE_BENCH_MODE`       | `run` (the benchmark), `queries` or `data` (see below)           | `run`                             |
+//!
+//! With `PIPELINE_BENCH_DATA_DIR`, the `parquet` source writes its files to
+//! that directory instead of a `TempDir`, and keeps them, so that other
+//! engines can read the same data (`benchmarks/plan-compare` captures
+//! DuckDB's plans over them): the files of every table in a directory named
+//! after the table, one file per thread (`<dir>/<table>/part-<i>.parquet`).
+//! The Parquet files that an earlier run left in the directories of the
+//! tables are removed first. A relative path is relative to the directory of
+//! the package (`datafusion/physical-pipeline`), where cargo runs the
+//! benchmark. Two modes do not run the queries:
+//!
+//! * `PIPELINE_BENCH_MODE=queries` prints the queries (of
+//!   `PIPELINE_BENCH_QUERIES`) as a SQL script: every query on the lines
+//!   after a comment line with its name (`-- q1`), terminated by `;`.
+//! * `PIPELINE_BENCH_MODE=data` writes the Parquet files of the tables (of
+//!   `PIPELINE_BENCH_SCALE`, `PIPELINE_BENCH_HITS` and
+//!   `PIPELINE_BENCH_THREADS`), as the `parquet` source does, to
+//!   `PIPELINE_BENCH_DATA_DIR`, which it needs, and prints the rows and files
+//!   of every table.
 
 #[path = "../tests/tpch_parity.rs"]
 mod tpch_parity;
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -426,6 +448,21 @@ struct BenchConfig {
     queries: Option<Vec<String>>,
     /// Whether the sessions trust DataFusion's built-in aggregate functions.
     trusted_aggregates: bool,
+    /// The directory of the Parquet files (`PIPELINE_BENCH_DATA_DIR`), if
+    /// they are kept.
+    data_dir: Option<PathBuf>,
+    mode: Mode,
+}
+
+/// What the benchmark does (`PIPELINE_BENCH_MODE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Measure the queries on both engines and print the report.
+    Run,
+    /// Print the queries, see [`query_list`].
+    Queries,
+    /// Write the Parquet files of the tables, see [`write_data`].
+    Data,
 }
 
 /// Where the tables of the benchmark are stored.
@@ -433,7 +470,8 @@ struct BenchConfig {
 enum SourceKind {
     /// `MemTable`s, with as many partitions as threads.
     Memory,
-    /// Parquet files in a temporary directory, as many per table as threads.
+    /// Parquet files in a temporary directory (or in
+    /// `PIPELINE_BENCH_DATA_DIR`), as many per table as threads.
     Parquet,
 }
 
@@ -472,6 +510,15 @@ impl BenchConfig {
                 "invalid value of PIPELINE_BENCH_SOURCE: {other} (memory, parquet or both)"
             ),
         };
+        let mode = env_or("PIPELINE_BENCH_MODE", "run".to_string());
+        let mode = match mode.to_lowercase().as_str() {
+            "run" => Mode::Run,
+            "queries" => Mode::Queries,
+            "data" => Mode::Data,
+            other => panic!(
+                "invalid value of PIPELINE_BENCH_MODE: {other} (run, queries or data)"
+            ),
+        };
         let queries = std::env::var("PIPELINE_BENCH_QUERIES").ok().map(|queries| {
             queries
                 .split(',')
@@ -494,7 +541,20 @@ impl BenchConfig {
             sources,
             queries,
             trusted_aggregates: env_or("PIPELINE_BENCH_TRUSTED_AGGREGATES", true),
+            data_dir: std::env::var_os("PIPELINE_BENCH_DATA_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+            mode,
         }
+    }
+
+    /// The tables of the benchmark: the TPC-H tables of scale factor
+    /// `scale` and the `hits` table of `hits` rows.
+    fn tables(&self) -> Result<Vec<(&'static str, RecordBatch)>> {
+        let tpch = TpchData::generate(self.scale)?;
+        let mut tables = tpch.tables().to_vec();
+        tables.push(("hits", hits::generate(self.hits)?));
+        Ok(tables)
     }
 
     /// The queries to run: name and SQL.
@@ -535,30 +595,91 @@ impl BenchConfig {
     }
 }
 
+/// The layout of the tables of the benchmark: as many partitions (or
+/// Parquet files) per table as `threads`, of batches of 8192 rows.
+fn table_layout(threads: usize) -> TableLayout {
+    TableLayout::Even {
+        partitions: threads,
+        batch_size: 8_192,
+    }
+}
+
+/// The maximum number of rows of the row groups of the Parquet files.
+const ROW_GROUP_ROWS: usize = 128 * 1024;
+
+/// Write the Parquet files of `tables` with `layout` to `dir`, the files of
+/// every table in a directory named after the table (see
+/// [`tpch::write_parquet`]), and return them. First removes the Parquet files
+/// in the directories of the tables (that an earlier run left there, e.g.
+/// with more threads), so that they hold the files of `tables` only.
+fn write_parquet_tables(
+    tables: &[(&'static str, RecordBatch)],
+    layout: &TableLayout,
+    dir: &Path,
+) -> Result<Vec<tpch::ParquetFile>> {
+    let files = tpch::encode_parquet(tables, layout, ROW_GROUP_ROWS)?;
+    for (table, _) in tables {
+        let table_dir = dir.join(table);
+        if !table_dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&table_dir)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+            {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    tpch::write_parquet(&files, dir)?;
+    Ok(files)
+}
+
+/// The directory of the Parquet files of [`SourceKind::Parquet`].
+enum ParquetDir {
+    /// A temporary directory, deleted with the tables.
+    Temporary(TempDir),
+    /// `PIPELINE_BENCH_DATA_DIR`, which is kept.
+    Kept(PathBuf),
+}
+
+impl ParquetDir {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(dir) => dir.path(),
+            Self::Kept(dir) => dir,
+        }
+    }
+}
+
 /// The tables of the benchmark, registered in the sessions of both engines.
 struct Tables {
     tables: Vec<(&'static str, RecordBatch)>,
     layout: TableLayout,
     /// The directory of the Parquet files, for [`SourceKind::Parquet`].
-    parquet: Option<TempDir>,
+    parquet: Option<ParquetDir>,
 }
 
 impl Tables {
+    /// The tables of `source`, whose Parquet files are written to
+    /// `data_dir`, or to a temporary directory if it is `None`.
     fn try_new(
         tables: Vec<(&'static str, RecordBatch)>,
         threads: usize,
         source: SourceKind,
+        data_dir: Option<&Path>,
     ) -> Result<Self> {
-        let layout = TableLayout::Even {
-            partitions: threads,
-            batch_size: 8_192,
-        };
+        let layout = table_layout(threads);
         let parquet = match source {
             SourceKind::Memory => None,
             SourceKind::Parquet => {
-                let dir = tempfile::tempdir()?;
-                let files = tpch::encode_parquet(&tables, &layout, 128 * 1024)?;
-                tpch::write_parquet(&files, dir.path())?;
+                let dir = match data_dir {
+                    Some(dir) => ParquetDir::Kept(dir.to_path_buf()),
+                    None => ParquetDir::Temporary(tempfile::tempdir()?),
+                };
+                write_parquet_tables(&tables, &layout, dir.path())?;
                 Some(dir)
             }
         };
@@ -679,12 +800,15 @@ async fn run(config: &BenchConfig) -> Result<Vec<Measurement>> {
             "PIPELINE_BENCH_QUERIES selects no query".to_string(),
         ));
     }
-    let tpch = TpchData::generate(config.scale)?;
-    let mut tables = tpch.tables().to_vec();
-    tables.push(("hits", hits::generate(config.hits)?));
+    let tables = config.tables()?;
     let mut measurements = vec![];
     for &source in &config.sources {
-        let tables = Tables::try_new(tables.clone(), config.threads, source)?;
+        let tables = Tables::try_new(
+            tables.clone(),
+            config.threads,
+            source,
+            config.data_dir.as_deref(),
+        )?;
         let datafusion = datafusion_context(config.session_config());
         tables.register(&datafusion).await?;
         let pipeline = pipeline_context(config.session_config());
@@ -928,10 +1052,84 @@ impl Summary {
     }
 }
 
+/// The queries of `config` as a SQL script (`PIPELINE_BENCH_MODE=queries`):
+/// every query on the lines after a comment line with its name, terminated
+/// by `;` (none of the queries contains a `;`), and followed by an empty line.
+fn query_list(config: &BenchConfig) -> Result<String> {
+    let queries = config.queries();
+    if queries.is_empty() {
+        return Err(DataFusionError::Configuration(
+            "PIPELINE_BENCH_QUERIES selects no query".to_string(),
+        ));
+    }
+    let mut out = String::new();
+    for (name, sql) in queries {
+        let _ = writeln!(out, "-- {name}\n{sql};\n");
+    }
+    Ok(out)
+}
+
+/// Write the Parquet files of the tables of `config` to
+/// `PIPELINE_BENCH_DATA_DIR`, as [`SourceKind::Parquet`] does
+/// (`PIPELINE_BENCH_MODE=data`); returns the rows, files and bytes of every
+/// table.
+fn write_data(config: &BenchConfig) -> Result<String> {
+    let dir = config.data_dir.as_deref().ok_or_else(|| {
+        DataFusionError::Configuration(
+            "PIPELINE_BENCH_MODE=data needs PIPELINE_BENCH_DATA_DIR".to_string(),
+        )
+    })?;
+    let tables = config.tables()?;
+    let files = write_parquet_tables(&tables, &table_layout(config.threads), dir)?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\nParquet files of TPC-H SF {} and {} ClickBench-style hits, {} per table, in {}:",
+        config.scale,
+        config.hits,
+        config.threads,
+        dir.display()
+    );
+    let _ = writeln!(
+        out,
+        "{:<9} {:>9} {:>6} {:>10}",
+        "table", "rows", "files", "bytes"
+    );
+    for (table, batch) in &tables {
+        let (count, bytes) = files
+            .iter()
+            .filter(|file| file.table == *table)
+            .fold((0, 0), |(count, bytes), file| {
+                (count + 1, bytes + file.bytes.len())
+            });
+        let _ = writeln!(
+            out,
+            "{table:<9} {:>9} {count:>6} {bytes:>10}",
+            batch.num_rows()
+        );
+    }
+    Ok(out)
+}
+
+/// Write `text` to stdout, bypassing the output capture of libtest.
+fn print_uncaptured(text: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
 /// The benchmark, see the module documentation.
 #[test]
 fn pipeline_vs_default() -> Result<()> {
     let config = BenchConfig::from_env();
+    match config.mode {
+        Mode::Run => {}
+        // The leading newline separates the output from the test name that
+        // libtest may have printed.
+        Mode::Queries => return print_uncaptured(&format!("\n{}", query_list(&config)?)),
+        Mode::Data => return print_uncaptured(&write_data(&config)?),
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.threads)
         .enable_all()
@@ -954,4 +1152,163 @@ fn pipeline_vs_default() -> Result<()> {
         mismatches.join(", ")
     );
     Ok(())
+}
+
+/// Tests of the modes that write the data and print the queries of the
+/// benchmark for other engines (`benchmarks/plan-compare`).
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::*;
+
+    /// A configuration of `mode` over small tables, on 3 threads.
+    fn config(mode: Mode, data_dir: Option<PathBuf>) -> BenchConfig {
+        BenchConfig {
+            scale: 0.001,
+            hits: 1_000,
+            iterations: 1,
+            threads: 3,
+            sources: vec![SourceKind::Parquet],
+            queries: None,
+            trusted_aggregates: true,
+            data_dir,
+            mode,
+        }
+    }
+
+    /// The content of the files in the directories of `dir`, by directory
+    /// and file name.
+    fn files(dir: &Path) -> Result<BTreeMap<(String, String), Vec<u8>>> {
+        let mut files = BTreeMap::new();
+        for table in std::fs::read_dir(dir)? {
+            let table = table?;
+            for file in std::fs::read_dir(table.path())? {
+                let file = file?;
+                let name = (
+                    table.file_name().to_string_lossy().into_owned(),
+                    file.file_name().to_string_lossy().into_owned(),
+                );
+                files.insert(name, std::fs::read(file.path())?);
+            }
+        }
+        Ok(files)
+    }
+
+    /// The `(name, SQL)` of the queries of a script of [`query_list`], split
+    /// as `benchmarks/plan-compare/capture.py` splits it.
+    fn parse_query_list(script: &str) -> Vec<(String, String)> {
+        let mut queries = vec![];
+        let mut lines = script.lines();
+        while let Some(line) = lines.next() {
+            let Some(name) = line.strip_prefix("-- ") else {
+                assert!(line.is_empty(), "unexpected line {line:?}");
+                continue;
+            };
+            let mut sql = vec![];
+            for line in lines.by_ref() {
+                match line.strip_suffix(';') {
+                    Some(last) => {
+                        sql.push(last);
+                        break;
+                    }
+                    None => sql.push(line),
+                }
+            }
+            queries.push((name.to_string(), sql.join("\n")));
+        }
+        queries
+    }
+
+    #[test]
+    fn data_mode_writes_the_files_of_the_parquet_source_to_the_data_dir() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("data");
+        // A file of an earlier run with more threads, and a file that is not
+        // a Parquet file.
+        std::fs::create_dir_all(data_dir.join("region"))?;
+        std::fs::write(data_dir.join("region").join("part-7.parquet"), b"stale")?;
+        std::fs::write(data_dir.join("region").join("notes.txt"), b"kept")?;
+        let config = config(Mode::Data, Some(data_dir.clone()));
+        let report = write_data(&config)?;
+
+        // The data directory holds the files that the parquet source writes
+        // to a temporary directory (and the file that is not a Parquet file).
+        let tables = config.tables()?;
+        let source =
+            Tables::try_new(tables.clone(), config.threads, SourceKind::Parquet, None)?;
+        let expected = files(source.parquet.as_ref().unwrap().path())?;
+        let mut actual = files(&data_dir)?;
+        let notes = actual.remove(&("region".to_string(), "notes.txt".to_string()));
+        assert_eq!(notes.as_deref(), Some(b"kept".as_slice()));
+        assert_eq!(
+            actual.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        for (file, bytes) in &expected {
+            assert!(actual[file] == *bytes, "{file:?} differs");
+        }
+
+        // One file per table per thread, with all rows of the table.
+        assert_eq!(tables.len(), 9);
+        for (table, batch) in &tables {
+            let mut rows = 0;
+            for i in 0..config.threads {
+                let path = data_dir.join(table).join(format!("part-{i}.parquet"));
+                let reader = SerializedFileReader::new(File::open(path)?)?;
+                rows += reader.metadata().file_metadata().num_rows();
+            }
+            assert_eq!(rows, batch.num_rows() as i64, "{table}");
+            let line = format!("{table:<9} {:>9} {:>6} ", batch.num_rows(), 3);
+            assert!(report.contains(&line), "{line:?} not in {report}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn data_mode_needs_a_data_dir() {
+        let error = write_data(&config(Mode::Data, None)).unwrap_err();
+        assert!(
+            error.to_string().contains("PIPELINE_BENCH_DATA_DIR"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn queries_mode_prints_the_22_tpch_and_25_clickbench_queries() -> Result<()> {
+        let config = config(Mode::Queries, None);
+        let queries = parse_query_list(&query_list(&config)?);
+        let expected = config.queries();
+        assert_eq!(queries.len(), 47);
+        assert_eq!(expected.len(), 47);
+        for ((name, sql), (expected_name, expected_sql)) in queries.iter().zip(&expected)
+        {
+            assert_eq!(name, expected_name);
+            assert_eq!(sql, expected_sql);
+            // `;` terminates the queries of the script.
+            assert!(!sql.contains(';'), "{name}");
+        }
+        let names = queries.iter().map(|(name, _)| name.as_str());
+        assert_eq!(
+            names.clone().filter(|name| name.starts_with('q')).count(),
+            22
+        );
+        assert_eq!(names.filter(|name| name.starts_with("hits")).count(), 25);
+
+        // Of the queries of `PIPELINE_BENCH_QUERIES` only.
+        let mut config = config;
+        config.queries = Some(vec!["q18".to_string(), "hits42".to_string()]);
+        let queries = parse_query_list(&query_list(&config)?);
+        let names = queries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["q18", "hits42"]);
+        config.queries = Some(vec![]);
+        assert!(query_list(&config).is_err());
+        Ok(())
+    }
 }

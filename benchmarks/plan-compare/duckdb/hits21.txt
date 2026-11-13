@@ -1,0 +1,22 @@
+╭─ Top N ───────────────────────────╮
+│ Top: 10                           │
+│ Order By: c DESC,                 │
+│           SearchPhrase ASC        │
+│ ~10 rows                          │
+╰─────────────────┬─────────────────╯
+╭─ Hash Group By ─┴─────────────────╮
+│ Groups: #0                        │
+│ Aggregates: min(#1), count_star() │
+│ ~200,000 rows                     │
+╰─────────────────┬─────────────────╯
+╭─ Projection ────┴─────────────────╮
+│ Projections: SearchPhrase, URL    │
+│ ~200,000 rows                     │
+╰─────────────────┬─────────────────╯
+╭─ Read Parquet ──┴─────────────────╮
+│ Function: READ_PARQUET            │
+│ Projections: SearchPhrase, URL    │
+│ Filters: SearchPhrase != '',      │
+│          contains(URL, 'google')  │
+│ ~200,000 rows                     │
+╰───────────────────────────────────╯

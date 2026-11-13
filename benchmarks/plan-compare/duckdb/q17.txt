@@ -1,0 +1,43 @@
+╭─ Projection ──────────────────────────────╮
+│ Projections: avg_yearly                   │
+│ ~1 row                                    │
+╰─────────────────────┬─────────────────────╯
+╭─ Ungrouped Aggregate ─────────────────────╮
+│ Aggregates: sum(#0)                       │
+│ ~1 row                                    │
+╰─────────────────────┬─────────────────────╯
+╭─ Projection ────────┴─────────────────────╮
+│ Projections: #2                           │
+│ ~481,011 rows                             │
+╰─────────────────────┬─────────────────────╯
+╭─ Hash Join ─────────┴─────────────────────╮
+│ Join Type: INNER                          │
+│ Conditions:                               │
+│ p_partkey IS NOT DISTINCT FROM p_partkey, │
+│ SUBQUERY > CAST(l_quantity AS DOUBLE)     │
+│ ~481,011 rows                             │
+╰─────────────────────┬─────────────────────╯
+                      ├──────────────────────────────────────────╮
+╭─ Projection ────────┴─────────────────────╮  ╭─ Hash Join ─────┴─────────────────╮
+│ Projections: 0.2 * avg(l_quantity),       │  │ Join Type: INNER                  │
+│              p_partkey                    │  │ Conditions: l_partkey = p_partkey │
+│ ~481,011 rows                             │  │ ~120,252 rows                     │
+╰─────────────────────┬─────────────────────╯  ╰─────────────────┬─────────────────╯
+╭─ Hash Group By ─────┴─────────────────────╮                    ├──────────────────────────────────────╮
+│ Groups: #0                                │  ╭─ Read Parquet ──┴─────────────────╮  ╭─ Read Parquet ──┴─────────────────╮
+│ Aggregates: avg(#1)                       │  │ Function: READ_PARQUET            │  │ Function: READ_PARQUET            │
+│ ~481,011 rows                             │  │ Projections: l_partkey,           │  │ Projections: p_partkey            │
+╰─────────────────────┬─────────────────────╯  │              l_quantity,          │  │ Filters: p_brand = 'Brand#23',    │
+╭─ Projection ────────┴─────────────────────╮  │              l_extendedprice      │  │          p_container = 'MED BOX'  │
+│ Projections: p_partkey, l_quantity        │  │ ~601,264 rows                     │  │ ~4,000 rows                       │
+│ ~481,011 rows                             │  ╰───────────────────────────────────╯  ╰───────────────────────────────────╯
+╰─────────────────────┬─────────────────────╯
+╭─ Filter ────────────┴─────────────────────╮
+│ Expression: l_partkey IS NOT NULL         │
+│ ~481,011 rows                             │
+╰─────────────────────┬─────────────────────╯
+╭─ Read Parquet ──────┴─────────────────────╮
+│ Function: READ_PARQUET                    │
+│ Projections: l_partkey, l_quantity        │
+│ ~601,264 rows                             │
+╰───────────────────────────────────────────╯

@@ -1,0 +1,26 @@
+╭─ Top N ───────────────────────╮
+│ Top: 10                       │
+│ Order By: c DESC, WatchID ASC │
+│ ~10 rows                      │
+╰───────────────┬───────────────╯
+╭─ Hash Group By ───────────────╮
+│ Groups: #0, #1                │
+│ Aggregates: count_star(),     │
+│             sum(#2), avg(#3)  │
+│ ~999,999 rows                 │
+╰───────────────┬───────────────╯
+╭─ Projection ──┴───────────────╮
+│ Projections: WatchID,         │
+│              ClientIP,        │
+│              IsRefresh,       │
+│              ResolutionWidth  │
+│ ~1,000,000 rows               │
+╰───────────────┬───────────────╯
+╭─ Read Parquet ┴───────────────╮
+│ Function: READ_PARQUET        │
+│ Projections: WatchID,         │
+│              ClientIP,        │
+│              IsRefresh,       │
+│              ResolutionWidth  │
+│ ~1,000,000 rows               │
+╰───────────────────────────────╯

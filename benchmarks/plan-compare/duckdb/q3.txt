@@ -1,0 +1,43 @@
+╭─ Top N ──────────────────────────────────╮
+│ Top: 10                                  │
+│ Order By: revenue DESC, o_orderdate ASC  │
+│ ~10 rows                                 │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections: l_orderkey, revenue,        │
+│              o_orderdate, o_shippriority │
+│ ~4,808 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Group By ─────┴────────────────────╮
+│ Groups: #0, #1, #2                       │
+│ Aggregates: sum(#3)                      │
+│ ~4,808 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections:                             │
+│ l_orderkey, o_orderdate, o_shippriority, │
+│ l_extendedprice * (1.00 - l_discount)    │
+│ ~4,809 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Join ─────────┴────────────────────╮
+│ Join Type: INNER                         │
+│ Conditions: l_orderkey = o_orderkey      │
+│ ~4,809 rows                              │
+╰─────────────────────┬────────────────────╯
+                      ├─────────────────────────────────────────╮
+╭─ Read Parquet ──────┴────────────────────╮  ╭─ Hash Join ─────┴─────────────────╮
+│ Function: READ_PARQUET                   │  │ Join Type: INNER                  │
+│ Projections: l_orderkey,                 │  │ Conditions: o_custkey = c_custkey │
+│              l_extendedprice, l_discount │  │ ~5,999 rows                       │
+│ Filters: l_shipdate > '1995-03-15'::DATE │  ╰─────────────────┬─────────────────╯
+│ ~120,252 rows                            │                    ├───────────────────────────────────────╮
+╰──────────────────────────────────────────╯  ╭─ Read Parquet ──┴─────────────────╮  ╭─ Read Parquet ───┴─────────────────╮
+                                              │ Function: READ_PARQUET            │  │ Function: READ_PARQUET             │
+                                              │ Projections: o_orderkey,          │  │ Projections: c_custkey             │
+                                              │              o_custkey,           │  │ Filters: c_mktsegment = 'BUILDING' │
+                                              │              o_orderdate,         │  │ ~2,998 rows                        │
+                                              │              o_shippriority       │  ╰────────────────────────────────────╯
+                                              │ Filters:                          │
+                                              │ o_orderdate < '1995-03-15'::DATE  │
+                                              │ ~30,000 rows                      │
+                                              ╰───────────────────────────────────╯
