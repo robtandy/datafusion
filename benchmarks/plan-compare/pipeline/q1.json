@@ -1,0 +1,252 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [
+        2
+      ],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 1
+    },
+    {
+      "children": [],
+      "id": 2,
+      "parent": 1,
+      "pipelines": [
+        2
+      ],
+      "sink": 3
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 4
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalSort",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 4
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 4
+        }
+      },
+      "name": "PhysicalSort: expr=[l_returnflag@0 ASC NULLS LAST, l_linestatus@1 ASC NULLS LAST]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 4
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 4
+        }
+      },
+      "name": "PhysicalProjection: expr=[l_returnflag@0 as l_returnflag, l_linestatus@1 as l_linestatus, sum(lineitem.l_quantity)@2 as sum_qty, sum(lineitem.l_extendedprice)@3 as sum_base_price, sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)@4 as sum_disc_price, sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount * Int64(1) + lineitem.l_tax)@5 as sum_charge, avg(lineitem.l_quantity)@6 as avg_qty, avg(lineitem.l_extendedprice)@7 as avg_price, avg(lineitem.l_discount)@8 as avg_disc, count(Int64(1))@9 as count_order]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [
+        4
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 592753
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 4
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[l_returnflag@5 as l_returnflag, l_linestatus@6 as l_linestatus], aggr=[sum(lineitem.l_quantity), sum(lineitem.l_extendedprice), sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount), sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount * Int64(1) + lineitem.l_tax), avg(lineitem.l_quantity), avg(lineitem.l_extendedprice), avg(lineitem.l_discount), count(Int64(1))]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        },
+        {
+          "pipeline": 2,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "inputs": [
+        5
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 592753
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 592753
+        }
+      },
+      "name": "PhysicalProjection: expr=[l_extendedprice@0 * (1 - l_discount@1) as __common_expr_1, l_quantity@2 as l_quantity, l_extendedprice@0 as l_extendedprice, l_discount@1 as l_discount, l_tax@3 as l_tax, l_returnflag@4 as l_returnflag, l_linestatus@5 as l_linestatus]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "inputs": [
+        6
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 592753
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 592753
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 592753
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[lineitem/part-0.parquet:0..2998168, lineitem/part-1.parquet:0..3502], [lineitem/part-1.parquet:3502..3005172], [lineitem/part-1.parquet:3005172..3006854, lineitem/part-10.parquet:0..2993390, lineitem/part-11.parquet:0..6598], [lineitem/part-11.parquet:6598..3001009, lineitem/part-12.parquet:0..7259], [lineitem/part-12.parquet:7259..3001903, lineitem/part-13.parquet:0..7026], ...]}, projection=[l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate], file_type=parquet, predicate=l_shipdate@10 <= 1998-09-02, pruning_predicate=l_shipdate_null_count@1 != row_count@2 AND l_shipdate_min@0 <= 1998-09-02, required_guarantees=[], filter=l_shipdate@6 <= 1998-09-02, projection=[l_extendedprice@1, l_discount@2, l_quantity@0, l_tax@3, l_returnflag@4, l_linestatus@5]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [],
+      "sink": 0,
+      "source": 1
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [
+        2
+      ],
+      "meta_pipeline": 1,
+      "operators": [
+        2
+      ],
+      "sink": 1,
+      "source": 3
+    },
+    {
+      "dependencies": [],
+      "id": 2,
+      "meta_dependencies": [],
+      "meta_pipeline": 2,
+      "operators": [
+        5,
+        4
+      ],
+      "sink": 3,
+      "source": 6
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

@@ -1,0 +1,133 @@
+[
+    {
+        "name": "PROJECTION",
+        "children": [
+            {
+                "name": "UNGROUPED_AGGREGATE",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "HASH_JOIN",
+                                "children": [
+                                    {
+                                        "name": "PROJECTION",
+                                        "children": [
+                                            {
+                                                "name": "HASH_GROUP_BY",
+                                                "children": [
+                                                    {
+                                                        "name": "PROJECTION",
+                                                        "children": [
+                                                            {
+                                                                "name": "FILTER",
+                                                                "children": [
+                                                                    {
+                                                                        "name": "READ_PARQUET",
+                                                                        "children": [],
+                                                                        "extra_info": {
+                                                                            "Function": "READ_PARQUET",
+                                                                            "Projections": [
+                                                                                "l_partkey",
+                                                                                "l_quantity"
+                                                                            ],
+                                                                            "Estimated Cardinality": "601264"
+                                                                        }
+                                                                    }
+                                                                ],
+                                                                "extra_info": {
+                                                                    "Expression": "(l_partkey IS NOT NULL)",
+                                                                    "Estimated Cardinality": "481011"
+                                                                }
+                                                            }
+                                                        ],
+                                                        "extra_info": {
+                                                            "Projections": [
+                                                                "p_partkey",
+                                                                "l_quantity"
+                                                            ],
+                                                            "Estimated Cardinality": "481011"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Groups": "#0",
+                                                    "Aggregates": "avg(#1)",
+                                                    "Estimated Cardinality": "481011"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Projections": [
+                                                "(0.2 * avg(l_quantity))",
+                                                "p_partkey"
+                                            ],
+                                            "Estimated Cardinality": "481011"
+                                        }
+                                    },
+                                    {
+                                        "name": "HASH_JOIN",
+                                        "children": [
+                                            {
+                                                "name": "READ_PARQUET",
+                                                "children": [],
+                                                "extra_info": {
+                                                    "Function": "READ_PARQUET",
+                                                    "Projections": [
+                                                        "l_partkey",
+                                                        "l_quantity",
+                                                        "l_extendedprice"
+                                                    ],
+                                                    "Estimated Cardinality": "601264"
+                                                }
+                                            },
+                                            {
+                                                "name": "READ_PARQUET",
+                                                "children": [],
+                                                "extra_info": {
+                                                    "Function": "READ_PARQUET",
+                                                    "Projections": "p_partkey",
+                                                    "Filters": [
+                                                        "(p_brand = 'Brand#23')",
+                                                        "(p_container = 'MED BOX')"
+                                                    ],
+                                                    "Estimated Cardinality": "4000"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Join Type": "INNER",
+                                            "Conditions": "l_partkey = p_partkey",
+                                            "Estimated Cardinality": "120252"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Join Type": "INNER",
+                                    "Conditions": [
+                                        "p_partkey IS NOT DISTINCT FROM p_partkey",
+                                        "SUBQUERY > CAST(l_quantity AS DOUBLE)"
+                                    ],
+                                    "Estimated Cardinality": "481011"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": "#2",
+                            "Estimated Cardinality": "481011"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Aggregates": "sum(#0)",
+                    "Estimated Cardinality": "1"
+                }
+            }
+        ],
+        "extra_info": {
+            "Projections": "avg_yearly",
+            "Estimated Cardinality": "1"
+        }
+    }
+]

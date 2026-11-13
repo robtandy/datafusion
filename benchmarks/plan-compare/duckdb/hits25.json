@@ -1,0 +1,22 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "READ_PARQUET",
+                "children": [],
+                "extra_info": {
+                    "Function": "READ_PARQUET",
+                    "Projections": "SearchPhrase",
+                    "Filters": "((SearchPhrase != '') AND optional: Dynamic Filter (SearchPhrase))",
+                    "Estimated Cardinality": "800000"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "10",
+            "Order By": "SearchPhrase ASC",
+            "Estimated Cardinality": "10"
+        }
+    }
+]

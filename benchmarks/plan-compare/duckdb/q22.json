@@ -1,0 +1,360 @@
+[
+    {
+        "name": "PROJECTION",
+        "children": [
+            {
+                "name": "ORDER_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "PROJECTION",
+                                "children": [
+                                    {
+                                        "name": "HASH_GROUP_BY",
+                                        "children": [
+                                            {
+                                                "name": "PROJECTION",
+                                                "children": [
+                                                    {
+                                                        "name": "PROJECTION",
+                                                        "children": [
+                                                            {
+                                                                "name": "PROJECTION",
+                                                                "children": [
+                                                                    {
+                                                                        "name": "CTE",
+                                                                        "children": [
+                                                                            {
+                                                                                "name": "PROJECTION",
+                                                                                "children": [
+                                                                                    {
+                                                                                        "name": "NESTED_LOOP_JOIN",
+                                                                                        "children": [
+                                                                                            {
+                                                                                                "name": "PROJECTION",
+                                                                                                "children": [
+                                                                                                    {
+                                                                                                        "name": "FILTER",
+                                                                                                        "children": [
+                                                                                                            {
+                                                                                                                "name": "HASH_JOIN",
+                                                                                                                "children": [
+                                                                                                                    {
+                                                                                                                        "name": "READ_PARQUET",
+                                                                                                                        "children": [],
+                                                                                                                        "extra_info": {
+                                                                                                                            "Function": "READ_PARQUET",
+                                                                                                                            "Projections": [
+                                                                                                                                "c_custkey",
+                                                                                                                                "c_phone",
+                                                                                                                                "c_acctbal"
+                                                                                                                            ],
+                                                                                                                            "Estimated Cardinality": "14992"
+                                                                                                                        }
+                                                                                                                    },
+                                                                                                                    {
+                                                                                                                        "name": "COLUMN_DATA_SCAN",
+                                                                                                                        "children": [],
+                                                                                                                        "extra_info": {
+                                                                                                                            "Estimated Cardinality": "7"
+                                                                                                                        }
+                                                                                                                    }
+                                                                                                                ],
+                                                                                                                "extra_info": {
+                                                                                                                    "Join Type": "MARK",
+                                                                                                                    "Conditions": "\"substring\"(c_phone, 1, 2) = #0",
+                                                                                                                    "Estimated Cardinality": "14992"
+                                                                                                                }
+                                                                                                            }
+                                                                                                        ],
+                                                                                                        "extra_info": {
+                                                                                                            "Expression": "IN (...)",
+                                                                                                            "Estimated Cardinality": "2998"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "extra_info": {
+                                                                                                    "Projections": [
+                                                                                                        "#0",
+                                                                                                        "#1",
+                                                                                                        "#2"
+                                                                                                    ],
+                                                                                                    "Estimated Cardinality": "2998"
+                                                                                                }
+                                                                                            },
+                                                                                            {
+                                                                                                "name": "PROJECTION",
+                                                                                                "children": [
+                                                                                                    {
+                                                                                                        "name": "UNGROUPED_AGGREGATE",
+                                                                                                        "children": [
+                                                                                                            {
+                                                                                                                "name": "PROJECTION",
+                                                                                                                "children": [
+                                                                                                                    {
+                                                                                                                        "name": "PROJECTION",
+                                                                                                                        "children": [
+                                                                                                                            {
+                                                                                                                                "name": "PROJECTION",
+                                                                                                                                "children": [
+                                                                                                                                    {
+                                                                                                                                        "name": "FILTER",
+                                                                                                                                        "children": [
+                                                                                                                                            {
+                                                                                                                                                "name": "HASH_JOIN",
+                                                                                                                                                "children": [
+                                                                                                                                                    {
+                                                                                                                                                        "name": "READ_PARQUET",
+                                                                                                                                                        "children": [],
+                                                                                                                                                        "extra_info": {
+                                                                                                                                                            "Function": "READ_PARQUET",
+                                                                                                                                                            "Projections": [
+                                                                                                                                                                "c_phone",
+                                                                                                                                                                "c_acctbal"
+                                                                                                                                                            ],
+                                                                                                                                                            "Filters": "(c_acctbal > 0.00)",
+                                                                                                                                                            "Estimated Cardinality": "2998"
+                                                                                                                                                        }
+                                                                                                                                                    },
+                                                                                                                                                    {
+                                                                                                                                                        "name": "COLUMN_DATA_SCAN",
+                                                                                                                                                        "children": [],
+                                                                                                                                                        "extra_info": {
+                                                                                                                                                            "Estimated Cardinality": "7"
+                                                                                                                                                        }
+                                                                                                                                                    }
+                                                                                                                                                ],
+                                                                                                                                                "extra_info": {
+                                                                                                                                                    "Join Type": "MARK",
+                                                                                                                                                    "Conditions": "\"substring\"(c_phone, 1, 2) = #0",
+                                                                                                                                                    "Estimated Cardinality": "2998"
+                                                                                                                                                }
+                                                                                                                                            }
+                                                                                                                                        ],
+                                                                                                                                        "extra_info": {
+                                                                                                                                            "Expression": "IN (...)",
+                                                                                                                                            "Estimated Cardinality": "599"
+                                                                                                                                        }
+                                                                                                                                    }
+                                                                                                                                ],
+                                                                                                                                "extra_info": {
+                                                                                                                                    "Projections": [
+                                                                                                                                        "#0",
+                                                                                                                                        "#1"
+                                                                                                                                    ],
+                                                                                                                                    "Estimated Cardinality": "599"
+                                                                                                                                }
+                                                                                                                            }
+                                                                                                                        ],
+                                                                                                                        "extra_info": {
+                                                                                                                            "Projections": "c_acctbal",
+                                                                                                                            "Estimated Cardinality": "599"
+                                                                                                                        }
+                                                                                                                    }
+                                                                                                                ],
+                                                                                                                "extra_info": {
+                                                                                                                    "Projections": "c_acctbal",
+                                                                                                                    "Estimated Cardinality": "599"
+                                                                                                                }
+                                                                                                            }
+                                                                                                        ],
+                                                                                                        "extra_info": {
+                                                                                                            "Aggregates": [
+                                                                                                                "sum(#0)",
+                                                                                                                "count(#0)"
+                                                                                                            ],
+                                                                                                            "Estimated Cardinality": "1"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "extra_info": {
+                                                                                                    "Projections": "\"/\"(CAST(#0 AS DOUBLE), CAST(#1 AS DOUBLE))",
+                                                                                                    "Estimated Cardinality": "1"
+                                                                                                }
+                                                                                            }
+                                                                                        ],
+                                                                                        "extra_info": {
+                                                                                            "Join Type": "INNER",
+                                                                                            "Conditions": "CAST(c_acctbal AS DOUBLE) > SUBQUERY",
+                                                                                            "Estimated Cardinality": "1499"
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "extra_info": {
+                                                                                    "Projections": [
+                                                                                        "#0",
+                                                                                        "#1",
+                                                                                        "#2"
+                                                                                    ],
+                                                                                    "Estimated Cardinality": "1499"
+                                                                                }
+                                                                            },
+                                                                            {
+                                                                                "name": "PROJECTION",
+                                                                                "children": [
+                                                                                    {
+                                                                                        "name": "FILTER",
+                                                                                        "children": [
+                                                                                            {
+                                                                                                "name": "HASH_JOIN",
+                                                                                                "children": [
+                                                                                                    {
+                                                                                                        "name": "CTE_SCAN",
+                                                                                                        "children": [],
+                                                                                                        "extra_info": {
+                                                                                                            "CTE Index": "49",
+                                                                                                            "Estimated Cardinality": "1499"
+                                                                                                        }
+                                                                                                    },
+                                                                                                    {
+                                                                                                        "name": "HASH_JOIN",
+                                                                                                        "children": [
+                                                                                                            {
+                                                                                                                "name": "READ_PARQUET",
+                                                                                                                "children": [],
+                                                                                                                "extra_info": {
+                                                                                                                    "Function": "READ_PARQUET",
+                                                                                                                    "Projections": "o_custkey",
+                                                                                                                    "Estimated Cardinality": "150000"
+                                                                                                                }
+                                                                                                            },
+                                                                                                            {
+                                                                                                                "name": "HASH_GROUP_BY",
+                                                                                                                "children": [
+                                                                                                                    {
+                                                                                                                        "name": "PROJECTION",
+                                                                                                                        "children": [
+                                                                                                                            {
+                                                                                                                                "name": "CTE_SCAN",
+                                                                                                                                "children": [],
+                                                                                                                                "extra_info": {
+                                                                                                                                    "CTE Index": "49",
+                                                                                                                                    "Estimated Cardinality": "1499"
+                                                                                                                                }
+                                                                                                                            }
+                                                                                                                        ],
+                                                                                                                        "extra_info": {
+                                                                                                                            "Projections": "#[1.0]",
+                                                                                                                            "Estimated Cardinality": "1499"
+                                                                                                                        }
+                                                                                                                    }
+                                                                                                                ],
+                                                                                                                "extra_info": {
+                                                                                                                    "Groups": "#0",
+                                                                                                                    "Aggregates": "",
+                                                                                                                    "Estimated Cardinality": "1499"
+                                                                                                                }
+                                                                                                            }
+                                                                                                        ],
+                                                                                                        "extra_info": {
+                                                                                                            "Join Type": "SEMI",
+                                                                                                            "Conditions": "o_custkey = c_custkey",
+                                                                                                            "Estimated Cardinality": "14998"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "extra_info": {
+                                                                                                    "Join Type": "MARK",
+                                                                                                    "Conditions": "c_custkey IS NOT DISTINCT FROM c_custkey",
+                                                                                                    "Estimated Cardinality": "1499"
+                                                                                                }
+                                                                                            }
+                                                                                        ],
+                                                                                        "extra_info": {
+                                                                                            "Expression": "(NOT SUBQUERY)",
+                                                                                            "Estimated Cardinality": "299"
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "extra_info": {
+                                                                                    "Projections": [
+                                                                                        "#0",
+                                                                                        "#1"
+                                                                                    ],
+                                                                                    "Estimated Cardinality": "299"
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "extra_info": {
+                                                                            "CTE Name": "__duckdb_delim_49",
+                                                                            "Table Index": "49",
+                                                                            "Execution Mode": "PIPELINE_DEPENDENT",
+                                                                            "Estimated Cardinality": "299"
+                                                                        }
+                                                                    }
+                                                                ],
+                                                                "extra_info": {
+                                                                    "Projections": [
+                                                                        "cntrycode",
+                                                                        "c_acctbal"
+                                                                    ],
+                                                                    "Estimated Cardinality": "299"
+                                                                }
+                                                            }
+                                                        ],
+                                                        "extra_info": {
+                                                            "Projections": [
+                                                                "__internal_compress_string_uhugeint(#0)",
+                                                                "#1"
+                                                            ],
+                                                            "Estimated Cardinality": "299"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Projections": [
+                                                        "cntrycode",
+                                                        "c_acctbal"
+                                                    ],
+                                                    "Estimated Cardinality": "299"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Groups": "#0",
+                                            "Aggregates": [
+                                                "count_star()",
+                                                "sum(#1)"
+                                            ],
+                                            "Estimated Cardinality": "299"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Projections": [
+                                        "__internal_decompress_string(#0)",
+                                        "#1",
+                                        "#2"
+                                    ],
+                                    "Estimated Cardinality": "299"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "__internal_compress_string_uhugeint(#0)",
+                                "#1",
+                                "#2"
+                            ],
+                            "Estimated Cardinality": "299"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Order By": "cntrycode ASC",
+                    "Estimated Cardinality": "299"
+                }
+            }
+        ],
+        "extra_info": {
+            "Projections": [
+                "__internal_decompress_string(#0)",
+                "#1",
+                "#2"
+            ],
+            "Estimated Cardinality": "299"
+        }
+    }
+]

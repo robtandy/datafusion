@@ -1,0 +1,151 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 1
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 10
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalTopK",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 33790
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 10
+        }
+      },
+      "name": "PhysicalTopK: fetch=10, expr=[EventTime@5 ASC NULLS LAST, WatchID@0 ASC NULLS LAST], dynamic_filter=true",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 33790
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 33790
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 33790
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[hits/part-0.parquet:0..5716123], [hits/part-0.parquet:5716123..5723123, hits/part-1.parquet:0..5709123], [hits/part-1.parquet:5709123..5710232, hits/part-10.parquet:0..5710484, hits/part-11.parquet:0..4530], [hits/part-11.parquet:4530..5720653], [hits/part-11.parquet:5720653..5732231, hits/part-12.parquet:0..5704545], ...]}, projection=[WatchID, UserID, CounterID, RegionID, ClientIP, EventTime, EventDate, AdvEngineID, SearchEngineID, SearchPhrase, URL, Title, IsRefresh, DontCountHits, ResolutionWidth, MobilePhone, MobilePhoneModel], file_type=parquet, predicate=URL@10 LIKE %google% AND DynamicFilter [ EventTime@5 < 1372638146 OR EventTime@5 = 1372638146 AND WatchID@0 < 2072021522208071178 ], dynamic_rg_pruning=eligible, pruning_predicate=EventTime_null_count@3 != row_count@4 AND EventTime_min@2 < 1372638146 OR EventTime_null_count@3 != row_count@4 AND EventTime_min@2 <= 1372638146 AND 1372638146 <= EventTime_max@5 AND WatchID_null_count@7 != row_count@4 AND WatchID_min@6 < 2072021522208071178, required_guarantees=[], filter=URL@10 LIKE %google%",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [],
+      "sink": 0,
+      "source": 1
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [],
+      "meta_pipeline": 1,
+      "operators": [
+        2
+      ],
+      "sink": 1,
+      "source": 3
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

@@ -1,0 +1,277 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [
+        2
+      ],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 1
+    },
+    {
+      "children": [
+        3
+      ],
+      "id": 2,
+      "parent": 1,
+      "pipelines": [
+        2
+      ],
+      "sink": 3
+    },
+    {
+      "children": [],
+      "id": 3,
+      "parent": 2,
+      "pipelines": [
+        3
+      ],
+      "sink": 4
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 8
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalTopK",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 8
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 8
+        }
+      },
+      "name": "PhysicalTopK: fetch=10, expr=[u@1 DESC, MobilePhoneModel@0 ASC NULLS LAST], dynamic_filter=true",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 8
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 8
+        }
+      },
+      "name": "PhysicalProjection: expr=[MobilePhoneModel@0 as MobilePhoneModel, count(alias1)@1 as u]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [
+        4
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 114139
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 8
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[MobilePhoneModel@0 as MobilePhoneModel], aggr=[count(alias1)]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        },
+        {
+          "pipeline": 2,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "inputs": [
+        5
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 149889
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 114139
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[MobilePhoneModel@1 as MobilePhoneModel, UserID@0 as alias1], aggr=[]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "source"
+        },
+        {
+          "pipeline": 3,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "inputs": [
+        6
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 149889
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 149889
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 3,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 149889
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[hits/part-0.parquet:0..5716123], [hits/part-0.parquet:5716123..5723123, hits/part-1.parquet:0..5709123], [hits/part-1.parquet:5709123..5710232, hits/part-10.parquet:0..5710484, hits/part-11.parquet:0..4530], [hits/part-11.parquet:4530..5720653], [hits/part-11.parquet:5720653..5732231, hits/part-12.parquet:0..5704545], ...]}, projection=[UserID, MobilePhoneModel], file_type=parquet, predicate=MobilePhoneModel@16 != , pruning_predicate=MobilePhoneModel_null_count@2 != row_count@3 AND (MobilePhoneModel_min@0 !=  OR  != MobilePhoneModel_max@1), required_guarantees=[MobilePhoneModel not in ()], filter=MobilePhoneModel@1 != ",
+      "pipelines": [
+        {
+          "pipeline": 3,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [],
+      "sink": 0,
+      "source": 1
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [
+        2
+      ],
+      "meta_pipeline": 1,
+      "operators": [
+        2
+      ],
+      "sink": 1,
+      "source": 3
+    },
+    {
+      "dependencies": [],
+      "id": 2,
+      "meta_dependencies": [
+        3
+      ],
+      "meta_pipeline": 2,
+      "operators": [],
+      "sink": 3,
+      "source": 4
+    },
+    {
+      "dependencies": [],
+      "id": 3,
+      "meta_dependencies": [],
+      "meta_pipeline": 3,
+      "operators": [
+        5
+      ],
+      "sink": 4,
+      "source": 6
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

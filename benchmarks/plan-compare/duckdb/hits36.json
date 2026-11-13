@@ -1,0 +1,50 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": "URL",
+                                    "Filters": [
+                                        "(CounterID = 62)",
+                                        "((EventDate >= '2013-07-01'::DATE) AND (EventDate <= '2013-07-31'::DATE))",
+                                        "(URL != '')",
+                                        "(IsRefresh = 0)",
+                                        "(DontCountHits = 0)"
+                                    ],
+                                    "Estimated Cardinality": "200000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": "URL",
+                            "Estimated Cardinality": "200000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": "#0",
+                    "Aggregates": "count_star()",
+                    "Estimated Cardinality": "200000"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "10",
+            "Order By": [
+                "PageViews DESC",
+                "URL ASC"
+            ],
+            "Estimated Cardinality": "10"
+        }
+    }
+]

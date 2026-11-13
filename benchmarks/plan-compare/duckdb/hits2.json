@@ -1,0 +1,53 @@
+[
+    {
+        "name": "PROJECTION",
+        "children": [
+            {
+                "name": "UNGROUPED_AGGREGATE",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": [
+                                        "AdvEngineID",
+                                        "ResolutionWidth"
+                                    ],
+                                    "Estimated Cardinality": "1000000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "AdvEngineID",
+                                "ResolutionWidth"
+                            ],
+                            "Estimated Cardinality": "1000000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Aggregates": [
+                        "sum(#0)",
+                        "count_star()",
+                        "sum(#1)",
+                        "count(#1)"
+                    ],
+                    "Estimated Cardinality": "1"
+                }
+            }
+        ],
+        "extra_info": {
+            "Projections": [
+                "#0",
+                "#1",
+                "\"/\"(CAST(#2 AS DOUBLE), CAST(#3 AS DOUBLE))"
+            ],
+            "Estimated Cardinality": "1"
+        }
+    }
+]

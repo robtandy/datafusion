@@ -1,0 +1,315 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [
+        2
+      ],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 2
+    },
+    {
+      "children": [],
+      "id": 2,
+      "parent": 1,
+      "pipelines": [
+        2,
+        3
+      ],
+      "sink": 4
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalProjection: expr=[100 * CAST(sum(CASE WHEN part.p_type LIKE Utf8(\"PROMO%\") THEN lineitem.l_extendedprice * Int64(1) - lineitem.l_discount ELSE Int64(0) END)@0 AS Float64) / CAST(sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)@1 AS Float64) as promo_revenue]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 7594
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[], aggr=[sum(CASE WHEN part.p_type LIKE Utf8(\"PROMO%\") THEN lineitem.l_extendedprice * Int64(1) - lineitem.l_discount ELSE Int64(0) END), sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [
+        4
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 7594
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 7594
+        }
+      },
+      "name": "PhysicalProjection: expr=[l_extendedprice@0 * (1 - l_discount@1) as __common_expr_1, p_type@2 as p_type]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "inputs": [
+        5,
+        7
+      ],
+      "kind": "PhysicalHashJoin",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 13132
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 7594
+        }
+      },
+      "name": "PhysicalHashJoin: join_type=Inner, on=[(l_partkey@0, p_partkey@0)], projection=[l_extendedprice@1, l_discount@2, p_type@4]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        },
+        {
+          "pipeline": 2,
+          "role": "sink"
+        },
+        {
+          "pipeline": 3,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "inputs": [
+        6
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 7594
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 7594
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 7594
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[lineitem/part-0.parquet:0..2998168, lineitem/part-1.parquet:0..3502], [lineitem/part-1.parquet:3502..3005172], [lineitem/part-1.parquet:3005172..3006854, lineitem/part-10.parquet:0..2993390, lineitem/part-11.parquet:0..6598], [lineitem/part-11.parquet:6598..3001009, lineitem/part-12.parquet:0..7259], [lineitem/part-12.parquet:7259..3001903, lineitem/part-13.parquet:0..7026], ...]}, projection=[l_partkey, l_extendedprice, l_discount, l_shipdate], file_type=parquet, predicate=l_shipdate@10 >= 1995-09-01 AND l_shipdate@10 < 1995-10-01, pruning_predicate=l_shipdate_null_count@1 != row_count@2 AND l_shipdate_max@0 >= 1995-09-01 AND l_shipdate_null_count@1 != row_count@2 AND l_shipdate_min@3 < 1995-10-01, required_guarantees=[], filter=l_shipdate@3 >= 1995-09-01 AND l_shipdate@3 < 1995-10-01, projection=[l_partkey@0, l_extendedprice@1, l_discount@2]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 5538
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[part/part-0.parquet:0..147099, part/part-1.parquet:0..576], [part/part-1.parquet:576..147797, part/part-10.parquet:0..454], [part/part-10.parquet:454..148129], [part/part-10.parquet:148129..148363, part/part-11.parquet:0..147441], [part/part-11.parquet:147441..147684, part/part-12.parquet:0..147389, part/part-13.parquet:0..43], ...]}, projection=[p_partkey, p_type], file_type=parquet, predicate=DynamicFilter [ p_partkey@0 >= 1 AND p_partkey@0 <= 19998 AND hash_lookup(p_partkey@0) ], dynamic_rg_pruning=eligible, pruning_predicate=p_partkey_null_count@1 != row_count@2 AND p_partkey_max@0 >= 1 AND p_partkey_null_count@1 != row_count@2 AND p_partkey_min@3 <= 19998, required_guarantees=[]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "inputs": [],
+      "kind": "JoinHashTableBuild",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "JoinHashTableBuild",
+      "pipelines": [
+        {
+          "pipeline": 3,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [
+        1
+      ],
+      "sink": 0,
+      "source": 2
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [
+        2
+      ],
+      "meta_pipeline": 1,
+      "operators": [
+        4,
+        3
+      ],
+      "sink": 2,
+      "source": 7
+    },
+    {
+      "dependencies": [],
+      "id": 2,
+      "meta_dependencies": [],
+      "meta_pipeline": 2,
+      "operators": [
+        5
+      ],
+      "sink": 4,
+      "source": 6
+    },
+    {
+      "dependencies": [
+        2
+      ],
+      "id": 3,
+      "meta_dependencies": [],
+      "meta_pipeline": 2,
+      "operators": [],
+      "sink": 4,
+      "source": 8
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

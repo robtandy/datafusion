@@ -1,0 +1,277 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [
+        2
+      ],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 1
+    },
+    {
+      "children": [],
+      "id": 2,
+      "parent": 1,
+      "pipelines": [
+        2
+      ],
+      "sink": 5
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 25
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalTopK",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 500
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 25
+        }
+      },
+      "name": "PhysicalTopK: fetch=25, expr=[l@1 DESC, CounterID@0 ASC NULLS LAST], dynamic_filter=true",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 500
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 500
+        }
+      },
+      "name": "PhysicalProjection: expr=[CounterID@0 as CounterID, avg(length(hits.URL))@1 as l, count(Int64(1))@2 as c]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [
+        4
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 500
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 500
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "inputs": [
+        5
+      ],
+      "kind": "PhysicalFilter",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 500
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 500
+        }
+      },
+      "name": "PhysicalFilter: count(Int64(1))@2 > 100",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "inputs": [
+        6
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1000000
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 500
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[CounterID@0 as CounterID], aggr=[avg(length(hits.URL)), count(Int64(1))]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        },
+        {
+          "pipeline": 2,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "inputs": [
+        7
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1000000
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1000000
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1000000
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[hits/part-0.parquet:0..5716123], [hits/part-0.parquet:5716123..5723123, hits/part-1.parquet:0..5709123], [hits/part-1.parquet:5709123..5710232, hits/part-10.parquet:0..5710484, hits/part-11.parquet:0..4530], [hits/part-11.parquet:4530..5720653], [hits/part-11.parquet:5720653..5732231, hits/part-12.parquet:0..5704545], ...]}, projection=[CounterID, URL], file_type=parquet, predicate=URL@10 != , pruning_predicate=URL_null_count@2 != row_count@3 AND (URL_min@0 !=  OR  != URL_max@1), required_guarantees=[URL not in ()], filter=URL@1 != ",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [],
+      "sink": 0,
+      "source": 1
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [
+        2
+      ],
+      "meta_pipeline": 1,
+      "operators": [
+        4,
+        3,
+        2
+      ],
+      "sink": 1,
+      "source": 5
+    },
+    {
+      "dependencies": [],
+      "id": 2,
+      "meta_dependencies": [],
+      "meta_pipeline": 2,
+      "operators": [
+        6
+      ],
+      "sink": 5,
+      "source": 7
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

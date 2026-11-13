@@ -1,0 +1,101 @@
+[
+    {
+        "name": "ORDER_BY",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "HASH_JOIN",
+                                "children": [
+                                    {
+                                        "name": "READ_PARQUET",
+                                        "children": [],
+                                        "extra_info": {
+                                            "Function": "READ_PARQUET",
+                                            "Projections": [
+                                                "o_orderkey",
+                                                "o_orderpriority"
+                                            ],
+                                            "Estimated Cardinality": "150000"
+                                        }
+                                    },
+                                    {
+                                        "name": "PROJECTION",
+                                        "children": [
+                                            {
+                                                "name": "FILTER",
+                                                "children": [
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "l_orderkey",
+                                                                "l_shipdate",
+                                                                "l_commitdate",
+                                                                "l_receiptdate",
+                                                                "l_shipmode"
+                                                            ],
+                                                            "Filters": [
+                                                                "(l_shipdate < '1995-01-01'::DATE)",
+                                                                "(l_commitdate < '1995-01-01'::DATE)",
+                                                                "((l_receiptdate >= '1994-01-01'::DATE) AND (l_receiptdate < '1995-01-01'::DATE))",
+                                                                "optional: (l_shipmode IN ('MAIL', 'SHIP'))"
+                                                            ],
+                                                            "Estimated Cardinality": "120252"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Expression": "((l_commitdate < l_receiptdate) AND (l_shipdate < l_commitdate) AND ((l_shipmode = 'MAIL') OR (l_shipmode = 'SHIP')))",
+                                                    "Estimated Cardinality": "24050"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Projections": [
+                                                "#0",
+                                                "#4"
+                                            ],
+                                            "Estimated Cardinality": "24050"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Join Type": "INNER",
+                                    "Conditions": "o_orderkey = l_orderkey",
+                                    "Estimated Cardinality": "24050"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "l_shipmode",
+                                "CASE  WHEN (((o_orderpriority = '1-URGENT') OR (o_orderpriority = '2-HIGH'))) THEN (1) ELSE 0 END",
+                                "CASE  WHEN (((o_orderpriority != '1-URGENT') AND (o_orderpriority != '2-HIGH'))) THEN (1) ELSE 0 END"
+                            ],
+                            "Estimated Cardinality": "24050"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": "#0",
+                    "Aggregates": [
+                        "sum(#1)",
+                        "sum(#2)"
+                    ],
+                    "Estimated Cardinality": "2"
+                }
+            }
+        ],
+        "extra_info": {
+            "Order By": "l_shipmode ASC",
+            "Estimated Cardinality": "2"
+        }
+    }
+]

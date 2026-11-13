@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
+# SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
+
+# Dumps the pipeline engine's plans of the 47 benchmark queries for the
+# comparison with DuckDB's plans (see ../README.md). A package of its own,
+# outside of the workspace of the repository (so that the workspace does not
+# change): build it with `--locked`, its Cargo.lock pins the versions of the
+# workspace's Cargo.lock.
+
+[package]
+name = "plan-compare-dump-plans"
+description = "Dumps the pipeline engine's plans of the benchmark queries for benchmarks/plan-compare"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Not a member of the workspace of the repository.
+[workspace]
+
+[dependencies]
+datafusion = { path = "../../../datafusion/core" }
+datafusion-physical-pipeline = { path = "../../../datafusion/physical-pipeline" }
+serde_json = "1"
+tokio = { version = "1.52", features = ["macros", "rt", "rt-multi-thread", "sync"] }

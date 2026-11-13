@@ -1,0 +1,52 @@
+[
+    {
+        "name": "PROJECTION",
+        "children": [
+            {
+                "name": "UNGROUPED_AGGREGATE",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": "ResolutionWidth",
+                                    "Estimated Cardinality": "1000000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": "ResolutionWidth",
+                            "Estimated Cardinality": "1000000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Aggregates": [
+                        "sum(#0)",
+                        "count(#0)"
+                    ],
+                    "Estimated Cardinality": "1"
+                }
+            }
+        ],
+        "extra_info": {
+            "Projections": [
+                "#0",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 1))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 2))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 3))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 4))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 5))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 6))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 7))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 8))",
+                "\"+\"(#0, \"*\"(CAST(#1 AS HUGEINT), 9))"
+            ],
+            "Estimated Cardinality": "1"
+        }
+    }
+]

@@ -1,0 +1,30 @@
+[
+    {
+        "name": "UNGROUPED_AGGREGATE",
+        "children": [
+            {
+                "name": "PROJECTION",
+                "children": [
+                    {
+                        "name": "READ_PARQUET",
+                        "children": [],
+                        "extra_info": {
+                            "Function": "READ_PARQUET",
+                            "Projections": "",
+                            "Filters": "contains(URL, 'google')",
+                            "Estimated Cardinality": "200000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Projections": "42",
+                    "Estimated Cardinality": "200000"
+                }
+            }
+        ],
+        "extra_info": {
+            "Aggregates": "count_star()",
+            "Estimated Cardinality": "1"
+        }
+    }
+]

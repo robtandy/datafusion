@@ -1,0 +1,48 @@
+[
+    {
+        "name": "UNGROUPED_AGGREGATE",
+        "children": [
+            {
+                "name": "PROJECTION",
+                "children": [
+                    {
+                        "name": "HASH_GROUP_BY",
+                        "children": [
+                            {
+                                "name": "PROJECTION",
+                                "children": [
+                                    {
+                                        "name": "READ_PARQUET",
+                                        "children": [],
+                                        "extra_info": {
+                                            "Function": "READ_PARQUET",
+                                            "Projections": "SearchPhrase",
+                                            "Estimated Cardinality": "1000000"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Projections": "SearchPhrase",
+                                    "Estimated Cardinality": "1000000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Groups": "#0",
+                            "Aggregates": "",
+                            "Estimated Cardinality": "1000000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Projections": "#0",
+                    "Estimated Cardinality": "1000000"
+                }
+            }
+        ],
+        "extra_info": {
+            "Aggregates": "count(#0)",
+            "Estimated Cardinality": "1"
+        }
+    }
+]

@@ -1,0 +1,62 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": [
+                                        "ClientIP",
+                                        "SearchEngineID",
+                                        "IsRefresh",
+                                        "ResolutionWidth"
+                                    ],
+                                    "Filters": "(SearchPhrase != '')",
+                                    "Estimated Cardinality": "800000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "SearchEngineID",
+                                "ClientIP",
+                                "IsRefresh",
+                                "ResolutionWidth"
+                            ],
+                            "Estimated Cardinality": "800000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": [
+                        "#0",
+                        "#1"
+                    ],
+                    "Aggregates": [
+                        "count_star()",
+                        "sum(#2)",
+                        "avg(#3)"
+                    ],
+                    "Estimated Cardinality": "799999"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "10",
+            "Order By": [
+                "c DESC",
+                "SearchEngineID ASC",
+                "ClientIP ASC"
+            ],
+            "Estimated Cardinality": "10"
+        }
+    }
+]

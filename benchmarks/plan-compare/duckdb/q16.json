@@ -1,0 +1,197 @@
+[
+    {
+        "name": "ORDER_BY",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "HASH_GROUP_BY",
+                                "children": [
+                                    {
+                                        "name": "PROJECTION",
+                                        "children": [
+                                            {
+                                                "name": "PROJECTION",
+                                                "children": [
+                                                    {
+                                                        "name": "FILTER",
+                                                        "children": [
+                                                            {
+                                                                "name": "HASH_JOIN",
+                                                                "children": [
+                                                                    {
+                                                                        "name": "HASH_JOIN",
+                                                                        "children": [
+                                                                            {
+                                                                                "name": "READ_PARQUET",
+                                                                                "children": [],
+                                                                                "extra_info": {
+                                                                                    "Function": "READ_PARQUET",
+                                                                                    "Projections": [
+                                                                                        "ps_partkey",
+                                                                                        "ps_suppkey"
+                                                                                    ],
+                                                                                    "Estimated Cardinality": "80000"
+                                                                                }
+                                                                            },
+                                                                            {
+                                                                                "name": "PROJECTION",
+                                                                                "children": [
+                                                                                    {
+                                                                                        "name": "FILTER",
+                                                                                        "children": [
+                                                                                            {
+                                                                                                "name": "HASH_JOIN",
+                                                                                                "children": [
+                                                                                                    {
+                                                                                                        "name": "READ_PARQUET",
+                                                                                                        "children": [],
+                                                                                                        "extra_info": {
+                                                                                                            "Function": "READ_PARQUET",
+                                                                                                            "Projections": [
+                                                                                                                "p_partkey",
+                                                                                                                "p_brand",
+                                                                                                                "p_type",
+                                                                                                                "p_size"
+                                                                                                            ],
+                                                                                                            "Filters": [
+                                                                                                                "(p_brand != 'Brand#45')",
+                                                                                                                "(NOT prefix(p_type, 'MEDIUM POLISHED'))",
+                                                                                                                "optional: (p_size IN (3, 9, 14, 19, 23, 36, 45, 49))"
+                                                                                                            ],
+                                                                                                            "Estimated Cardinality": "4000"
+                                                                                                        }
+                                                                                                    },
+                                                                                                    {
+                                                                                                        "name": "COLUMN_DATA_SCAN",
+                                                                                                        "children": [],
+                                                                                                        "extra_info": {
+                                                                                                            "Estimated Cardinality": "8"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "extra_info": {
+                                                                                                    "Join Type": "MARK",
+                                                                                                    "Conditions": "p_size = #0",
+                                                                                                    "Estimated Cardinality": "4000"
+                                                                                                }
+                                                                                            }
+                                                                                        ],
+                                                                                        "extra_info": {
+                                                                                            "Expression": "IN (...)",
+                                                                                            "Estimated Cardinality": "800"
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "extra_info": {
+                                                                                    "Projections": [
+                                                                                        "#0",
+                                                                                        "#1",
+                                                                                        "#2",
+                                                                                        "#3"
+                                                                                    ],
+                                                                                    "Estimated Cardinality": "800"
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "extra_info": {
+                                                                            "Join Type": "INNER",
+                                                                            "Conditions": "ps_partkey = p_partkey",
+                                                                            "Estimated Cardinality": "3200"
+                                                                        }
+                                                                    },
+                                                                    {
+                                                                        "name": "READ_PARQUET",
+                                                                        "children": [],
+                                                                        "extra_info": {
+                                                                            "Function": "READ_PARQUET",
+                                                                            "Projections": "s_suppkey",
+                                                                            "Filters": "(s_comment ~~ '%Customer%Complaints%')",
+                                                                            "Estimated Cardinality": "198"
+                                                                        }
+                                                                    }
+                                                                ],
+                                                                "extra_info": {
+                                                                    "Join Type": "MARK",
+                                                                    "Conditions": "ps_suppkey = #0",
+                                                                    "Estimated Cardinality": "3200"
+                                                                }
+                                                            }
+                                                        ],
+                                                        "extra_info": {
+                                                            "Expression": "(NOT SUBQUERY)",
+                                                            "Estimated Cardinality": "640"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Projections": [
+                                                        "#0",
+                                                        "#1",
+                                                        "#2",
+                                                        "#3"
+                                                    ],
+                                                    "Estimated Cardinality": "640"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Projections": [
+                                                "p_brand",
+                                                "p_type",
+                                                "p_size",
+                                                "ps_suppkey"
+                                            ],
+                                            "Estimated Cardinality": "640"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Groups": [
+                                        "#0",
+                                        "#1",
+                                        "#2",
+                                        "#3"
+                                    ],
+                                    "Aggregates": "",
+                                    "Estimated Cardinality": "639"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "#0",
+                                "#1",
+                                "#2",
+                                "#3"
+                            ],
+                            "Estimated Cardinality": "639"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": [
+                        "#0",
+                        "#1",
+                        "#2"
+                    ],
+                    "Aggregates": "count(#3)",
+                    "Estimated Cardinality": "638"
+                }
+            }
+        ],
+        "extra_info": {
+            "Order By": [
+                "supplier_cnt DESC",
+                "p_brand ASC",
+                "p_type ASC",
+                "p_size ASC"
+            ],
+            "Estimated Cardinality": "638"
+        }
+    }
+]
