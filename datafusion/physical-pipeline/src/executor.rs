@@ -42,6 +42,9 @@ use crate::operator::{
     SourceResult, TaskInterrupt, downcast_state_mut, operator_key,
 };
 use crate::pipeline::{MetaPipeline, Pipeline, PipelineGraph};
+use crate::profiling::{
+    ExecutionProfiler, PipelineProfiling, ProfilingOptions, QueryProfile, WorkerProfiler,
+};
 
 /// Maximum number of operator calls (`get_data`, `execute`, `final_execute`
 /// and `sink`) a [`PipelineExecutor`] makes per poll before it yields back to
@@ -63,6 +66,20 @@ struct PipelineShared {
     /// [`crate::operator::SinkFinalize::NoOutputPossible`] and
     /// [`crate::operator::SinkResult::Finished`]): no push loop at all.
     skip: bool,
+    /// The profiling of the pipeline, if the execution is profiled.
+    profiling: Option<Arc<PipelineProfiling>>,
+}
+
+impl PipelineShared {
+    /// The metrics of the operator at `stage` (`0`: the source, `1..=n`: an
+    /// operator, `n + 1`: the sink).
+    fn stage_metrics(&self, stage: usize) -> &OperatorMetrics {
+        match stage {
+            0 => &self.source_metrics,
+            stage if stage <= self.operators.len() => &self.operator_metrics[stage - 1],
+            _ => &self.sink_metrics,
+        }
+    }
 }
 
 /// What [`PipelineExecutor::poll_run`] achieved.
@@ -153,14 +170,55 @@ pub struct PipelineExecutor {
     /// whether an operator or the sink of the pipeline finished.
     finish_epoch: usize,
     done: bool,
+    /// What this thread records for the profile of the execution, if it is
+    /// profiled.
+    profile: Option<Box<WorkerProfiler>>,
+}
+
+/// Run `f`, a call of the operator at `stage` of a pipeline that creates a
+/// state or combines, and record its time in `metrics` and `profile`.
+fn measure<T>(
+    profile: Option<&mut WorkerProfiler>,
+    metrics: &OperatorMetrics,
+    stage: usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    let scope = profile.as_ref().map(|profile| profile.enter(stage));
+    let start = Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    drop(scope);
+    metrics.add_elapsed(elapsed);
+    if let Some(profile) = profile {
+        profile.record_time(stage, elapsed);
+    }
+    result
 }
 
 impl PipelineExecutor {
-    fn try_new(shared: Arc<PipelineShared>, ctx: ExecutionContext) -> Result<Self> {
+    /// Create the executor of a thread of the pipeline of `shared`, spawned
+    /// at `spawned` (if the execution is profiled, else `None`).
+    fn try_new(
+        shared: Arc<PipelineShared>,
+        ctx: ExecutionContext,
+        spawned: Option<Instant>,
+    ) -> Result<Self> {
         let num_operators = shared.operators.len();
-        let sink_state = shared
-            .sink
-            .get_local_sink_state(&ctx, shared.sink_state.as_ref())?;
+        let mut profile = shared.profiling.as_ref().map(|profiling| {
+            Box::new(
+                profiling.worker(ctx.thread_id, spawned.unwrap_or_else(Instant::now)),
+            )
+        });
+        let sink_state = measure(
+            profile.as_deref_mut(),
+            &shared.sink_metrics,
+            num_operators + 1,
+            || {
+                shared
+                    .sink
+                    .get_local_sink_state(&ctx, shared.sink_state.as_ref())
+            },
+        )?;
         let mut chunks = Vec::with_capacity(num_operators + 1);
         chunks.push(DataChunk::empty(shared.source.schema()));
         chunks.extend(
@@ -187,19 +245,29 @@ impl PipelineExecutor {
                 thread: ctx.registry().next_thread_id(),
                 finish_epoch: 0,
                 done: false,
+                profile,
                 shared,
                 ctx,
             });
         }
 
-        let source_state = shared
-            .source
-            .get_local_source_state(&ctx, shared.source_state.as_ref())?;
+        let source_state =
+            measure(profile.as_deref_mut(), &shared.source_metrics, 0, || {
+                shared
+                    .source
+                    .get_local_source_state(&ctx, shared.source_state.as_ref())
+            })?;
         let operator_states = shared
             .operators
             .iter()
             .zip(&shared.operator_states)
-            .map(|(operator, gstate)| operator.get_operator_state(&ctx, gstate.as_ref()))
+            .zip(&shared.operator_metrics)
+            .enumerate()
+            .map(|(index, ((operator, gstate), metrics))| {
+                measure(profile.as_deref_mut(), metrics, index + 1, || {
+                    operator.get_operator_state(&ctx, gstate.as_ref())
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             source_state,
@@ -217,6 +285,7 @@ impl PipelineExecutor {
             thread: ctx.registry().next_thread_id(),
             finish_epoch: 0,
             done: false,
+            profile,
             shared,
             ctx,
         })
@@ -257,16 +326,70 @@ impl PipelineExecutor {
     /// Make progress until the pipeline is complete, blocked, or the call
     /// budget of this poll is exhausted.
     fn poll_run(&mut self, cx: &mut Context<'_>) -> Poll<Result<Progress>> {
+        if self.profile.is_none() {
+            return self.run_until_suspended(cx);
+        }
+        // The profile of the thread: whether it was blocked or queued since
+        // its last poll, and how long this poll is active.
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.resume(Instant::now());
+        }
+        let poll = self.run_until_suspended(cx);
+        let now = Instant::now();
+        match &poll {
+            Poll::Ready(Ok(Progress::Done) | Err(_)) => {
+                if let Some(profile) = self.profile.take() {
+                    profile.finish(now);
+                }
+            }
+            Poll::Ready(Ok(Progress::Yield)) | Poll::Pending => {
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.suspend(now);
+                }
+            }
+        }
+        poll
+    }
+
+    /// Poll `future`, which the operator at `stage` waits for, and record
+    /// the time of the poll as time spent in the operator. Returns whether
+    /// it is still pending.
+    fn poll_wait(
+        &mut self,
+        stage: usize,
+        future: &mut BoxFuture<'static, ()>,
+        cx: &mut Context<'_>,
+    ) -> bool {
+        let scope = self.profile.as_ref().map(|profile| profile.enter(stage));
+        let start = Instant::now();
+        let pending = future.as_mut().poll(cx).is_pending();
+        let elapsed = start.elapsed();
+        drop(scope);
+        self.record_time(stage, elapsed);
+        pending
+    }
+
+    /// Record time spent in the operator at `stage` outside of its calls.
+    fn record_time(&mut self, stage: usize, elapsed: std::time::Duration) {
+        self.shared.stage_metrics(stage).add_elapsed(elapsed);
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.record_time(stage, elapsed);
+        }
+    }
+
+    /// [`Self::poll_run`], without profiling the poll.
+    fn run_until_suspended(&mut self, cx: &mut Context<'_>) -> Poll<Result<Progress>> {
         if self.done {
             return Poll::Ready(Ok(Progress::Done));
         }
         self.ctx.set_waker(cx.waker());
         self.apply_finished();
-        if let Some(wait) = self.wait.as_mut() {
-            if wait.future.as_mut().poll(cx).is_pending() {
-                return self.suspend(cx);
-            }
-            self.wait = None;
+        // Wait for the future of a blocked call before retrying the call.
+        if let Some(mut wait) = self.wait.take()
+            && self.poll_wait(wait.stage, &mut wait.future, cx)
+        {
+            self.wait = Some(wait);
+            return self.suspend(cx);
         }
         self.budget = CALLS_PER_POLL;
         loop {
@@ -284,7 +407,7 @@ impl PipelineExecutor {
                     InterruptKind::WakerRegistered => return self.suspend(cx),
                     InterruptKind::Yield => return Poll::Ready(Ok(Progress::Yield)),
                     InterruptKind::Future(mut future) => {
-                        if future.as_mut().poll(cx).is_pending() {
+                        if self.poll_wait(stage, &mut future, cx) {
                             self.wait = Some(Wait { stage, future });
                             return self.suspend(cx);
                         }
@@ -382,19 +505,28 @@ impl PipelineExecutor {
         if !self.take_budget() {
             return Ok(Step::Continue);
         }
+        let scope = self.profile.as_ref().map(|profile| profile.enter(0));
         let start = Instant::now();
         let result = self.shared.source.get_data(
             &self.ctx,
             self.shared.source_state.as_ref(),
             self.source_state.as_mut(),
         );
-        self.shared.source_metrics.add_elapsed(start.elapsed());
+        let elapsed = start.elapsed();
+        drop(scope);
+        self.shared.source_metrics.add_elapsed(elapsed);
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.record_call(0, elapsed);
+        }
         match result? {
             SourceResult::Chunk(chunk) => {
                 if chunk.is_empty() {
                     return Ok(Step::Continue);
                 }
                 self.shared.source_metrics.record_output(chunk.len());
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_output(0, &chunk);
+                }
                 self.chunks[0] = chunk;
                 self.push_stage = 0;
                 let outcome = self.push(0)?;
@@ -404,7 +536,12 @@ impl PipelineExecutor {
                 self.source_exhausted = true;
                 Ok(Step::Continue)
             }
-            SourceResult::Blocked(interrupt) => Ok(Step::Blocked(0, interrupt)),
+            SourceResult::Blocked(interrupt) => {
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_blocked(0);
+                }
+                Ok(Step::Blocked(0, interrupt))
+            }
         }
     }
 
@@ -445,6 +582,7 @@ impl PipelineExecutor {
             output.reset();
 
             let metrics = &shared.operator_metrics[index];
+            let scope = self.profile.as_ref().map(|profile| profile.enter(stage));
             let start = Instant::now();
             let result = shared.operators[index].execute(
                 &self.ctx,
@@ -453,7 +591,13 @@ impl PipelineExecutor {
                 shared.operator_states[index].as_ref(),
                 self.operator_states[index].as_mut(),
             );
-            metrics.add_elapsed(start.elapsed());
+            let elapsed = start.elapsed();
+            drop(scope);
+            metrics.add_elapsed(elapsed);
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.record_call(stage, elapsed);
+                profile.record_input(stage);
+            }
             match result? {
                 OperatorResult::NeedMoreInput => {}
                 OperatorResult::HaveMoreOutput => self.in_process_operators.push(stage),
@@ -467,6 +611,9 @@ impl PipelineExecutor {
                 }
                 OperatorResult::Blocked(interrupt) => {
                     output.reset();
+                    if let Some(profile) = self.profile.as_deref_mut() {
+                        profile.record_blocked(stage);
+                    }
                     self.in_process_operators.push(stage);
                     return Ok(PushOutcome::Blocked(stage, interrupt));
                 }
@@ -482,6 +629,9 @@ impl PipelineExecutor {
                 }
             } else {
                 metrics.record_output(rows);
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_output(stage, &self.chunks[stage]);
+                }
                 stage += 1;
             }
         }
@@ -492,8 +642,10 @@ impl PipelineExecutor {
             // `pending_sink` is set: the chunk is sunk in the next poll.
             return Ok(Step::Continue);
         }
+        let stage = self.shared.operators.len() + 1;
         let chunk = self.chunks.last().expect("pipeline has a source chunk");
         let rows = chunk.len();
+        let scope = self.profile.as_ref().map(|profile| profile.enter(stage));
         let start = Instant::now();
         let result = self.shared.sink.sink(
             &self.ctx,
@@ -501,15 +653,26 @@ impl PipelineExecutor {
             self.shared.sink_state.as_ref(),
             self.sink_state.as_mut(),
         );
-        self.shared.sink_metrics.add_elapsed(start.elapsed());
+        let elapsed = start.elapsed();
+        drop(scope);
+        self.shared.sink_metrics.add_elapsed(elapsed);
+        if let Some(profile) = self.profile.as_deref_mut() {
+            profile.record_call(stage, elapsed);
+        }
         match result? {
             SinkResult::NeedMoreInput => {
                 self.shared.sink_metrics.record_sink(rows);
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_input(stage);
+                }
                 self.pending_sink = false;
                 Ok(Step::Continue)
             }
             SinkResult::Finished => {
                 self.shared.sink_metrics.record_sink(rows);
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_input(stage);
+                }
                 self.pending_sink = false;
                 // The sink does not want more data: stop everything,
                 // including flushing, on all threads of all pipelines that
@@ -521,7 +684,10 @@ impl PipelineExecutor {
                 Ok(Step::Continue)
             }
             SinkResult::Blocked(interrupt) => {
-                Ok(Step::Blocked(self.shared.operators.len() + 1, interrupt))
+                if let Some(profile) = self.profile.as_deref_mut() {
+                    profile.record_blocked(stage);
+                }
+                Ok(Step::Blocked(stage, interrupt))
             }
         }
     }
@@ -558,6 +724,10 @@ impl PipelineExecutor {
             let output = &mut self.chunks[index + 1];
             output.reset();
             let metrics = &shared.operator_metrics[index];
+            let scope = self
+                .profile
+                .as_ref()
+                .map(|profile| profile.enter(index + 1));
             let start = Instant::now();
             let result = operator.final_execute(
                 &self.ctx,
@@ -565,7 +735,12 @@ impl PipelineExecutor {
                 shared.operator_states[index].as_ref(),
                 self.operator_states[index].as_mut(),
             );
-            metrics.add_elapsed(start.elapsed());
+            let elapsed = start.elapsed();
+            drop(scope);
+            metrics.add_elapsed(elapsed);
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.record_call(index + 1, elapsed);
+            }
             if result? == OperatorFinalizeResult::Finished {
                 self.flush_current_finished = true;
             }
@@ -574,6 +749,9 @@ impl PipelineExecutor {
                 continue;
             }
             metrics.record_output(rows);
+            if let Some(profile) = self.profile.as_deref_mut() {
+                profile.record_output(index + 1, &self.chunks[index + 1]);
+            }
             self.push_stage = index + 1;
             let outcome = self.push(index + 1)?;
             return self.handle_push_outcome(outcome).map(Some);
@@ -582,14 +760,19 @@ impl PipelineExecutor {
     }
 
     fn combine(&mut self) -> Result<()> {
-        let start = Instant::now();
-        let result = self.shared.sink.combine(
-            &self.ctx,
-            self.shared.sink_state.as_ref(),
-            self.sink_state.as_mut(),
-        );
-        self.shared.sink_metrics.add_elapsed(start.elapsed());
-        result
+        let shared = &self.shared;
+        measure(
+            self.profile.as_deref_mut(),
+            &shared.sink_metrics,
+            shared.operators.len() + 1,
+            || {
+                shared.sink.combine(
+                    &self.ctx,
+                    shared.sink_state.as_ref(),
+                    self.sink_state.as_mut(),
+                )
+            },
+        )
     }
 }
 
@@ -606,10 +789,13 @@ impl fmt::Debug for PipelineExecutor {
     }
 }
 
-/// Runtime metrics of all operators of one execution.
+/// Runtime metrics of all operators of one execution, and its profile if it
+/// was profiled (see [`ProfilingOptions`]).
 #[derive(Debug)]
 pub struct ExecutionMetrics {
     operators: Vec<(Arc<dyn PhysicalOperator>, Arc<OperatorMetrics>)>,
+    /// The profiler of the last completed execution, if it was profiled.
+    profiler: Mutex<Option<Arc<ExecutionProfiler>>>,
 }
 
 impl ExecutionMetrics {
@@ -619,7 +805,21 @@ impl ExecutionMetrics {
             .into_iter()
             .map(|operator| (operator, Arc::new(OperatorMetrics::default())))
             .collect();
-        Self { operators }
+        Self {
+            operators,
+            profiler: Mutex::new(None),
+        }
+    }
+
+    /// The profile of the execution, once it completed, if it was profiled
+    /// (see [`ProfilingOptions`]).
+    pub fn profile(&self) -> Option<Arc<QueryProfile>> {
+        let profiler = self.profiler.lock().clone()?;
+        Some(profiler.profile())
+    }
+
+    fn set_profiler(&self, profiler: Arc<ExecutionProfiler>) {
+        *self.profiler.lock() = Some(profiler);
     }
 
     /// The metrics of every operator, in pipeline order.
@@ -660,12 +860,27 @@ impl ExecutionMetrics {
 /// A pipeline on a single thread that runs while no other pipeline does runs
 /// on the task of the execution (the task that polls the [`PipelineStream`])
 /// and spawns no task, see [`Executor::execute`].
+///
+/// If the session of `task_ctx` enables [`ProfilingOptions`] (or
+/// [`Executor::with_profiling`] enables profiling), every execution records a
+/// [`QueryProfile`] ([`Executor::profile`]), see
+/// [`profiling`](crate::profiling).
 #[derive(Debug)]
 pub struct Executor {
     graph: Arc<PipelineGraph>,
     task_ctx: Arc<TaskContext>,
     num_threads: usize,
     metrics: Arc<ExecutionMetrics>,
+    profiling: bool,
+}
+
+/// The state of one execution of an [`Executor`].
+struct Execution {
+    registry: Arc<ExecutionRegistry>,
+    /// The task context of the operators: that of the executor, whose memory
+    /// pool records the memory of the operators if the execution is profiled.
+    task_ctx: Arc<TaskContext>,
+    profiler: Option<Arc<ExecutionProfiler>>,
 }
 
 impl Executor {
@@ -678,12 +893,31 @@ impl Executor {
     ) -> Result<Self> {
         let graph = Arc::new(PipelineGraph::try_new(sink)?);
         let metrics = Arc::new(ExecutionMetrics::new(&graph));
+        let profiling = ProfilingOptions::enabled_for(&task_ctx);
         Ok(Self {
             graph,
             task_ctx,
             num_threads: num_threads.max(1),
             metrics,
+            profiling,
         })
+    }
+
+    /// Profile the executions (or not), whatever the session options (see
+    /// [`ProfilingOptions`]).
+    pub fn with_profiling(mut self, profiling: bool) -> Self {
+        self.profiling = profiling;
+        self
+    }
+
+    /// Whether the executions are profiled.
+    pub fn profiling(&self) -> bool {
+        self.profiling
+    }
+
+    /// The profile of the last completed execution, if it was profiled.
+    pub fn profile(&self) -> Option<Arc<QueryProfile>> {
+        self.metrics.profile()
     }
 
     /// The pipelines executed by this executor.
@@ -739,11 +973,35 @@ impl Executor {
     /// runs on the task that awaits this future. Otherwise all threads of a
     /// pipeline run on worker tasks, and pipelines that do not depend on each
     /// other run concurrently.
+    ///
+    /// If the executions are profiled ([`Self::profiling`]), the profile of
+    /// the execution is available from [`Self::profile`] once it completed.
     pub async fn execute(&self) -> Result<()> {
-        let registry = Arc::new(ExecutionRegistry::new(
-            self.metrics.by_key(),
-            pipeline_dependencies(&self.graph),
-        ));
+        let profiler = self
+            .profiling
+            .then(|| ExecutionProfiler::new(Arc::clone(&self.graph), self.num_threads));
+        let task_ctx = match &profiler {
+            Some(profiler) => profiler.instrument(&self.task_ctx),
+            None => Arc::clone(&self.task_ctx),
+        };
+        let execution = Execution {
+            registry: Arc::new(ExecutionRegistry::new(
+                self.metrics.by_key(),
+                pipeline_dependencies(&self.graph),
+            )),
+            task_ctx,
+            profiler,
+        };
+        self.run_events(&execution).await?;
+        if let Some(profiler) = execution.profiler {
+            profiler.finish();
+            self.metrics.set_profiler(profiler);
+        }
+        Ok(())
+    }
+
+    /// Run the events of `execution` (see [`Events`]) in dependency order.
+    async fn run_events(&self, execution: &Execution) -> Result<()> {
         let graph = self.graph.as_ref();
         log::debug!(
             "Executing pipelines with up to {} threads:\n{graph}",
@@ -773,7 +1031,7 @@ impl Executor {
             let alone = running_pipelines == 0 && ready_pipelines.count() == 1;
             for event in ready.drain(..) {
                 running_pipelines += usize::from(is_pipeline(event));
-                running.push(self.run_event(event, &registry, alone));
+                running.push(self.run_event(event, execution, alone));
             }
             let Some(result) = running.next().await else {
                 return internal_err!(
@@ -799,17 +1057,17 @@ impl Executor {
     fn run_event<'a>(
         &'a self,
         event: usize,
-        registry: &'a Arc<ExecutionRegistry>,
+        execution: &'a Execution,
         alone: bool,
     ) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             let num_pipelines = self.graph.pipelines().len();
             if event < num_pipelines {
-                self.run_pipeline(self.graph.pipeline(event), registry, alone)
+                self.run_pipeline(self.graph.pipeline(event), execution, alone)
                     .await?;
             } else {
                 let meta = self.graph.meta_pipeline(event - num_pipelines);
-                self.finalize(meta, registry)?;
+                self.finalize(meta, execution)?;
             }
             Ok(event)
         })
@@ -819,13 +1077,13 @@ impl Executor {
         &self,
         thread_id: usize,
         num_threads: usize,
-        registry: &Arc<ExecutionRegistry>,
+        execution: &Execution,
     ) -> ExecutionContext {
         ExecutionContext::new_with_registry(
-            Arc::clone(&self.task_ctx),
+            Arc::clone(&execution.task_ctx),
             thread_id,
             num_threads,
-            Arc::clone(registry),
+            Arc::clone(&execution.registry),
         )
     }
 
@@ -841,27 +1099,51 @@ impl Executor {
     async fn run_pipeline(
         &self,
         pipeline: &Pipeline,
-        registry: &Arc<ExecutionRegistry>,
+        execution: &Execution,
         alone: bool,
     ) -> Result<()> {
-        let ctx = self.context(0, self.num_threads, registry);
+        let registry = &execution.registry;
+        let started = execution.profiler.as_ref().map(|_| Instant::now());
+        let profiling = execution
+            .profiler
+            .as_ref()
+            .map(|profiler| profiler.pipeline(pipeline));
+        let ctx = self.context(0, self.num_threads, execution);
         // The pipeline is a no-op (its sink still combines an empty state) if
         // an operator already knows it cannot produce output, if its sink
         // does not need more input, or if one of its operators finished.
         let skip = registry.skips_pipeline(pipeline.id());
-        let sink_state =
-            registry.get_or_create_sink_state(pipeline.sink().as_ref(), &ctx)?;
+        let source_metrics = registry.metrics(pipeline.source().as_ref());
+        let operator_metrics = pipeline
+            .operators()
+            .iter()
+            .map(|operator| registry.metrics(operator.as_ref()))
+            .collect::<Vec<_>>();
+        let sink_metrics = registry.metrics(pipeline.sink().as_ref());
+        let num_operators = pipeline.operators().len();
+        let sink_state = measure_setup(
+            profiling.as_deref(),
+            &sink_metrics,
+            num_operators + 1,
+            || registry.get_or_create_sink_state(pipeline.sink().as_ref(), &ctx),
+        )?;
         let operator_states = pipeline
             .operators()
             .iter()
-            .map(|operator| {
-                registry.get_or_create_operator_state(operator.as_ref(), &ctx)
+            .zip(&operator_metrics)
+            .enumerate()
+            .map(|(index, (operator, metrics))| {
+                measure_setup(profiling.as_deref(), metrics, index + 1, || {
+                    registry.get_or_create_operator_state(operator.as_ref(), &ctx)
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let source_state: Arc<dyn GlobalSourceState> = if skip {
             Arc::new(EmptyState)
         } else {
-            pipeline.source().get_global_source_state(&ctx)?
+            measure_setup(profiling.as_deref(), &source_metrics, 0, || {
+                pipeline.source().get_global_source_state(&ctx)
+            })?
         };
         let num_threads = if skip {
             1
@@ -881,35 +1163,44 @@ impl Executor {
             source_state,
             operator_states,
             sink_state,
-            source_metrics: registry.metrics(pipeline.source().as_ref()),
-            operator_metrics: pipeline
-                .operators()
-                .iter()
-                .map(|operator| registry.metrics(operator.as_ref()))
-                .collect(),
-            sink_metrics: registry.metrics(pipeline.sink().as_ref()),
+            source_metrics,
+            operator_metrics,
+            sink_metrics,
             skip,
+            profiling: profiling.clone(),
         });
+        let setup = started.map(|started| started.elapsed());
 
         // A pipeline on a single thread that runs while no other pipeline does
         // runs on this task, without a worker task. A pipeline on several
         // threads runs all of them, each on a worker task: a source that is
         // finished for one thread may still have work for the others.
         if alone && num_threads == 1 {
-            let ctx = self.context(0, num_threads, registry);
-            return PipelineExecutor::try_new(shared, ctx)?.execute().await;
+            let ctx = self.context(0, num_threads, execution);
+            PipelineExecutor::try_new(shared, ctx, None)?
+                .execute()
+                .await?;
+        } else {
+            let mut workers = JoinSet::new();
+            for thread_id in 0..num_threads {
+                let shared = Arc::clone(&shared);
+                let ctx = self.context(thread_id, num_threads, execution);
+                let spawned = profiling.as_ref().map(|_| Instant::now());
+                workers.spawn(async move {
+                    PipelineExecutor::try_new(shared, ctx, spawned)?
+                        .execute()
+                        .await
+                });
+            }
+            // Dropping `workers` (on error, or when the execution is dropped)
+            // aborts the threads.
+            join_workers(workers).await?;
         }
-        let mut workers = JoinSet::new();
-        for thread_id in 0..num_threads {
-            let shared = Arc::clone(&shared);
-            let ctx = self.context(thread_id, num_threads, registry);
-            workers.spawn(async move {
-                PipelineExecutor::try_new(shared, ctx)?.execute().await
-            });
+        if let (Some(profiling), Some(started), Some(setup)) = (profiling, started, setup)
+        {
+            profiling.record_run(started, setup, num_threads, skip);
         }
-        // Dropping `workers` (on error, or when the execution is dropped)
-        // aborts the threads.
-        join_workers(workers).await
+        Ok(())
     }
 
     /// The number of threads that execute `pipeline`.
@@ -930,20 +1221,47 @@ impl Executor {
         self.num_threads.min(source_state.max_threads()).max(1)
     }
 
-    fn finalize(
-        &self,
-        meta: &MetaPipeline,
-        registry: &Arc<ExecutionRegistry>,
-    ) -> Result<()> {
-        let ctx = self.context(0, self.num_threads, registry);
+    fn finalize(&self, meta: &MetaPipeline, execution: &Execution) -> Result<()> {
+        let registry = &execution.registry;
+        let ctx = self.context(0, self.num_threads, execution);
         let sink = meta.sink();
         let state = registry.get_or_create_sink_state(sink.as_ref(), &ctx)?;
+        let scope = execution
+            .profiler
+            .as_ref()
+            .and_then(|profiler| profiler.enter(sink.as_ref()));
         let start = Instant::now();
         let result = sink.finalize(&ctx, state.as_ref());
-        registry.metrics(sink.as_ref()).add_elapsed(start.elapsed());
+        let elapsed = start.elapsed();
+        drop(scope);
+        registry.metrics(sink.as_ref()).add_elapsed(elapsed);
+        if let Some(profiler) = &execution.profiler {
+            profiler.record_finalize(meta.id(), elapsed);
+        }
         registry.set_finalize_result(sink.as_ref(), result?);
         Ok(())
     }
+}
+
+/// Run `f`, a call of the operator at `stage` of a pipeline that creates a
+/// global state before the threads of the pipeline start, and record its
+/// time in `metrics` and `profiling`.
+fn measure_setup<T>(
+    profiling: Option<&PipelineProfiling>,
+    metrics: &OperatorMetrics,
+    stage: usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    let scope = profiling.map(|profiling| profiling.enter(stage));
+    let start = Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    drop(scope);
+    metrics.add_elapsed(elapsed);
+    if let Some(profiling) = profiling {
+        profiling.record_setup(stage, elapsed);
+    }
+    result
 }
 
 /// Wait for the threads `workers` of a pipeline: the first error of any of
@@ -1290,6 +1608,12 @@ impl PipelineStream {
     /// The runtime metrics of the operators of this execution.
     pub fn metrics(&self) -> &Arc<ExecutionMetrics> {
         &self.metrics
+    }
+
+    /// The profile of this execution, once it completed, if it was profiled
+    /// (see [`ProfilingOptions`]).
+    pub fn profile(&self) -> Option<Arc<QueryProfile>> {
+        self.metrics.profile()
     }
 }
 
