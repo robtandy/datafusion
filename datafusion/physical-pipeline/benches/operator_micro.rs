@@ -20,8 +20,8 @@
 //! # How an operator is measured
 //!
 //! Every configuration builds an operator tree `DiscardSink(operator(ChunkSource...))`:
-//! `ChunkSource`s hand out pre-built chunks (zero-copy slices of synthetic
-//! arrays) to the threads of their pipelines, and the `DiscardSink` drops the
+//! `ChunkSource`s hand out pre-built chunks (every chunk with buffers of its
+//! own) to the threads of their pipelines, and the `DiscardSink` drops the
 //! chunks of the operator. The `Executor` runs the tree with profiling on, so
 //! that the numbers are those of the query profiles of `docs/profiling.md`
 //! and line up with them: the time of the operator is the `self_time` of its
@@ -35,8 +35,10 @@
 //! many threads as configured.
 //!
 //! The first execution of every configuration is a warm-up that checks the
-//! output of the operator (its rows, and e.g. their order for a sort); the
-//! numbers are the medians of the timed executions that follow.
+//! output of the operator (its rows, and e.g. their order for a sort) and
+//! measures the bytes of the output that the operator wrote; an execution
+//! without profiling counts its allocations and copies; the other numbers are
+//! the medians of the timed executions that follow.
 //!
 //! # Columns of the report
 //!
@@ -45,8 +47,10 @@
 //! | `rows`           | the rows of the operator: its `rows_in` (the probe rows of a probe, the build rows of a build), its `rows_out` for a source (Parquet decode)       |
 //! | `ns/row`         | `self_time / rows`: the time of the operator per row, summed over its threads (CPU time)                                                        |
 //! | `Mrows/s`        | `rows` per second of the wall time of the operator (the elapsed time of its pipelines, attributed to the operator by its share of their active time) |
-//! | `allocs/chunk`   | the heap allocations of the operator per chunk of its input (`morsels_in`), net of those of the harness                                           |
-//! | `copied B/row`   | the bytes that the operator allocated per row, net of the harness: every byte it copies (gathered, computed or stored in rows, keys and tables) lands in memory it allocated |
+//! | `allocs/chunk`   | the heap allocations of the operator per chunk of its input (`morsels_in`)                                                                       |
+//! | `alloc B/row`    | the bytes that the operator allocated per row                                                                                                   |
+//! | `copied B/row`   | the bytes that the operator copied per row with `memcpy` and `memmove`, into new and into reused buffers, and that its `realloc`s moved          |
+//! | `written B/row`  | the bytes per row of the buffers of its output that the operator wrote (gathered, computed or copied), rather than passed through from its input |
 //! | `in B/row`       | `bytes_in / rows`, see `profiling::chunk_bytes`                                                                                                 |
 //! | `out B/row`      | `bytes_out / rows` (the bytes of the rows a tuple-data collection holds, for tuple-data ingestion)                                              |
 //! | `memory_peak`    | the high-water mark of the memory that the operator reserved                                                                                    |
@@ -55,13 +59,22 @@
 //! | `cv %`           | the coefficient of variation of `ns/row` over the timed executions                                                                              |
 //! | `sink/fin/src %` | the shares of the time of a pipeline breaker spent as a sink, finalizing, and as a source (the `JoinHashTableBuild` for a hash join build)       |
 //!
-//! The allocations are counted by the global allocator of this benchmark,
-//! which counts the allocations of all threads (`alloc`, `alloc_zeroed` and
-//! `realloc`, the latter with its new size) in sharded counters before it
-//! calls the system allocator. The harness allocations are those of
-//! executions of the same plan without the measured part (the sources into a
-//! `DiscardSink`, and for a probe the join with an empty probe side), which
-//! are subtracted.
+//! The global allocator of this benchmark counts the allocations, and on
+//! Linux with glibc the binary interposes `memcpy` and `memmove`, which count
+//! the bytes they copy (see [`counters`]); copies that the compiler inlines
+//! (of a few bytes) and value-by-value gathers and scatters are not calls of
+//! `memcpy`, and show in `written B/row` and `alloc B/row` instead. Only the
+//! threads of the benchmark count, in a dedicated execution without
+//! profiling (whose own allocations would count too), and only in the window
+//! of the execution that the operator is measured in, which the
+//! `DiscardSink` marks (see [`Window`]): the whole execution for most
+//! operators, the execution until the probe pipeline starts for the build of
+//! a hash join, and the probe pipeline for its probe and for the streaming
+//! operators. The counts of the harness are those of its sources into a
+//! `DiscardSink`, counted in the window that covers the same pipelines of the
+//! harness (see [`Baseline`]), and are subtracted. The bytes written are
+//! those of the buffers of the output chunks (once each) that do not lie in
+//! the buffers of the input chunks.
 //!
 //! The bandwidth of the machine is measured first, with streaming reads,
 //! writes and copies of buffers far larger than the last-level cache on 1, 4
@@ -81,7 +94,6 @@
 //! | `OPERATOR_MICRO_SAVE`        | a file to write the results to, as tab-separated values                                             | none                              |
 //! | `OPERATOR_MICRO_COMPARE`     | a file of earlier results (`OPERATOR_MICRO_SAVE`) to compare `ns/row` with                           | none                              |
 //! | `OPERATOR_MICRO_BANDWIDTH_MB`| the MiB of the buffers of the bandwidth measurement                                                 | `512` / `16`                      |
-//! | `OPERATOR_MICRO_COUNT_ALLOCATIONS` | whether to count the allocations (`false` measures what counting them costs)                   | `true`                            |
 //!
 //! To profile a configuration, run the test binary under `perf record` with
 //! a filter, e.g.
@@ -102,9 +114,10 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array, RecordBatch,
-    StringViewArray, StringViewBuilder,
+    Array, ArrayData, ArrayRef, AsArray, Float64Array, Int32Array, Int64Array,
+    RecordBatch, StringViewArray, StringViewBuilder,
 };
+use arrow::buffer::Buffer;
 use arrow::compute::SortOptions;
 use arrow::datatypes::{
     DataType, Field, Float64Type, Int32Type, Int64Type, Schema, SchemaRef,
@@ -142,8 +155,9 @@ use datafusion_physical_pipeline::sources::ParquetScanSource;
 use datafusion_physical_pipeline::tuple_data::{PartitionedTupleData, TupleDataLayout};
 use datafusion_physical_pipeline::window::PhysicalWindow;
 use datafusion_physical_pipeline::{
-    DEFAULT_VECTOR_SIZE, DataChunk, ExecutionContext, Executor, GlobalSourceState,
-    LocalSinkState, PhysicalOperator, SelectionVector, SinkResult, SourceResult,
+    DEFAULT_VECTOR_SIZE, DataChunk, EmptyState, ExecutionContext, Executor,
+    GlobalSinkState, GlobalSourceState, LocalSinkState, PhysicalOperator,
+    SelectionVector, SinkFinalize, SinkResult, SourceResult,
 };
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
@@ -158,61 +172,87 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
 // ---------------------------------------------------------------------------
-// Allocations
+// Allocations and copies
 // ---------------------------------------------------------------------------
 
 /// The global allocator of the benchmark: the system allocator, which counts
-/// the allocations.
+/// the allocations (see [`counters`]).
 #[global_allocator]
-static ALLOCATOR: allocations::Counting = allocations::Counting;
+static ALLOCATOR: counters::Counting = counters::Counting;
 
-/// A global allocator that counts the allocations of all threads, and the
-/// bytes they allocate, in sharded counters (one cache line per shard, a
-/// shard per thread), so that the counting neither contends nor slows down
-/// the threads of an execution measurably.
-mod allocations {
+/// Counters of the allocations, the allocated bytes and the copied bytes of
+/// the threads of a [`counters::Session`] (a [`Bench`]).
+///
+/// The global allocator counts every `alloc`, `alloc_zeroed` and `realloc`
+/// (with its new size), and as moved the bytes that a `realloc` moves to a
+/// new block (which depends on the layout of the heap). On
+/// Linux with glibc, the benchmark binary interposes the C library's `memcpy`
+/// and `memmove` (see [`copies`]), which count the bytes they copy: the bulk
+/// copies of all code of the binary, into new and into reused buffers alike.
+/// (Copies of a few bytes whose size the compiler knows are inlined, and
+/// gathers and scatters copy value by value: these are not calls of
+/// `memcpy`.)
+///
+/// Only the threads that a session tagged count, into the counters of that
+/// session and only while the session is enabled, so that the threads of
+/// other sessions and of the test harness never disturb a measurement. The
+/// counters are sharded (one cache line per shard, a shard per thread), so
+/// that counting neither contends nor slows down the threads of an execution
+/// measurably.
+mod counters {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-    const SHARDS: usize = 64;
+    /// The most sessions of a process.
+    const SESSIONS: usize = 32;
+    const SHARDS: usize = 32;
 
     /// The counters of the threads of a shard, on a cache line of their own
     /// (Neoverse-N1 prefetches pairs of 64-byte lines).
     #[repr(align(128))]
     struct Shard {
         allocations: AtomicU64,
-        bytes: AtomicU64,
+        allocated: AtomicU64,
+        copied: AtomicU64,
+        moved: AtomicU64,
     }
 
-    static COUNTERS: [Shard; SHARDS] = [const {
-        Shard {
-            allocations: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-        }
-    }; SHARDS];
+    static COUNTERS: [[Shard; SHARDS]; SESSIONS] = [const {
+        [const {
+            Shard {
+                allocations: AtomicU64::new(0),
+                allocated: AtomicU64::new(0),
+                copied: AtomicU64::new(0),
+                moved: AtomicU64::new(0),
+            }
+        }; SHARDS]
+    }; SESSIONS];
 
-    /// The shard of the next thread that allocates.
+    /// Whether the threads of a session count.
+    static ENABLED: [AtomicBool; SESSIONS] = [const { AtomicBool::new(false) }; SESSIONS];
+
+    /// The next session (0 is no session).
+    static NEXT_SESSION: AtomicUsize = AtomicUsize::new(1);
+
+    /// The shard of the next thread that a session tags.
     static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
-    /// Whether the allocations are counted.
-    static COUNTING: AtomicBool = AtomicBool::new(true);
-
-    /// Count the allocations (or not).
-    pub fn set_counting(counting: bool) {
-        COUNTING.store(counting, Ordering::Relaxed);
-    }
-
     thread_local! {
-        /// The shard of this thread, `usize::MAX` until it first allocates.
-        static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// The session of this thread (0 if none) and its shard. A `const`
+        /// thread local without a destructor: accessing it never allocates
+        /// nor copies.
+        static THREAD: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
     }
 
-    /// The allocations and the allocated bytes of all threads.
+    /// The allocations, the allocated bytes, the bytes copied by `memcpy`
+    /// and `memmove` and the bytes moved by `realloc` of a session.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct Counts {
         pub allocations: u64,
-        pub bytes: u64,
+        pub allocated: u64,
+        pub copied: u64,
+        pub moved: u64,
     }
 
     impl Counts {
@@ -220,49 +260,102 @@ mod allocations {
         pub fn since(self, earlier: Self) -> Self {
             Self {
                 allocations: self.allocations - earlier.allocations,
-                bytes: self.bytes - earlier.bytes,
+                allocated: self.allocated - earlier.allocated,
+                copied: self.copied - earlier.copied,
+                moved: self.moved - earlier.moved,
             }
         }
 
         pub fn add(self, other: Self) -> Self {
             Self {
                 allocations: self.allocations + other.allocations,
-                bytes: self.bytes + other.bytes,
+                allocated: self.allocated + other.allocated,
+                copied: self.copied + other.copied,
+                moved: self.moved + other.moved,
+            }
+        }
+
+        /// These counts without `other`, at least 0.
+        pub fn saturating_sub(self, other: Self) -> Self {
+            Self {
+                allocations: self.allocations.saturating_sub(other.allocations),
+                allocated: self.allocated.saturating_sub(other.allocated),
+                copied: self.copied.saturating_sub(other.copied),
+                moved: self.moved.saturating_sub(other.moved),
             }
         }
     }
 
-    /// The counts of all allocations so far.
-    pub fn snapshot() -> Counts {
-        COUNTERS
-            .iter()
-            .fold(Counts::default(), |counts, shard| Counts {
-                allocations: counts.allocations
-                    + shard.allocations.load(Ordering::Relaxed),
-                bytes: counts.bytes + shard.bytes.load(Ordering::Relaxed),
-            })
+    /// The counters of the threads that it tags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Session(usize);
+
+    impl Session {
+        pub fn new() -> Self {
+            let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+            assert!(session < SESSIONS, "more than {SESSIONS} sessions");
+            Self(session)
+        }
+
+        /// The session of the current thread, if it has one.
+        pub fn current() -> Option<Self> {
+            let (session, _) = THREAD.try_with(Cell::get).unwrap_or((0, 0));
+            (session != 0).then_some(Self(session))
+        }
+
+        /// Count the allocations and copies of the current thread in this
+        /// session.
+        pub fn tag_current_thread(self) {
+            let shard = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
+            THREAD.with(|thread| thread.set((self.0, shard)));
+        }
+
+        /// Count (or not) the allocations and copies of the threads of this
+        /// session.
+        pub fn set_enabled(self, enabled: bool) {
+            ENABLED[self.0].store(enabled, Ordering::SeqCst);
+        }
+
+        /// The counts of all threads of this session so far.
+        pub fn snapshot(self) -> Counts {
+            COUNTERS[self.0]
+                .iter()
+                .fold(Counts::default(), |counts, shard| Counts {
+                    allocations: counts.allocations
+                        + shard.allocations.load(Ordering::Relaxed),
+                    allocated: counts.allocated + shard.allocated.load(Ordering::Relaxed),
+                    copied: counts.copied + shard.copied.load(Ordering::Relaxed),
+                    moved: counts.moved + shard.moved.load(Ordering::Relaxed),
+                })
+        }
+    }
+
+    /// Whether the copies of `memcpy` and `memmove` are counted (see
+    /// [`copies`](super::copies)).
+    pub const COUNTS_COPIES: bool = cfg!(all(target_os = "linux", target_env = "gnu"));
+
+    /// The shard of the current thread, if it counts.
+    #[inline]
+    fn shard() -> Option<&'static Shard> {
+        let (session, shard) = THREAD.try_with(Cell::get).unwrap_or((0, 0));
+        (session != 0 && ENABLED[session].load(Ordering::Relaxed))
+            .then(|| &COUNTERS[session][shard])
     }
 
     #[inline]
-    fn record(bytes: usize) {
-        if !COUNTING.load(Ordering::Relaxed) {
-            return;
+    fn record_allocation(bytes: usize) {
+        if let Some(shard) = shard() {
+            shard.allocations.fetch_add(1, Ordering::Relaxed);
+            shard.allocated.fetch_add(bytes as u64, Ordering::Relaxed);
         }
-        // A `const` thread local without a destructor: accessing it never
-        // allocates.
-        let shard = SHARD
-            .try_with(|shard| {
-                let mut index = shard.get();
-                if index == usize::MAX {
-                    index = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS;
-                    shard.set(index);
-                }
-                index
-            })
-            .unwrap_or(0);
-        let counters = &COUNTERS[shard];
-        counters.allocations.fetch_add(1, Ordering::Relaxed);
-        counters.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Count `bytes` copied by the current thread.
+    #[inline]
+    pub fn record_copy(bytes: usize) {
+        if let Some(shard) = shard() {
+            shard.copied.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
     }
 
     /// The system allocator, counting its allocations.
@@ -272,13 +365,13 @@ mod allocations {
     // which upholds the contract of `GlobalAlloc`.
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
+            record_allocation(layout.size());
             // SAFETY: the caller upholds the contract of `GlobalAlloc::alloc`.
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            record(layout.size());
+            record_allocation(layout.size());
             // SAFETY: the caller upholds the contract of
             // `GlobalAlloc::alloc_zeroed`.
             unsafe { System.alloc_zeroed(layout) }
@@ -290,10 +383,20 @@ mod allocations {
             layout: Layout,
             new_size: usize,
         ) -> *mut u8 {
-            record(new_size);
+            record_allocation(new_size);
             // SAFETY: the caller upholds the contract of
             // `GlobalAlloc::realloc`.
-            unsafe { System.realloc(ptr, layout, new_size) }
+            let moved = unsafe { System.realloc(ptr, layout, new_size) };
+            // A block that moved was copied (by the C library's own
+            // `memcpy`, which the benchmark does not interpose).
+            if !moved.is_null()
+                && moved != ptr
+                && let Some(shard) = shard()
+            {
+                let bytes = layout.size().min(new_size) as u64;
+                shard.moved.fetch_add(bytes, Ordering::Relaxed);
+            }
+            moved
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -304,7 +407,69 @@ mod allocations {
     }
 }
 
-use allocations::Counts;
+/// The `memcpy` and `memmove` of the benchmark binary, which interpose those
+/// of glibc for all code of the binary: they count the bytes they copy (see
+/// [`counters`]) and copy them with glibc's `__memcpy_chk` and
+/// `__memmove_chk`, which branch to glibc's own implementations (not to
+/// these functions) after checking the size of the target, which is unknown
+/// here (`usize::MAX`).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod copies {
+    use std::ffi::c_void;
+    use std::hint::black_box;
+
+    unsafe extern "C" {
+        fn __memcpy_chk(
+            target: *mut c_void,
+            source: *const c_void,
+            len: usize,
+            target_len: usize,
+        ) -> *mut c_void;
+        fn __memmove_chk(
+            target: *mut c_void,
+            source: *const c_void,
+            len: usize,
+            target_len: usize,
+        ) -> *mut c_void;
+    }
+
+    /// `memcpy`, counting the copied bytes.
+    ///
+    /// # Safety
+    ///
+    /// The contract of the C library's `memcpy`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn memcpy(
+        target: *mut c_void,
+        source: *const c_void,
+        len: usize,
+    ) -> *mut c_void {
+        super::counters::record_copy(len);
+        // The size of the target is opaque to the compiler, so that it does
+        // not turn the call back into one of `memcpy` (this function).
+        // SAFETY: the caller upholds the contract of `memcpy`, and the target
+        // is large enough.
+        unsafe { __memcpy_chk(target, source, len, black_box(usize::MAX)) }
+    }
+
+    /// `memmove`, counting the moved bytes.
+    ///
+    /// # Safety
+    ///
+    /// The contract of the C library's `memmove`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn memmove(
+        target: *mut c_void,
+        source: *const c_void,
+        len: usize,
+    ) -> *mut c_void {
+        super::counters::record_copy(len);
+        // SAFETY: as for `memcpy`.
+        unsafe { __memmove_chk(target, source, len, black_box(usize::MAX)) }
+    }
+}
+
+use counters::{Counts, Session};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -332,7 +497,6 @@ struct BenchConfig {
     save: Option<PathBuf>,
     compare: Option<PathBuf>,
     bandwidth_bytes: usize,
-    count_allocations: bool,
 }
 
 impl BenchConfig {
@@ -387,7 +551,6 @@ impl BenchConfig {
                 "OPERATOR_MICRO_BANDWIDTH_MB",
                 if optimized { 512 } else { 16 },
             ) << 20,
-            count_allocations: env_or("OPERATOR_MICRO_COUNT_ALLOCATIONS", true),
         }
     }
 }
@@ -818,11 +981,32 @@ impl PhysicalOperator for ChunkSource {
     }
 }
 
-/// A parallel sink that drops its chunks, or collects them (compacted) for
-/// the checks of the warm-up execution.
+/// A parallel sink that drops the chunks of the operator, or collects them
+/// (compacted) for the checks of the warm-up execution, with the bytes of
+/// the output that the operator wrote (see [`DiscardSink::collecting`]).
+///
+/// It marks the windows of the counts of an execution (see [`Window`]): it
+/// takes a snapshot of the counts of the session of the executing thread when
+/// the root pipeline starts (the executor creates the global state of the
+/// sink of a pipeline before anything else of it) and when the root meta
+/// pipeline is finalized (once all pipelines completed).
 struct DiscardSink {
     children: Vec<Arc<dyn PhysicalOperator>>,
-    collected: Option<Mutex<Vec<RecordBatch>>>,
+    collected: Option<Mutex<Collected>>,
+    /// The counts when the root pipeline started and when it was finalized,
+    /// in the last execution.
+    marks: Mutex<[Option<Counts>; 2]>,
+}
+
+/// The output that a [`DiscardSink`] collected.
+#[derive(Default)]
+struct Collected {
+    batches: Vec<RecordBatch>,
+    /// The memory of the buffers of the input of the operator, sorted and
+    /// disjoint: the buffers of the columns that it passes through lie in it.
+    input: Vec<(usize, usize)>,
+    /// The memory of the buffers of the output columns outside of `input`.
+    written: Vec<(usize, usize)>,
 }
 
 impl std::fmt::Debug for DiscardSink {
@@ -834,19 +1018,111 @@ impl std::fmt::Debug for DiscardSink {
 }
 
 impl DiscardSink {
-    fn new(child: Arc<dyn PhysicalOperator>, collect: bool) -> Arc<Self> {
+    /// A sink that drops the chunks of `child`.
+    fn new(child: Arc<dyn PhysicalOperator>) -> Arc<Self> {
+        Self::with(child, None)
+    }
+
+    /// A sink that collects the chunks of `child`, whose input are the
+    /// chunks of the `ChunkSource`s among `sources`, and measures the bytes
+    /// of their columns that `child` wrote: the bytes of the buffers that are
+    /// not those of its input.
+    fn collecting(
+        child: Arc<dyn PhysicalOperator>,
+        sources: &[Arc<dyn PhysicalOperator>],
+    ) -> Arc<Self> {
+        let mut input = vec![];
+        for source in sources {
+            if let Some(source) = source.as_ref().downcast_ref::<ChunkSource>() {
+                for chunk in &source.chunks {
+                    for column in chunk.columns() {
+                        buffer_ranges(&column.to_data(), &mut input);
+                    }
+                }
+            }
+        }
+        let collected = Collected {
+            input: merged(input),
+            ..Collected::default()
+        };
+        Self::with(child, Some(collected))
+    }
+
+    fn with(child: Arc<dyn PhysicalOperator>, collected: Option<Collected>) -> Arc<Self> {
         Arc::new(Self {
             children: vec![child],
-            collected: collect.then(|| Mutex::new(vec![])),
+            collected: collected.map(Mutex::new),
+            marks: Mutex::new([None, None]),
         })
     }
 
-    fn take_collected(&self) -> Vec<RecordBatch> {
-        self.collected
-            .as_ref()
-            .map(|collected| std::mem::take(&mut *collected.lock()))
-            .unwrap_or_default()
+    /// The collected batches, and the bytes of the buffers of their columns
+    /// that the operator wrote.
+    fn take_collected(&self) -> (Vec<RecordBatch>, u64) {
+        let Some(collected) = &self.collected else {
+            return (vec![], 0);
+        };
+        let collected = std::mem::take(&mut *collected.lock());
+        let written = merged(collected.written)
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum::<usize>();
+        (collected.batches, written as u64)
     }
+
+    /// The counts of the last execution, which started at `start`, in its
+    /// windows.
+    fn windows(&self, start: Counts) -> Result<Windows> {
+        let [Some(root_start), Some(root_end)] = *self.marks.lock() else {
+            return internal_err!("The execution did not mark the windows of its counts");
+        };
+        Ok(Windows {
+            before_root: root_start.since(start),
+            root: root_end.since(root_start),
+        })
+    }
+
+    /// Mark the window boundary `index` of the current execution.
+    fn mark(&self, index: usize) {
+        self.marks.lock()[index] = Session::current().map(Session::snapshot);
+    }
+}
+
+/// Add the memory of the buffers of `data` (and of its children) to
+/// `ranges`.
+fn buffer_ranges(data: &ArrayData, ranges: &mut Vec<(usize, usize)>) {
+    let mut add = |buffer: &Buffer| {
+        if !buffer.is_empty() {
+            let start = buffer.as_ptr().addr();
+            ranges.push((start, start + buffer.len()));
+        }
+    };
+    data.buffers().iter().for_each(&mut add);
+    if let Some(nulls) = data.nulls() {
+        add(nulls.buffer());
+    }
+    for child in data.child_data() {
+        buffer_ranges(child, ranges);
+    }
+}
+
+/// `ranges` sorted, with the ranges that overlap or touch merged.
+fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = vec![];
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Whether `range` lies in one of `ranges` (sorted and disjoint).
+fn contained(ranges: &[(usize, usize)], (start, end): (usize, usize)) -> bool {
+    let index = ranges.partition_point(|&(first, _)| first <= start);
+    index > 0 && ranges[index - 1].1 >= end
 }
 
 /// The local sink state of a [`DiscardSink`] (none).
@@ -875,10 +1151,18 @@ impl PhysicalOperator for DiscardSink {
         true
     }
 
+    fn get_global_sink_state(
+        &self,
+        _ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSinkState>> {
+        self.mark(0);
+        Ok(Arc::new(EmptyState))
+    }
+
     fn get_local_sink_state(
         &self,
         _ctx: &ExecutionContext,
-        _gstate: &dyn datafusion_physical_pipeline::GlobalSinkState,
+        _gstate: &dyn GlobalSinkState,
     ) -> Result<Box<dyn LocalSinkState>> {
         Ok(Box::new(NoState))
     }
@@ -887,15 +1171,34 @@ impl PhysicalOperator for DiscardSink {
         &self,
         _ctx: &ExecutionContext,
         input: &DataChunk,
-        _gstate: &dyn datafusion_physical_pipeline::GlobalSinkState,
+        _gstate: &dyn GlobalSinkState,
         lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         downcast_state_mut::<NoState>(lstate.as_any_mut(), self.name())?;
         if let Some(collected) = &self.collected {
+            let mut ranges = vec![];
+            for column in input.columns() {
+                buffer_ranges(&column.to_data(), &mut ranges);
+            }
             let batch = input.compact()?;
-            collected.lock().push(batch);
+            let mut collected = collected.lock();
+            for range in ranges {
+                if !contained(&collected.input, range) {
+                    collected.written.push(range);
+                }
+            }
+            collected.batches.push(batch);
         }
         Ok(SinkResult::NeedMoreInput)
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &ExecutionContext,
+        _gstate: &dyn GlobalSinkState,
+    ) -> Result<SinkFinalize> {
+        self.mark(1);
+        Ok(SinkFinalize::Ready)
     }
 }
 
@@ -916,48 +1219,68 @@ struct Bandwidth {
 
 /// Measure the [`Bandwidth`] on `threads` threads, with buffers of
 /// `total_bytes` (split over the threads), the best of `repetitions`.
+///
+/// Every thread times its own passes: a pass of all threads takes from the
+/// first start to the last end, so that a thread that the system preempts
+/// makes it slower, never faster.
 fn measure_bandwidth(
     threads: usize,
     total_bytes: usize,
     repetitions: usize,
 ) -> Bandwidth {
     let words = (total_bytes / 8 / threads).max(1);
-    let barrier = Barrier::new(threads + 1);
-    let mut best = [Duration::MAX; 3];
-    std::thread::scope(|scope| {
-        for thread in 0..threads {
-            let barrier = &barrier;
-            scope.spawn(move || {
-                // Every thread touches its own buffers first.
-                let source = vec![thread as u64 + 1; words];
-                let mut target = vec![0x5a_u64; words];
-                for _ in 0..repetitions {
-                    barrier.wait();
-                    let sum = source
-                        .iter()
-                        .fold(0_u64, |sum, &value| sum.wrapping_add(value));
-                    black_box(sum);
-                    barrier.wait();
-                    barrier.wait();
-                    target.fill(black_box(0x5a5a_5a5a_5a5a_5a5a));
-                    black_box(&target);
-                    barrier.wait();
-                    barrier.wait();
-                    target.copy_from_slice(&source);
-                    black_box(&target);
-                    barrier.wait();
-                }
-            });
-        }
-        for _ in 0..repetitions {
-            for time in &mut best {
-                barrier.wait();
-                let start = Instant::now();
-                barrier.wait();
-                *time = (*time).min(start.elapsed());
-            }
-        }
+    let barrier = Barrier::new(threads);
+    // The start and the end of every pass of every kernel, of every thread.
+    let passes = std::thread::scope(|scope| {
+        let handles = (0..threads)
+            .map(|thread| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    // Every thread touches its own buffers first.
+                    let source = vec![thread as u64 + 1; words];
+                    let mut target = vec![0x5a_u64; words];
+                    let mut passes = Vec::with_capacity(3 * repetitions);
+                    for _ in 0..repetitions {
+                        for kernel in 0..3 {
+                            barrier.wait();
+                            let start = Instant::now();
+                            match kernel {
+                                0 => {
+                                    let sum = source.iter().fold(0_u64, |sum, &value| {
+                                        sum.wrapping_add(value)
+                                    });
+                                    black_box(sum);
+                                }
+                                1 => {
+                                    target.fill(black_box(0x5a5a_5a5a_5a5a_5a5a));
+                                    black_box(&target);
+                                }
+                                _ => {
+                                    target.copy_from_slice(&source);
+                                    black_box(&target);
+                                }
+                            }
+                            passes.push((start, Instant::now()));
+                        }
+                    }
+                    passes
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("the bandwidth thread panicked"))
+            .collect::<Vec<_>>()
     });
+    let mut best = [Duration::MAX; 3];
+    for pass in 0..3 * repetitions {
+        let start = passes.iter().map(|passes| passes[pass].0).min();
+        let end = passes.iter().map(|passes| passes[pass].1).max();
+        if let (Some(start), Some(end)) = (start, end) {
+            let kernel = pass % 3;
+            best[kernel] = best[kernel].min(end.duration_since(start));
+        }
+    }
     let bytes = (words * 8 * threads) as f64;
     let rate = |bytes: f64, time: Duration| bytes / time.as_nanos().max(1) as f64;
     Bandwidth {
@@ -987,6 +1310,69 @@ enum Scope {
     Operator,
 }
 
+impl Scope {
+    /// The window of the counts of the operator in this scope.
+    fn window(self) -> Window {
+        match self {
+            Self::All => Window::Execution,
+            Self::Sink => Window::BeforeRoot,
+            Self::Operator => Window::Root,
+        }
+    }
+}
+
+/// A window of the counts of an execution, as its [`DiscardSink`] marks
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// The execution until its root meta pipeline is finalized.
+    Execution,
+    /// The execution until the root pipeline starts: the pipelines of the
+    /// child meta pipelines (the build side of a hash join) and their
+    /// finalizations.
+    BeforeRoot,
+    /// The root pipeline (whose sink is the `DiscardSink`, e.g. the probe
+    /// pipeline of a hash join), until it is finalized.
+    Root,
+}
+
+/// The counts of an execution in the windows that its [`DiscardSink`]
+/// marked.
+#[derive(Debug, Clone, Copy, Default)]
+struct Windows {
+    before_root: Counts,
+    root: Counts,
+}
+
+impl Windows {
+    fn of(self, window: Window) -> Counts {
+        match window {
+            Window::Execution => self.before_root.add(self.root),
+            Window::BeforeRoot => self.before_root,
+            Window::Root => self.root,
+        }
+    }
+}
+
+/// A plan whose counts in `window` are those of the harness of a
+/// configuration: of its sources into a `DiscardSink`, counted in the window
+/// that covers the same pipelines of the harness as the window of the
+/// configuration covers (e.g. the whole execution of the build side for the
+/// build of a hash join, which is counted until the probe pipeline starts).
+struct Baseline {
+    sink: Arc<DiscardSink>,
+    window: Window,
+}
+
+impl Baseline {
+    fn of(source: &Arc<ChunkSource>, window: Window) -> Self {
+        Self {
+            sink: DiscardSink::new(Arc::clone(source) as _),
+            window,
+        }
+    }
+}
+
 /// The plan of one execution of a configuration: the `DiscardSink` above the
 /// operator, the operator and the harness sources below it.
 struct Plan {
@@ -1001,8 +1387,14 @@ impl Plan {
         sources: Vec<Arc<dyn PhysicalOperator>>,
         collect: bool,
     ) -> Self {
+        let child = Arc::clone(&operator);
+        let sink = if collect {
+            DiscardSink::collecting(child, &sources)
+        } else {
+            DiscardSink::new(child)
+        };
         Self {
-            sink: DiscardSink::new(Arc::clone(&operator), collect),
+            sink,
             operator,
             sources,
         }
@@ -1039,20 +1431,22 @@ struct Case {
     config: String,
     threads: usize,
     scope: Scope,
-    /// The sinks of the executions whose allocations are those of the
-    /// harness, and not of the measured part of the plan.
-    baselines: Vec<Arc<dyn PhysicalOperator>>,
+    /// The plans whose counts are those of the harness, which are subtracted
+    /// from the counts of the configuration.
+    baselines: Vec<Baseline>,
     /// The task context of the executions, if not the default one.
     task_ctx: Option<Arc<TaskContext>>,
 }
 
 /// One execution of a plan.
 struct Run {
-    profile: Arc<QueryProfile>,
-    allocations: Counts,
+    /// The profile, if the execution was profiled.
+    profile: Option<Arc<QueryProfile>>,
+    /// The counts, if the session counted.
+    windows: Windows,
 }
 
-/// The measurements of one execution of a configuration.
+/// The measurements of one timed execution of a configuration.
 #[derive(Debug, Clone, Copy, Default)]
 struct Sample {
     /// The self time of the measured stages and finalizations, in ns.
@@ -1066,18 +1460,16 @@ struct Sample {
     bytes_in: u64,
     bytes_out: u64,
     memory_peak: u64,
-    allocations: Counts,
-    /// The self time as a sink, finalizing, as a source and as an operator.
+    /// The self time as a sink, finalizing and as a source.
     sink_time: u64,
     finalize_time: u64,
     source_time: u64,
 }
 
 impl Sample {
-    /// The sample of `run` of `plan`, with the allocations of `baseline`
-    /// (the harness) subtracted.
-    fn of(run: &Run, plan: &Plan, scope: Scope, baseline: Counts) -> Result<Self> {
-        let profile = &run.profile;
+    /// The sample of the operator of `plan` in `scope` in `profile`, the
+    /// profile of an execution of `plan`.
+    fn of(profile: &QueryProfile, plan: &Plan, scope: Scope) -> Result<Self> {
         let id = |operator: &dyn PhysicalOperator| {
             profile
                 .operator(operator)
@@ -1095,13 +1487,6 @@ impl Sample {
             harness.push(id(source.as_ref())?);
         }
         let mut sample = Self {
-            allocations: Counts {
-                allocations: run
-                    .allocations
-                    .allocations
-                    .saturating_sub(baseline.allocations),
-                bytes: run.allocations.bytes.saturating_sub(baseline.bytes),
-            },
             memory_peak: profile.operators()[target].memory_peak,
             ..Self::default()
         };
@@ -1166,7 +1551,19 @@ impl Sample {
     }
 }
 
-/// The results of a configuration: the medians of its samples.
+/// What a configuration allocates, copies and writes: the counts of an
+/// execution (without profiling, whose allocations would count too) in the
+/// window of its scope, net of the counts of its baselines, and the bytes of
+/// its output that the operator wrote, if it produces the output of the
+/// execution.
+#[derive(Debug, Clone, Copy, Default)]
+struct Footprint {
+    counts: Counts,
+    written: Option<u64>,
+}
+
+/// The results of a configuration: the medians of its samples, and its
+/// footprint.
 #[derive(Debug, Clone)]
 struct Measurement {
     operator: &'static str,
@@ -1175,7 +1572,13 @@ struct Measurement {
     ns_per_row: f64,
     rows_per_second: f64,
     allocations_per_chunk: f64,
-    copied_per_row: f64,
+    allocated_per_row: f64,
+    /// The bytes copied by `memcpy` and `memmove` and moved by `realloc`
+    /// per row, `None` where the copies are not counted.
+    copied_per_row: Option<f64>,
+    /// The bytes of the output that the operator wrote per row, `None` if
+    /// the operator does not produce the output of the execution.
+    written_per_row: Option<f64>,
     in_per_row: f64,
     out_per_row: f64,
     memory_peak: u64,
@@ -1216,7 +1619,13 @@ fn coefficient_of_variation(values: &[f64]) -> f64 {
 }
 
 impl Measurement {
-    fn new(case: &Case, samples: &[Sample], floor: Floor, bandwidth: &Bandwidth) -> Self {
+    fn new(
+        case: &Case,
+        samples: &[Sample],
+        footprint: Footprint,
+        floor: Floor,
+        bandwidth: &Bandwidth,
+    ) -> Self {
         let per = |f: &dyn Fn(&Sample) -> f64| {
             median(&mut samples.iter().map(f).collect::<Vec<_>>())
         };
@@ -1236,15 +1645,19 @@ impl Measurement {
                 per(&|sample| sample.source_time as f64) / total,
             ]
         });
+        let counts = footprint.counts;
         Self {
             operator: case.operator,
             config: case.config.clone(),
             rows,
             ns_per_row: median(&mut ns_per_row.clone()),
             rows_per_second: row_count / wall_time.max(1.0) * 1e9,
-            allocations_per_chunk: per(&|sample| sample.allocations.allocations as f64)
+            allocations_per_chunk: counts.allocations as f64
                 / samples[0].chunks.max(1) as f64,
-            copied_per_row: per(&|sample| sample.allocations.bytes as f64) / row_count,
+            allocated_per_row: counts.allocated as f64 / row_count,
+            copied_per_row: counters::COUNTS_COPIES
+                .then(|| (counts.copied + counts.moved) as f64 / row_count),
+            written_per_row: footprint.written.map(|written| written as f64 / row_count),
             in_per_row: per(&|sample| sample.bytes_in as f64) / row_count,
             out_per_row: per(&|sample| sample.bytes_out as f64) / row_count,
             memory_peak: per(&|sample| sample.memory_peak as f64) as u64,
@@ -1260,9 +1673,13 @@ impl Measurement {
     }
 }
 
-/// The benchmark: its configuration, runtime, bandwidths and results.
+/// The benchmark: its configuration, counters, runtime, bandwidths and
+/// results.
 struct Bench {
     config: BenchConfig,
+    /// The counters of the threads of the benchmark: of its runtime and of
+    /// the thread that created it, which runs the executions.
+    session: Session,
     runtime: tokio::runtime::Runtime,
     task_ctx: Arc<TaskContext>,
     bandwidths: Vec<Bandwidth>,
@@ -1271,15 +1688,19 @@ struct Bench {
 
 impl Bench {
     fn try_new(config: BenchConfig) -> Result<Self> {
+        let session = Session::new();
+        session.tag_current_thread();
         let max_threads = config.threads.iter().copied().max().unwrap_or(1);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(max_threads)
             .enable_all()
+            .on_thread_start(move || session.tag_current_thread())
             .build()?;
-        let session = SessionConfig::new().with_target_partitions(max_threads);
-        let task_ctx = SessionContext::new_with_config(session).task_ctx();
+        let session_config = SessionConfig::new().with_target_partitions(max_threads);
+        let task_ctx = SessionContext::new_with_config(session_config).task_ctx();
         Ok(Self {
             config,
+            session,
             runtime,
             task_ctx,
             bandwidths: vec![],
@@ -1347,29 +1768,52 @@ impl Bench {
         selected
     }
 
+    /// Execute the plan below `sink` on `threads` threads, profiled or not.
     fn execute(
         &self,
-        sink: Arc<dyn PhysicalOperator>,
+        sink: &Arc<DiscardSink>,
         threads: usize,
         task_ctx: Option<&Arc<TaskContext>>,
+        profiling: bool,
     ) -> Result<Run> {
+        self.session.tag_current_thread();
         let task_ctx = Arc::clone(task_ctx.unwrap_or(&self.task_ctx));
-        let executor = Executor::try_new(sink, task_ctx, threads)?.with_profiling(true);
-        let before = allocations::snapshot();
+        let executor = Executor::try_new(Arc::clone(sink) as _, task_ctx, threads)?
+            .with_profiling(profiling);
+        let start = self.session.snapshot();
         self.runtime.block_on(executor.execute())?;
-        let allocations = allocations::snapshot().since(before);
-        let profile = executor
-            .profile()
-            .ok_or_else(|| internal_datafusion_err!("The execution has no profile"))?;
         Ok(Run {
-            profile,
-            allocations,
+            profile: executor.profile(),
+            windows: sink.windows(start)?,
         })
+    }
+
+    /// The counts of `plan` in the window of the scope of `case`, net of the
+    /// counts of the baselines of `case` in theirs, in executions without
+    /// profiling.
+    fn count(&self, case: &Case, plan: &Plan) -> Result<Counts> {
+        let task_ctx = case.task_ctx.as_ref();
+        for baseline in &case.baselines {
+            self.execute(&baseline.sink, case.threads, task_ctx, false)?;
+        }
+        self.session.set_enabled(true);
+        let counts = (|| {
+            let mut harness = Counts::default();
+            for baseline in &case.baselines {
+                let run = self.execute(&baseline.sink, case.threads, task_ctx, false)?;
+                harness = harness.add(run.windows.of(baseline.window));
+            }
+            let run = self.execute(&plan.sink, case.threads, task_ctx, false)?;
+            Ok(run.windows.of(case.scope.window()).saturating_sub(harness))
+        })();
+        self.session.set_enabled(false);
+        counts
     }
 
     /// Measure `case`: a warm-up execution of `plan` (with `collect`) whose
     /// output `check` checks and whose output rows give the `floor`, the
-    /// executions of the baselines, and the timed executions.
+    /// counted executions of `plan` and of the baselines, and the timed
+    /// executions.
     fn measure(
         &mut self,
         case: &Case,
@@ -1381,41 +1825,47 @@ impl Bench {
             |e: DataFusionError| e.context(format!("{} {}", case.operator, case.config));
         let task_ctx = case.task_ctx.as_ref();
         let warm_up = plan(true)?;
-        self.execute(Arc::clone(&warm_up.sink) as _, case.threads, task_ctx)
+        self.execute(&warm_up.sink, case.threads, task_ctx, true)
             .map_err(context)?;
-        let output = warm_up.sink.take_collected();
+        let (output, written) = warm_up.sink.take_collected();
         check(&output).map_err(context)?;
         let floor = floor(output.iter().map(|batch| batch.num_rows() as u64).sum());
         drop(output);
-        let mut baseline = Counts::default();
-        for sink in &case.baselines {
-            self.execute(Arc::clone(sink), case.threads, task_ctx)?;
-            let run = self.execute(Arc::clone(sink), case.threads, task_ctx)?;
-            baseline = baseline.add(run.allocations);
-        }
+        let footprint = Footprint {
+            counts: self.count(case, &plan(false)?).map_err(context)?,
+            // The output of the probe pipeline is not the build's.
+            written: (case.scope != Scope::Sink).then_some(written),
+        };
         let mut samples = vec![];
         for _ in 0..self.config.iterations {
             let plan = plan(false)?;
             let run = self
-                .execute(Arc::clone(&plan.sink) as _, case.threads, task_ctx)
+                .execute(&plan.sink, case.threads, task_ctx, true)
                 .map_err(context)?;
-            samples.push(Sample::of(&run, &plan, case.scope, baseline)?);
+            let profile = run.profile.ok_or_else(|| {
+                internal_datafusion_err!("The execution has no profile")
+            })?;
+            samples.push(Sample::of(&profile, &plan, case.scope)?);
         }
-        let measurement =
-            Measurement::new(case, &samples, floor, &self.bandwidth(case.threads));
-        eprintln!(
-            "{:<18} {:<50} {:>8.2} ns/row",
-            measurement.operator, measurement.config, measurement.ns_per_row
-        );
-        self.measurements.push(measurement);
+        self.record(case, &samples, footprint, floor);
         Ok(())
     }
 
-    /// Record the samples of a configuration measured without an executor
-    /// (tuple-data ingestion).
-    fn record(&mut self, case: &Case, samples: &[Sample], floor: Floor) {
-        let measurement =
-            Measurement::new(case, samples, floor, &self.bandwidth(case.threads));
+    /// Record the results of a configuration.
+    fn record(
+        &mut self,
+        case: &Case,
+        samples: &[Sample],
+        footprint: Footprint,
+        floor: Floor,
+    ) {
+        let measurement = Measurement::new(
+            case,
+            samples,
+            footprint,
+            floor,
+            &self.bandwidth(case.threads),
+        );
         eprintln!(
             "{:<18} {:<50} {:>8.2} ns/row",
             measurement.operator, measurement.config, measurement.ns_per_row
@@ -1585,7 +2035,7 @@ fn projection(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::Operator,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Root)],
             task_ctx: None,
         };
         let computed = params.exprs.computed();
@@ -1765,7 +2215,7 @@ fn filter(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::Operator,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Root)],
             task_ctx: None,
         };
         let rows = rows as f64;
@@ -1996,10 +2446,10 @@ fn hash_join_build(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::Sink,
-            baselines: vec![
-                DiscardSink::new(Arc::clone(&build.source) as _, false),
-                DiscardSink::new(Arc::clone(&probe.source) as _, false),
-            ],
+            // The build is counted until the probe pipeline starts: the
+            // harness of the build side is all of its execution into a
+            // `DiscardSink`.
+            baselines: vec![Baseline::of(&build.source, Window::Execution)],
             task_ctx: None,
         };
         let expected = probe.hits * build.duplicates;
@@ -2105,17 +2555,14 @@ fn hash_join_probe(bench: &mut Bench) -> Result<()> {
         )?;
         let probe =
             ProbeSide::new(probe_rows, params.hit, &build, params.key, params.batch)?;
-        let empty = ChunkSource::new(probe.source.schema(), vec![]);
         let case = Case {
             operator: "hash_join_probe",
             config: params.label(),
             threads: params.threads,
             scope: Scope::Operator,
-            // The build, and the probe rows.
-            baselines: vec![
-                DiscardSink::new(hash_join(&build.source, &empty, params.key)?, false),
-                DiscardSink::new(Arc::clone(&probe.source) as _, false),
-            ],
+            // The probe is counted in the probe pipeline (the root pipeline),
+            // without the build.
+            baselines: vec![Baseline::of(&probe.source, Window::Root)],
             task_ctx: None,
         };
         let expected = probe.hits * build.duplicates;
@@ -2269,7 +2716,7 @@ fn aggregate(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::All,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Execution)],
             task_ctx: None,
         };
         let groups = params.groups.min(rows) as u64;
@@ -2438,7 +2885,7 @@ fn sort(bench: &mut Bench) -> Result<()> {
             config: params.label(rows),
             threads: params.threads,
             scope: Scope::All,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Execution)],
             task_ctx: None,
         };
         bench.measure(
@@ -2529,7 +2976,7 @@ fn top_k(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::All,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Execution)],
             task_ctx: None,
         };
         bench.measure(
@@ -2731,7 +3178,7 @@ fn window_bench(bench: &mut Bench) -> Result<()> {
             config: params.label(),
             threads: params.threads,
             scope: Scope::All,
-            baselines: vec![DiscardSink::new(Arc::clone(&source) as _, false)],
+            baselines: vec![Baseline::of(&source, Window::Execution)],
             task_ctx: None,
         };
         bench.measure(
@@ -2930,7 +3377,14 @@ fn tuple_data(bench: &mut Bench) -> Result<()> {
         // The first execution is the warm-up.
         let mut samples = vec![];
         for iteration in 0..=bench.config.iterations {
-            let sample = append_tuple_data(&layout, &chunks, &hashes, params)?;
+            let (sample, _) = append_tuple_data(
+                bench.session,
+                &layout,
+                &chunks,
+                &hashes,
+                params,
+                true,
+            )?;
             if sample.rows != logical_rows {
                 return internal_err!(
                     "tuple_data {}: stored {} rows, expected {logical_rows}",
@@ -2946,32 +3400,52 @@ fn tuple_data(bench: &mut Bench) -> Result<()> {
                 });
             }
         }
+        // The counts of the ingestion, net of those of the threads (which
+        // the harness spawns and joins).
+        bench.session.set_enabled(true);
+        let counted =
+            append_tuple_data(bench.session, &layout, &chunks, &hashes, params, true);
+        let harness =
+            append_tuple_data(bench.session, &layout, &chunks, &hashes, params, false);
+        bench.session.set_enabled(false);
+        let footprint = Footprint {
+            counts: counted?.1.saturating_sub(harness?.1),
+            written: None,
+        };
         // The ingestion reads (the lines of) the values of the rows and
         // writes them once.
         let floor = Floor {
             read: chunks.iter().map(read_line_bytes).sum(),
             write: bytes_in as f64,
         };
-        bench.record(&case, &samples, floor);
+        bench.record(&case, &samples, footprint, floor);
     }
     Ok(())
 }
 
 /// Append `chunks` (with the hashes `hashes`) to `PartitionedTupleData`s of
-/// `layout` on `params.threads` threads.
+/// `layout` on `params.threads` threads (if `append`, otherwise only spawn
+/// and join the threads), with the counts of `session` in the meantime.
 fn append_tuple_data(
+    session: Session,
     layout: &Arc<TupleDataLayout>,
     chunks: &[DataChunk],
     hashes: &[Vec<u64>],
     params: TupleParams,
-) -> Result<Sample> {
+    append: bool,
+) -> Result<(Sample, Counts)> {
     let threads = params.threads;
-    let before = allocations::snapshot();
+    session.tag_current_thread();
+    let before = session.snapshot();
     let start = Instant::now();
     let results = std::thread::scope(|scope| {
         let handles = (0..threads)
             .map(|thread| {
                 scope.spawn(move || -> Result<(u64, u64, u64)> {
+                    session.tag_current_thread();
+                    if !append {
+                        return Ok((0, 0, 0));
+                    }
                     let start = Instant::now();
                     let mut data = PartitionedTupleData::try_new(
                         Arc::clone(layout),
@@ -2994,10 +3468,9 @@ fn append_tuple_data(
             .collect::<Result<Vec<_>>>()
     })?;
     let wall_time = start.elapsed().as_nanos() as f64;
-    let allocations = allocations::snapshot().since(before);
+    let counts = session.snapshot().since(before);
     let mut sample = Sample {
         wall_time,
-        allocations,
         ..Sample::default()
     };
     for (elapsed, rows, memory) in results {
@@ -3006,7 +3479,7 @@ fn append_tuple_data(
         sample.memory_peak += memory;
         sample.bytes_out += memory;
     }
-    Ok(sample)
+    Ok((sample, counts))
 }
 
 // ---------------------------------------------------------------------------
@@ -3147,12 +3620,15 @@ fn parquet_decode(bench: &mut Bench) -> Result<()> {
         )
         .with_file_groups(vec![FileGroup::new(files)])
         .build();
+        // The harness of the scan: an execution of a pipeline of a source
+        // without chunks into a `DiscardSink`.
+        let idle = ChunkSource::new(Arc::clone(&schema), vec![]);
         let case = Case {
             operator: "parquet_decode",
             config: params.label(rows),
             threads: params.threads,
             scope: Scope::All,
-            baselines: vec![],
+            baselines: vec![Baseline::of(&idle, Window::Execution)],
             task_ctx: Some(task_ctx),
         };
         let key = params.column;
@@ -3262,7 +3738,9 @@ impl Measurement {
             short(self.ns_per_row),
             short(self.rows_per_second / 1e6),
             short(self.allocations_per_chunk),
-            short(self.copied_per_row),
+            short(self.allocated_per_row),
+            self.copied_per_row.map_or_else(|| "-".to_owned(), short),
+            self.written_per_row.map_or_else(|| "-".to_owned(), short),
             short(self.in_per_row),
             short(self.out_per_row),
             si(self.memory_peak as f64),
@@ -3285,14 +3763,16 @@ impl Measurement {
     }
 }
 
-const HEADERS: [&str; 14] = [
+const HEADERS: [&str; 16] = [
     "operator",
     "configuration",
     "rows",
     "ns/row",
     "Mrows/s",
     "allocs/chunk",
+    "alloc B/row",
     "copied B/row",
+    "written B/row",
     "in B/row",
     "out B/row",
     "memory_peak",
@@ -3313,10 +3793,10 @@ fn report(bench: &Bench) -> String {
         config.scale,
         config.iterations,
         std::thread::available_parallelism().map_or(0, |n| n.get()),
-        if config.count_allocations {
+        if counters::COUNTS_COPIES {
             ""
         } else {
-            ", allocations not counted"
+            ", copies not counted"
         }
     );
     let _ = writeln!(
@@ -3465,11 +3945,16 @@ fn print_uncaptured(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The tests of this binary (the benchmark and the tests of its harness)
+/// run one after the other, so that they do not disturb each other's
+/// timings.
+static SERIAL: Mutex<()> = Mutex::new(());
+
 /// The benchmark, see the module documentation.
 #[test]
 fn operator_micro() -> Result<()> {
+    let _serial = SERIAL.lock();
     let config = BenchConfig::from_env();
-    allocations::set_counting(config.count_allocations);
     let mut bench = Bench::try_new(config)?;
     bench.measure_bandwidths();
     projection(&mut bench)?;
@@ -3490,4 +3975,279 @@ fn operator_micro() -> Result<()> {
         print_uncaptured(&comparison(&bench, &std::fs::read_to_string(path)?))?;
     }
     Ok(())
+}
+
+/// Tests of the harness: of its counts of allocations and copies, of the
+/// windows and baselines that scope them, and of the bytes written.
+mod harness_tests {
+    use datafusion_physical_pipeline::{
+        GlobalOperatorState, OperatorResult, OperatorState,
+    };
+
+    use super::*;
+
+    /// A benchmark of inputs of 1% of the sizes, on 1 and 4 threads, with one
+    /// timed execution per configuration.
+    fn small_bench() -> Bench {
+        Bench::try_new(BenchConfig {
+            scale: 0.01,
+            iterations: 1,
+            threads: vec![1, 4],
+            filter: vec![],
+            save: None,
+            compare: None,
+            bandwidth_bytes: 1 << 20,
+        })
+        .expect("a benchmark")
+    }
+
+    /// The measurement of `bench` whose `operator configuration` starts
+    /// with `name`.
+    fn measurement<'a>(bench: &'a Bench, name: &str) -> &'a Measurement {
+        bench
+            .measurements
+            .iter()
+            .find(|measurement| measurement.name().starts_with(name))
+            .unwrap_or_else(|| panic!("no measurement of {name}"))
+    }
+
+    #[test]
+    fn copies_into_reused_buffers_are_counted() {
+        let _serial = SERIAL.lock();
+        let session = Session::new();
+        session.tag_current_thread();
+        let source = vec![1_u8; 10_000];
+        let mut target = vec![0_u8; 10_000];
+        session.set_enabled(true);
+        let before = session.snapshot();
+        for _ in 0..3 {
+            let len = black_box(source.len());
+            target[..len].copy_from_slice(&source[..len]);
+            black_box(&target);
+        }
+        let counts = session.snapshot().since(before);
+        session.set_enabled(false);
+        // The copies into `target` allocate nothing, but they are copies.
+        assert_eq!(counts.allocations, 0);
+        let expected = if counters::COUNTS_COPIES { 30_000 } else { 0 };
+        assert_eq!(counts.copied, expected);
+    }
+
+    /// A streaming operator that, for every chunk, allocates `allocations`
+    /// buffers of `bytes` bytes, copies the bytes of the source of its thread
+    /// into its target (buffers that it reuses), and produces no rows.
+    struct Allocating {
+        children: Vec<Arc<dyn PhysicalOperator>>,
+        allocations: usize,
+        bytes: usize,
+        /// The source and the target of the copies of every thread.
+        buffers: Vec<Mutex<(Vec<u8>, Vec<u8>)>>,
+        state: Arc<dyn GlobalOperatorState>,
+    }
+
+    impl std::fmt::Debug for Allocating {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Allocating")
+                .field("allocations", &self.allocations)
+                .field("bytes", &self.bytes)
+                .finish()
+        }
+    }
+
+    impl PhysicalOperator for Allocating {
+        fn name(&self) -> &str {
+            "Allocating"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.children[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &self.children
+        }
+
+        fn get_global_operator_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalOperatorState>> {
+            Ok(Arc::clone(&self.state))
+        }
+
+        fn execute(
+            &self,
+            ctx: &ExecutionContext,
+            _input: &DataChunk,
+            _output: &mut DataChunk,
+            _gstate: &dyn GlobalOperatorState,
+            _lstate: &mut dyn OperatorState,
+        ) -> Result<OperatorResult> {
+            for _ in 0..self.allocations {
+                black_box(Vec::<u8>::with_capacity(self.bytes));
+            }
+            let mut buffers = self.buffers[ctx.thread_id].lock();
+            let (source, target) = &mut *buffers;
+            target.copy_from_slice(black_box(source.as_slice()));
+            Ok(OperatorResult::NeedMoreInput)
+        }
+    }
+
+    #[test]
+    fn the_harness_counts_what_an_operator_allocates_and_copies() {
+        let _serial = SERIAL.lock();
+        let bench = small_bench();
+        let schema = schema_of(vec![Field::new("a", DataType::Int64, false)]);
+        let column = uniform_i64(&mut Rng::new(11), 64 * DEFAULT_VECTOR_SIZE, 100);
+        let chunks = chunks_of(&schema, &[column], DEFAULT_VECTOR_SIZE).expect("chunks");
+        let source = ChunkSource::new(schema, chunks);
+        let chunks = source.chunks.len() as u64;
+        for threads in [1, 4] {
+            let count = |allocations: usize, bytes: usize, copied: usize| {
+                let operator = Arc::new(Allocating {
+                    children: vec![Arc::clone(&source) as _],
+                    allocations,
+                    bytes,
+                    buffers: (0..threads)
+                        .map(|_| Mutex::new((vec![1; copied], vec![0; copied])))
+                        .collect(),
+                    state: Arc::new(EmptyState),
+                });
+                let case = Case {
+                    operator: "allocating",
+                    config: String::new(),
+                    threads,
+                    scope: Scope::Operator,
+                    baselines: vec![Baseline::of(&source, Window::Root)],
+                    task_ctx: None,
+                };
+                let plan = Plan::new(operator, vec![Arc::clone(&source) as _], false);
+                bench.count(&case, &plan).expect("counts")
+            };
+            let idle = count(0, 0, 0);
+            let busy = count(3, 1000, 4096);
+            // What the operator allocates and copies for every chunk, exactly.
+            assert_eq!(busy.allocations - idle.allocations, 3 * chunks);
+            assert_eq!(busy.allocated - idle.allocated, 3000 * chunks);
+            if counters::COUNTS_COPIES {
+                assert_eq!(busy.copied - idle.copied, 4096 * chunks);
+            }
+            // The baseline subtracts the harness (e.g. the copies of the
+            // chunks the source hands out, an allocation per chunk), and no
+            // more: what is left without an allocation of the operator is
+            // what the executor allocates for its stage in the pipeline.
+            assert!(
+                idle.allocations < chunks / 4,
+                "{idle:?} for an operator that allocates nothing, on {threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_count_their_allocations_without_those_of_the_probe() {
+        let _serial = SERIAL.lock();
+        let bench = small_bench();
+        // 8192 build rows of 128 keys: a probe chunk whose rows all find a
+        // match has 131,072 output rows.
+        let rows = 4 * DEFAULT_VECTOR_SIZE;
+        let build = BuildSide::new(rows, 64, KeyKind::I64, DEFAULT_VECTOR_SIZE)
+            .expect("a build side");
+        let count = |hit: f64| {
+            let probe = ProbeSide::new(
+                DEFAULT_VECTOR_SIZE,
+                hit,
+                &build,
+                KeyKind::I64,
+                DEFAULT_VECTOR_SIZE,
+            )
+            .expect("a probe side");
+            let case = Case {
+                operator: "hash_join_build",
+                config: String::new(),
+                threads: 1,
+                scope: Scope::Sink,
+                baselines: vec![Baseline::of(&build.source, Window::Execution)],
+                task_ctx: None,
+            };
+            let join =
+                hash_join(&build.source, &probe.source, KeyKind::I64).expect("a join");
+            let sources = vec![
+                Arc::clone(&build.source) as _,
+                Arc::clone(&probe.source) as _,
+            ];
+            bench
+                .count(&case, &Plan::new(join, sources, false))
+                .expect("counts")
+        };
+        let with_matches = count(1.0);
+        let without_matches = count(0.0);
+        // The output of the probe is not part of the counts of the build.
+        // (Whether a `realloc` moves its block depends on the heap.)
+        assert_eq!(with_matches.allocations, without_matches.allocations);
+        assert_eq!(with_matches.allocated, without_matches.allocated);
+        assert_eq!(with_matches.copied, without_matches.copied);
+        // The build stores its rows (keys, payload, hashes) in blocks that it
+        // allocates: the baseline does not subtract them.
+        assert!(
+            with_matches.allocated >= rows as u64 * 24,
+            "{with_matches:?} for a build of {rows} rows"
+        );
+    }
+
+    #[test]
+    fn the_written_bytes_are_those_of_the_buffers_that_the_operator_wrote() {
+        let _serial = SERIAL.lock();
+        let mut bench = small_bench();
+        let sort_rows = bench.rows(2 << 20);
+        let sort_label = SortParams {
+            order: Order::Random,
+            key: KeyKind::I64,
+            distinct: 0,
+            batch: DEFAULT_VECTOR_SIZE,
+            threads: 1,
+        }
+        .label(sort_rows);
+        bench.config.filter = vec![
+            "projection exprs=c,a sel=1.00 batch=2048 threads=1 ".to_owned(),
+            "projection exprs=a+b,c sel=1.00 batch=2048 threads=1 ".to_owned(),
+            "filter pred=a<x sel=0.5 batch=2048 threads=1 ".to_owned(),
+            format!("sort {sort_label} "),
+        ];
+        projection(&mut bench).expect("projections");
+        filter(&mut bench).expect("a filter");
+        sort(&mut bench).expect("a sort");
+        let written = |name: &str| {
+            measurement(&bench, name)
+                .written_per_row
+                .expect("bytes written")
+        };
+        // The projection of columns passes them through.
+        assert_eq!(written("projection exprs=c,a "), 0.0);
+        // `a + b` writes the sum (8 bytes per row) and passes `c` through.
+        assert_eq!(written("projection exprs=a+b,c "), 8.0);
+        // The filter selects the rows of its input.
+        assert_eq!(written("filter pred=a<x "), 0.0);
+        // The sort writes both of its columns, sorted.
+        let sort = written("sort ");
+        assert!(
+            (sort - 16.0).abs() < 1e-9,
+            "the sort wrote {sort} bytes per row"
+        );
+    }
+
+    #[test]
+    fn probes_count_the_copies_of_the_hashes_of_their_rows() {
+        let _serial = SERIAL.lock();
+        let mut bench = small_bench();
+        bench.config.filter = vec!["hash_join_probe hit=0.00 ".to_owned()];
+        hash_join_probe(&mut bench).expect("a probe");
+        let probe = measurement(&bench, "hash_join_probe hit=0.00 ");
+        // No probe row finds a match: the probe writes no output.
+        assert_eq!(probe.written_per_row, Some(0.0));
+        if counters::COUNTS_COPIES {
+            // But `ChainScan::reset` copies the hash of every probe row (8
+            // bytes) into a buffer that it reuses for every chunk.
+            let copied = probe.copied_per_row.expect("copies");
+            assert!(copied >= 8.0, "the probe copied {copied} bytes per row");
+        }
+    }
 }
