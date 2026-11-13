@@ -36,9 +36,10 @@
 //!
 //! The first execution of every configuration is a warm-up that checks the
 //! output of the operator (its rows, and e.g. their order for a sort) and
-//! measures the bytes of the output that the operator wrote; an execution
-//! without profiling counts its allocations and copies; the other numbers are
-//! the medians of the timed executions that follow.
+//! measures the bytes of the output that the operator wrote; executions
+//! without profiling count its allocations and copies (the least counts of
+//! three, see [`COUNTED_EXECUTIONS`]); the other numbers are the medians of
+//! the timed executions that follow.
 //!
 //! # Columns of the report
 //!
@@ -64,7 +65,7 @@
 //! the bytes they copy (see [`counters`]); copies that the compiler inlines
 //! (of a few bytes) and value-by-value gathers and scatters are not calls of
 //! `memcpy`, and show in `written B/row` and `alloc B/row` instead. Only the
-//! threads of the benchmark count, in a dedicated execution without
+//! threads of the benchmark count, in dedicated executions without
 //! profiling (whose own allocations would count too), and only in the window
 //! of the execution that the operator is measured in, which the
 //! `DiscardSink` marks (see [`Window`]): the whole execution for most
@@ -272,6 +273,16 @@ mod counters {
                 allocated: self.allocated + other.allocated,
                 copied: self.copied + other.copied,
                 moved: self.moved + other.moved,
+            }
+        }
+
+        /// The least of these counts and `other`, count by count.
+        pub fn min(self, other: Self) -> Self {
+            Self {
+                allocations: self.allocations.min(other.allocations),
+                allocated: self.allocated.min(other.allocated),
+                copied: self.copied.min(other.copied),
+                moved: self.moved.min(other.moved),
             }
         }
 
@@ -1673,6 +1684,13 @@ impl Measurement {
     }
 }
 
+/// The executions whose least counts are those of a plan (see
+/// [`Bench::count`]). The threads of the runtime of a multi-threaded
+/// execution allocate now and then for themselves (on 4 threads, about once
+/// in 40 to 100 executions), which only ever adds to the counts of the plan:
+/// the least counts of a few executions are those of the plan alone.
+const COUNTED_EXECUTIONS: usize = 3;
+
 /// The benchmark: its configuration, counters, runtime, bandwidths and
 /// results.
 struct Bench {
@@ -1789,22 +1807,31 @@ impl Bench {
     }
 
     /// The counts of `plan` in the window of the scope of `case`, net of the
-    /// counts of the baselines of `case` in theirs, in executions without
-    /// profiling.
+    /// counts of the baselines of `case` in theirs: the least counts of
+    /// [`COUNTED_EXECUTIONS`] executions without profiling of every plan.
     fn count(&self, case: &Case, plan: &Plan) -> Result<Counts> {
         let task_ctx = case.task_ctx.as_ref();
         for baseline in &case.baselines {
             self.execute(&baseline.sink, case.threads, task_ctx, false)?;
         }
+        let least = |sink: &Arc<DiscardSink>, window: Window| -> Result<Counts> {
+            let mut least: Option<Counts> = None;
+            for _ in 0..COUNTED_EXECUTIONS {
+                let counts = self
+                    .execute(sink, case.threads, task_ctx, false)?
+                    .windows
+                    .of(window);
+                least = Some(least.map_or(counts, |least| least.min(counts)));
+            }
+            Ok(least.unwrap_or_default())
+        };
         self.session.set_enabled(true);
         let counts = (|| {
             let mut harness = Counts::default();
             for baseline in &case.baselines {
-                let run = self.execute(&baseline.sink, case.threads, task_ctx, false)?;
-                harness = harness.add(run.windows.of(baseline.window));
+                harness = harness.add(least(&baseline.sink, baseline.window)?);
             }
-            let run = self.execute(&plan.sink, case.threads, task_ctx, false)?;
-            Ok(run.windows.of(case.scope.window()).saturating_sub(harness))
+            Ok(least(&plan.sink, case.scope.window())?.saturating_sub(harness))
         })();
         self.session.set_enabled(false);
         counts
@@ -3401,15 +3428,29 @@ fn tuple_data(bench: &mut Bench) -> Result<()> {
             }
         }
         // The counts of the ingestion, net of those of the threads (which
-        // the harness spawns and joins).
+        // the harness spawns and joins): the least of a few appends of each
+        // (see `COUNTED_EXECUTIONS`).
+        let least = |append: bool| -> Result<Counts> {
+            let mut least: Option<Counts> = None;
+            for _ in 0..COUNTED_EXECUTIONS {
+                let (_, counts) = append_tuple_data(
+                    bench.session,
+                    &layout,
+                    &chunks,
+                    &hashes,
+                    params,
+                    append,
+                )?;
+                least = Some(least.map_or(counts, |least| least.min(counts)));
+            }
+            Ok(least.unwrap_or_default())
+        };
         bench.session.set_enabled(true);
-        let counted =
-            append_tuple_data(bench.session, &layout, &chunks, &hashes, params, true);
-        let harness =
-            append_tuple_data(bench.session, &layout, &chunks, &hashes, params, false);
+        let counted = least(true);
+        let harness = least(false);
         bench.session.set_enabled(false);
         let footprint = Footprint {
-            counts: counted?.1.saturating_sub(harness?.1),
+            counts: counted?.saturating_sub(harness?),
             written: None,
         };
         // The ingestion reads (the lines of) the values of the rows and
