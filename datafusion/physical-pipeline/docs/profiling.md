@@ -116,10 +116,10 @@ and of the active time of the execution.
 The `idle_time` of a pipeline is `threads * elapsed_time - active_time`: the
 time that its threads could have been active but were not, because they were
 blocked, queued, not started yet, or already done while other threads still
-ran. The `idle_time` of the execution is `threads * elapsed_time -
-active_time` too, with the `threads` of the executor: it also counts the time
-that the execution ran pipelines with fewer threads, or waited for pipelines
-to complete. So a CPU-bound query has an active time close to
+ran. The `idle_time` of the execution is
+`threads * elapsed_time - active_time` too, with the `threads` of the
+executor: it also counts the time that the execution ran pipelines with fewer
+threads, or waited for pipelines to complete. So a CPU-bound query has an active time close to
 `threads * elapsed_time`; a starved query has a large idle time: a large
 blocked time if it waits for its input, a large queue wait if it waits for the
 CPU, or else too few threads, too little parallelism.
@@ -217,25 +217,25 @@ execution started.
 
 #### Units
 
-| Unit      | Meaning                                                                  |
-| --------- | ------------------------------------------------------------------------ |
+| Unit      | Meaning                                                                |
+| --------- | ---------------------------------------------------------------------- |
 | `ns`      | nanoseconds: durations, and points in time since the execution started |
-| `rows`    | rows                                                                     |
-| `morsels` | morsels: chunks of at most 2048 rows                                     |
-| `bytes`   | bytes, see [Morsels, rows and bytes](#morsels-rows-and-bytes)            |
-| `count`   | a number of things, e.g. of threads or of calls                          |
+| `rows`    | rows                                                                   |
+| `morsels` | morsels: chunks of at most 2048 rows                                   |
+| `bytes`   | bytes, see [Morsels, rows and bytes](#morsels-rows-and-bytes)          |
+| `count`   | a number of things, e.g. of threads or of calls                        |
 
 #### Top level
 
-| Field            | Type   | Meaning                                                              |
-| ---------------- | ------ | -------------------------------------------------------------------- |
-| `schema`         | string | `"datafusion-physical-pipeline/profile"`                             |
-| `version`        | number | the version of the schema, `1`, see [Stability](#stability)         |
-| `root`           | number | the id of the root of the operator tree: always `0`                  |
-| `executor`       | object | the execution as a whole                                             |
-| `operators`      | array  | the operators, by id                                                 |
-| `pipelines`      | array  | the pipelines, by id (the ids of `EXPLAIN`)                          |
-| `meta_pipelines` | array  | the meta pipelines, by id                                            |
+| Field            | Type   | Meaning                                                     |
+| ---------------- | ------ | ----------------------------------------------------------- |
+| `schema`         | string | `"datafusion-physical-pipeline/profile"`                    |
+| `version`        | number | the version of the schema, `1`, see [Stability](#stability) |
+| `root`           | number | the id of the root of the operator tree: always `0`         |
+| `executor`       | object | the execution as a whole                                    |
+| `operators`      | array  | the operators, by id                                        |
+| `pipelines`      | array  | the pipelines, by id (the ids of `EXPLAIN`)                 |
+| `meta_pipelines` | array  | the meta pipelines, by id                                   |
 
 #### Executor fields
 
@@ -245,21 +245,21 @@ execution started.
 
 #### Executor metrics
 
-| Metric                     | Unit      | Meaning                                                                                                |
-| -------------------------- | --------- | ------------------------------------------------------------------------------------------------------ |
-| `threads`                  | `count`   | the maximum number of threads of a pipeline (`target_partitions` for a `PipelineRootExec`)             |
-| `pipelines`                | `count`   | the pipelines                                                                                          |
-| `workers`                  | `count`   | the threads of all pipelines                                                                           |
-| `morsels`                  | `morsels` | the morsels that the sources of all pipelines distributed                                              |
-| `elapsed_time`             | `ns`      | the wall time of the execution                                                                         |
-| `thread_time`              | `ns`      | the wall time of all threads: `active_time + blocked_time + queue_wait_time`                           |
-| `active_time`              | `ns`      | the active time of all pipelines (with their setup), and the time of the finalizations                 |
-| `blocked_time`             | `ns`      | the blocked time of all threads                                                                        |
-| `queue_wait_time`          | `ns`      | the work-queue wait of all threads                                                                     |
-| `idle_time`                | `ns`      | `threads * elapsed_time - active_time` (or `0`)                                                        |
-| `overhead_time`            | `ns`      | `active_time` minus the self times of all operators: the time of the executor itself                   |
-| `memory_peak`              | `bytes`   | the high-water mark of the memory reserved in the memory pool                                          |
-| `unattributed_memory_peak` | `bytes`   | the high-water mark of the memory of the consumers registered outside of the calls of the operators   |
+| Metric                     | Unit      | Meaning                                                                                             |
+| -------------------------- | --------- | --------------------------------------------------------------------------------------------------- |
+| `threads`                  | `count`   | the maximum number of threads of a pipeline (`target_partitions` for a `PipelineRootExec`)          |
+| `pipelines`                | `count`   | the pipelines                                                                                       |
+| `workers`                  | `count`   | the threads of all pipelines                                                                        |
+| `morsels`                  | `morsels` | the morsels that the sources of all pipelines distributed                                           |
+| `elapsed_time`             | `ns`      | the wall time of the execution                                                                      |
+| `thread_time`              | `ns`      | the wall time of all threads: `active_time + blocked_time + queue_wait_time`                        |
+| `active_time`              | `ns`      | the active time of all pipelines (with their setup), and the time of the finalizations              |
+| `blocked_time`             | `ns`      | the blocked time of all threads                                                                     |
+| `queue_wait_time`          | `ns`      | the work-queue wait of all threads                                                                  |
+| `idle_time`                | `ns`      | `threads * elapsed_time - active_time` (or `0`)                                                     |
+| `overhead_time`            | `ns`      | `active_time` minus the self times of all operators: the time of the executor itself                |
+| `memory_peak`              | `bytes`   | the high-water mark of the memory reserved in the memory pool                                       |
+| `unattributed_memory_peak` | `bytes`   | the high-water mark of the memory of the consumers registered outside of the calls of the operators |
 
 #### Operator fields
 
@@ -270,14 +270,14 @@ operators that the pipelines have but the tree does not (e.g. the
 `JoinHashTableBuild` source of the pipeline that builds the hash table of a
 hash join, which produces no rows).
 
-| Field       | Type   | Meaning                                                                                                              |
-| ----------- | ------ | -------------------------------------------------------------------------------------------------------------------- |
-| `id`        | number | the id of the operator                                                                                               |
+| Field       | Type   | Meaning                                                                                                             |
+| ----------- | ------ | ------------------------------------------------------------------------------------------------------------------- |
+| `id`        | number | the id of the operator                                                                                              |
 | `kind`      | string | the kind of the operator, the same for all operators of its type: `PhysicalOperator::name`, e.g. `PhysicalHashJoin` |
-| `name`      | string | the operator as `EXPLAIN` describes it, with its parameters: `PhysicalOperator::description`                         |
-| `inputs`    | array  | the ids of its inputs (its children), in order                                                                       |
+| `name`      | string | the operator as `EXPLAIN` describes it, with its parameters: `PhysicalOperator::description`                        |
+| `inputs`    | array  | the ids of its inputs (its children), in order                                                                      |
 | `pipelines` | array  | the pipelines it takes part in: objects with the id of the `pipeline` and the `role` of the operator in it          |
-| `metrics`   | object | its metrics, summed over all threads of all of its pipelines                                                         |
+| `metrics`   | object | its metrics, summed over all threads of all of its pipelines                                                        |
 
 A `role` is `"source"`, `"operator"` or `"sink"`. A pipeline breaker is the
 sink of a pipeline and the source (or an operator, for the probe side of a
@@ -290,7 +290,7 @@ join).
 | Metric         | Unit      | Meaning                                                                                                     |
 | -------------- | --------- | ----------------------------------------------------------------------------------------------------------- |
 | `self_time`    | `ns`      | the time in the calls of the operator, with the creation of its states and the finalization of its sink     |
-| `blocked_time` | `ns`      | the time that threads were suspended because a call of the operator returned `Blocked`                     |
+| `blocked_time` | `ns`      | the time that threads were suspended because a call of the operator returned `Blocked`                      |
 | `calls`        | `count`   | the calls of `get_data`, `execute`, `final_execute` and `sink`                                              |
 | `rows_in`      | `rows`    | the rows of the chunks that it consumed, as an operator and as a sink                                       |
 | `morsels_in`   | `morsels` | the chunks that it consumed                                                                                 |
@@ -302,43 +302,43 @@ join).
 
 #### Pipeline fields
 
-| Field               | Type    | Meaning                                                                                             |
-| ------------------- | ------- | --------------------------------------------------------------------------------------------------- |
-| `id`                | number  | the id of the pipeline                                                                              |
-| `meta_pipeline`     | number  | the id of its meta pipeline                                                                         |
-| `source`            | number  | the id of its source                                                                                |
-| `operators`         | array   | the ids of its operators, from the source to the sink                                               |
-| `sink`              | number  | the id of its sink                                                                                  |
-| `dependencies`      | array   | the ids of the pipelines of its meta pipeline that complete before it starts                       |
-| `meta_dependencies` | array   | the ids of the meta pipelines that are finalized before it starts                                  |
-| `skipped`           | boolean | whether it skipped its work (an operator or its sink had finished, or could not produce output)    |
-| `metrics`           | object  | its metrics                                                                                         |
-| `stages`            | array   | its stages: its source, its operators and its sink, in this order                                  |
-| `workers`           | array   | its threads, by thread index                                                                        |
+| Field               | Type    | Meaning                                                                                         |
+| ------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `id`                | number  | the id of the pipeline                                                                          |
+| `meta_pipeline`     | number  | the id of its meta pipeline                                                                     |
+| `source`            | number  | the id of its source                                                                            |
+| `operators`         | array   | the ids of its operators, from the source to the sink                                           |
+| `sink`              | number  | the id of its sink                                                                              |
+| `dependencies`      | array   | the ids of the pipelines of its meta pipeline that complete before it starts                    |
+| `meta_dependencies` | array   | the ids of the meta pipelines that are finalized before it starts                               |
+| `skipped`           | boolean | whether it skipped its work (an operator or its sink had finished, or could not produce output) |
+| `metrics`           | object  | its metrics                                                                                     |
+| `stages`            | array   | its stages: its source, its operators and its sink, in this order                               |
+| `workers`           | array   | its threads, by thread index                                                                    |
 
 #### Pipeline metrics
 
-| Metric            | Unit      | Meaning                                                                                    |
-| ----------------- | --------- | ------------------------------------------------------------------------------------------ |
-| `threads`         | `count`   | its threads                                                                                |
-| `morsels`         | `morsels` | the morsels that its source distributed to its threads                                     |
-| `rows`            | `rows`    | the rows of these morsels                                                                  |
-| `started_at`      | `ns`      | when it started (its setup), since the execution started                                   |
-| `finished_at`     | `ns`      | when its last thread completed                                                             |
-| `elapsed_time`    | `ns`      | `finished_at - started_at`                                                                 |
-| `setup_time`      | `ns`      | the time it took to create its global states and to start its threads                     |
-| `active_time`     | `ns`      | `setup_time`, and the active time of its threads                                           |
-| `blocked_time`    | `ns`      | the blocked time of its threads                                                            |
-| `queue_wait_time` | `ns`      | the work-queue wait of its threads                                                         |
-| `idle_time`       | `ns`      | `threads * elapsed_time - active_time` (or `0`)                                            |
+| Metric            | Unit      | Meaning                                                               |
+| ----------------- | --------- | --------------------------------------------------------------------- |
+| `threads`         | `count`   | its threads                                                           |
+| `morsels`         | `morsels` | the morsels that its source distributed to its threads                |
+| `rows`            | `rows`    | the rows of these morsels                                             |
+| `started_at`      | `ns`      | when it started (its setup), since the execution started              |
+| `finished_at`     | `ns`      | when its last thread completed                                        |
+| `elapsed_time`    | `ns`      | `finished_at - started_at`                                            |
+| `setup_time`      | `ns`      | the time it took to create its global states and to start its threads |
+| `active_time`     | `ns`      | `setup_time`, and the active time of its threads                      |
+| `blocked_time`    | `ns`      | the blocked time of its threads                                       |
+| `queue_wait_time` | `ns`      | the work-queue wait of its threads                                    |
+| `idle_time`       | `ns`      | `threads * elapsed_time - active_time` (or `0`)                       |
 
 #### Stage fields
 
-| Field      | Type   | Meaning                                                       |
-| ---------- | ------ | ------------------------------------------------------------- |
-| `operator` | number | the id of the operator                                        |
+| Field      | Type   | Meaning                                                        |
+| ---------- | ------ | -------------------------------------------------------------- |
+| `operator` | number | the id of the operator                                         |
 | `role`     | string | its role in the pipeline: `"source"`, `"operator"` or `"sink"` |
-| `metrics`  | object | the metrics of the operator in this pipeline                  |
+| `metrics`  | object | the metrics of the operator in this pipeline                   |
 
 #### Stage metrics
 
@@ -347,48 +347,48 @@ pipeline. The metrics of an operator are the sums of the metrics of its
 stages, but for the finalization of its sink, which is part of its
 `self_time` only, and for its `memory_peak`.
 
-| Metric         | Unit      | Meaning                          |
-| -------------- | --------- | -------------------------------- |
-| `self_time`    | `ns`      | as for operators                 |
-| `blocked_time` | `ns`      | as for operators                 |
-| `calls`        | `count`   | as for operators                 |
-| `rows_in`      | `rows`    | as for operators                 |
-| `morsels_in`   | `morsels` | as for operators                 |
-| `bytes_in`     | `bytes`   | as for operators                 |
-| `rows_out`     | `rows`    | as for operators                 |
-| `morsels_out`  | `morsels` | as for operators                 |
-| `bytes_out`    | `bytes`   | as for operators                 |
+| Metric         | Unit      | Meaning          |
+| -------------- | --------- | ---------------- |
+| `self_time`    | `ns`      | as for operators |
+| `blocked_time` | `ns`      | as for operators |
+| `calls`        | `count`   | as for operators |
+| `rows_in`      | `rows`    | as for operators |
+| `morsels_in`   | `morsels` | as for operators |
+| `bytes_in`     | `bytes`   | as for operators |
+| `rows_out`     | `rows`    | as for operators |
+| `morsels_out`  | `morsels` | as for operators |
+| `bytes_out`    | `bytes`   | as for operators |
 
 #### Worker fields
 
-| Field     | Type   | Meaning                                         |
-| --------- | ------ | ----------------------------------------------- |
-| `thread`  | number | the index of the thread in the pipeline         |
-| `metrics` | object | its metrics                                     |
+| Field     | Type   | Meaning                                 |
+| --------- | ------ | --------------------------------------- |
+| `thread`  | number | the index of the thread in the pipeline |
+| `metrics` | object | its metrics                             |
 
 #### Worker metrics
 
-| Metric            | Unit      | Meaning                                                                       |
-| ----------------- | --------- | ----------------------------------------------------------------------------- |
-| `started_at`      | `ns`      | when the thread was spawned, since the execution started                      |
-| `finished_at`     | `ns`      | when it completed                                                             |
+| Metric            | Unit      | Meaning                                                                                   |
+| ----------------- | --------- | ----------------------------------------------------------------------------------------- |
+| `started_at`      | `ns`      | when the thread was spawned, since the execution started                                  |
+| `finished_at`     | `ns`      | when it completed                                                                         |
 | `elapsed_time`    | `ns`      | its time from its spawn to its completion: `active_time + blocked_time + queue_wait_time` |
-| `active_time`     | `ns`      | its time in polls of its task                                                 |
-| `blocked_time`    | `ns`      | its time suspended on a `Blocked` result                                      |
-| `queue_wait_time` | `ns`      | its time ready to run, waiting for a thread of the runtime                    |
-| `morsels`         | `morsels` | the morsels it got from the source                                            |
-| `rows`            | `rows`    | the rows of these morsels                                                     |
+| `active_time`     | `ns`      | its time in polls of its task                                                             |
+| `blocked_time`    | `ns`      | its time suspended on a `Blocked` result                                                  |
+| `queue_wait_time` | `ns`      | its time ready to run, waiting for a thread of the runtime                                |
+| `morsels`         | `morsels` | the morsels it got from the source                                                        |
+| `rows`            | `rows`    | the rows of these morsels                                                                 |
 
 #### Meta pipeline fields
 
-| Field       | Type           | Meaning                                       |
-| ----------- | -------------- | --------------------------------------------- |
-| `id`        | number         | the id of the meta pipeline                   |
-| `sink`      | number         | the id of its sink                            |
-| `pipelines` | array          | the ids of its pipelines                      |
-| `children`  | array          | the ids of its child meta pipelines           |
-| `parent`    | number or null | the id of its parent, `null` for the root     |
-| `metrics`   | object         | its metrics                                   |
+| Field       | Type           | Meaning                                   |
+| ----------- | -------------- | ----------------------------------------- |
+| `id`        | number         | the id of the meta pipeline               |
+| `sink`      | number         | the id of its sink                        |
+| `pipelines` | array          | the ids of its pipelines                  |
+| `children`  | array          | the ids of its child meta pipelines       |
+| `parent`    | number or null | the id of its parent, `null` for the root |
+| `metrics`   | object         | its metrics                               |
 
 #### Meta pipeline metrics
 
