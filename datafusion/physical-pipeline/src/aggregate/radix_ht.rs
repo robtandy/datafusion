@@ -91,8 +91,9 @@
 //! * the groups and rows of the radix partitions as they are scattered to
 //!   them: the pieces of a scatter, slices of the same arrays, are reserved
 //!   once, until the partitions of all of them are finalized;
-//! * the tables of the final aggregation of a partition as they grow, and
-//!   the evaluated groups of the partition until they are emitted.
+//! * the tables of the final aggregation of a partition as they grow, the
+//!   evaluated groups of the partition until they are emitted, and the top
+//!   groups of a top-k aggregation that the finalized partitions keep.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -859,35 +860,43 @@ impl GlobalSourceState for RadixSourceState {
 struct TopKGroups {
     top_k: TopK,
     /// The top groups of the partitions that were finalized so far, sorted
-    /// (see [`TopK::sort_groups`]).
-    groups: Mutex<Option<RecordBatch>>,
+    /// (see [`TopK::sort_groups`]), and their memory, which `reservation`
+    /// holds.
+    groups: Mutex<(Option<RecordBatch>, usize)>,
     /// The cutoff of `groups` (see [`TopK::sorted_cutoff`]): the groups of
     /// the other partitions whose values are worse are not among the top
     /// groups.
     cutoff: Mutex<Option<ArrayRef>>,
     /// The number of partitions that were not finalized yet.
     remaining: AtomicUsize,
+    /// The memory of `groups`.
+    reservation: MemoryReservation,
 }
 
 impl TopKGroups {
-    fn new(top_k: TopK, partitions: usize) -> Self {
+    fn new(top_k: TopK, partitions: usize, reservation: MemoryReservation) -> Self {
         Self {
             top_k,
-            groups: Mutex::new(None),
+            groups: Mutex::new((None, 0)),
             cutoff: Mutex::new(None),
             remaining: AtomicUsize::new(partitions),
+            reservation,
         }
     }
 
     /// Add `outputs`, the groups of a finalized partition. Returns the top
-    /// groups of all partitions once all of them were added.
+    /// groups of all partitions once all of them were added, with their
+    /// memory, which stays reserved in [`Self::reservation`] (the caller takes
+    /// it over).
     ///
     /// The groups of a partition that may be among the top groups (not worse
     /// than the cutoff of the groups added so far) are selected and sorted
     /// first, by the thread that finalized the partition, so that merging
     /// them with the groups added so far, one partition after the other,
-    /// gathers the top groups only.
-    fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
+    /// gathers the top groups only. The merged groups are reserved once they
+    /// are merged, instead of the groups before: the aggregation fails with
+    /// `ResourcesExhausted` if the memory pool cannot hold them.
+    fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<(RecordBatch, usize)>> {
         let column = self.top_k.output_column();
         for output in outputs {
             let cutoff = self.cutoff.lock().clone();
@@ -905,17 +914,20 @@ impl TopKGroups {
             }
             let output = self.top_k.select_sorted_groups(&output)?;
             let mut groups = self.groups.lock();
+            let (groups, memory) = &mut *groups;
             let merged = match groups.take() {
                 Some(groups) => self.top_k.merge_sorted_groups(&groups, &output)?,
                 None => output,
             };
+            resize_share(&self.reservation, memory, buffered_memory(&merged))?;
             if let Some(cutoff) = self.top_k.sorted_cutoff(&merged) {
                 *self.cutoff.lock() = Some(cutoff);
             }
             *groups = Some(merged);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            return Ok(self.groups.lock().take());
+            let (groups, memory) = std::mem::take(&mut *self.groups.lock());
+            return Ok(groups.map(|groups| (groups, memory)));
         }
         Ok(None)
     }
@@ -1075,9 +1087,9 @@ impl RadixHashAggregate {
         let Some(partitions) = sink.non_empty.lock().clone() else {
             return internal_err!("{OPERATOR} is a source before it was finalized");
         };
-        let top_k = spec
-            .top_k
-            .map(|top_k| TopKGroups::new(top_k, partitions.len()));
+        let top_k = spec.top_k.map(|top_k| {
+            TopKGroups::new(top_k, partitions.len(), sink.reservation.new_empty())
+        });
         Ok(Arc::new(RadixSourceState {
             sink,
             partitions,
@@ -1130,18 +1142,21 @@ impl RadixHashAggregate {
             local.outputs = match &state.top_k {
                 Some(top_k) => {
                     // The groups of the partition are merged into the top
-                    // groups, which the thread of the last partition emits.
+                    // groups (which reserve them), which the thread of the
+                    // last partition emits.
                     let memory = outputs.iter().map(|(_, memory)| memory).sum();
                     let outputs = outputs.into_iter().map(|(output, _)| output);
                     let top = top_k.add(outputs.collect())?;
                     local.reservation.shrink(memory);
-                    let mut outputs = vec![];
-                    if let Some(top) = top {
-                        let memory = buffered_memory(&top);
-                        local.reservation.try_grow(memory)?;
-                        outputs.push((top, memory));
+                    match top {
+                        Some((top, memory)) => {
+                            // Their memory moves to the outputs of the thread.
+                            local.reservation.grow(memory);
+                            top_k.reservation.shrink(memory);
+                            vec![(top, memory)]
+                        }
+                        None => vec![],
                     }
-                    outputs
                 }
                 None => outputs.into_iter().rev().collect(),
             };
@@ -2315,6 +2330,72 @@ mod tests {
             "{buffered} + {partitioned}"
         );
         assert_eq!(finish(sink)?, (0..64).map(|key| (key, 1)).collect());
+        Ok(())
+    }
+
+    #[test]
+    fn the_top_groups_of_top_k_aggregations_are_reserved_until_they_are_emitted()
+    -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        // `SELECT k FROM t GROUP BY k ORDER BY k DESC LIMIT 50000`: the top
+        // groups of the partitions that were finalized so far are kept (and
+        // reserved) until the last partition is, up to 50,000 keys (400 KB),
+        // here of 4 partitions of 20,000 keys each.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![],
+            vec![],
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+            Arc::clone(&schema),
+        )?
+        .try_optimize_topk(50_000, "k", SortOptions::new(true, false))
+        .expect("a top-k aggregation")
+        .data;
+        let (spec, _, _) = top_k_sink(aggregate)?;
+        let top_k = spec.top_k.expect("a top-k aggregation");
+        let partition = |partition: i64| {
+            let keys = Int64Array::from_iter_values(
+                partition * 20_000..(partition + 1) * 20_000,
+            );
+            RecordBatch::try_new(Arc::clone(&spec.schema), vec![Arc::new(keys)])
+        };
+        for (limit, fits) in [(64 << 20, true), (256 << 10, false)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let reservation =
+                MemoryConsumer::new("PhysicalHashAggregate").register(&pool);
+            let top = TopKGroups::new(top_k, 4, reservation);
+            let mut outcome = Ok(None);
+            for index in 0..4 {
+                outcome = top.add(vec![partition(index)?]);
+                if !matches!(outcome, Ok(None)) {
+                    break;
+                }
+                let (groups, memory) = &*top.groups.lock();
+                let groups = groups.as_ref().expect("the top groups so far");
+                assert_eq!(*memory, buffered_memory(groups));
+                assert_eq!(pool.reserved(), *memory);
+            }
+            if !fits {
+                let error = outcome.expect_err("the pool cannot hold the top groups");
+                assert!(
+                    matches!(
+                        error.find_root(),
+                        datafusion_common::DataFusionError::ResourcesExhausted(_)
+                    ),
+                    "{error}"
+                );
+                continue;
+            }
+            // The caller takes over the memory of the top groups.
+            let (groups, memory) = outcome?.expect("the top groups of all partitions");
+            assert_eq!(groups.num_rows(), 50_000);
+            assert_eq!(pool.reserved(), memory);
+            assert_eq!(top.reservation.size(), memory);
+        }
         Ok(())
     }
 
