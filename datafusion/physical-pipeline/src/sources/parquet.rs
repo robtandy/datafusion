@@ -32,10 +32,15 @@ use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadataCache,
 };
 use datafusion_expr::ColumnarValue;
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{
+    Column, DynamicFilterPhysicalExpr, Literal, lit,
+};
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
-use datafusion_physical_expr::{PhysicalExpr, conjunction, split_conjunction};
+use datafusion_physical_expr::{
+    PhysicalExpr, ScalarFunctionExpr, conjunction, split_conjunction,
+};
 use datafusion_physical_expr_common::physical_expr::{is_volatile, snapshot_generation};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::filter::FilterExec;
@@ -998,9 +1003,11 @@ enum ConjunctKind {
     /// decoding otherwise, also if it does not produce its columns (see
     /// [`RowFilterState::version_filter`]).
     Exact,
-    /// An exact conjunct of a scan that cannot decode the columns that it
-    /// does not produce (see [`ScanPredicate::widens`]): always in the row
-    /// filter.
+    /// An exact conjunct that the scan does not evaluate natively, as it
+    /// cannot decode the columns that it does not produce (see
+    /// [`ScanPredicate::widens`]), or as the conjunct may read columns that
+    /// it does not reference (see [`reads_unreferenced_columns`]): always in
+    /// the row filter, as with DataFusion.
     Pinned,
     /// A conjunct that no row has to be filtered by: a dynamic filter, or a
     /// conjunct that DataFusion pushed into the scan to prune it, which a
@@ -1097,14 +1104,19 @@ impl ScanPredicate {
                 continue;
             }
             let dynamic = conjunct.is::<DynamicFilterPhysicalExpr>();
-            let kind = match (exact && !dynamic, predicate.widens) {
+            // A conjunct that may read the columns that it does not reference
+            // is evaluated as DataFusion does, in the row filter, if the scan
+            // relies on it, and only prunes otherwise.
+            let opaque = reads_unreferenced_columns(conjunct);
+            let kind = match (exact && !dynamic, predicate.widens && !opaque) {
                 (false, _) => ConjunctKind::Optional,
                 (true, true) => ConjunctKind::Exact,
                 (true, false) => ConjunctKind::Pinned,
             };
             // Whether the row filter may evaluate the conjunct in any order:
             // it neither fails on some rows nor is volatile.
-            let evaluable = !is_volatile(conjunct)
+            let evaluable = !opaque
+                && !is_volatile(conjunct)
                 && (dynamic
                     || (!is_dynamic(conjunct)
                         && fallibility(conjunct, table_schema)
@@ -1187,6 +1199,7 @@ impl ScanPredicate {
             )
             || is_volatile(&expr)
             || is_dynamic(&expr)
+            || reads_unreferenced_columns(&expr)
             || fallibility(&expr, table.table_schema()) != Fallibility::Infallible
         {
             return Ok(None);
@@ -1229,6 +1242,25 @@ fn column_indices(expr: &Arc<dyn PhysicalExpr>) -> Vec<usize> {
 fn is_dynamic(expr: &Arc<dyn PhysicalExpr>) -> bool {
     expr.exists(|expr| Ok(!matches!(expr.snapshot(), Ok(None))))
         .unwrap_or(true)
+}
+
+/// Whether `expr` may read columns of its input that it does not reference
+/// as [`Column`]s: it has a leaf that is neither a column, a literal, a
+/// function (whose arguments are its children) nor the result of a scalar
+/// subquery, e.g. a custom expression without children, or the parameter of
+/// a lambda (as for `BoundExprs`, which binds such expressions to all input
+/// columns). Its columns cannot be narrowed nor renumbered: it reads them at
+/// their positions in its input, also in DataFusion's row filter, which
+/// decodes only the columns that a conjunct references.
+fn reads_unreferenced_columns(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.exists(|expr| {
+        Ok(expr.children().is_empty()
+            && !expr.is::<Column>()
+            && !expr.is::<Literal>()
+            && !expr.is::<ScalarFunctionExpr>()
+            && !expr.is::<ScalarSubqueryExpr>())
+    })
+    .unwrap_or(true)
 }
 
 /// The conjunct is evaluated by the row filter (also to sample it).
@@ -2130,12 +2162,16 @@ impl RowFilterState {
         exact_columns.sort_unstable();
         exact_columns.dedup();
         // The decoded columns of the scan, and the columns of the table that
-        // it does not produce.
+        // it does not produce. A folded conjunct that may read columns that
+        // it does not reference (see `reads_unreferenced_columns`) sees all
+        // columns of the scan, at their positions.
+        let all_columns = folded.iter().any(|expr| reads_unreferenced_columns(expr));
         let mut decoded = outputs
             .iter()
             .copied()
             .chain(folded.iter().flat_map(|expr| column_indices(expr)))
             .chain(exact_columns.iter().filter_map(|&column| produced[column]))
+            .chain((0..scan_schema.fields().len()).filter(|_| all_columns))
             .collect::<Vec<_>>();
         decoded.sort_unstable();
         decoded.dedup();
@@ -4520,6 +4556,133 @@ mod tests {
         .await?;
         assert_eq!(first_column(&output), expected);
         assert!(metric(&source, "natively_filtered_units") > 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn folded_conjuncts_with_opaque_leaves_see_all_columns() -> Result<()> {
+        // `opaque(a)` reads `a` at its position in the output of the scan,
+        // without a `Column` child (see `reads_unreferenced_columns`). The
+        // filter projects `id` and `b`, so a version of the row filters that
+        // decoded only the columns that its conjuncts reference (`id`) and
+        // the projection would make `opaque(a)` read `b`. It decodes every
+        // column of the scan, at its position: the rows with even ids pass,
+        // as with DataFusion.
+        use crate::operators::filter::test_support::opaque_column;
+        use datafusion_physical_expr::expressions::binary;
+
+        let dir = tempfile::tempdir()?;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+        let ids = 1..=100_i64;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(ids.clone())),
+                Arc::new(BooleanArray::from_iter(
+                    ids.clone().map(|id| Some(id % 2 == 0)),
+                )),
+                Arc::new(BooleanArray::from_iter(ids.map(|id| Some(id % 3 == 0)))),
+            ],
+        )?;
+        write_parquet(
+            &dir.path().join("t.parquet"),
+            Arc::clone(&schema),
+            &[batch],
+            None,
+        )?;
+        let ctx = SessionContext::new_with_config(test_session_config());
+        ctx.register_parquet("t", dir.path().to_str().unwrap(), Default::default())
+            .await?;
+        let plan = ctx
+            .sql("SELECT id, a, b FROM t")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let scan = find_scan(&plan);
+        assert_eq!(scan.schema(), schema);
+        let id: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let predicate = binary(
+            binary(id, Operator::Gt, lit(0_i64), &schema)?,
+            Operator::And,
+            opaque_column("a", &schema),
+            &schema,
+        )?;
+        let filter = datafusion_physical_plan::filter::FilterExecBuilder::new(
+            predicate,
+            Arc::clone(&scan),
+        )
+        .apply_projection(Some(vec![0, 2]))?
+        .build()?;
+        let expected = first_column(
+            &datafusion_physical_plan::collect(
+                Arc::new(filter.clone()) as Arc<dyn ExecutionPlan>,
+                ctx.task_ctx(),
+            )
+            .await?,
+        );
+        assert_eq!(expected, (1..=50).map(|id| 2 * id).collect::<Vec<_>>());
+
+        let exec = scan.downcast_ref::<DataSourceExec>().unwrap();
+        let source = ParquetScanSource::try_new(exec)?.try_with_filter(&filter)?;
+        // The row filters may evaluate `id > 0`, but not `opaque(a)`.
+        let [candidate] = &source.predicate.candidates[..] else {
+            panic!("one candidate: {:?}", source.predicate.candidates);
+        };
+        assert_eq!(candidate.kind, ConjunctKind::Folded);
+        // With and without row filters, on 1 and 4 threads.
+        let source = Arc::new(source);
+        for threads in [1, 4] {
+            let output = Executor::collect(
+                Arc::clone(&source) as Arc<dyn PhysicalOperator>,
+                ctx.task_ctx(),
+                threads,
+            )
+            .await?;
+            assert_eq!(first_column(&output), expected, "{threads} threads");
+        }
+        let gstate = execution_state(&source, &ctx, 1)?;
+        prefer_native(row_filters_of(&gstate));
+        let output = drain(&source, &ctx, &gstate).await?;
+        assert_eq!(first_column(&output), expected, "without row filters");
+        assert!(metric(&source, "natively_filtered_units") > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn exact_conjuncts_with_opaque_leaves_stay_in_the_row_filter() -> Result<()> {
+        // With `pushdown_filters`, DataFusion evaluates `opaque(a)` in its row
+        // filter, so the scan does too: it may not decode the columns that the
+        // conjunct reads to evaluate it natively, as it does not reference
+        // them. A dynamic filter of opaque keys only prunes.
+        use crate::operators::filter::test_support::opaque_column;
+
+        let schema = big_schema();
+        let opaque = opaque_column("a", &schema);
+        let dynamic: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![opaque_column("k", &schema)],
+            lit(true),
+        ));
+        let source = ParquetSource::new(Arc::clone(&schema))
+            .with_pushdown_filters(true)
+            .with_predicate(conjunction([Arc::clone(&opaque), Arc::clone(&dynamic)]));
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source),
+        )
+        .build();
+        let predicate = ScanPredicate::try_new(&config, None)?;
+        let [candidate] = &predicate.candidates[..] else {
+            panic!("one candidate: {:?}", predicate.candidates);
+        };
+        assert!(candidate.expr.eq(&opaque));
+        assert_eq!(candidate.kind, ConjunctKind::Pinned);
+        assert!(!predicate.reorder);
+        assert!(predicate.exact_native.is_empty());
+        assert!(predicate.pruning_only.iter().any(|expr| expr.eq(&dynamic)));
         Ok(())
     }
 }
