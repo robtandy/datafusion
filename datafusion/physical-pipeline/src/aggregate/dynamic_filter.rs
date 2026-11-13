@@ -896,12 +896,13 @@ mod tests {
     /// the filters of the queries do not cache them, see `CachingOperator`),
     /// whose values are bounded by the values of every file before them: file
     /// `i` has values `x` from `i` to `1000 - i` (both of them, in its first
-    /// two rows, followed by `i + 1` and `999 - i`), and `s`,
+    /// two rows, followed by `999 - i` and `i + 1`), and `s`,
     /// `d`, `dec` and `f` of the same order (`f` with a `NaN` in its last
-    /// file). Once a thread aggregated the `MIN` or the `MAX` of a file, a
-    /// filter of its bounds prunes all files after it. `id` is unique and
-    /// ascending, `e` is true for two of three rows, `n` is always `NULL` and
-    /// `g` has 7 values.
+    /// file). Once a thread aggregated the first chunk of any file, a filter
+    /// of its bounds prunes all files after it, for every query of
+    /// [`BOUNDED_QUERIES`] (the least `x` of the rows of `g = 3` that pass `e`
+    /// is `i + 1`, in the fourth row). `id` is unique and ascending, `e` is
+    /// true for two of three rows, `n` is always `NULL` and `g` has 7 values.
     fn write_table_m(dir: &Path) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -922,8 +923,8 @@ mod tests {
                 .map(|row| match row {
                     0 => file,
                     1 => 1000 - file,
-                    2 => file + 1,
-                    3 => 999 - file,
+                    2 => 999 - file,
+                    3 => file + 1,
                     _ => file + 1 + (row * 37) % (999 - 2 * file),
                 })
                 .collect::<Vec<_>>();
@@ -1183,7 +1184,8 @@ mod tests {
         // aggregations set them to the bounds of their aggregates of all
         // threads, as DataFusion does, so the scans prune the files whose
         // values are within the bounds: every file but the first one of every
-        // thread (of 4).
+        // thread (of 4), whichever thread publishes its bounds first (see
+        // `write_table_m`).
         let dir = write_tables()?;
         let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
         for pushdown_filters in [false, true] {
