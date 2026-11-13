@@ -1,0 +1,152 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "PROJECTION",
+                "children": [
+                    {
+                        "name": "HASH_GROUP_BY",
+                        "children": [
+                            {
+                                "name": "PROJECTION",
+                                "children": [
+                                    {
+                                        "name": "HASH_JOIN",
+                                        "children": [
+                                            {
+                                                "name": "HASH_JOIN",
+                                                "children": [
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "c_custkey",
+                                                                "c_name",
+                                                                "c_address",
+                                                                "c_nationkey",
+                                                                "c_phone",
+                                                                "c_acctbal",
+                                                                "c_comment"
+                                                            ],
+                                                            "Estimated Cardinality": "14992"
+                                                        }
+                                                    },
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "n_nationkey",
+                                                                "n_name"
+                                                            ],
+                                                            "Estimated Cardinality": "16"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Join Type": "INNER",
+                                                    "Conditions": "c_nationkey = n_nationkey",
+                                                    "Estimated Cardinality": "14992"
+                                                }
+                                            },
+                                            {
+                                                "name": "HASH_JOIN",
+                                                "children": [
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "l_orderkey",
+                                                                "l_extendedprice",
+                                                                "l_discount"
+                                                            ],
+                                                            "Filters": "(l_returnflag = 'R')",
+                                                            "Estimated Cardinality": "120252"
+                                                        }
+                                                    },
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "o_orderkey",
+                                                                "o_custkey"
+                                                            ],
+                                                            "Filters": "((o_orderdate >= '1993-10-01'::DATE) AND (o_orderdate < '1994-01-01'::DATE))",
+                                                            "Estimated Cardinality": "30000"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Join Type": "INNER",
+                                                    "Conditions": "l_orderkey = o_orderkey",
+                                                    "Estimated Cardinality": "24050"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Join Type": "INNER",
+                                            "Conditions": "c_custkey = o_custkey",
+                                            "Estimated Cardinality": "24050"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Projections": [
+                                        "c_custkey",
+                                        "c_name",
+                                        "c_acctbal",
+                                        "c_phone",
+                                        "n_name",
+                                        "c_address",
+                                        "c_comment",
+                                        "(l_extendedprice * (1.00 - l_discount))"
+                                    ],
+                                    "Estimated Cardinality": "24050"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Groups": [
+                                "#0",
+                                "#1",
+                                "#2",
+                                "#3",
+                                "#4",
+                                "#5",
+                                "#6"
+                            ],
+                            "Aggregates": "sum(#7)",
+                            "Estimated Cardinality": "24050"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Projections": [
+                        "c_custkey",
+                        "c_name",
+                        "revenue",
+                        "c_acctbal",
+                        "n_name",
+                        "c_address",
+                        "c_phone",
+                        "c_comment"
+                    ],
+                    "Estimated Cardinality": "24050"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "20",
+            "Order By": "revenue DESC",
+            "Estimated Cardinality": "20"
+        }
+    }
+]

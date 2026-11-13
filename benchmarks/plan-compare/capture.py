@@ -8,14 +8,16 @@
 Runs `EXPLAIN` for every query of `queries.sql` (written by `materialize.sh`)
 in the DuckDB CLI built by `build_duckdb.sh`, over views of the Parquet files
 that `materialize.sh` wrote, and writes the output of every query to
-`duckdb/<query>.txt`. Checks first that the CLI is built from the commit of the
-captured plans and that the data is that of the captured plans (`--force`
-skips these checks). See README.md.
+`duckdb/<query>.txt`, and that of `EXPLAIN (FORMAT JSON)`, the same plan in
+JSON (which `differ.py` reads), to `duckdb/<query>.json`. Checks first that the
+CLI is built from the commit of the captured plans and that the data is that of
+the captured plans (`--force` skips these checks). See README.md.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import subprocess
@@ -164,15 +166,16 @@ class DuckDB:
             tables[table] = (int(files), int(rows))
         return tables
 
-    def explain(self, sql: str, threads: int) -> str:
-        """The output of `EXPLAIN sql` on `threads` threads, over a view of
-        the Parquet files of every table."""
+    def explain(self, sql: str, threads: int, options: str = "") -> str:
+        """The output of `EXPLAIN <options> sql` on `threads` threads, over a
+        view of the Parquet files of every table."""
         script = [f"SET threads = {threads};"]
         script += [
             f"CREATE VIEW {table} AS SELECT * FROM read_parquet('{table}/*.parquet');"
             for table in TABLES
         ]
-        script.append(f"EXPLAIN {sql};")
+        explain = f"EXPLAIN {options} " if options else "EXPLAIN "
+        script.append(f"{explain}{sql};")
         return self.run("\n".join(script) + "\n")
 
 
@@ -246,8 +249,15 @@ def main() -> None:
     for name, sql in queries:
         plan = duckdb.explain(adjust(name, sql), args.threads)
         (args.out / f"{name}.txt").write_text(plan, encoding="utf-8", newline="\n")
+        # The same plan in JSON: DuckDB's JSON tree renderer, a tree of
+        # objects with the `name`, the `children` and the `extra_info` of
+        # every operator (the details of the text plan, a list for the
+        # details of several lines).
+        plan = duckdb.explain(adjust(name, sql), args.threads, "(FORMAT JSON)")
+        json.loads(plan)
+        (args.out / f"{name}.json").write_text(plan, encoding="utf-8", newline="\n")
     # Remove the plans of queries that are no longer in the list.
-    for plan in args.out.glob("*.txt"):
+    for plan in [*args.out.glob("*.txt"), *args.out.glob("*.json")]:
         if plan.stem not in names:
             plan.unlink()
     print(f"Wrote the plans of {len(queries)} queries to {args.out}")

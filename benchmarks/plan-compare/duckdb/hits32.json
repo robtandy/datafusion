@@ -1,0 +1,60 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": [
+                                        "WatchID",
+                                        "ClientIP",
+                                        "IsRefresh",
+                                        "ResolutionWidth"
+                                    ],
+                                    "Estimated Cardinality": "1000000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "WatchID",
+                                "ClientIP",
+                                "IsRefresh",
+                                "ResolutionWidth"
+                            ],
+                            "Estimated Cardinality": "1000000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": [
+                        "#0",
+                        "#1"
+                    ],
+                    "Aggregates": [
+                        "count_star()",
+                        "sum(#2)",
+                        "avg(#3)"
+                    ],
+                    "Estimated Cardinality": "999999"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "10",
+            "Order By": [
+                "c DESC",
+                "WatchID ASC"
+            ],
+            "Estimated Cardinality": "10"
+        }
+    }
+]

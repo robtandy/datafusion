@@ -1,0 +1,43 @@
+[
+    {
+        "name": "ORDER_BY",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "READ_PARQUET",
+                                "children": [],
+                                "extra_info": {
+                                    "Function": "READ_PARQUET",
+                                    "Projections": "AdvEngineID",
+                                    "Filters": "(AdvEngineID != 0)",
+                                    "Estimated Cardinality": "800000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": "AdvEngineID",
+                            "Estimated Cardinality": "800000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": "#0",
+                    "Aggregates": "count_star()",
+                    "Estimated Cardinality": "65537"
+                }
+            }
+        ],
+        "extra_info": {
+            "Order By": [
+                "count_star() DESC",
+                "AdvEngineID ASC"
+            ],
+            "Estimated Cardinality": "800000"
+        }
+    }
+]

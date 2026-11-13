@@ -1,0 +1,151 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 2
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalProjection: expr=[sum(hits.ResolutionWidth)@0 as sum(hits.ResolutionWidth), sum(hits.ResolutionWidth)@0 + count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(1)), sum(hits.ResolutionWidth)@0 + 2 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(2)), sum(hits.ResolutionWidth)@0 + 3 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(3)), sum(hits.ResolutionWidth)@0 + 4 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(4)), sum(hits.ResolutionWidth)@0 + 5 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(5)), sum(hits.ResolutionWidth)@0 + 6 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(6)), sum(hits.ResolutionWidth)@0 + 7 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(7)), sum(hits.ResolutionWidth)@0 + 8 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(8)), sum(hits.ResolutionWidth)@0 + 9 * count(hits.ResolutionWidth)@1 as sum(hits.ResolutionWidth + Int64(9))]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1000000
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[], aggr=[sum(hits.ResolutionWidth), count(hits.ResolutionWidth)]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1000000
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[hits/part-0.parquet:0..5716123], [hits/part-0.parquet:5716123..5723123, hits/part-1.parquet:0..5709123], [hits/part-1.parquet:5709123..5710232, hits/part-10.parquet:0..5710484, hits/part-11.parquet:0..4530], [hits/part-11.parquet:4530..5720653], [hits/part-11.parquet:5720653..5732231, hits/part-12.parquet:0..5704545], ...]}, projection=[CAST(ResolutionWidth@14 AS Int64) as __common_expr_2], file_type=parquet",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 0,
+      "operators": [
+        1
+      ],
+      "sink": 0,
+      "source": 2
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [],
+      "meta_pipeline": 1,
+      "operators": [],
+      "sink": 2,
+      "source": 3
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

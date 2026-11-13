@@ -1,0 +1,933 @@
+{
+  "meta_pipelines": [
+    {
+      "children": [
+        1,
+        5
+      ],
+      "id": 0,
+      "parent": null,
+      "pipelines": [
+        0
+      ],
+      "sink": 0
+    },
+    {
+      "children": [
+        2
+      ],
+      "id": 1,
+      "parent": 0,
+      "pipelines": [
+        1
+      ],
+      "sink": 13
+    },
+    {
+      "children": [
+        3,
+        4
+      ],
+      "id": 2,
+      "parent": 1,
+      "pipelines": [
+        2
+      ],
+      "sink": 15
+    },
+    {
+      "children": [],
+      "id": 3,
+      "parent": 2,
+      "pipelines": [
+        3,
+        4
+      ],
+      "sink": 16
+    },
+    {
+      "children": [],
+      "id": 4,
+      "parent": 2,
+      "pipelines": [
+        5,
+        6
+      ],
+      "sink": 19
+    },
+    {
+      "children": [
+        6
+      ],
+      "id": 5,
+      "parent": 0,
+      "pipelines": [
+        7
+      ],
+      "sink": 2
+    },
+    {
+      "children": [
+        7,
+        8
+      ],
+      "id": 6,
+      "parent": 5,
+      "pipelines": [
+        8
+      ],
+      "sink": 6
+    },
+    {
+      "children": [],
+      "id": 7,
+      "parent": 6,
+      "pipelines": [
+        9,
+        10
+      ],
+      "sink": 7
+    },
+    {
+      "children": [],
+      "id": 8,
+      "parent": 6,
+      "pipelines": [
+        11,
+        12
+      ],
+      "sink": 10
+    }
+  ],
+  "operators": [
+    {
+      "id": 0,
+      "inputs": [
+        1
+      ],
+      "kind": "CollectorSink",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 2443
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "CollectorSink",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "inputs": [
+        2,
+        13
+      ],
+      "kind": "PhysicalScalarSubquery",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "PhysicalScalarSubquery: subqueries=1",
+      "pipelines": []
+    },
+    {
+      "id": 2,
+      "inputs": [
+        3
+      ],
+      "kind": "PhysicalSort",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 2443
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 2443
+        }
+      },
+      "name": "PhysicalSort: expr=[value@1 DESC]",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "source"
+        },
+        {
+          "pipeline": 7,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "inputs": [
+        4
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 2443
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 2443
+        }
+      },
+      "name": "PhysicalProjection: expr=[ps_partkey@0 as ps_partkey, sum(partsupp.ps_supplycost * partsupp.ps_availqty)@1 as value]",
+      "pipelines": [
+        {
+          "pipeline": 7,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "inputs": [
+        5
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 2443
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 2443
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 7,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "inputs": [
+        6
+      ],
+      "kind": "PhysicalFilter",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3513
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 2443
+        }
+      },
+      "name": "PhysicalFilter: CAST(sum(partsupp.ps_supplycost * partsupp.ps_availqty)@1 AS Decimal128(38, 15)) > scalar_subquery(981240.039329000194048)",
+      "pipelines": [
+        {
+          "pipeline": 7,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "inputs": [
+        7
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3760
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3513
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[ps_partkey@0 as ps_partkey], aggr=[sum(partsupp.ps_supplycost * partsupp.ps_availqty)]",
+      "pipelines": [
+        {
+          "pipeline": 7,
+          "role": "source"
+        },
+        {
+          "pipeline": 8,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "inputs": [
+        8,
+        10
+      ],
+      "kind": "PhysicalHashJoin",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3761
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "PhysicalHashJoin: join_type=Inner, on=[(n_nationkey@0, s_nationkey@3)], projection=[ps_partkey@1, ps_availqty@2, ps_supplycost@3]",
+      "pipelines": [
+        {
+          "pipeline": 8,
+          "role": "operator"
+        },
+        {
+          "pipeline": 9,
+          "role": "sink"
+        },
+        {
+          "pipeline": 10,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "inputs": [
+        9
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 9,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[nation/part-0.parquet], [nation/part-1.parquet], [nation/part-10.parquet], [nation/part-11.parquet], [nation/part-12.parquet], ...]}, projection=[n_nationkey, n_name], file_type=parquet, predicate=n_name@1 = GERMANY, pruning_predicate=n_name_null_count@2 != row_count@3 AND n_name_min@0 <= GERMANY AND GERMANY <= n_name_max@1, required_guarantees=[n_name in (GERMANY)], filter=n_name@1 = GERMANY, projection=[n_nationkey@0]",
+      "pipelines": [
+        {
+          "pipeline": 9,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "inputs": [
+        11,
+        12
+      ],
+      "kind": "PhysicalHashJoin",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3807
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "PhysicalHashJoin: join_type=Inner, on=[(s_suppkey@0, ps_suppkey@1)], projection=[ps_partkey@2, ps_availqty@4, ps_supplycost@5, s_nationkey@1]",
+      "pipelines": [
+        {
+          "pipeline": 8,
+          "role": "operator"
+        },
+        {
+          "pipeline": 11,
+          "role": "sink"
+        },
+        {
+          "pipeline": 12,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 47
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[supplier/part-0.parquet], [supplier/part-1.parquet], [supplier/part-10.parquet], [supplier/part-11.parquet], [supplier/part-12.parquet], ...]}, projection=[s_suppkey, s_nationkey], file_type=parquet, predicate=DynamicFilter [ s_nationkey@3 >= 7 AND s_nationkey@3 <= 7 ], dynamic_rg_pruning=eligible, pruning_predicate=s_nationkey_null_count@1 != row_count@2 AND s_nationkey_max@0 >= 7 AND s_nationkey_null_count@1 != row_count@2 AND s_nationkey_min@3 <= 7, required_guarantees=[]",
+      "pipelines": [
+        {
+          "pipeline": 11,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[partsupp/part-0.parquet:0..369704, partsupp/part-1.parquet:0..519], [partsupp/part-1.parquet:519..370194, partsupp/part-10.parquet:0..548], [partsupp/part-10.parquet:548..369645, partsupp/part-11.parquet:0..1126], [partsupp/part-11.parquet:1126..369371, partsupp/part-12.parquet:0..1978], [partsupp/part-12.parquet:1978..371586, partsupp/part-13.parquet:0..615], ...]}, projection=[ps_partkey, ps_suppkey, ps_availqty, ps_supplycost], file_type=parquet, predicate=DynamicFilter [ ps_suppkey@1 >= 8 AND ps_suppkey@1 <= 990 AND ps_suppkey@1 IN (SET) ([8, 43, 53, 55, 58, 67, 113, 126, 160, 165, 174, 179, 187, 189, 220, 241, 296, 298, 307, 324, 364, 376, 388, 423, 479, 517, 552, 584, 638, 658, 659, 679, 709, 715, 718, 742, 747, 749, 764, 779, 789, 940, 948, 961, 962, 985, 990]) ], dynamic_rg_pruning=eligible, pruning_predicate=ps_suppkey_null_count@1 != row_count@2 AND ps_suppkey_max@0 >= 8 AND ps_suppkey_null_count@1 != row_count@2 AND ps_suppkey_min@3 <= 990, required_guarantees=[ps_suppkey in (113, 126, 160, 165, 174, 179, 187, 189, 220, 241, 296, 298, 307, 324, 364, 376, 388, 423, 43, 479, 517, 53, 55, 552, 58, 584, 638, 658, 659, 67, 679, 709, 715, 718, 742, 747, 749, 764, 779, 789, 8, 940, 948, 961, 962, 985, 990)]",
+      "pipelines": [
+        {
+          "pipeline": 8,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "inputs": [
+        14
+      ],
+      "kind": "ScalarSubqueryResult",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 2444
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 2443
+        }
+      },
+      "name": "ScalarSubqueryResult: index=0",
+      "pipelines": [
+        {
+          "pipeline": 0,
+          "role": "operator"
+        },
+        {
+          "pipeline": 1,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "inputs": [
+        15
+      ],
+      "kind": "PhysicalProjection",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalProjection: expr=[CAST(CAST(sum(partsupp.ps_supplycost * partsupp.ps_availqty)@0 AS Float64) * 0.0001 AS Decimal128(38, 15)) as sum(partsupp.ps_supplycost * partsupp.ps_availqty) * Float64(0.0001)]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "inputs": [
+        16
+      ],
+      "kind": "PhysicalHashAggregate",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3760
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "PhysicalHashAggregate: gby=[], aggr=[sum(partsupp.ps_supplycost * partsupp.ps_availqty)]",
+      "pipelines": [
+        {
+          "pipeline": 1,
+          "role": "source"
+        },
+        {
+          "pipeline": 2,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "inputs": [
+        17,
+        19
+      ],
+      "kind": "PhysicalHashJoin",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3761
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "PhysicalHashJoin: join_type=Inner, on=[(n_nationkey@0, s_nationkey@2)], projection=[ps_availqty@1, ps_supplycost@2]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        },
+        {
+          "pipeline": 3,
+          "role": "sink"
+        },
+        {
+          "pipeline": 4,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "inputs": [
+        18
+      ],
+      "kind": "CachingOperator",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 1
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "CachingOperator: threshold=256",
+      "pipelines": [
+        {
+          "pipeline": 3,
+          "role": "operator"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 1
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[nation/part-0.parquet], [nation/part-1.parquet], [nation/part-10.parquet], [nation/part-11.parquet], [nation/part-12.parquet], ...]}, projection=[n_nationkey, n_name], file_type=parquet, predicate=n_name@1 = GERMANY, pruning_predicate=n_name_null_count@2 != row_count@3 AND n_name_min@0 <= GERMANY AND GERMANY <= n_name_max@1, required_guarantees=[n_name in (GERMANY)], filter=n_name@1 = GERMANY, projection=[n_nationkey@0]",
+      "pipelines": [
+        {
+          "pipeline": 3,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "inputs": [
+        20,
+        21
+      ],
+      "kind": "PhysicalHashJoin",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 3807
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "PhysicalHashJoin: join_type=Inner, on=[(s_suppkey@0, ps_suppkey@0)], projection=[ps_availqty@3, ps_supplycost@4, s_nationkey@1]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "operator"
+        },
+        {
+          "pipeline": 5,
+          "role": "sink"
+        },
+        {
+          "pipeline": 6,
+          "role": "sink"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 47
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[supplier/part-0.parquet], [supplier/part-1.parquet], [supplier/part-10.parquet], [supplier/part-11.parquet], [supplier/part-12.parquet], ...]}, projection=[s_suppkey, s_nationkey], file_type=parquet, predicate=DynamicFilter [ s_nationkey@3 >= 7 AND s_nationkey@3 <= 7 ], dynamic_rg_pruning=eligible, pruning_predicate=s_nationkey_null_count@1 != row_count@2 AND s_nationkey_max@0 >= 7 AND s_nationkey_null_count@1 != row_count@2 AND s_nationkey_min@3 <= 7, required_guarantees=[]",
+      "pipelines": [
+        {
+          "pipeline": 5,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "inputs": [],
+      "kind": "ParquetScanSource",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 3760
+        }
+      },
+      "name": "ParquetScanSource: file_groups={16 groups: [[partsupp/part-0.parquet:0..369704, partsupp/part-1.parquet:0..519], [partsupp/part-1.parquet:519..370194, partsupp/part-10.parquet:0..548], [partsupp/part-10.parquet:548..369645, partsupp/part-11.parquet:0..1126], [partsupp/part-11.parquet:1126..369371, partsupp/part-12.parquet:0..1978], [partsupp/part-12.parquet:1978..371586, partsupp/part-13.parquet:0..615], ...]}, projection=[ps_suppkey, ps_availqty, ps_supplycost], file_type=parquet, predicate=DynamicFilter [ ps_suppkey@1 >= 8 AND ps_suppkey@1 <= 990 AND ps_suppkey@1 IN (SET) ([8, 43, 53, 55, 58, 67, 113, 126, 160, 165, 174, 179, 187, 189, 220, 241, 296, 298, 307, 324, 364, 376, 388, 423, 479, 517, 552, 584, 638, 658, 659, 679, 709, 715, 718, 742, 747, 749, 764, 779, 789, 940, 948, 961, 962, 985, 990]) ], dynamic_rg_pruning=eligible, pruning_predicate=ps_suppkey_null_count@1 != row_count@2 AND ps_suppkey_max@0 >= 8 AND ps_suppkey_null_count@1 != row_count@2 AND ps_suppkey_min@3 <= 990, required_guarantees=[ps_suppkey in (113, 126, 160, 165, 174, 179, 187, 189, 220, 241, 296, 298, 307, 324, 364, 376, 388, 423, 43, 479, 517, 53, 55, 552, 58, 584, 638, 658, 659, 67, 679, 709, 715, 718, 742, 747, 749, 764, 779, 789, 8, 940, 948, 961, 962, 985, 990)]",
+      "pipelines": [
+        {
+          "pipeline": 2,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "inputs": [],
+      "kind": "JoinHashTableBuild",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "JoinHashTableBuild",
+      "pipelines": [
+        {
+          "pipeline": 4,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "inputs": [],
+      "kind": "JoinHashTableBuild",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "JoinHashTableBuild",
+      "pipelines": [
+        {
+          "pipeline": 6,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "inputs": [],
+      "kind": "JoinHashTableBuild",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "JoinHashTableBuild",
+      "pipelines": [
+        {
+          "pipeline": 10,
+          "role": "source"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "inputs": [],
+      "kind": "JoinHashTableBuild",
+      "metrics": {
+        "rows_in": {
+          "unit": "rows",
+          "value": 0
+        },
+        "rows_out": {
+          "unit": "rows",
+          "value": 0
+        }
+      },
+      "name": "JoinHashTableBuild",
+      "pipelines": [
+        {
+          "pipeline": 12,
+          "role": "source"
+        }
+      ]
+    }
+  ],
+  "pipelines": [
+    {
+      "dependencies": [],
+      "id": 0,
+      "meta_dependencies": [
+        1,
+        5
+      ],
+      "meta_pipeline": 0,
+      "operators": [
+        13
+      ],
+      "sink": 0,
+      "source": 2
+    },
+    {
+      "dependencies": [],
+      "id": 1,
+      "meta_dependencies": [
+        2
+      ],
+      "meta_pipeline": 1,
+      "operators": [
+        14
+      ],
+      "sink": 13,
+      "source": 15
+    },
+    {
+      "dependencies": [],
+      "id": 2,
+      "meta_dependencies": [
+        3,
+        4
+      ],
+      "meta_pipeline": 2,
+      "operators": [
+        19,
+        16
+      ],
+      "sink": 15,
+      "source": 21
+    },
+    {
+      "dependencies": [],
+      "id": 3,
+      "meta_dependencies": [],
+      "meta_pipeline": 3,
+      "operators": [
+        17
+      ],
+      "sink": 16,
+      "source": 18
+    },
+    {
+      "dependencies": [
+        3
+      ],
+      "id": 4,
+      "meta_dependencies": [],
+      "meta_pipeline": 3,
+      "operators": [],
+      "sink": 16,
+      "source": 22
+    },
+    {
+      "dependencies": [],
+      "id": 5,
+      "meta_dependencies": [
+        3
+      ],
+      "meta_pipeline": 4,
+      "operators": [],
+      "sink": 19,
+      "source": 20
+    },
+    {
+      "dependencies": [
+        5
+      ],
+      "id": 6,
+      "meta_dependencies": [
+        3
+      ],
+      "meta_pipeline": 4,
+      "operators": [],
+      "sink": 19,
+      "source": 23
+    },
+    {
+      "dependencies": [],
+      "id": 7,
+      "meta_dependencies": [
+        6,
+        1
+      ],
+      "meta_pipeline": 5,
+      "operators": [
+        5,
+        4,
+        3
+      ],
+      "sink": 2,
+      "source": 6
+    },
+    {
+      "dependencies": [],
+      "id": 8,
+      "meta_dependencies": [
+        7,
+        8,
+        1
+      ],
+      "meta_pipeline": 6,
+      "operators": [
+        10,
+        7
+      ],
+      "sink": 6,
+      "source": 12
+    },
+    {
+      "dependencies": [],
+      "id": 9,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 7,
+      "operators": [
+        8
+      ],
+      "sink": 7,
+      "source": 9
+    },
+    {
+      "dependencies": [
+        9
+      ],
+      "id": 10,
+      "meta_dependencies": [
+        1
+      ],
+      "meta_pipeline": 7,
+      "operators": [],
+      "sink": 7,
+      "source": 24
+    },
+    {
+      "dependencies": [],
+      "id": 11,
+      "meta_dependencies": [
+        7,
+        1
+      ],
+      "meta_pipeline": 8,
+      "operators": [],
+      "sink": 10,
+      "source": 11
+    },
+    {
+      "dependencies": [
+        11
+      ],
+      "id": 12,
+      "meta_dependencies": [
+        7,
+        1
+      ],
+      "meta_pipeline": 8,
+      "operators": [],
+      "sink": 10,
+      "source": 25
+    }
+  ],
+  "root": 0,
+  "schema": "datafusion-physical-pipeline/profile",
+  "version": 1
+}

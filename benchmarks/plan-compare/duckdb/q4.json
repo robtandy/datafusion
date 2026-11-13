@@ -1,0 +1,85 @@
+[
+    {
+        "name": "ORDER_BY",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "HASH_JOIN",
+                                "children": [
+                                    {
+                                        "name": "PROJECTION",
+                                        "children": [
+                                            {
+                                                "name": "FILTER",
+                                                "children": [
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "l_orderkey",
+                                                                "l_commitdate",
+                                                                "l_receiptdate"
+                                                            ],
+                                                            "Filters": "(l_orderkey IS NOT NULL)",
+                                                            "Estimated Cardinality": "481011"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Expression": "(l_commitdate < l_receiptdate)",
+                                                    "Estimated Cardinality": "96202"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Projections": "#0",
+                                            "Estimated Cardinality": "96202"
+                                        }
+                                    },
+                                    {
+                                        "name": "READ_PARQUET",
+                                        "children": [],
+                                        "extra_info": {
+                                            "Function": "READ_PARQUET",
+                                            "Projections": [
+                                                "o_orderkey",
+                                                "o_orderpriority"
+                                            ],
+                                            "Filters": "((o_orderdate >= '1993-07-01'::DATE) AND (o_orderdate < '1993-10-01'::DATE))",
+                                            "Estimated Cardinality": "30000"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Join Type": "RIGHT_SEMI",
+                                    "Conditions": "o_orderkey = o_orderkey",
+                                    "Estimated Cardinality": "6000"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": "o_orderpriority",
+                            "Estimated Cardinality": "6000"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": "#0",
+                    "Aggregates": "count_star()",
+                    "Estimated Cardinality": "6000"
+                }
+            }
+        ],
+        "extra_info": {
+            "Order By": "o_orderpriority ASC",
+            "Estimated Cardinality": "6000"
+        }
+    }
+]

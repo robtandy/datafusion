@@ -1,0 +1,168 @@
+[
+    {
+        "name": "TOP_N",
+        "children": [
+            {
+                "name": "HASH_GROUP_BY",
+                "children": [
+                    {
+                        "name": "PROJECTION",
+                        "children": [
+                            {
+                                "name": "HASH_JOIN",
+                                "children": [
+                                    {
+                                        "name": "READ_PARQUET",
+                                        "children": [],
+                                        "extra_info": {
+                                            "Function": "READ_PARQUET",
+                                            "Projections": [
+                                                "l_orderkey",
+                                                "l_quantity"
+                                            ],
+                                            "Estimated Cardinality": "601264"
+                                        }
+                                    },
+                                    {
+                                        "name": "HASH_JOIN",
+                                        "children": [
+                                            {
+                                                "name": "HASH_JOIN",
+                                                "children": [
+                                                    {
+                                                        "name": "READ_PARQUET",
+                                                        "children": [],
+                                                        "extra_info": {
+                                                            "Function": "READ_PARQUET",
+                                                            "Projections": [
+                                                                "o_orderkey",
+                                                                "o_custkey",
+                                                                "o_totalprice",
+                                                                "o_orderdate"
+                                                            ],
+                                                            "Filters": "optional: Dynamic Filter (o_totalprice)",
+                                                            "Estimated Cardinality": "150000"
+                                                        }
+                                                    },
+                                                    {
+                                                        "name": "PROJECTION",
+                                                        "children": [
+                                                            {
+                                                                "name": "FILTER",
+                                                                "children": [
+                                                                    {
+                                                                        "name": "HASH_GROUP_BY",
+                                                                        "children": [
+                                                                            {
+                                                                                "name": "PROJECTION",
+                                                                                "children": [
+                                                                                    {
+                                                                                        "name": "READ_PARQUET",
+                                                                                        "children": [],
+                                                                                        "extra_info": {
+                                                                                            "Function": "READ_PARQUET",
+                                                                                            "Projections": [
+                                                                                                "l_orderkey",
+                                                                                                "l_quantity"
+                                                                                            ],
+                                                                                            "Estimated Cardinality": "601264"
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "extra_info": {
+                                                                                    "Projections": [
+                                                                                        "l_orderkey",
+                                                                                        "l_quantity"
+                                                                                    ],
+                                                                                    "Estimated Cardinality": "601264"
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "extra_info": {
+                                                                            "Groups": "#0",
+                                                                            "Aggregates": "sum(#1)",
+                                                                            "Estimated Cardinality": "601264"
+                                                                        }
+                                                                    }
+                                                                ],
+                                                                "extra_info": {
+                                                                    "Expression": "(sum(l_quantity) > 300.00)",
+                                                                    "Estimated Cardinality": "120252"
+                                                                }
+                                                            }
+                                                        ],
+                                                        "extra_info": {
+                                                            "Projections": "#0",
+                                                            "Estimated Cardinality": "120252"
+                                                        }
+                                                    }
+                                                ],
+                                                "extra_info": {
+                                                    "Join Type": "SEMI",
+                                                    "Conditions": "o_orderkey = #0",
+                                                    "Estimated Cardinality": "120252"
+                                                }
+                                            },
+                                            {
+                                                "name": "READ_PARQUET",
+                                                "children": [],
+                                                "extra_info": {
+                                                    "Function": "READ_PARQUET",
+                                                    "Projections": [
+                                                        "c_custkey",
+                                                        "c_name"
+                                                    ],
+                                                    "Estimated Cardinality": "14992"
+                                                }
+                                            }
+                                        ],
+                                        "extra_info": {
+                                            "Join Type": "INNER",
+                                            "Conditions": "o_custkey = c_custkey",
+                                            "Estimated Cardinality": "30000"
+                                        }
+                                    }
+                                ],
+                                "extra_info": {
+                                    "Join Type": "INNER",
+                                    "Conditions": "l_orderkey = o_orderkey",
+                                    "Estimated Cardinality": "120252"
+                                }
+                            }
+                        ],
+                        "extra_info": {
+                            "Projections": [
+                                "c_name",
+                                "c_custkey",
+                                "o_orderkey",
+                                "o_orderdate",
+                                "o_totalprice",
+                                "l_quantity"
+                            ],
+                            "Estimated Cardinality": "120252"
+                        }
+                    }
+                ],
+                "extra_info": {
+                    "Groups": [
+                        "#0",
+                        "#1",
+                        "#2",
+                        "#3",
+                        "#4"
+                    ],
+                    "Aggregates": "sum(#5)",
+                    "Estimated Cardinality": "120252"
+                }
+            }
+        ],
+        "extra_info": {
+            "Top": "100",
+            "Order By": [
+                "o_totalprice DESC",
+                "o_orderdate ASC"
+            ],
+            "Estimated Cardinality": "100"
+        }
+    }
+]
