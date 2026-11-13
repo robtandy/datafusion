@@ -70,10 +70,10 @@ files it would change. None of them is implemented here.
 Both plans are read from their machine-readable form: DuckDB's JSON plan (the
 `name`, `children` and `extra_info` of every operator) and our dump (the
 `kind`, `inputs` and pipelines of every operator, and its description). The
-differ only takes apart the details that both render as text (the lists of
-projections, the conjuncts of filters, the keys of aggregations, joins and
-sorts) and finds the columns that they reference; it never compares their
-formatting. It normalizes both plans into one model, in which
+differ takes apart the details that both render as text (the lists of
+projections, the filters, the keys of aggregations, joins and sorts) into
+their meaning; it never compares their formatting. It normalizes both plans
+into one model, in which
 
 - projections are left out (both engines place them differently and they do not
   change the shape), and so are our `CachingOperator`s (which coalesce small
@@ -93,16 +93,44 @@ formatting. It normalizes both plans into one model, in which
   top-N with an offset, as DuckDB's `TOP_N`.
 
 The fingerprint of a plan has, for every scan, its table, the columns it reads,
-the columns its filters compare with constants (which it can prune row groups
-with) and whether a top-N pushes its dynamic filter into it; every join, by its
-inputs (the join order, whatever the build side), with its operator (hash,
-nested loop, ...), its kind and its build side; every aggregation, by the tables
-of its input and its number of keys; every top-N, sort and limit; and the
-pipeline breaks: the sinks of our pipelines, and the sinks that DuckDB's
+its filters (but those that it only prunes with, such as DuckDB's `optional:`
+filters, and the dynamic filters of joins) and whether a top-N pushes its
+dynamic filter into it; every join, by its inputs (the join order, whatever the
+build side), with its operator (hash, nested loop, ...), its kind and its build
+side; and the location of every aggregation, top-N, sort and limit, and of every
+pipeline break: the sinks of our pipelines, and the sinks that DuckDB's
 operators make (the build side of a join, aggregations, sorts, top-N and shared
 subplans; its `EXPLAIN` does not show its pipelines). Both engines aggregate in
-one operator, partially in every thread and then finally: the placement of an
-aggregation is the tables below it.
+one operator, partially in every thread and then finally.
+
+The filters of a scan are compared by their meaning. Every conjunct is a term:
+an expression (a column, or a function of columns, without casts), an operator
+and its constants (without quotes and casts, numbers canonical, the value of a
+scalar subquery `<subquery>`). The same filter in both dialects is the same
+term: `URL LIKE '%google%'` and DuckDB's `contains(URL, 'google')`,
+`p_name LIKE 'forest%'` and DuckDB's `p_name >= 'forest' AND p_name < 'foresu'`,
+an `OR` of equalities and an `IN` list, a disjunction with or without its common
+conjuncts factored out; an `IN` list of a `MARK` join, whose constants DuckDB
+does not show, is the list of as many constants of our plan. A term of one plan
+is in the other if the terms of the other scan imply it: by bounds, equalities,
+lists and exclusions of one expression, by unions of intervals (`l_quantity`
+between 1 and 30 is `l_quantity` between 1 and 11, 10 and 20 or 20 and 30), and
+by cases over disjunctions. So a missing or changed bound is a finding, a
+derived filter that the other filters imply is not.
+
+The location of an aggregation, a top-N, a sort or a limit is its kind and
+parameters (`agg1`, an aggregation by one key; `top10+100`, the top 10 rows
+after 100), the skeleton of the plan below it and the operators above it. A
+skeleton keeps the structure of a plan only: scans by their table, the other
+placed operators, and blocks of joins as the multiset of their inputs, so that
+the join order (which the joins compare) does not move the operators above or
+below the joins (e.g. `top10(agg1(join[customer, lineitem, orders]))`). A
+pipeline break is its kind at the location of its operator (that of the block
+of joins of a join, once per join), so a breaker below another is in the
+skeleton below the other: two plans with as many breaks of every kind, at
+other places, differ. Through DuckDB's shared subplans, the operators of a
+definition have a location for every reader, as if the plan computed it once
+per reader as ours does; the sharing itself is a finding of its own.
 
 Every difference of the fingerprints is a finding, and the findings of a query
 are grouped by their cause into its divergences: the rules of DuckDB that change
@@ -111,7 +139,11 @@ expressions, decorrelation by the outer keys) explain all the differences of
 that part, and so do the exact statistics that let our planner answer a query
 without scanning; then a join that both plans have but build on different
 inputs is a cost/statistics-driven divergence, and different joins are a
-different join order, a rule gap. Every cause is a rule gap (our optimizer
+different join order, a rule gap; the filters of a scan that the other plan
+does not have are `IS NOT NULL` filters of keys, bounds that follow from
+comparisons of columns, or filters that the other plan does not push into the
+scan; and the aggregations, top-N, sorts and limits at other places are
+placements of their own. Every cause is a rule gap (our optimizer
 lacks a rule that DuckDB has: a planner fix) or cost/statistics-driven (the
 rules agree but the choice differs, through estimates or statistics; also when
 our plan is ahead through statistics that DuckDB does not use). A query
@@ -271,8 +303,9 @@ only: no timing of DuckDB.
 **1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
-- aggregations: the aggregations differ: DuckDB has an aggregation by 1 key of `nation` (2), `part`, `partsupp` (2), `region` (2), `supplier` (2), an aggregation by 1 key of `nation`, `part`, `partsupp`, `region`, `supplier` that ours has not, ours an aggregation by 1 key of `nation`, `partsupp`, `region`, `supplier` that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 2 / 1, join build 9 / 8, shared subplan 1 / 0
+- aggregations: the locations of the aggregations differ: DuckDB has `agg1` over `join[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]` below `join < top100`; `agg1` over `join[nation, part, partsupp, region, supplier]` below `join < agg1 < join < top100`; ours has `agg1` over `join[nation, partsupp, region, supplier]` below `join < top100`
+- top-N and limits: the locations of the top-N, sorts and limits differ: DuckDB has `top100` over `join[agg1(join[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` at the top; ours has `top100` over `join[agg1(join[nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` at the top
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with a top-N at `top100` over `join[agg1(join[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` at the top; a shared subplan at `shared` over `join[nation, part, partsupp, region, supplier]` at the top; 5 join builds at `join` over `[agg1(join[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` below `top100`; 4 join builds at `join` over `[nation, part, partsupp, region, supplier]` below `agg1 < join < agg1 < join < top100`; an aggregation at `agg1` over `join[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]` below `join < top100`; 4 join builds at `join` over `[agg1(join[nation, part, partsupp, region, supplier]), nation, partsupp, region, supplier]` below `agg1 < join < top100`; an aggregation at `agg1` over `join[nation, part, partsupp, region, supplier]` below `join < agg1 < join < top100`, ours with a top-N at `top100` over `join[agg1(join[nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` at the top; 5 join builds at `join` over `[agg1(join[nation, partsupp, region, supplier]), nation, part, partsupp, region, supplier]` below `top100`; an aggregation at `agg1` over `join[nation, partsupp, region, supplier]` below `join < top100`; 3 join builds at `join` over `[nation, partsupp, region, supplier]` below `agg1 < join < top100` (DuckDB / ours: aggregation 2 / 1, join build 9 / 8, shared subplan 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -280,7 +313,7 @@ only: no timing of DuckDB.
 <td>
 
 ```text
-  TOP_N Top: 100; Order By: s_acctbal DESC, n_name ASC, s_name ASC, p_partkey ASC ~0 rows
+* TOP_N Top: 100; Order By: s_acctbal DESC, n_name ASC, s_name ASC, p_partkey ASC ~0 rows
 *   CTE CTE Name: __duckdb_delim_79; Table Index: 79; Execution Mode: PIPELINE_DEPENDENT ~0 rows
       ...
 *     HASH_JOIN Join Type: INNER; Conditions: p_partkey IS NOT DISTINCT FROM p_partkey, ps_supplycost = SUBQUERY ~0 rows
@@ -299,7 +332,7 @@ only: no timing of DuckDB.
 <td>
 
 ```text
-  PhysicalTopK: fetch=100, expr=[s_acctbal@0 DESC, n_name@2 ASC NULLS LAST, s_name@1 ASC NULLS LAST, p_partkey@3 ASC NULLS LAST], dynamic_filter=true (48 rows)
+* PhysicalTopK: fetch=100, expr=[s_acctbal@0 DESC, n_name@2 ASC NULLS LAST, s_name@1 ASC NULLS LAST, p_partkey@3 ASC NULLS LAST], dynamic_filter=true (48 rows)
 *   PhysicalHashJoin: join_type=LeftSemi, on=[(p_partkey@0, ps_partkey@1), (ps_supplycost@7, min(partsupp.ps_supplycost)@0)] (48 rows)
       PhysicalHashJoin: join_type=Inner, on=[(r_regionkey@0, n_regionkey@9)] (66 rows)
         ...
@@ -384,7 +417,7 @@ Likely cost: Both blocks join in the order of the query, `region` last; the dyna
 
 **1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
-- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate`): DuckDB filters `l_orderkey` with `IS NOT NULL`
+- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate`): DuckDB filters `l_orderkey IS NOT NULL`
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -760,7 +793,7 @@ Likely cost: The dynamic filter of `supplier` cuts both `partsupp` scans to 3,76
 
 **1. Constant bounds derived through comparisons of columns** (rule gap, follow-up #118; likely impact: none)
 
-- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_shipdate, l_shipmode`): DuckDB bounds `l_commitdate, l_shipdate` by constants, which our scan compares with other columns only
+- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_shipdate, l_shipmode`): DuckDB bounds `l_commitdate < 1995-01-01`, `l_shipdate < 1995-01-01`, which follow from comparisons of columns of our scan
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -839,8 +872,7 @@ Likely cost: Ours builds on the 7,594 `lineitem` rows of the month, whose dynami
 
 - pipeline breaks: DuckDB computes `revenue0` (`agg(lineitem)`) once, in a shared subplan that it reads twice; ours computes it twice
 - scans: `lineitem` is scanned once in DuckDB, twice in ours
-- aggregations: the aggregations differ: DuckDB has none that ours has not, ours an aggregation by 1 key of `lineitem` that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 2 / 3, shared subplan 1 / 0
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with a shared subplan at `shared` over `agg1(lineitem)` at the top, ours with none (DuckDB / ours: aggregation 2 / 3, shared subplan 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -857,7 +889,7 @@ Likely cost: Ours builds on the 7,594 `lineitem` rows of the month, whose dynami
 *         CTE_SCAN CTE Index: 0 ~120,252 rows
         ...
   scalar subquery:
-*   UNGROUPED_AGGREGATE Aggregates: max(#0) ~1 row
+    UNGROUPED_AGGREGATE Aggregates: max(#0) ~1 row
 *     CTE_SCAN CTE Index: 0 ~120,252 rows
 ```
 
@@ -872,7 +904,7 @@ Likely cost: Ours builds on the 7,594 `lineitem` rows of the month, whose dynami
 *       PhysicalHashAggregate: gby=[l_suppkey@0 as l_suppkey], aggr=[sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)] (1,000 rows)
 *         ParquetScanSource: projection=[l_suppkey, l_extendedprice, l_discount, l_shipdate], predicate=l_shipdate@10 >= 1996-01-01 AND l_shipdate@10 < 1996-04-01 AND DynamicFilter [ l_suppkey@2 >= 1 AND l_suppkey@2 <= 1000 ], filter=l_shipdate@3 >= 1996-01-01 AND l_shipdate@3 < 1996-04-01, projection=[l_suppkey@0, l_extendedprice@1, l_discount@2] (22,996 rows)
   scalar subquery:
-*   PhysicalHashAggregate: gby=[], aggr=[max(revenue0.total_revenue)] (1 row)
+    PhysicalHashAggregate: gby=[], aggr=[max(revenue0.total_revenue)] (1 row)
 *     PhysicalHashAggregate: gby=[l_suppkey@0 as l_suppkey], aggr=[sum(lineitem.l_extendedprice * Int64(1) - lineitem.l_discount)] (1,000 rows)
 *       ParquetScanSource: projection=[l_suppkey, l_extendedprice, l_discount, l_shipdate], predicate=l_shipdate@10 >= 1996-01-01 AND l_shipdate@10 < 1996-04-01, filter=l_shipdate@3 >= 1996-01-01 AND l_shipdate@3 < 1996-04-01, projection=[l_suppkey@0, l_extendedprice@1, l_discount@2] (22,996 rows)
 ```
@@ -890,7 +922,7 @@ Likely cost: Ours scans the 22,996 `lineitem` rows of the quarter and aggregates
 
 **1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
-- scans: the scan of `lineitem` (`l_partkey, l_quantity`): DuckDB filters `l_partkey` with `IS NOT NULL`
+- scans: the scan of `lineitem` (`l_partkey, l_quantity`): DuckDB filters `l_partkey IS NOT NULL`
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -980,8 +1012,9 @@ Likely cost: DuckDB semi-joins `orders` with the `IN` subquery (the orders of mo
 **1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
-- aggregations: the aggregations differ: DuckDB has an aggregation by 2 keys of `lineitem`, `part`, `partsupp`, an aggregation by 2 keys of `part`, `partsupp` that ours has not, ours an aggregation by 2 keys of `lineitem` that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 2 / 1, join build 5 / 4, shared subplan 1 / 0
+- aggregations: the locations of the aggregations differ: DuckDB has `agg2` over `join[agg2(join[part, partsupp]), lineitem]` below `join < sort1`; `agg2` over `join[part, partsupp]` below `join < agg2 < join < sort1`; ours has `agg2` over `lineitem` below `join < sort1`
+- top-N and limits: the locations of the top-N, sorts and limits differ: DuckDB has `sort1` over `join[agg2(join[agg2(join[part, partsupp]), lineitem]), nation, part, partsupp, supplier]` at the top; ours has `sort1` over `join[agg2(lineitem), nation, part, partsupp, supplier]` at the top
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with a sort at `sort1` over `join[agg2(join[agg2(join[part, partsupp]), lineitem]), nation, part, partsupp, supplier]` at the top; 4 join builds at `join` over `[agg2(join[agg2(join[part, partsupp]), lineitem]), nation, part, partsupp, supplier]` below `sort1`; a shared subplan at `shared` over `join[part, partsupp]` at the top; a join build at `join` over `[part, partsupp]` below `agg2 < join < agg2 < join < sort1`; an aggregation at `agg2` over `join[agg2(join[part, partsupp]), lineitem]` below `join < sort1`; a join build at `join` over `[agg2(join[part, partsupp]), lineitem]` below `agg2 < join < sort1`; an aggregation at `agg2` over `join[part, partsupp]` below `join < agg2 < join < sort1`, ours with a sort at `sort1` over `join[agg2(lineitem), nation, part, partsupp, supplier]` at the top; 4 join builds at `join` over `[agg2(lineitem), nation, part, partsupp, supplier]` below `sort1`; an aggregation at `agg2` over `lineitem` below `join < sort1` (DuckDB / ours: aggregation 2 / 1, join build 5 / 4, shared subplan 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -989,7 +1022,7 @@ Likely cost: DuckDB semi-joins `orders` with the `IN` subquery (the orders of mo
 <td>
 
 ```text
-  ORDER_BY Order By: s_name ASC ~37 rows
+* ORDER_BY Order By: s_name ASC ~37 rows
 *   HASH_JOIN Join Type: RIGHT_SEMI; Conditions: #0 = s_suppkey ~37 rows
 *     CTE CTE Name: __duckdb_delim_65; Table Index: 65; Execution Mode: PIPELINE_DEPENDENT ~24,049 rows
         ...
@@ -1008,7 +1041,7 @@ Likely cost: DuckDB semi-joins `orders` with the `IN` subquery (the orders of mo
 <td>
 
 ```text
-  PhysicalSort: expr=[s_name@0 ASC NULLS LAST] (17 rows)
+* PhysicalSort: expr=[s_name@0 ASC NULLS LAST] (17 rows)
 *   PhysicalHashJoin: join_type=LeftSemi, on=[(s_suppkey@0, ps_suppkey@0)] (17 rows)
       PhysicalHashJoin: join_type=Inner, on=[(n_nationkey@0, s_nationkey@3)] (44 rows)
         ...
@@ -1032,8 +1065,8 @@ Likely cost: The dynamic filters restrict our aggregation of `lineitem` to the k
 
 **1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
-- scans: the scan of `lineitem` (`l_orderkey, l_suppkey`): DuckDB filters `l_orderkey, l_suppkey` with `IS NOT NULL`
-- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_suppkey`): DuckDB filters `l_orderkey, l_suppkey` with `IS NOT NULL`
+- scans: the scan of `lineitem` (`l_orderkey, l_suppkey`): DuckDB filters `l_orderkey IS NOT NULL`, `l_suppkey IS NOT NULL`
+- scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_suppkey`): DuckDB filters `l_orderkey IS NOT NULL`, `l_suppkey IS NOT NULL`
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -1130,8 +1163,9 @@ Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 3
 **1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
-- aggregations: the aggregations differ: DuckDB has an aggregation by 1 key of `customer` (2), `orders`, an aggregation by 1 key of `customer` that ours has not, ours an aggregation by 1 key of `customer`, `orders` that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 3 / 2, join build 2 / 1, shared subplan 1 / 0
+- aggregations: the locations of the aggregations differ: DuckDB has `agg1` over `join[agg1(customer), customer, orders]` below `sort1`; `agg1` over `customer` below `join < agg1 < sort1`; ours has `agg1` over `join[customer, orders]` below `sort1`
+- top-N and limits: the locations of the top-N, sorts and limits differ: DuckDB has `sort1` over `agg1(join[agg1(customer), customer, orders])` at the top; ours has `sort1` over `agg1(join[customer, orders])` at the top
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with a sort at `sort1` over `agg1(join[agg1(customer), customer, orders])` at the top; an aggregation at `agg1` over `join[agg1(customer), customer, orders]` below `sort1`; a shared subplan at `shared` over `customer` at the top; 2 join builds at `join` over `[agg1(customer), customer, orders]` below `agg1 < sort1`; an aggregation at `agg1` over `customer` below `join < agg1 < sort1`, ours with a sort at `sort1` over `agg1(join[customer, orders])` at the top; an aggregation at `agg1` over `join[customer, orders]` below `sort1`; a join build at `join` over `[customer, orders]` below `agg1 < sort1` (DuckDB / ours: aggregation 3 / 2, join build 2 / 1, shared subplan 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -1139,7 +1173,7 @@ Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 3
 <td>
 
 ```text
-  ORDER_BY Order By: cntrycode ASC ~299 rows
+* ORDER_BY Order By: cntrycode ASC ~299 rows
 *   HASH_GROUP_BY Groups: #0; Aggregates: count_star(), sum(#1) ~299 rows
 *     CTE CTE Name: __duckdb_delim_49; Table Index: 49; Execution Mode: PIPELINE_DEPENDENT ~299 rows
         ...
@@ -1159,7 +1193,7 @@ Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 3
 <td>
 
 ```text
-  PhysicalSort: expr=[cntrycode@0 ASC NULLS LAST] (7 rows)
+* PhysicalSort: expr=[cntrycode@0 ASC NULLS LAST] (7 rows)
 *   PhysicalHashAggregate: gby=[cntrycode@0 as cntrycode], aggr=[count(Int64(1)), sum(custsale.c_acctbal)] (7 rows)
 *     PhysicalHashJoin: join_type=LeftAnti, on=[(c_custkey@0, o_custkey@0)] (609 rows)
         ParquetScanSource: projection=[c_custkey, c_phone, c_acctbal], predicate=substr(c_phone@4, 1, 2) IN (SET) AND CAST(c_acctbal@5 AS Decimal128(19, 6)) > scalar_subquery(5016.966223), filter=substr(c_phone@1, 1, 2) IN (SET) AND CAST(c_acctbal@2 AS Decimal128(19, 6)) > scalar_subquery(5016.966223) (1,880 rows)
@@ -1183,8 +1217,8 @@ Likely cost: Our anti join builds on the 1,880 customers and probes `orders`, wh
 **1. Aggregation answered from exact statistics** (cost/statistics-driven; likely impact: none)
 
 - scans: `hits` is scanned once in DuckDB, never in ours
-- aggregations: the aggregations differ: DuckDB has an ungrouped aggregation of `hits` that ours has not, ours none that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 1 / 0
+- aggregations: the locations of the aggregations differ: DuckDB has `agg0` over `hits` at the top; ours has none
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with an aggregation at `agg0` over `hits` at the top, ours with none (DuckDB / ours: aggregation 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -1218,8 +1252,8 @@ Likely cost: Our plan reads no file (0.06 ms); DuckDB scans the 1,000,000 rows. 
 **1. Aggregation answered from exact statistics** (cost/statistics-driven; likely impact: none)
 
 - scans: `hits` is scanned once in DuckDB, never in ours
-- aggregations: the aggregations differ: DuckDB has an ungrouped aggregation of `hits` that ours has not, ours none that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): aggregation 1 / 0
+- aggregations: the locations of the aggregations differ: DuckDB has `agg0` over `hits` at the top; ours has none
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with an aggregation at `agg0` over `hits` at the top, ours with none (DuckDB / ours: aggregation 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -1252,11 +1286,11 @@ Likely cost: Our plan answers `min` and `max` from the statistics of the Parquet
 
 **1. Late materialization of top-N** (rule gap, follow-up #113; likely impact: high)
 
-- scans: the scan of `hits` (`AdvEngineID, ClientIP, CounterID, DontCountHits, EventDate, EventTime, IsRefresh, MobilePhone, MobilePhoneModel, RegionID, ResolutionWidth, SearchEngineID, SearchPhrase, Title, URL, UserID, WatchID`): only our top-N pushes its dynamic filter into it (on `EventTime, WatchID`)
+- scans: the scan of `hits` (`EventTime, URL, WatchID`): reads `EventTime, URL, WatchID` in DuckDB, `AdvEngineID, ClientIP, CounterID, DontCountHits, EventDate, EventTime, IsRefresh, MobilePhone, MobilePhoneModel, RegionID, ResolutionWidth, SearchEngineID, SearchPhrase, Title, URL, UserID, WatchID` in ours
 - scans: `hits` is scanned twice in DuckDB, once in ours
 - joins: DuckDB joins the top rows back to a second scan by their row ids (`file_index`, `file_row_number`) to read their other columns
-- top-N and limits: DuckDB has a sort by 2 keys of `hits` that ours has not, ours none that DuckDB has not
-- pipeline breaks: the pipeline breaks differ (DuckDB / ours): join build 1 / 0, sort 1 / 0
+- top-N and limits: the locations of the top-N, sorts and limits differ: DuckDB has `sort2` over `join[hits, top10(hits)]` at the top; `top10` over `hits` below `join < sort2`; ours has `top10` over `hits` at the top
+- pipeline breaks: the pipeline breaks differ: DuckDB blocks with a sort at `sort2` over `join[hits, top10(hits)]` at the top; a join build at `join` over `[hits, top10(hits)]` below `sort2`; a top-N at `top10` over `hits` below `join < sort2`, ours with a top-N at `top10` over `hits` at the top (DuckDB / ours: join build 1 / 0, sort 1 / 0)
 
 <table>
 <tr><th>DuckDB</th><th>ours</th></tr>
@@ -1267,7 +1301,7 @@ Likely cost: Our plan answers `min` and `max` from the statistics of the Parquet
 * ORDER_BY Order By: EventTime ASC, WatchID ASC ~1,000,000 rows
 *   HASH_JOIN Join Type: SEMI; Conditions: file_index = file_index, file_row_number = file_row_number ~1,000,000 rows
 *     READ_PARQUET Projections: WatchID, UserID, CounterID, RegionID, ClientIP, EventTime, EventDate, AdvEngineID, SearchEngineID, SearchPhrase, URL, Title, IsRefresh, DontCountHits, ResolutionWidth, MobilePhone, MobilePhoneModel; Filters: optional: contains(URL, 'google') ~1,000,000 rows
-      TOP_N Top: 10; Order By: EventTime ASC, WatchID ASC ~10 rows
+*     TOP_N Top: 10; Order By: EventTime ASC, WatchID ASC ~10 rows
 *       READ_PARQUET Projections: WatchID, EventTime; Filters: optional: Dynamic Filter (EventTime), contains(URL, 'google') ~200,000 rows
 ```
 
@@ -1275,7 +1309,7 @@ Likely cost: Our plan answers `min` and `max` from the statistics of the Parquet
 <td>
 
 ```text
-  PhysicalTopK: fetch=10, expr=[EventTime@5 ASC NULLS LAST, WatchID@0 ASC NULLS LAST], dynamic_filter=true (10 rows)
+* PhysicalTopK: fetch=10, expr=[EventTime@5 ASC NULLS LAST, WatchID@0 ASC NULLS LAST], dynamic_filter=true (10 rows)
 *   ParquetScanSource: projection=[WatchID, UserID, CounterID, RegionID, ClientIP, EventTime, EventDate, AdvEngineID, SearchEngineID, SearchPhrase, URL, Title, IsRefresh, DontCountHits, ResolutionWidth, MobilePhone, MobilePhoneModel], predicate=URL@10 LIKE %google% AND DynamicFilter [ EventTime@5 < 1372638146 OR EventTime@5 = 1372638146 AND WatchID@0 < 2072021522208071178 ], filter=URL@10 LIKE %google% (33,790 rows)
 ```
 

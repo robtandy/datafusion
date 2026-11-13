@@ -28,6 +28,7 @@ the scripts that reproduce all of it. Plan shapes only: no timings of DuckDB.
 | `dump_plans/`           | a Rust program that plans and runs every query with the pipeline engine and writes `pipeline/` |
 | `differ.py`             | compares the plans and writes `docs/planner-comparison.md`                                     |
 | `test_differ.py`        | the tests of the differ                                                                        |
+| `test_measure.py`       | the tests of `measure.py`                                                                      |
 | `experiments.sql`       | variants of queries with the shape of DuckDB's plans, for the likely costs of the divergences  |
 | `measure.py`            | measures the queries of `experiments.sql` on our engine                                        |
 | `data/`                 | the Parquet files that `materialize.sh` writes (ignored by git, see `benchmarks/.gitignore`)   |
@@ -226,11 +227,19 @@ the `dev` profile writes the plans of the 47 queries in 10 seconds.
 (DuckDB's `duckdb/<query>.json` and our `pipeline/<query>.json`), normalizes
 them into one fingerprint (for every scan the columns it reads and the filters
 pushed into it; the join order, the join operators and their build sides; the
-aggregations and the tables below them; top-N and limits; and the pipeline
-breaks), compares the fingerprints, groups the differences of every query by
-their cause into its divergences, and classifies every divergence as a rule
-gap (our optimizer lacks a rule that DuckDB has) or as cost/statistics-driven
-(the rules agree, the choice differs). It prints the verdict of every query
+locations of the aggregations, top-N, sorts and limits; and the pipeline
+breaks, at the locations of their operators), compares the fingerprints,
+groups the differences of every query by their cause into its divergences, and
+classifies every divergence as a rule gap (our optimizer lacks a rule that
+DuckDB has) or as cost/statistics-driven (the rules agree, the choice differs).
+It compares the filters of the scans by their meaning (normalized terms of an
+expression, an operator and its constants, which the filters of the other scan
+must imply: a missing or changed bound is a divergence, the same filter in the
+other dialect is not), and the placement of operators by their locations (the
+skeleton of the plan below them, with blocks of joins as the multiset of their
+inputs, and the operators above them: an operator or a pipeline break at
+another place is a divergence, also with as many of every kind). See "How the
+plans are compared" in the report. It prints the verdict of every query
 (matches, rule gap or cost/statistics-driven) and the summary of
 `docs/planner-comparison.md`, which it writes with `--report`:
 
@@ -256,13 +265,15 @@ written out with explicit joins, the common table expression of q15
 benchmarks/plan-compare/measure.py
 ```
 
-builds `dump_plans` in the `release` profile and runs it 3 times on 5 rounds
-of all queries of `experiments.sql` (with the PostgreSQL dialect, which parses
-`MATERIALIZED` and plans the benchmark's queries as the default dialect), and
-prints the medians of the elapsed time of every query and of the self time of
-its operators, from their profiles (so with profiling on). These are timings
-of our engine only, on 16 threads; on a busy machine, the differences of less
-than 3% are noise.
+builds `dump_plans` in the `release` profile (and runs the executable that
+cargo reports, wherever its target directory is, e.g. `CARGO_TARGET_DIR`) and
+runs it 6 times on 6 rounds of all queries of `experiments.sql` (with the
+PostgreSQL dialect, which parses `MATERIALIZED` and plans the benchmark's
+queries as the default dialect), and prints the medians (of 36 executions,
+those that the notes quote) of the elapsed time of every query and of the self
+time of its operators, from their profiles (so with profiling on). These are
+timings of our engine only, on 16 threads; on a busy machine, the differences
+of less than 3% are noise.
 
 ## Reproduce from a clean workspace
 
