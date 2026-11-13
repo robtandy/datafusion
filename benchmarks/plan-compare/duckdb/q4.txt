@@ -1,0 +1,34 @@
+╭─ Order By ───────────────────────────────╮
+│ Order By: o_orderpriority ASC            │
+│ ~6,000 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Group By ─────┴────────────────────╮
+│ Groups: #0                               │
+│ Aggregates: count_star()                 │
+│ ~6,000 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Projection ────────┴────────────────────╮
+│ Projections: o_orderpriority             │
+│ ~6,000 rows                              │
+╰─────────────────────┬────────────────────╯
+╭─ Hash Join ─────────┴────────────────────╮
+│ Join Type: RIGHT_SEMI                    │
+│ Conditions: o_orderkey = o_orderkey      │
+│ ~6,000 rows                              │
+╰─────────────────────┬────────────────────╯
+                      ├──────────────────────────────────────────────────────────────╮
+╭─ Projection ────────┴────────────────────╮  ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮
+│ Projections: #0                          │  │ Function: READ_PARQUET                                                     │
+│ ~96,202 rows                             │  │ Projections: o_orderkey, o_orderpriority                                   │
+╰─────────────────────┬────────────────────╯  │ Filters:                                                                   │
+╭─ Filter ────────────┴────────────────────╮  │ (o_orderdate >= '1993-07-01'::DATE) AND (o_orderdate < '1993-10-01'::DATE) │
+│ Expression: l_commitdate < l_receiptdate │  │ ~30,000 rows                                                               │
+│ ~96,202 rows                             │  ╰────────────────────────────────────────────────────────────────────────────╯
+╰─────────────────────┬────────────────────╯
+╭─ Read Parquet ──────┴────────────────────╮
+│ Function: READ_PARQUET                   │
+│ Projections: l_orderkey, l_commitdate,   │
+│              l_receiptdate               │
+│ Filters: l_orderkey IS NOT NULL          │
+│ ~481,011 rows                            │
+╰──────────────────────────────────────────╯

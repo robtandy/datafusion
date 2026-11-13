@@ -1,0 +1,13 @@
+╭─ Ungrouped Aggregate ────────────╮
+│ Aggregates: count_star()         │
+│ ~1 row                           │
+╰─────────────────┬────────────────╯
+╭─ Projection ────┴────────────────╮
+│ Projections: 42                  │
+│ ~200,000 rows                    │
+╰─────────────────┬────────────────╯
+╭─ Read Parquet ──┴────────────────╮
+│ Function: READ_PARQUET           │
+│ Filters: contains(URL, 'google') │
+│ ~200,000 rows                    │
+╰──────────────────────────────────╯

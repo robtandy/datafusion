@@ -1,0 +1,30 @@
+╭─ Top N ─────────────────╮
+│ Top: 10                 │
+│ Order By: u DESC,       │
+│           RegionID ASC  │
+│ ~10 rows                │
+╰────────────┬────────────╯
+╭─ Hash Group By ─────────╮
+│ Groups: #0              │
+│ Aggregates: count(#1)   │
+│ ~999,999 rows           │
+╰────────────┬────────────╯
+╭─ Projection ────────────╮
+│ Projections: #0, #1     │
+│ ~999,999 rows           │
+╰────────────┬────────────╯
+╭─ Hash Group By ─────────╮
+│ Groups: #0, #1          │
+│ ~999,999 rows           │
+╰────────────┬────────────╯
+╭─ Projection ────────────╮
+│ Projections: RegionID,  │
+│              UserID     │
+│ ~1,000,000 rows         │
+╰────────────┬────────────╯
+╭─ Read Parquet ──────────╮
+│ Function: READ_PARQUET  │
+│ Projections: UserID,    │
+│              RegionID   │
+│ ~1,000,000 rows         │
+╰─────────────────────────╯

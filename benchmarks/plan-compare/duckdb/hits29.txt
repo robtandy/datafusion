@@ -1,0 +1,27 @@
+╭─ Projection ──────────────────────────╮
+│ Projections:                          │
+│ #0,                                   │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 1)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 2)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 3)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 4)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 5)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 6)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 7)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 8)), │
+│ "+"(#0, "*"(CAST(#1 AS HUGEINT), 9))  │
+│ ~1 row                                │
+╰───────────────────┬───────────────────╯
+╭─ Ungrouped Aggregate ─────────────────╮
+│ Aggregates: sum(#0), count(#0)        │
+│ ~1 row                                │
+╰───────────────────┬───────────────────╯
+╭─ Projection ──────┴───────────────────╮
+│ Projections: ResolutionWidth          │
+│ ~1,000,000 rows                       │
+╰───────────────────┬───────────────────╯
+╭─ Read Parquet ────┴───────────────────╮
+│ Function: READ_PARQUET                │
+│ Projections: ResolutionWidth          │
+│ ~1,000,000 rows                       │
+╰───────────────────────────────────────╯

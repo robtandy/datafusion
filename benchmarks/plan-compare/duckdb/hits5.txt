@@ -1,0 +1,21 @@
+╭─ Ungrouped Aggregate ─────╮
+│ Aggregates: count(#0)     │
+│ ~1 row                    │
+╰─────────────┬─────────────╯
+╭─ Projection ┴─────────────╮
+│ Projections: #0           │
+│ ~1,000,000 rows           │
+╰─────────────┬─────────────╯
+╭─ Hash Group By ───────────╮
+│ Groups: #0                │
+│ ~1,000,000 rows           │
+╰─────────────┬─────────────╯
+╭─ Projection ┴─────────────╮
+│ Projections: SearchPhrase │
+│ ~1,000,000 rows           │
+╰─────────────┬─────────────╯
+╭─ Read Parquet ────────────╮
+│ Function: READ_PARQUET    │
+│ Projections: SearchPhrase │
+│ ~1,000,000 rows           │
+╰───────────────────────────╯

@@ -1,0 +1,52 @@
+╭─ Order By ─────────────────────────────╮
+│ Order By: revenue DESC                 │
+│ ~0 rows                                │
+╰────────────────────┬───────────────────╯
+╭─ Hash Group By ────┴───────────────────╮
+│ Groups: #0                             │
+│ Aggregates: sum(#1)                    │
+│ ~0 rows                                │
+╰────────────────────┬───────────────────╯
+╭─ Projection ───────┴───────────────────╮
+│ Projections:                           │
+│ n_name,                                │
+│ l_extendedprice * (1.00 - l_discount)  │
+│ ~0 rows                                │
+╰────────────────────┬───────────────────╯
+╭─ Hash Join ────────┴───────────────────╮
+│ Join Type: INNER                       │
+│ Conditions: l_orderkey = o_orderkey,   │
+│             l_suppkey = s_suppkey      │
+│ ~0 rows                                │
+╰────────────────────┬───────────────────╯
+                     ├─────────────────────────────────────────────────────────────╮
+╭─ Read Parquet ─────┴───────────────────╮  ╭─ Hash Join ──────────────────────────┴─────────────────────────────────────╮
+│ Function: READ_PARQUET                 │  │ Join Type: INNER                                                           │
+│ Projections: l_orderkey, l_suppkey,    │  │ Conditions: o_custkey = c_custkey                                          │
+│              l_extendedprice,          │  │ ~0 rows                                                                    │
+│              l_discount                │  ╰──────────────────────────────────────┬─────────────────────────────────────╯
+│ ~601,264 rows                          │                                         ├────────────────────────────────────────────────────────────╮
+╰────────────────────────────────────────╯  ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+                                            │ Function: READ_PARQUET                                                     │  │ Join Type: INNER                      │
+                                            │ Projections: o_orderkey, o_custkey                                         │  │ Conditions: s_nationkey = c_nationkey │
+                                            │ Filters:                                                                   │  │ ~0 rows                               │
+                                            │ (o_orderdate >= '1994-01-01'::DATE) AND (o_orderdate < '1995-01-01'::DATE) │  ╰───────────────────┬───────────────────╯
+                                            │ ~30,000 rows                                                               │                      ├──────────────────────────────────────────╮
+                                            ╰────────────────────────────────────────────────────────────────────────────╯  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+                                                                                                                            │ Function: READ_PARQUET                │  │ Join Type: INNER                      │
+                                                                                                                            │ Projections: s_suppkey, s_nationkey   │  │ Conditions: c_nationkey = n_nationkey │
+                                                                                                                            │ ~992 rows                             │  │ ~0 rows                               │
+                                                                                                                            ╰───────────────────────────────────────╯  ╰───────────────────┬───────────────────╯
+                                                                                                                                                                                           ├──────────────────────────────────────────╮
+                                                                                                                                                                       ╭─ Read Parquet ────┴───────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+                                                                                                                                                                       │ Function: READ_PARQUET                │  │ Join Type: INNER                      │
+                                                                                                                                                                       │ Projections: c_custkey, c_nationkey   │  │ Conditions: n_regionkey = r_regionkey │
+                                                                                                                                                                       │ ~14,992 rows                          │  │ ~0 rows                               │
+                                                                                                                                                                       ╰───────────────────────────────────────╯  ╰───────────────────┬───────────────────╯
+                                                                                                                                                                                                                                      ├────────────────────────────────────╮
+                                                                                                                                                                                                                  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ───────────╮
+                                                                                                                                                                                                                  │ Function: READ_PARQUET                │  │ Function: READ_PARQUET   │
+                                                                                                                                                                                                                  │ Projections: n_nationkey, n_name,     │  │ Projections: r_regionkey │
+                                                                                                                                                                                                                  │              n_regionkey              │  │ Filters: r_name = 'ASIA' │
+                                                                                                                                                                                                                  │ ~16 rows                              │  │ ~0 rows                  │
+                                                                                                                                                                                                                  ╰───────────────────────────────────────╯  ╰──────────────────────────╯
