@@ -49,6 +49,7 @@
 //! | `copied B/row`   | the bytes that the operator allocated per row, net of the harness: every byte it copies (gathered, computed or stored in rows, keys and tables) lands in memory it allocated |
 //! | `in B/row`       | `bytes_in / rows`, see `profiling::chunk_bytes`                                                                                                 |
 //! | `out B/row`      | `bytes_out / rows` (the bytes of the rows a tuple-data collection holds, for tuple-data ingestion)                                              |
+//! | `memory_peak`    | the high-water mark of the memory that the operator reserved                                                                                    |
 //! | `floor B/row`    | the bytes per row that the operator must read and write, whatever its implementation (see `docs/operator-performance.md`)                         |
 //! | `% floor`        | the time it takes to move the floor bytes at the bandwidth of the machine (on as many threads), over the wall time of the operator              |
 //! | `cv %`           | the coefficient of variation of `ns/row` over the timed executions                                                                              |
@@ -64,8 +65,10 @@
 //!
 //! The bandwidth of the machine is measured first, with streaming reads,
 //! writes and copies of buffers far larger than the last-level cache on 1, 4
-//! and 16 threads (every thread its own buffers); the floor uses the fastest
-//! of them.
+//! and 16 threads (every thread its own buffers). The time of the floor is
+//! the largest of three lower bounds: reading the bytes that the operator
+//! must read at the read bandwidth, writing those it must write at the write
+//! bandwidth, and moving both at the bandwidth of the copy.
 //!
 //! # Configuration
 //!
@@ -74,17 +77,18 @@
 //! | `OPERATOR_MICRO_SCALE`       | factor of the input sizes (4Mi rows for most operators)                                             | `1` / `0.01`                      |
 //! | `OPERATOR_MICRO_ITERATIONS`  | timed executions of every configuration                                                             | `5` / `1`                         |
 //! | `OPERATOR_MICRO_THREADS`     | thread counts of the partition sweeps, comma-separated                                              | `1,4,16` (at most the cores)      |
-//! | `OPERATOR_MICRO_FILTER`      | comma-separated substrings: only the configurations whose `operator configuration` contains one run | all                               |
+//! | `OPERATOR_MICRO_FILTER`      | substrings separated by `\|`: only the configurations whose `operator configuration ` contains one run | all                             |
 //! | `OPERATOR_MICRO_SAVE`        | a file to write the results to, as tab-separated values                                             | none                              |
 //! | `OPERATOR_MICRO_COMPARE`     | a file of earlier results (`OPERATOR_MICRO_SAVE`) to compare `ns/row` with                           | none                              |
 //! | `OPERATOR_MICRO_BANDWIDTH_MB`| the MiB of the buffers of the bandwidth measurement                                                 | `512` / `16`                      |
+//! | `OPERATOR_MICRO_COUNT_ALLOCATIONS` | whether to count the allocations (`false` measures what counting them costs)                   | `true`                            |
 //!
 //! To profile a configuration, run the test binary under `perf record` with
 //! a filter, e.g.
 //!
 //! ```text
-//! OPERATOR_MICRO_FILTER="hash_join_probe hit=0.50 build=1M key=i64 " perf record -g -- \
-//!     target/release-nonlto/deps/operator_micro-<hash> operator_micro --nocapture
+//! OPERATOR_MICRO_FILTER="hash_join_probe hit=0.50 build=1M dups=1 key=i64 batch=2048 threads=1 " \
+//!     perf record -g -- target/release-nonlto/deps/operator_micro-<hash> operator_micro --nocapture
 //! ```
 
 use std::collections::HashMap;
@@ -169,7 +173,7 @@ static ALLOCATOR: allocations::Counting = allocations::Counting;
 mod allocations {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     const SHARDS: usize = 64;
 
@@ -190,6 +194,14 @@ mod allocations {
 
     /// The shard of the next thread that allocates.
     static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+    /// Whether the allocations are counted.
+    static COUNTING: AtomicBool = AtomicBool::new(true);
+
+    /// Count the allocations (or not).
+    pub fn set_counting(counting: bool) {
+        COUNTING.store(counting, Ordering::Relaxed);
+    }
 
     thread_local! {
         /// The shard of this thread, `usize::MAX` until it first allocates.
@@ -233,6 +245,9 @@ mod allocations {
 
     #[inline]
     fn record(bytes: usize) {
+        if !COUNTING.load(Ordering::Relaxed) {
+            return;
+        }
         // A `const` thread local without a destructor: accessing it never
         // allocates.
         let shard = SHARD
@@ -317,6 +332,7 @@ struct BenchConfig {
     save: Option<PathBuf>,
     compare: Option<PathBuf>,
     bandwidth_bytes: usize,
+    count_allocations: bool,
 }
 
 impl BenchConfig {
@@ -343,11 +359,13 @@ impl BenchConfig {
                     .collect()
             },
         );
+        // The configurations have commas (`exprs=a+b,c`): the filters are
+        // separated by `|`.
         let filter = std::env::var("OPERATOR_MICRO_FILTER").map_or_else(
             |_| vec![],
             |value| {
                 value
-                    .split(',')
+                    .split('|')
                     .filter(|part| !part.trim().is_empty())
                     .map(str::to_owned)
                     .collect()
@@ -369,6 +387,7 @@ impl BenchConfig {
                 "OPERATOR_MICRO_BANDWIDTH_MB",
                 if optimized { 512 } else { 16 },
             ) << 20,
+            count_allocations: env_or("OPERATOR_MICRO_COUNT_ALLOCATIONS", true),
         }
     }
 }
@@ -635,6 +654,58 @@ fn with_selections(chunks: Vec<DataChunk>, selectivity: f64) -> Result<Vec<DataC
             chunk.with_selection(SelectionVector::from(selected))
         })
         .collect()
+}
+
+/// The bytes of a cache line: an operator that reads some values of a column
+/// reads the lines that hold them.
+const CACHE_LINE: usize = 64;
+
+/// The bytes of the cache lines that hold the values of `width` bytes of the
+/// rows `rows` (in increasing order) of a column, in a buffer of its own.
+fn line_bytes(rows: impl IntoIterator<Item = usize>, width: usize) -> usize {
+    let mut lines = 0;
+    let mut last = None;
+    for row in rows {
+        let line = row * width / CACHE_LINE;
+        if last != Some(line) {
+            lines += 1;
+            last = Some(line);
+        }
+    }
+    lines * CACHE_LINE
+}
+
+/// The bytes of the cache lines that hold the (selected) values of the
+/// fixed-width columns `columns` of `chunks`, of `width` bytes each.
+fn selected_line_bytes(chunks: &[DataChunk], columns: usize, width: usize) -> f64 {
+    let bytes = chunks
+        .iter()
+        .map(|chunk| match chunk.selection() {
+            Some(selection) => line_bytes(selection.iter(), width),
+            None => chunk.len() * width,
+        })
+        .sum::<usize>();
+    (bytes * columns) as f64
+}
+
+/// The bytes of the cache lines that hold the (selected) values of `chunk`,
+/// of the types of the synthetic data (whose strings are of 16 bytes,
+/// stored in the order of their rows).
+fn read_line_bytes(chunk: &DataChunk) -> f64 {
+    let Some(selection) = chunk.selection() else {
+        return chunk_bytes(chunk) as f64;
+    };
+    let bytes = chunk
+        .columns()
+        .iter()
+        .map(|column| match column.data_type() {
+            DataType::Utf8View => 2 * line_bytes(selection.iter(), 16),
+            data_type => {
+                line_bytes(selection.iter(), data_type.primitive_width().unwrap_or(8))
+            }
+        })
+        .sum::<usize>();
+    bytes as f64
 }
 
 /// The bytes of `columns` per row (see `profiling::array_bytes`).
@@ -1518,6 +1589,7 @@ fn projection(bench: &mut Bench) -> Result<()> {
             task_ctx: None,
         };
         let computed = params.exprs.computed();
+        let read_bytes = selected_line_bytes(&source.chunks, 2, 8);
         bench.measure(
             &case,
             |collect| {
@@ -1529,14 +1601,11 @@ fn projection(bench: &mut Bench) -> Result<()> {
                     collect,
                 ))
             },
-            // The computed columns read `a` and `b` and write a column each;
-            // the columns are passed through.
+            // The computed columns read (the lines of the selected values
+            // of) `a` and `b` and write a column each; the columns are passed
+            // through.
             |_| Floor {
-                read: if computed > 0 {
-                    16.0 * logical_rows as f64
-                } else {
-                    0.0
-                },
+                read: if computed > 0 { read_bytes } else { 0.0 },
                 write: 8.0 * (computed * logical_rows) as f64,
             },
             |output| expect_rows(output, logical_rows),
@@ -1668,11 +1737,19 @@ fn filter(bench: &mut Bench) -> Result<()> {
                         &schema,
                     )?
                 };
-                (predicate, selected, selected)
+                (predicate, 0.0, selected)
             }
             Predicate::Conjunction => {
                 let x = threshold(params.selectivity.sqrt());
-                let passing_a = a.iter().filter(|&&a| a < x).count() as u64;
+                // The second conjunct reads the lines of `b` of the rows that
+                // pass the first one, in every chunk.
+                let passing_a = a
+                    .chunks(params.batch)
+                    .map(|chunk| {
+                        let rows = chunk.iter().enumerate().filter(|&(_, &a)| a < x);
+                        line_bytes(rows.map(|(row, _)| row), 8)
+                    })
+                    .sum::<usize>() as f64;
                 let selected =
                     a.iter().zip(&b).filter(|&(&a, &b)| a < x && b < x).count() as u64;
                 let conjunct = |name: &str| {
@@ -1712,7 +1789,7 @@ fn filter(bench: &mut Bench) -> Result<()> {
             |output_rows| Floor {
                 read: match params.predicate {
                     Predicate::I64 => 8.0 * rows,
-                    Predicate::Conjunction => 8.0 * (rows + passing_a as f64),
+                    Predicate::Conjunction => 8.0 * rows + passing_a,
                     Predicate::Utf8 => s_bytes * rows,
                 },
                 write: 4.0 * output_rows as f64,
@@ -2869,9 +2946,10 @@ fn tuple_data(bench: &mut Bench) -> Result<()> {
                 });
             }
         }
-        // The ingestion reads the values of the rows and writes them once.
+        // The ingestion reads (the lines of) the values of the rows and
+        // writes them once.
         let floor = Floor {
-            read: bytes_in as f64,
+            read: chunks.iter().map(read_line_bytes).sum(),
             write: bytes_in as f64,
         };
         bench.record(&case, &samples, floor);
@@ -3231,10 +3309,15 @@ fn report(bench: &Bench) -> String {
     let config = &bench.config;
     let _ = writeln!(
         out,
-        "\noperator_micro: scale {}, {} timed executions per configuration, {} cores",
+        "\noperator_micro: scale {}, {} timed executions per configuration, {} cores{}",
         config.scale,
         config.iterations,
-        std::thread::available_parallelism().map_or(0, |n| n.get())
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+        if config.count_allocations {
+            ""
+        } else {
+            ", allocations not counted"
+        }
     );
     let _ = writeln!(
         out,
@@ -3294,6 +3377,10 @@ fn report(bench: &Bench) -> String {
             .join(" | ")
     );
     for row in &rows {
+        // The configurations have characters that Markdown interprets
+        // (`a*b`, `a<x&b<y`).
+        let mut row = row.clone();
+        row[1] = format!("`{}`", row[1]);
         let _ = writeln!(out, "| {} |", row.join(" | "));
     }
     out
@@ -3382,6 +3469,7 @@ fn print_uncaptured(text: &str) -> Result<()> {
 #[test]
 fn operator_micro() -> Result<()> {
     let config = BenchConfig::from_env();
+    allocations::set_counting(config.count_allocations);
     let mut bench = Bench::try_new(config)?;
     bench.measure_bandwidths();
     projection(&mut bench)?;
