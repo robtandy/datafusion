@@ -19,7 +19,7 @@ DuckDB, no `EXPLAIN ANALYZE`.
   `5d254ad870763a9724af68b937ebf4e1440ad040` (`PRAGMA version`: `v2.1.0-dev93719`, DuckDB 2), built
   and captured as `benchmarks/plan-compare/README.md` describes. Its plans are
   `benchmarks/plan-compare/duckdb/<query>.json` (`EXPLAIN (FORMAT JSON)`).
-- **Ours**: the plans of `datafusion/new_ex` at `29c9d0687`, as the
+- **Ours**: the plans of `datafusion/new_ex` at `c1d4a6f6e`, as the
   benchmark's sessions plan them (16 target partitions, trusting DataFusion's
   built-in functions), from the dump of the profile of their execution
   (`docs/profiling.md` of the crate): `benchmarks/plan-compare/pipeline/<query>.json`.
@@ -36,18 +36,20 @@ The notes on what every divergence likely costs are the `NOTES` of the differ.
 
 Of the 47 queries, 28 match DuckDB's plan shape, 16 diverge through a rule gap and 3 only through cost or statistics.
 
+Only 4 divergences likely cost something on these queries, measured on our engine: q15 (common table expressions computed once per reference: high), q18 (join order: low), q21 (join order: medium), hits23 (late materialization of top-N: high). The other divergences cost nothing measurable here, or our plan is ahead.
+
 The divergences, the most common first (a query may have several):
 
 | Divergence                                             | Classification         | Queries | Which                                  | Likely impact           | Follow-up |
 | ------------------------------------------------------ | ---------------------- | ------: | -------------------------------------- | ----------------------- | --------- |
-| Join order                                             | rule gap               |       9 | q2, q5, q7, q8, q9, q10, q11, q18, q21 | 1 medium, 1 low, 7 none | -         |
-| Correlated subqueries decorrelated by their outer keys | rule gap               |       3 | q2, q20, q22                           | 3 none                  | -         |
-| `IS NOT NULL` filters of join keys                     | rule gap               |       3 | q4, q17, q21                           | 3 none                  | -         |
+| Join order                                             | rule gap               |       9 | q2, q5, q7, q8, q9, q10, q11, q18, q21 | 1 medium, 1 low, 7 none | #115      |
+| Correlated subqueries decorrelated by their outer keys | rule gap               |       3 | q2, q20, q22                           | 3 none                  | #116      |
+| `IS NOT NULL` filters of join keys                     | rule gap               |       3 | q4, q17, q21                           | 3 none                  | #117      |
 | Aggregation answered from exact statistics             | cost/statistics-driven |       2 | hits0, hits6                           | 2 none                  | -         |
-| Common table expressions computed once per reference   | rule gap               |       1 | q15                                    | 1 high                  | -         |
-| Late materialization of top-N                          | rule gap               |       1 | hits23                                 | 1 high                  | -         |
+| Common table expressions computed once per reference   | rule gap               |       1 | q15                                    | 1 high                  | #114      |
+| Late materialization of top-N                          | rule gap               |       1 | hits23                                 | 1 high                  | #113      |
 | Build side of a join                                   | cost/statistics-driven |       1 | q14                                    | 1 none                  | -         |
-| Constant bounds derived through comparisons of columns | rule gap               |       1 | q12                                    | 1 none                  | -         |
+| Constant bounds derived through comparisons of columns | rule gap               |       1 | q12                                    | 1 none                  | #118      |
 
 ## Follow-up issues
 
@@ -56,12 +58,12 @@ impact on one of their queries first, then the time that DuckDB's shape saves on
 our engine), each filed as an issue that names the queries it costs and the
 files it would change. None of them is implemented here.
 
-1. **Late materialization of top-N**: costs hits23 (impact on hits23: 1 high); would change `datafusion/physical-pipeline/src/planner.rs` (the lowering of a TopK over a Parquet scan) and `datafusion/physical-pipeline/src/sources/parquet.rs` (row ids, and a scan of given rows).
-2. **Common table expressions computed once per reference**: costs q15 (impact on q15: 1 high); would change `datafusion/sql/src/cte.rs` (plan a common table expression that the query reads more than once as a `MaterializedCte`, which the pipeline engine lowers natively).
-3. **Join order**: costs q10, q21 (impact on q2, q5, q7, q8, q9, q10, q11, q18, q21: 1 medium, 1 low, 7 none); would change `datafusion/physical-optimizer/src/` (a new join reordering rule next to `join_selection.rs`, whose statistics it would use, registered in `datafusion/physical-optimizer/src/optimizer.rs`).
-4. **Correlated subqueries decorrelated by their outer keys**: costs none of the queries (impact on q2, q20, q22: 3 none); would change `datafusion/optimizer/src/scalar_subquery_to_join.rs`, `datafusion/optimizer/src/decorrelate_predicate_subquery.rs` and `datafusion/optimizer/src/decorrelate.rs`.
-5. **`IS NOT NULL` filters of join keys**: costs none of the queries (impact on q4, q17, q21: 3 none); would change `datafusion/optimizer/src/filter_null_join_keys.rs` (or the defaults of the sessions of the pipeline engine).
-6. **Constant bounds derived through comparisons of columns**: costs none of the queries (impact on q12: 1 none); would change `datafusion/optimizer/src/push_down_filter.rs` (or a rule of `datafusion/optimizer/src/simplify_expressions/`).
+1. #113: **Late materialization of top-N**: costs hits23 (impact on hits23: 1 high); would change `datafusion/physical-pipeline/src/planner.rs` (the lowering of a TopK over a Parquet scan) and `datafusion/physical-pipeline/src/sources/parquet.rs` (row ids, and a scan of given rows).
+2. #114: **Common table expressions computed once per reference**: costs q15 (impact on q15: 1 high); would change `datafusion/sql/src/cte.rs` (plan a common table expression that the query reads more than once as a `MaterializedCte`, which the pipeline engine lowers natively).
+3. #115: **Join order**: costs q18, q21 (impact on q2, q5, q7, q8, q9, q10, q11, q18, q21: 1 medium, 1 low, 7 none); would change `datafusion/physical-optimizer/src/` (a new join reordering rule next to `join_selection.rs`, whose statistics it would use, registered in `datafusion/physical-optimizer/src/optimizer.rs`).
+4. #116: **Correlated subqueries decorrelated by their outer keys**: costs none of the queries (impact on q2, q20, q22: 3 none); would change `datafusion/optimizer/src/scalar_subquery_to_join.rs`, `datafusion/optimizer/src/decorrelate_predicate_subquery.rs` and `datafusion/optimizer/src/decorrelate.rs`.
+5. #117: **`IS NOT NULL` filters of join keys**: costs none of the queries (impact on q4, q17, q21: 3 none); would change `datafusion/optimizer/src/filter_null_join_keys.rs` (or the defaults of the sessions of the pipeline engine).
+6. #118: **Constant bounds derived through comparisons of columns**: costs none of the queries (impact on q12: 1 none); would change `datafusion/optimizer/src/push_down_filter.rs` (or a rule of `datafusion/optimizer/src/simplify_expressions/`).
 
 ## How the plans are compared
 
@@ -116,29 +118,46 @@ our plan is ahead through statistics that DuckDB does not use). A query
 matches if its fingerprints do, is a rule gap if one of its divergences is, and
 is cost/statistics-driven otherwise.
 
+### Likely costs
+
+What a divergence likely costs is measured on our engine, where SQL can give
+the query the shape of DuckDB's plan: `benchmarks/plan-compare/experiments.sql`
+has DuckDB's join orders written out with explicit joins, the common table
+expression of q15 `MATERIALIZED` (which DataFusion plans as a
+`MaterializedCteExec`, which our engine executes natively), and the top-N of
+hits23 over its sort keys only (what DuckDB's first scan reads, an upper bound
+of what late materialization saves). `benchmarks/plan-compare/measure.py` runs
+them with the benchmark's queries on our engine (an optimized build of
+`dump_plans`, 16 threads, profiling on) and the notes quote the medians of 36
+executions of every query. The impact of a divergence is high if DuckDB's
+shape is at least 25% faster, medium at 10-25%, low at 3-10%, and none below 3%
+(the noise of these measurements), if it is slower, if the divergence removes
+no row on this data, or if our plan is ahead. These are timings of our engine
+only: no timing of DuckDB.
+
 ### The causes
 
-- **Common table expressions computed once per reference** (rule gap)
+- **Common table expressions computed once per reference** (rule gap, #114)
   - DuckDB: Its `CTEInlining` (`src/optimizer/cte_inlining.cpp`) keeps a common table expression that the query reads more than once and that ends in an aggregation as one shared subplan (`CTE`, `CTE_SCAN`), which it computes once and materializes or streams to its readers.
   - Ours: DataFusion inlines every common table expression that is not `MATERIALIZED`, so the plan computes it once per reference.
   - A fix would change `datafusion/sql/src/cte.rs` (plan a common table expression that the query reads more than once as a `MaterializedCte`, which the pipeline engine lowers natively).
-- **Constant bounds derived through comparisons of columns** (rule gap)
+- **Constant bounds derived through comparisons of columns** (rule gap, #118)
   - DuckDB: Its `FilterCombiner` (`src/optimizer/filter_combiner.cpp`) derives constant bounds through chains of comparisons of columns (`a < b AND b < c AND c < k` implies `a < k` and `b < k`), which its scans prune with.
   - Ours: DataFusion pushes the comparisons as they are: the scan prunes with the bounds of the query only.
   - A fix would change `datafusion/optimizer/src/push_down_filter.rs` (or a rule of `datafusion/optimizer/src/simplify_expressions/`).
-- **Correlated subqueries decorrelated by their outer keys** (rule gap)
+- **Correlated subqueries decorrelated by their outer keys** (rule gap, #116)
   - DuckDB: It decorrelates a correlated subquery with a duplicate-eliminated join (`src/planner/subquery/flatten_dependent_join.cpp`, then `Deliminator`): it computes the outer rows once (a shared subplan `__duckdb_delim_<n>`), evaluates the subquery only for their distinct correlation keys, and joins its result back.
   - Ours: DataFusion decorrelates the subquery into a join with an aggregation of the subquery over all of its rows (`ScalarSubqueryToJoin`, `DecorrelatePredicateSubquery`); the dynamic filters of our hash joins then restrict the scans of the subquery to the outer keys at run time.
   - A fix would change `datafusion/optimizer/src/scalar_subquery_to_join.rs`, `datafusion/optimizer/src/decorrelate_predicate_subquery.rs` and `datafusion/optimizer/src/decorrelate.rs`.
-- **Join order** (rule gap)
+- **Join order** (rule gap, #115)
   - DuckDB: Its join order optimizer (`src/optimizer/join_order/`) enumerates the join orders of every block of inner, semi and anti joins (DPhyp) and picks the cheapest by its cardinality estimates, bushy trees included.
   - Ours: DataFusion has no join reordering: the joins of a query are planned in the order of its `FROM` clause and of its subqueries (`EliminateCrossJoin` and `PushDownFilter` turn the cross joins of the `FROM` clause into inner joins in that order, the decorrelated subqueries are joined last), and `JoinSelection` only chooses the build side of every join.
   - A fix would change `datafusion/physical-optimizer/src/` (a new join reordering rule next to `join_selection.rs`, whose statistics it would use, registered in `datafusion/physical-optimizer/src/optimizer.rs`).
-- **Late materialization of top-N** (rule gap)
+- **Late materialization of top-N** (rule gap, #113)
   - DuckDB: Its `LateMaterialization` (`src/optimizer/late_materialization.cpp`) plans a top-N over a scan of many columns as a top-N over the sort keys and the row ids (`file_index`, `file_row_number`), and a second scan that reads the other columns of the top rows only (a semi join on the row ids).
   - Ours: Our TopK reads every column of every row that passes the filters of its scan (its dynamic filter skips rows, but only once it has its first rows).
   - A fix would change `datafusion/physical-pipeline/src/planner.rs` (the lowering of a TopK over a Parquet scan) and `datafusion/physical-pipeline/src/sources/parquet.rs` (row ids, and a scan of given rows).
-- **`IS NOT NULL` filters of join keys** (rule gap)
+- **`IS NOT NULL` filters of join keys** (rule gap, #117)
   - DuckDB: Its filter pushdown (`src/optimizer/pushdown/`) adds an `IS NOT NULL` filter of every nullable key of an inner or a semi join, and of the correlation keys of a decorrelated subquery, and pushes it into the scans.
   - Ours: DataFusion's `FilterNullJoinKeys` (`datafusion/optimizer/src/filter_null_join_keys.rs`) does so only when `datafusion.optimizer.filter_null_join_keys` is on, which it is not by default; the hash joins skip the rows of null keys themselves.
   - A fix would change `datafusion/optimizer/src/filter_null_join_keys.rs` (or the defaults of the sessions of the pipeline engine).
@@ -249,7 +268,7 @@ is cost/statistics-driven otherwise.
 - DuckDB: 9 scans; 9 hash joins; 2 aggregations; 1 top-N; pipeline breaks: 2 aggregations, 9 join builds, 1 shared subplan, 1 top-N.
 - Ours: 9 scans; 8 hash joins; 1 aggregation; 1 top-N; pipeline breaks: 1 aggregation, 8 join builds, 1 top-N.
 
-**1. Correlated subqueries decorrelated by their outer keys** (rule gap; likely impact: none)
+**1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
 - aggregations: the aggregations differ: DuckDB has an aggregation by 1 key of `nation` (2), `part`, `partsupp` (2), `region` (2), `supplier` (2), an aggregation by 1 key of `nation`, `part`, `partsupp`, `region`, `supplier` that ours has not, ours an aggregation by 1 key of `nation`, `partsupp`, `region`, `supplier` that DuckDB has not
@@ -270,7 +289,7 @@ is cost/statistics-driven otherwise.
 *         HASH_JOIN Join Type: INNER; Conditions: ps_suppkey = s_suppkey ~0 rows
 *           HASH_JOIN Join Type: SEMI; Conditions: ps_partkey = p_partkey ~0 rows
               READ_PARQUET Projections: ps_partkey, ps_suppkey, ps_supplycost ~80,000 rows
-*             HASH_GROUP_BY Groups: #0; Aggregates:  ~0 rows
+*             HASH_GROUP_BY Groups: #0 ~0 rows
                 ...
             HASH_JOIN Join Type: INNER; Conditions: s_nationkey = n_nationkey ~0 rows
               ...
@@ -294,7 +313,7 @@ is cost/statistics-driven otherwise.
 
 Likely cost: Our dynamic join filters already restrict the subquery to the part keys of the outer rows: its `partsupp` scan returns 66 of 80,000 rows. Both plans scan the four tables of the subquery once more: nothing to gain.
 
-**2. Join order** (rule gap; likely impact: none)
+**2. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order of the rest of the query differs: DuckDB joins `((((nation ⋈ region) ⋈ supplier) ⋈ partsupp) ⋈ part)`, `(((nation ⋈ region) ⋈ supplier) ⋈ partsupp)`, `((nation ⋈ region) ⋈ supplier)`, `(nation ⋈ region)`, `((nation ⋈ region) ⋈ supplier)`, `(nation ⋈ region)`; ours joins `((((part ⋈ partsupp) ⋈ supplier) ⋈ nation) ⋈ region)`, `(((part ⋈ partsupp) ⋈ supplier) ⋈ nation)`, `((part ⋈ partsupp) ⋈ supplier)`, `(part ⋈ partsupp)`, `(((partsupp ⋈ supplier) ⋈ nation) ⋈ region)`, `((partsupp ⋈ supplier) ⋈ nation)`, `(partsupp ⋈ supplier)`
 
@@ -356,14 +375,14 @@ Likely cost: Our dynamic join filters already restrict the subquery to the part 
 </tr>
 </table>
 
-Likely cost: Both blocks join in the order of the query, `region` last; the dynamic filters reduce every probe side to at most 207 rows. With DuckDB's join order written out, our engine runs q2 in 13.80 ms instead of 13.82 ms.
+Likely cost: Both blocks join in the order of the query, `region` last; the dynamic filters reduce every probe side to at most 207 rows. With DuckDB's join order written out, our engine runs q2 in 13.65 ms instead of 13.91 ms (2%, within the noise).
 
 ### q4: rule gap
 
 - DuckDB: 2 scans; 1 hash join; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 1 join build, 1 sort.
 - Ours: 2 scans; 1 hash join; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 1 join build, 1 sort.
 
-**1. `IS NOT NULL` filters of join keys** (rule gap; likely impact: none)
+**1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
 - scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate`): DuckDB filters `l_orderkey` with `IS NOT NULL`
 
@@ -403,7 +422,7 @@ Likely cost: `l_orderkey` has no nulls: the filter removes no row (and the hash 
 - DuckDB: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 - Ours: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `(((((nation ⋈ region) ⋈ customer) ⋈ supplier) ⋈ orders) ⋈ lineitem)`, `((((nation ⋈ region) ⋈ customer) ⋈ supplier) ⋈ orders)`, `(((nation ⋈ region) ⋈ customer) ⋈ supplier)`, `((nation ⋈ region) ⋈ customer)`, `(nation ⋈ region)`; ours joins `(((((customer ⋈ orders) ⋈ lineitem) ⋈ supplier) ⋈ nation) ⋈ region)`, `((((customer ⋈ orders) ⋈ lineitem) ⋈ supplier) ⋈ nation)`, `(((customer ⋈ orders) ⋈ lineitem) ⋈ supplier)`, `((customer ⋈ orders) ⋈ lineitem)`, `(customer ⋈ orders)`
 
@@ -440,25 +459,25 @@ Likely cost: `l_orderkey` has no nulls: the filter removes no row (and the hash 
           ParquetScanSource: projection=[n_nationkey, n_name, n_regionkey], predicate=DynamicFilter [ n_regionkey@2 >= 2 AND n_regionkey@2 <= 2 ] (5 rows)
 *         PhysicalHashJoin: join_type=Inner, on=[(s_suppkey@0, l_suppkey@1), (s_nationkey@1, c_nationkey@0)] (656 rows)
             ParquetScanSource: projection=[s_suppkey, s_nationkey], predicate=DynamicFilter [ s_nationkey@3 >= 8 AND s_nationkey@3 <= 21 AND s_nationkey@3 IN (SET) ] (202 rows)
-*           PhysicalHashJoin: join_type=Inner, on=[(o_orderkey@1, l_orderkey@0)] (16,281 rows)
+*           PhysicalHashJoin: join_type=Inner, on=[(o_orderkey@1, l_orderkey@0)] (16,347 rows)
 *             PhysicalHashJoin: join_type=Inner, on=[(c_custkey@0, o_custkey@1)] (4,081 rows)
                 ParquetScanSource: projection=[c_custkey, c_nationkey], predicate=DynamicFilter [ c_nationkey@3 >= 8 AND c_nationkey@3 <= 21 AND c_nationkey@3 IN (SET) ] AND DynamicFilter [ c_nationkey@3 >= 8 AND c_nationkey@3 <= 21 ] (3,031 rows)
                 ParquetScanSource: projection=[o_orderkey, o_custkey, o_orderdate], predicate=o_orderdate@4 >= 1994-01-01 AND o_orderdate@4 < 1995-01-01 AND DynamicFilter [ o_custkey@1 >= 16 AND o_custkey@1 <= 15000 AND hash_lookup(o_custkey@1) ], filter=o_orderdate@2 >= 1994-01-01 AND o_orderdate@2 < 1995-01-01, projection=[o_orderkey@0, o_custkey@1] (4,081 rows)
-              ParquetScanSource: projection=[l_orderkey, l_suppkey, l_extendedprice, l_discount], predicate=DynamicFilter [ l_orderkey@0 >= 66 AND l_orderkey@0 <= 599976 AND hash_lookup(l_orderkey@0) ] AND DynamicFilter [ l_suppkey@2 >= 9 AND l_suppkey@2 <= 995 ] (16,281 rows)
+              ParquetScanSource: projection=[l_orderkey, l_suppkey, l_extendedprice, l_discount], predicate=DynamicFilter [ l_orderkey@0 >= 66 AND l_orderkey@0 <= 599976 AND hash_lookup(l_orderkey@0) ] AND DynamicFilter [ l_suppkey@2 >= 9 AND l_suppkey@2 <= 995 ] (16,347 rows)
 ```
 
 </td>
 </tr>
 </table>
 
-Likely cost: Our order builds on the 3,031 customers and the 4,081 orders that the dynamic filters let through and probes 16,281 `lineitem` rows; DuckDB's probes all of `lineitem` against the joins of the five other tables. With DuckDB's join order written out, our engine is slower: 14.14 ms instead of 12.85 ms.
+Likely cost: Our order builds on the 3,031 customers and the 4,081 orders that the dynamic filters let through and probes about 16,300 `lineitem` rows; DuckDB's probes all of `lineitem` against the joins of the five other tables. With DuckDB's join order written out, our engine is slower: 13.56 ms instead of 12.85 ms.
 
 ### q7: rule gap
 
 - DuckDB: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 - Ours: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `((((nation ⋈ supplier) ⋈ lineitem) ⋈ orders) ⋈ (customer ⋈ nation))`, `(((nation ⋈ supplier) ⋈ lineitem) ⋈ orders)`, `((nation ⋈ supplier) ⋈ lineitem)`, `(nation ⋈ supplier)`, `(customer ⋈ nation)`; ours joins `(((((lineitem ⋈ supplier) ⋈ orders) ⋈ customer) ⋈ nation) ⋈ nation)`, `((((lineitem ⋈ supplier) ⋈ orders) ⋈ customer) ⋈ nation)`, `(((lineitem ⋈ supplier) ⋈ orders) ⋈ customer)`, `((lineitem ⋈ supplier) ⋈ orders)`, `(lineitem ⋈ supplier)`
 
@@ -508,14 +527,14 @@ Likely cost: Our order builds on the 3,031 customers and the 4,081 orders that t
 </tr>
 </table>
 
-Likely cost: The dynamic filters cut every probe side (11,043 `orders` rows, 1,216 customers): 13.64 ms with DuckDB's join order instead of 13.55 ms.
+Likely cost: The dynamic filters cut every probe side (11,043 `orders` rows, 1,216 customers): 13.03 ms with DuckDB's join order instead of 13.22 ms (1%, within the noise).
 
 ### q8: rule gap
 
 - DuckDB: 8 scans; 7 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 7 join builds, 1 sort.
 - Ours: 8 scans; 7 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 7 join builds, 1 sort.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `(((((((nation ⋈ region) ⋈ customer) ⋈ orders) ⋈ lineitem) ⋈ part) ⋈ supplier) ⋈ nation)`, `((((((nation ⋈ region) ⋈ customer) ⋈ orders) ⋈ lineitem) ⋈ part) ⋈ supplier)`, `(((((nation ⋈ region) ⋈ customer) ⋈ orders) ⋈ lineitem) ⋈ part)`, `((((nation ⋈ region) ⋈ customer) ⋈ orders) ⋈ lineitem)`, `(((nation ⋈ region) ⋈ customer) ⋈ orders)`, `((nation ⋈ region) ⋈ customer)`, `(nation ⋈ region)`; ours joins `(((((((lineitem ⋈ part) ⋈ supplier) ⋈ orders) ⋈ customer) ⋈ nation) ⋈ nation) ⋈ region)`, `((((((lineitem ⋈ part) ⋈ supplier) ⋈ orders) ⋈ customer) ⋈ nation) ⋈ nation)`, `(((((lineitem ⋈ part) ⋈ supplier) ⋈ orders) ⋈ customer) ⋈ nation)`, `((((lineitem ⋈ part) ⋈ supplier) ⋈ orders) ⋈ customer)`, `(((lineitem ⋈ part) ⋈ supplier) ⋈ orders)`, `((lineitem ⋈ part) ⋈ supplier)`, `(lineitem ⋈ part)`
 
@@ -571,14 +590,14 @@ Likely cost: The dynamic filters cut every probe side (11,043 `orders` rows, 1,2
 </tr>
 </table>
 
-Likely cost: 15.97 ms with DuckDB's join order instead of 16.25 ms (2%, within the noise): the dynamic filters cut the `lineitem` scan to the 130 parts of the type.
+Likely cost: 15.68 ms with DuckDB's join order instead of 15.95 ms (2%, within the noise): the dynamic filters cut the `lineitem` scan to the rows of the 130 parts of the type.
 
 ### q9: rule gap
 
 - DuckDB: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 - Ours: 6 scans; 5 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 5 join builds, 1 sort.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `((((nation ⋈ supplier) ⋈ (part ⋈ partsupp)) ⋈ lineitem) ⋈ orders)`, `(((nation ⋈ supplier) ⋈ (part ⋈ partsupp)) ⋈ lineitem)`, `((nation ⋈ supplier) ⋈ (part ⋈ partsupp))`, `(part ⋈ partsupp)`, `(nation ⋈ supplier)`; ours joins `(((((lineitem ⋈ part) ⋈ supplier) ⋈ partsupp) ⋈ orders) ⋈ nation)`, `((((lineitem ⋈ part) ⋈ supplier) ⋈ partsupp) ⋈ orders)`, `(((lineitem ⋈ part) ⋈ supplier) ⋈ partsupp)`, `((lineitem ⋈ part) ⋈ supplier)`, `(lineitem ⋈ part)`
 
@@ -626,14 +645,14 @@ Likely cost: 15.97 ms with DuckDB's join order instead of 16.25 ms (2%, within t
 </tr>
 </table>
 
-Likely cost: Ours builds on all 80,000 `partsupp` and 150,000 `orders` rows (DuckDB builds on `orders` too) and the dynamic filters cut `lineitem` to 36,764 rows; DuckDB's order, `part` with `partsupp` first, is slower on our engine: 21.10 ms instead of 19.98 ms.
+Likely cost: Ours builds on all 80,000 `partsupp` and 150,000 `orders` rows (DuckDB builds on `orders` too) and the dynamic filters cut `lineitem` to 36,764 rows; DuckDB's order, `part` with `partsupp` first, is slower on our engine: 20.33 ms instead of 19.67 ms.
 
 ### q10: rule gap
 
 - DuckDB: 4 scans; 3 hash joins; 1 aggregation; 1 top-N; pipeline breaks: 1 aggregation, 3 join builds, 1 top-N.
 - Ours: 4 scans; 3 hash joins; 1 aggregation; 1 top-N; pipeline breaks: 1 aggregation, 3 join builds, 1 top-N.
 
-**1. Join order** (rule gap; likely impact: low)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `((customer ⋈ nation) ⋈ (lineitem ⋈ orders))`, `(customer ⋈ nation)`, `(lineitem ⋈ orders)`; ours joins `(((customer ⋈ orders) ⋈ lineitem) ⋈ nation)`, `((customer ⋈ orders) ⋈ lineitem)`, `(customer ⋈ orders)`
 
@@ -673,14 +692,14 @@ Likely cost: Ours builds on all 80,000 `partsupp` and 150,000 `orders` rows (Duc
 </tr>
 </table>
 
-Likely cost: DuckDB joins `customer` with `nation` and `lineitem` with `orders`, then the two (a bushy tree); ours joins in the order of the query. With DuckDB's join order written out, q10 takes 13.77 ms instead of 14.54 ms (5%).
+Likely cost: DuckDB joins `customer` with `nation` and `lineitem` with `orders`, then the two (a bushy tree); ours joins in the order of the query. With DuckDB's join order written out, q10 takes 13.88 ms either way.
 
 ### q11: rule gap
 
 - DuckDB: 6 scans; 4 hash joins; 2 aggregations; 1 sort; pipeline breaks: 2 aggregations, 4 join builds, 1 scalar subquery, 1 sort.
 - Ours: 6 scans; 4 hash joins; 2 aggregations; 1 sort; pipeline breaks: 2 aggregations, 4 join builds, 1 scalar subquery, 1 sort.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: none)
 
 - joins: the join order differs: DuckDB joins `((nation ⋈ supplier) ⋈ partsupp)`, `(nation ⋈ supplier)`, `((nation ⋈ supplier) ⋈ partsupp)`, `(nation ⋈ supplier)`; ours joins `((partsupp ⋈ supplier) ⋈ nation)`, `(partsupp ⋈ supplier)`, `((partsupp ⋈ supplier) ⋈ nation)`, `(partsupp ⋈ supplier)`
 
@@ -732,14 +751,14 @@ Likely cost: DuckDB joins `customer` with `nation` and `lineitem` with `orders`,
 </tr>
 </table>
 
-Likely cost: The dynamic filter of `supplier` cuts both `partsupp` scans to 3,760 rows: 9.44 ms with DuckDB's join order instead of 9.67 ms (2%, within the noise).
+Likely cost: The dynamic filter of `supplier` cuts both `partsupp` scans to 3,760 rows: 9.53 ms with DuckDB's join order instead of 9.61 ms (1%, within the noise).
 
 ### q12: rule gap
 
 - DuckDB: 2 scans; 1 hash join; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 1 join build, 1 sort.
 - Ours: 2 scans; 1 hash join; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 1 join build, 1 sort.
 
-**1. Constant bounds derived through comparisons of columns** (rule gap; likely impact: none)
+**1. Constant bounds derived through comparisons of columns** (rule gap, follow-up #118; likely impact: none)
 
 - scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_shipdate, l_shipmode`): DuckDB bounds `l_commitdate, l_shipdate` by constants, which our scan compares with other columns only
 
@@ -816,7 +835,7 @@ Likely cost: Ours builds on the 7,594 `lineitem` rows of the month, whose dynami
 - DuckDB: 2 scans; 1 hash join; 2 aggregations; 1 sort; pipeline breaks: 2 aggregations, 1 join build, 1 scalar subquery, 1 shared subplan, 1 sort.
 - Ours: 3 scans; 1 hash join; 3 aggregations; 1 sort; pipeline breaks: 3 aggregations, 1 join build, 1 scalar subquery, 1 sort.
 
-**1. Common table expressions computed once per reference** (rule gap; likely impact: high)
+**1. Common table expressions computed once per reference** (rule gap, follow-up #114; likely impact: high)
 
 - pipeline breaks: DuckDB computes `revenue0` (`agg(lineitem)`) once, in a shared subplan that it reads twice; ours computes it twice
 - scans: `lineitem` is scanned once in DuckDB, twice in ours
@@ -862,14 +881,14 @@ Likely cost: Ours builds on the 7,594 `lineitem` rows of the month, whose dynami
 </tr>
 </table>
 
-Likely cost: Ours scans the 22,996 `lineitem` rows of the quarter and aggregates them twice, for the join and for the `max` of the scalar subquery. With `WITH revenue0 AS MATERIALIZED (...)`, which the pipeline engine executes natively, q15 takes 5.67 ms instead of 10.06 ms (44%).
+Likely cost: Ours scans the 22,996 `lineitem` rows of the quarter and aggregates them twice, for the join and for the `max` of the scalar subquery. With `WITH revenue0 AS MATERIALIZED (...)`, which the pipeline engine executes natively, q15 takes 5.66 ms instead of 9.30 ms (39%).
 
 ### q17: rule gap
 
 - DuckDB: 3 scans; 2 hash joins; 2 aggregations; pipeline breaks: 2 aggregations, 2 join builds.
 - Ours: 3 scans; 2 hash joins; 2 aggregations; pipeline breaks: 2 aggregations, 2 join builds.
 
-**1. `IS NOT NULL` filters of join keys** (rule gap; likely impact: none)
+**1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
 - scans: the scan of `lineitem` (`l_partkey, l_quantity`): DuckDB filters `l_partkey` with `IS NOT NULL`
 
@@ -909,7 +928,7 @@ Likely cost: `l_partkey` has no nulls: the filter removes no row.
 - DuckDB: 4 scans; 3 hash joins; 2 aggregations; 1 top-N; pipeline breaks: 2 aggregations, 3 join builds, 1 top-N.
 - Ours: 4 scans; 3 hash joins; 2 aggregations; 1 top-N; pipeline breaks: 2 aggregations, 3 join builds, 1 top-N.
 
-**1. Join order** (rule gap; likely impact: none)
+**1. Join order** (rule gap, follow-up #115; likely impact: low)
 
 - joins: the join order differs: DuckDB joins `(((agg(lineitem) ⋈ orders) ⋈ customer) ⋈ lineitem)`, `((agg(lineitem) ⋈ orders) ⋈ customer)`, `(agg(lineitem) ⋈ orders)`; ours joins `(((customer ⋈ orders) ⋈ lineitem) ⋈ agg(lineitem))`, `((customer ⋈ orders) ⋈ lineitem)`, `(customer ⋈ orders)`
 
@@ -951,14 +970,14 @@ Likely cost: `l_partkey` has no nulls: the filter removes no row.
 </tr>
 </table>
 
-Likely cost: DuckDB applies the semi join with the large orders to `orders` before the other joins; our dynamic filters already cut `orders` to 381 rows and `lineitem` to 2,667 before our joins. 13.14 ms with DuckDB's join order instead of 13.35 ms (2%, within the noise).
+Likely cost: DuckDB semi-joins `orders` with the `IN` subquery (the orders of more than 300 units) before the other joins; our dynamic filters already cut `orders` to about 380 rows and `lineitem` to 2,667 before our joins. With DuckDB's join order written out, q18 takes 13.15 ms instead of 13.72 ms (4%).
 
 ### q20: rule gap
 
 - DuckDB: 5 scans; 5 hash joins; 2 aggregations; 1 sort; pipeline breaks: 2 aggregations, 5 join builds, 1 shared subplan, 1 sort.
 - Ours: 5 scans; 4 hash joins; 1 aggregation; 1 sort; pipeline breaks: 1 aggregation, 4 join builds, 1 sort.
 
-**1. Correlated subqueries decorrelated by their outer keys** (rule gap; likely impact: none)
+**1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
 - aggregations: the aggregations differ: DuckDB has an aggregation by 2 keys of `lineitem`, `part`, `partsupp`, an aggregation by 2 keys of `part`, `partsupp` that ours has not, ours an aggregation by 2 keys of `lineitem` that DuckDB has not
@@ -978,7 +997,7 @@ Likely cost: DuckDB applies the semi join with the large orders to `orders` befo
 *         HASH_GROUP_BY Groups: #0, #1; Aggregates: sum(#2) ~24,049 rows
 *           HASH_JOIN Join Type: SEMI; Conditions: l_partkey = ps_partkey, l_suppkey = ps_suppkey ~24,050 rows
               READ_PARQUET Projections: l_partkey, l_suppkey, l_quantity; Filters: ((l_shipdate >= '1994-01-01'::DATE) AND (l_shipdate < '1995-01-01'::DATE)) ~120,252 rows
-*             HASH_GROUP_BY Groups: #0, #1; Aggregates:  ~15,999 rows
+*             HASH_GROUP_BY Groups: #0, #1 ~15,999 rows
                 ...
           CTE_SCAN CTE Index: 65 ~16,000 rows
       HASH_JOIN Join Type: INNER; Conditions: s_nationkey = n_nationkey ~186 rows
@@ -1011,7 +1030,7 @@ Likely cost: The dynamic filters restrict our aggregation of `lineitem` to the k
 - DuckDB: 6 scans; 5 hash joins; 1 aggregation; 1 top-N; pipeline breaks: 1 aggregation, 5 join builds, 1 top-N.
 - Ours: 6 scans; 5 hash joins; 1 aggregation; 1 top-N; pipeline breaks: 1 aggregation, 5 join builds, 1 top-N.
 
-**1. `IS NOT NULL` filters of join keys** (rule gap; likely impact: none)
+**1. `IS NOT NULL` filters of join keys** (rule gap, follow-up #117; likely impact: none)
 
 - scans: the scan of `lineitem` (`l_orderkey, l_suppkey`): DuckDB filters `l_orderkey, l_suppkey` with `IS NOT NULL`
 - scans: the scan of `lineitem` (`l_commitdate, l_orderkey, l_receiptdate, l_suppkey`): DuckDB filters `l_orderkey, l_suppkey` with `IS NOT NULL`
@@ -1051,7 +1070,7 @@ Likely cost: The dynamic filters restrict our aggregation of `lineitem` to the k
 
 Likely cost: `l_orderkey` and `l_suppkey` have no nulls: the filters remove no row.
 
-**2. Join order** (rule gap; likely impact: medium)
+**2. Join order** (rule gap, follow-up #115; likely impact: medium)
 
 - joins: the join order differs: DuckDB joins `(((((nation ⋈ supplier) ⋈ lineitem) ⋈ orders) ⋈ lineitem) ⋈ lineitem)`, `((((nation ⋈ supplier) ⋈ lineitem) ⋈ orders) ⋈ lineitem)`, `(((nation ⋈ supplier) ⋈ lineitem) ⋈ orders)`, `((nation ⋈ supplier) ⋈ lineitem)`, `(nation ⋈ supplier)`; ours joins `(((((lineitem ⋈ supplier) ⋈ orders) ⋈ nation) ⋈ lineitem) ⋈ lineitem)`, `((((lineitem ⋈ supplier) ⋈ orders) ⋈ nation) ⋈ lineitem)`, `(((lineitem ⋈ supplier) ⋈ orders) ⋈ nation)`, `((lineitem ⋈ supplier) ⋈ orders)`, `(lineitem ⋈ supplier)`
 
@@ -1101,14 +1120,14 @@ Likely cost: `l_orderkey` and `l_suppkey` have no nulls: the filters remove no r
 </tr>
 </table>
 
-Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 380,417 `l3` rows with `l_receiptdate > l_commitdate` and probes it with 7,471 rows; DuckDB applies the anti join first and builds on the ~4,509 (estimated) rows of the inner joins. With DuckDB's join order written out, q21 takes 18.58 ms instead of 21.40 ms (13%).
+Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 380,417 `l3` rows with `l_receiptdate > l_commitdate` and probes it with 7,471 rows; DuckDB applies the anti join first and builds on the ~4,509 (estimated) rows of the inner joins. With DuckDB's join order written out, q21 takes 19.10 ms instead of 21.31 ms (10%).
 
 ### q22: rule gap
 
 - DuckDB: 3 scans; 2 hash joins; 3 aggregations; 1 sort; pipeline breaks: 3 aggregations, 2 join builds, 1 scalar subquery, 1 shared subplan, 1 sort.
 - Ours: 3 scans; 1 hash join; 2 aggregations; 1 sort; pipeline breaks: 2 aggregations, 1 join build, 1 scalar subquery, 1 sort.
 
-**1. Correlated subqueries decorrelated by their outer keys** (rule gap; likely impact: none)
+**1. Correlated subqueries decorrelated by their outer keys** (rule gap, follow-up #116; likely impact: none)
 
 - joins: DuckDB joins the shared outer rows with the subquery evaluated for their keys; ours joins the outer rows with the subquery over all of its rows
 - aggregations: the aggregations differ: DuckDB has an aggregation by 1 key of `customer` (2), `orders`, an aggregation by 1 key of `customer` that ours has not, ours an aggregation by 1 key of `customer`, `orders` that DuckDB has not
@@ -1129,7 +1148,7 @@ Likely cost: Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 3
             CTE_SCAN CTE Index: 49 ~1,499 rows
 *           HASH_JOIN Join Type: SEMI; Conditions: o_custkey = c_custkey ~14,998 rows
               READ_PARQUET Projections: o_custkey ~150,000 rows
-*             HASH_GROUP_BY Groups: #0; Aggregates:  ~1,499 rows
+*             HASH_GROUP_BY Groups: #0 ~1,499 rows
                 ...
   scalar subquery:
 *   UNGROUPED_AGGREGATE Aggregates: sum(#0), count(#0) ~1 row
@@ -1174,14 +1193,15 @@ Likely cost: Our anti join builds on the 1,880 customers and probes `orders`, wh
 
 ```text
 * UNGROUPED_AGGREGATE Aggregates: count_star() ~1 row
-*   READ_PARQUET Projections:  ~1,000,000 rows
+*   READ_PARQUET ~1,000,000 rows
 ```
 
 </td>
 <td>
 
 ```text
-(none)
+* PhysicalProjection: expr=[1000000 as count(*)] (1 row)
+*   PhysicalPlaceholderRow (1 row)
 ```
 
 </td>
@@ -1215,7 +1235,8 @@ Likely cost: Our plan reads no file (0.06 ms); DuckDB scans the 1,000,000 rows. 
 <td>
 
 ```text
-(none)
+* PhysicalProjection: expr=[2013-07-01 as min(hits.EventDate), 2013-07-31 as max(hits.EventDate)] (1 row)
+*   PhysicalPlaceholderRow (1 row)
 ```
 
 </td>
@@ -1229,7 +1250,7 @@ Likely cost: Our plan answers `min` and `max` from the statistics of the Parquet
 - DuckDB: 2 scans; 1 hash join; 1 sort; 1 top-N; pipeline breaks: 1 join build, 1 sort, 1 top-N.
 - Ours: 1 scan; 1 top-N; pipeline breaks: 1 top-N.
 
-**1. Late materialization of top-N** (rule gap; likely impact: high)
+**1. Late materialization of top-N** (rule gap, follow-up #113; likely impact: high)
 
 - scans: the scan of `hits` (`AdvEngineID, ClientIP, CounterID, DontCountHits, EventDate, EventTime, IsRefresh, MobilePhone, MobilePhoneModel, RegionID, ResolutionWidth, SearchEngineID, SearchPhrase, Title, URL, UserID, WatchID`): only our top-N pushes its dynamic filter into it (on `EventTime, WatchID`)
 - scans: `hits` is scanned twice in DuckDB, once in ours
@@ -1255,11 +1276,11 @@ Likely cost: Our plan answers `min` and `max` from the statistics of the Parquet
 
 ```text
   PhysicalTopK: fetch=10, expr=[EventTime@5 ASC NULLS LAST, WatchID@0 ASC NULLS LAST], dynamic_filter=true (10 rows)
-*   ParquetScanSource: projection=[WatchID, UserID, CounterID, RegionID, ClientIP, EventTime, EventDate, AdvEngineID, SearchEngineID, SearchPhrase, URL, Title, IsRefresh, DontCountHits, ResolutionWidth, MobilePhone, MobilePhoneModel], predicate=URL@10 LIKE %google% AND DynamicFilter [ EventTime@5 < 1372638092 OR EventTime@5 = 1372638092 AND WatchID@0 < 8622006909670409631 ], filter=URL@10 LIKE %google% (33,790 rows)
+*   ParquetScanSource: projection=[WatchID, UserID, CounterID, RegionID, ClientIP, EventTime, EventDate, AdvEngineID, SearchEngineID, SearchPhrase, URL, Title, IsRefresh, DontCountHits, ResolutionWidth, MobilePhone, MobilePhoneModel], predicate=URL@10 LIKE %google% AND DynamicFilter [ EventTime@5 < 1372638146 OR EventTime@5 = 1372638146 AND WatchID@0 < 2072021522208071178 ], filter=URL@10 LIKE %google% (33,790 rows)
 ```
 
 </td>
 </tr>
 </table>
 
-Likely cost: Our scan reads the 17 columns of the 33,790 rows with `URL LIKE '%google%'` (the dynamic filter of the TopK skips rows once it has 10); DuckDB reads `WatchID`, `EventTime` and `URL` for the top-N, then all columns of 10 rows. Reading the sort keys only, what DuckDB's first scan reads, takes 8.52 ms instead of 23.72 ms (64%): most of hits23 is the late materialization it lacks.
+Likely cost: Our scan reads the 17 columns of the 33,790 rows with `URL LIKE '%google%'` (the dynamic filter of the TopK skips rows once it has 10); DuckDB reads `WatchID`, `EventTime` and `URL` for the top-N, then all columns of 10 rows. Reading the sort keys only, what DuckDB's first scan reads, takes 8.35 ms instead of 21.63 ms (61%): most of hits23 is the late materialization it lacks.

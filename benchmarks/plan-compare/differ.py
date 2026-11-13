@@ -406,7 +406,8 @@ def duckdb_line(node: dict) -> str:
             key == "Function" and value == node["name"]
         ):
             continue
-        details.append(f"{key}: {', '.join(as_list(value))}")
+        if as_list(value):
+            details.append(f"{key}: {', '.join(as_list(value))}")
     rows = node["extra_info"].get("Estimated Cardinality")
     line = node["name"]
     if details:
@@ -849,6 +850,9 @@ def _pipeline_op(
         return pipeline_op(dump, inputs[0], subqueries, by_id)
     children = [pipeline_op(dump, child, subqueries, by_id) for child in inputs]
     if kind in ("PhysicalProjection", "CachingOperator", "CollectorSink"):
+        if kind == "PhysicalProjection" and children[0].kind == "empty":
+            # The answer of a plan without input (e.g. from statistics).
+            children[0].line = f"{line} <- {children[0].line}"
         return children[0]
     if kind == "ScalarSubqueryResult":
         return children[0]
@@ -1285,6 +1289,7 @@ CAUSES = {
             "`datafusion/physical-optimizer/src/` (a new join reordering rule next to "
             "`join_selection.rs`, whose statistics it would use, registered in "
             "`datafusion/physical-optimizer/src/optimizer.rs`)",
+            issue=115,
         ),
         Cause(
             "shared-cte",
@@ -1299,6 +1304,7 @@ CAUSES = {
             "`datafusion/sql/src/cte.rs` (plan a common table expression that the "
             "query reads more than once as a `MaterializedCte`, which the pipeline "
             "engine lowers natively)",
+            issue=114,
         ),
         Cause(
             "delim-join",
@@ -1316,6 +1322,7 @@ CAUSES = {
             "`datafusion/optimizer/src/scalar_subquery_to_join.rs`, "
             "`datafusion/optimizer/src/decorrelate_predicate_subquery.rs` and "
             "`datafusion/optimizer/src/decorrelate.rs`",
+            issue=116,
         ),
         Cause(
             "late-materialization",
@@ -1332,6 +1339,7 @@ CAUSES = {
             "`datafusion/physical-pipeline/src/planner.rs` (the lowering of a TopK "
             "over a Parquet scan) and `datafusion/physical-pipeline/src/sources/parquet.rs` "
             "(row ids, and a scan of given rows)",
+            issue=113,
         ),
         Cause(
             "null-key-filters",
@@ -1347,6 +1355,7 @@ CAUSES = {
             "default; the hash joins skip the rows of null keys themselves.",
             "`datafusion/optimizer/src/filter_null_join_keys.rs` (or the defaults of "
             "the sessions of the pipeline engine)",
+            issue=117,
         ),
         Cause(
             "transitive-filters",
@@ -1360,6 +1369,7 @@ CAUSES = {
             "bounds of the query only.",
             "`datafusion/optimizer/src/push_down_filter.rs` (or a rule of "
             "`datafusion/optimizer/src/simplify_expressions/`)",
+            issue=118,
         ),
         Cause(
             "build-side",
@@ -1798,6 +1808,8 @@ def attribute(duckdb: Fingerprint, ours: Fingerprint, findings: list[Finding]) -
                 )
         elif statistics:
             finding.cause = "exact-statistics"
+            # Our plan: the row of the answer.
+            finding.ours = [op for op in ours.plan.ops() if op.kind == "empty"]
         elif shared_tables and (
             (
                 finding.component in ("scans", "aggregations")
@@ -2020,16 +2032,17 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ("q2", "delim-join"): (
         "none",
         None,
-        "Our dynamic join filters already restrict the subquery to the part keys "
-        "of the outer rows: its `partsupp` scan returns 66 of 80,000 rows. Both "
-        "plans scan the four tables of the subquery once more: nothing to gain.",
+        "Our dynamic join filters already restrict the subquery to the part keys of "
+        "the outer rows: its `partsupp` scan returns 66 of 80,000 rows. Both plans "
+        "scan the four tables of the subquery once more: nothing to gain.",
     ),
     ("q2", "join-order"): (
         "none",
-        -0.02,
+        -0.26,
         "Both blocks join in the order of the query, `region` last; the dynamic "
         "filters reduce every probe side to at most 207 rows. With DuckDB's join "
-        "order written out, our engine runs q2 in 13.80 ms instead of 13.82 ms.",
+        "order written out, our engine runs q2 in 13.65 ms instead of 13.91 ms (2%, "
+        "within the noise).",
     ),
     ("q4", "null-key-filters"): (
         "none",
@@ -2039,48 +2052,48 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ),
     ("q5", "join-order"): (
         "none",
-        1.29,
+        0.71,
         "Our order builds on the 3,031 customers and the 4,081 orders that the "
-        "dynamic filters let through and probes 16,281 `lineitem` rows; DuckDB's "
-        "probes all of `lineitem` against the joins of the five other tables. "
-        "With DuckDB's join order written out, our engine is slower: 14.14 ms "
-        "instead of 12.85 ms.",
+        "dynamic filters let through and probes about 16,300 `lineitem` rows; "
+        "DuckDB's probes all of `lineitem` against the joins of the five other "
+        "tables. With DuckDB's join order written out, our engine is slower: 13.56 "
+        "ms instead of 12.85 ms.",
     ),
     ("q7", "join-order"): (
         "none",
-        0.09,
+        -0.19,
         "The dynamic filters cut every probe side (11,043 `orders` rows, 1,216 "
-        "customers): 13.64 ms with DuckDB's join order instead of 13.55 ms.",
+        "customers): 13.03 ms with DuckDB's join order instead of 13.22 ms (1%, "
+        "within the noise).",
     ),
     ("q8", "join-order"): (
         "none",
-        -0.28,
-        "15.97 ms with DuckDB's join order instead of 16.25 ms (2%, within the "
-        "noise): the dynamic filters cut the `lineitem` scan to the 130 parts of "
-        "the type.",
+        -0.27,
+        "15.68 ms with DuckDB's join order instead of 15.95 ms (2%, within the "
+        "noise): the dynamic filters cut the `lineitem` scan to the rows of the 130 "
+        "parts of the type.",
     ),
     ("q9", "join-order"): (
         "none",
-        1.12,
+        0.66,
         "Ours builds on all 80,000 `partsupp` and 150,000 `orders` rows (DuckDB "
         "builds on `orders` too) and the dynamic filters cut `lineitem` to 36,764 "
         "rows; DuckDB's order, `part` with `partsupp` first, is slower on our "
-        "engine: 21.10 ms instead of 19.98 ms.",
+        "engine: 20.33 ms instead of 19.67 ms.",
     ),
     ("q10", "join-order"): (
-        "low",
-        -0.77,
+        "none",
+        0.0,
         "DuckDB joins `customer` with `nation` and `lineitem` with `orders`, then "
         "the two (a bushy tree); ours joins in the order of the query. With "
-        "DuckDB's join order written out, q10 takes 13.77 ms instead of 14.54 ms "
-        "(5%).",
+        "DuckDB's join order written out, q10 takes 13.88 ms either way.",
     ),
     ("q11", "join-order"): (
         "none",
-        -0.23,
-        "The dynamic filter of `supplier` cuts both `partsupp` scans to 3,760 "
-        "rows: 9.44 ms with DuckDB's join order instead of 9.67 ms (2%, within "
-        "the noise).",
+        -0.08,
+        "The dynamic filter of `supplier` cuts both `partsupp` scans to 3,760 rows: "
+        "9.53 ms with DuckDB's join order instead of 9.61 ms (1%, within the "
+        "noise).",
     ),
     ("q12", "transitive-filters"): (
         "none",
@@ -2100,11 +2113,11 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ),
     ("q15", "shared-cte"): (
         "high",
-        -4.39,
+        -3.64,
         "Ours scans the 22,996 `lineitem` rows of the quarter and aggregates them "
         "twice, for the join and for the `max` of the scalar subquery. With `WITH "
         "revenue0 AS MATERIALIZED (...)`, which the pipeline engine executes "
-        "natively, q15 takes 5.67 ms instead of 10.06 ms (44%).",
+        "natively, q15 takes 5.66 ms instead of 9.30 ms (39%).",
     ),
     ("q17", "null-key-filters"): (
         "none",
@@ -2112,12 +2125,13 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
         "`l_partkey` has no nulls: the filter removes no row.",
     ),
     ("q18", "join-order"): (
-        "none",
-        -0.21,
-        "DuckDB applies the semi join with the large orders to `orders` before "
-        "the other joins; our dynamic filters already cut `orders` to 381 rows "
-        "and `lineitem` to 2,667 before our joins. 13.14 ms with DuckDB's join "
-        "order instead of 13.35 ms (2%, within the noise).",
+        "low",
+        -0.57,
+        "DuckDB semi-joins `orders` with the `IN` subquery (the orders of more "
+        "than 300 units) before the other joins; our dynamic filters already cut "
+        "`orders` to about 380 rows and `lineitem` to 2,667 before our joins. "
+        "With DuckDB's join order written out, q18 takes 13.15 ms instead of "
+        "13.72 ms (4%).",
     ),
     ("q20", "delim-join"): (
         "none",
@@ -2128,12 +2142,12 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ),
     ("q21", "join-order"): (
         "medium",
-        -2.82,
-        "Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the "
-        "380,417 `l3` rows with `l_receiptdate > l_commitdate` and probes it "
-        "with 7,471 rows; DuckDB applies the anti join first and builds on the "
-        "~4,509 (estimated) rows of the inner joins. With DuckDB's join order "
-        "written out, q21 takes 18.58 ms instead of 21.40 ms (13%).",
+        -2.21,
+        "Our anti join (`NOT EXISTS` of `l3`) builds its hash table on the 380,417 "
+        "`l3` rows with `l_receiptdate > l_commitdate` and probes it with 7,471 "
+        "rows; DuckDB applies the anti join first and builds on the ~4,509 "
+        "(estimated) rows of the inner joins. With DuckDB's join order written out, "
+        "q21 takes 19.10 ms instead of 21.31 ms (10%).",
     ),
     ("q21", "null-key-filters"): (
         "none",
@@ -2143,10 +2157,9 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ("q22", "delim-join"): (
         "none",
         None,
-        "Our anti join builds on the 1,880 customers and probes `orders`, which "
-        "its dynamic filter cuts to 18,077 rows; DuckDB semi-joins `orders` with "
-        "the distinct keys of the shared customers. The same scans: nothing to "
-        "gain.",
+        "Our anti join builds on the 1,880 customers and probes `orders`, which its "
+        "dynamic filter cuts to 18,077 rows; DuckDB semi-joins `orders` with the "
+        "distinct keys of the shared customers. The same scans: nothing to gain.",
     ),
     ("hits0", "exact-statistics"): (
         "none",
@@ -2157,18 +2170,18 @@ NOTES: dict[tuple[str, str], tuple[str, float | None, str]] = {
     ("hits6", "exact-statistics"): (
         "none",
         None,
-        "Our plan answers `min` and `max` from the statistics of the Parquet "
-        "files and reads no file; DuckDB scans `EventDate`. Our plan is ahead.",
+        "Our plan answers `min` and `max` from the statistics of the Parquet files "
+        "and reads no file; DuckDB scans `EventDate`. Our plan is ahead.",
     ),
     ("hits23", "late-materialization"): (
         "high",
-        -15.20,
+        -13.28,
         "Our scan reads the 17 columns of the 33,790 rows with `URL LIKE "
         "'%google%'` (the dynamic filter of the TopK skips rows once it has 10); "
         "DuckDB reads `WatchID`, `EventTime` and `URL` for the top-N, then all "
         "columns of 10 rows. Reading the sort keys only, what DuckDB's first scan "
-        "reads, takes 8.52 ms instead of 23.72 ms (64%): most of hits23 is "
-        "the late materialization it lacks.",
+        "reads, takes 8.35 ms instead of 21.63 ms (61%): most of hits23 is the late "
+        "materialization it lacks.",
     ),
 }
 
@@ -2271,10 +2284,25 @@ def issue_link(cause: Cause) -> str:
 def summary(comparisons: list[Comparison]) -> str:
     """The summary that the differ prints and that the report starts with."""
     verdicts = collections.Counter(c.verdict for c in comparisons)
+
+    def lower(title: str) -> str:
+        return title[0].lower() + title[1:] if title[0].isalpha() else title
+
+    costly = [
+        f"{c.query} ({lower(d.cause.title)}: {impact})"
+        for c in comparisons
+        for d in c.divergences
+        for impact in [NOTES.get((c.query, d.cause.id), ("none", None, ""))[0]]
+        if d.cause.classification == RULE_GAP and impact != "none"
+    ]
     lines = [
         f"Of the {len(comparisons)} queries, {verdicts['matches']} match DuckDB's plan "
         f"shape, {verdicts[RULE_GAP]} diverge through a rule gap and "
         f"{verdicts[COST]} only through cost or statistics.",
+        "",
+        f"Only {plural(len(costly), 'divergence')} likely cost something on these "
+        f"queries, measured on our engine: {', '.join(costly)}. The other "
+        "divergences cost nothing measurable here, or our plan is ahead.",
         "",
         "The divergences, the most common first (a query may have several):",
         "",
@@ -2310,7 +2338,7 @@ def summary(comparisons: list[Comparison]) -> str:
 DUCKDB_VERSION = "v2.1.0-dev93719"
 
 #: The commit of `datafusion/new_ex` whose plans `pipeline/` holds.
-PIPELINE_COMMIT = "29c9d0687"
+PIPELINE_COMMIT = "c1d4a6f6e"
 
 LICENSE = """<!--
 SPDX-License-Identifier: Apache-2.0
@@ -2408,6 +2436,7 @@ def report(comparisons: list[Comparison]) -> str:
         )
     lines.append("")
     lines += [*REPORT_METHOD.strip("\n").split("\n"), ""]
+    lines += [*REPORT_COSTS.strip("\n").split("\n"), ""]
     lines += ["### The causes", ""]
     for cause in sorted(
         CAUSES.values(), key=lambda c: (c.classification != RULE_GAP, c.title)
@@ -2470,6 +2499,25 @@ one fingerprint, compares them, classifies every divergence and writes this
 report (`differ.py --report`; `differ.py` prints the same summary, and
 `differ.py --check` fails if this report is not the one that the plans give).
 The notes on what every divergence likely costs are the `NOTES` of the differ.
+"""
+
+REPORT_COSTS = """
+### Likely costs
+
+What a divergence likely costs is measured on our engine, where SQL can give
+the query the shape of DuckDB's plan: `benchmarks/plan-compare/experiments.sql`
+has DuckDB's join orders written out with explicit joins, the common table
+expression of q15 `MATERIALIZED` (which DataFusion plans as a
+`MaterializedCteExec`, which our engine executes natively), and the top-N of
+hits23 over its sort keys only (what DuckDB's first scan reads, an upper bound
+of what late materialization saves). `benchmarks/plan-compare/measure.py` runs
+them with the benchmark's queries on our engine (an optimized build of
+`dump_plans`, 16 threads, profiling on) and the notes quote the medians of 36
+executions of every query. The impact of a divergence is high if DuckDB's
+shape is at least 25% faster, medium at 10-25%, low at 3-10%, and none below 3%
+(the noise of these measurements), if it is slower, if the divergence removes
+no row on this data, or if our plan is ahead. These are timings of our engine
+only: no timing of DuckDB.
 """
 
 REPORT_FOLLOW_UPS = """
