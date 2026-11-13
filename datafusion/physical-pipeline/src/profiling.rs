@@ -1677,3 +1677,806 @@ fn list_bytes<O: OffsetSizeTrait>(list: &GenericListArray<O>) -> usize {
     let (start, end) = offset_range(offsets);
     size_of_val(offsets) + array_bytes(list.values().slice(start, end - start).as_ref())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arrow::array::{
+        ArrayRef, BooleanArray, DictionaryArray, Int32Array, Int64Array, ListArray,
+        RecordBatch, StringArray, StringViewArray,
+    };
+    use arrow::datatypes::{Field, Int32Type, Schema, SchemaRef};
+    use datafusion::prelude::{SessionConfig, SessionContext};
+    use datafusion_common::DataFusionError;
+    use datafusion_physical_plan::ExecutionPlan;
+    use futures::TryStreamExt;
+
+    use crate::bridge::PipelineRootExec;
+    use crate::chunk::SelectionVector;
+    use crate::executor::Executor;
+    use crate::operator::{
+        ExecutionContext, GlobalSourceState, LocalSourceState, SourceResult,
+        TaskInterrupt, downcast_state, downcast_state_mut,
+    };
+    use crate::test_utils::{
+        EngineOutput, compare_outputs, pipeline_context, register_test_tables, run_sql,
+        test_session_config,
+    };
+
+    /// The documentation of the profile, whose tables the JSON dump must
+    /// match.
+    const DOCUMENTATION: &str = include_str!("../docs/profiling.md");
+
+    /// A multi-pipeline plan of several operators over the test tables: a
+    /// hash join (its build side and its probe side), a filter, an
+    /// aggregation, a projection and a sort.
+    const JOIN_AGGREGATE_SORT: &str = "SELECT t2.name, COUNT(*) AS n, SUM(t1.b) AS s \
+        FROM t1 JOIN t2 ON t1.a = t2.k WHERE t1.id % 3 <> 0 \
+        GROUP BY t2.name ORDER BY n DESC, t2.name";
+
+    /// A session of the pipeline engine with the test tables, on
+    /// `target_partitions` threads, that profiles its executions if
+    /// `profiled`.
+    fn session(target_partitions: usize, profiled: bool) -> Result<SessionContext> {
+        let config = test_session_config()
+            .with_target_partitions(target_partitions)
+            .with_option_extension(ProfilingOptions::new(profiled));
+        let ctx = pipeline_context(config);
+        register_test_tables(&ctx)?;
+        Ok(ctx)
+    }
+
+    /// The profile of the last execution of `plan`, a `PipelineRootExec`.
+    fn profile_of(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<QueryProfile>> {
+        plan.downcast_ref::<PipelineRootExec>()
+            .expect("a plan of the pipeline engine")
+            .profile()
+    }
+
+    /// Run `sql` in `ctx`, which profiles its executions, and return its
+    /// output and its profile.
+    async fn run_profiled(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<(EngineOutput, Arc<QueryProfile>)> {
+        let output = run_sql(ctx, sql).await?;
+        let profile = profile_of(&output.plan).expect("a profiled execution");
+        Ok((output, profile))
+    }
+
+    /// A table `big` of 200,000 rows in 8 partitions (`k`, `g` and `v`), and a
+    /// table `dim` of 1,000 rows (`id` and `w`), so that the operators of the
+    /// plans over them do much more work than the executor.
+    async fn register_big_tables(ctx: &SessionContext) -> Result<()> {
+        ctx.sql(
+            "CREATE TABLE big AS SELECT value AS k, value % 97 AS g, value * 3 AS v \
+             FROM generate_series(1, 200000)",
+        )
+        .await?
+        .collect()
+        .await?;
+        ctx.sql("CREATE TABLE dim AS SELECT value AS id, value % 13 AS w FROM generate_series(0, 999)")
+            .await?
+            .collect()
+            .await?;
+        Ok(())
+    }
+
+    /// A plan of several operators and several pipelines over the tables of
+    /// [`register_big_tables`].
+    const BIG_JOIN_AGGREGATE_SORT: &str = "SELECT g, w, COUNT(*) AS n, SUM(v) AS s \
+        FROM big JOIN dim ON big.k % 1000 = dim.id WHERE big.v % 7 <> 0 \
+        GROUP BY g, w ORDER BY s DESC, g, w";
+
+    #[test]
+    fn bytes_of_arrays_are_those_of_their_slices() {
+        let numbers = Int64Array::from_iter_values(0..100);
+        assert_eq!(array_bytes(&numbers), 800);
+        assert_eq!(array_bytes(&numbers.slice(10, 20)), 160);
+        let nullable = Int32Array::from(vec![Some(1), None, Some(3)]);
+        assert_eq!(array_bytes(&nullable), 12 + 1);
+        let booleans = BooleanArray::from(vec![true; 17]);
+        assert_eq!(array_bytes(&booleans), 3);
+
+        let strings = StringArray::from(vec!["a", "bb", "ccc", "dddd"]);
+        assert_eq!(array_bytes(&strings), 5 * 4 + 10);
+        assert_eq!(array_bytes(&strings.slice(2, 2)), 3 * 4 + 7);
+
+        // Views count their 16 bytes and the values that are not inlined.
+        let long = "x".repeat(20);
+        let views = StringViewArray::from(vec!["short", long.as_str(), long.as_str()]);
+        assert_eq!(array_bytes(&views), 3 * 16 + 40);
+        assert_eq!(array_bytes(&views.slice(0, 1)), 16);
+
+        // Lists count the values of their rows only.
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(3)]),
+            Some(vec![Some(4), Some(5), Some(6)]),
+        ]);
+        assert_eq!(array_bytes(&list), 4 * 4 + 6 * 4);
+        assert_eq!(array_bytes(&list.slice(1, 1)), 2 * 4 + 4);
+
+        // Dictionaries count their keys and all of their values.
+        let dictionary: DictionaryArray<Int32Type> =
+            vec!["a", "b", "a", "a"].into_iter().collect();
+        assert_eq!(array_bytes(&dictionary), 4 * 4 + (3 * 4 + 2));
+    }
+
+    #[test]
+    fn bytes_of_chunks_are_scaled_to_their_selection() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(0..100)),
+            Arc::new(Int32Array::from_iter_values(0..100)),
+        ];
+        let batch = RecordBatch::try_new(schema, columns)?;
+        let chunk = DataChunk::from_record_batch(batch);
+        assert_eq!(chunk_bytes(&chunk), 1200);
+        assert_eq!(chunk_bytes(&chunk.slice(0, 10)), 120);
+        let selected = chunk
+            .clone()
+            .with_selection(SelectionVector::new(vec![1, 5, 7, 9]))?;
+        assert_eq!(chunk_bytes(&selected), 48);
+        // The bytes of the columns that a chunk shares with the chunk before
+        // are those of their arrays.
+        let mut cached = ColumnBytes::default();
+        assert_eq!(cached.chunk_bytes(&chunk), 1200);
+        assert_eq!(cached.chunk_bytes(&selected), 48);
+        assert_eq!(cached.chunk_bytes(&chunk.slice(0, 10)), 120);
+        assert_eq!(cached.chunk_bytes(&selected.project(&[1])?), 16);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn profiling_is_off_by_default_and_enabled_per_session() -> Result<()> {
+        let sql = "SELECT d, COUNT(*) FROM t1 GROUP BY d";
+        // Without the options, and with the options switched off.
+        let ctx = pipeline_context(test_session_config());
+        register_test_tables(&ctx)?;
+        assert!(profile_of(&run_sql(&ctx, sql).await?.plan).is_none());
+        let ctx = session(4, false)?;
+        assert!(profile_of(&run_sql(&ctx, sql).await?.plan).is_none());
+        // Switched on with `SET`, for this session only.
+        ctx.sql("SET pipeline_profiling.enabled = true")
+            .await?
+            .collect()
+            .await?;
+        let (_, profile) = run_profiled(&ctx, sql).await?;
+        assert_eq!(profile.pipelines().len(), 2);
+        let other = session(4, false)?;
+        assert!(profile_of(&run_sql(&other, sql).await?.plan).is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_operator_of_a_multi_pipeline_plan_reports_metrics() -> Result<()> {
+        let ctx = session(4, true)?;
+        let (output, profile) = run_profiled(&ctx, JOIN_AGGREGATE_SORT).await?;
+        assert!(
+            output
+                .batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>()
+                > 0
+        );
+        assert!(profile.pipelines().len() >= 4, "{profile:#?}");
+        let kinds = profile
+            .operators()
+            .iter()
+            .map(|operator| operator.kind.as_str())
+            .collect::<Vec<_>>();
+        for kind in [
+            "CollectorSink",
+            "PhysicalSort",
+            "PhysicalHashAggregate",
+            "PhysicalHashJoin",
+            "PhysicalFilter",
+            "MemoryScanSource",
+        ] {
+            assert!(kinds.contains(&kind), "no {kind} in {kinds:?}");
+        }
+
+        // Every operator reports its time and its calls, and the morsels,
+        // rows and bytes that it consumed and produced: all but the builder
+        // of the hash table of the join, a source of no rows.
+        let no_rows = |operator: &OperatorProfile| operator.kind == "JoinHashTableBuild";
+        for operator in profile.operators() {
+            let context = format!("{} ({})", operator.name, operator.kind);
+            assert!(!operator.pipelines.is_empty(), "{context}");
+            let counters = &operator.counters;
+            assert!(counters.self_time > 0, "{context}");
+            assert!(counters.calls > 0, "{context}");
+            if no_rows(operator) {
+                assert_eq!(counters.rows_out, 0, "{context}");
+                continue;
+            }
+            for (_, role) in &operator.pipelines {
+                if *role != OperatorRole::Sink {
+                    assert!(counters.rows_out > 0, "{context}");
+                    assert!(counters.morsels_out > 0, "{context}");
+                    assert!(counters.bytes_out > 0, "{context}");
+                }
+                if *role != OperatorRole::Source {
+                    assert!(counters.rows_in > 0, "{context}");
+                    assert!(counters.morsels_in > 0, "{context}");
+                    assert!(counters.bytes_in > 0, "{context}");
+                }
+            }
+            // The operators that keep their input reserve its memory.
+            if ["PhysicalSort", "PhysicalHashAggregate", "PhysicalHashJoin"]
+                .contains(&operator.kind.as_str())
+            {
+                assert!(operator.memory_peak > 0, "{context}");
+            }
+        }
+        // Every stage of a pipeline consumes what the stage before it
+        // produced.
+        for pipeline in profile.pipelines() {
+            for pair in pipeline.stages.windows(2) {
+                let (from, to) = (&pair[0].counters, &pair[1].counters);
+                assert_eq!(
+                    (to.rows_in, to.morsels_in, to.bytes_in),
+                    (from.rows_out, from.morsels_out, from.bytes_out),
+                    "{pipeline:#?}"
+                );
+            }
+        }
+
+        // The metrics of the operators are those of the execution metrics,
+        // and the stages of the pipelines add up to them.
+        let root = output.plan.downcast_ref::<PipelineRootExec>().unwrap();
+        let metrics = root.execution_metrics().unwrap();
+        for (operator, metrics) in metrics.iter() {
+            let profiled = profile.operator(operator.as_ref()).unwrap();
+            assert_eq!(profiled.counters.self_time, metrics.elapsed_nanos());
+            assert_eq!(profiled.counters.rows_out, metrics.output_rows() as u64);
+            assert_eq!(
+                profiled.counters.morsels_out,
+                metrics.output_chunks() as u64
+            );
+            let sunk = profile
+                .pipelines()
+                .iter()
+                .flat_map(|pipeline| &pipeline.stages)
+                .filter(|stage| stage.operator == profiled.id)
+                .filter(|stage| stage.role == OperatorRole::Sink)
+                .fold((0, 0), |(rows, morsels), stage| {
+                    (
+                        rows + stage.counters.rows_in,
+                        morsels + stage.counters.morsels_in,
+                    )
+                });
+            assert_eq!(
+                sunk,
+                (metrics.sink_rows() as u64, metrics.sink_chunks() as u64)
+            );
+        }
+
+        // Every pipeline reports the morsels its source distributed and the
+        // time of its threads.
+        let executor = profile.executor();
+        for pipeline in profile.pipelines() {
+            assert!(pipeline.threads >= 1, "{pipeline:#?}");
+            assert_eq!(pipeline.workers.len() as u64, pipeline.threads);
+            let source = &profile.operators()[pipeline.source];
+            assert_eq!(pipeline.morsels > 0, !no_rows(source), "{pipeline:#?}");
+            assert_eq!(
+                pipeline.morsels, pipeline.stages[0].counters.morsels_out,
+                "{pipeline:#?}"
+            );
+            assert_eq!(
+                pipeline.morsels,
+                pipeline.workers.iter().map(|w| w.morsels).sum::<u64>()
+            );
+            assert!(pipeline.active_time > 0, "{pipeline:#?}");
+            assert!(pipeline.elapsed_time > 0, "{pipeline:#?}");
+            assert!(pipeline.finished_at <= executor.elapsed_time);
+            for worker in &pipeline.workers {
+                assert_eq!(
+                    worker.elapsed_time,
+                    worker.active_time + worker.blocked_time + worker.queue_wait_time
+                );
+                assert!(worker.started_at >= pipeline.started_at, "{pipeline:#?}");
+                assert!(worker.finished_at <= pipeline.finished_at, "{pipeline:#?}");
+            }
+        }
+        assert_eq!(
+            executor.morsels,
+            profile.pipelines().iter().map(|p| p.morsels).sum::<u64>()
+        );
+        assert_eq!(
+            executor.workers,
+            profile.pipelines().iter().map(|p| p.threads).sum::<u64>()
+        );
+        assert_eq!(executor.threads, 4);
+        let peak = profile.operators().iter().map(|op| op.memory_peak).max();
+        assert!(executor.memory_peak >= peak.unwrap_or_default());
+        Ok(())
+    }
+
+    /// The tolerance of the additivity of the timings, in percent of the
+    /// thread time (see `docs/profiling.md`).
+    const TOLERANCE_PERCENT: u64 = 10;
+
+    /// Assert that the self times and the blocked times of the operators of
+    /// `profile` add up to the thread time of its execution, which is its
+    /// elapsed time if it ran on one thread, but for the overhead of the
+    /// executor and the work-queue wait, which are at most
+    /// [`TOLERANCE_PERCENT`] of it.
+    fn assert_timings_add_up(profile: &QueryProfile, one_thread: bool) {
+        let executor = profile.executor();
+        let operators = profile.operators();
+        let self_time = operators
+            .iter()
+            .map(|op| op.counters.self_time)
+            .sum::<u64>();
+        let blocked_time = operators
+            .iter()
+            .map(|op| op.counters.blocked_time)
+            .sum::<u64>();
+        // The parts of the thread time add up exactly.
+        assert_eq!(
+            executor.thread_time,
+            executor.active_time + executor.blocked_time + executor.queue_wait_time
+        );
+        assert_eq!(blocked_time, executor.blocked_time);
+        assert_eq!(self_time + executor.overhead_time, executor.active_time);
+        // The operators account for all but the overhead and the queue wait.
+        let wall_time = if one_thread {
+            executor.elapsed_time
+        } else {
+            executor.thread_time
+        };
+        let operator_time = self_time + blocked_time;
+        let unaccounted = wall_time.abs_diff(operator_time);
+        println!(
+            "wall time {wall_time} ns, operators {operator_time} ns, unaccounted {unaccounted} ns \
+             ({:.2}%), overhead {} ns, queue wait {} ns, elapsed {} ns, thread time {} ns",
+            unaccounted as f64 * 100.0 / wall_time as f64,
+            executor.overhead_time,
+            executor.queue_wait_time,
+            executor.elapsed_time,
+            executor.thread_time,
+        );
+        assert!(
+            unaccounted * 100 <= wall_time * TOLERANCE_PERCENT,
+            "the operators account for {operator_time} ns of {wall_time} ns: {:#?}",
+            profile.executor()
+        );
+    }
+
+    /// Execute the plan of several operators and pipelines over the big
+    /// tables on `threads` threads, and check the additivity of its profile.
+    async fn timings_add_up(threads: usize) -> Result<()> {
+        let ctx = session(threads, true)?;
+        register_big_tables(&ctx).await?;
+        let (_, profile) = run_profiled(&ctx, BIG_JOIN_AGGREGATE_SORT).await?;
+        assert!(profile.pipelines().len() >= 4, "{profile:#?}");
+        assert!(profile.operators().len() >= 7, "{profile:#?}");
+        assert_timings_add_up(&profile, threads == 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timings_add_up_to_the_elapsed_time_on_one_thread() -> Result<()> {
+        timings_add_up(1).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timings_add_up_to_the_thread_time() -> Result<()> {
+        timings_add_up(4).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn results_do_not_change_with_profiling() -> Result<()> {
+        let queries = [
+            JOIN_AGGREGATE_SORT,
+            "SELECT a, b, c FROM t1 WHERE a > 3 AND d IS NOT NULL",
+            "SELECT d, COUNT(*), SUM(b), MIN(c), MAX(g) FROM t1 GROUP BY d",
+            "SELECT t1.id, t2.name FROM t1 LEFT JOIN t2 ON t1.a = t2.k \
+             WHERE t1.id < 500 ORDER BY t1.id, t2.name",
+            "SELECT id, a, b FROM t1 ORDER BY b DESC NULLS LAST, id LIMIT 17",
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY a ORDER BY id) AS r FROM t1",
+            "SELECT a FROM t1 WHERE id < 100 UNION ALL SELECT k FROM t2",
+            "SELECT DISTINCT a % 10 AS m FROM t1",
+            "SELECT COUNT(*) FROM t1 WHERE a IN (SELECT k FROM t2 WHERE w > 10)",
+            "SELECT * FROM t1 CROSS JOIN (SELECT k FROM t2 LIMIT 2) ORDER BY id, k LIMIT 9",
+        ];
+        let off = session(4, false)?;
+        let on = session(4, true)?;
+        for sql in queries {
+            let expected = run_sql(&off, sql).await?;
+            assert!(profile_of(&expected.plan).is_none(), "{sql}");
+            let (actual, _) = run_profiled(&on, sql).await?;
+            if let Err(difference) = compare_outputs(&expected, &actual) {
+                panic!("{sql}: {difference}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The rows of the table of the documentation that follows the heading
+    /// `heading`: the name and the unit (or type) of every field or metric,
+    /// without backticks.
+    fn documented(heading: &str) -> Vec<(String, String)> {
+        let mut lines = DOCUMENTATION
+            .lines()
+            .skip_while(|line| line.trim() != heading)
+            .skip(1)
+            .skip_while(|line| !line.starts_with('|'));
+        let mut rows = vec![];
+        // The header and the separator.
+        lines.next();
+        lines.next();
+        for line in lines.take_while(|line| line.starts_with('|')) {
+            let cells = line
+                .split('|')
+                .map(|cell| cell.trim().trim_matches('`').to_string())
+                .collect::<Vec<_>>();
+            rows.push((cells[1].clone(), cells[2].clone()));
+        }
+        assert!(!rows.is_empty(), "no table after {heading}");
+        rows
+    }
+
+    /// Assert that `object` has exactly the documented fields of `heading`.
+    fn assert_fields(object: &Value, heading: &str) {
+        let object = object.as_object().expect("an object");
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut fields = documented(heading)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(keys, fields, "{heading}");
+    }
+
+    /// Assert that `metrics` are exactly the documented metrics of
+    /// `heading`, with their units, and that their values are integers.
+    fn assert_metrics(metrics: &Value, heading: &str) {
+        let metrics = metrics.as_object().expect("an object of metrics");
+        let documented = documented(heading);
+        assert_eq!(metrics.len(), documented.len(), "{heading}: {metrics:?}");
+        for (name, unit) in documented {
+            let metric = &metrics[&name];
+            assert_eq!(
+                metric["unit"],
+                Value::from(unit.clone()),
+                "{heading}: {name}"
+            );
+            assert!(metric["value"].is_u64(), "{heading}: {name}: {metric}");
+            assert_eq!(metric.as_object().unwrap().len(), 2, "{name}: {metric}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_json_dump_parses_and_matches_the_documented_schema() -> Result<()> {
+        let ctx = session(4, true)?;
+        let (_, profile) = run_profiled(&ctx, JOIN_AGGREGATE_SORT).await?;
+        let json: Value = serde_json::from_str(&profile.to_json_string())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        assert_fields(&json, "#### Top level");
+        assert_eq!(json["schema"], PROFILE_SCHEMA);
+        assert_eq!(json["version"], PROFILE_VERSION);
+        assert_eq!(json["root"], 0);
+        assert_fields(&json["executor"], "#### Executor fields");
+        assert_metrics(&json["executor"]["metrics"], "#### Executor metrics");
+
+        let operators = json["operators"].as_array().unwrap();
+        let pipelines = json["pipelines"].as_array().unwrap();
+        let meta_pipelines = json["meta_pipelines"].as_array().unwrap();
+        let is_operator =
+            |id: &Value| id.as_u64().is_some_and(|id| id < operators.len() as u64);
+        let is_pipeline =
+            |id: &Value| id.as_u64().is_some_and(|id| id < pipelines.len() as u64);
+        let is_meta = |id: &Value| {
+            id.as_u64()
+                .is_some_and(|id| id < meta_pipelines.len() as u64)
+        };
+        let roles = ["source", "operator", "sink"].map(Value::from);
+        assert_eq!(operators[0]["kind"], "CollectorSink");
+        for (id, operator) in operators.iter().enumerate() {
+            assert_fields(operator, "#### Operator fields");
+            assert_eq!(operator["id"], id);
+            assert!(operator["kind"].is_string() && operator["name"].is_string());
+            assert!(
+                operator["inputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(is_operator)
+            );
+            for pipeline in operator["pipelines"].as_array().unwrap() {
+                assert_eq!(pipeline.as_object().unwrap().len(), 2, "{pipeline}");
+                assert!(is_pipeline(&pipeline["pipeline"]), "{pipeline}");
+                assert!(roles.contains(&pipeline["role"]), "{pipeline}");
+            }
+            assert_metrics(&operator["metrics"], "#### Operator metrics");
+        }
+        for (id, pipeline) in pipelines.iter().enumerate() {
+            assert_fields(pipeline, "#### Pipeline fields");
+            assert_eq!(pipeline["id"], id);
+            assert!(is_meta(&pipeline["meta_pipeline"]));
+            assert!(is_operator(&pipeline["source"]) && is_operator(&pipeline["sink"]));
+            assert!(
+                pipeline["operators"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(is_operator)
+            );
+            assert!(
+                pipeline["dependencies"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(is_pipeline)
+            );
+            assert!(
+                pipeline["meta_dependencies"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(is_meta)
+            );
+            assert!(pipeline["skipped"].is_boolean());
+            assert_metrics(&pipeline["metrics"], "#### Pipeline metrics");
+            let stages = pipeline["stages"].as_array().unwrap();
+            assert_eq!(
+                stages.len(),
+                pipeline["operators"].as_array().unwrap().len() + 2
+            );
+            assert_eq!(stages[0]["operator"], pipeline["source"]);
+            assert_eq!(stages[0]["role"], "source");
+            assert_eq!(stages[stages.len() - 1]["operator"], pipeline["sink"]);
+            assert_eq!(stages[stages.len() - 1]["role"], "sink");
+            for stage in stages {
+                assert_fields(stage, "#### Stage fields");
+                assert!(
+                    is_operator(&stage["operator"]) && roles.contains(&stage["role"])
+                );
+                assert_metrics(&stage["metrics"], "#### Stage metrics");
+            }
+            let workers = pipeline["workers"].as_array().unwrap();
+            assert_eq!(
+                Some(workers.len() as u64),
+                pipeline["metrics"]["threads"]["value"].as_u64()
+            );
+            for worker in workers {
+                assert_fields(worker, "#### Worker fields");
+                assert!(worker["thread"].is_u64());
+                assert_metrics(&worker["metrics"], "#### Worker metrics");
+            }
+        }
+        for (id, meta) in meta_pipelines.iter().enumerate() {
+            assert_fields(meta, "#### Meta pipeline fields");
+            assert_eq!(meta["id"], id);
+            assert!(is_operator(&meta["sink"]));
+            assert!(
+                meta["pipelines"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(is_pipeline)
+            );
+            assert!(meta["children"].as_array().unwrap().iter().all(is_meta));
+            assert!(meta["parent"].is_null() || is_meta(&meta["parent"]));
+            assert_metrics(&meta["metrics"], "#### Meta pipeline metrics");
+        }
+        // The units of the documentation are those of the code.
+        let units = documented("#### Units")
+            .into_iter()
+            .map(|(unit, _)| unit)
+            .collect::<Vec<_>>();
+        for unit in [
+            MetricUnit::Nanoseconds,
+            MetricUnit::Rows,
+            MetricUnit::Morsels,
+            MetricUnit::Bytes,
+            MetricUnit::Count,
+        ] {
+            assert!(units.contains(&unit.as_str().to_string()), "{unit}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn explain_analyze_shows_the_profile() -> Result<()> {
+        let explain = async |ctx: &SessionContext, sql: &str| -> Result<String> {
+            let batches = ctx.sql(sql).await?.collect().await?;
+            Ok(batches
+                .iter()
+                .flat_map(|batch| {
+                    let plans = batch.column(1).as_string::<i32>();
+                    plans
+                        .iter()
+                        .flatten()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        };
+        let sql = format!("EXPLAIN ANALYZE {JOIN_AGGREGATE_SORT}");
+        let plan = explain(&session(4, true)?, &sql).await?;
+        let lines = plan.lines().collect::<Vec<_>>();
+        assert!(
+            lines[0].starts_with("PipelineRootExec: pipelines=")
+                && lines[0].contains(", profile=[elapsed_time=")
+                && lines[0].contains("memory_peak="),
+            "{plan}"
+        );
+        for operator in ["PhysicalHashJoin", "PhysicalHashAggregate", "PhysicalSort"] {
+            let line = lines
+                .iter()
+                .find(|line| line.trim_start().starts_with(operator))
+                .unwrap_or_else(|| panic!("no {operator}: {plan}"));
+            for metric in [
+                "elapsed_compute=",
+                "blocked_time=",
+                "rows_in=",
+                "bytes_in=",
+                "bytes_out=",
+                "memory_peak=",
+            ] {
+                assert!(line.contains(metric), "{metric}: {line}");
+            }
+        }
+        let pipelines = lines
+            .iter()
+            .filter(|line| line.trim_start().starts_with("Pipeline "))
+            .collect::<Vec<_>>();
+        assert!(pipelines.len() >= 4, "{plan}");
+        for line in pipelines {
+            assert!(line.contains(", profile=[threads="), "{line}");
+            assert!(line.contains("queue_wait_time="), "{line}");
+        }
+        // The selection of the metrics applies to the profile too.
+        let sql = format!("EXPLAIN (ANALYZE, METRICS 'rows') {JOIN_AGGREGATE_SORT}");
+        let plan = explain(&session(4, true)?, &sql).await?;
+        assert!(plan.contains("profile=[threads="), "{plan}");
+        assert!(plan.contains("rows_in="), "{plan}");
+        for metric in ["elapsed_time", "blocked_time", "bytes_in", "memory_peak"] {
+            assert!(!plan.contains(metric), "{metric}: {plan}");
+        }
+        // Without profiling, nothing changes.
+        let plan = explain(
+            &session(4, false)?,
+            &format!("EXPLAIN ANALYZE {JOIN_AGGREGATE_SORT}"),
+        )
+        .await?;
+        assert!(!plan.contains("profile="), "{plan}");
+        assert!(!plan.contains("blocked_time"), "{plan}");
+        Ok(())
+    }
+
+    /// A parallel source of `batches` whose threads first wait for `wait`,
+    /// each once.
+    #[derive(Debug)]
+    struct WaitingSource {
+        batches: Vec<RecordBatch>,
+        wait: Duration,
+    }
+
+    struct WaitingSourceState {
+        next: AtomicUsize,
+    }
+
+    impl GlobalSourceState for WaitingSourceState {}
+
+    #[derive(Default)]
+    struct WaitingSourceThread {
+        waited: bool,
+    }
+
+    impl LocalSourceState for WaitingSourceThread {}
+
+    impl PhysicalOperator for WaitingSource {
+        fn name(&self) -> &str {
+            "WaitingSource"
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.batches[0].schema()
+        }
+
+        fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+            &[]
+        }
+
+        fn is_source(&self) -> bool {
+            true
+        }
+
+        fn parallel_source(&self) -> bool {
+            true
+        }
+
+        fn get_global_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+        ) -> Result<Arc<dyn GlobalSourceState>> {
+            Ok(Arc::new(WaitingSourceState {
+                next: AtomicUsize::new(0),
+            }))
+        }
+
+        fn get_local_source_state(
+            &self,
+            _ctx: &ExecutionContext,
+            _gstate: &dyn GlobalSourceState,
+        ) -> Result<Box<dyn LocalSourceState>> {
+            Ok(Box::new(WaitingSourceThread::default()))
+        }
+
+        fn get_data(
+            &self,
+            _ctx: &ExecutionContext,
+            gstate: &dyn GlobalSourceState,
+            lstate: &mut dyn LocalSourceState,
+        ) -> Result<SourceResult> {
+            let lstate = downcast_state_mut::<WaitingSourceThread>(
+                lstate.as_any_mut(),
+                self.name(),
+            )?;
+            if !std::mem::replace(&mut lstate.waited, true) {
+                let wait = tokio::time::sleep(self.wait);
+                return Ok(SourceResult::Blocked(TaskInterrupt::wait_for(wait)));
+            }
+            let gstate =
+                downcast_state::<WaitingSourceState>(gstate.as_any(), self.name())?;
+            let next = gstate.next.fetch_add(1, Ordering::Relaxed);
+            Ok(match self.batches.get(next) {
+                Some(batch) => {
+                    SourceResult::Chunk(DataChunk::from_record_batch(batch.clone()))
+                }
+                None => SourceResult::Finished,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_time_the_threads_wait_is_the_blocked_time_of_the_operator() -> Result<()>
+    {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batches = (0..8)
+            .map(|b| {
+                let values = Int64Array::from_iter_values(b * 100..(b + 1) * 100);
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let wait = Duration::from_millis(30);
+        let source = Arc::new(WaitingSource { batches, wait });
+        let config =
+            SessionConfig::new().with_option_extension(ProfilingOptions::new(true));
+        let task_ctx = Arc::new(TaskContext::default().with_session_config(config));
+        let stream = Executor::execute_stream(Arc::clone(&source) as _, task_ctx, 2)?;
+        let execution = Arc::clone(stream.metrics());
+        let output = stream.try_collect::<Vec<_>>().await?;
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 800);
+
+        let profile = execution.profile().expect("a profiled execution");
+        let waiting = profile.operator(source.as_ref()).unwrap();
+        let waited = nanos(wait);
+        // Both threads waited once.
+        assert!(waiting.counters.blocked_time >= 2 * waited, "{waiting:#?}");
+        assert_eq!(waiting.counters.rows_out, 800);
+        assert_eq!(waiting.counters.morsels_out, 8);
+        let pipeline = &profile.pipelines()[0];
+        assert_eq!(pipeline.threads, 2);
+        assert!(pipeline.blocked_time >= 2 * waited, "{pipeline:#?}");
+        for worker in &pipeline.workers {
+            assert!(worker.blocked_time >= waited, "{worker:#?}");
+        }
+        assert!(profile.executor().blocked_time >= 2 * waited);
+        assert_timings_add_up(&profile, false);
+        Ok(())
+    }
+}
