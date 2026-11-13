@@ -1,0 +1,68 @@
+╭─ Top N ────────────────────────────╮
+│ Top: 100                           │
+│ Order By: s_acctbal DESC,          │
+│           n_name ASC, s_name ASC,  │
+│           p_partkey ASC            │
+│ ~0 rows                            │
+╰──────────────────┬─────────────────╯
+╭─ Projection ─────┴─────────────────╮
+│ Projections: s_acctbal, s_name,    │
+│              n_name, p_partkey,    │
+│              p_mfgr, s_address,    │
+│              s_phone, s_comment    │
+│ ~0 rows                            │
+╰──────────────────┬─────────────────╯
+╭─ CTE ────────────┴─────────────────╮
+│ CTE Name: __duckdb_delim_79        │
+│ Table Index: 79                    │
+│ Execution Mode: PIPELINE_DEPENDENT │
+│ ~0 rows                            │
+╰──────────────────┬─────────────────╯
+                   ├─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+╭─ Projection ─────┴─────────────────╮                                                                                                                 ╭─ Projection ────────┴─────────────────────╮
+│ Projections: #0, #1, #3, #4, #5,   │                                                                                                                 │ Projections: #0, #1, #2, #3, #4, #5, #6,  │
+│              #6, #7, #2, #8        │                                                                                                                 │              #7                           │
+│ ~0 rows                            │                                                                                                                 │ ~0 rows                                   │
+╰──────────────────┬─────────────────╯                                                                                                                 ╰─────────────────────┬─────────────────────╯
+╭─ Hash Join ──────┴─────────────────╮                                                                                                                 ╭─ Hash Join ─────────┴─────────────────────╮
+│ Join Type: INNER                   │                                                                                                                 │ Join Type: INNER                          │
+│ Conditions: p_partkey = ps_partkey │                                                                                                                 │ Conditions:                               │
+│ ~0 rows                            │                                                                                                                 │ p_partkey IS NOT DISTINCT FROM p_partkey, │
+╰──────────────────┬─────────────────╯                                                                                                                 │ ps_supplycost = SUBQUERY                  │
+                   ├───────────────────────────────────────╮                                                                                           │ ~0 rows                                   │
+╭─ Read Parquet ───┴─────────────────╮  ╭─ Hash Join ──────┴─────────────────╮                                                                         ╰─────────────────────┬─────────────────────╯
+│ Function: READ_PARQUET             │  │ Join Type: INNER                   │                                                                                               ├───────────────────────────────────────────╮
+│ Projections: p_partkey, p_mfgr     │  │ Conditions: ps_suppkey = s_suppkey │                                                                         ╭─ CTE Scan ──────────┴─────────────────────╮  ╭─ Hash Group By ──┴─────────────────╮
+│ Filters: suffix(p_type, 'BRASS'),  │  │ ~0 rows                            │                                                                         │ CTE Index: 79                             │  │ Groups: #0                         │
+│          p_size = 15               │  ╰──────────────────┬─────────────────╯                                                                         │ ~0 rows                                   │  │ Aggregates: min(#1)                │
+│ ~4,000 rows                        │                     ├────────────────────────────────────────╮                                                  ╰───────────────────────────────────────────╯  │ ~0 rows                            │
+╰────────────────────────────────────╯  ╭─ Read Parquet ───┴─────────────────╮  ╭─ Hash Join ───────┴───────────────────╮                                                                             ╰──────────────────┬─────────────────╯
+                                        │ Function: READ_PARQUET             │  │ Join Type: INNER                      │                                                                             ╭─ Projection ─────┴─────────────────╮
+                                        │ Projections: ps_partkey,           │  │ Conditions: s_nationkey = n_nationkey │                                                                             │ Projections: p_partkey,            │
+                                        │              ps_suppkey,           │  │ ~0 rows                               │                                                                             │              ps_supplycost         │
+                                        │              ps_supplycost         │  ╰───────────────────┬───────────────────╯                                                                             │ ~0 rows                            │
+                                        │ ~80,000 rows                       │                      ├──────────────────────────────────────────╮                                                      ╰──────────────────┬─────────────────╯
+                                        ╰────────────────────────────────────╯  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Hash Join ───────┴───────────────────╮                                  ╭─ Hash Join ──────┴─────────────────╮
+                                                                                │ Function: READ_PARQUET                │  │ Join Type: INNER                      │                                  │ Join Type: INNER                   │
+                                                                                │ Projections: s_suppkey, s_name,       │  │ Conditions: n_regionkey = r_regionkey │                                  │ Conditions: ps_suppkey = s_suppkey │
+                                                                                │              s_address, s_nationkey,  │  │ ~0 rows                               │                                  │ ~0 rows                            │
+                                                                                │              s_phone, s_acctbal,      │  ╰───────────────────┬───────────────────╯                                  ╰──────────────────┬─────────────────╯
+                                                                                │              s_comment                │                      ├─────────────────────────────────────╮                                   ├─────────────────────────────────────────────────────────────────╮
+                                                                                │ ~992 rows                             │  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ─────────────╮  ╭─ Hash Join ──────┴─────────────────╮                           ╭─ Hash Join ───────┴───────────────────╮
+                                                                                ╰───────────────────────────────────────╯  │ Function: READ_PARQUET                │  │ Function: READ_PARQUET     │  │ Join Type: SEMI                    │                           │ Join Type: INNER                      │
+                                                                                                                           │ Projections: n_nationkey, n_name,     │  │ Projections: r_regionkey   │  │ Conditions: ps_partkey = p_partkey │                           │ Conditions: s_nationkey = n_nationkey │
+                                                                                                                           │              n_regionkey              │  │ Filters: r_name = 'EUROPE' │  │ ~0 rows                            │                           │ ~0 rows                               │
+                                                                                                                           │ ~16 rows                              │  │ ~0 rows                    │  ╰──────────────────┬─────────────────╯                           ╰───────────────────┬───────────────────╯
+                                                                                                                           ╰───────────────────────────────────────╯  ╰────────────────────────────╯                     ├───────────────────────────────╮                                 ├──────────────────────────────────────────╮
+                                                                                                                                                                                                      ╭─ Read Parquet ───┴─────────────────╮  ╭─ Hash Group By ─────╮  ╭─ Read Parquet ────┴───────────────────╮  ╭─ Hash Join ───────┴───────────────────╮
+                                                                                                                                                                                                      │ Function: READ_PARQUET             │  │ Groups: #0          │  │ Function: READ_PARQUET                │  │ Join Type: INNER                      │
+                                                                                                                                                                                                      │ Projections: ps_partkey,           │  │ ~0 rows             │  │ Projections: s_suppkey, s_nationkey   │  │ Conditions: n_regionkey = r_regionkey │
+                                                                                                                                                                                                      │              ps_suppkey,           │  ╰──────────┬──────────╯  │ ~992 rows                             │  │ ~0 rows                               │
+                                                                                                                                                                                                      │              ps_supplycost         │  ╭─ Projection ────────╮  ╰───────────────────────────────────────╯  ╰───────────────────┬───────────────────╯
+                                                                                                                                                                                                      │ ~80,000 rows                       │  │ Projections: #[1.0] │                                                                 ├─────────────────────────────────────╮
+                                                                                                                                                                                                      ╰────────────────────────────────────╯  │ ~0 rows             │                                             ╭─ Read Parquet ────┴───────────────────╮  ╭─ Read Parquet ─────────────╮
+                                                                                                                                                                                                                                              ╰──────────┬──────────╯                                             │ Function: READ_PARQUET                │  │ Function: READ_PARQUET     │
+                                                                                                                                                                                                                                              ╭─ CTE Scan ──────────╮                                             │ Projections: n_nationkey, n_regionkey │  │ Projections: r_regionkey   │
+                                                                                                                                                                                                                                              │ CTE Index: 79       │                                             │ ~16 rows                              │  │ Filters: r_name = 'EUROPE' │
+                                                                                                                                                                                                                                              │ ~0 rows             │                                             ╰───────────────────────────────────────╯  │ ~0 rows                    │
+                                                                                                                                                                                                                                              ╰─────────────────────╯                                                                                        ╰────────────────────────────╯
