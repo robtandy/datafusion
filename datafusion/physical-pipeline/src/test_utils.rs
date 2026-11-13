@@ -53,7 +53,10 @@
 //!      values: rows that are equal on them are ordered by their later keys.
 //!      DataFusion sorts `-0.0` before `0.0`, but they are equal, so rows
 //!      whose zeros only differ in sign may also be ordered by their later
-//!      keys.
+//!      keys. Likewise, it sorts negative `NaN`s first and positive ones last,
+//!      but `NaN = NaN`: the rows may also be in the order of the query whose
+//!      top-level sort has all its `NaN`s positive, or all negative (see
+//!      [`nan_alternatives`]).
 //!      Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
 //!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
@@ -188,6 +191,7 @@ use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SessionState, SessionStateBuilder};
+use datafusion::functions::math::expr_fn::isnan;
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -198,7 +202,9 @@ use datafusion_common::{
 use datafusion_expr::logical_plan::{
     Distinct, DistinctOn, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
 };
-use datafusion_expr::{ColumnarValue, Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
+use datafusion_expr::{
+    ColumnarValue, Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, SortExpr,
+};
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::execution_plan::reset_plan_states;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
@@ -755,10 +761,22 @@ impl EngineOutcomes {
             (Ok(expected), Ok(actual)) => {
                 let difference = compare_results(expected, actual, &self.order, options);
                 match difference {
+                    // The schemas must be the schema of DataFusion, which the
+                    // other results of the query have too.
                     Err(difference)
-                        if !self.alternatives.iter().any(|(expected, order)| {
-                            compare_results(expected, actual, order, options).is_ok()
-                        }) =>
+                        if compare_schemas(expected, actual).is_err()
+                            || !self.alternatives.iter().any(
+                                |(alternative, order)| {
+                                    let alternative = EngineOutput {
+                                        plan: Arc::clone(&alternative.plan),
+                                        schema: Arc::clone(&expected.schema),
+                                        batches: alternative.batches.clone(),
+                                        ordered: alternative.ordered,
+                                    };
+                                    compare_results(&alternative, actual, order, options)
+                                        .is_ok()
+                                },
+                            ) =>
                     {
                         Err(if self.alternatives.is_empty() {
                             difference
@@ -835,9 +853,13 @@ where
     let order = result_order(&datafusion, &plan, options).await;
     let alternatives = match (&datafusion_outcome, &pipeline_outcome) {
         (Ok(expected), Ok(actual))
-            if compare_results(expected, actual, &order, options).is_err() =>
+            if compare_schemas(expected, actual).is_ok()
+                && compare_results(expected, actual, &order, options).is_err() =>
         {
-            alternative_outcomes(&datafusion, &plan, options, actual).await
+            let mut alternatives =
+                alternative_outcomes(&datafusion, &plan, options, actual).await;
+            alternatives.extend(nan_alternatives(&datafusion, &plan, options).await);
+            alternatives
         }
         _ => vec![],
     };
@@ -1117,7 +1139,7 @@ impl NestedLimit {
             columns.push(Arc::new(positions_array(rows)?));
             fields.push((None, Arc::new(Field::new(lineage, DataType::UInt32, false))));
         }
-        let batch = rows_batch(columns, &fields)?;
+        let batch = rows_batch(columns, &fields, self.plan.schema().metadata())?;
         let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
         self.plan_over(Arc::new(table), lineage)
     }
@@ -1257,8 +1279,11 @@ pub async fn alternative_outcomes(
         for (entry, rows) in nested.iter().zip(chosen) {
             replacements.push(match (entry, rows) {
                 (Some(possible), Some(rows)) => {
-                    let batch =
-                        rows_batch((*rows).clone(), &possible.limit.row_fields())?;
+                    let batch = rows_batch(
+                        (*rows).clone(),
+                        &possible.limit.row_fields(),
+                        possible.limit.plan.schema().metadata(),
+                    )?;
                     let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
                     Some(possible.limit.plan_over(Arc::new(table), None)?)
                 }
@@ -1326,6 +1351,82 @@ pub async fn alternative_outcomes(
     alternatives
 }
 
+/// Other outputs of DataFusion for `plan`, planned by `ctx`, with the order of
+/// their rows, to be compared with `options`, for other signs of the `NaN`s of
+/// the floating-point keys of its top-level sort: DataFusion sorts negative
+/// `NaN`s first and positive ones last, but `NaN = NaN`, so another engine may
+/// sort all of them first or last. The query runs with these keys as
+/// positive, then as negative `NaN`s.
+pub async fn nan_alternatives(
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+    options: &ComparisonOptions,
+) -> Vec<(EngineOutput, ResultOrder)> {
+    let mut alternatives = vec![];
+    for negative in [false, true] {
+        let Ok(Some(normalized)) = normalize_nans(plan, negative) else {
+            continue;
+        };
+        let Ok(output) =
+            run_dataframe(ctx, DataFrame::new(ctx.state(), normalized.clone())).await
+        else {
+            continue;
+        };
+        let order = result_order(ctx, &normalized, options).await;
+        alternatives.push((output, order));
+    }
+    alternatives
+}
+
+/// `plan` with its top-level sort by `CASE WHEN isnan(key) THEN NaN ELSE key
+/// END` for each of its floating-point keys `key`, a negative `NaN` if
+/// `negative`: `None` if it has none.
+fn normalize_nans(plan: &LogicalPlan, negative: bool) -> Result<Option<LogicalPlan>> {
+    match plan {
+        LogicalPlan::Projection(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Limit(_) => {
+            let Some(input) = normalize_nans(plan.inputs()[0], negative)? else {
+                return Ok(None);
+            };
+            Ok(Some(plan.with_new_exprs(plan.expressions(), vec![input])?))
+        }
+        LogicalPlan::Sort(sort) => {
+            let schema = sort.input.schema();
+            let mut floats = false;
+            let mut expr = vec![];
+            for sort_expr in &sort.expr {
+                let data_type = sort_expr.expr.get_type(schema)?;
+                if !matches!(
+                    data_type,
+                    DataType::Float16 | DataType::Float32 | DataType::Float64
+                ) {
+                    expr.push(sort_expr.clone());
+                    continue;
+                }
+                floats = true;
+                let nan = if negative { -f64::NAN } else { f64::NAN };
+                let nan = Expr::Literal(ScalarValue::Float64(Some(nan)), None)
+                    .cast_to(&data_type, schema)?;
+                let key = datafusion_expr::when(isnan(sort_expr.expr.clone()), nan)
+                    .otherwise(sort_expr.expr.clone())?;
+                expr.push(SortExpr {
+                    expr: key,
+                    ..sort_expr.clone()
+                });
+            }
+            Ok(floats.then(|| {
+                LogicalPlan::Sort(Sort {
+                    expr,
+                    input: Arc::clone(&sort.input),
+                    fetch: sort.fetch,
+                })
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The rows (the columns of [`NestedLimit::columns`]) that a nested limit or
 /// a `DISTINCT ON` returns.
 type Rows = Vec<ArrayRef>;
@@ -1384,8 +1485,11 @@ fn possible_outputs(
         for combination in combinations {
             let mut replacements = vec![];
             for (inner, &i) in inners.iter().zip(&combination) {
-                let batch =
-                    rows_batch(inner.outputs[i].clone(), &inner.limit.row_fields())?;
+                let batch = rows_batch(
+                    inner.outputs[i].clone(),
+                    &inner.limit.row_fields(),
+                    inner.limit.plan.schema().metadata(),
+                )?;
                 let table = MemTable::try_new(batch.schema(), vec![vec![batch]])?;
                 replacements.push(inner.limit.plan_over(Arc::new(table), None)?);
             }
@@ -1437,7 +1541,11 @@ async fn slot_choices(
             continue;
         };
         let fields = possible.limit.row_fields();
-        let empty = rows_batch(possible.limit.columns(&[])?, &fields)?;
+        let empty = rows_batch(
+            possible.limit.columns(&[])?,
+            &fields,
+            possible.limit.plan.schema().metadata(),
+        )?;
         let slot = Arc::new(Slot {
             schema: empty.schema(),
             batch: Mutex::new(empty.clone()),
@@ -1469,8 +1577,11 @@ async fn slot_choices(
         for ((slot, entry), index) in slots.iter().zip(nested).zip(&combination) {
             if let (Some((slot, fields)), Some(possible), Some(i)) = (slot, entry, index)
             {
-                *slot.batch.lock().expect("the slot is not poisoned") =
-                    rows_batch(possible.outputs[*i].clone(), fields)?;
+                *slot.batch.lock().expect("the slot is not poisoned") = rows_batch(
+                    possible.outputs[*i].clone(),
+                    fields,
+                    possible.limit.plan.schema().metadata(),
+                )?;
             }
         }
         let Ok(batches) =
@@ -1801,6 +1912,7 @@ fn nested_limits(plan: &LogicalPlan) -> Vec<LogicalPlan> {
 fn rows_batch(
     columns: Vec<ArrayRef>,
     fields: &[(Option<TableReference>, FieldRef)],
+    metadata: &arrow::datatypes::Metadata,
 ) -> Result<RecordBatch> {
     let schema = fields
         .iter()
@@ -1808,7 +1920,7 @@ fn rows_batch(
         .map(|(i, (_, field))| field.as_ref().clone().with_name(format!("c{i}")))
         .collect::<Vec<_>>();
     Ok(RecordBatch::try_new(
-        Arc::new(Schema::new(schema)),
+        Arc::new(Schema::new_with_metadata(schema, metadata.clone())),
         columns,
     )?)
 }
@@ -8431,6 +8543,125 @@ mod tests {
             &setup,
         )
         .await;
+    }
+
+    /// The outcomes of `sql` over the table `m` of `batch` in DataFusion, and
+    /// `pipeline` as the output of the pipeline engine.
+    async fn outcomes_of(
+        batch: RecordBatch,
+        sql: &str,
+        pipeline: Vec<RecordBatch>,
+    ) -> Result<EngineOutcomes> {
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", batch)?;
+        let options = ComparisonOptions::default();
+        let plan = ctx.sql(sql).await?.logical_plan().clone();
+        let datafusion = run_dataframe(&ctx, ctx.sql(sql).await?).await?;
+        let pipeline = output(pipeline, true);
+        let order = result_order(&ctx, &plan, &options).await;
+        let mut alternatives =
+            alternative_outcomes(&ctx, &plan, &options, &pipeline).await;
+        alternatives.extend(nan_alternatives(&ctx, &plan, &options).await);
+        Ok(EngineOutcomes {
+            datafusion: Ok(datafusion),
+            pipeline: Ok(pipeline),
+            order,
+            alternatives,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_nans_of_other_signs() -> Result<()> {
+        // DataFusion sorts `-NaN` first and `NaN` last, but `NaN = NaN`: an engine
+        // whose `NaN`s are all positive sorts them last, by their later keys.
+        let nan = f64::NAN;
+        for (datafusion, pipeline, sqls) in [
+            (
+                vec![(-nan, 2), (nan, 1)],
+                vec![(nan, 2), (nan, 1)],
+                vec![
+                    "SELECT k, v FROM m ORDER BY k, v",
+                    "SELECT v FROM m ORDER BY k, v LIMIT 1",
+                ],
+            ),
+            (
+                vec![(-nan, 3), (1.0, 2), (nan, 1)],
+                vec![(nan, 3), (1.0, 2), (nan, 1)],
+                vec![
+                    "SELECT v FROM m ORDER BY k, v",
+                    "SELECT k, v FROM m ORDER BY k DESC, v",
+                ],
+            ),
+        ] {
+            let setup = per_engine_tables(
+                float_kv_batch(&datafusion, 0, 0.0),
+                float_kv_batch(&pipeline, 0, 0.0),
+            );
+            for sql in sqls {
+                assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+            }
+        }
+        // But the `NaN`s stay together, in the order of their later keys.
+        let batch = float_kv_batch(&[(-nan, 3), (1.0, 2), (nan, 1)], 0, 0.0);
+        let options = ComparisonOptions::default();
+        for (result, valid) in [
+            ([3, 2, 1], true),
+            ([2, 1, 3], true),
+            ([1, 3, 2], true),
+            ([3, 1, 2], false),
+        ] {
+            let pipeline = vec![int_batch(&result.map(Some))];
+            let outcomes =
+                outcomes_of(batch.clone(), "SELECT v FROM m ORDER BY k, v", pipeline)
+                    .await?;
+            assert_eq!(outcomes.compare(&options).is_ok(), valid, "{result:?}");
+        }
+        Ok(())
+    }
+
+    /// A batch of `(k INT, v INT)` rows, whose schema and field `v` have
+    /// metadata.
+    fn kv_metadata_batch(rows: &[(i32, i32)]) -> RecordBatch {
+        let batch = kv_int_batch(rows);
+        let schema = batch.schema();
+        let fields = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let metadata = HashMap::from([("unit".to_string(), "kg".to_string())]);
+                if field.name() == "v" {
+                    Arc::new(field.as_ref().clone().with_metadata(metadata))
+                } else {
+                    Arc::clone(field)
+                }
+            })
+            .collect::<Vec<_>>();
+        let metadata = HashMap::from([("source".to_string(), "test".to_string())]);
+        let schema = Schema::new_with_metadata(fields, metadata);
+        RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_require_the_schema_of_datafusion_with_other_rows_of_nested_limits()
+    -> Result<()> {
+        let sql = "SELECT * FROM (SELECT * FROM m ORDER BY k LIMIT 1) s ORDER BY v";
+        let setup = per_engine_tables(
+            kv_metadata_batch(&[(0, 1), (0, 2)]),
+            kv_metadata_batch(&[(0, 2), (0, 1)]),
+        );
+        assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        // The other row that ties, with the metadata of the schema of DataFusion
+        // or without it.
+        let options = ComparisonOptions::default();
+        let batch = kv_metadata_batch(&[(0, 1), (0, 2)]);
+        let with = vec![kv_metadata_batch(&[(0, 2)])];
+        let outcomes = outcomes_of(batch.clone(), sql, with).await?;
+        outcomes.compare(&options).unwrap();
+        let without = vec![kv_int_batch(&[(0, 2)])];
+        let outcomes = outcomes_of(batch, sql, without).await?;
+        let err = outcomes.compare(&options).unwrap_err();
+        assert!(err.starts_with("the output schemas differ"), "{err}");
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
