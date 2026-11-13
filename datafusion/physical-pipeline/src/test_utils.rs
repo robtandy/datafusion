@@ -1357,11 +1357,13 @@ fn possible_outputs(
     Box::pin(async move {
         let inner = inner_limits(&plan);
         let limit = NestedLimit::new(ctx, plan.clone(), tolerance).await?;
+        // The rows that it may return for the rows of the nested limits inside it
+        // that DataFusion returns, those of DataFusion first.
         let mut outputs = vec![limit.columns(&limit.own())?];
+        for choice in limit.choices(None, max) {
+            outputs.push(limit.columns(&choice)?);
+        }
         if inner.is_empty() {
-            for choice in limit.choices(None, max) {
-                outputs.push(limit.columns(&choice)?);
-            }
             return Ok(PossibleOutputs {
                 limit,
                 outputs,
@@ -8363,6 +8365,35 @@ mod tests {
         ] {
             assert_same_results_as_datafusion_with_setup(&sql, &setup).await;
         }
+        // The outer limit may return any of the rows that tie, also for the rows
+        // of the inner limit that DataFusion returns.
+        let ctx = datafusion_context(test_session_config());
+        ctx.register_batch("m", kv_int_batch(&[(0, 1), (0, 2), (0, 3)]))
+            .unwrap();
+        let sql = "SELECT sum(v) AS total FROM \
+                   (SELECT v FROM (SELECT k, v FROM m ORDER BY v LIMIT 3) a ORDER BY k LIMIT 1) b";
+        let plan = ctx.sql(sql).await.unwrap().logical_plan().clone();
+        let options = ComparisonOptions::default();
+        let expected = run_dataframe(&ctx, ctx.sql(sql).await.unwrap())
+            .await
+            .unwrap();
+        let order = result_order(&ctx, &plan, &options).await;
+        for (total, valid) in [(1, true), (2, true), (3, true), (4, false), (6, false)] {
+            let values = Int64Array::from(vec![total]);
+            let result = output(
+                vec![batch_of(vec![("total", Arc::new(values) as ArrayRef)])],
+                false,
+            );
+            let accepted = compare_results(&expected, &result, &order, &options).is_ok()
+                || alternative_outcomes(&ctx, &plan, &options, &result)
+                    .await
+                    .iter()
+                    .any(|(expected, order)| {
+                        compare_results(expected, &result, order, &options).is_ok()
+                    });
+            assert_eq!(accepted, valid, "{sql}: {total:?}");
+        }
+
         // But never `3`.
         let ctx = datafusion_context(test_session_config());
         ctx.register_batch("m", kv_int_batch(&[(0, 1), (0, 2), (0, 3)]))
