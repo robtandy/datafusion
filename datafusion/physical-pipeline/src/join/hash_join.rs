@@ -6419,6 +6419,8 @@ mod tests {
         //   of `two` if the `IN` lists may have no values (and with `k` of
         //   `full`, whose keys fill their bounds, without any), the scan filters
         //   the rows with `pushdown_filters`: it produces the rows that match.
+        //   Without, the native scan filters them where that pays off: it
+        //   produces at least the rows that match, and at most those it reads.
         let dir = tempfile::tempdir()?;
         write_parquet_table_q(dir.path())?;
         let setup = async |ctx: &SessionContext| register_tables_q(ctx, dir.path()).await;
@@ -6436,7 +6438,7 @@ mod tests {
             statistics: usize,
             bloom: usize,
             /// The rows that match, which the scan produces with
-            /// `pushdown_filters`, and the rows it produces without, if known.
+            /// `pushdown_filters`, and the rows it reads, if known.
             matches: usize,
             rows: Option<usize>,
         }
@@ -6573,7 +6575,10 @@ mod tests {
                         assert_eq!(probe_rows, matches, "{case}: {filter}");
                     }
                 } else if let Some(rows) = rows {
-                    assert_eq!(probe_rows, rows, "{case}: {filter}");
+                    assert!(
+                        (matches..=rows).contains(&probe_rows),
+                        "{case}: {filter}: {probe_rows} rows"
+                    );
                 }
 
                 assert_join_parity_with_setup(sql, config, &setup, 1).await;
