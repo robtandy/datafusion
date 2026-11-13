@@ -3819,9 +3819,10 @@ mod tests {
         // of 1 MiB of its own, made as the table is read (see `SlicedRows`),
         // read by the native operators that keep the rows of their inputs
         // (until they sort them, aggregate them in their order or join with
-        // them): they keep copies of the rows only, not the arrays that they
-        // are slices of (whose bytes beyond those of the rows, which they
-        // reserve, they would hold unreserved). In a pool of 4 MiB (the scan
+        // them), or whose accumulators keep the arrays of their arguments:
+        // they keep copies of the rows only, not the arrays that they are
+        // slices of (whose bytes beyond those of the rows, which they reserve,
+        // they would hold unreserved). In a pool of 4 MiB (the scan
         // reserves the batch that it emits), every query returns its rows,
         // allocating less than 16 MiB (on the thread of the test, as a runtime
         // of the current thread runs all tasks of the query there), while the
@@ -3845,6 +3846,17 @@ mod tests {
                 "SELECT STRING_AGG(CAST(k AS VARCHAR), ',' ORDER BY k) AS ks FROM sliced",
                 "PhysicalHashAggregate",
                 1,
+            ),
+            // The accumulators of `ARRAY_AGG` keep the arrays of its arguments.
+            (
+                "SELECT ARRAY_AGG(k) AS ks FROM sliced",
+                "PhysicalHashAggregate",
+                1,
+            ),
+            (
+                "SELECT k % 2 AS g, ARRAY_AGG(k) AS ks FROM sliced GROUP BY k % 2",
+                "PhysicalHashAggregate",
+                2,
             ),
             // (A single row of `t2` has `k = 7`.)
             (
