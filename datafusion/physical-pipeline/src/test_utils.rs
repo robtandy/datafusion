@@ -55,8 +55,8 @@
 //!      whose zeros only differ in sign may also be ordered by their later
 //!      keys. Likewise, it sorts negative `NaN`s first and positive ones last,
 //!      but `NaN = NaN`: the rows may also be in the order of the query whose
-//!      top-level sort has all its `NaN`s positive, or all negative (see
-//!      [`nan_alternatives`]).
+//!      top-level sort has all its `NaN`s positive, or all negative, also in
+//!      lists and structs (see [`nan_alternatives`]).
 //!      Ties are not transitive: rows that tie with a
 //!      row may not tie with each other. So rows that tie may come in any
 //!      order among themselves, and under `ORDER BY … LIMIT`, the last rows
@@ -170,8 +170,8 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, RunArray, UInt32Array,
-    new_null_array,
+    Array, ArrayRef, AsArray, FixedSizeListArray, LargeListArray, ListArray, RecordBatch,
+    RecordBatchOptions, RunArray, StructArray, UInt32Array, new_null_array,
 };
 use arrow::compute::{SortOptions, cast, concat_batches, take};
 use arrow::datatypes::{
@@ -191,7 +191,6 @@ use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::execution::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::{SessionState, SessionStateBuilder};
-use datafusion::functions::math::expr_fn::isnan;
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -203,7 +202,8 @@ use datafusion_expr::logical_plan::{
     Distinct, DistinctOn, FetchType, Limit, Projection, SkipType, Sort, SubqueryAlias,
 };
 use datafusion_expr::{
-    ColumnarValue, Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, SortExpr,
+    ColumnarValue, Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SortExpr, Volatility,
 };
 use datafusion_physical_pipeline::{PipelineQueryPlanner, PipelineRootExec};
 use datafusion_physical_plan::execution_plan::reset_plan_states;
@@ -1353,10 +1353,10 @@ pub async fn alternative_outcomes(
 
 /// Other outputs of DataFusion for `plan`, planned by `ctx`, with the order of
 /// their rows, to be compared with `options`, for other signs of the `NaN`s of
-/// the floating-point keys of its top-level sort: DataFusion sorts negative
-/// `NaN`s first and positive ones last, but `NaN = NaN`, so another engine may
-/// sort all of them first or last. The query runs with these keys as
-/// positive, then as negative `NaN`s.
+/// the keys of its top-level sort (also in lists and structs): DataFusion
+/// sorts negative `NaN`s first and positive ones last, but `NaN = NaN`, so
+/// another engine may sort all of them first or last. The query runs with all
+/// these `NaN`s positive, then negative (see [`NormalizeNans`]).
 pub async fn nan_alternatives(
     ctx: &SessionContext,
     plan: &LogicalPlan,
@@ -1378,9 +1378,10 @@ pub async fn nan_alternatives(
     alternatives
 }
 
-/// `plan` with its top-level sort by `CASE WHEN isnan(key) THEN NaN ELSE key
-/// END` for each of its floating-point keys `key`, a negative `NaN` if
-/// `negative`: `None` if it has none.
+/// `plan` with its top-level sort by the keys of its keys whose values have
+/// floating-point values (also in lists and structs) with all their `NaN`s
+/// positive, negative if `negative` (see [`NormalizeNans`]): `None` if it has
+/// none.
 fn normalize_nans(plan: &LogicalPlan, negative: bool) -> Result<Option<LogicalPlan>> {
     match plan {
         LogicalPlan::Projection(_)
@@ -1392,26 +1393,21 @@ fn normalize_nans(plan: &LogicalPlan, negative: bool) -> Result<Option<LogicalPl
             Ok(Some(plan.with_new_exprs(plan.expressions(), vec![input])?))
         }
         LogicalPlan::Sort(sort) => {
+            let normalize = ScalarUDF::new_from_impl(NormalizeNans {
+                negative,
+                signature: Signature::any(1, Volatility::Immutable),
+            });
             let schema = sort.input.schema();
             let mut floats = false;
             let mut expr = vec![];
             for sort_expr in &sort.expr {
-                let data_type = sort_expr.expr.get_type(schema)?;
-                if !matches!(
-                    data_type,
-                    DataType::Float16 | DataType::Float32 | DataType::Float64
-                ) {
+                if !has_floats(&sort_expr.expr.get_type(schema)?) {
                     expr.push(sort_expr.clone());
                     continue;
                 }
                 floats = true;
-                let nan = if negative { -f64::NAN } else { f64::NAN };
-                let nan = Expr::Literal(ScalarValue::Float64(Some(nan)), None)
-                    .cast_to(&data_type, schema)?;
-                let key = datafusion_expr::when(isnan(sort_expr.expr.clone()), nan)
-                    .otherwise(sort_expr.expr.clone())?;
                 expr.push(SortExpr {
-                    expr: key,
+                    expr: normalize.call(vec![sort_expr.expr.clone()]),
                     ..sort_expr.clone()
                 });
             }
@@ -1425,6 +1421,123 @@ fn normalize_nans(plan: &LogicalPlan, negative: bool) -> Result<Option<LogicalPl
         }
         _ => Ok(None),
     }
+}
+
+/// Whether values of `data_type` have floating-point values, also in lists
+/// and structs.
+fn has_floats(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => true,
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _) => has_floats(field.data_type()),
+        DataType::Struct(fields) => {
+            fields.iter().any(|field| has_floats(field.data_type()))
+        }
+        _ => false,
+    }
+}
+
+/// A function that returns its argument with all its `NaN`s (also in lists
+/// and structs) positive, or negative if `negative`, see
+/// [`nan_alternatives`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct NormalizeNans {
+    negative: bool,
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for NormalizeNans {
+    fn name(&self) -> &str {
+        if self.negative {
+            "__test_utils_negative_nans"
+        } else {
+            "__test_utils_positive_nans"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let array = args.args[0].to_array(args.number_rows)?;
+        Ok(ColumnarValue::Array(normalized_nans(
+            &array,
+            self.negative,
+        )?))
+    }
+}
+
+/// `array` with all its `NaN`s (also in lists and structs) positive, or
+/// negative if `negative`.
+fn normalized_nans(array: &ArrayRef, negative: bool) -> Result<ArrayRef> {
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+    Ok(match array.data_type() {
+        DataType::Float64 => {
+            let nan = if negative { -f64::NAN } else { f64::NAN };
+            Arc::new(array.as_primitive::<Float64Type>().unary::<_, Float64Type>(
+                |value| if value.is_nan() { nan } else { value },
+            ))
+        }
+        DataType::Float32 => {
+            let nan = if negative { -f32::NAN } else { f32::NAN };
+            Arc::new(array.as_primitive::<Float32Type>().unary::<_, Float32Type>(
+                |value| if value.is_nan() { nan } else { value },
+            ))
+        }
+        DataType::Float16 => {
+            let nan = if negative { -F16::NAN } else { F16::NAN };
+            Arc::new(array.as_primitive::<Float16Type>().unary::<_, Float16Type>(
+                |value| if value.is_nan() { nan } else { value },
+            ))
+        }
+        DataType::List(field) => {
+            let list = array.as_list::<i32>();
+            Arc::new(ListArray::try_new(
+                Arc::clone(field),
+                list.offsets().clone(),
+                normalized_nans(list.values(), negative)?,
+                list.nulls().cloned(),
+            )?)
+        }
+        DataType::LargeList(field) => {
+            let list = array.as_list::<i64>();
+            Arc::new(LargeListArray::try_new(
+                Arc::clone(field),
+                list.offsets().clone(),
+                normalized_nans(list.values(), negative)?,
+                list.nulls().cloned(),
+            )?)
+        }
+        DataType::FixedSizeList(field, size) => {
+            let list = array.as_fixed_size_list();
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(field),
+                *size,
+                normalized_nans(list.values(), negative)?,
+                list.nulls().cloned(),
+            )?)
+        }
+        DataType::Struct(fields) => {
+            let r#struct = array.as_struct();
+            let columns = r#struct
+                .columns()
+                .iter()
+                .map(|column| normalized_nans(column, negative))
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                fields.clone(),
+                columns,
+                r#struct.nulls().cloned(),
+            )?)
+        }
+        _ => Arc::clone(array),
+    })
 }
 
 /// The rows (the columns of [`NestedLimit::columns`]) that a nested limit or
@@ -1857,35 +1970,66 @@ fn replace_ambiguous(
     top_level_path: bool,
     replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
 ) -> Result<LogicalPlan> {
-    // The limits above the top-level sort of the query, and the sort, which
-    // the sorted reference of the query compares, come first.
-    let mut top_level = 0;
-    if top_level_path && has_top_level_order_by(plan) {
-        let mut node = plan;
-        loop {
-            top_level += usize::from(limits_a_sort(node));
-            match node {
-                LogicalPlan::Projection(_)
-                | LogicalPlan::SubqueryAlias(_)
-                | LogicalPlan::Limit(_) => node = node.inputs()[0],
-                _ => break,
-            }
-        }
-    }
     let mut index = 0;
+    if top_level_path && has_top_level_order_by(plan) {
+        replace_on_path(plan, replace, &mut index)
+    } else {
+        replace_below(plan.clone(), replace, &mut index)
+    }
+}
+
+/// `plan`, a query with a top-level `ORDER BY`, whose limits above its
+/// top-level sort and whose sort the sorted reference of the query compares,
+/// with the nested limits and `DISTINCT ON`s of the subqueries of the nodes of
+/// this path and below its sort that `replace` replaces (see
+/// [`replace_below`]).
+fn replace_on_path(
+    plan: &LogicalPlan,
+    replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
+    index: &mut usize,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Projection(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Sort(_) => {
+            let node = plan
+                .clone()
+                .map_subqueries(|subquery| {
+                    Ok(Transformed::yes(replace_below(subquery, replace, index)?))
+                })?
+                .data;
+            let input = match plan {
+                LogicalPlan::Sort(sort) => {
+                    replace_below(sort.input.as_ref().clone(), replace, index)?
+                }
+                _ => replace_on_path(plan.inputs()[0], replace, index)?,
+            };
+            node.with_new_exprs(node.expressions(), vec![input])
+        }
+        // A top-level `DISTINCT ON`, which may return other rows.
+        _ => replace_below(plan.clone(), replace, index),
+    }
+}
+
+/// `plan` with its nested limits and `DISTINCT ON`s that `replace` replaces
+/// (given their index from `index` on, and their plan): its limits over
+/// sorts, its sorts with a fetch and its `DISTINCT ON`s, also in subqueries,
+/// but not inside each other.
+fn replace_below(
+    plan: LogicalPlan,
+    replace: &mut dyn FnMut(usize, &LogicalPlan) -> Option<LogicalPlan>,
+    index: &mut usize,
+) -> Result<LogicalPlan> {
     Ok(plan
-        .clone()
         .transform_down_with_subqueries(|node| {
-            let distinct_on = matches!(node, LogicalPlan::Distinct(Distinct::On(_)));
-            if !limits_a_sort(&node) && !distinct_on {
+            if !limits_a_sort(&node)
+                && !matches!(node, LogicalPlan::Distinct(Distinct::On(_)))
+            {
                 return Ok(Transformed::no(node));
             }
-            if top_level > 0 && !distinct_on {
-                top_level -= 1;
-                return Ok(Transformed::no(node));
-            }
-            index += 1;
-            Ok(match replace(index - 1, &node) {
+            *index += 1;
+            Ok(match replace(*index - 1, &node) {
                 Some(rows) => Transformed::new(rows, true, TreeNodeRecursion::Jump),
                 None => Transformed::new(node, false, TreeNodeRecursion::Jump),
             })
@@ -5168,9 +5312,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use arrow::array::{
-        DictionaryArray, FixedSizeListArray, Float32Array, Float64Array, Float64Builder,
-        Int8Array, Int32Array, Int64Array, ListArray, MapBuilder, StringArray,
-        StringBuilder, StringViewArray, StructArray, UnionArray,
+        DictionaryArray, Float32Array, Float64Array, Float64Builder, Int8Array,
+        Int32Array, Int64Array, MapBuilder, StringArray, StringBuilder, StringViewArray,
+        UnionArray,
     };
     use arrow::buffer::{NullBuffer, ScalarBuffer};
     use arrow::datatypes::{Fields, Int8Type, UnionFields};
@@ -8617,6 +8761,40 @@ mod tests {
             assert_eq!(outcomes.compare(&options).is_ok(), valid, "{result:?}");
         }
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_accept_nans_of_other_signs_in_nested_keys() {
+        let nan = f64::NAN;
+        let setup = per_engine_tables(
+            float_kv_batch(&[(-nan, 2), (nan, 1)], 0, 0.0),
+            float_kv_batch(&[(nan, 2), (nan, 1)], 0, 0.0),
+        );
+        for sql in [
+            "SELECT v FROM m ORDER BY make_array(k), v",
+            "SELECT v FROM m ORDER BY make_array(k), v LIMIT 1",
+            "SELECT v FROM m ORDER BY named_struct('k', k), v",
+            "SELECT v FROM m ORDER BY named_struct('k', k), v LIMIT 1",
+        ] {
+            assert_same_results_as_datafusion_with_setup(sql, &setup).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_results_as_datafusion_tell_nested_limits_in_subqueries_from_top_level_ones()
+     {
+        // The scalar subquery is a nested limit, the limit of the subquery of
+        // `t` is the top-level one, which returns both rows.
+        let setup = per_engine_tables(
+            kv_int_batch(&[(0, 1), (0, 2)]),
+            kv_int_batch(&[(0, 2), (0, 1)]),
+        );
+        assert_same_results_as_datafusion_with_setup(
+            "SELECT (SELECT v FROM m ORDER BY k LIMIT 1) AS chosen, v \
+             FROM (SELECT v FROM m ORDER BY v LIMIT 2) t",
+            &setup,
+        )
+        .await;
     }
 
     /// A batch of `(k INT, v INT)` rows, whose schema and field `v` have
