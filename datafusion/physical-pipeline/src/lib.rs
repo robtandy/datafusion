@@ -34,6 +34,8 @@
 //!   between DataFusion `ExecutionPlan`s and the pipeline engine.
 //! * [`planner`] - [`PipelineQueryPlanner`].
 //! * [`explain`] - `EXPLAIN` and metrics support.
+//! * [`profiling`] - per-operator profiling of the executions
+//!   ([`ProfilingOptions`], [`QueryProfile`]), see `docs/profiling.md`.
 //! * [`tuple_data`], [`sources`], [`operators`], [`join`], [`aggregate`],
 //!   [`sort`] and [`window`] - native operators.
 
@@ -52,6 +54,7 @@ pub mod operator;
 pub mod operators;
 pub mod pipeline;
 pub mod planner;
+pub mod profiling;
 pub mod sort;
 pub mod sources;
 #[cfg(test)]
@@ -74,3 +77,4 @@ pub use pipeline::{
     MetaPipeline, MetaPipelineBuilder, Pipeline, PipelineBuilder, PipelineGraph,
 };
 pub use planner::PipelineQueryPlanner;
+pub use profiling::{ProfilingOptions, QueryProfile};

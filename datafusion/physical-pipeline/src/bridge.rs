@@ -44,6 +44,7 @@ use crate::operator::{
     ExecutionContext, GlobalSourceState, LocalSourceState, PhysicalOperator,
     SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
+use crate::profiling::QueryProfile;
 
 /// A source that executes a DataFusion [`ExecutionPlan`] and emits its
 /// output as [`DataChunk`]s of at most [`DEFAULT_VECTOR_SIZE`] rows.
@@ -377,6 +378,14 @@ impl PipelineRootExec {
     /// The operator metrics of the most recent execution, if any.
     pub fn execution_metrics(&self) -> Option<Arc<ExecutionMetrics>> {
         self.execution_metrics.lock().clone()
+    }
+
+    /// The profile of the most recent execution, once it completed, if it
+    /// was profiled: if the session enables
+    /// [`ProfilingOptions`](crate::profiling::ProfilingOptions).
+    pub fn profile(&self) -> Option<Arc<QueryProfile>> {
+        self.execution_metrics()
+            .and_then(|metrics| metrics.profile())
     }
 
     pub(crate) fn metrics_set(&self) -> &ExecutionPlanMetricsSet {

@@ -22,6 +22,14 @@
 //!   the operators of the pipeline engine are not: the planner shows the
 //!   plan through an `AnalyzedPipelineExec`, which applies it to them, and
 //!   to the nodes of the bridged plans.
+//! * If the execution was profiled (see [`ProfilingOptions`]), `EXPLAIN
+//!   ANALYZE` also shows the metrics of its [`QueryProfile`] that fit on its
+//!   lines (development metrics): those of the execution
+//!   (`profile=[...]` on the line of the `PipelineRootExec`), of every
+//!   operator (`blocked_time`, `rows_in`, `bytes_in`, `bytes_out` and
+//!   `memory_peak`, after its other metrics) and of every pipeline
+//!   (`profile=[...]` on its line). [`QueryProfile::to_json`] has all of
+//!   them.
 //!
 //! For example, `EXPLAIN ANALYZE SELECT d, COUNT(*) FROM t GROUP BY d` shows
 //!
@@ -54,7 +62,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::display::human_readable::{
-    human_readable_count, human_readable_duration,
+    human_readable_count, human_readable_duration, human_readable_size,
 };
 use datafusion_common::display::{PlanType, StringifiedPlan};
 use datafusion_common::format::ExplainFormat;
@@ -77,6 +85,9 @@ use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
 use crate::executor::{ExecutionMetrics, PipelineStream};
 use crate::operator::{OperatorMetrics, PhysicalOperator, operator_key};
 use crate::pipeline::{PipelineGraph, PipelineId};
+#[cfg(doc)]
+use crate::profiling::ProfilingOptions;
+use crate::profiling::{Metric, MetricUnit, OperatorProfile, QueryProfile};
 
 impl DisplayAs for PipelineRootExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -161,6 +172,8 @@ struct ExplainedTree<'a> {
     pipelines: HashMap<usize, Vec<PipelineId>>,
     /// The metrics of the last execution, if any.
     metrics: Option<Arc<ExecutionMetrics>>,
+    /// The profile of the last execution, if it was profiled.
+    profile: Option<Arc<QueryProfile>>,
     /// The metrics that are shown.
     selection: &'a MetricSelection,
 }
@@ -188,11 +201,13 @@ impl<'a> ExplainedTree<'a> {
                 }
             }
         }
+        let profile = metrics.as_ref().and_then(|metrics| metrics.profile());
         Self {
             root,
             graph,
             pipelines,
             metrics,
+            profile,
             selection,
         }
     }
@@ -209,6 +224,12 @@ impl<'a> ExplainedTree<'a> {
         if bridged > 0 {
             write!(f, ", bridged_plans={bridged}")?;
         }
+        if let Some(profile) = &self.profile {
+            let metrics = profile.executor().metrics();
+            let shown =
+                format_profile_metrics(&metrics, EXECUTOR_METRICS, self.selection);
+            write!(f, ", profile=[{shown}]")?;
+        }
         self.fmt_operator(f, self.root, 1, verbose)?;
         let Ok(graph) = &self.graph else {
             return Ok(());
@@ -223,6 +244,16 @@ impl<'a> ExplainedTree<'a> {
             after.dedup();
             if !after.is_empty() {
                 write!(f, ", after pipelines {after:?}")?;
+            }
+            if let Some(profiled) = self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.pipelines().get(pipeline.id()))
+            {
+                let metrics = profiled.metrics();
+                let shown =
+                    format_profile_metrics(&metrics, PIPELINE_METRICS, self.selection);
+                write!(f, ", profile=[{shown}]")?;
             }
         }
         Ok(())
@@ -250,10 +281,14 @@ impl<'a> ExplainedTree<'a> {
             .as_ref()
             .and_then(|metrics| metrics.get(operator.as_ref()))
         {
+            let profiled = self
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.operator(operator.as_ref()));
             write!(
                 f,
                 ", metrics=[{}]",
-                format_operator_metrics(operator, metrics, self.selection)
+                format_operator_metrics(operator, metrics, profiled, self.selection)
             )?;
         }
         if let Some(bridge) = bridge {
@@ -297,15 +332,91 @@ impl<'a> ExplainedTree<'a> {
     }
 }
 
+/// The metrics of the [`QueryProfile`] of an execution that `EXPLAIN ANALYZE`
+/// shows on the line of the `PipelineRootExec`.
+const EXECUTOR_METRICS: &[&str] = &[
+    "elapsed_time",
+    "threads",
+    "morsels",
+    "active_time",
+    "idle_time",
+    "blocked_time",
+    "queue_wait_time",
+    "memory_peak",
+];
+
+/// The metrics of the profile of an operator that `EXPLAIN ANALYZE` shows
+/// after its other metrics.
+const OPERATOR_METRICS: &[&str] = &[
+    "blocked_time",
+    "rows_in",
+    "bytes_in",
+    "bytes_out",
+    "memory_peak",
+];
+
+/// The metrics of the profile of a pipeline that `EXPLAIN ANALYZE` shows on
+/// its line.
+const PIPELINE_METRICS: &[&str] = &[
+    "threads",
+    "morsels",
+    "elapsed_time",
+    "active_time",
+    "idle_time",
+    "blocked_time",
+    "queue_wait_time",
+];
+
+/// The metrics `names` of `metrics`, a part of a [`QueryProfile`], that
+/// `selection` selects, for `EXPLAIN ANALYZE`: all of them are development
+/// metrics, whose category is that of their unit.
+fn format_profile_metrics(
+    metrics: &[Metric],
+    names: &[&str],
+    selection: &MetricSelection,
+) -> String {
+    let mut out = String::new();
+    for metric in names
+        .iter()
+        .filter_map(|name| metrics.iter().find(|metric| metric.name == *name))
+    {
+        let category = match metric.unit {
+            MetricUnit::Nanoseconds => MetricCategory::Timing,
+            MetricUnit::Bytes => MetricCategory::Bytes,
+            MetricUnit::Rows | MetricUnit::Morsels | MetricUnit::Count => {
+                MetricCategory::Rows
+            }
+        };
+        if !selection.shows(MetricType::Dev, category) {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        let value = match metric.unit {
+            MetricUnit::Nanoseconds => human_readable_duration(metric.value),
+            MetricUnit::Bytes => human_readable_size(metric.value as usize),
+            MetricUnit::Rows | MetricUnit::Morsels | MetricUnit::Count => {
+                human_readable_count(metric.value as usize)
+            }
+        };
+        let _ = write!(out, "{}={value}", metric.name);
+    }
+    out
+}
+
 /// The metrics of `operator` in an execution, for `EXPLAIN ANALYZE`, that
 /// `selection` selects: the rows and chunks it produced (as a source or an
 /// operator) and consumed (as a sink), and the time spent in it, summed over
 /// all threads. Their types and categories are those of the corresponding
 /// metrics of DataFusion: `output_rows` and `elapsed_compute` are summary
-/// metrics, the others development metrics, like `output_batches`.
+/// metrics, the others development metrics, like `output_batches`. If the
+/// execution was profiled, the metrics of its profile (`profiled`) that
+/// [`OPERATOR_METRICS`] lists follow.
 fn format_operator_metrics(
     operator: &Arc<dyn PhysicalOperator>,
     metrics: &OperatorMetrics,
+    profiled: Option<&OperatorProfile>,
     selection: &MetricSelection,
 ) -> String {
     let count = |value: usize| human_readable_count(value);
@@ -349,6 +460,14 @@ fn format_operator_metrics(
             }
             let _ = write!(out, "{name}={value}");
         }
+    }
+    if let Some(profiled) = profiled {
+        let profile =
+            format_profile_metrics(&profiled.metrics(), OPERATOR_METRICS, selection);
+        if !out.is_empty() && !profile.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(&profile);
     }
     out
 }
