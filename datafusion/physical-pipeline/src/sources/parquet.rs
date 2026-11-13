@@ -2286,15 +2286,15 @@ fn decoded_columns(
 }
 
 /// A [`ParquetSource`] like `source` (with its table schema, options, file
-/// reader factory and predicate) that decodes `projection`, over the table
-/// schema, which may read columns that the projection of `source` does not
-/// produce. DataFusion can only narrow the projection of a source (see
-/// `ParquetSource::try_pushdown_projection`), so this is a new source: it has
-/// its own metrics (see [`RowFilterState::widened_metrics`]), and neither a
-/// schema provider (`ParquetSource::with_schema_provider`) nor an encryption
-/// factory of `source` (see [`ScanPredicate::widens`]), nor the order of the
-/// row groups that a sort pushed into `source` (which only matters to the
-/// pace of a TopK above the scan).
+/// reader factory, schema provider and predicate) that decodes `projection`,
+/// over the table schema, which may read columns that the projection of
+/// `source` does not produce. DataFusion can only narrow the projection of a
+/// source (see `ParquetSource::try_pushdown_projection`), so this is a new
+/// source: it has its own metrics (see [`RowFilterState::widened_metrics`]),
+/// and neither an encryption factory of `source` (see
+/// [`ScanPredicate::widens`]) nor the order of the row groups that a sort
+/// pushed into `source` (which only matters to the pace of a TopK above the
+/// scan).
 fn widened_source(
     source: &ParquetSource,
     projection: &ProjectionExprs,
@@ -2308,6 +2308,10 @@ fn widened_source(
     }
     if let Some(factory) = source.parquet_file_reader_factory() {
         widened = widened.with_parquet_file_reader_factory(Arc::clone(factory));
+    }
+    // The files may only be readable with the schemas that it gives.
+    if let Some(provider) = source.schema_provider() {
+        widened = widened.with_schema_provider(Arc::clone(provider));
     }
     if let Some(predicate) = source.filter() {
         widened = widened.with_predicate(predicate);
@@ -4403,6 +4407,116 @@ mod tests {
                 assert_same_results(sql, config, &setup).await;
             }
         }
+        Ok(())
+    }
+
+    /// The schema provider of the files of
+    /// [`native_filtering_reads_with_the_schema_provider`]: the schema of
+    /// `big`, whatever the files say.
+    #[derive(Debug)]
+    struct BigSchema;
+
+    impl datafusion_datasource_parquet::ParquetFileSchemaProvider for BigSchema {
+        fn schema(
+            &self,
+            _parquet_schema: &parquet::schema::types::SchemaDescriptor,
+        ) -> Result<SchemaRef> {
+            Ok(big_schema())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn native_filtering_reads_with_the_schema_provider() -> Result<()> {
+        // 8 files of a row group of `big` each, whose `ARROW:schema` hint is
+        // invalid, which only a source with a schema provider reads (it derives the schemas of the
+        // files from their Parquet schemas instead). With `pushdown_filters`
+        // and a projection without `k`, the units that the scan reads without
+        // row filters decode `k` too, with a widened source (see
+        // `widened_source`), which reads them with the same provider.
+        use datafusion_physical_expr::expressions::binary;
+        use parquet::arrow::ArrowWriter;
+        use parquet::arrow::arrow_writer::ArrowWriterOptions;
+        use parquet::file::metadata::KeyValue;
+
+        let dir = tempfile::tempdir()?;
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(BIG_ROW_GROUP_ROWS))
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "ARROW:schema".to_string(),
+                "invalid schema".to_string(),
+            )]))
+            .build();
+        let mut files = vec![];
+        let file_rows = BIG_ROW_GROUP_ROWS as i64;
+        for file in 0..8 {
+            let path = dir.path().join(format!("{file}.parquet"));
+            let options = ArrowWriterOptions::new()
+                .with_properties(properties.clone())
+                .with_skip_arrow_metadata(true);
+            let mut writer = ArrowWriter::try_new_with_options(
+                std::fs::File::create(&path)?,
+                big_schema(),
+                options,
+            )?;
+            let start = file * file_rows;
+            writer.write(&big_batch(start..start + file_rows))?;
+            writer.close()?;
+            let size = std::fs::metadata(&path)?.len();
+            files.push(PartitionedFile::new(path.to_str().unwrap(), size));
+        }
+        // `SELECT id FROM big WHERE k % 8192 < 256`, with `pushdown_filters`.
+        let schema = big_schema();
+        let k: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
+        let predicate = binary(
+            binary(k, Operator::Modulo, lit(8192_i64), &schema)?,
+            Operator::Lt,
+            lit(256_i64),
+            &schema,
+        )?;
+        let source = ParquetSource::new(Arc::clone(&schema))
+            .with_schema_provider(Arc::new(BigSchema))
+            .with_pushdown_filters(true)
+            .with_predicate(predicate);
+        let Some(source) = source
+            .try_pushdown_projection(&ProjectionExprs::from_indices(&[1], &schema))?
+        else {
+            panic!("ParquetSource takes the projection");
+        };
+        let config =
+            FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                .with_file_groups(vec![FileGroup::new(files)])
+                .build();
+        let ctx = SessionContext::new_with_config(test_session_config());
+        let datafusion: Arc<dyn ExecutionPlan> =
+            Arc::new(DataSourceExec::new(Arc::new(config.clone())));
+        let expected = first_column(
+            &datafusion_physical_plan::collect(datafusion, ctx.task_ctx()).await?,
+        );
+        assert_eq!(expected.len(), 8 * file_rows as usize / 32);
+
+        // Every unit (a file: their metadata is not cached) without row
+        // filters (see `pushdown_filters_fall_back_to_native_filtering`).
+        let source =
+            ParquetScanSource::try_from_config(config.clone())?.with_min_unit_rows(1);
+        assert_eq!(source.schema().fields().len(), 1);
+        let gstate = execution_state(&source, &ctx, 1)?;
+        prefer_native(row_filters_of(&gstate));
+        let output = drain(&source, &ctx, &gstate).await?;
+        assert_eq!(first_column(&output), expected);
+        assert_eq!(metric(&source, "natively_filtered_units"), 8);
+
+        // And with the row filters that it decides on, on 4 threads (which
+        // read one in eight units without row filters).
+        let source =
+            Arc::new(ParquetScanSource::try_from_config(config)?.with_min_unit_rows(1));
+        let output = Executor::collect(
+            Arc::clone(&source) as Arc<dyn PhysicalOperator>,
+            ctx.task_ctx(),
+            4,
+        )
+        .await?;
+        assert_eq!(first_column(&output), expected);
+        assert!(metric(&source, "natively_filtered_units") > 0);
         Ok(())
     }
 }
