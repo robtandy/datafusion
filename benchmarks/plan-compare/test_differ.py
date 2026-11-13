@@ -452,6 +452,314 @@ class ComparisonTest(unittest.TestCase):
         )
 
 
+class PredicateTest(unittest.TestCase):
+    """The filters of the scans compared by their meaning."""
+
+    def terms(self, text: str, engine: str = differ.PIPELINE) -> frozenset:
+        del engine  # Both dialects have the same parser.
+        return frozenset(differ.filter_terms(text))
+
+    def test_both_dialects_normalize_alike(self):
+        pairs = [
+            ("l_discount@6 <= 0.07", "(l_discount <= 0.07)"),
+            ("l_shipdate@10 > 1995-03-15", "(l_shipdate > '1995-03-15'::DATE)"),
+            ("l_quantity@4 < 24.00", "(l_quantity < 24)"),
+            ("SearchPhrase@9 != ", "(SearchPhrase != '')"),
+            ("URL@10 LIKE %google%", "contains(URL, 'google')"),
+            ("p_type@4 LIKE %BRASS", "suffix(p_type, 'BRASS')"),
+            (
+                "p_type@4 NOT LIKE MEDIUM POLISHED%",
+                "(NOT prefix(p_type, 'MEDIUM POLISHED'))",
+            ),
+            (
+                "o_comment@8 NOT LIKE %special%requests%",
+                "(o_comment !~~ '%special%requests%')",
+            ),
+            ("p_name@1 LIKE forest%", "(p_name >= 'forest') AND (p_name < 'foresu')"),
+            (
+                "n_name@1 = GERMANY OR n_name@1 = FRANCE",
+                "n_name IN ('FRANCE', 'GERMANY')",
+            ),
+            (
+                "l_shipinstruct@13 = DELIVER IN PERSON",
+                "(l_shipinstruct = 'DELIVER IN PERSON')",
+            ),
+            ("l_receiptdate@12 > l_commitdate@11", "(l_commitdate < l_receiptdate)"),
+            (
+                "CAST(c_acctbal@5 AS Decimal128(19, 6)) > scalar_subquery(5016.966223)",
+                "CAST(c_acctbal AS DOUBLE) > SUBQUERY",
+            ),
+            ("p_size@5 IN (SET) ([49, 14, 23])", "(p_size IN (14, 23, 49))"),
+            # Factored out of a disjunction, or not.
+            (
+                "p_size@5 >= 1 AND (p_brand@3 = A AND p_size@5 <= 5 OR p_brand@3 = B)",
+                "((p_brand = 'A') AND (p_size >= 1) AND (p_size <= 5)) OR "
+                "((p_brand = 'B') AND (p_size >= 1))",
+            ),
+        ]
+        for ours, duckdb in pairs:
+            self.assertEqual(self.terms(ours), self.terms(duckdb), (ours, duckdb))
+
+    def test_lists_whose_constants_duckdb_does_not_show(self):
+        # DuckDB's `IN` lists of `MARK` joins: as many constants.
+        unknown = self.terms('"substring"(c_phone, 1, 2) IN (#3)')
+        known = self.terms("substr(c_phone@4, 1, 2) IN (SET) ([13, 31, 23])")
+        self.assertTrue(all(differ.implies(known, term) for term in unknown))
+        self.assertTrue(all(differ.implies(unknown, term) for term in known))
+        four = self.terms("substr(c_phone@4, 1, 2) IN (SET) ([13, 31, 23, 29])")
+        self.assertFalse(all(differ.implies(four, term) for term in unknown))
+
+    def test_implication_by_bounds(self):
+        implies = differ.implies
+        terms = self.terms("l_discount@6 >= 0.05 AND l_discount@6 <= 0.07")
+        for text, expected in [
+            ("l_discount@6 <= 0.07", True),
+            ("l_discount@6 <= 0.08", True),
+            ("l_discount@6 < 0.07", False),
+            ("l_discount@6 <= 0.06", False),
+            ("l_discount@6 > 0.04", True),
+            ("l_discount@6 != 0.10", True),
+            ("l_discount@6 != 0.06", False),
+            ("l_discount@6 IS NOT NULL", True),
+            ("l_tax@7 IS NOT NULL", False),
+        ]:
+            (term,) = differ.filter_terms(text)
+            self.assertEqual(implies(terms, term), expected, text)
+        values = self.terms("p_size@5 IN (SET) ([3, 9])")
+        for text, expected in [
+            ("p_size@5 IN (SET) ([3, 9, 14])", True),
+            ("p_size@5 IN (SET) ([3])", False),
+            ("p_size@5 >= 3", True),
+            ("p_size@5 < 9", False),
+            ("p_size@5 != 4", True),
+        ]:
+            (term,) = differ.filter_terms(text)
+            self.assertEqual(implies(values, term), expected, text)
+
+    def test_implication_by_cases_and_unions(self):
+        # q19: the bounds of DuckDB's scan, derived from the disjunction of the
+        # join condition, and the disjunctions that our scan evaluates.
+        ours = self.terms(
+            "p_size@5 >= 1 AND (p_brand@3 = Brand#12 AND p_size@5 <= 5 OR "
+            "p_brand@3 = Brand#23 AND p_size@5 <= 10)"
+        )
+        (brands,) = differ.filter_terms(
+            "(p_brand = 'Brand#12') OR (p_brand = 'Brand#23')"
+        )
+        self.assertTrue(differ.implies(ours, brands))
+        (sizes,) = differ.filter_terms("(p_size >= 1) OR (p_size <= 5)")
+        self.assertTrue(differ.implies(ours, sizes))
+        hull = self.terms("(l_quantity >= 1.00) AND (l_quantity <= 30.00)")
+        (ranges,) = differ.filter_terms(
+            "l_quantity@4 >= 1.00 AND l_quantity@4 <= 11.00 OR l_quantity@4 >= 10.00 "
+            "AND l_quantity@4 <= 20.00 OR l_quantity@4 >= 20.00 AND l_quantity@4 <= 30.00"
+        )
+        self.assertTrue(differ.implies(hull, ranges))
+        self.assertTrue(all(differ.implies(frozenset([ranges]), t) for t in hull))
+        (gap,) = differ.filter_terms(
+            "l_quantity@4 >= 1.00 AND l_quantity@4 <= 9.00 OR l_quantity@4 >= 10.00 "
+            "AND l_quantity@4 <= 30.00"
+        )
+        self.assertFalse(differ.implies(hull, gap))
+
+    def test_transitive_bounds(self):
+        terms = self.terms(
+            "l_shipdate@10 < l_commitdate@11 AND l_receiptdate@12 > l_commitdate@11 "
+            "AND l_receiptdate@12 < 1995-01-01"
+        )
+        (bound,) = differ.filter_terms("(l_shipdate < '1995-01-01'::DATE)")
+        self.assertFalse(differ.implies(terms, bound))
+        self.assertTrue(differ.implies(differ.transitive(terms), bound))
+
+    def compare_q6(self, edit) -> differ.Comparison:
+        """q6, with the descriptions of our scan edited by `edit`."""
+        dump = json.loads((HERE / "pipeline" / "q6.json").read_text(encoding="utf-8"))
+        for op in dump["operators"]:
+            if op["kind"] == "ParquetScanSource":
+                op["name"] = edit(op["name"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "q6.json"
+            path.write_text(json.dumps(dump), encoding="utf-8")
+            return differ.compare(
+                "q6",
+                differ.load_duckdb(HERE / "duckdb" / "q6.json"),
+                differ.load_pipeline(path),
+            )
+
+    def test_a_missing_pushed_predicate_is_a_divergence(self):
+        """Without both copies of `l_discount <= 0.07` (of the predicate and
+        of the folded filter), our scan still filters `l_discount` (by `>=
+        0.05`), but not by that bound."""
+        self.assertEqual(self.compare_q6(lambda name: name).verdict, "matches")
+
+        def remove(name: str) -> str:
+            for column in ("l_discount@6", "l_discount@2"):
+                name = name.replace(f" AND {column} <= 0.07", "")
+            # (The pruning predicate, which the differ does not read, still
+            # has `l_discount_min@6 <= 0.07`.)
+            self.assertNotIn("l_discount@6 <= 0.07", name)
+            self.assertNotIn("l_discount@2 <= 0.07", name)
+            return name
+
+        comparison = self.compare_q6(remove)
+        self.assertEqual(comparison.verdict, differ.RULE_GAP)
+        ((cause, text),) = [
+            (d.cause.id, f.text) for d in comparison.divergences for f in d.findings
+        ]
+        self.assertEqual(cause, "scan-filters")
+        self.assertIn("`l_discount <= 0.07`", text)
+
+    def test_a_changed_pushed_predicate_is_a_divergence(self):
+        comparison = self.compare_q6(lambda name: name.replace("<= 0.07", "<= 0.08"))
+        self.assertNotEqual(comparison.verdict, "matches")
+        comparison = self.compare_q6(lambda name: name.replace("<= 0.07", "<= 0.06"))
+        self.assertNotEqual(comparison.verdict, "matches")
+
+
+class PlacementTest(unittest.TestCase):
+    """The aggregations, top-N, sorts, limits and pipeline breaks compared by
+    their locations."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = pathlib.Path(self.directory.name)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_a_top_n_below_its_aggregation_is_a_divergence(self):
+        """hits15 with our TopK moved below the aggregation (the same
+        operators and pipeline breaks, at other places)."""
+        dump = json.loads(
+            (HERE / "pipeline" / "hits15.json").read_text(encoding="utf-8")
+        )
+        operators = {op["kind"]: op for op in dump["operators"]}
+        sink, topk = operators["CollectorSink"], operators["PhysicalTopK"]
+        aggregate = operators["PhysicalHashAggregate"]
+        # sink <- topk <- (projection) <- aggregate <- input: sink <- aggregate
+        # <- topk <- input.
+        above_aggregate = next(
+            op for op in dump["operators"] if aggregate["id"] in op["inputs"]
+        )
+        below = aggregate["inputs"]
+        sink["inputs"] = [aggregate["id"]]
+        aggregate["inputs"] = [topk["id"]]
+        topk["inputs"] = below
+        if above_aggregate is not topk:
+            above_aggregate["inputs"] = []
+        for pipeline in dump["pipelines"]:
+            ends = {pipeline["source"], pipeline["sink"]}
+            if ends == {topk["id"], sink["id"]}:
+                pipeline["source"] = aggregate["id"]
+                pipeline["operators"] = []
+            elif ends == {aggregate["id"], topk["id"]}:
+                pipeline["source"], pipeline["sink"] = topk["id"], aggregate["id"]
+                pipeline["operators"] = []
+            elif pipeline["sink"] == aggregate["id"]:
+                pipeline["sink"] = topk["id"]
+        path = self.path / "hits15.json"
+        path.write_text(json.dumps(dump), encoding="utf-8")
+        original = differ.compare(
+            "hits15",
+            differ.load_duckdb(HERE / "duckdb" / "hits15.json"),
+            differ.load_pipeline(HERE / "pipeline" / "hits15.json"),
+        )
+        self.assertEqual(original.verdict, "matches")
+        moved = differ.compare(
+            "hits15",
+            differ.load_duckdb(HERE / "duckdb" / "hits15.json"),
+            differ.load_pipeline(path),
+        )
+        self.assertEqual(moved.verdict, differ.RULE_GAP)
+        findings = {f.component: f for d in moved.divergences for f in d.findings}
+        self.assertEqual(
+            set(findings), {"aggregations", "top-N and limits", "pipeline breaks"}
+        )
+        # As many pipeline breaks of every kind, at other places.
+        self.assertEqual(moved.duckdb.breaks, moved.ours.breaks)
+        self.assertIn(
+            "`top10` over `hits` below `agg1`", findings["pipeline breaks"].text
+        )
+
+    def test_an_aggregation_below_a_join_is_a_divergence(self):
+        def aggregate(child):
+            return duck("HASH_GROUP_BY", child, Groups="#0", Aggregates="count_star()")
+
+        def join(probe, build):
+            return duck(
+                "HASH_JOIN",
+                probe,
+                build,
+                Join_Type="INNER",
+                Conditions="l_orderkey = o_orderkey",
+            )
+
+        def lineitem():
+            return duck("READ_PARQUET", Projections="l_orderkey")
+
+        def orders():
+            return duck("READ_PARQUET", Projections="o_orderkey")
+
+        above = aggregate(join(lineitem(), orders()))
+        below = join(aggregate(lineitem()), orders())
+        write_duckdb(self.path, "above", above)
+        write_duckdb(self.path, "below", below)
+        # Two DuckDB plans compared as if one were ours: the locations only.
+        duckdb = differ.fingerprint(differ.load_duckdb(self.path / "above.json"))
+        other = differ.fingerprint(differ.load_duckdb(self.path / "below.json"))
+        (finding,) = differ.compare_aggregates(duckdb, other)
+        self.assertIn("`agg1` over `join[lineitem, orders]` at the top", finding.text)
+        self.assertIn("`agg1` over `lineitem` below `join`", finding.text)
+        (breaks,) = differ.compare_breaks(duckdb, other)
+        self.assertEqual(duckdb.breaks, other.breaks)
+        self.assertIn("pipeline breaks differ", breaks.text)
+
+    def test_a_limit_above_or_below_a_join_is_a_divergence(self):
+        def scans():
+            return (
+                duck("READ_PARQUET", Projections="l_orderkey"),
+                duck("READ_PARQUET", Projections="o_orderkey"),
+            )
+
+        def join(probe, build):
+            return duck(
+                "HASH_JOIN",
+                probe,
+                build,
+                Join_Type="INNER",
+                Conditions="l_orderkey = o_orderkey",
+            )
+
+        lineitem, orders = scans()
+        above = duck("STREAMING_LIMIT", join(lineitem, orders), Limit="10")
+        lineitem, orders = scans()
+        below = join(duck("STREAMING_LIMIT", lineitem, Limit="10"), orders)
+        write_duckdb(self.path, "above", above)
+        write_duckdb(self.path, "below", below)
+        duckdb = differ.fingerprint(differ.load_duckdb(self.path / "above.json"))
+        other = differ.fingerprint(differ.load_duckdb(self.path / "below.json"))
+        (finding,) = differ.compare_orders(duckdb, other)
+        self.assertIn(
+            "`limit10` over `join[lineitem, orders]` at the top", finding.text
+        )
+        self.assertIn("`limit10` over `lineitem` below `join`", finding.text)
+
+    def test_the_join_order_does_not_move_the_operators_above_it(self):
+        """q5 diverges by its join order only: its aggregation, sort and
+        pipeline breaks are at the same places."""
+        comparison = differ.compare(
+            "q5",
+            differ.load_duckdb(HERE / "duckdb" / "q5.json"),
+            differ.load_pipeline(HERE / "pipeline" / "q5.json"),
+        )
+        self.assertEqual([d.cause.id for d in comparison.divergences], ["join-order"])
+        self.assertEqual(
+            differ.compare_aggregates(comparison.duckdb, comparison.ours), []
+        )
+        self.assertEqual(differ.compare_orders(comparison.duckdb, comparison.ours), [])
+        self.assertEqual(differ.compare_breaks(comparison.duckdb, comparison.ours), [])
+
+
 class FixturesTest(unittest.TestCase):
     """The comparison of the captured plans of the 47 queries."""
 

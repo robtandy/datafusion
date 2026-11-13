@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import collections
 import dataclasses
+import decimal
+import functools
 import itertools
 import json
 import pathlib
@@ -152,9 +154,10 @@ ROW_ID_COLUMNS = ("file_index", "file_row_number", "rowid")
 # Both plans render expressions as text: DuckDB's SQL (`(l_shipdate <=
 # '1998-09-02'::DATE)`, columns by name, strings quoted) and DataFusion's
 # physical expressions (`l_shipdate@10 <= 1998-09-02`, columns as
-# `name@index`, strings unquoted). The differ only splits them into their
-# conjuncts and disjuncts (at `AND` and `OR` outside of brackets and strings)
-# and finds the columns that they reference: never compares their text.
+# `name@index`, strings unquoted). The differ splits them into their conjuncts
+# and disjuncts (at `AND` and `OR` outside of brackets and strings), finds the
+# columns that they reference, and normalizes the filters into terms (see
+# Predicates): it never compares their text.
 # --------------------------------------------------------------------------
 
 _OPEN = "([{"
@@ -283,6 +286,8 @@ class Atom:
     #: Whether the scan only prunes with it (DuckDB's `optional:` filters,
     #: which a filter above the scan evaluates, and dynamic filters).
     pruning_only: bool = False
+    #: Its normalized terms (see Predicates), for the filters.
+    terms: tuple = ()
 
 
 def is_topn_filter(text: str) -> bool:
@@ -319,12 +324,624 @@ def make_atom(text: str, engine: str, pruning_only: bool = False) -> Atom:
     kind = "filter"
     if len(columns) == 1 and re.fullmatch(r".* IS NOT NULL", text):
         kind = "is_not_null"
-    return Atom(text, columns, constant_columns(text, engine), kind, pruning_only)
+    return Atom(
+        text,
+        columns,
+        constant_columns(text, engine),
+        kind,
+        pruning_only,
+        tuple(filter_terms(text)),
+    )
 
 
 def atoms_of(text: str, engine: str) -> list[Atom]:
     """The atoms of the conjuncts of the filter `text`."""
     return [make_atom(conjunct, engine) for conjunct in conjuncts(text) if conjunct]
+
+
+# --------------------------------------------------------------------------
+# Predicates
+#
+# The filters of the scans are compared by their meaning: every conjunct is
+# normalized into a term (an expression, an operator and its constants), and
+# the terms of a scan of one plan are compared with those of the other by
+# implication, so that the same filter written differently (`URL LIKE
+# '%google%'` and `contains(URL, 'google')`, `p_name LIKE 'forest%'` and
+# `p_name >= 'forest' AND p_name < 'foresu'`, an `OR` of equalities and an
+# `IN` list, an `OR` with or without its common conjuncts factored out) is the
+# same, and a missing or changed bound is not. The terms are tuples:
+#
+# - `("cmp", expr, op, value)`: `expr op value`, `op` one of `=`, `!=`, `<`,
+#   `<=`, `>`, `>=`;
+# - `("in", expr, values, negated)`: `values` a frozenset of constants, or the
+#   number of constants of a list whose constants the plan does not show;
+# - `("like", expr, pattern, negated)`;
+# - `("notnull", expr)` and `("isnull", expr)`;
+# - `("cols", expr_a, op, expr_b)`: a comparison of two expressions, `expr_a`
+#   before `expr_b`;
+# - `("or", branches)`: a disjunction of conjunctions (frozensets of terms);
+# - `("opaque", text)`: anything else, by its normalized text.
+#
+# An expression is a column (`l_shipdate`), or a function of columns with its
+# constants (`substr(c_phone,1,2)`), without casts. A constant is its text,
+# without quotes or casts (`1995-03-15`, `BUILDING`); numbers are canonical
+# (`24.00` is `24`); the value of a scalar subquery is `<subquery>`.
+# --------------------------------------------------------------------------
+
+_COMPARISON_OPERATORS = ("<=", ">=", "!=", "<>", "=", "<", ">")
+_FLIPPED = {"<": ">", "<=": ">=", ">": "<", ">=": "<=", "=": "=", "!=": "!="}
+_NEGATED = {"<": ">=", "<=": ">", ">": "<=", ">=": "<", "=": "!=", "!=": "="}
+#: Functions that the engines name differently.
+_FUNCTION_ALIASES = {"substring": "substr"}
+_TYPED_LITERAL = re.compile(r"^[A-Za-z0-9]+\((?:Some\()?\"?(.*?)\"?\)?(?:,.*)?\)$")
+
+
+def find_top(text: str, token: str) -> int:
+    """The index of the first `token` in `text` outside of brackets and of
+    single-quoted strings, or -1."""
+    depth = 0
+    quoted = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if quoted:
+            if char == "'":
+                if text.startswith("''", i):
+                    i += 2
+                    continue
+                quoted = False
+        elif char == "'":
+            quoted = True
+        elif char in _OPEN:
+            depth += 1
+        elif char in _CLOSE:
+            depth -= 1
+        elif depth == 0 and text.startswith(token, i):
+            return i
+        i += 1
+    return -1
+
+
+def _without_casts(text: str) -> str:
+    """`text` without `CAST(x AS type)` (which is `x`) and `x::TYPE`."""
+    while True:
+        start = text.find("CAST(")
+        if start < 0:
+            break
+        end = _closing(text, start + len("CAST"))
+        inner = text[start + len("CAST(") : end]
+        at = find_top(inner, " AS ")
+        text = text[:start] + (inner[:at] if at >= 0 else inner) + text[end + 1 :]
+    return re.sub(r"::[A-Z_]+(\([^)]*\))?", "", text)
+
+
+def expression(text: str) -> str:
+    """The normalized expression of `text` (of either engine)."""
+    text = _without_casts(strip_parens(text))
+    text = _DATAFUSION_COLUMN.sub(lambda match: match.group(1), text)
+    text = re.sub(r'"([^"]+)"', lambda match: match.group(1), text)
+    for name, alias in _FUNCTION_ALIASES.items():
+        text = re.sub(rf"\b{name}\(", f"{alias}(", text)
+    return re.sub(r"\s+", "", text)
+
+
+def constant(text: str) -> str:
+    """The normalized constant of `text` (of either engine)."""
+    text = _without_casts(text.strip())
+    if text in ("SUBQUERY",) or text.startswith("scalar_subquery("):
+        return "<subquery>"
+    typed = _TYPED_LITERAL.match(text)
+    if typed and not text.startswith("'"):
+        # DataFusion's `Utf8("x")`, `Int64(1)`, `Float64(0.5)`.
+        text = typed.group(1)
+    if len(text) >= 2 and text.startswith("'") and text.endswith("'"):
+        text = text[1:-1].replace("''", "'")
+    try:
+        number_ = decimal.Decimal(text)
+    except decimal.InvalidOperation:
+        return text
+    if not number_.is_finite():
+        return text
+    return format(number_.normalize(), "f")
+
+
+def _constants(text: str) -> frozenset[str] | int:
+    """The constants of an `IN` list: `('a', 'b')` (DuckDB), `(SET) ([a, b])`
+    or `([a, b])` (DataFusion), or `(#n)` (a list of `n` constants that the
+    plan does not show)."""
+    text = text.strip()
+    unknown = re.fullmatch(r"\(#(\d+)\)", text)
+    if unknown:
+        return int(unknown.group(1))
+    if text.startswith("(SET)"):
+        text = text[len("(SET)") :].strip()
+    text = strip_parens(text)
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return frozenset(constant(item) for item in split_top(text, ", ") if item != "")
+
+
+def _has_column(text: str) -> bool:
+    return bool(
+        columns_of(text, PIPELINE)
+        or columns_of(text, DUCKDB)
+        or re.search(r"\b(file_index|file_row_number|rowid)\b", text)
+    )
+
+
+def _like_terms(
+    expr: str, pattern: str, negated: bool, ranges: bool = True
+) -> list[tuple]:
+    """The terms of `expr [NOT] LIKE pattern`: a prefix pattern (`abc%`) is the
+    range of its prefix, as DuckDB rewrites it (unless not `ranges`)."""
+    prefix = pattern[:-1]
+    if (
+        ranges
+        and not negated
+        and pattern.endswith("%")
+        and prefix
+        and "%" not in prefix
+        and "_" not in prefix
+    ):
+        successor = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+        return [("cmp", expr, ">=", prefix), ("cmp", expr, "<", successor)]
+    return [("like", expr, pattern, negated)]
+
+
+def leaf_terms(text: str, ranges: bool = True) -> list[tuple]:
+    """The terms of the conjunct `text` (no `AND` or `OR` at its top level); a
+    `LIKE` of a prefix is a range, unless not `ranges`."""
+    text = strip_parens(text)
+    if text.startswith("NOT "):
+        inner = leaf_terms(text[len("NOT ") :], ranges=False)
+        if len(inner) == 1:
+            term = inner[0]
+            if term[0] in ("like", "in"):
+                return [(*term[:-1], not term[-1])]
+            if term[0] == "cmp":
+                return [("cmp", term[1], _NEGATED[term[2]], term[3])]
+            if term[0] in ("notnull", "isnull"):
+                flipped = "isnull" if term[0] == "notnull" else "notnull"
+                return [(flipped, term[1])]
+        return [("opaque", expression(text))]
+    for suffix, kind in ((" IS NOT NULL", "notnull"), (" IS NULL", "isnull")):
+        if text.endswith(suffix) and find_top(text, suffix) == len(text) - len(suffix):
+            return [(kind, expression(text[: -len(suffix)]))]
+    function = re.fullmatch(r"(contains|prefix|suffix)\((.*)\)", text)
+    if function:
+        arguments = split_top(function.group(2), ", ")
+        if len(arguments) == 2:
+            value = constant(arguments[1])
+            pattern = {
+                "contains": f"%{value}%",
+                "prefix": f"{value}%",
+                "suffix": f"%{value}",
+            }[function.group(1)]
+            return _like_terms(expression(arguments[0]), pattern, False, ranges)
+    # The operator is the first one at the top level (the unquoted strings of
+    # DataFusion may contain words such as `IN`: `= DELIVER IN PERSON`).
+    tokens = [
+        (" NOT LIKE ", "like", True),
+        (" !~~ ", "like", True),
+        (" LIKE ", "like", False),
+        (" ~~ ", "like", False),
+        (" NOT IN ", "in", True),
+        (" IN ", "in", False),
+        *((f" {op} ", "cmp", op) for op in _COMPARISON_OPERATORS),
+        *((f" {op}", "cmp", op) for op in _COMPARISON_OPERATORS),
+    ]
+    found = [
+        (at, -len(token), token, kind, extra)
+        for token, kind, extra in tokens
+        for at in [find_top(text, token)]
+        if at >= 0
+        and (
+            kind != "cmp"
+            or text[at + len(token) :].strip() != ""
+            or token.endswith(extra)
+        )
+    ]
+    if found:
+        at, _, token, kind, extra = min(found)
+        left, right = text[:at], text[at + len(token) :]
+        if kind == "like":
+            return _like_terms(expression(left), constant(right), extra, ranges)
+        if kind == "in":
+            return [("in", expression(left), _constants(right), extra)]
+        op = "!=" if extra == "<>" else extra
+        if _has_column(left) and _has_column(right):
+            a, b = expression(left), expression(right)
+            if b < a:
+                a, b, op = b, a, _FLIPPED[op]
+            return [("cols", a, op, b)]
+        if _has_column(right) and not _has_column(left):
+            left, right, op = right, left, _FLIPPED[op]
+        return [("cmp", expression(left), op, constant(right))]
+    return [("opaque", expression(text))]
+
+
+def _or_terms(branches: list[frozenset]) -> list[tuple]:
+    """The terms of the disjunction of `branches` (conjunctions of terms): its
+    common conjuncts factored out, an `IN` list for equalities of one
+    expression, nested disjunctions flattened."""
+    flat = []
+    for branch in branches:
+        if len(branch) == 1 and next(iter(branch))[0] == "or":
+            flat += list(next(iter(branch))[1])
+        else:
+            flat.append(branch)
+    branches = flat
+    common = frozenset.intersection(*branches)
+    rest = [branch - common for branch in branches]
+    if any(not branch for branch in rest):
+        # (a AND x) OR x is x.
+        return list(common)
+    singles = [next(iter(branch)) for branch in rest if len(branch) == 1]
+    if len(singles) == len(rest):
+        expressions = {term[1] for term in singles}
+        if len(expressions) == 1 and all(
+            (term[0] == "cmp" and term[2] == "=")
+            or (term[0] == "in" and not term[3] and isinstance(term[2], frozenset))
+            for term in singles
+        ):
+            values = frozenset().union(
+                *(
+                    frozenset([term[3]]) if term[0] == "cmp" else term[2]
+                    for term in singles
+                )
+            )
+            return [*common, ("in", expressions.pop(), values, False)]
+    return [*common, ("or", frozenset(rest))]
+
+
+def filter_terms(text: str) -> list[tuple]:
+    """The terms of the filter `text` (of either engine)."""
+    terms = []
+    for part in conjuncts(text):
+        if not part:
+            continue
+        branches = disjuncts(part)
+        if len(branches) > 1:
+            terms += _or_terms([frozenset(filter_terms(branch)) for branch in branches])
+        else:
+            terms += leaf_terms(part)
+    return terms
+
+
+def _ordered(a: str, b: str) -> int:
+    """-1, 0 or 1: `a` before, at or after `b`, as numbers if both are."""
+    try:
+        x, y = decimal.Decimal(a), decimal.Decimal(b)
+    except decimal.InvalidOperation:
+        x, y = a, b
+    return (x > y) - (x < y)
+
+
+def _satisfies(value: str, op: str, bound: str) -> bool:
+    order = _ordered(value, bound)
+    return {
+        "=": order == 0,
+        "!=": order != 0,
+        "<": order < 0,
+        "<=": order <= 0,
+        ">": order > 0,
+        ">=": order >= 0,
+    }[op]
+
+
+def _single_expression_implies(terms: frozenset, term: tuple) -> bool:
+    """Whether the terms of one expression in `terms` imply `term`, a term of
+    that expression: by their bounds, equalities, `IN` lists and exclusions."""
+    expr = term[1]
+    lower = upper = None  # (value, inclusive)
+    finite = None  # the values that it may have, if they are finitely many
+    unknown_lists = set()
+    excluded = set()
+    constrained = False
+    for other in terms:
+        if other[0] not in ("cmp", "in", "like", "notnull") or other[1] != expr:
+            continue
+        constrained = True
+        if other[0] == "cmp":
+            op, value = other[2], other[3]
+            if op == "=":
+                finite = {value} if finite is None else finite & {value}
+            elif op == "!=":
+                excluded.add(value)
+            elif op in ("<", "<="):
+                bound = (value, op == "<=")
+                if (
+                    upper is None
+                    or _ordered(value, upper[0]) < 0
+                    or (_ordered(value, upper[0]) == 0 and not bound[1])
+                ):
+                    upper = bound
+            else:
+                bound = (value, op == ">=")
+                if (
+                    lower is None
+                    or _ordered(value, lower[0]) > 0
+                    or (_ordered(value, lower[0]) == 0 and not bound[1])
+                ):
+                    lower = bound
+        elif other[0] == "in" and not other[3]:
+            if isinstance(other[2], int):
+                unknown_lists.add(other[2])
+            else:
+                finite = set(other[2]) if finite is None else finite & other[2]
+    if term[0] == "notnull":
+        # A row with a null is not kept by any comparison.
+        return constrained
+    if finite is not None:
+        finite = {
+            value
+            for value in finite
+            if value not in excluded
+            and (
+                lower is None or _satisfies(value, ">=" if lower[1] else ">", lower[0])
+            )
+            and (
+                upper is None or _satisfies(value, "<=" if upper[1] else "<", upper[0])
+            )
+        }
+    if term[0] == "in":
+        values = term[2]
+        if term[3]:
+            return (
+                finite is not None
+                and not isinstance(values, int)
+                and not (finite & values)
+            )
+        # A list whose constants the plan does not show (DuckDB's `IN` lists of
+        # `MARK` joins) is the list of as many constants of the other plan.
+        if isinstance(values, int):
+            return values in unknown_lists or (
+                finite is not None and len(finite) == values
+            )
+        if len(values) in unknown_lists:
+            return True
+        return finite is not None and finite <= values
+    if term[0] != "cmp":
+        return False
+    op, value = term[2], term[3]
+    if finite is not None:
+        return all(_satisfies(item, op, value) for item in finite)
+    if op == "!=":
+        if value in excluded:
+            return True
+        below = upper is not None and (
+            _ordered(upper[0], value) < 0
+            or (_ordered(upper[0], value) == 0 and not upper[1])
+        )
+        above = lower is not None and (
+            _ordered(lower[0], value) > 0
+            or (_ordered(lower[0], value) == 0 and not lower[1])
+        )
+        return below or above
+    if op in ("<", "<="):
+        if upper is None:
+            return False
+        order = _ordered(upper[0], value)
+        return order < 0 or (order == 0 and (op == "<=" or not upper[1]))
+    if op in (">", ">="):
+        if lower is None:
+            return False
+        order = _ordered(lower[0], value)
+        return order > 0 or (order == 0 and (op == ">=" or not lower[1]))
+    # `=`: an interval of one value.
+    return (
+        lower is not None
+        and upper is not None
+        and lower[1]
+        and upper[1]
+        and _ordered(lower[0], value) == 0
+        and _ordered(upper[0], value) == 0
+    )
+
+
+def _interval(terms, expr: str):
+    """The interval `(low, low_inclusive, high, high_inclusive)` of the bounds
+    of `expr` in `terms` (`None` for an unbounded side), or `None` if `terms`
+    constrain `expr` otherwise than by bounds."""
+    low = high = None
+    low_inclusive = high_inclusive = True
+    for term in terms:
+        if term[1] != expr:
+            continue
+        if term[0] != "cmp" or term[2] == "!=":
+            return None
+        op, value = term[2], term[3]
+        if op in (">", ">=", "="):
+            order = 1 if low is None else _ordered(value, low)
+            if order > 0 or (order == 0 and op == ">"):
+                low, low_inclusive = value, op != ">"
+        if op in ("<", "<=", "="):
+            order = -1 if high is None else _ordered(value, high)
+            if order < 0 or (order == 0 and op == "<"):
+                high, high_inclusive = value, op != "<"
+    return (low, low_inclusive, high, high_inclusive)
+
+
+def _union(intervals: list) -> list:
+    """The union of `intervals` (see `_interval`), as disjoint intervals."""
+
+    def high_of(a, b):
+        """The higher of the high ends `(value, inclusive)` `a` and `b`."""
+        if a[0] is None or b[0] is None:
+            return (None, True)
+        order = _ordered(a[0], b[0])
+        if order != 0:
+            return a if order > 0 else b
+        return (a[0], a[1] or b[1])
+
+    ordered = sorted(
+        intervals,
+        key=functools.cmp_to_key(
+            lambda x, y: (
+                (x[0] is not None) - (y[0] is not None)
+                if x[0] is None or y[0] is None
+                else _ordered(x[0], y[0]) or (y[1] - x[1])
+            )
+        ),
+    )
+    merged: list = []
+    for interval in ordered:
+        if merged:
+            last = merged[-1]
+            touches = (
+                last[2] is None
+                or interval[0] is None
+                or _ordered(interval[0], last[2]) < 0
+                or (_ordered(interval[0], last[2]) == 0 and (last[3] or interval[1]))
+            )
+            if touches:
+                high = high_of((last[2], last[3]), (interval[2], interval[3]))
+                merged[-1] = (last[0], last[1], *high)
+                continue
+        merged.append(interval)
+    return merged
+
+
+def _within(inner, outer) -> bool:
+    """Whether the interval `inner` is within the interval `outer`."""
+    low, low_inclusive, high, high_inclusive = inner
+    if outer[0] is not None:
+        if low is None:
+            return False
+        order = _ordered(low, outer[0])
+        if order < 0 or (order == 0 and low_inclusive and not outer[1]):
+            return False
+    if outer[2] is not None:
+        if high is None:
+            return False
+        order = _ordered(high, outer[2])
+        if order > 0 or (order == 0 and high_inclusive and not outer[3]):
+            return False
+    return True
+
+
+def _implies_ranges(terms: frozenset, term: tuple) -> bool:
+    """Whether the bounds in `terms` of the expression of the disjunction of
+    bounds `term` lie in one of the intervals of the union of its branches
+    (`l_quantity >= 1 AND l_quantity <= 30` implies `l_quantity` in [1, 11] or
+    [10, 20] or [20, 30])."""
+    branches = term[1]
+    expressions = {part[1] for branch in branches for part in branch}
+    if len(expressions) != 1:
+        return False
+    expr = expressions.pop()
+    intervals = [_interval(branch, expr) for branch in branches]
+    if any(interval is None for interval in intervals):
+        return False
+    own = _interval(frozenset(t for t in terms if t[0] == "cmp" and t[1] == expr), expr)
+    if own is None or own == (None, True, None, True):
+        return False
+    return any(_within(own, interval) for interval in _union(intervals))
+
+
+def implies(terms: frozenset, term: tuple, depth: int = 0) -> bool:
+    """Whether the conjunction `terms` implies `term` (sound, not complete:
+    a `False` may be a filter that implies the term in a way that the differ
+    does not see)."""
+    if term in terms:
+        return True
+    if term[0] == "or" and (
+        any(all(implies(terms, part, depth) for part in branch) for branch in term[1])
+        or _implies_ranges(terms, term)
+    ):
+        return True
+    if term[0] in ("cmp", "in", "notnull") and _single_expression_implies(terms, term):
+        return True
+    if depth < 2:
+        # By cases: every branch of a disjunction of `terms` implies it.
+        for other in terms:
+            if other[0] == "or" and other != term:
+                rest = terms - {other}
+                if all(implies(rest | branch, term, depth + 1) for branch in other[1]):
+                    return True
+    return False
+
+
+def transitive(terms: frozenset) -> frozenset:
+    """`terms` with the constant bounds that their comparisons of columns
+    imply: `a < b` and `b < k` imply `a < k`, `a < b` and `a > k` imply
+    `b > k`."""
+    derived = set(terms)
+    changed = True
+    while changed:
+        changed = False
+        for term in list(derived):
+            if term[0] != "cols" or term[2] not in ("<", "<=", ">", ">="):
+                continue
+            a, op, b = term[1], term[2], term[3]
+            # As `small op big` with `op` one of `<`, `<=`.
+            small, big, strict = (
+                (a, b, op == "<") if op in ("<", "<=") else (b, a, op == ">")
+            )
+            for bound in list(derived):
+                if bound[0] != "cmp":
+                    continue
+                if bound[1] == big and bound[2] in ("<", "<="):
+                    new = (
+                        "cmp",
+                        small,
+                        "<" if strict or bound[2] == "<" else "<=",
+                        bound[3],
+                    )
+                elif bound[1] == small and bound[2] in (">", ">="):
+                    new = (
+                        "cmp",
+                        big,
+                        ">" if strict or bound[2] == ">" else ">=",
+                        bound[3],
+                    )
+                else:
+                    continue
+                if new not in derived:
+                    derived.add(new)
+                    changed = True
+    return frozenset(derived)
+
+
+def term_text(term: tuple) -> str:
+    """A term as text, for the findings."""
+    kind = term[0]
+    if kind == "cmp":
+        return f"{term[1]} {term[2]} {term[3]}"
+    if kind == "in":
+        values = term[2]
+        listed = (
+            f"{values} constants"
+            if isinstance(values, int)
+            else ", ".join(sorted(values, key=lambda v: (len(v), v)))
+        )
+        return f"{term[1]} {'NOT ' if term[3] else ''}IN ({listed})"
+    if kind == "like":
+        return f"{term[1]} {'NOT ' if term[3] else ''}LIKE {term[2]}"
+    if kind == "notnull":
+        return f"{term[1]} IS NOT NULL"
+    if kind == "isnull":
+        return f"{term[1]} IS NULL"
+    if kind == "cols":
+        return f"{term[1]} {term[2]} {term[3]}"
+    if kind == "or":
+        branches = [
+            " AND ".join(sorted(term_text(part) for part in branch))
+            for branch in term[1]
+        ]
+        return " OR ".join(f"({branch})" for branch in sorted(branches))
+    return term[1]
+
+
+def term_columns(term: tuple) -> frozenset[str]:
+    """The columns of a term."""
+    if term[0] == "or":
+        return frozenset().union(
+            *(term_columns(part) for branch in term[1] for part in branch)
+        )
+    text = f"{term[1]} {term[3]}" if term[0] == "cols" else term[1]
+    names = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text)
+    return frozenset(name for name in names if name in COLUMN_TABLE)
 
 
 # --------------------------------------------------------------------------
@@ -589,7 +1206,9 @@ def duckdb_normalize(op: Op, subqueries: list[Op]) -> Op:
                 # An IN list: the filter of the probe side by the constants.
                 key = join.attrs["conditions"][0].split(" = ")[0]
                 negated = expression.startswith("NOT ")
-                text = f"{'NOT ' if negated else ''}{key} IN (...)"
+                # The constants are those of the COLUMN_DATA_SCAN, which the
+                # plan does not show: as many as its (exact) cardinality.
+                text = f"{'NOT ' if negated else ''}{key} IN (#{build.rows})"
                 filtered = Op(
                     "filter",
                     [join.children[0]],
@@ -1092,6 +1711,149 @@ JOIN_OPERATORS = {
 }
 
 
+# Placement -------------------------------------------------------------------
+#
+# Where an aggregation, a top-N, a sort, a limit or a pipeline break is in its
+# plan: its location is its kind and parameters, the skeleton of the plan below
+# it, and the operators above it. A skeleton is the plan with only its
+# structure: scans by their table, and blocks of joins as the multiset of their
+# inputs (so that the join order, which the joins compare, does not change the
+# locations of the operators above and below the joins). Through DuckDB's
+# shared subplans, an operator of a definition has a location for every reader
+# (as if the plan computed it once per reader, as ours does): the sharing
+# itself is a finding of its own (`compare_ctes`).
+
+
+def placed_label(op: Op) -> str:
+    """An operator in a skeleton or a location: `agg1` (an aggregation by one
+    key), `top10+100` (a top-N of 10 rows after 100), `sort2`, `limit5`,
+    `filter`, `join`."""
+    if op.kind == "aggregate":
+        return f"agg{op.attrs['groups']}"
+    if op.kind in ("topn", "limit"):
+        offset = op.attrs.get("offset") or 0
+        name = "top" if op.kind == "topn" else "limit"
+        return f"{name}{op.attrs.get('k')}" + (f"+{offset}" if offset else "")
+    if op.kind == "sort":
+        return f"sort{len(op.attrs.get('keys', []))}"
+    return op.kind
+
+
+def inline(plan: Plan, op: Op) -> Op:
+    """`op`, through shared subplans: the plan that a `CTE` feeds, the
+    definition that a `CTE_SCAN` reads."""
+    while True:
+        if op.kind == "cte":
+            op = op.children[1]
+        elif op.kind == "cte_scan" and op.attrs["index"] in plan.ctes:
+            op = plan.ctes[op.attrs["index"]][1]
+        else:
+            return op
+
+
+def block_inputs(plan: Plan, op: Op) -> list[Op]:
+    """The inputs of the block of joins of the join `op`."""
+    inputs = []
+    for child in op.children:
+        child = inline(plan, child)
+        if child.kind == "join":
+            inputs += block_inputs(plan, child)
+        else:
+            inputs.append(child)
+    return inputs
+
+
+def skeleton(plan: Plan, op: Op) -> str:
+    """The skeleton of the plan of `op`, e.g. `top10(agg1(join[customer,
+    lineitem, orders]))`."""
+    op = inline(plan, op)
+    if op.kind == "scan":
+        return op.attrs["table"]
+    if op.kind in ("values", "empty"):
+        return op.kind
+    if op.kind == "join":
+        inputs = sorted(skeleton(plan, child) for child in block_inputs(plan, op))
+        return f"join[{', '.join(inputs)}]"
+    inner = ", ".join(skeleton(plan, child) for child in op.children)
+    return f"{placed_label(op)}({inner})"
+
+
+@dataclasses.dataclass(frozen=True)
+class Location:
+    """Where an operator is in its plan."""
+
+    #: The operator: `placed_label`.
+    label: str
+    #: The skeleton of its input.
+    below: str
+    #: The operators above it, from its parent up (a block of joins once,
+    #: `scalar subquery` for the plan of a scalar subquery).
+    above: tuple[str, ...]
+
+    def text(self) -> str:
+        above = " < ".join(self.above)
+        return f"`{self.label}` over `{self.below}`" + (
+            f" below `{above}`" if above else " at the top"
+        )
+
+
+PLACED = ("aggregate", "topn", "sort", "limit", "filter", "join")
+
+
+def locate(plan: Plan) -> dict[int, list[Location]]:
+    """The locations of the placed operators of `plan` (`PLACED`), by the id
+    of the operator: those of a join are those of its block of joins."""
+    locations: dict[int, list[Location]] = collections.defaultdict(list)
+
+    def visit(op: Op, above: tuple[str, ...], block: Location | None) -> None:
+        if op.kind in ("cte", "cte_scan"):
+            inlined = inline(plan, op)
+            if inlined is not op:
+                visit(inlined, above, block)
+            return
+        if op.kind == "join":
+            if block is None:
+                below = ", ".join(
+                    sorted(skeleton(plan, c) for c in block_inputs(plan, op))
+                )
+                block = Location("join", f"[{below}]", above)
+            locations[id(op)].append(block)
+            for child in op.children:
+                visit(
+                    child, ("join", *above) if above[:1] != ("join",) else above, block
+                )
+            return
+        if op.kind in PLACED:
+            below = ", ".join(skeleton(plan, child) for child in op.children)
+            locations[id(op)].append(Location(placed_label(op), below, above))
+        child_above = (placed_label(op), *above) if op.kind in PLACED else above
+        for child in op.children:
+            visit(child, child_above, None)
+
+    for index, root in enumerate(plan.roots()):
+        visit(root, () if index == 0 else ("scalar subquery",), None)
+    return locations
+
+
+def break_locations(plan: Plan, locations: dict[int, list[Location]]) -> list[tuple]:
+    """The pipeline breaks of `plan` by their kind and the location of their
+    operator (the block of joins of a join, once per join; a shared subplan by
+    the skeleton of its definition)."""
+    breaks = []
+    for kind, op in plan.breaks:
+        if op.kind == "cte":
+            breaks.append(
+                (kind, Location("shared", skeleton(plan, op.children[0]), ()))
+            )
+            continue
+        found = locations.get(id(op))
+        if not found:
+            below = ", ".join(skeleton(plan, child) for child in op.children)
+            found = [Location(placed_label(op), below, ())]
+        breaks += [(kind, location) for location in found]
+    return breaks
+
+
 @dataclasses.dataclass(eq=False)
 class Scan:
     op: Op
@@ -1102,6 +1864,9 @@ class Scan:
     filtered: frozenset[str]
     #: The columns that its filters compare with constants.
     constant: frozenset[str]
+    #: The normalized terms of its filters (see Predicates), but those that it
+    #: only prunes with.
+    terms: frozenset
     #: Whether a top-N pushes its dynamic filter into it, and the columns of
     #: that filter (none for our TopK filters whose threshold was not set
     #: before the scan ended).
@@ -1156,6 +1921,8 @@ class Fingerprint:
     #: The shared subplans of DuckDB: (name, the label of the definition, the
     #: number of readers).
     ctes: list[tuple[str, str, int]]
+    #: The locations of the placed operators, by the id of the operator.
+    locations: dict[int, list[Location]] = dataclasses.field(default_factory=dict)
 
 
 def fingerprint(plan: Plan) -> Fingerprint:
@@ -1169,6 +1936,9 @@ def fingerprint(plan: Plan) -> Fingerprint:
             atoms = op.attrs["atoms"]
             static = [atom for atom in atoms if atom.kind in ("filter", "is_not_null")]
             filtered = frozenset().union(*(atom.columns for atom in static))
+            terms = frozenset(
+                term for atom in static if not atom.pruning_only for term in atom.terms
+            )
             read = op.attrs.get("read")
             if read is None:
                 read = op.attrs["output"] | filtered
@@ -1179,6 +1949,7 @@ def fingerprint(plan: Plan) -> Fingerprint:
                     frozenset(read),
                     filtered,
                     frozenset().union(*(atom.constant for atom in static)),
+                    terms,
                     any(atom.kind == "topn_dynamic" for atom in atoms),
                     frozenset().union(
                         *(atom.columns for atom in atoms if atom.kind == "topn_dynamic")
@@ -1241,7 +2012,9 @@ def fingerprint(plan: Plan) -> Fingerprint:
         )
         ctes.append((name, leaf_label(plan, definition), readers))
     breaks = collections.Counter(kind for kind, _ in plan.breaks)
-    return Fingerprint(plan, scans, joins, aggregates, orders, breaks, ctes)
+    return Fingerprint(
+        plan, scans, joins, aggregates, orders, breaks, ctes, locate(plan)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1372,6 +2145,51 @@ CAUSES = {
             issue=118,
         ),
         Cause(
+            "aggregate-placement",
+            "Placement of aggregations",
+            RULE_GAP,
+            "It aggregates elsewhere in the plan: e.g. below a join "
+            "(`PartialAggregatePushdown`, "
+            "`src/optimizer/partial_aggregate_pushdown.cpp`).",
+            "Our plan aggregates where the query does.",
+            "`datafusion/optimizer/src/` (a rule that places the aggregation where "
+            "DuckDB does)",
+        ),
+        Cause(
+            "order-placement",
+            "Placement of top-N, sorts and limits",
+            RULE_GAP,
+            "It places the top-N, sort or limit elsewhere in the plan (`TopN` and "
+            "`LimitPushdown`, `src/optimizer/topn_optimizer.cpp`, "
+            "`src/optimizer/limit_pushdown.cpp`).",
+            "Our plan places it where the query does.",
+            "`datafusion/physical-optimizer/src/limit_pushdown.rs` (or "
+            "`datafusion/optimizer/src/push_down_limit.rs`)",
+        ),
+        Cause(
+            "scan-filters",
+            "Filters pushed into the scans",
+            RULE_GAP,
+            "Its filter pushdown pushes the filter into the scan.",
+            "Our scan does not apply it (our plan evaluates it above the scan, or "
+            "not at all).",
+            "`datafusion/optimizer/src/push_down_filter.rs` and the folding of the "
+            "filters of scans in `datafusion/physical-pipeline/src/planner.rs`",
+        ),
+        Cause(
+            "derived-filters",
+            "Filters derived from disjunctions",
+            COST,
+            "Its filter pushdown derives, from a disjunction over several tables "
+            "(the `OR` of the join condition of q19), the hull of the bounds of "
+            "every column that a scan can filter alone (`l_quantity >= 1 AND "
+            "l_quantity <= 30`), and keeps the disjunction in the join.",
+            "DataFusion's `PushDownFilter` extracts the disjunction of the "
+            "conditions of every table (`extract_or_clauses_for_join`): our scan "
+            "filters `l_quantity` by one of the three ranges, a tighter filter. "
+            "Both derive filters from the disjunction; our plan is ahead.",
+        ),
+        Cause(
             "build-side",
             "Build side of a join",
             COST,
@@ -1407,6 +2225,8 @@ class Finding:
     duckdb: list[Op]
     ours: list[Op]
     cause: str | None = None
+    #: For the pipeline breaks: the kinds of the breaks that differ.
+    kinds: set = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass(eq=False)
@@ -1488,6 +2308,7 @@ def pair_scans(duckdb: list[Scan], ours: list[Scan]):
                 jaccard(a.read, b.read)
                 + jaccard(a.constant, b.constant)
                 + jaccard(a.filtered, b.filtered)
+                + jaccard(a.terms, b.terms)
             )
 
         best, best_score = [], -1.0
@@ -1507,50 +2328,76 @@ def pair_scans(duckdb: list[Scan], ours: list[Scan]):
     return pairs, left, right
 
 
+def terms_text(terms) -> str:
+    """Terms, as code."""
+    return ", ".join(f"`{term_text(term)}`" for term in terms)
+
+
+def compare_filters(a: Scan, b: Scan) -> list[Finding]:
+    """The filters of DuckDB's scan `a` that those of our scan `b` do not
+    imply, and the other way around, by their causes: `IS NOT NULL` filters of
+    keys, bounds that follow from comparisons of columns, filters that the
+    other plan does not push into the scan, and our tighter filters of the
+    disjunctions of DuckDB's."""
+    ordered = functools.partial(sorted, key=term_text)
+    missing = [term for term in ordered(a.terms) if not implies(b.terms, term)]
+    extra = [term for term in ordered(b.terms) if not implies(a.terms, term)]
+    scan = f"the scan of `{a.table}` ({columns_text(a.read)})"
+    causes: dict[str | None, list[str]] = {}
+
+    def add(cause: str | None, text: str) -> None:
+        causes.setdefault(cause, []).append(text)
+
+    not_null = [term for term in missing if term[0] == "notnull"]
+    if not_null:
+        add("null-key-filters", f"DuckDB filters {terms_text(not_null)}")
+    derived = transitive(b.terms)
+    bounds = [t for t in missing if t[0] != "notnull" and implies(derived, t)]
+    if bounds:
+        add(
+            "transitive-filters",
+            f"DuckDB bounds {terms_text(bounds)}, which follow from comparisons of "
+            "columns of our scan",
+        )
+    others = [t for t in missing if t[0] != "notnull" and t not in bounds]
+    if others:
+        add("scan-filters", f"DuckDB filters {terms_text(others)}, ours does not")
+    tighter = [
+        term
+        for term in extra
+        if term[0] == "or"
+        and len(term_columns(term)) == 1
+        and any(
+            other[0] != "notnull"
+            and term_columns(other) == term_columns(term)
+            and implies(frozenset([term]), other)
+            for other in a.terms
+        )
+    ]
+    if tighter:
+        add(
+            "derived-filters",
+            f"ours filters {terms_text(tighter)}, tighter than DuckDB's bounds of "
+            f"{columns_text(frozenset().union(*map(term_columns, tighter)))}",
+        )
+    rest = [term for term in extra if term not in tighter]
+    if rest:
+        add(None, f"ours filters {terms_text(rest)}, DuckDB does not")
+    return [
+        Finding("scans", f"{scan}: " + "; ".join(texts), [a.op], [b.op], cause)
+        for cause, texts in causes.items()
+    ]
+
+
 def compare_scans(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
     findings = []
     pairs, left, right = pair_scans(duckdb.scans, ours.scans)
     for a, b in pairs:
+        findings += compare_filters(a, b)
         differences = []
-        cause = None
         if a.read != b.read:
             differences.append(
                 f"reads {columns_text(a.read)} in DuckDB, {columns_text(b.read)} in ours"
-            )
-        only_duckdb = a.constant - b.constant
-        only_ours = b.constant - a.constant
-        if only_duckdb:
-            not_null = {
-                column
-                for atom in a.atoms
-                if atom.kind == "is_not_null"
-                for column in atom.columns
-            }
-            compared = {
-                column
-                for atom in b.atoms
-                if atom.kind == "filter" and len(atom.columns) > 1
-                for column in atom.columns
-            }
-            if only_duckdb <= not_null:
-                cause = "null-key-filters"
-                differences.append(
-                    f"DuckDB filters {columns_text(only_duckdb)} with `IS NOT NULL`"
-                )
-            elif only_duckdb <= compared:
-                cause = "transitive-filters"
-                differences.append(
-                    f"DuckDB bounds {columns_text(only_duckdb)} by constants, which "
-                    "our scan compares with other columns only"
-                )
-            else:
-                differences.append(
-                    f"DuckDB filters {columns_text(only_duckdb)} by constants, ours "
-                    "does not"
-                )
-        if only_ours:
-            differences.append(
-                f"ours filters {columns_text(only_ours)} by constants, DuckDB does not"
             )
         if a.topn != b.topn:
             plans = "DuckDB's" if a.topn else "our"
@@ -1571,7 +2418,6 @@ def compare_scans(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
                     + "; ".join(differences),
                     [a.op],
                     [b.op],
-                    cause,
                 )
             )
     counts_duckdb = collections.Counter(scan.table for scan in duckdb.scans)
@@ -1639,109 +2485,119 @@ def compare_joins(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
     return findings
 
 
-def compare_aggregates(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
-    remaining = list(ours.aggregates)
+def _placed(fp: Fingerprint, kinds: tuple[str, ...]) -> list[tuple[Location, Op]]:
+    """The locations of the operators of `kinds` of `fp`, with the operators."""
+    return [
+        (location, op)
+        for op in fp.plan.ops()
+        if op.kind in kinds
+        for location in fp.locations.get(id(op), [])
+    ]
+
+
+def _unmatched(duckdb: list[tuple], ours: list[tuple]) -> tuple[list, list]:
+    """The items `(key, op)` of either list whose keys the other list has
+    fewer of (multisets)."""
+    remaining = list(ours)
     unmatched = []
-    for aggregate in duckdb.aggregates:
-        match = next(
-            (
-                other
-                for other in remaining
-                if (other.input, other.groups) == (aggregate.input, aggregate.groups)
-            ),
-            None,
-        )
+    for key, op in duckdb:
+        match = next((item for item in remaining if item[0] == key), None)
         if match is None:
-            unmatched.append(aggregate)
+            unmatched.append((key, op))
         else:
             remaining.remove(match)
+    return unmatched, remaining
+
+
+def _placement_finding(component: str, what: str, duckdb, ours) -> list[Finding]:
+    unmatched, remaining = _unmatched(duckdb, ours)
     if not unmatched and not remaining:
         return []
 
-    def describe(aggregates):
-        return (
-            ", ".join(
-                (
-                    "an ungrouped aggregation"
-                    if a.groups == 0
-                    else f"an aggregation by {a.groups} key{'s' if a.groups > 1 else ''}"
-                )
-                + f" of {tables_text(a.input.split(', ') if a.input else [])}"
-                for a in aggregates
-            )
-            or "none"
-        )
+    def describe(items) -> str:
+        return "; ".join(location.text() for location, _ in items) or "none"
 
     return [
         Finding(
-            "aggregations",
-            f"the aggregations differ: DuckDB has {describe(unmatched)} that ours has "
-            f"not, ours {describe(remaining)} that DuckDB has not",
-            [a.op for a in unmatched],
-            [a.op for a in remaining],
+            component,
+            f"the {what} differ: DuckDB has {describe(unmatched)}; ours has "
+            f"{describe(remaining)}",
+            [op for _, op in unmatched],
+            [op for _, op in remaining],
         )
     ]
+
+
+def compare_aggregates(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
+    """The aggregations of both plans by their locations: their keys, the
+    skeleton below them and the operators above them."""
+    return _placement_finding(
+        "aggregations",
+        "locations of the aggregations",
+        _placed(duckdb, ("aggregate",)),
+        _placed(ours, ("aggregate",)),
+    )
 
 
 def compare_orders(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
-    remaining = list(ours.orders)
-    unmatched = []
-    for order in duckdb.orders:
-        key = (order.kind, order.k, order.offset, order.keys, order.input)
-        match = next(
-            (o for o in remaining if (o.kind, o.k, o.offset, o.keys, o.input) == key),
-            None,
-        )
-        if match is None:
-            unmatched.append(order)
-        else:
-            remaining.remove(match)
+    """The top-N, sorts and limits of both plans by their locations."""
+    kinds = ("topn", "sort", "limit")
+    return _placement_finding(
+        "top-N and limits",
+        "locations of the top-N, sorts and limits",
+        _placed(duckdb, kinds),
+        _placed(ours, kinds),
+    )
+
+
+def compare_breaks(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
+    """The pipeline breaks of both plans by their kinds and the locations of
+    their operators (so the relations of the breakers too: a breaker below
+    another is in the skeleton below it)."""
+    mine = break_locations(duckdb.plan, duckdb.locations)
+    theirs = break_locations(ours.plan, ours.locations)
+    keyed_duckdb = [((kind, location), (kind, location)) for kind, location in mine]
+    keyed_ours = [((kind, location), (kind, location)) for kind, location in theirs]
+    unmatched, remaining = _unmatched(keyed_duckdb, keyed_ours)
     if not unmatched and not remaining:
         return []
 
-    def describe(orders):
+    def describe(items) -> str:
+        counts = collections.Counter(key for key, _ in items)
         return (
-            ", ".join(
-                f"a {({'topn': 'top-N', 'sort': 'sort', 'limit': 'limit'})[o.kind]}"
-                + (f" of {o.k}" if o.k is not None else "")
-                + (f" after {o.offset}" if o.offset else "")
-                + f" by {o.keys} key{'s' if o.keys != 1 else ''} of "
-                + tables_text(o.input.split(", "))
-                for o in orders
+            "; ".join(
+                (
+                    f"{plural(count, kind)} at {location.text()}"
+                    if count > 1
+                    else f"{'an' if kind[0] in 'aeiou' else 'a'} {kind} at "
+                    f"{location.text()}"
+                )
+                for (kind, location), count in counts.items()
             )
             or "none"
         )
 
-    return [
-        Finding(
-            "top-N and limits",
-            f"DuckDB has {describe(unmatched)} that ours has not, ours "
-            f"{describe(remaining)} that DuckDB has not",
-            [o.op for o in unmatched],
-            [o.op for o in remaining],
-        )
-    ]
-
-
-def compare_breaks(duckdb: Fingerprint, ours: Fingerprint) -> list[Finding]:
-    if duckdb.breaks == ours.breaks:
-        return []
-    kinds = sorted(set(duckdb.breaks) | set(ours.breaks))
-    differences = [
+    differences = ", ".join(
         f"{kind} {duckdb.breaks[kind]} / {ours.breaks[kind]}"
-        for kind in kinds
+        for kind in sorted(set(duckdb.breaks) | set(ours.breaks))
         if duckdb.breaks[kind] != ours.breaks[kind]
-    ]
-    changed = {kind for kind in kinds if duckdb.breaks[kind] != ours.breaks[kind]}
-    return [
-        Finding(
-            "pipeline breaks",
-            "the pipeline breaks differ (DuckDB / ours): " + ", ".join(differences),
-            # The joins are in the excerpts of the findings of the joins.
-            [op for kind, op in duckdb.plan.breaks if kind in changed - {"join build"}],
-            [op for kind, op in ours.plan.breaks if kind in changed - {"join build"}],
-        )
-    ]
+    )
+    changed = {kind for (kind, _), _ in unmatched + remaining}
+
+    def ops(plan: Plan) -> list[Op]:
+        # The joins are in the excerpts of the findings of the joins.
+        return [op for kind, op in plan.breaks if kind in changed - {"join build"}]
+
+    finding = Finding(
+        "pipeline breaks",
+        f"the pipeline breaks differ: DuckDB blocks with {describe(unmatched)}, "
+        f"ours with {describe(remaining)}"
+        + (f" (DuckDB / ours: {differences})" if differences else ""),
+        ops(duckdb.plan),
+        ops(ours.plan),
+    )
+    finding.kinds = changed
+    return [finding]
 
 
 def attribute(duckdb: Fingerprint, ours: Fingerprint, findings: list[Finding]) -> None:
@@ -1818,7 +2674,7 @@ def attribute(duckdb: Fingerprint, ours: Fingerprint, findings: list[Finding]) -
             )
             or (
                 finding.component == "pipeline breaks"
-                and "shared subplan" in finding.text
+                and "shared subplan" in finding.kinds
                 and not delim
             )
         ):
@@ -1827,7 +2683,19 @@ def attribute(duckdb: Fingerprint, ours: Fingerprint, findings: list[Finding]) -
             finding.cause = "delim-join"
         elif delim and finding.cause == "join-order":
             split_delim_joins(finding, delim_ops, findings)
+    # The placements of their own: the aggregations and the top-N, sorts and
+    # limits elsewhere, and the pipeline breaks that follow from them.
+    placements = {
+        "aggregations": "aggregate-placement",
+        "top-N and limits": "order-placement",
+    }
     for finding in findings:
+        if finding.cause is None and finding.component in placements:
+            finding.cause = placements[finding.component]
+    placed = [f.cause for f in findings if f.cause in placements.values()]
+    for finding in findings:
+        if finding.cause is None and finding.component == "pipeline breaks" and placed:
+            finding.cause = placed[0]
         if finding.cause is None:
             finding.cause = "unexplained"
 
@@ -2219,7 +3087,14 @@ def cause_rows(comparisons: list[Comparison]) -> list[tuple[Cause, list[str], in
                 (comparison.query, divergence.cause.id), ("none", None, "")
             )[0]
             scores[divergence.cause.id] += IMPACT_SCORES[impact]
-    rows = [(CAUSES[cause], names, scores[cause]) for cause, names in queries.items()]
+    rows = [
+        (
+            CAUSES.get(cause) or Cause(cause, cause, RULE_GAP, "?", "?"),
+            names,
+            scores[cause],
+        )
+        for cause, names in queries.items()
+    ]
     rows.sort(key=lambda row: (-len(row[1]), -row[2], row[0].title))
     return rows
 
@@ -2438,8 +3313,10 @@ def report(comparisons: list[Comparison]) -> str:
     lines += [*REPORT_METHOD.strip("\n").split("\n"), ""]
     lines += [*REPORT_COSTS.strip("\n").split("\n"), ""]
     lines += ["### The causes", ""]
+    found = {d.cause.id for c in comparisons for d in c.divergences}
     for cause in sorted(
-        CAUSES.values(), key=lambda c: (c.classification != RULE_GAP, c.title)
+        (cause for cause in CAUSES.values() if cause.id in found),
+        key=lambda c: (c.classification != RULE_GAP, c.title),
     ):
         lines += [
             f"- **{cause.title}** ({cause.classification}"
@@ -2535,10 +3412,10 @@ REPORT_METHOD = """
 Both plans are read from their machine-readable form: DuckDB's JSON plan (the
 `name`, `children` and `extra_info` of every operator) and our dump (the
 `kind`, `inputs` and pipelines of every operator, and its description). The
-differ only takes apart the details that both render as text (the lists of
-projections, the conjuncts of filters, the keys of aggregations, joins and
-sorts) and finds the columns that they reference; it never compares their
-formatting. It normalizes both plans into one model, in which
+differ takes apart the details that both render as text (the lists of
+projections, the filters, the keys of aggregations, joins and sorts) into
+their meaning; it never compares their formatting. It normalizes both plans
+into one model, in which
 
 - projections are left out (both engines place them differently and they do not
   change the shape), and so are our `CachingOperator`s (which coalesce small
@@ -2558,16 +3435,44 @@ formatting. It normalizes both plans into one model, in which
   top-N with an offset, as DuckDB's `TOP_N`.
 
 The fingerprint of a plan has, for every scan, its table, the columns it reads,
-the columns its filters compare with constants (which it can prune row groups
-with) and whether a top-N pushes its dynamic filter into it; every join, by its
-inputs (the join order, whatever the build side), with its operator (hash,
-nested loop, ...), its kind and its build side; every aggregation, by the tables
-of its input and its number of keys; every top-N, sort and limit; and the
-pipeline breaks: the sinks of our pipelines, and the sinks that DuckDB's
+its filters (but those that it only prunes with, such as DuckDB's `optional:`
+filters, and the dynamic filters of joins) and whether a top-N pushes its
+dynamic filter into it; every join, by its inputs (the join order, whatever the
+build side), with its operator (hash, nested loop, ...), its kind and its build
+side; and the location of every aggregation, top-N, sort and limit, and of every
+pipeline break: the sinks of our pipelines, and the sinks that DuckDB's
 operators make (the build side of a join, aggregations, sorts, top-N and shared
 subplans; its `EXPLAIN` does not show its pipelines). Both engines aggregate in
-one operator, partially in every thread and then finally: the placement of an
-aggregation is the tables below it.
+one operator, partially in every thread and then finally.
+
+The filters of a scan are compared by their meaning. Every conjunct is a term:
+an expression (a column, or a function of columns, without casts), an operator
+and its constants (without quotes and casts, numbers canonical, the value of a
+scalar subquery `<subquery>`). The same filter in both dialects is the same
+term: `URL LIKE '%google%'` and DuckDB's `contains(URL, 'google')`,
+`p_name LIKE 'forest%'` and DuckDB's `p_name >= 'forest' AND p_name < 'foresu'`,
+an `OR` of equalities and an `IN` list, a disjunction with or without its common
+conjuncts factored out; an `IN` list of a `MARK` join, whose constants DuckDB
+does not show, is the list of as many constants of our plan. A term of one plan
+is in the other if the terms of the other scan imply it: by bounds, equalities,
+lists and exclusions of one expression, by unions of intervals (`l_quantity`
+between 1 and 30 is `l_quantity` between 1 and 11, 10 and 20 or 20 and 30), and
+by cases over disjunctions. So a missing or changed bound is a finding, a
+derived filter that the other filters imply is not.
+
+The location of an aggregation, a top-N, a sort or a limit is its kind and
+parameters (`agg1`, an aggregation by one key; `top10+100`, the top 10 rows
+after 100), the skeleton of the plan below it and the operators above it. A
+skeleton keeps the structure of a plan only: scans by their table, the other
+placed operators, and blocks of joins as the multiset of their inputs, so that
+the join order (which the joins compare) does not move the operators above or
+below the joins (e.g. `top10(agg1(join[customer, lineitem, orders]))`). A
+pipeline break is its kind at the location of its operator (that of the block
+of joins of a join, once per join), so a breaker below another is in the
+skeleton below the other: two plans with as many breaks of every kind, at
+other places, differ. Through DuckDB's shared subplans, the operators of a
+definition have a location for every reader, as if the plan computed it once
+per reader as ours does; the sharing itself is a finding of its own.
 
 Every difference of the fingerprints is a finding, and the findings of a query
 are grouped by their cause into its divergences: the rules of DuckDB that change
@@ -2576,7 +3481,11 @@ expressions, decorrelation by the outer keys) explain all the differences of
 that part, and so do the exact statistics that let our planner answer a query
 without scanning; then a join that both plans have but build on different
 inputs is a cost/statistics-driven divergence, and different joins are a
-different join order, a rule gap. Every cause is a rule gap (our optimizer
+different join order, a rule gap; the filters of a scan that the other plan
+does not have are `IS NOT NULL` filters of keys, bounds that follow from
+comparisons of columns, or filters that the other plan does not push into the
+scan; and the aggregations, top-N, sorts and limits at other places are
+placements of their own. Every cause is a rule gap (our optimizer
 lacks a rule that DuckDB has: a planner fix) or cost/statistics-driven (the
 rules agree but the choice differs, through estimates or statistics; also when
 our plan is ahead through statistics that DuckDB does not use). A query
