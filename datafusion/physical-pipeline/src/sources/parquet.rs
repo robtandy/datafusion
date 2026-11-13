@@ -121,15 +121,17 @@ const MIN_UNIT_ROWS: usize = 32 * DEFAULT_VECTOR_SIZE;
 ///   folds into it (see [`Self::try_with_filter`]): then the scan produces
 ///   the output of the `FilterExec`;
 /// * the conjuncts of the predicate of its [`ParquetSource`]: the dynamic
-///   filters of the hash joins above it, and the filters that DataFusion
-///   pushed into it to prune its files, row groups and pages. No row has to
-///   be filtered by them (the nodes above evaluate them too, or drop the rows
-///   that they reject), so the scan only evaluates them where that pays off.
-///   The dynamic filters of the TopKs and aggregations above it, which these
-///   tighten from the rows of the scan, only prune (see
-///   [`ConjunctMeter::tightens`]). With `pushdown_filters`, DataFusion relies
-///   on the scan to apply its static conjuncts, which it then always does:
-///   in the row filter, or natively, as the conjuncts of a folded filter.
+///   filters of the TopKs, aggregations and hash joins above it, and the
+///   filters that DataFusion pushed into it to prune its files, row groups
+///   and pages. No row has to be filtered by them (the nodes above evaluate
+///   them too, or drop the rows that they reject), so the scan only
+///   evaluates them where that pays off, as it measures. A dynamic filter
+///   that its node tightens while the scan runs (e.g. the threshold of a
+///   TopK) is measured again as soon as it changes (see
+///   [`ConjunctMeter::record_passed`]). With `pushdown_filters`, DataFusion
+///   relies on the scan to apply its static conjuncts, which it then always
+///   does: in the row filter, or natively, as the conjuncts of a folded
+///   filter.
 ///
 /// The scan evaluates a conjunct in the row filter of the Parquet decoder,
 /// or natively on the decoded chunks. The row filter decodes the columns of
@@ -1362,20 +1364,6 @@ impl ConjunctMeter {
         self.set_placement(placement);
     }
 
-    /// Whether the conjunct is a dynamic filter that its node is still
-    /// tightening, from the rows that the scan produces: the threshold of a
-    /// TopK, or the bounds of a `MIN` or `MAX` aggregation above it (the
-    /// dynamic filters of the hash joins above a scan are complete before it
-    /// starts). Its node tightens it as it receives rows, once per buffer or
-    /// batch of rows: filtering the rows of the scan with it would delay that
-    /// (by the rows that the filter rejects), and the pruning of the files,
-    /// row groups and pages that it gives. So it only prunes.
-    fn tightens(&self) -> bool {
-        self.expr
-            .downcast_ref::<DynamicFilterPhysicalExpr>()
-            .is_some_and(|filter| !filter.is_complete())
-    }
-
     /// Whether the row filter of a version applies the conjunct to every row
     /// (see [`RowFilterState::version_filter`]): a folded or exact conjunct
     /// in the row filter, and a pinned one.
@@ -1922,10 +1910,7 @@ impl RowFilterState {
         // change after.
         let epoch = self.epoch.load(Ordering::Relaxed);
         let in_row_filter = (0..self.meters.len())
-            .filter(|&candidate| {
-                self.meters[candidate].placement() == IN_ROW_FILTER
-                    && !self.meters[candidate].tightens()
-            })
+            .filter(|&candidate| self.meters[candidate].placement() == IN_ROW_FILTER)
             .collect::<Vec<_>>();
         if in_row_filter.is_empty() || !self.reads_with_row_filter(unit) {
             return self.native_version(scan, ctx);
@@ -2021,11 +2006,9 @@ impl RowFilterState {
             .iter()
             .chain(&others)
             .map(|&candidate| {
-                // A dynamic filter that is being tightened only prunes.
-                let meter = &self.meters[candidate];
                 RowFilterExpr::new_arc(
                     Arc::clone(&predicate.candidates[candidate].expr),
-                    (!meter.tightens()).then(|| Arc::clone(meter)),
+                    Some(Arc::clone(&self.meters[candidate])),
                     applied.contains(&candidate),
                 )
             })
@@ -2424,6 +2407,8 @@ mod tests {
     use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
     use datafusion_datasource_csv::source::CsvSource;
     use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::BinaryExpr;
     use datafusion_physical_plan::metrics::MetricValue;
     use parquet::file::properties::WriterProperties;
     use parquet::schema::types::ColumnPath;
@@ -3725,6 +3710,74 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topk_dynamic_filters_filter_rows_in_the_decoders() -> Result<()> {
+        // `ORDER BY id LIMIT 10` over the 16 units (row groups) of `big`: `id`
+        // does not follow the order of the rows, so every row group has ids
+        // near 0, and the threshold of the TopK prunes no row group. Once the
+        // TopK has its first rows, its dynamic filter (`id < threshold`, which
+        // it marks complete only once it consumed the scan) rejects nearly
+        // every row: the scan evaluates it in the row filter of its decoders,
+        // which decode `id` for the rows of the units they read, and the
+        // other columns (`k` and `s`) only for the rows that pass it.
+        let big = tempfile::tempdir()?;
+        write_big_table(big.path())?;
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("big", big.path().to_str().unwrap(), Default::default())
+                .await
+        };
+        let sql = "SELECT k, s FROM big ORDER BY id LIMIT 10";
+        let rows = 4 * BIG_FILE_ROWS as usize;
+        for config in [
+            test_session_config(),
+            test_session_config().with_target_partitions(1),
+        ] {
+            let partitions = config.target_partitions();
+            let (expected, actual) = run_engines(sql, config, &setup).await?;
+            compare_outputs(&expected, &actual).unwrap();
+            let root = actual
+                .plan
+                .downcast_ref::<PipelineRootExec>()
+                .unwrap()
+                .operator();
+            let [scan] = parquet_scans(root)[..] else {
+                panic!("one scan\n{}", format_operator_tree(root));
+            };
+            let [candidate] = &scan.predicate.candidates[..] else {
+                panic!("one candidate: {:?}", scan.predicate.candidates);
+            };
+            assert!(candidate.expr.is::<DynamicFilterPhysicalExpr>());
+            assert_eq!(candidate.kind, ConjunctKind::Optional);
+            let context = format!("{partitions} partitions");
+            // The row filters evaluated the filter of the TopK on the rows of
+            // more than one unit, and the decoders skipped the rows that it
+            // rejected (DataFusion's metrics of the row filter).
+            let evaluated = metric(scan, "row_filter_evaluated_rows");
+            let output = metric(scan, "row_filter_output_rows");
+            let pruned = metric(scan, "pushdown_rows_pruned");
+            assert!(
+                evaluated > BIG_ROW_GROUP_ROWS && evaluated <= rows,
+                "{context}: {evaluated} rows evaluated"
+            );
+            assert!(
+                pruned >= evaluated / 2 && output < evaluated / 2,
+                "{context}: {pruned} rows pruned, {output} produced of {evaluated}"
+            );
+            // DataFusion's row filter ran on every row of these units (also
+            // where the conjunct selected its rows unevaluated, while it was
+            // `true`), and pruned rows only where the conjunct was evaluated.
+            let matched = metric(scan, "pushdown_rows_matched");
+            assert!(
+                pruned <= evaluated && matched + pruned >= evaluated,
+                "{context}: {matched} rows matched, {pruned} pruned of {evaluated}"
+            );
+            assert!(metric(scan, "row_filtered_units") > 1, "{context}");
+            // `k` and `s` are materialized late.
+            assert_eq!(metric(scan, "late_materialized_columns"), 2, "{context}");
+        }
+        Ok(())
+    }
+
     /// A candidate conjunct of `kind` for the meters of the tests.
     fn candidate(kind: ConjunctKind) -> RowFilterConjunct {
         RowFilterConjunct {
@@ -3784,11 +3837,14 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_filters_that_are_tightened_only_prune() {
-        // The dynamic filter of a TopK or an aggregation above the scan,
-        // which their nodes tighten from the rows of the scan, is not
-        // evaluated by the row filter until it is complete (as the dynamic
-        // filters of hash joins are when their probe sides start).
+    fn dynamic_filters_are_measured_again_when_they_change() -> Result<()> {
+        // The dynamic filter of a TopK above the scan, which the TopK
+        // tightens from the rows of the scan (and marks complete only once it
+        // consumed them all), is placed by what it rejects, as the other
+        // conjuncts: it leaves the row filter while it rejects few rows
+        // (`true`, before the TopK has its first `k` rows), and is sampled in
+        // the row filter again as soon as it changes, not only after
+        // `RESAMPLE_ROWS` rows.
         let key: Arc<dyn PhysicalExpr> = Arc::new(Column::new("k", 0));
         let filter = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![Arc::clone(&key)],
@@ -3801,16 +3857,24 @@ mod tests {
         };
         let meter =
             ConjunctMeter::new(&dynamic, Arc::new(AtomicU64::new(0)), Count::new());
-        assert!(meter.tightens());
-        filter.mark_complete();
-        assert!(!meter.tightens());
-        // Other conjuncts are never tightened.
-        let meter = ConjunctMeter::new(
-            &candidate(ConjunctKind::Optional),
-            Arc::new(AtomicU64::new(0)),
-            Count::new(),
-        );
-        assert!(!meter.tightens());
+        assert_eq!(meter.placement(), IN_ROW_FILTER);
+        meter.record(SAMPLE_ROWS, SAMPLE_ROWS, 1000);
+        assert_eq!(meter.placement(), NOT_EVALUATED);
+        meter.record_passed(1);
+        assert_eq!(meter.placement(), NOT_EVALUATED);
+        // The TopK publishes a threshold.
+        filter.update(Arc::new(BinaryExpr::new(
+            Arc::clone(&key),
+            Operator::Lt,
+            lit(10i64),
+        )))?;
+        assert!(!filter.is_complete());
+        meter.record_passed(1);
+        assert_eq!(meter.placement(), IN_ROW_FILTER);
+        // Which rejects most rows: it stays in the row filter.
+        meter.record(SAMPLE_ROWS, SAMPLE_ROWS / 100, 1000);
+        assert_eq!(meter.placement(), IN_ROW_FILTER);
+        Ok(())
     }
 
     #[test]
