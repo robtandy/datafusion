@@ -104,8 +104,8 @@ time, from its spawn to its completion:
   the runtime in its work queue: from its spawn to its first poll, and after
   it yielded (every 128 operator calls).
 
-A thread that is woken while blocked waits in the work queue too, which
-counts as blocked time.
+The time from the wake-up of a blocked thread to its next poll (in the work
+queue) counts as blocked time.
 
 Before the threads of a pipeline start, the executor creates the global states
 of its operators (`setup_time`), and once all pipelines of a meta pipeline
@@ -119,10 +119,10 @@ blocked, queued, not started yet, or already done while other threads still
 ran. The `idle_time` of the execution is
 `threads * elapsed_time - active_time` too, with the `threads` of the
 executor: it also counts the time that the execution ran pipelines with fewer
-threads, or waited for pipelines to complete. So a CPU-bound query has an active time close to
-`threads * elapsed_time`; a starved query has a large idle time: a large
-blocked time if it waits for its input, a large queue wait if it waits for the
-CPU, or else too few threads, too little parallelism.
+threads, or waited for pipelines to complete. So a CPU-bound query has an
+active time close to `threads * elapsed_time`; a starved query has a large
+idle time: a large blocked time if it waits for its input, a large queue wait
+if it waits for the CPU, or else too few threads, too little parallelism.
 
 ### Additivity
 
@@ -143,8 +143,9 @@ for the overhead of the executor and the work-queue wait. The tolerance is
 `timings_add_up_to_the_thread_time` assert it, in debug builds, for a plan of
 11 operators and 5 pipelines (the scans of two tables, a filter, two
 projections, a hash join, an aggregation and a sort of 200,000 rows) on one
-and on four threads, and `the_time_the_threads_wait_is_the_blocked_time_of_the_operator`
-for a source that blocks. In these tests, the operators account for all but
+and on four threads, and
+`the_time_the_threads_wait_is_the_blocked_time_of_the_operator` for a source
+that blocks. In these tests, the operators account for all but
 about 1.3% of the thread time (and of the elapsed time on one thread), of
 which the overhead of the executor is the larger part; the work-queue wait is
 larger on a busy machine.
@@ -164,12 +165,39 @@ all of them towards its `memory_peak`.
 ## Overhead
 
 When profiling is off, the executor records only the metrics of
-`OperatorMetrics` (as before), and checks once per operator call whether it
-profiles. When profiling is on, it also takes a timestamp per poll of a
-thread, computes the bytes of every chunk (which costs a loop over the views
-of view columns), updates the counters of the thread (merged once per thread
-into the profile of the pipeline), and records the reservations of the memory
-pool (a lookup in a sharded map per reservation change).
+`OperatorMetrics`, as before: the only additions to the push loop are the
+checks whether the thread profiles, around every operator call. (It now also
+times the creation of the states of the operators and the polls of the futures
+that they wait for, once per pipeline or thread and per wait, which are part
+of their `elapsed_compute`.)
+
+When profiling is on, the executor also takes a timestamp at the start and at
+the end of every poll of a thread, computes the bytes of every chunk (which
+reads the views of view columns, whose bytes it then remembers for the columns
+that the next stage passes on), updates the counters of the thread (merged
+into the profile of the pipeline once per thread), and records the changes of
+the reservations in the memory pool (a lookup in a sharded map). A profiled
+execution also creates its profile, and a task context with the recording
+memory pool. The time spent on the profile while the threads run is part of
+the `overhead_time` of the execution.
+
+Measured with
+`cargo test --profile release-nonlto -p datafusion-physical-pipeline --bench pipeline_vs_default -- pipeline_vs_default --nocapture`
+(TPC-H SF 0.1 and 1,000,000 `hits` rows, 16 threads, a 16-core Neoverse-N1
+machine), in interleaved runs of the builds before and after profiling was
+added (the totals of the 47 queries are the medians of the runs, in ms):
+
+| Profiling           | Runs  | `MemTable` total        | Parquet total           | Geometric mean per query (`MemTable`, Parquet)     |
+| ------------------- | ----- | ----------------------- | ----------------------- | -------------------------------------------------- |
+| off: before → after | 6 + 6 | 247.44 → 247.55 (+0.0%) | 436.33 → 435.78 (−0.1%) | 1.001, 0.997 (DataFusion, unchanged: 0.997, 1.003) |
+| off → on            | 4 + 4 | 244.21 → 259.36 (+6.2%) | 432.48 → 443.04 (+2.4%) | 1.086, 1.048 (DataFusion, unchanged: 1.011, 1.004) |
+
+With profiling off, the engine is as fast as before, within the noise of the
+machine (the run-to-run standard deviation of the totals is 2-4 ms). With
+profiling on, the queries take a few percent longer: a fixed cost of about
+50 µs per execution doubles the queries of less than 0.1 ms, and computing the
+bytes of the chunks costs most of the rest (up to 15% for `hits23`, which
+reads all columns of `hits`, many of them strings).
 
 ## `EXPLAIN ANALYZE`
 
