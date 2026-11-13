@@ -2219,7 +2219,7 @@ mod tests {
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
     use datafusion_physical_plan::collect;
-    use datafusion_physical_plan::joins::{CrossJoinExec, NestedLoopJoinExec};
+    use datafusion_physical_plan::joins::CrossJoinExec;
     use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
     use datafusion_physical_plan::union::UnionExec;
     use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
@@ -2228,6 +2228,7 @@ mod tests {
     use crate::PipelineQueryPlanner;
     use crate::bridge::{BridgeOperator, PipelineRootExec, bridged_plans};
     use crate::explain::{format_operator_tree, format_pipelines};
+    use crate::join::nested_loop::PhysicalCrossJoin;
     use crate::operators::union::test_support::count;
     use crate::planner::lower_execution_plan;
     use crate::sources::LazyMemorySource;
@@ -3182,15 +3183,35 @@ mod tests {
             || plan.children().into_iter().any(scans_native_work_table)
     }
 
+    /// `plan` with every node that `wrap` selects below a node that DataFusion
+    /// executes, as every user-defined node (see [`EvaluatesExpr`]), with its
+    /// subtree.
+    fn below_user_defined_nodes(
+        plan: Arc<dyn ExecutionPlan>,
+        wrap: impl Fn(&Arc<dyn ExecutionPlan>) -> bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_common::tree_node::{Transformed, TreeNode};
+        let plan = plan.transform_up(|node| {
+            if !wrap(&node) {
+                return Ok(Transformed::no(node));
+            }
+            let expr = lit(true);
+            let node: Arc<dyn ExecutionPlan> =
+                Arc::new(EvaluatesExpr { expr, input: node });
+            Ok(Transformed::yes(node))
+        })?;
+        Ok(plan.data)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_nodes_that_datafusion_executes_read_the_working_table_of_the_cte()
     -> Result<()> {
         let ctx = datafusion_context(test_session_config());
-        // Lowered for any session, cross joins are left to DataFusion (they do
-        // not reserve their memory yet): DataFusion executes the cross join of
-        // the recursive term, whose scan of the working table reads the
-        // working table of the native CTE.
+        // DataFusion executes a user-defined node of the recursive term above
+        // the cross join, with its subtree, whose scan of the working table
+        // reads the working table of the native CTE.
         let plan = ctx.sql(CROSS_JOIN).await?.create_physical_plan().await?;
+        let plan = below_user_defined_nodes(plan, |node| node.is::<CrossJoinExec>())?;
         let root = lower_execution_plan(&plan)?;
         assert_recursion_is_native(&root, CROSS_JOIN);
         let cte = root
@@ -3219,61 +3240,35 @@ mod tests {
         ))
     }
 
-    /// Whether a recursive query of the DataFusion plan `plan` is below a node
-    /// that the planner leaves to DataFusion, with its whole subtree, in a
-    /// session whose memory pool has a limit: a nested loop join, a cross join
-    /// or a window (see `lower_execution_plan_with_runtime`).
-    fn is_below_node_of_unlimited_memory(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        fn has_recursive_query(plan: &Arc<dyn ExecutionPlan>) -> bool {
-            plan.is::<RecursiveQueryExec>()
-                || plan.children().into_iter().any(has_recursive_query)
-        }
-        let unlimited = plan.is::<CrossJoinExec>()
-            || plan.is::<NestedLoopJoinExec>()
-            || plan.is::<WindowAggExec>()
-            || plan.is::<BoundedWindowAggExec>();
-        (unlimited && has_recursive_query(plan))
-            || plan
-                .children()
-                .into_iter()
-                .any(is_below_node_of_unlimited_memory)
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn recursions_are_native_in_sessions_with_a_memory_limit() -> Result<()> {
-        // In a session whose memory pool has a limit, the planner leaves the
-        // windows, nested loop joins and cross joins to DataFusion (they do
-        // not reserve their memory yet), with their whole subtrees: also
-        // those of recursive terms that scan the working table, which read the
-        // working table of the native CTE. So the recursive queries of
-        // `cte.slt` are native but those below such nodes: the two inputs of
-        // the cross join of `SELECT * FROM my_cte t1, my_cte`.
+        // The native operators reserve their memory in the memory pool of the
+        // session, whatever its limit: the recursive queries of `cte.slt` are
+        // native in a session whose pool has a limit, also those below the
+        // windows, nested loop joins and cross joins (e.g. the two inputs of
+        // the cross join of `SELECT * FROM my_cte t1, my_cte`), and so are
+        // these nodes.
         let dir = tempfile::tempdir()?;
         let dir = dir.path().to_str().unwrap().to_owned();
         write_parquet_files(&dir).await?;
         let setup = async |ctx: &SessionContext| register_cte_tables(ctx, &dir).await;
-        let mut native = 0;
         for sql in CTE_SLT_QUERIES {
             let (datafusion, pipeline) =
                 sessions_with_a_memory_limit(test_session_config())?;
-            let (expected, actual) =
+            let (_, actual) =
                 assert_same_results_in(sql, datafusion, pipeline, &setup).await;
-            if !is_below_node_of_unlimited_memory(&expected.plan) {
-                assert_recursion_is_native(&lowered(&actual), sql);
-                native += 1;
-            }
+            assert_recursion_is_native(&lowered(&actual), sql);
         }
-        assert_eq!(native, CTE_SLT_QUERIES.len() - 1);
-        // The cross join of the recursive term is left to DataFusion, and
-        // reads the working table of the native CTE.
+        // The cross join of the recursive term is native.
         let (datafusion, pipeline) = sessions_with_a_memory_limit(test_session_config())?;
         let root =
             assert_native_recursion_in(CROSS_JOIN, datafusion, pipeline, &setup).await;
         assert!(
-            bridged_plans(&root).iter().any(scans_native_work_table),
+            bridged_plans(&root).is_empty(),
             "{}",
             format_operator_tree(&root)
         );
+        assert_eq!(count::<PhysicalCrossJoin>(&root), 1);
         Ok(())
     }
 
@@ -4255,12 +4250,12 @@ mod tests {
     }
 
     /// A recursive query whose recursive term has a partial `MIN`/`MAX`
-    /// aggregation below a window. In a session with a memory limit, the
-    /// planner leaves the window to DataFusion, with its subtree, so
-    /// DataFusion's aggregation sets its dynamic filter (`k < min OR k >
-    /// max`), which the scan of `nums` reads, from the bounds of its
-    /// aggregates. Every iteration aggregates the rows `n + 250` and `n + 750`
-    /// of its `n`, so the bounds of the iterations differ.
+    /// aggregation below a window. Below a node that DataFusion executes,
+    /// with its subtree (see `below_user_defined_nodes`), DataFusion's
+    /// aggregation sets its dynamic filter (`k < min OR k > max`), which the
+    /// scan of `nums` reads, from the bounds of its aggregates. Every
+    /// iteration aggregates the rows `n + 250` and `n + 750` of its `n`, so
+    /// the bounds of the iterations differ.
     const AGGREGATION_IN_A_WINDOW: &str = "WITH RECURSIVE w(n) AS (SELECT 1 UNION ALL \
         SELECT lo - 249 FROM (SELECT lo, hi, row_number() OVER () AS rn FROM \
           (SELECT min(t.k) AS lo, max(t.k) AS hi FROM w \
@@ -4298,13 +4293,27 @@ mod tests {
         )
         .await?;
         let sql = AGGREGATION_IN_A_WINDOW;
-        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        // DataFusion executes a user-defined node above the window, with the
+        // window and the partial aggregation, whose filter the scan reads.
+        let state = ctx.state();
+        let lowered = ctx.sql(sql).await?.create_physical_plan().await?;
+        let plan = lowered
+            .downcast_ref::<PipelineRootExec>()
+            .expect("a pipeline plan")
+            .input();
+        let plan = below_user_defined_nodes(Arc::clone(plan), |node| {
+            node.is::<WindowAggExec>() || node.is::<BoundedWindowAggExec>()
+        })?;
+        let plan: Arc<dyn ExecutionPlan> =
+            crate::planner::create_pipeline_plan_with_runtime(
+                plan,
+                state.config_options(),
+                state.runtime_env(),
+            )?;
         let root = plan
             .downcast_ref::<PipelineRootExec>()
             .expect("a pipeline plan");
         assert_recursion_is_native(root.operator(), sql);
-        // DataFusion executes the window, with the partial aggregation, whose
-        // filter the scan reads.
         let [window] = bridged_plans(root.operator()).try_into().unwrap();
         let mut partial_aggregations = vec![];
         window.apply(|node| {

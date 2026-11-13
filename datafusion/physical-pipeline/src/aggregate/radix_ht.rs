@@ -75,6 +75,25 @@
 //! ([`GroupValues`](datafusion_physical_plan::aggregates::group_values::GroupValues)),
 //! so that the groups of a partition, which share the upper bits of their
 //! partition hash, still spread over the hash table of the partition.
+//!
+//! # Memory
+//!
+//! The memory that the aggregation holds is reserved in the memory pool of
+//! the session, and the aggregation fails with `ResourcesExhausted` when the
+//! pool cannot hold it (it does not spill yet):
+//!
+//! * the thread-local tables, after every chunk they aggregate (as
+//!   DataFusion's hash aggregation reserves its table after every batch), the
+//!   rows that a thread buffers to sort them before it aggregates them, and
+//!   the rows that bypass the tables until they are scattered (copies of
+//!   them if they are slices of larger arrays, see
+//!   [`compact_to_keep`](crate::sort::compact_to_keep));
+//! * the groups and rows of the radix partitions as they are scattered to
+//!   them: the pieces of a scatter, slices of the same arrays, are reserved
+//!   once, until the partitions of all of them are finalized;
+//! * the tables of the final aggregation of a partition as they grow, the
+//!   evaluated groups of the partition until they are emitted, and the top
+//!   groups of a top-k aggregation that the finalized partitions keep.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -91,6 +110,7 @@ use arrow::compute::{filter, filter_record_batch, interleave, take};
 use arrow::datatypes::{BinaryViewType, ByteViewType, DataType, StringViewType};
 use datafusion_common::hash_utils::{RandomState, create_hashes};
 use datafusion_common::{Result, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
 use datafusion_physical_expr::PhysicalExpr;
 use parking_lot::Mutex;
 
@@ -103,6 +123,10 @@ use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     GlobalSinkState, GlobalSourceState, LocalSinkState, LocalSourceState, SinkFinalize,
     SinkResult, SourceResult, downcast_state, downcast_state_mut,
+};
+use crate::sort::{
+    ReservedMemory, array_memory, array_overhead, buffered_memory, columns_to_keep,
+    resize_share,
 };
 
 /// The name of the operator, for error messages.
@@ -165,6 +189,11 @@ struct Partition {
     /// (their columns, see [`evaluate_rows`]), by sub-partition: one entry
     /// per scatter of rows of a thread that had rows in the sub-partition.
     rows: [Vec<Vec<ArrayRef>>; NUM_SPLITS],
+    /// The reservations of the memory of the scatters whose states and rows
+    /// the partition holds: the pieces of the states and rows of a scatter
+    /// are slices of the same arrays, which are freed once the pieces of all
+    /// partitions are dropped, and so is their reservation.
+    scatters: Vec<Arc<MemoryReservation>>,
 }
 
 impl Partition {
@@ -191,6 +220,10 @@ impl Partition {
 #[derive(Debug)]
 struct RadixSinkState {
     partitions: Vec<Mutex<Partition>>,
+    /// The memory of the tables and the buffered rows of the threads (their
+    /// shares, see [`resize_share`]), and of the partitions (the
+    /// reservations of their scatters, see [`Partition::scatters`]).
+    reservation: MemoryReservation,
     /// The partitions that have groups, set by `finalize`.
     non_empty: Mutex<Option<Vec<usize>>>,
     /// For a top-k aggregation, the best cutoff of all threads, with which
@@ -204,11 +237,12 @@ struct RadixSinkState {
 impl GlobalSinkState for RadixSinkState {}
 
 impl RadixSinkState {
-    fn new(filters: bool) -> Self {
+    fn new(filters: bool, reservation: MemoryReservation) -> Self {
         Self {
             partitions: (0..NUM_PARTITIONS)
                 .map(|_| Mutex::new(Partition::default()))
                 .collect(),
+            reservation,
             non_empty: Mutex::new(None),
             cutoff: SharedCutoff::default(),
             filters,
@@ -216,33 +250,78 @@ impl RadixSinkState {
     }
 
     /// Scatter `states`, the groups of a thread-local table, to their
-    /// partitions `partitions` (see [`hash_keys`]).
+    /// partitions `partitions` (see [`hash_keys`]), reserving their memory.
     fn add_states(&self, states: GroupedStates, partitions: &[u8]) -> Result<()> {
-        for (partition, states) in scatter_states(states, partitions, NUM_PARTITIONS)? {
-            self.partitions[partition].lock().states.push(states);
+        let pieces = scatter_states(states, partitions, NUM_PARTITIONS)?;
+        let memory = pieces
+            .iter()
+            .map(|(_, states)| states.memory_size() + PIECE_BYTES)
+            .sum();
+        let scatter = self.reserve_scatter(memory)?;
+        for (partition, states) in pieces {
+            let mut partition = self.partitions[partition].lock();
+            partition.scatters.push(Arc::clone(&scatter));
+            partition.states.push(states);
         }
         Ok(())
     }
 
     /// Scatter input rows, the columns of the rows of several chunks (see
     /// [`evaluate_rows`]), to their sub-partitions `sub_partitions` (see
-    /// [`sub_partition_of`]), in the order of the chunks.
+    /// [`sub_partition_of`]), in the order of the chunks, reserving their
+    /// memory.
     fn add_rows(&self, chunks: Vec<Vec<ArrayRef>>, sub_partitions: &[u8]) -> Result<()> {
-        for (sub_partition, columns) in
-            scatter(chunks, sub_partitions, NUM_PARTITIONS * NUM_SPLITS)?
-        {
+        let pieces = scatter(chunks, sub_partitions, NUM_PARTITIONS * NUM_SPLITS)?;
+        let memory = pieces
+            .iter()
+            .map(|(_, columns)| columns_memory(columns) + PIECE_BYTES)
+            .sum();
+        let scatter = self.reserve_scatter(memory)?;
+        for (sub_partition, columns) in pieces {
             let (partition, split) =
                 (sub_partition >> SPLIT_BITS, sub_partition % NUM_SPLITS);
-            self.partitions[partition].lock().rows[split].push(columns);
+            let mut partition = self.partitions[partition].lock();
+            partition.scatters.push(Arc::clone(&scatter));
+            partition.rows[split].push(columns);
         }
         Ok(())
     }
+
+    /// A reservation of `memory` bytes, of the pieces of a scatter, which the
+    /// partitions that hold them share (see [`Partition::scatters`]).
+    fn reserve_scatter(&self, memory: usize) -> Result<Arc<MemoryReservation>> {
+        let reservation = self.reservation.new_empty();
+        reservation.try_grow(memory)?;
+        Ok(Arc::new(reservation))
+    }
+}
+
+/// The memory that a piece of a scatter (of states or rows, see
+/// [`RadixSinkState::add_states`]) holds in its partition besides its arrays:
+/// the entry of its list of arrays (and its share of the reservation).
+const PIECE_BYTES: usize =
+    size_of::<Vec<ArrayRef>>() + size_of::<GroupedStates>() + size_of::<usize>();
+
+/// The memory that the arrays `columns` hold (see [`array_memory`]), with
+/// their structures (see [`array_overhead`]).
+fn columns_memory(columns: &[ArrayRef]) -> usize {
+    columns
+        .iter()
+        .map(|column| {
+            array_memory(column.as_ref())
+                + array_overhead(column.as_ref())
+                + size_of::<ArrayRef>()
+        })
+        .sum()
 }
 
 /// The thread-local sink state.
 #[derive(Debug)]
 struct RadixLocalState {
     table: GroupedHashTable,
+    /// The memory of `table`, which is reserved (the share of the thread of
+    /// the reservation of the aggregation, see [`resize_share`]).
+    table_memory: usize,
     /// The number of groups at which the table is flushed or grown.
     capacity: usize,
     /// The capacity the table can grow to.
@@ -349,6 +428,7 @@ impl RadixLocalState {
             return self.aggregate_bypassed_or_limited(spec, global, batch);
         }
         self.table.update(spec, batch)?;
+        self.reserve_table(global)?;
         self.table_rows += batch.num_rows();
         if self.table.num_groups() < self.capacity {
             return Ok(());
@@ -411,6 +491,7 @@ impl RadixLocalState {
             Some(columns) => self.table.update_rows(spec, columns)?,
             None => self.table.update(spec, batch)?,
         }
+        self.reserve_table(global)?;
         self.table_rows += num_rows;
         let num_groups = self.table.num_groups();
         if spec.soft_limit.is_some_and(|limit| num_groups >= limit) {
@@ -498,7 +579,18 @@ impl RadixLocalState {
         hash_keys(&states.keys, &mut self.hashes, &mut self.partitions)?;
         self.flushed += states.num_groups();
         self.distinct_flushed.add(&self.hashes);
-        global.add_states(states, &self.partitions)
+        global.add_states(states, &self.partitions)?;
+        // The groups moved to the partitions, which reserve them: the table
+        // holds less memory. (Until they are scattered, the emitted states,
+        // which hold at most the memory of the table, are reserved as the
+        // table.)
+        self.reserve_table(global)
+    }
+
+    /// Reserve the memory of the table of the thread, after it changed.
+    fn reserve_table(&mut self, global: &RadixSinkState) -> Result<()> {
+        let memory = self.table.memory_size();
+        resize_share(&global.reservation, &mut self.table_memory, memory)
     }
 
     /// Make `cutoff`, a cutoff of the top-k aggregation `top_k`, the cutoff of
@@ -615,6 +707,9 @@ struct BypassBuffer {
     chunks: Vec<Vec<ArrayRef>>,
     /// The sub-partition of every row, in the order of the chunks.
     partitions: Vec<u8>,
+    /// The memory of `chunks` and `partitions`, which is reserved (a share of
+    /// the reservation of the aggregation, see [`resize_share`]).
+    memory: usize,
     /// The bytes of the values of the buffered columns with 32-bit offsets.
     offset_bytes: usize,
     /// The most bytes of the values of the buffered columns with 32-bit
@@ -628,6 +723,7 @@ impl BypassBuffer {
         Self {
             chunks: vec![],
             partitions: vec![],
+            memory: 0,
             offset_bytes: 0,
             max_bytes,
             hashes: vec![],
@@ -647,7 +743,10 @@ impl BypassBuffer {
         batch: &RecordBatch,
         distinct: &mut DistinctEstimate,
     ) -> Result<bool> {
-        let columns = evaluate_rows(spec, batch)?;
+        // The rows are kept until they are scattered (or as their pieces, if
+        // they are all in one partition): not the arrays that they may be
+        // slices of.
+        let columns = columns_to_keep(evaluate_rows(spec, batch)?);
         let bytes = columns
             .iter()
             .map(|column| offset_bytes(column.as_ref()))
@@ -657,6 +756,9 @@ impl BypassBuffer {
         if scattered {
             self.scatter(global)?;
         }
+        let memory =
+            self.memory + columns_memory(&columns) + PIECE_BYTES + batch.num_rows();
+        resize_share(&global.reservation, &mut self.memory, memory)?;
         let keys = &columns[..spec.group_by.expr().len()];
         self.hashes.clear();
         self.hashes.resize(batch.num_rows(), 0);
@@ -689,7 +791,8 @@ impl BypassBuffer {
         global.add_rows(std::mem::take(&mut self.chunks), &self.partitions)?;
         self.partitions.clear();
         self.offset_bytes = 0;
-        Ok(())
+        // The partitions reserve the scattered rows.
+        resize_share(&global.reservation, &mut self.memory, 0)
     }
 }
 
@@ -757,35 +860,43 @@ impl GlobalSourceState for RadixSourceState {
 struct TopKGroups {
     top_k: TopK,
     /// The top groups of the partitions that were finalized so far, sorted
-    /// (see [`TopK::sort_groups`]).
-    groups: Mutex<Option<RecordBatch>>,
+    /// (see [`TopK::sort_groups`]), and their memory, which `reservation`
+    /// holds.
+    groups: Mutex<(Option<RecordBatch>, usize)>,
     /// The cutoff of `groups` (see [`TopK::sorted_cutoff`]): the groups of
     /// the other partitions whose values are worse are not among the top
     /// groups.
     cutoff: Mutex<Option<ArrayRef>>,
     /// The number of partitions that were not finalized yet.
     remaining: AtomicUsize,
+    /// The memory of `groups`.
+    reservation: MemoryReservation,
 }
 
 impl TopKGroups {
-    fn new(top_k: TopK, partitions: usize) -> Self {
+    fn new(top_k: TopK, partitions: usize, reservation: MemoryReservation) -> Self {
         Self {
             top_k,
-            groups: Mutex::new(None),
+            groups: Mutex::new((None, 0)),
             cutoff: Mutex::new(None),
             remaining: AtomicUsize::new(partitions),
+            reservation,
         }
     }
 
     /// Add `outputs`, the groups of a finalized partition. Returns the top
-    /// groups of all partitions once all of them were added.
+    /// groups of all partitions once all of them were added, with their
+    /// memory, which stays reserved in [`Self::reservation`] (the caller takes
+    /// it over).
     ///
     /// The groups of a partition that may be among the top groups (not worse
     /// than the cutoff of the groups added so far) are selected and sorted
     /// first, by the thread that finalized the partition, so that merging
     /// them with the groups added so far, one partition after the other,
-    /// gathers the top groups only.
-    fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<RecordBatch>> {
+    /// gathers the top groups only. The merged groups are reserved once they
+    /// are merged, instead of the groups before: the aggregation fails with
+    /// `ResourcesExhausted` if the memory pool cannot hold them.
+    fn add(&self, outputs: Vec<RecordBatch>) -> Result<Option<(RecordBatch, usize)>> {
         let column = self.top_k.output_column();
         for output in outputs {
             let cutoff = self.cutoff.lock().clone();
@@ -803,17 +914,20 @@ impl TopKGroups {
             }
             let output = self.top_k.select_sorted_groups(&output)?;
             let mut groups = self.groups.lock();
+            let (groups, memory) = &mut *groups;
             let merged = match groups.take() {
                 Some(groups) => self.top_k.merge_sorted_groups(&groups, &output)?,
                 None => output,
             };
+            resize_share(&self.reservation, memory, buffered_memory(&merged))?;
             if let Some(cutoff) = self.top_k.sorted_cutoff(&merged) {
                 *self.cutoff.lock() = Some(cutoff);
             }
             *groups = Some(merged);
         }
         if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            return Ok(self.groups.lock().take());
+            let (groups, memory) = std::mem::take(&mut *self.groups.lock());
+            return Ok(groups.map(|groups| (groups, memory)));
         }
         Ok(None)
     }
@@ -821,12 +935,16 @@ impl TopKGroups {
 
 /// The thread-local source state: the evaluated groups of the partition the
 /// thread finalized last that were not emitted yet.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RadixLocalSource {
-    /// The batches of groups to emit, the next one last.
-    outputs: Vec<RecordBatch>,
+    /// The batches of groups to emit, the next one last, with their memory,
+    /// which is reserved until they are emitted.
+    outputs: Vec<(RecordBatch, usize)>,
     /// The number of rows of the next batch that were emitted.
     offset: usize,
+    /// The memory of the outputs, and of the tables that finalize a
+    /// partition while they do.
+    reservation: MemoryReservation,
 }
 
 impl LocalSourceState for RadixLocalSource {}
@@ -834,9 +952,13 @@ impl LocalSourceState for RadixLocalSource {}
 impl RadixHashAggregate {
     /// The global sink state of an execution, whose threads update the
     /// dynamic filter of the aggregation, if it has one, if `filters` (see
-    /// `filters_enabled`).
-    pub(crate) fn global_sink_state(filters: bool) -> Result<Arc<dyn GlobalSinkState>> {
-        Ok(Arc::new(RadixSinkState::new(filters)))
+    /// `filters_enabled`), and reserve the memory of the aggregation in
+    /// `reservation`.
+    pub(crate) fn global_sink_state(
+        filters: bool,
+        reservation: MemoryReservation,
+    ) -> Result<Arc<dyn GlobalSinkState>> {
+        Ok(Arc::new(RadixSinkState::new(filters, reservation)))
     }
 
     /// The local sink state of a thread, with a table of capacity `capacity`,
@@ -860,6 +982,7 @@ impl RadixHashAggregate {
         }
         Ok(Box::new(RadixLocalState {
             table: GroupedHashTable::try_new_update(spec)?,
+            table_memory: 0,
             capacity: initial,
             maximum_capacity: capacity.maximum,
             table_rows: 0,
@@ -890,11 +1013,11 @@ impl RadixHashAggregate {
         lstate: &mut dyn LocalSinkState,
     ) -> Result<SinkResult> {
         let local = downcast_state_mut::<RadixLocalState>(lstate.as_any_mut(), OPERATOR)?;
+        let global = downcast_state::<RadixSinkState>(gstate.as_any(), OPERATOR)?;
         if spec.input_order.is_some() {
-            local.buffer.push(batch);
+            local.buffer.push(batch, &global.reservation)?;
             return Ok(SinkResult::NeedMoreInput);
         }
-        let global = downcast_state::<RadixSinkState>(gstate.as_any(), OPERATOR)?;
         local.aggregate(spec, global, &batch)?;
         Ok(match local.finished {
             true => SinkResult::Finished,
@@ -910,7 +1033,13 @@ impl RadixHashAggregate {
         let global = downcast_state::<RadixSinkState>(gstate.as_any(), OPERATOR)?;
         let local = downcast_state_mut::<RadixLocalState>(lstate.as_any_mut(), OPERATOR)?;
         if let Some(order) = &spec.input_order {
-            for batch in local.buffer.take_sorted(&spec.input_schema, order)? {
+            // The buffered and the sorted rows, freed once they are aggregated.
+            let mut sorting = ReservedMemory::new(&global.reservation);
+            let sorted =
+                local
+                    .buffer
+                    .take_sorted(&spec.input_schema, order, &mut sorting)?;
+            for batch in sorted {
                 local.aggregate(spec, global, &batch)?;
             }
         }
@@ -923,7 +1052,9 @@ impl RadixHashAggregate {
         if local.flushed == 0 {
             local.table.add_empty_grouping_sets(spec)?;
         }
-        local.flush(spec, global)
+        local.flush(spec, global)?;
+        // The table of the thread is dropped with its state.
+        resize_share(&global.reservation, &mut local.table_memory, 0)
     }
 
     pub(crate) fn finalize(gstate: &dyn GlobalSinkState) -> Result<SinkFinalize> {
@@ -956,9 +1087,9 @@ impl RadixHashAggregate {
         let Some(partitions) = sink.non_empty.lock().clone() else {
             return internal_err!("{OPERATOR} is a source before it was finalized");
         };
-        let top_k = spec
-            .top_k
-            .map(|top_k| TopKGroups::new(top_k, partitions.len()));
+        let top_k = spec.top_k.map(|top_k| {
+            TopKGroups::new(top_k, partitions.len(), sink.reservation.new_empty())
+        });
         Ok(Arc::new(RadixSourceState {
             sink,
             partitions,
@@ -967,8 +1098,15 @@ impl RadixHashAggregate {
         }))
     }
 
-    pub(crate) fn local_source_state() -> Result<Box<dyn LocalSourceState>> {
-        Ok(Box::new(RadixLocalSource::default()))
+    pub(crate) fn local_source_state(
+        gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        let state = downcast_state::<RadixSourceState>(gstate.as_any(), OPERATOR)?;
+        Ok(Box::new(RadixLocalSource {
+            outputs: vec![],
+            offset: 0,
+            reservation: state.sink.reservation.new_empty(),
+        }))
     }
 
     pub(crate) fn get_data(
@@ -980,7 +1118,7 @@ impl RadixHashAggregate {
         let local =
             downcast_state_mut::<RadixLocalSource>(lstate.as_any_mut(), OPERATOR)?;
         loop {
-            if let Some(output) = local.outputs.last() {
+            if let Some((output, memory)) = local.outputs.last() {
                 let remaining = output.num_rows() - local.offset;
                 if remaining > 0 {
                     let len = remaining.min(DEFAULT_VECTOR_SIZE);
@@ -988,6 +1126,7 @@ impl RadixHashAggregate {
                     local.offset += len;
                     return Ok(SourceResult::Chunk(DataChunk::from_record_batch(chunk)));
                 }
+                local.reservation.shrink(*memory);
                 local.outputs.pop();
                 local.offset = 0;
                 continue;
@@ -996,10 +1135,29 @@ impl RadixHashAggregate {
             let Some(&partition) = state.partitions.get(next) else {
                 return Ok(SourceResult::Finished);
             };
+            // The memory of the partition is freed once it is finalized (with
+            // the pieces of its scatters that the other partitions hold).
             let data = std::mem::take(&mut *state.sink.partitions[partition].lock());
-            let outputs = finalize_partition(spec, data)?;
+            let outputs = finalize_partition(spec, data, &local.reservation)?;
             local.outputs = match &state.top_k {
-                Some(top_k) => top_k.add(outputs)?.into_iter().collect(),
+                Some(top_k) => {
+                    // The groups of the partition are merged into the top
+                    // groups (which reserve them), which the thread of the
+                    // last partition emits.
+                    let memory = outputs.iter().map(|(_, memory)| memory).sum();
+                    let outputs = outputs.into_iter().map(|(output, _)| output);
+                    let top = top_k.add(outputs.collect())?;
+                    local.reservation.shrink(memory);
+                    match top {
+                        Some((top, memory)) => {
+                            // Their memory moves to the outputs of the thread.
+                            local.reservation.grow(memory);
+                            top_k.reservation.shrink(memory);
+                            vec![(top, memory)]
+                        }
+                        None => vec![],
+                    }
+                }
                 None => outputs.into_iter().rev().collect(),
             };
         }
@@ -1460,15 +1618,36 @@ impl DistinctEstimate {
 /// their keys) first. A partition of partial states only is finalized at
 /// once: hashing and scattering all of its states again costs more than the
 /// smaller tables save.
+///
+/// The tables are reserved in `reservation` as they grow, and the evaluated
+/// groups (the outputs, with their memory), which stay reserved: the caller
+/// frees them as it emits them. The memory of `partition` is the caller's to
+/// reserve.
 fn finalize_partition(
     spec: &AggregateSpec,
     partition: Partition,
-) -> Result<Vec<RecordBatch>> {
+    reservation: &MemoryReservation,
+) -> Result<Vec<(RecordBatch, usize)>> {
+    let mut working = ReservedMemory::new(reservation);
+    let mut outputs = vec![];
     if partition.num_rows() <= SPLIT_ROWS || partition.rows.iter().all(Vec::is_empty) {
-        let output =
-            finalize_groups(spec, &partition.states, partition.rows.iter().flatten())?;
-        return Ok(output.into_iter().collect());
+        outputs.extend(finalize_groups(
+            spec,
+            &partition.states,
+            partition.rows.iter().flatten(),
+            &mut working,
+        )?);
+        working.keep(outputs.iter().map(|(_, memory)| memory).sum())?;
+        return Ok(outputs);
     }
+    // The states scattered to the sub-partitions.
+    working.try_grow(
+        partition
+            .states
+            .iter()
+            .map(GroupedStates::memory_size)
+            .sum(),
+    )?;
     let mut states: [Vec<GroupedStates>; NUM_SPLITS] = Default::default();
     let (mut hashes, mut splits) = (vec![], vec![]);
     for groups in partition.states {
@@ -1483,35 +1662,54 @@ fn finalize_partition(
             states[split].push(groups);
         }
     }
-    let mut outputs = vec![];
     for (states, rows) in states.iter().zip(&partition.rows) {
-        outputs.extend(finalize_groups(spec, states, rows)?);
+        outputs.extend(finalize_groups(spec, states, rows, &mut working)?);
     }
+    working.keep(outputs.iter().map(|(_, memory)| memory).sum())?;
     Ok(outputs)
 }
 
 /// Merge the partial states `states` and aggregate the input rows `rows` of
-/// a set of groups into a new table, and evaluate the groups. Returns `None`
-/// if there are no groups.
+/// a set of groups into a new table, and evaluate the groups, with their
+/// memory. Returns `None` if there are no groups.
+///
+/// The table is reserved in `working` as it grows, until it is evaluated,
+/// and the evaluated groups.
 fn finalize_groups<'a>(
     spec: &AggregateSpec,
     states: &[GroupedStates],
     rows: impl IntoIterator<Item = &'a Vec<ArrayRef>>,
-) -> Result<Option<RecordBatch>> {
+    working: &mut ReservedMemory<'_>,
+) -> Result<Option<(RecordBatch, usize)>> {
     let mut table = GroupedHashTable::try_new_merge(spec)?;
+    let mut reserved = 0;
+    let mut reserve = |table: &GroupedHashTable, working: &mut ReservedMemory<'_>| {
+        let memory = table.memory_size();
+        if memory > reserved {
+            working.try_grow(memory - reserved)?;
+            reserved = memory;
+        }
+        Ok::<_, datafusion_common::DataFusionError>(())
+    };
     for states in states {
         table.merge(states)?;
+        reserve(&table, working)?;
     }
     for rows in rows {
         table.update_rows(spec, rows)?;
+        reserve(&table, working)?;
     }
     let Some(columns) = table.evaluate()? else {
+        working.shrink(reserved);
         return Ok(None);
     };
-    Ok(Some(RecordBatch::try_new(
-        Arc::clone(&spec.schema),
-        columns,
-    )?))
+    let output = RecordBatch::try_new(Arc::clone(&spec.schema), columns)?;
+    let memory = buffered_memory(&output);
+    working.try_grow(memory)?;
+    // The evaluated groups replace the table, which is dropped.
+    drop(table);
+    working.shrink(reserved);
+    Ok(Some((output, memory)))
 }
 
 #[cfg(test)]
@@ -1543,6 +1741,15 @@ mod tests {
         assert_byte_eq_with_datafusion_with_config, canonical_batch, datafusion_context,
         test_session_config,
     };
+
+    /// A reservation in a memory pool without a limit.
+    fn unbounded_reservation() -> MemoryReservation {
+        use datafusion_execution::memory_pool::{
+            MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("test").register(&pool)
+    }
 
     /// The partition of the group of the keys of `row`.
     fn partition_of_row(keys: &[ArrayRef], row: usize) -> usize {
@@ -1582,7 +1789,7 @@ mod tests {
     fn groups_are_scattered_to_the_partitions_of_their_hashes() -> Result<()> {
         for n in [1, 2, 63, 64, 1000, 5000] {
             let states = groups(n);
-            let global = RadixSinkState::new(false);
+            let global = RadixSinkState::new(false, unbounded_reservation());
             global.add_states(states.clone(), &partitions_of(&states.keys)?)?;
             let mut seen = vec![false; n as usize];
             for (partition, data) in global.partitions.iter().enumerate() {
@@ -1616,7 +1823,7 @@ mod tests {
         }
         // 5000 groups are spread over all partitions.
         let states = groups(5000);
-        let global = RadixSinkState::new(false);
+        let global = RadixSinkState::new(false, unbounded_reservation());
         global.add_states(states.clone(), &partitions_of(&states.keys)?)?;
         assert!(global.partitions.iter().all(|data| !data.lock().is_empty()));
         Ok(())
@@ -1890,7 +2097,11 @@ mod tests {
         let spec = two_stage_spec(&aggregate)?;
         assert!(spec.bypass);
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
+        Ok((
+            spec,
+            local,
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?,
+        ))
     }
 
     /// The sink of `COUNT(*) GROUP BY k`, with tables of capacity `capacity`.
@@ -1917,7 +2128,7 @@ mod tests {
             return Ok(counts);
         }
         let source = RadixHashAggregate::global_source_state(&spec, global)?;
-        let mut local = RadixHashAggregate::local_source_state()?;
+        let mut local = RadixHashAggregate::local_source_state(source.as_ref())?;
         while let SourceResult::Chunk(chunk) =
             RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
         {
@@ -1962,6 +2173,231 @@ mod tests {
         initial: 16,
         maximum: 64,
     };
+
+    #[test]
+    fn tables_and_partitions_are_reserved_until_their_groups_are_emitted() -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        // 20,000 distinct keys, in tables of 1,024 groups: the tables are
+        // flushed (or their rows bypass them) into the partitions.
+        let batches = || (0..20_000).step_by(2_000).map(|b| (b..b + 2_000).collect());
+        let capacity = TableCapacity {
+            initial: 1024,
+            maximum: 1024,
+        };
+        for bypass in [false, true] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+            let (spec, local, _) = count_by_key_with(capacity, bypass)?;
+            let reservation = MemoryConsumer::new("test").register(&pool);
+            let global = RadixHashAggregate::global_sink_state(false, reservation)?;
+            let mut sink = (spec, local, global);
+            sink_batches(&mut sink, batches());
+            let (spec, mut local, global) = sink;
+            // The keys of the groups (and their counts, unless their rows
+            // bypass the tables), in the partitions and the table.
+            let keys = 20_000 * size_of::<i64>();
+            let sunk = pool.reserved();
+            assert!(sunk >= keys, "bypass: {bypass}: {sunk}");
+            RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut())?;
+            drop(local);
+            let partitioned = pool.reserved();
+            assert!(partitioned >= keys, "bypass: {bypass}: {partitioned}");
+            RadixHashAggregate::finalize(global.as_ref())?;
+            let source = RadixHashAggregate::global_source_state(&spec, global)?;
+            let mut local = RadixHashAggregate::local_source_state(source.as_ref())?;
+            let mut rows = 0;
+            while let SourceResult::Chunk(chunk) =
+                RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
+            {
+                rows += chunk.len();
+            }
+            assert_eq!(rows, 20_000);
+            // All groups were emitted: their memory is freed.
+            assert_eq!(pool.reserved(), 0, "bypass: {bypass}");
+
+            // A pool that cannot hold the groups.
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 10));
+            let (spec, mut local, _) = count_by_key_with(capacity, bypass)?;
+            let reservation =
+                MemoryConsumer::new("PhysicalHashAggregate").register(&pool);
+            let global = RadixHashAggregate::global_sink_state(false, reservation)?;
+            let mut outcome = Ok(());
+            for keys in batches() {
+                let batch = key_batch(keys)?;
+                outcome = RadixHashAggregate::sink(
+                    &spec,
+                    batch,
+                    global.as_ref(),
+                    local.as_mut(),
+                )
+                .map(|_| ());
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            if outcome.is_ok() {
+                outcome =
+                    RadixHashAggregate::combine(&spec, global.as_ref(), local.as_mut());
+            }
+            let error = outcome.expect_err("the pool does not hold the groups");
+            assert!(
+                matches!(
+                    error.find_root(),
+                    datafusion_common::DataFusionError::ResourcesExhausted(_)
+                ),
+                "{error}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_pieces_of_a_scatter_are_reserved_until_all_partitions_drop_them() -> Result<()>
+    {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        // The pieces of the groups that a flush scatters to the partitions are
+        // slices of the same arrays, which the pieces of every partition keep:
+        // they are reserved once, until all partitions dropped their pieces.
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let global =
+            RadixSinkState::new(false, MemoryConsumer::new("test").register(&pool));
+        let states = groups(5000);
+        global.add_states(states.clone(), &partitions_of(&states.keys)?)?;
+        let reserved = pool.reserved();
+        assert!(reserved >= states.memory_size(), "{reserved}");
+        let mut partitions = global
+            .partitions
+            .iter()
+            .map(|partition| std::mem::take(&mut *partition.lock()))
+            .filter(|partition| !partition.is_empty())
+            .collect::<Vec<_>>();
+        assert!(partitions.len() > 1);
+        let last = partitions.pop().expect("a partition");
+        drop(partitions);
+        assert_eq!(pool.reserved(), reserved);
+        drop(last);
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bypassed_rows_are_kept_in_copies_of_their_rows() -> Result<()> {
+        // 64 distinct keys, in chunks of a row, every one a zero-copy slice of
+        // a row of an array of 1 MiB of its own: the rows that bypass the
+        // table of the thread (once it held 16 groups) are kept until they are
+        // scattered, and in the partitions, as copies of their rows, not of the
+        // arrays that they are slices of.
+        let mut sink = count_by_key_with(SMALL_TABLES, true)?;
+        for key in 0..64 {
+            let array = Int64Array::from_iter_values(std::iter::repeat_n(key, 1 << 17));
+            let batch =
+                RecordBatch::try_new(key_schema(), vec![Arc::new(array.slice(0, 1))])?;
+            let (spec, local, global) = &mut sink;
+            RadixHashAggregate::sink(spec, batch, global.as_ref(), local.as_mut())?;
+        }
+        let held = |columns: &[ArrayRef]| {
+            columns
+                .iter()
+                .map(|column| column.get_array_memory_size())
+                .sum::<usize>()
+        };
+        let state = local_state(&sink);
+        let bypass = state.bypass.as_ref().expect("rows that bypass the table");
+        assert!(!bypass.chunks.is_empty());
+        let buffered = bypass.chunks.iter().map(|chunk| held(chunk)).sum::<usize>();
+        let global = sink
+            .2
+            .downcast_ref::<RadixSinkState>()
+            .expect("a sink state");
+        let partitioned = global
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .lock()
+                    .rows
+                    .iter()
+                    .flatten()
+                    .map(|columns| held(columns))
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        assert!(
+            buffered + partitioned < 1 << 20,
+            "{buffered} + {partitioned}"
+        );
+        assert_eq!(finish(sink)?, (0..64).map(|key| (key, 1)).collect());
+        Ok(())
+    }
+
+    #[test]
+    fn the_top_groups_of_top_k_aggregations_are_reserved_until_they_are_emitted()
+    -> Result<()> {
+        use datafusion_execution::memory_pool::{
+            GreedyMemoryPool, MemoryConsumer, MemoryPool,
+        };
+        // `SELECT k FROM t GROUP BY k ORDER BY k DESC LIMIT 50000`: the top
+        // groups of the partitions that were finalized so far are kept (and
+        // reserved) until the last partition is, up to 50,000 keys (400 KB),
+        // here of 4 partitions of 20,000 keys each.
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(col("k", &schema)?, "k".into())]),
+            vec![],
+            vec![],
+            MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)?,
+            Arc::clone(&schema),
+        )?
+        .try_optimize_topk(50_000, "k", SortOptions::new(true, false))
+        .expect("a top-k aggregation")
+        .data;
+        let (spec, _, _) = top_k_sink(aggregate)?;
+        let top_k = spec.top_k.expect("a top-k aggregation");
+        let partition = |partition: i64| {
+            let keys = Int64Array::from_iter_values(
+                partition * 20_000..(partition + 1) * 20_000,
+            );
+            RecordBatch::try_new(Arc::clone(&spec.schema), vec![Arc::new(keys)])
+        };
+        for (limit, fits) in [(64 << 20, true), (256 << 10, false)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let reservation =
+                MemoryConsumer::new("PhysicalHashAggregate").register(&pool);
+            let top = TopKGroups::new(top_k, 4, reservation);
+            let mut outcome = Ok(None);
+            for index in 0..4 {
+                outcome = top.add(vec![partition(index)?]);
+                if !matches!(outcome, Ok(None)) {
+                    break;
+                }
+                let (groups, memory) = &*top.groups.lock();
+                let groups = groups.as_ref().expect("the top groups so far");
+                assert_eq!(*memory, buffered_memory(groups));
+                assert_eq!(pool.reserved(), *memory);
+            }
+            if !fits {
+                let error = outcome.expect_err("the pool cannot hold the top groups");
+                assert!(
+                    matches!(
+                        error.find_root(),
+                        datafusion_common::DataFusionError::ResourcesExhausted(_)
+                    ),
+                    "{error}"
+                );
+                continue;
+            }
+            // The caller takes over the memory of the top groups.
+            let (groups, memory) = outcome?.expect("the top groups of all partitions");
+            assert_eq!(groups.num_rows(), 50_000);
+            assert_eq!(pool.reserved(), memory);
+            assert_eq!(top.reservation.size(), memory);
+        }
+        Ok(())
+    }
 
     #[test]
     fn full_tables_are_flushed_or_grown() -> Result<()> {
@@ -2089,7 +2525,11 @@ mod tests {
         let mut spec = two_stage_spec(&aggregate)?;
         Arc::get_mut(&mut spec).expect("a single owner").bypass = true;
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
+        Ok((
+            spec,
+            local,
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?,
+        ))
     }
 
     /// A batch of keys `keys`, with binaries of `len` bytes.
@@ -2255,10 +2695,16 @@ mod tests {
                 partition.rows[split].push(columns);
             }
             assert_eq!(partition.num_rows() > SPLIT_ROWS, split);
-            let outputs = finalize_partition(&spec, partition)?;
+            let reservation = unbounded_reservation();
+            let outputs = finalize_partition(&spec, partition, &reservation)?;
             assert_eq!(outputs.len(), if split { NUM_SPLITS } else { 1 });
+            // The outputs stay reserved, and nothing else.
+            assert_eq!(
+                reservation.size(),
+                outputs.iter().map(|(_, memory)| memory).sum::<usize>()
+            );
             let mut counts = BTreeMap::new();
-            for output in &outputs {
+            for (output, _) in &outputs {
                 let keys = output.column(0).as_primitive::<Int64Type>();
                 let values = output.column(1).as_primitive::<Int64Type>();
                 let mut splits = BTreeMap::<u8, usize>::new();
@@ -3696,7 +4142,11 @@ mod tests {
                 TableCapacity::default(),
                 true,
             )?;
-            let mut sink = (spec, local, RadixHashAggregate::global_sink_state(false)?);
+            let mut sink = (
+                spec,
+                local,
+                RadixHashAggregate::global_sink_state(false, unbounded_reservation())?,
+            );
             let (spec, local, global) = &mut sink;
             let error = batches
                 .iter()
@@ -3910,7 +4360,8 @@ mod tests {
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
-        let global = RadixHashAggregate::global_sink_state(false)?;
+        let global =
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?;
         // Two threads.
         let mut locals = (0..2)
             .map(|_| {
@@ -3955,7 +4406,7 @@ mod tests {
         let source = RadixHashAggregate::global_source_state(&spec, Arc::clone(&global))?;
         let mut keys: Vec<i64> = vec![];
         let mut sources = (0..2)
-            .map(|_| RadixHashAggregate::local_source_state())
+            .map(|_| RadixHashAggregate::local_source_state(source.as_ref()))
             .collect::<Result<Vec<_>>>()?;
         let mut finished = [false; 2];
         while !finished.iter().all(|&finished| finished) {
@@ -4002,7 +4453,11 @@ mod tests {
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert!(spec.top_k.is_some() && !spec.bypass);
         let local = RadixHashAggregate::local_sink_state(&spec, capacity, spec.bypass)?;
-        Ok((spec, local, RadixHashAggregate::global_sink_state(false)?))
+        Ok((
+            spec,
+            local,
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?,
+        ))
     }
 
     /// Combine the local sink state of `sink`, finalize the aggregation and
@@ -4013,7 +4468,7 @@ mod tests {
         let mut batches = vec![];
         if RadixHashAggregate::finalize(global.as_ref())? == SinkFinalize::Ready {
             let source = RadixHashAggregate::global_source_state(&spec, global)?;
-            let mut local = RadixHashAggregate::local_source_state()?;
+            let mut local = RadixHashAggregate::local_source_state(source.as_ref())?;
             while let SourceResult::Chunk(chunk) =
                 RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
             {
@@ -4275,7 +4730,8 @@ mod tests {
             aggregate.input(),
         )));
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
-        let global = RadixHashAggregate::global_sink_state(false)?;
+        let global =
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?;
         let mut locals = (0..2)
             .map(|_| {
                 RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, spec.bypass)
@@ -4311,7 +4767,7 @@ mod tests {
             SinkFinalize::Ready
         );
         let source = RadixHashAggregate::global_source_state(&spec, Arc::clone(&global))?;
-        let mut local = RadixHashAggregate::local_source_state()?;
+        let mut local = RadixHashAggregate::local_source_state(source.as_ref())?;
         let mut output = vec![];
         while let SourceResult::Chunk(chunk) =
             RadixHashAggregate::get_data(&spec, source.as_ref(), local.as_mut())?
@@ -4518,7 +4974,8 @@ mod tests {
         let spec = PhysicalHashAggregate::try_new_single_stage(&aggregate, input)?.spec();
         assert_eq!(spec.soft_limit, Some(5));
         assert!(spec.top_k.is_none() && !spec.bypass);
-        let global = RadixHashAggregate::global_sink_state(false)?;
+        let global =
+            RadixHashAggregate::global_sink_state(false, unbounded_reservation())?;
         let mut local = RadixHashAggregate::local_sink_state(&spec, SMALL_TABLES, false)?;
         let mut sink = |keys: Vec<i64>| {
             RadixHashAggregate::sink(

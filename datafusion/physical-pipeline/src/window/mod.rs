@@ -57,7 +57,6 @@ pub(crate) mod test_support {
     use datafusion_common::Result;
     use datafusion_common::cast::as_boolean_array;
     use datafusion_common::config::ConfigOptions;
-    use datafusion_execution::runtime_env::RuntimeEnv;
     use datafusion_physical_expr::LexOrdering;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -108,28 +107,16 @@ pub(crate) mod test_support {
     ///   operators below them are lowered too;
     /// * scans with the native sources;
     /// * every other node is bridged, with its subtree.
-    ///
-    /// The plan is lowered for an execution with a default runtime (whose
-    /// memory pool has no limit), see [`lower_for`].
     pub(crate) fn lower(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn PhysicalOperator>> {
-        lower_for(plan, &RuntimeEnv::default())
-    }
-
-    /// [`lower`] `plan` for an execution with the runtime `runtime`.
-    pub(crate) fn lower_for(
-        plan: &Arc<dyn ExecutionPlan>,
-        runtime: &RuntimeEnv,
-    ) -> Result<Arc<dyn PhysicalOperator>> {
-        let lower = |plan: &Arc<dyn ExecutionPlan>| lower_for(plan, runtime);
-        if let Some(window) = PhysicalWindow::try_lower(plan, runtime, lower)? {
+        if let Some(window) = PhysicalWindow::try_lower(plan, lower)? {
             return Ok(Arc::new(window));
         }
-        if let Some(join) = PhysicalNestedLoopJoin::try_lower(plan, runtime, lower)? {
+        if let Some(join) = PhysicalNestedLoopJoin::try_lower(plan, lower)? {
             return Ok(Arc::new(join));
         }
-        if let Some(join) = PhysicalCrossJoin::try_lower(plan, runtime, lower)? {
+        if let Some(join) = PhysicalCrossJoin::try_lower(plan, lower)? {
             return Ok(Arc::new(join));
         }
         if let Some(sort) =

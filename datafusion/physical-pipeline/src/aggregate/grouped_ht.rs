@@ -47,6 +47,7 @@ use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
 use super::hash_aggregate::{AggregateSpec, rebuilt_literal};
+use crate::sort::{array_memory, array_overhead};
 
 /// The group keys and the aggregate states of a set of groups, emitted by a
 /// [`GroupedHashTable`]: row `i` of every array belongs to the same group.
@@ -62,6 +63,21 @@ impl GroupedStates {
     /// The number of groups.
     pub(crate) fn num_groups(&self) -> usize {
         self.keys.first().map_or(0, |keys| keys.len())
+    }
+
+    /// The memory that the keys and the states of the groups hold (see
+    /// [`array_memory`]), with the structures of their arrays (see
+    /// [`array_overhead`]).
+    pub(crate) fn memory_size(&self) -> usize {
+        self.keys
+            .iter()
+            .chain(self.states.iter().flatten())
+            .map(|array| {
+                array_memory(array.as_ref())
+                    + array_overhead(array.as_ref())
+                    + size_of::<ArrayRef>()
+            })
+            .sum()
     }
 
     /// The groups at `indices`.
@@ -175,6 +191,19 @@ impl GroupedHashTable {
     /// Whether the table has no groups.
     pub(crate) fn is_empty(&self) -> bool {
         self.group_values.is_empty()
+    }
+
+    /// The memory that the table holds: its group keys and their hash table,
+    /// the states of the groups, and the group indices of the rows of the
+    /// last batch, as DataFusion's hash aggregation counts them.
+    pub(crate) fn memory_size(&self) -> usize {
+        self.group_values.size()
+            + self
+                .accumulators
+                .iter()
+                .map(|accumulator| accumulator.size())
+                .sum::<usize>()
+            + self.group_indices.capacity() * size_of::<usize>()
     }
 
     /// Aggregate the input rows of `batch`, like DataFusion's partial (or

@@ -68,21 +68,30 @@
 //! (which rows they keep): floats compare in their total order, in which
 //! `-0.0` comes before `0.0`.
 //!
-//! The native operators keep all rows in memory: they do not spill and do
-//! not reserve memory in the memory pool.
+//! # Memory
+//!
+//! The native operators keep all rows in memory (they do not spill), and
+//! reserve it in the memory pool of the session: the chunks that the threads
+//! buffer as they arrive (with their metadata, and copies of their rows if
+//! they are slices of larger arrays, see [`compact_to_keep`]), what sorting
+//! them into runs allocates before it allocates it (see [`SortKeys::sort`]),
+//! and the runs until the merger emitted their rows. They fail with
+//! `ResourcesExhausted` when the pool cannot hold them.
 //!
 //! [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
 
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array,
+    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array, make_array,
 };
 use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, exec_datafusion_err, exec_err, internal_err};
+use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::projection::update_expr;
@@ -100,6 +109,7 @@ use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
 use crate::operator::{
     GlobalSourceState, PhysicalOperator, SourceResult, downcast_state,
 };
+use crate::sources::batches::batch_overhead;
 
 pub mod merge;
 pub mod sort_sink;
@@ -567,10 +577,43 @@ impl SortKeys {
     }
 
     /// The values of the sort keys of the rows of `batch`.
+    #[cfg(test)]
     pub(crate) fn evaluate(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>> {
         self.ordering
             .iter()
             .map(|sort_expr| sort_expr.expr.evaluate(batch)?.into_array(batch.num_rows()))
+            .collect()
+    }
+
+    /// The values of the sort keys of the rows of `batch`, whose arrays are
+    /// reserved in `working`: the keys of a single value (e.g. literals)
+    /// before they are made arrays of the value for every row, and the other
+    /// computed keys once they are evaluated (the keys that are columns of
+    /// `batch` take no memory).
+    fn evaluate_reserved(
+        &self,
+        batch: &RecordBatch,
+        working: &mut ReservedMemory<'_>,
+    ) -> Result<Vec<ArrayRef>> {
+        let rows = batch.num_rows();
+        self.ordering
+            .iter()
+            .map(|sort_expr| match sort_expr.expr.evaluate(batch)? {
+                ColumnarValue::Array(array) => {
+                    if !batch
+                        .columns()
+                        .iter()
+                        .any(|column| Arc::ptr_eq(column, &array))
+                    {
+                        working.try_grow(array.get_array_memory_size())?;
+                    }
+                    Ok(array)
+                }
+                ColumnarValue::Scalar(scalar) => {
+                    working.try_grow(scalar.size().saturating_mul(rows))?;
+                    scalar.to_array_of_size(rows)
+                }
+            })
             .collect()
     }
 
@@ -591,11 +634,21 @@ impl SortKeys {
     /// consecutive rows of the sort, in order: a single run, unless the rows
     /// do not fit into one batch (see [`gather_rows_in_batches`]). Returns no
     /// run if there are no rows to keep.
+    ///
+    /// What the sort allocates is reserved in `reservation` (which may be
+    /// shared by several threads) before it is allocated, but for the sort
+    /// keys, which are reserved as they are evaluated and encoded, batch by
+    /// batch: the sort fails with `ResourcesExhausted` if the memory pool
+    /// cannot hold them. It is freed when the sort returns, but for the memory
+    /// of the runs (see [`SortedRun::memory_size`]), which stays reserved in
+    /// `reservation`: the caller frees it with the runs. The memory of
+    /// `batches` is the caller's to reserve.
     pub(crate) fn sort(
         &self,
         schema: &SchemaRef,
         batches: &[RecordBatch],
         limit: Option<usize>,
+        reservation: &MemoryReservation,
     ) -> Result<Vec<SortedRun>> {
         let batches = batches
             .iter()
@@ -610,24 +663,29 @@ impl SortKeys {
             return exec_err!("Cannot sort {num_rows} rows at once");
         }
         let limit = (len < num_rows).then_some(len);
+        let mut working = ReservedMemory::new(reservation);
         let key_values = batches
             .iter()
-            .map(|batch| self.evaluate(batch))
+            .map(|batch| self.evaluate_reserved(batch, &mut working))
             .collect::<Result<Vec<_>>>()?;
 
         // The positions of the sorted rows in the concatenation of `batches`,
         // and the sorted keys.
         let (order, sorted_keys) = match self.direct {
-            true => match self.sort_with_kernel(&key_values, limit)? {
+            true => match self.sort_with_kernel(&key_values, limit, &mut working)? {
                 Some((indices, key)) => {
                     let sorted_keys = match self.key_column {
                         Some(column) => SortedKeys::Column(column),
-                        None => SortedKeys::Values(take(key.as_ref(), &indices, None)?),
+                        None => {
+                            working.try_grow(array_memory(key.as_ref()))?;
+                            SortedKeys::Values(take(key.as_ref(), &indices, None)?)
+                        }
                     };
                     (indices.values().to_vec(), sorted_keys)
                 }
                 None => {
-                    let (order, _) = self.order_by_rows(&key_values, num_rows, len)?;
+                    let (order, _) =
+                        self.order_by_rows(&key_values, num_rows, len, &mut working)?;
                     let sorted_keys = match self.key_column {
                         Some(column) => SortedKeys::Column(column),
                         None => SortedKeys::Gather,
@@ -636,8 +694,10 @@ impl SortKeys {
                 }
             },
             false => {
-                let (order, rows) = self.order_by_rows(&key_values, num_rows, len)?;
+                let (order, rows) =
+                    self.order_by_rows(&key_values, num_rows, len, &mut working)?;
                 let data_len = order.iter().map(|&i| rows.row_len(i as usize)).sum();
+                working.try_grow(data_len + (len + 1) * size_of::<usize>())?;
                 let mut sorted_rows = self.converter.empty_rows(len, data_len);
                 for &i in &order {
                     sorted_rows.push(rows.row(i as usize));
@@ -653,6 +713,7 @@ impl SortKeys {
             starts.push(start);
             start += batch.num_rows();
         }
+        working.try_grow(len * size_of::<(usize, usize)>())?;
         let positions = order
             .iter()
             .map(|&index| {
@@ -661,24 +722,47 @@ impl SortKeys {
                 (batch, index - starts[batch])
             })
             .collect::<Vec<_>>();
+        drop(order);
+        // The gathered rows take about the memory of the rows they are
+        // gathered from.
+        let rows_memory = batches
+            .iter()
+            .map(|batch| memory_size(batch))
+            .sum::<usize>();
+        working.try_grow(proportion(rows_memory, len, num_rows))?;
         let gathered = gather_rows_in_batches(schema, &batches, &positions)?;
-        let sorted_keys = match sorted_keys {
-            SortedKeys::Rows(rows) if gathered.len() == 1 => {
-                return gathered
-                    .into_iter()
-                    .zip([rows])
-                    .map(|(batch, rows)| SortedRun::try_new(batch, rows))
-                    .collect();
+        let runs = match sorted_keys {
+            SortedKeys::Rows(rows) if gathered.len() == 1 => gathered
+                .into_iter()
+                .zip([rows])
+                .map(|(batch, rows)| SortedRun::try_new(batch, rows))
+                .collect::<Result<Vec<_>>>()?,
+            sorted_keys => {
+                self.split_runs(gathered, &sorted_keys, &key_values, &positions)?
             }
-            sorted_keys => sorted_keys,
         };
+        working.keep(runs.iter().map(SortedRun::memory_size).sum())?;
+        Ok(runs)
+    }
+
+    /// The runs of the sorted rows `gathered` (consecutive rows of the sort)
+    /// with their keys `sorted_keys`: the sorted keys of all rows, split like
+    /// the rows, or the keys of the rows at `positions` of the batches whose
+    /// sort keys are `key_values`.
+    fn split_runs(
+        &self,
+        gathered: Vec<RecordBatch>,
+        sorted_keys: &SortedKeys,
+        key_values: &[Vec<ArrayRef>],
+        positions: &[(usize, usize)],
+    ) -> Result<Vec<SortedRun>> {
         let options = self.ordering[0].options;
         let mut runs = Vec::with_capacity(gathered.len());
         let mut start = 0;
         for mut batch in gathered {
             let rows = start..start + batch.num_rows();
             start = rows.end;
-            let keys = match &sorted_keys {
+            let keys = match sorted_keys {
                 // Split the keys like the rows.
                 SortedKeys::Rows(sorted_rows) => {
                     let data_len = rows.clone().map(|row| sorted_rows.row_len(row)).sum();
@@ -730,18 +814,27 @@ impl SortKeys {
     /// concatenation of the batches whose sort keys are `keys`, sorted by
     /// their keys encoded in the row format, and the encoded keys of all
     /// rows.
+    ///
+    /// The encoded keys are reserved in `working` as they are encoded, batch
+    /// by batch, and the order before it is allocated.
     fn order_by_rows(
         &self,
         keys: &[Vec<ArrayRef>],
         num_rows: usize,
         len: usize,
+        working: &mut ReservedMemory<'_>,
     ) -> Result<(Vec<u32>, arrow_row::Rows)> {
+        working.try_grow((num_rows + 1) * size_of::<usize>())?;
         let mut rows = self.converter.empty_rows(num_rows, 0);
+        let mut encoded = rows.size();
         for keys in keys {
             self.converter.append(&mut rows, keys)?;
+            working.try_grow(rows.size().saturating_sub(encoded))?;
+            encoded = encoded.max(rows.size());
         }
         let num_rows_u32 = u32::try_from(num_rows)
             .map_err(|_| exec_datafusion_err!("Cannot sort {num_rows} rows at once"))?;
+        working.try_grow(num_rows * size_of::<u32>())?;
         let mut order = (0..num_rows_u32).collect::<Vec<_>>();
         let compare =
             |a: &u32, b: &u32| rows.row(*a as usize).cmp(&rows.row(*b as usize));
@@ -758,11 +851,16 @@ impl SortKeys {
     /// concatenation of the batches, and the concatenated keys. `None` if
     /// the keys of all batches do not fit into one array (then they are sorted
     /// by their encoded rows, which have no such limit).
+    ///
+    /// The concatenated keys and what the kernel allocates are reserved in
+    /// `working` before they are allocated.
     fn sort_with_kernel(
         &self,
         keys: &[Vec<ArrayRef>],
         limit: Option<usize>,
+        working: &mut ReservedMemory<'_>,
     ) -> Result<Option<(UInt32Array, ArrayRef)>> {
+        let num_rows = keys.iter().map(|keys| keys[0].len()).sum::<usize>();
         let key = match keys {
             [keys] => Arc::clone(&keys[0]),
             _ => {
@@ -775,6 +873,7 @@ impl SortKeys {
                 if bytes > i32::MAX as usize {
                     return Ok(None);
                 }
+                working.try_grow(keys.iter().map(|key| array_memory(*key)).sum())?;
                 match concat(&keys) {
                     Ok(key) => key,
                     Err(error) if is_capacity_error(&error) => return Ok(None),
@@ -786,9 +885,117 @@ impl SortKeys {
             values: Arc::clone(&key),
             options: Some(self.ordering[0].options),
         };
+        working.try_grow(num_rows * KERNEL_SORT_BYTES_PER_ROW)?;
         let indices = lexsort_to_indices(&[column], limit)?;
         Ok(Some((indices, key)))
     }
+}
+
+/// The memory per row that sorting the values of a single key with
+/// `lexsort_to_indices` allocates at most: a pair of an index and a value (of
+/// at most 16 bytes, or a slice of bytes) for every row, the sorted indices,
+/// and the indices of the runs that are taken from them.
+pub(crate) const KERNEL_SORT_BYTES_PER_ROW: usize =
+    size_of::<(u32, u128)>() + 2 * size_of::<u32>();
+
+/// Memory reserved in a [`MemoryReservation`] (which may be shared by
+/// several threads) for what a computation allocates, freed when the
+/// computation ends unless it is kept (see [`Self::keep`]).
+pub(crate) struct ReservedMemory<'a> {
+    reservation: &'a MemoryReservation,
+    bytes: usize,
+}
+
+impl<'a> ReservedMemory<'a> {
+    /// Reserve the memory of a computation in `reservation`.
+    pub(crate) fn new(reservation: &'a MemoryReservation) -> Self {
+        Self::with_reserved(reservation, 0)
+    }
+
+    /// Reserve the memory of a computation in `reservation`, which holds
+    /// `bytes` of it already (e.g. the memory of its input, which it frees).
+    pub(crate) fn with_reserved(
+        reservation: &'a MemoryReservation,
+        bytes: usize,
+    ) -> Self {
+        Self { reservation, bytes }
+    }
+
+    /// Take over `bytes` that are reserved in the reservation already (e.g.
+    /// the memory of the input of the computation, which it frees).
+    pub(crate) fn adopt(&mut self, bytes: usize) {
+        self.bytes += bytes;
+    }
+
+    /// Reserve `bytes` more bytes. Fails with `ResourcesExhausted` if the
+    /// memory pool cannot hold them.
+    pub(crate) fn try_grow(&mut self, bytes: usize) -> Result<()> {
+        self.reservation.try_grow(bytes)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    /// Free `bytes` of the memory of the computation (e.g. of what it
+    /// allocated and dropped already).
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.reservation.shrink(bytes);
+        self.bytes -= bytes;
+    }
+
+    /// End the computation, keeping `bytes` of its memory reserved (e.g. the
+    /// memory of its result, which the reservation then holds): the rest is
+    /// freed, or the difference reserved, which fails with
+    /// `ResourcesExhausted` if the memory pool cannot hold it.
+    pub(crate) fn keep(mut self, bytes: usize) -> Result<()> {
+        if bytes > self.bytes {
+            self.try_grow(bytes - self.bytes)?;
+        }
+        self.reservation.shrink(self.bytes - bytes);
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for ReservedMemory<'_> {
+    fn drop(&mut self) {
+        self.reservation.shrink(self.bytes);
+    }
+}
+
+/// Resize the share `reserved` of `reservation` (which may be shared by
+/// several threads, each of which tracks its share) to `bytes`: reserve the
+/// difference, which fails with `ResourcesExhausted` if the memory pool
+/// cannot hold it, or free it.
+pub(crate) fn resize_share(
+    reservation: &MemoryReservation,
+    reserved: &mut usize,
+    bytes: usize,
+) -> Result<()> {
+    if bytes > *reserved {
+        reservation.try_grow(bytes - *reserved)?;
+    } else {
+        reservation.shrink(*reserved - bytes);
+    }
+    *reserved = bytes;
+    Ok(())
+}
+
+/// `bytes` in the proportion `part / whole`, e.g. the memory of `part` of
+/// `whole` rows that take `bytes` bytes (all of them if `whole` is 0).
+pub(crate) fn proportion(bytes: usize, part: usize, whole: usize) -> usize {
+    if part >= whole {
+        return bytes;
+    }
+    (bytes as u128 * part as u128 / whole as u128) as usize
+}
+
+/// The memory of `array`: the bytes its values take (see [`memory_size`]).
+pub(crate) fn array_memory(array: &dyn Array) -> usize {
+    array
+        .to_data()
+        .get_slice_memory_size()
+        .unwrap_or_else(|_| array.get_array_memory_size())
 }
 
 /// The sorted key values `values` of a run, with the data of their views
@@ -852,13 +1059,141 @@ pub(crate) fn memory_size(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
-        .map(|column| {
-            column
-                .to_data()
-                .get_slice_memory_size()
-                .unwrap_or_else(|_| column.get_array_memory_size())
-        })
+        .map(|column| array_memory(column.as_ref()))
         .sum()
+}
+
+/// The memory that buffering `batch` holds: its rows (see [`memory_size`]),
+/// and its metadata (see [`metadata_memory`]), which is all that a batch
+/// without columns holds.
+///
+/// The operators that keep batches reserve this memory for them, and keep
+/// them as [`compact_to_keep`] makes them, so that they hold at most about
+/// twice that memory.
+pub(crate) fn buffered_memory(batch: &RecordBatch) -> usize {
+    memory_size(batch) + metadata_memory(batch)
+}
+
+/// The memory of the metadata of `batch`: the batch in a list of batches,
+/// and the structures of its arrays (see [`array_overhead`]).
+pub(crate) fn metadata_memory(batch: &RecordBatch) -> usize {
+    batch_overhead(batch)
+        + batch
+            .columns()
+            .iter()
+            .map(|column| array_overhead(column.as_ref()))
+            .sum::<usize>()
+}
+
+/// The memory of the structure of `array` besides its buffers (and its
+/// reference, e.g. in the columns of a batch): the array, in the allocation of
+/// its `Arc`.
+pub(crate) fn array_overhead(array: &dyn Array) -> usize {
+    size_of_val(array) + 2 * size_of::<usize>()
+}
+
+/// The bytes that a column of a batch that an operator keeps may take beyond
+/// twice those of its rows before the operator copies it (see
+/// [`compact_to_keep`]): of the structures of its arrays.
+const KEPT_EXCESS_BYTES: usize = 1024;
+
+/// `batch`, to keep (the operators keep the batches of their rows, e.g. the
+/// sorts until they sort them, reserving the bytes of their rows, see
+/// [`buffered_memory`]): with the columns that take more than twice the
+/// memory of their rows (and [`KEPT_EXCESS_BYTES`]) copied to arrays of their
+/// rows only (see [`compacted_array`]), so that a kept batch takes at most
+/// about twice the memory that is reserved for it (as the arrays that
+/// builders make, whose buffers may have twice the capacity that they use,
+/// which are not copied). A zero-copy slice of an array keeps all of its
+/// buffers (e.g. a row of an array of 1 MiB), whose bytes beyond those of its
+/// rows [`memory_size`] does not count. (It counts whole the values that
+/// views, dictionaries and lists refer to, which the copies may share.)
+pub(crate) fn compact_to_keep(batch: RecordBatch) -> Result<RecordBatch> {
+    let Some(columns) = compacted_to_keep(batch.columns(), batch.num_rows()) else {
+        return Ok(batch);
+    };
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
+}
+
+/// The arrays `columns` (of the same rows), to keep, as [`compact_to_keep`]
+/// keeps the columns of a batch.
+pub(crate) fn columns_to_keep(columns: Vec<ArrayRef>) -> Vec<ArrayRef> {
+    let rows = columns.first().map_or(0, |column| column.len());
+    compacted_to_keep(&columns, rows).unwrap_or(columns)
+}
+
+/// The arrays `columns` (of `rows` rows) with the arrays that take more than
+/// twice the memory of their rows copied (see [`compact_to_keep`]), `None` if
+/// none does.
+fn compacted_to_keep(columns: &[ArrayRef], rows: usize) -> Option<Vec<ArrayRef>> {
+    let rows = u32::try_from(rows).ok()?;
+    let mut indices = None;
+    let mut compacted = None;
+    for (index, column) in columns.iter().enumerate() {
+        if !holds_more_than_kept(column.as_ref()) {
+            continue;
+        }
+        let indices =
+            indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
+        let Some(copy) = compacted_array(column, indices) else {
+            continue;
+        };
+        compacted.get_or_insert_with(|| columns.to_vec())[index] = copy;
+    }
+    compacted
+}
+
+/// Whether `array` takes more than twice the memory of its rows (see
+/// [`array_memory`]) and [`KEPT_EXCESS_BYTES`]: a slice of larger arrays.
+fn holds_more_than_kept(array: &dyn Array) -> bool {
+    array.get_array_memory_size() > 2 * array_memory(array) + KEPT_EXCESS_BYTES
+}
+
+/// A copy of the rows `indices` (all of them) of `array`, which holds more
+/// than its rows (see [`holds_more_than_kept`]), that holds them only: `take`
+/// copies the rows of an array and of its children, but the values of
+/// dictionaries and of list views, which it shares with the copy (also
+/// nested in other arrays), so the children of the copy that hold more than
+/// their rows are copied too, in turn. `None` if the array is kept as it is:
+/// arrays that `take` does not copy.
+fn compacted_array(array: &ArrayRef, indices: &UInt32Array) -> Option<ArrayRef> {
+    let copy = take(array.as_ref(), indices, None).ok()?;
+    if !holds_more_than_kept(copy.as_ref()) {
+        return Some(copy);
+    }
+    let data = copy.to_data();
+    let mut copied = false;
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| {
+            let child = make_array(child.clone());
+            if !holds_more_than_kept(child.as_ref()) {
+                return child.to_data();
+            }
+            let Ok(rows) = u32::try_from(child.len()) else {
+                return child.to_data();
+            };
+            let indices = UInt32Array::from_iter_values(0..rows);
+            match compacted_array(&child, &indices) {
+                Some(compacted) => {
+                    copied = true;
+                    compacted.to_data()
+                }
+                None => child.to_data(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if !copied {
+        return Some(copy);
+    }
+    let data = data.into_builder().child_data(children).build().ok()?;
+    Some(make_array(data))
 }
 
 /// The data types of the sort keys `ordering` of rows with schema `schema`.
@@ -871,43 +1206,60 @@ fn data_types(ordering: &LexOrdering, schema: &Schema) -> Result<Vec<DataType>> 
 
 /// The sorted output of a [`PhysicalSort`] or [`PhysicalTopK`], set up when
 /// the sink is finalized and handed to the source: the merge of the runs that
-/// the sink collected.
+/// the sink collected, and the reservation of their memory.
 #[derive(Debug, Default)]
 pub(crate) struct SortedOutput {
-    merger: Mutex<Option<RunMerger>>,
+    merger: Mutex<Option<(RunMerger, MemoryReservation)>>,
 }
 
 impl SortedOutput {
-    /// Set the merger of the runs collected by the sink.
-    pub(crate) fn set(&self, merger: RunMerger) {
-        *self.merger.lock() = Some(merger);
+    /// Set the merger of the runs collected by the sink, whose memory
+    /// (see [`RunMerger::memory_size`]) is split off `reservation`, the
+    /// reservation of the sink, which holds it: the source frees it as the
+    /// merger drops the runs whose rows it emitted.
+    pub(crate) fn set(&self, merger: RunMerger, reservation: &MemoryReservation) {
+        let memory = merger.memory_size().min(reservation.size());
+        *self.merger.lock() = Some((merger, reservation.split(memory)));
     }
 
     /// The global source state of the operator `name`, which takes over the
     /// merger.
     pub(crate) fn take_source(&self, name: &str) -> Result<Arc<dyn GlobalSourceState>> {
         match self.merger.lock().take() {
-            Some(merger) => Ok(Arc::new(SortedSource(Mutex::new(merger)))),
+            Some((merger, reservation)) => Ok(Arc::new(SortedSource {
+                merger: Mutex::new(merger),
+                reservation,
+            })),
             None => internal_err!("{name} is read before its sink is finalized"),
         }
     }
 }
 
 /// The global source state of a [`PhysicalSort`] or [`PhysicalTopK`]: the
-/// merger of its runs. The source is not parallel, so a single thread reads
-/// it.
-struct SortedSource(Mutex<RunMerger>);
+/// merger of its runs, and the memory of the runs it holds. The source is not
+/// parallel, so a single thread reads it.
+struct SortedSource {
+    merger: Mutex<RunMerger>,
+    reservation: MemoryReservation,
+}
 
 impl GlobalSourceState for SortedSource {}
 
 /// The next chunk of the sorted output of the source state `gstate` of the
-/// operator `name`.
+/// operator `name`. The memory of the runs that the merger drops is freed.
 pub(crate) fn next_sorted_chunk(
     gstate: &dyn GlobalSourceState,
     name: &str,
 ) -> Result<SourceResult> {
-    let SortedSource(merger) = downcast_state::<SortedSource>(gstate.as_any(), name)?;
-    Ok(match merger.lock().next_batch(DEFAULT_VECTOR_SIZE)? {
+    let source = downcast_state::<SortedSource>(gstate.as_any(), name)?;
+    let mut merger = source.merger.lock();
+    let batch = merger.next_batch(DEFAULT_VECTOR_SIZE)?;
+    let released = source
+        .reservation
+        .size()
+        .saturating_sub(merger.memory_size());
+    source.reservation.shrink(released);
+    Ok(match batch {
         Some(batch) => SourceResult::Chunk(DataChunk::from_record_batch(batch)),
         None => SourceResult::Finished,
     })
@@ -948,6 +1300,21 @@ pub(crate) mod test_support {
         datafusion_context, has_top_level_order_by, register_test_tables, run_sql,
         test_session_config,
     };
+
+    /// Assert that all memory reserved in `pool` is freed, within a few
+    /// seconds: the threads of a failed execution are aborted, and free the
+    /// memory that they hold once they stop.
+    pub(crate) async fn assert_memory_freed(
+        pool: &dyn datafusion_execution::memory_pool::MemoryPool,
+    ) {
+        for _ in 0..1000 {
+            if pool.reserved() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{} bytes are still reserved", pool.reserved());
+    }
 
     /// Lower `plan` with the native operators, standing in for the planner
     /// until it lowers sorts (#10):
@@ -1316,6 +1683,77 @@ mod tests {
     use crate::sources::ParquetScanSource;
     use crate::sources::test_harness::{data_batch, data_schema, write_parquet};
     use crate::test_utils::{datafusion_context, test_session_config, test_table_t1};
+    use datafusion_execution::memory_pool::{
+        MemoryConsumer, MemoryPool, UnboundedMemoryPool,
+    };
+
+    /// A reservation in a memory pool without a limit.
+    fn unbounded_reservation() -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new("test").register(&pool)
+    }
+
+    #[test]
+    fn kept_batches_copy_the_shared_values_that_are_slices_of_larger_arrays() {
+        use arrow::array::{GenericListViewArray, ListArray};
+        use arrow::buffer::ScalarBuffer;
+        // A value that is a slice of an array of 1 MiB, in the values of a
+        // dictionary (also nested in a list and in a struct) and of a list view,
+        // which `take` shares with its copies.
+        let sliced = || -> ArrayRef {
+            let values = Int64Array::from_iter_values(std::iter::repeat_n(7, 1 << 17));
+            Arc::new(values.slice(0, 1))
+        };
+        let dictionary = || -> ArrayRef {
+            Arc::new(DictionaryArray::new(Int32Array::from(vec![0]), sliced()))
+        };
+        let list = {
+            let field = Arc::new(Field::new_list_field(
+                dictionary().data_type().clone(),
+                false,
+            ));
+            let offsets = OffsetBuffer::from_lengths([1]);
+            Arc::new(ListArray::new(field, offsets, dictionary(), None)) as ArrayRef
+        };
+        let structure = {
+            let field =
+                Arc::new(Field::new("d", dictionary().data_type().clone(), false));
+            Arc::new(StructArray::new(
+                vec![field].into(),
+                vec![dictionary()],
+                None,
+            )) as ArrayRef
+        };
+        let list_view = {
+            let field = Arc::new(Field::new_list_field(DataType::Int64, false));
+            Arc::new(GenericListViewArray::<i32>::new(
+                field,
+                ScalarBuffer::from(vec![0]),
+                ScalarBuffer::from(vec![1]),
+                sliced(),
+                None,
+            )) as ArrayRef
+        };
+        for column in [dictionary(), list, structure, list_view] {
+            let data_type = column.data_type().clone();
+            assert!(column.get_array_memory_size() > 1 << 20, "{data_type}");
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("c", data_type.clone(), false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).unwrap();
+            let kept = compact_to_keep(batch.clone()).unwrap();
+            // The kept batch has the rows of the batch, and holds at most about
+            // twice the memory that is reserved for it.
+            assert_eq!(kept.column(0).to_data(), column.to_data(), "{data_type}");
+            let held = kept.get_array_memory_size();
+            assert!(
+                held <= 2 * buffered_memory(&kept) + KEPT_EXCESS_BYTES,
+                "{data_type}: the kept batch holds {held} bytes"
+            );
+            // So do the arrays that `columns_to_keep` keeps.
+            let [kept] = columns_to_keep(vec![column]).try_into().unwrap();
+            assert!(kept.get_array_memory_size() < 1 << 16, "{data_type}");
+        }
+    }
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::datasource::MemTable;
     use datafusion_common::DataFusionError;
@@ -1454,7 +1892,13 @@ mod tests {
                 assert!(sort_keys.key_column.is_none());
             }
             for limit in [None, Some(1), Some(77), Some(499), Some(500), Some(800)] {
-                let mut runs = sort_keys.sort(&schema, &batches, limit)?;
+                let reservation = unbounded_reservation();
+                let mut runs = sort_keys.sort(&schema, &batches, limit, &reservation)?;
+                // The memory of the runs stays reserved, and nothing else.
+                assert_eq!(
+                    reservation.size(),
+                    runs.iter().map(SortedRun::memory_size).sum::<usize>()
+                );
                 assert_eq!(runs.len(), 1, "the rows fit into one run");
                 let run = runs.pop().expect("a run");
                 assert_eq!(run.num_rows(), limit.unwrap_or(500).min(500));
@@ -1494,7 +1938,7 @@ mod tests {
                     by_rows.direct = false;
                     by_rows.key_column = None;
                     let other = by_rows
-                        .sort(&schema, &batches, limit)?
+                        .sort(&schema, &batches, limit, &unbounded_reservation())?
                         .pop()
                         .expect("a run");
                     assert!(matches!(other.keys(), RunKeys::Rows(_)));
@@ -1507,8 +1951,14 @@ mod tests {
                     }
                 }
             }
-            assert!(sort_keys.sort(&schema, &batches, Some(0))?.is_empty());
-            assert!(sort_keys.sort(&schema, &[], None)?.is_empty());
+            let reservation = unbounded_reservation();
+            assert!(
+                sort_keys
+                    .sort(&schema, &batches, Some(0), &reservation)?
+                    .is_empty()
+            );
+            assert!(sort_keys.sort(&schema, &[], None, &reservation)?.is_empty());
+            assert_eq!(reservation.size(), 0);
         }
         Ok(())
     }
@@ -1746,7 +2196,9 @@ mod tests {
             LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(cast))]).unwrap();
         let sort_keys = SortKeys::try_new(ordering, &schema).unwrap();
         assert_eq!((sort_keys.direct, sort_keys.key_column), (true, None));
-        let runs = sort_keys.sort(&schema, &batches, None).unwrap();
+        let runs = sort_keys
+            .sort(&schema, &batches, None, &unbounded_reservation())
+            .unwrap();
         assert_eq!(
             runs.iter().map(SortedRun::num_rows).collect::<Vec<_>>(),
             [513, 512]
@@ -3557,14 +4009,23 @@ mod tests {
             .map(|batch| sort_keys.evaluate(batch))
             .collect::<Result<Vec<_>>>()
             .unwrap();
+        let reservation = unbounded_reservation();
+        let mut working = ReservedMemory::new(&reservation);
         assert!(
             sort_keys
-                .sort_with_kernel(&keys, Some(2))
+                .sort_with_kernel(&keys, Some(2), &mut working)
                 .unwrap()
                 .is_none()
         );
         let some = &keys[1000..];
-        assert!(sort_keys.sort_with_kernel(some, Some(2)).unwrap().is_some());
+        assert!(
+            sort_keys
+                .sort_with_kernel(some, Some(2), &mut working)
+                .unwrap()
+                .is_some()
+        );
+        drop(working);
+        assert_eq!(reservation.size(), 0);
     }
 
     #[test]
@@ -3587,7 +4048,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let sort_keys = sort_keys(&schema, &[("k", SortOptions::default())]);
-        let runs = sort_keys.sort(&schema, &batches, None).unwrap();
+        let runs = sort_keys
+            .sort(&schema, &batches, None, &unbounded_reservation())
+            .unwrap();
         assert_eq!(
             runs.iter().map(SortedRun::num_rows).collect::<Vec<_>>(),
             [513, 512]

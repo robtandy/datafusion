@@ -277,6 +277,26 @@ impl SortedRun {
         self.batch.num_rows()
     }
 
+    /// The memory that the run holds: its rows (see
+    /// [`buffered_memory`](super::buffered_memory)) and their keys, unless
+    /// the keys are a column of the rows.
+    pub fn memory_size(&self) -> usize {
+        let keys = match &self.keys {
+            RunKeys::Rows(rows) => rows.size(),
+            RunKeys::Column(column)
+                if self
+                    .batch
+                    .columns()
+                    .iter()
+                    .any(|values| Arc::ptr_eq(values, &column.values)) =>
+            {
+                0
+            }
+            RunKeys::Column(column) => column.values.get_array_memory_size(),
+        };
+        super::buffered_memory(&self.batch) + keys
+    }
+
     /// The sort key of row `row` encoded in the row format, if the keys of
     /// the run are encoded (see [`RunKeys::Rows`]).
     pub fn encoded_key(&self, row: usize) -> Option<Row<'_>> {
@@ -364,6 +384,9 @@ pub struct RunMerger {
     tree: Vec<usize>,
     /// The number of rows still to emit.
     remaining: usize,
+    /// The memory of the runs that are not dropped yet (see
+    /// [`SortedRun::memory_size`]).
+    memory: usize,
     /// How the keys of the runs compare, or why the runs cannot be merged:
     /// their keys are of different kinds or types.
     keys: std::result::Result<KeyKind, String>,
@@ -383,6 +406,7 @@ impl RunMerger {
             .collect::<Vec<_>>();
         let lens = runs.iter().map(SortedRun::num_rows).collect::<Vec<_>>();
         let total = lens.iter().sum::<usize>();
+        let memory = runs.iter().map(SortedRun::memory_size).sum();
         let kinds = runs.iter().map(|run| KeyKind::of(&run.keys));
         let mut keys = Ok(KeyKind::Rows);
         for (index, kind) in kinds.enumerate() {
@@ -404,6 +428,7 @@ impl RunMerger {
             runs: runs.into_iter().map(Some).collect(),
             lens,
             remaining: fetch.map_or(total, |fetch| fetch.min(total)),
+            memory,
             keys,
         };
         merger.init_tree();
@@ -418,6 +443,13 @@ impl RunMerger {
     /// The number of rows the merger still emits.
     pub fn remaining_rows(&self) -> usize {
         self.remaining + self.pending.len()
+    }
+
+    /// The memory of the runs that the merger still holds (see
+    /// [`SortedRun::memory_size`]): it drops the runs whose rows it emitted,
+    /// and all of them once it emitted its rows.
+    pub fn memory_size(&self) -> usize {
+        self.memory
     }
 
     /// Emit the next (at most) `max_rows` rows in sort order, or `None` once
@@ -469,14 +501,20 @@ impl RunMerger {
         // nor pending.
         let (emitted, pending) = self.pending.split_at(len);
         for &(run, _) in emitted {
-            if self.runs[run].is_some()
-                && self.positions[run] >= self.lens[run]
+            if self.positions[run] >= self.lens[run]
                 && !pending.iter().any(|&(other, _)| other == run)
+                && let Some(dropped) = self.runs[run].take()
             {
-                self.runs[run] = None;
+                self.memory -= dropped.memory_size();
             }
         }
         self.pending.drain(..len);
+        // Once all rows are emitted (e.g. the `fetch` of a sort), no row of
+        // any run is needed any more.
+        if self.remaining_rows() == 0 {
+            self.runs.iter_mut().for_each(|run| *run = None);
+            self.memory = 0;
+        }
         Ok(Some(batch))
     }
 
@@ -1238,15 +1276,27 @@ mod tests {
         let converter = converter(options);
         let first = run(&converter, options, vec![(Some(1), 1), (Some(2), 2)]);
         let second = run(&converter, options, vec![(Some(3), 3), (Some(4), 4)]);
+        let (first_memory, second_memory) = (first.memory_size(), second.memory_size());
+        assert!(first_memory > 0 && second_memory > 0);
         let mut merger = RunMerger::new(schema(), vec![first, second], None);
+        assert_eq!(merger.memory_size(), first_memory + second_memory);
         let batch = merger.next_batch(3).unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert!(merger.runs[0].is_none(), "the first run is exhausted");
         assert!(merger.runs[1].is_some());
+        assert_eq!(merger.memory_size(), second_memory);
         let batch = merger.next_batch(3).unwrap().unwrap();
         assert_eq!(rows_of(&[batch]), vec![(Some(4), "4".to_string(), 4)]);
         assert!(merger.runs.iter().all(Option::is_none));
+        assert_eq!(merger.memory_size(), 0);
         assert!(merger.next_batch(3).unwrap().is_none());
+        // A merger with a fetch drops all runs once it emitted its rows.
+        let first = run(&converter, options, vec![(Some(1), 1), (Some(2), 2)]);
+        let second = run(&converter, options, vec![(Some(3), 3), (Some(4), 4)]);
+        let mut merger = RunMerger::new(schema(), vec![first, second], Some(1));
+        assert_eq!(merger.next_batch(3).unwrap().unwrap().num_rows(), 1);
+        assert!(merger.runs.iter().all(Option::is_none));
+        assert_eq!(merger.memory_size(), 0);
     }
 
     /// Random sort keys of `data_type`, with nulls and many ties: integers
