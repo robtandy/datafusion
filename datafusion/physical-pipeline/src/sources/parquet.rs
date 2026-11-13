@@ -5,9 +5,16 @@
 //! [`ParquetScanSource`]: a parallel, morsel-driven scan of Parquet files,
 //! which filters its rows with adaptive row filters and late
 //! materialization.
+//!
+//! The late materialization of a TopK over a Parquet scan reads the columns
+//! that the TopK does not need of the rows that it keeps only:
+//! [`ParquetRowPositions`] is the scan with the positions of its rows (the
+//! index of their file and their row number in it), and
+//! [`PhysicalLateMaterialization`] reads the rows at given positions of the
+//! files of a scan.
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -15,22 +22,32 @@ use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::task::Waker;
 
 use arrow::array::{Array, AsArray, BooleanArray, RecordBatch};
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{
+    DataType, Field, FieldRef, Int64Type, Schema, SchemaRef, UInt32Type,
+};
 use arrow_buffer::BooleanBuffer;
 use datafusion_common::instant::Instant;
 use datafusion_common::parquet_config::RowGroupRangeAssignment;
+use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{Result, ScalarValue, internal_err};
+use datafusion_common::{
+    ColumnStatistics, Result, ScalarValue, Statistics, internal_err,
+};
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_datasource_parquet::can_expr_be_pushed_down_with_schemas;
+use datafusion_datasource::table_schema::TableSchema;
 use datafusion_datasource_parquet::metadata::CachedParquetMetaData;
 use datafusion_datasource_parquet::source::ParquetSource;
+use datafusion_datasource_parquet::{
+    ParquetRowSelection, can_expr_be_pushed_down_with_schemas,
+};
 use datafusion_execution::cache::cache_manager::{
     CachedFileMetadataEntry, FileMetadataCache,
 };
+use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr::expressions::{
     Column, DynamicFilterPhysicalExpr, Literal, lit,
@@ -48,17 +65,19 @@ use datafusion_physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Gauge, MetricBuilder,
 };
 use parking_lot::Mutex;
+use parquet::arrow::RowNumber;
+use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 
 use super::{
     EmptyScanSource, FileScan, FileScanGlobalState, FileScanLocalState, FileScanMode,
     file_scan_config, push_file_ranges,
 };
-use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk};
+use crate::chunk::{DEFAULT_VECTOR_SIZE, DataChunk, SelectionVector};
 use crate::operator::{
-    ExecutionContext, GlobalOperatorState, GlobalSourceState, LocalSourceState,
-    OperatorState, PhysicalOperator, SourceResult, TaskInterrupt, downcast_state,
-    downcast_state_mut,
+    ExecutionContext, GlobalOperatorState, GlobalSinkState, GlobalSourceState,
+    LocalSinkState, LocalSourceState, OperatorState, PhysicalOperator, SinkFinalize,
+    SinkResult, SourceResult, TaskInterrupt, downcast_state, downcast_state_mut,
 };
 use crate::operators::adaptive_filter::{Fallibility, fallibility};
 use crate::operators::filter::PhysicalFilter;
@@ -2432,6 +2451,731 @@ fn conjunction_opt(
     Some(conjunction(exprs))
 }
 
+// ---------------------------------------------------------------------------
+// Late materialization: the positions of the rows of a scan, and a scan of
+// the rows at given positions.
+// ---------------------------------------------------------------------------
+
+/// The name of the column of the file of the positions of a scan (see
+/// [`ParquetRowPositions`]), suffixed if the table has a column of this name.
+const FILE_POSITION_COLUMN: &str = "__late_materialization_file";
+
+/// The name of the column of the row number of the positions of a scan,
+/// suffixed if the table has a column of this name.
+const ROW_POSITION_COLUMN: &str = "__late_materialization_row";
+
+/// The positions of the rows of a scan of Parquet files, with which a
+/// [`PhysicalLateMaterialization`] reads the rows at given positions: DuckDB's
+/// row ids of late materialization (`file_index` and `file_row_number`).
+///
+/// The position of a row is the index of its file among the distinct files
+/// of the scan (in the order of its file groups) and its row number in the
+/// file: the Parquet reader's `row_number` virtual column, which counts the
+/// rows from the first row of the file, whatever byte ranges, row groups,
+/// pages and rows of the file a scan reads. [`Self::scan`] is the scan with
+/// the positions of its rows.
+///
+/// The scans of the positions have a [`ParquetSource`] of their own, like
+/// that of the scan (its options, predicate, file reader factory and schema
+/// provider), of the table schema of the scan with the columns of the
+/// positions: the index of the file, a partition column (the index of every
+/// file is its value), and the row number, a virtual column. They read the
+/// row groups of their files in the order of the files, not in the order
+/// that a sort pushed into the source of the scan asked for (which only
+/// matters to the pace of a TopK above the scan, into whose scan of the
+/// positions the planner pushes its sort again).
+#[derive(Debug, Clone)]
+pub struct ParquetRowPositions {
+    /// The configuration of the scan.
+    config: FileScanConfig,
+    /// The table schema of the scan, followed by the columns of the positions.
+    table_schema: TableSchema,
+    /// The distinct files of the scan, by their index: whole files (without
+    /// the byte ranges that the scan reads), with the value of the file column.
+    files: Vec<PartitionedFile>,
+    /// The index of every file, by its location.
+    indices: HashMap<object_store::path::Path, u32>,
+}
+
+impl ParquetRowPositions {
+    /// The positions of the rows of `plan`, a scan of Parquet files without a
+    /// limit (whose rows would not be those of the scan of the positions of
+    /// its rows). `None` for any other plan, and for the scans whose rows the
+    /// scans of the positions could not read as the scan does: of a table
+    /// with virtual columns (which the scans of the positions add a column
+    /// to), of files with extensions (e.g. a `ParquetAccessPlan`, besides
+    /// which the rows of a file cannot be selected), of files decrypted with
+    /// an encryption factory (which a new source would not have), and with a
+    /// volatile projection (which every scan of the positions evaluates
+    /// again).
+    pub fn try_new(plan: &DataSourceExec) -> Result<Option<Self>> {
+        let Some((config, source)) = plan.downcast_to_file_source::<ParquetSource>()
+        else {
+            return Ok(None);
+        };
+        let table = source.table_schema();
+        let volatile = source.projection().is_some_and(|projection| {
+            projection.iter().any(|expr| is_volatile(&expr.expr))
+        });
+        if config.limit.is_some()
+            || volatile
+            || !table.virtual_columns().is_empty()
+            || source.table_parquet_options().crypto.factory_id.is_some()
+        {
+            return Ok(None);
+        }
+        let mut indices = HashMap::new();
+        let mut files = vec![];
+        for file in config.file_groups.iter().flat_map(FileGroup::iter) {
+            if !file.extensions.is_empty() {
+                return Ok(None);
+            }
+            if indices.contains_key(&file.object_meta.location) {
+                continue;
+            }
+            let Ok(index) = u32::try_from(files.len()) else {
+                return Ok(None);
+            };
+            indices.insert(file.object_meta.location.clone(), index);
+            let mut whole = file.clone();
+            whole.range = None;
+            files.push(with_file_index(whole, index));
+        }
+        let names = table
+            .table_schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<HashSet<_>>();
+        let unique = |base: &str| {
+            let mut name = base.to_string();
+            let mut suffix = 0;
+            while names.contains(name.as_str()) {
+                suffix += 1;
+                name = format!("{base}_{suffix}");
+            }
+            name
+        };
+        let file = Field::new(unique(FILE_POSITION_COLUMN), DataType::UInt32, false);
+        let row = Field::new(unique(ROW_POSITION_COLUMN), DataType::Int64, false)
+            .with_extension_type(RowNumber);
+        let partition_columns = table
+            .table_partition_cols()
+            .iter()
+            .cloned()
+            .chain([Arc::new(file)])
+            .collect::<Vec<_>>();
+        let table_schema = TableSchema::builder(Arc::clone(table.file_schema()))
+            .with_table_partition_cols(partition_columns)
+            .with_virtual_columns(vec![Arc::new(row)])
+            .build();
+        Ok(Some(Self {
+            config: config.clone(),
+            table_schema,
+            files,
+            indices,
+        }))
+    }
+
+    /// The scan with the positions of its rows: it produces the columns
+    /// `columns` of the scan (indices of its output columns, in this order),
+    /// followed by the index of the file of every row (`UInt32`) and its row
+    /// number in the file (`Int64`). It reads the rows that the scan reads:
+    /// of its files and byte ranges, with its predicate (also the dynamic
+    /// filters that DataFusion pushed into it).
+    pub fn scan(&self, columns: &[usize]) -> Result<Arc<DataSourceExec>> {
+        let source = self.source(columns, true)?;
+        let file_groups = self
+            .config
+            .file_groups
+            .iter()
+            .map(|group| {
+                let files = group
+                    .iter()
+                    .map(|file| {
+                        let Some(&index) = self.indices.get(&file.object_meta.location)
+                        else {
+                            return internal_err!(
+                                "The file {} has no index",
+                                file.object_meta.location
+                            );
+                        };
+                        Ok(with_file_index(file.clone(), index))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut positions = FileGroup::new(files);
+                if let Some(statistics) = group.file_statistics(None) {
+                    let mut statistics = statistics.clone();
+                    statistics
+                        .column_statistics
+                        .push(ColumnStatistics::new_unknown());
+                    positions = positions.with_statistics(Arc::new(statistics));
+                }
+                Ok(positions)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut statistics = self.config.statistics();
+        statistics
+            .column_statistics
+            .push(ColumnStatistics::new_unknown());
+        let config = FileScanConfigBuilder::from(self.config.clone())
+            .with_source(source)
+            .with_file_groups(file_groups)
+            .with_statistics(statistics)
+            .build();
+        Ok(DataSourceExec::from_data_source(config))
+    }
+
+    /// The estimated size, in bytes, of the columns `columns` of the scan
+    /// (indices of its output columns) in all of its files: the sizes of the
+    /// columns of its files that their expressions read, from the statistics
+    /// of the scan (the Arrow sizes of fixed-width values, and the
+    /// uncompressed Parquet sizes of the others). Partition columns, which a
+    /// scan does not decode, have no size. `None` if the statistics do not
+    /// have the size of a column.
+    pub fn bytes_of(&self, columns: &[usize]) -> Option<usize> {
+        let projection = self.config.file_source().projection()?;
+        let exprs = projection.iter().collect::<Vec<_>>();
+        let file_columns = self.config.file_schema().fields().len();
+        let mut read = HashSet::new();
+        for &column in columns {
+            read.extend(
+                collect_columns(&exprs.get(column)?.expr)
+                    .iter()
+                    .map(Column::index)
+                    .filter(|&column| column < file_columns),
+            );
+        }
+        let statistics = self.config.statistics();
+        read.into_iter()
+            .map(|column| {
+                statistics
+                    .column_statistics
+                    .get(column)?
+                    .byte_size
+                    .get_value()
+                    .copied()
+            })
+            .sum()
+    }
+
+    /// The columns of the positions in the table schema of the scans of the
+    /// positions: the file, followed by the row number.
+    fn position_columns(&self) -> [Column; 2] {
+        let fields = self.table_schema.table_schema().fields();
+        let [file, row] = [fields.len() - 2, fields.len() - 1];
+        [
+            Column::new(fields[file].name(), file),
+            Column::new(fields[row].name(), row),
+        ]
+    }
+
+    /// The source of a scan of the positions that decodes the columns
+    /// `columns` of the scan, followed by the positions, with the predicate of
+    /// the scan if `predicate`.
+    fn source(&self, columns: &[usize], predicate: bool) -> Result<Arc<dyn FileSource>> {
+        let Some(scan) = self.config.file_source().downcast_ref::<ParquetSource>() else {
+            return internal_err!("ParquetRowPositions requires a ParquetSource");
+        };
+        let options = scan.table_parquet_options().clone();
+        let metadata_size_hint = options.global.metadata_size_hint;
+        let mut source = ParquetSource::new(self.table_schema.clone())
+            .with_table_parquet_options(options);
+        if let Some(metadata_size_hint) = metadata_size_hint {
+            source = source.with_metadata_size_hint(metadata_size_hint);
+        }
+        if let Some(factory) = scan.parquet_file_reader_factory() {
+            source = source.with_parquet_file_reader_factory(Arc::clone(factory));
+        }
+        if let Some(provider) = scan.schema_provider() {
+            source = source.with_schema_provider(Arc::clone(provider));
+        }
+        if predicate && let Some(predicate) = scan.filter() {
+            source = source.with_predicate(predicate);
+        }
+        let Some(projection) = scan.projection() else {
+            return internal_err!("a ParquetSource without a projection");
+        };
+        let exprs = projection.iter().collect::<Vec<_>>();
+        let projected = columns
+            .iter()
+            .map(|&column| match exprs.get(column) {
+                Some(expr) => Ok((*expr).clone()),
+                None => internal_err!(
+                    "The scan has {} columns, not a column {column}",
+                    exprs.len()
+                ),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let positions = self.position_columns().map(|column| {
+            let name = column.name().to_string();
+            ProjectionExpr::new(Arc::new(column), name)
+        });
+        let projection = ProjectionExprs::new(projected.into_iter().chain(positions));
+        match source.try_pushdown_projection(&projection)? {
+            Some(source) => Ok(source),
+            None => {
+                internal_err!("ParquetSource did not take the projection of positions")
+            }
+        }
+    }
+
+    /// The configuration of a scan, with `source` (of [`Self::source`], without
+    /// the predicate), of the rows at `positions` (sorted and distinct): of
+    /// every file of the positions, with a selection of their rows if the
+    /// number of rows of the file is known (from the metadata that `cache`
+    /// holds, or else from the statistics of the file), and the whole file
+    /// otherwise.
+    fn rows_config(
+        &self,
+        source: &Arc<dyn FileSource>,
+        positions: &[(u32, i64)],
+        cache: &FileMetadataCache,
+    ) -> Result<FileScanConfig> {
+        let mut files = vec![];
+        for rows in positions.chunk_by(|a, b| a.0 == b.0) {
+            let index = rows[0].0;
+            let Some(file) = usize::try_from(index)
+                .ok()
+                .and_then(|index| self.files.get(index))
+            else {
+                return internal_err!("A position of a row of the file {index}");
+            };
+            let selection = file_rows(cache, file)
+                .and_then(|total| row_selection(rows.iter().map(|(_, row)| *row), total));
+            files.push(match selection {
+                Some(selection) => file
+                    .clone()
+                    .with_extension(ParquetRowSelection::new(selection)),
+                None => file.clone(),
+            });
+        }
+        Ok(FileScanConfigBuilder::from(self.config.clone())
+            .with_source(Arc::clone(source))
+            .with_file_groups(vec![FileGroup::new(files)])
+            .with_statistics(Statistics::new_unknown(self.table_schema.table_schema()))
+            .with_output_ordering(vec![])
+            .with_output_partitioning(None)
+            .with_preserve_order(false)
+            .build())
+    }
+}
+
+/// `file`, a file of a scan, with the value `index` of the file column of the
+/// positions of the scan (see [`ParquetRowPositions`]), and its statistics.
+fn with_file_index(mut file: PartitionedFile, index: u32) -> PartitionedFile {
+    let value = ScalarValue::UInt32(Some(index));
+    if let Some(statistics) = file.statistics.as_mut() {
+        let statistics = Arc::make_mut(statistics);
+        let bytes = statistics
+            .num_rows
+            .multiply(&Precision::Exact(size_of::<u32>()));
+        statistics.column_statistics.push(ColumnStatistics {
+            null_count: Precision::Exact(0),
+            max_value: Precision::Exact(value.clone()),
+            min_value: Precision::Exact(value.clone()),
+            distinct_count: Precision::Exact(1),
+            sum_value: Precision::Absent,
+            byte_size: bytes,
+        });
+    }
+    file.partition_values.push(value);
+    file
+}
+
+/// The number of rows of `file`: of its metadata, if `cache` holds it (and it
+/// is up to date), and otherwise of its statistics, if they are exact.
+fn file_rows(cache: &FileMetadataCache, file: &PartitionedFile) -> Option<usize> {
+    let cached = cache.get(&file.object_meta.location).and_then(|entry| {
+        parquet_metadata(&entry, file)?
+            .row_groups()
+            .iter()
+            .map(|row_group| usize::try_from(row_group.num_rows()).ok())
+            .sum::<Option<usize>>()
+    });
+    cached.or_else(|| match file.statistics.as_ref()?.num_rows {
+        Precision::Exact(rows) => Some(rows),
+        _ => None,
+    })
+}
+
+/// The selection of the rows `rows` (row numbers, ascending and distinct) of
+/// a file of `total` rows, `None` if a row is not a row of the file.
+fn row_selection(rows: impl Iterator<Item = i64>, total: usize) -> Option<RowSelection> {
+    let mut selectors: Vec<RowSelector> = vec![];
+    // The first row that the selectors do not select or skip.
+    let mut next = 0;
+    for row in rows {
+        let row = usize::try_from(row).ok()?;
+        if row < next || row >= total {
+            return None;
+        }
+        match selectors.last_mut() {
+            Some(last) if row == next && !last.skip => last.row_count += 1,
+            _ => {
+                if row > next {
+                    selectors.push(RowSelector::skip(row - next));
+                }
+                selectors.push(RowSelector::select(1));
+            }
+        }
+        next = row + 1;
+    }
+    if next < total {
+        selectors.push(RowSelector::skip(total - next));
+    }
+    Some(RowSelection::from(selectors))
+}
+
+/// Reads the rows of a scan of Parquet files at the positions of the rows of
+/// its input: the late materialization of a TopK over a scan of many columns,
+/// as DuckDB's `LateMaterialization` plans it (see
+/// `Lowering::try_late_materialization` in `planner.rs`), which reads the
+/// rows of its TopK in a second scan.
+///
+/// The input produces positions of rows of the scan of a
+/// [`ParquetRowPositions`] (e.g. the TopK over the sort keys and the positions
+/// of the rows of [`ParquetRowPositions::scan`]), which the operator collects
+/// as a sink. As a source, it then reads the rows at these positions, on all
+/// threads: every file of the positions with a selection of its rows (a
+/// `ParquetRowSelection`), so that the decoder decodes only the pages of
+/// these rows, and the whole file if the number of its rows is unknown
+/// (which neither the metadata cache nor the statistics of the file have),
+/// without the predicate of the scan (the input filtered its rows already),
+/// and produces the rows at the positions, every row once, in no particular
+/// order. It produces no rows if its input has none.
+///
+/// The positions are reserved in the memory pool of the session: they are
+/// as many as the rows of the input (at most `k` of a TopK).
+pub struct PhysicalLateMaterialization {
+    /// The input, the only child.
+    children: Vec<Arc<dyn PhysicalOperator>>,
+    schema: SchemaRef,
+    positions: ParquetRowPositions,
+    /// The source that reads the rows: of the columns of the output, followed
+    /// by the positions, without a predicate.
+    source: Arc<dyn FileSource>,
+    /// The columns of the input of the file and of the row number of the
+    /// positions.
+    input_positions: [usize; 2],
+}
+
+impl fmt::Debug for PhysicalLateMaterialization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PhysicalLateMaterialization")
+            .field("children", &self.children)
+            .field("schema", &self.schema)
+            .field("positions", &self.positions)
+            .field("input_positions", &self.input_positions)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PhysicalLateMaterialization {
+    /// Read the columns `columns` of the scan of `positions` (indices of its
+    /// output columns) at the positions of the rows of `input`, whose columns
+    /// `input_positions` are the file (`UInt32`) and the row number (`Int64`)
+    /// of the positions, as rows of `schema`, which must have the types of the
+    /// columns.
+    pub fn try_new(
+        input: Arc<dyn PhysicalOperator>,
+        positions: ParquetRowPositions,
+        columns: &[usize],
+        schema: SchemaRef,
+        input_positions: [usize; 2],
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        for (column, data_type) in input_positions
+            .iter()
+            .zip([DataType::UInt32, DataType::Int64])
+        {
+            if input_schema
+                .fields()
+                .get(*column)
+                .is_none_or(|field| field.data_type() != &data_type)
+            {
+                return internal_err!(
+                    "The column {column} of the input of PhysicalLateMaterialization is not a {data_type} of positions"
+                );
+            }
+        }
+        let source = positions.source(columns, false)?;
+        let Some(projection) = source.projection() else {
+            return internal_err!("a ParquetSource without a projection");
+        };
+        let read = projection.project_schema(positions.table_schema.table_schema())?;
+        let types_match = schema.fields().len() == columns.len()
+            && schema
+                .fields()
+                .iter()
+                .zip(read.fields())
+                .all(|(output, read)| output.data_type() == read.data_type());
+        if !types_match {
+            return internal_err!(
+                "PhysicalLateMaterialization reads the columns {:?} of {}, not those of {schema:?}",
+                columns,
+                read
+            );
+        }
+        Ok(Self {
+            children: vec![input],
+            schema,
+            positions,
+            source,
+            input_positions,
+        })
+    }
+
+    /// The input.
+    pub fn input(&self) -> &Arc<dyn PhysicalOperator> {
+        &self.children[0]
+    }
+
+    /// The rows of `chunk`, a chunk of the rows of the files of the positions
+    /// (the columns of the output, followed by the positions), that are at the
+    /// positions `positions` (sorted), with the columns of the output.
+    fn rows_at(&self, chunk: DataChunk, positions: &[(u32, i64)]) -> Result<DataChunk> {
+        let columns = self.schema.fields().len();
+        if chunk.is_empty() {
+            return Ok(DataChunk::empty(self.schema()));
+        }
+        let files = chunk.compacted_column(columns)?;
+        let rows = chunk.compacted_column(columns + 1)?;
+        let (Some(files), Some(rows)) = (
+            files.as_primitive_opt::<UInt32Type>(),
+            rows.as_primitive_opt::<Int64Type>(),
+        ) else {
+            return internal_err!(
+                "The positions of the rows of {} are not read",
+                self.name()
+            );
+        };
+        let at_positions = files
+            .values()
+            .iter()
+            .zip(rows.values().iter())
+            .map(|(&file, &row)| positions.binary_search(&(file, row)).is_ok())
+            .collect::<BooleanArray>();
+        let chunk = match at_positions.true_count() {
+            0 => return Ok(DataChunk::empty(self.schema())),
+            count if count == chunk.len() => chunk,
+            _ => {
+                chunk.with_selection(SelectionVector::from_boolean_mask(&at_positions))?
+            }
+        };
+        DataChunk::try_new(
+            self.schema(),
+            chunk.columns()[..columns].to_vec(),
+            chunk.selection().cloned(),
+        )
+    }
+}
+
+/// The global sink state of a [`PhysicalLateMaterialization`]: the positions
+/// of the rows of its input.
+#[derive(Debug)]
+struct LateMaterializationSink {
+    /// The positions, sorted and distinct once the sink is finalized.
+    positions: Mutex<Vec<(u32, i64)>>,
+    /// The memory of the positions.
+    reservation: MemoryReservation,
+}
+
+impl GlobalSinkState for LateMaterializationSink {}
+
+/// The global source state of a [`PhysicalLateMaterialization`]: the scan of
+/// the rows at the positions of its input, and the state of that scan.
+struct LateMaterializationSource {
+    scan: ParquetScanSource,
+    state: Arc<dyn GlobalSourceState>,
+    /// The positions of the rows, sorted and distinct.
+    positions: Vec<(u32, i64)>,
+}
+
+impl GlobalSourceState for LateMaterializationSource {
+    fn max_threads(&self) -> usize {
+        self.state.max_threads()
+    }
+}
+
+impl PhysicalOperator for PhysicalLateMaterialization {
+    fn name(&self) -> &str {
+        "PhysicalLateMaterialization"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn children(&self) -> &[Arc<dyn PhysicalOperator>] {
+        &self.children
+    }
+
+    fn description(&self) -> String {
+        let input_schema = self.input().schema();
+        let column = |index: usize| {
+            let field = input_schema.field(index);
+            format!("{}@{index}", field.name())
+        };
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        format!(
+            "{}: projection=[{}], positions=[{}, {}]",
+            self.name(),
+            columns.join(", "),
+            column(self.input_positions[0]),
+            column(self.input_positions[1])
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Sink: the positions of the rows of the input.
+    // ---------------------------------------------------------------------
+
+    fn is_sink(&self) -> bool {
+        true
+    }
+
+    fn parallel_sink(&self) -> bool {
+        true
+    }
+
+    fn get_global_sink_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSinkState>> {
+        let reservation =
+            MemoryConsumer::new(self.name()).register(ctx.task_ctx.memory_pool());
+        Ok(Arc::new(LateMaterializationSink {
+            positions: Mutex::default(),
+            reservation,
+        }))
+    }
+
+    fn sink(
+        &self,
+        _ctx: &ExecutionContext,
+        input: &DataChunk,
+        gstate: &dyn GlobalSinkState,
+        _lstate: &mut dyn LocalSinkState,
+    ) -> Result<SinkResult> {
+        let state =
+            downcast_state::<LateMaterializationSink>(gstate.as_any(), self.name())?;
+        let [file, row] = self.input_positions;
+        let files = input.compacted_column(file)?;
+        let rows = input.compacted_column(row)?;
+        let (Some(files), Some(rows)) = (
+            files.as_primitive_opt::<UInt32Type>(),
+            rows.as_primitive_opt::<Int64Type>(),
+        ) else {
+            return internal_err!("The input of {} has no positions", self.name());
+        };
+        if files.null_count() > 0 || rows.null_count() > 0 {
+            return internal_err!("The input of {} has positions of NULL", self.name());
+        }
+        state
+            .reservation
+            .try_grow(files.len() * size_of::<(u32, i64)>())?;
+        state.positions.lock().extend(
+            files
+                .values()
+                .iter()
+                .copied()
+                .zip(rows.values().iter().copied()),
+        );
+        Ok(SinkResult::NeedMoreInput)
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &ExecutionContext,
+        gstate: &dyn GlobalSinkState,
+    ) -> Result<SinkFinalize> {
+        let state =
+            downcast_state::<LateMaterializationSink>(gstate.as_any(), self.name())?;
+        let mut positions = state.positions.lock();
+        positions.sort_unstable();
+        positions.dedup();
+        Ok(match positions.is_empty() {
+            true => SinkFinalize::NoOutputPossible,
+            false => SinkFinalize::Ready,
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Source: the rows at the positions.
+    // ---------------------------------------------------------------------
+
+    fn is_source(&self) -> bool {
+        true
+    }
+
+    fn parallel_source(&self) -> bool {
+        true
+    }
+
+    fn get_global_source_state(
+        &self,
+        ctx: &ExecutionContext,
+    ) -> Result<Arc<dyn GlobalSourceState>> {
+        let Some(sink) = ctx.global_sink_state(self) else {
+            return internal_err!(
+                "{} is read before it collected its input",
+                self.name()
+            );
+        };
+        let sink = downcast_state::<LateMaterializationSink>(sink.as_any(), self.name())?;
+        let positions = std::mem::take(&mut *sink.positions.lock());
+        let runtime = ctx.task_ctx.runtime_env();
+        let config = self.positions.rows_config(
+            &self.source,
+            &positions,
+            runtime.cache_manager.get_file_metadata_cache().as_ref(),
+        )?;
+        let scan = ParquetScanSource::try_from_config(config)?;
+        let state = scan.get_global_source_state(ctx)?;
+        Ok(Arc::new(LateMaterializationSource {
+            scan,
+            state,
+            positions,
+        }))
+    }
+
+    fn get_local_source_state(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+    ) -> Result<Box<dyn LocalSourceState>> {
+        let gstate =
+            downcast_state::<LateMaterializationSource>(gstate.as_any(), self.name())?;
+        gstate
+            .scan
+            .get_local_source_state(ctx, gstate.state.as_ref())
+    }
+
+    fn get_data(
+        &self,
+        ctx: &ExecutionContext,
+        gstate: &dyn GlobalSourceState,
+        lstate: &mut dyn LocalSourceState,
+    ) -> Result<SourceResult> {
+        let gstate =
+            downcast_state::<LateMaterializationSource>(gstate.as_any(), self.name())?;
+        Ok(
+            match gstate.scan.get_data(ctx, gstate.state.as_ref(), lstate)? {
+                SourceResult::Chunk(chunk) => {
+                    SourceResult::Chunk(self.rows_at(chunk, &gstate.positions)?)
+                }
+                result => result,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4683,6 +5427,322 @@ mod tests {
         assert!(!predicate.reorder);
         assert!(predicate.exact_native.is_empty());
         assert!(predicate.pruning_only.iter().any(|expr| expr.eq(&dynamic)));
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Late materialization
+    // ---------------------------------------------------------------------
+
+    /// The positions of the rows of the scan of the plan of `sql` (in the
+    /// session `ctx`, of the table of [`register_table`]), and that scan.
+    async fn row_positions(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<(ParquetRowPositions, Arc<dyn ExecutionPlan>)> {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let scan = find_scan(&plan);
+        let exec = scan.downcast_ref::<DataSourceExec>().unwrap();
+        let positions = ParquetRowPositions::try_new(exec)?.expect("positions");
+        Ok((positions, scan))
+    }
+
+    /// The index of the file of the year `year` among the files of
+    /// `positions`, see [`write_table`].
+    fn file_of_year(positions: &ParquetRowPositions, year: i32) -> u32 {
+        let index = positions
+            .files
+            .iter()
+            .position(|file| {
+                file.object_meta
+                    .location
+                    .as_ref()
+                    .contains(&format!("year={year}"))
+            })
+            .expect("the file of the year");
+        u32::try_from(index).unwrap()
+    }
+
+    /// The position of the row `id` of the table of [`write_table`]: the file
+    /// of its year, and its row in the file.
+    fn position_of(positions: &ParquetRowPositions, id: i64) -> (u32, i64) {
+        let first = match year_of(id) {
+            2020 => 0,
+            2021 => 5000,
+            _ => 5100,
+        };
+        (file_of_year(positions, year_of(id)), id - first)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scans_of_positions_produce_the_positions_of_their_rows() -> Result<()> {
+        // The row number of a row is its row in its file, whatever the scan
+        // reads of the file: row groups (the large file has 5), byte ranges,
+        // and rows and pages that a predicate of the scan skips (with
+        // `pushdown_filters`, DataFusion relies on the scan to apply it).
+        let dir = table();
+        for pushdown_filters in [false, true] {
+            let mut config = test_session_config();
+            config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
+            let ctx = SessionContext::new_with_config(config);
+            register_table(&ctx, dir.path()).await?;
+            for (sql, ids) in [
+                ("SELECT * FROM p", (0..5107).collect::<Vec<_>>()),
+                (
+                    "SELECT id, a FROM p WHERE id BETWEEN 1510 AND 1720 OR id > 5050",
+                    (1510..=1720).chain(5051..5107).collect(),
+                ),
+            ] {
+                let (positions, scan) = row_positions(&ctx, sql).await?;
+                // The id of the scan and its year, a partition column.
+                let year = scan.schema().index_of("year").ok();
+                let columns = [Some(0), year].into_iter().flatten().collect::<Vec<_>>();
+                let scan_of_positions = positions.scan(&columns)?;
+                let schema = scan_of_positions.schema();
+                let fields = schema.fields();
+                assert_eq!(fields.len(), columns.len() + 2, "{schema:?}");
+                assert_eq!(fields[columns.len()].data_type(), &DataType::UInt32);
+                assert_eq!(fields[columns.len() + 1].data_type(), &DataType::Int64);
+                let sources = [
+                    ParquetScanSource::try_new(&scan_of_positions)?,
+                    ParquetScanSource::try_new(&scan_of_positions)?.with_min_unit_rows(1),
+                    ParquetScanSource::try_new(&scan_of_positions)?
+                        .with_range_bytes(4096),
+                ];
+                for source in sources {
+                    let output =
+                        Executor::collect(Arc::new(source), ctx.task_ctx(), 4).await?;
+                    let mut rows = vec![];
+                    for batch in &output {
+                        let id = batch.column(0).as_primitive::<Int64Type>();
+                        let file =
+                            batch.column(columns.len()).as_primitive::<UInt32Type>();
+                        let row =
+                            batch.column(columns.len() + 1).as_primitive::<Int64Type>();
+                        for i in 0..batch.num_rows() {
+                            rows.push((id.value(i), (file.value(i), row.value(i))));
+                        }
+                    }
+                    rows.sort_unstable();
+                    let at_positions = rows
+                        .iter()
+                        .map(|&(id, _)| (id, position_of(&positions, id)))
+                        .collect::<Vec<_>>();
+                    assert_eq!(rows, at_positions, "{sql}, pushdown {pushdown_filters}");
+                    // Without `pushdown_filters`, the scan may produce rows that
+                    // the filter above it rejects.
+                    let produced = rows.iter().map(|&(id, _)| id).collect::<Vec<_>>();
+                    assert!(ids.iter().all(|id| produced.binary_search(id).is_ok()));
+                    if pushdown_filters {
+                        assert_eq!(produced, ids, "{sql}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rows_are_selected_by_their_row_numbers() {
+        let selection = |rows: &[i64], total| {
+            row_selection(rows.iter().copied(), total).map(Vec::<RowSelector>::from)
+        };
+        assert_eq!(
+            selection(&[0, 1, 2, 5], 10),
+            Some(vec![
+                RowSelector::select(3),
+                RowSelector::skip(2),
+                RowSelector::select(1),
+                RowSelector::skip(4),
+            ])
+        );
+        assert_eq!(
+            selection(&[9], 10),
+            Some(vec![RowSelector::skip(9), RowSelector::select(1)])
+        );
+        assert_eq!(selection(&[], 3), Some(vec![RowSelector::skip(3)]));
+        // Rows that are not rows of the file, or not in order.
+        assert_eq!(selection(&[10], 10), None);
+        assert_eq!(selection(&[-1], 10), None);
+        assert_eq!(selection(&[3, 3], 10), None);
+        assert_eq!(selection(&[4, 2], 10), None);
+    }
+
+    /// A source of the positions `positions`: columns `file` (`UInt32`) and
+    /// `row` (`Int64`).
+    fn positions_source(positions: &[(u32, i64)]) -> Result<Arc<dyn PhysicalOperator>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("file", DataType::UInt32, false),
+            Field::new("row", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::UInt32Array::from_iter_values(
+                    positions.iter().map(|(file, _)| *file),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    positions.iter().map(|(_, row)| *row),
+                )),
+            ],
+        )?;
+        Ok(Arc::new(crate::sources::MemoryScanSource::try_new(
+            &[vec![batch]],
+            schema,
+            None,
+            None,
+        )?))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rows_are_read_at_their_positions() -> Result<()> {
+        // The rows at positions of every file, also the first and the last rows
+        // of files and of row groups, every row once (also those whose
+        // positions repeat), with all columns of the scan (also the partition
+        // column `year`).
+        let dir = table();
+        let ctx = SessionContext::new_with_config(test_session_config());
+        register_table(&ctx, dir.path()).await?;
+        let (positions, scan) = row_positions(&ctx, "SELECT * FROM p").await?;
+        let ids = [0, 1, 999, 1000, 2500, 4999, 5000, 5042, 5099, 5100, 5106];
+        let mut input = ids
+            .iter()
+            .map(|&id| position_of(&positions, id))
+            .collect::<Vec<_>>();
+        input.extend_from_slice(&input.clone()[..3]);
+        let columns = (0..scan.schema().fields().len()).collect::<Vec<_>>();
+        let expected = ids.iter().map(|&id| (id, year_of(id))).collect::<Vec<_>>();
+        let late =
+            |positions: &ParquetRowPositions| -> Result<Arc<dyn PhysicalOperator>> {
+                Ok(Arc::new(PhysicalLateMaterialization::try_new(
+                    positions_source(&input)?,
+                    positions.clone(),
+                    &columns,
+                    scan.schema(),
+                    [0, 1],
+                )?))
+            };
+        // With the metadata of the files in the cache of the session (which
+        // planned the table), in a session without it (with the statistics of
+        // the files), and without either: the operator reads the whole files.
+        let uncached = SessionContext::new_with_config(test_session_config());
+        let mut without_statistics = positions.clone();
+        for file in &mut without_statistics.files {
+            file.statistics = None;
+        }
+        for (ctx, positions, selected) in [
+            (&ctx, &positions, true),
+            (&uncached, &positions, true),
+            (&uncached, &without_statistics, false),
+        ] {
+            for threads in [1, 4] {
+                let output =
+                    Executor::collect(late(positions)?, ctx.task_ctx(), threads).await?;
+                assert_eq!(output[0].schema(), scan.schema());
+                assert_eq!(ids_and_years(&output), expected, "{threads} threads");
+            }
+            let mut sorted = input.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let source = positions.source(&columns, false)?;
+            let runtime = ctx.runtime_env();
+            let cache = runtime.cache_manager.get_file_metadata_cache();
+            let config = positions.rows_config(&source, &sorted, cache.as_ref())?;
+            let files = config
+                .file_groups
+                .iter()
+                .flat_map(FileGroup::iter)
+                .collect::<Vec<_>>();
+            assert_eq!(files.len(), 3);
+            assert!(
+                files.iter().all(|file| file.range.is_none()
+                    && file.extensions.get::<ParquetRowSelection>().is_some()
+                        == selected),
+                "{config:?}"
+            );
+        }
+        // Without positions, there are no rows.
+        let empty = PhysicalLateMaterialization::try_new(
+            positions_source(&[])?,
+            positions,
+            &columns,
+            scan.schema(),
+            [0, 1],
+        )?;
+        let output = Executor::collect(Arc::new(empty), ctx.task_ctx(), 4).await?;
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sizes_of_columns_are_those_of_the_statistics() -> Result<()> {
+        // Of the 5107 rows of the table: 8 bytes of every `id` (`BIGINT`), the
+        // uncompressed size of `s` (`VARCHAR`) in the files, and nothing of
+        // the partition column `year`, which the scan does not decode.
+        let dir = table();
+        let ctx = SessionContext::new_with_config(test_session_config());
+        register_table(&ctx, dir.path()).await?;
+        let (positions, scan) = row_positions(&ctx, "SELECT * FROM p").await?;
+        let schema = scan.schema();
+        let [id, s, year] =
+            ["id", "s", "year"].map(|name| schema.index_of(name).unwrap());
+        assert_eq!(positions.bytes_of(&[id]), Some(8 * 5107));
+        assert_eq!(positions.bytes_of(&[year]), Some(0));
+        let strings = positions.bytes_of(&[s]).expect("the size of `s`");
+        assert!(strings > 0);
+        assert_eq!(positions.bytes_of(&[id, s, year]), Some(8 * 5107 + strings));
+        // Without statistics, the sizes are unknown.
+        let config = SessionConfig::new().with_collect_statistics(false);
+        let ctx = SessionContext::new_with_config(config);
+        register_table(&ctx, dir.path()).await?;
+        let (positions, _) = row_positions(&ctx, "SELECT * FROM p").await?;
+        assert_eq!(positions.bytes_of(&[id]), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scans_without_positions() -> Result<()> {
+        // The scans of files with extensions (whose rows a row selection could
+        // not select) and with a limit have no positions.
+        let dir = table();
+        let ctx = SessionContext::new_with_config(test_session_config());
+        register_table(&ctx, dir.path()).await?;
+        let plan = ctx
+            .sql("SELECT * FROM p")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let scan = find_scan(&plan);
+        let exec = scan.downcast_ref::<DataSourceExec>().unwrap();
+        assert!(ParquetRowPositions::try_new(exec)?.is_some());
+        let config = exec.data_source().downcast_ref::<FileScanConfig>().unwrap();
+        let with_extensions = config
+            .file_groups
+            .iter()
+            .map(|group| {
+                FileGroup::new(
+                    group
+                        .iter()
+                        .map(|file| {
+                            file.clone().with_extension(ParquetRowSelection::new(
+                                RowSelection::from(vec![]),
+                            ))
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        for config in [
+            FileScanConfigBuilder::from(config.clone())
+                .with_file_groups(with_extensions)
+                .build(),
+            FileScanConfigBuilder::from(config.clone())
+                .with_limit(Some(10))
+                .build(),
+        ] {
+            let exec = DataSourceExec::from_data_source(config);
+            assert!(ParquetRowPositions::try_new(&exec)?.is_none());
+        }
         Ok(())
     }
 }

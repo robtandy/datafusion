@@ -80,6 +80,14 @@
 //! the subqueries of scalar subqueries) are not cached: see
 //! `Lowering::lower_in`.
 //!
+//! A TopK of few rows over a Parquet scan of columns that its sort keys do
+//! not read (e.g. `SELECT * ... ORDER BY a LIMIT 10`) is materialized late,
+//! as DuckDB's `LateMaterialization` plans it: a TopK over the sort keys and
+//! the positions of the rows of a scan of these columns only (and of those
+//! of its filter), a [`PhysicalLateMaterialization`] that reads the other
+//! columns of the rows that the TopK keeps, at their positions, and a
+//! [`PhysicalSort`] of these rows. See `Lowering::try_late_materialization`.
+//!
 //! The dynamic filter of every native hash join is routed, like DuckDB's join
 //! filters, to the scans below its probe side that produce its probe keys
 //! unchanged: through projections, filters, sorts, unions, other joins and
@@ -192,11 +200,12 @@
 //! ```
 //!
 //! [`PhysicalTopK`]: crate::sort::PhysicalTopK
+//! [`PhysicalLateMaterialization`]: crate::sources::parquet::PhysicalLateMaterialization
 //! [`PhysicalMergeJoin`]: crate::join::PhysicalMergeJoin
 //! [`PhysicalSymmetricHashJoin`]: crate::join::PhysicalSymmetricHashJoin
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -207,11 +216,13 @@ use arrow::compute::{and, prep_null_mask_filter};
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::config::{ConfigExtension, ConfigOptions};
 use datafusion_common::format::ExplainFormat;
-use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_common::{
-    JoinSide, JoinType, Result, ScalarValue, exec_err, internal_err,
+    JoinSide, JoinType, Result, ScalarValue, exec_err, extensions_options, internal_err,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::memory::MemorySourceConfig;
@@ -223,6 +234,7 @@ use datafusion_expr::LogicalPlan;
 use datafusion_expr::logical_plan::Explain;
 use datafusion_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
 use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::aggregates::{AggregateExec, AggregateMode};
@@ -243,7 +255,7 @@ use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion_physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    ReplaceChildrenOptions,
+    ReplaceChildrenOptions, SortOrderPushdownResult,
 };
 use datafusion_session::{PhysicalPlanner, QueryPlanner, Session};
 
@@ -284,6 +296,7 @@ use crate::operators::union::PhysicalUnion;
 use crate::operators::unnest::PhysicalUnnest;
 use crate::pipeline::{MetaPipelineBuilder, MetaPipelineId, PipelineBuilder};
 use crate::sort::{PhysicalSort, PhysicalTopK, TopKDynamicFilter};
+use crate::sources::parquet::{ParquetRowPositions, PhysicalLateMaterialization};
 use crate::sources::{
     EmptyScanSource, ExplainSource, FileScanSource, LazyMemorySource, MemoryDmlSource,
     StreamingTableSource, try_create_scan_source,
@@ -564,6 +577,43 @@ fn any_session_options() -> ConfigOptions {
     let mut options = ConfigOptions::default();
     options.execution.sort_in_place_threshold_bytes = usize::MAX;
     options
+}
+
+extensions_options! {
+    /// The session options of the late materialization of the TopKs over
+    /// Parquet scans of many columns (see the
+    /// [module documentation](self#lowering)), whose defaults the sessions
+    /// without them have.
+    ///
+    /// ```
+    /// use datafusion::prelude::SessionConfig;
+    /// use datafusion_physical_pipeline::planner::LateMaterializationOptions;
+    ///
+    /// // Never reads the rows of a TopK late.
+    /// let mut options = LateMaterializationOptions::default();
+    /// options.max_rows = 0;
+    /// let config = SessionConfig::new().with_option_extension(options);
+    /// ```
+    pub struct LateMaterializationOptions {
+        /// The most rows of a TopK whose rows are read late, DuckDB's default
+        /// `late_materialization_max_rows`: the scan of the rows that a TopK
+        /// keeps reads, of every column, the pages of these rows and the
+        /// dictionaries of their files, which many rows spread over all pages
+        /// and files. 0 disables late materialization.
+        pub max_rows: usize, default = 50
+        /// The least size, in bytes, of the columns that only the late scan
+        /// of the rows of a TopK reads (the columns that neither its keys nor
+        /// the filter of its scan read), in all files of its scan, as their
+        /// statistics estimate it: a TopK reads its rows late if not
+        /// decoding these columns for all rows of its scan saves more than
+        /// the scan of its rows costs. 0 reads the rows of every TopK late,
+        /// also of scans without statistics.
+        pub min_bytes: usize, default = 16 * 1024 * 1024
+    }
+}
+
+impl ConfigExtension for LateMaterializationOptions {
+    const PREFIX: &'static str = "pipeline_late_materialization";
 }
 
 /// Lowers the nodes of a plan, see [`lower_execution_plan_with_options`] and
@@ -929,16 +979,274 @@ impl Lowering<'_> {
             None => Arc::clone(plan),
             Some(_) => with_unread_topk_filter(plan)?,
         };
+        // The rows that the sort sorts (see `Self::try_late_materialization`).
+        let mut rows = None;
         let Some(lowered) = crate::sort::try_lower(&to_lower, self.options, |plan| {
+            rows = Some(Arc::clone(plan));
             self.lower_in(plan, false)
         })?
         else {
             return Ok(None);
         };
-        Ok(Some(match read_filter {
+        let lowered = match read_filter {
             None => lowered,
             Some(filter) => updating_filter(lowered, filter)?,
-        }))
+        };
+        if let Some(rows) = rows
+            && let Some(late) = self.try_late_materialization(&lowered, &rows)?
+        {
+            return Ok(Some(late));
+        }
+        Ok(Some(lowered))
+    }
+
+    /// Lower `lowered`, the native sort of `rows` (see
+    /// [`Self::try_lower_sort`]), with the late materialization of its rows,
+    /// as DuckDB's `LateMaterialization` plans a top-N over a scan of many
+    /// columns, if it is a [`PhysicalTopK`] by keys that are not volatile of
+    /// the rows of a Parquet scan without a limit, of a filter directly above
+    /// it, or of a projection of columns of either (through nodes that only
+    /// distribute or schedule their rows), of at most
+    /// [`LateMaterializationOptions::max_rows`] rows, and if the columns of
+    /// the rows that neither its keys nor the filter read have at least
+    /// [`LateMaterializationOptions::min_bytes`] (in all files of the scan, as
+    /// their statistics estimate it, see [`ParquetRowPositions::bytes_of`]):
+    ///
+    /// * a TopK by the same keys of the rows of a scan of the columns that the
+    ///   keys and the filter read, followed by the positions of the rows (see
+    ///   [`ParquetRowPositions::scan`]), with the filter (folded into the scan,
+    ///   as any filter of a Parquet scan), which updates the dynamic filter of
+    ///   the TopK of the plan, so that the scan skips the reads that its
+    ///   threshold rules out;
+    /// * a [`PhysicalLateMaterialization`], which reads the rows that this
+    ///   TopK keeps at their positions, with all of their columns;
+    /// * a [`PhysicalSort`] of these rows by the keys of the TopK.
+    ///
+    /// So the columns that the keys and the filter do not read are read of
+    /// the rows of the result only, instead of all rows that pass the filter
+    /// (but those that the dynamic filter skips), which pays off unless they
+    /// are few bytes: the scan of the rows of the TopK reads, in every file
+    /// of these rows, the pages of the rows and the dictionaries of all
+    /// columns, and the TopK keeps the positions of the rows of its scan
+    /// too. E.g. ClickBench's `SELECT *
+    /// FROM hits WHERE "URL" LIKE '%google%' ORDER BY "EventTime" LIMIT 10`
+    /// reads `EventTime` and `URL` of the rows of the table, and its other
+    /// columns of 10 rows only. The result is a top-k of the rows by the keys
+    /// of the TopK, in their order: the rows that tie with the last row that
+    /// it keeps, and the order of rows with equal keys, are the engine's own,
+    /// as for any TopK.
+    ///
+    /// DataFusion pushes the sort of a TopK into the scan below it (unless a
+    /// filter is between them), which then reads its row groups in the order
+    /// of their statistics, so that the threshold of the TopK tightens early:
+    /// the sort is pushed into the scan of the positions too.
+    ///
+    /// `None` for any other sort, and if the scan of the positions of a scan
+    /// is not native (see [`ParquetRowPositions::try_new`] for the scans
+    /// whose positions are not read).
+    fn try_late_materialization(
+        &self,
+        lowered: &Arc<dyn PhysicalOperator>,
+        rows: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn PhysicalOperator>>> {
+        let Some(topk) = lowered.downcast_ref::<PhysicalTopK>() else {
+            return Ok(None);
+        };
+        let options = self
+            .options
+            .extensions
+            .get::<LateMaterializationOptions>()
+            .cloned()
+            .unwrap_or_default();
+        if topk.k() > options.max_rows
+            || topk.ordering().iter().any(|key| is_volatile(&key.expr))
+        {
+            return Ok(None);
+        }
+        let below = |mut plan: &Arc<dyn ExecutionPlan>| {
+            while let Some(input) =
+                redistributed_input(plan).or_else(|| scheduled_input(plan))
+            {
+                plan = input;
+            }
+            Arc::clone(plan)
+        };
+        let mut input = below(rows);
+        // The columns of the input of a projection of columns that the rows are.
+        let projected = match input.downcast_ref::<ProjectionExec>() {
+            Some(projection) => {
+                let columns = projection
+                    .expr()
+                    .iter()
+                    .map(|expr| expr.expr.downcast_ref::<Column>().map(Column::index))
+                    .collect::<Option<Vec<_>>>();
+                let Some(columns) = columns else {
+                    return Ok(None);
+                };
+                input = below(projection.input());
+                Some(columns)
+            }
+            None => None,
+        };
+        let (filter, scan) = match input.downcast_ref::<FilterExec>() {
+            Some(filter)
+                if filter.fetch().is_none()
+                    && PhysicalFilter::supports_filter_exec(filter) =>
+            {
+                (Some(filter), below(filter.input()))
+            }
+            Some(_) => return Ok(None),
+            None => (None, Arc::clone(&input)),
+        };
+        let Some(positions) = scan
+            .downcast_ref::<DataSourceExec>()
+            .map(ParquetRowPositions::try_new)
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        // The columns of the scan that the columns of the rows are.
+        let filtered = match filter.and_then(|filter| filter.projection().as_deref()) {
+            Some(projection) => projection.to_vec(),
+            None => (0..scan.schema().fields().len()).collect(),
+        };
+        let columns = match projected {
+            Some(projected) => {
+                let columns = projected
+                    .iter()
+                    .map(|&column| filtered.get(column).copied())
+                    .collect::<Option<Vec<_>>>();
+                let Some(columns) = columns else {
+                    return internal_err!(
+                        "A projection of columns its input does not have"
+                    );
+                };
+                columns
+            }
+            None => filtered,
+        };
+        // The columns of the rows that the keys read.
+        let keys = topk
+            .ordering()
+            .iter()
+            .flat_map(|key| collect_columns(&key.expr))
+            .map(|column| column.index())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if keys.len() >= columns.len() {
+            return Ok(None);
+        }
+        // The columns of the scan that the keys and the filter read, which the
+        // scan of the positions reads, followed by the positions.
+        let mut read = keys
+            .iter()
+            .map(|&key| columns[key])
+            .collect::<BTreeSet<_>>();
+        if let Some(filter) = filter {
+            read.extend(
+                collect_columns(filter.predicate())
+                    .iter()
+                    .map(Column::index),
+            );
+        }
+        let read = read.into_iter().collect::<Vec<_>>();
+        // The columns that only the late scan reads.
+        let late = (0..columns.len())
+            .filter(|column| keys.binary_search(column).is_err())
+            .map(|column| columns[column])
+            .filter(|column| read.binary_search(column).is_err())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let bytes = positions.bytes_of(&late);
+        if late.is_empty()
+            || (options.min_bytes > 0
+                && bytes.is_none_or(|bytes| bytes < options.min_bytes))
+        {
+            return Ok(None);
+        }
+        let position = |column: usize| match read.binary_search(&column) {
+            Ok(position) => Ok(position),
+            Err(_) => internal_err!("The column {column} of the scan is not read"),
+        };
+        // The rows of the TopK: those of the scan of the positions, or, with a
+        // filter, the columns that its keys read, followed by the positions.
+        let (key_columns, positions_column) = match filter {
+            None => (
+                keys.iter()
+                    .map(|&key| position(columns[key]))
+                    .collect::<Result<Vec<_>>>()?,
+                read.len(),
+            ),
+            Some(_) => ((0..keys.len()).collect(), keys.len()),
+        };
+        let ordering = topk
+            .ordering()
+            .iter()
+            .map(|key| {
+                let expr = with_columns(&key.expr, |column| {
+                    match keys.binary_search(&column) {
+                        Ok(key) => Ok(key_columns[key]),
+                        Err(_) => {
+                            internal_err!("The column {column} is not a key of the TopK")
+                        }
+                    }
+                })?;
+                Ok(PhysicalSortExpr::new(expr, key.options))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let Some(ordering) = LexOrdering::new(ordering) else {
+            return Ok(None);
+        };
+        let mut scan_of_positions: Arc<dyn ExecutionPlan> = positions.scan(&read)?;
+        let topk_rows: Arc<dyn ExecutionPlan> = match filter {
+            None => {
+                if self.options.optimizer.enable_sort_pushdown
+                    && let SortOrderPushdownResult::Inexact { inner } =
+                        scan_of_positions.try_pushdown_sort(&ordering)?
+                {
+                    scan_of_positions = inner;
+                }
+                scan_of_positions
+            }
+            Some(filter) => {
+                let predicate = with_columns(filter.predicate(), position)?;
+                let projection = keys
+                    .iter()
+                    .map(|&key| position(columns[key]))
+                    .chain([Ok(read.len()), Ok(read.len() + 1)])
+                    .collect::<Result<Vec<_>>>()?;
+                Arc::new(
+                    datafusion_physical_plan::filter::FilterExecBuilder::new(
+                        predicate,
+                        scan_of_positions,
+                    )
+                    .apply_projection(Some(projection))?
+                    .with_default_selectivity(filter.default_selectivity())
+                    .with_batch_size(filter.batch_size())
+                    .build()?,
+                )
+            }
+        };
+        let topk_input = self.lower_in(&topk_rows, false)?;
+        if !crate::bridge::bridged_plans(&topk_input).is_empty() {
+            return Ok(None);
+        }
+        let mut late_topk = PhysicalTopK::try_new(topk_input, ordering, topk.k())?;
+        if let Some(filter) = topk.dynamic_filter() {
+            late_topk = late_topk.with_dynamic_filter(filter.clone())?;
+        }
+        let late = PhysicalLateMaterialization::try_new(
+            Arc::new(late_topk),
+            positions,
+            &columns,
+            topk.schema(),
+            [positions_column, positions_column + 1],
+        )?;
+        let sort = PhysicalSort::try_new(Arc::new(late), topk.ordering().clone(), None)?;
+        Ok(Some(Arc::new(sort)))
     }
 
     /// Lower an aggregation with [`PhysicalHashAggregate::try_lower`], after
@@ -1767,6 +2075,23 @@ fn with_projection_below_sort(
     Ok(Some(
         Arc::clone(window).replace_children(vec![input], recompute())?,
     ))
+}
+
+/// `expr` with every column `c` replaced by the column `index(c)` (of the
+/// same name).
+fn with_columns(
+    expr: &Arc<dyn PhysicalExpr>,
+    index: impl Fn(usize) -> Result<usize>,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    Arc::clone(expr)
+        .transform(|expr| match expr.downcast_ref::<Column>() {
+            Some(column) => Ok(Transformed::yes(Arc::new(Column::new(
+                column.name(),
+                index(column.index())?,
+            )) as Arc<dyn PhysicalExpr>)),
+            None => Ok(Transformed::no(expr)),
+        })
+        .data()
 }
 
 /// The `SortExec` of `plan`, if `plan` is a `SortExec`, or a chain of
@@ -7968,6 +8293,231 @@ mod tests {
         assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}");
         let (plan, _) = pipeline_plan(sql, config, &setup).await;
         filter_of_native_topk(&plan);
+        Ok(())
+    }
+
+    /// `files` Parquet files of `rows` rows `(id BIGINT, k INT, s VARCHAR, w
+    /// VARCHAR, d DOUBLE)` in `dir/w`, with the ids `1000 * file ..`, in row
+    /// groups of 100 rows and pages of 10 rows: `id` is unique, the other
+    /// columns repeat their values, `k`, `s` and `d` have nulls, `w` is wide.
+    fn wide_parquet_files(
+        dir: &std::path::Path,
+        files: i64,
+        rows: i64,
+    ) -> Result<String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int32, true),
+            Field::new("s", DataType::Utf8View, true),
+            Field::new("w", DataType::Utf8View, false),
+            Field::new("d", DataType::Float64, true),
+        ]));
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        for file in 0..files {
+            let ids = (file * 1000..file * 1000 + rows).collect::<Vec<_>>();
+            let k = ids
+                .iter()
+                .map(|id| (id % 7 != 3).then_some(((id * 37) % 101) as i32));
+            let s = ids
+                .iter()
+                .map(|id| (id % 11 != 5).then(|| format!("s{}", id % 13)));
+            let w = ids
+                .iter()
+                .map(|id| format!("wide value {id} {}", "x".repeat((id % 50) as usize)));
+            let d = ids
+                .iter()
+                .map(|id| (id % 3 != 0).then_some((id % 89) as f64 / 4.0));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(ids.clone())),
+                    Arc::new(Int32Array::from_iter(k)),
+                    Arc::new(arrow::array::StringViewArray::from_iter(s)),
+                    Arc::new(arrow::array::StringViewArray::from_iter_values(w)),
+                    Arc::new(arrow::array::Float64Array::from_iter(d)),
+                ],
+            )?;
+            write_parquet(
+                &dir.join(format!("w/{file:02}.parquet")),
+                Arc::clone(&schema),
+                &[batch],
+                Some(properties.clone()),
+            )?;
+        }
+        Ok(dir.join("w").to_str().unwrap().to_string())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn topks_of_scans_of_many_columns_are_materialized_late() -> Result<()> {
+        // A TopK of few rows over a Parquet scan (and its filter) of columns
+        // that its keys do not read, as ClickBench's `hits23`: a TopK over the
+        // columns of its keys and the positions of the rows of a scan of these
+        // columns (and those of the filter) only, a `PhysicalLateMaterialization`
+        // that reads the rows that it keeps at their positions, and a sort of
+        // these rows. The rows are those of DataFusion, on any number of
+        // threads, also with the columns of the partitions of a table.
+        let dir = tempfile::tempdir()?;
+        let path = wide_parquet_files(dir.path(), 5, 450)?;
+        let partitioned = dir.path().join("h");
+        for (part, file) in [("a", 0), ("b", 3)] {
+            let target = partitioned.join(format!("part={part}"));
+            std::fs::create_dir_all(&target)?;
+            std::fs::copy(
+                format!("{path}/{file:02}.parquet"),
+                target.join("data.parquet"),
+            )?;
+        }
+        let partitioned = partitioned.to_str().unwrap().to_string();
+        let setup = async |ctx: &SessionContext| {
+            ctx.register_parquet("w", &path, ParquetReadOptions::default())
+                .await?;
+            ctx.register_parquet(
+                "h",
+                &partitioned,
+                ParquetReadOptions::default()
+                    .table_partition_cols(vec![("part".to_string(), DataType::Utf8)]),
+            )
+            .await
+        };
+        let late = [
+            "SELECT * FROM w WHERE s LIKE '%1%' ORDER BY k, id LIMIT 10",
+            "SELECT * FROM w ORDER BY k DESC NULLS FIRST, id LIMIT 7",
+            "SELECT w, id FROM w WHERE k > 50 ORDER BY d DESC, id LIMIT 3",
+            "SELECT * FROM w WHERE s IS NOT NULL ORDER BY k, id LIMIT 5 OFFSET 3",
+            "SELECT * FROM w ORDER BY length(w) DESC, id LIMIT 4",
+            "SELECT * FROM w ORDER BY id DESC LIMIT 50",
+            "SELECT * FROM w WHERE s = 'none' ORDER BY k, id LIMIT 10",
+            "SELECT * FROM h WHERE d > 10 ORDER BY k, id LIMIT 6",
+            "SELECT id, part FROM h ORDER BY d, id LIMIT 6",
+            // Of a projection that DataFusion pushes into the scan, which the
+            // scan evaluates of all rows for the keys, and of the rows of the
+            // TopK for the result.
+            "SELECT id, w, k * 2 AS j FROM w ORDER BY j, id LIMIT 10",
+        ];
+        let not_late = [
+            // More rows than late materialization reads.
+            "SELECT * FROM w ORDER BY k, id LIMIT 51",
+            // Keys of all columns.
+            "SELECT k, id FROM w ORDER BY k, id LIMIT 10",
+        ];
+        // Of the scans of any size (these files are small). With
+        // `pushdown_filters`, DataFusion relies on the scan to apply the filters
+        // that it pushed into it, also those of columns that the scan of the
+        // positions does not produce.
+        let any_size = LateMaterializationOptions {
+            min_bytes: 0,
+            ..Default::default()
+        };
+        for (target_partitions, pushdown_filters) in [(1, false), (4, false), (4, true)] {
+            let mut config = test_session_config()
+                .with_target_partitions(target_partitions)
+                .with_option_extension(any_size.clone());
+            config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
+            for sql in late {
+                let root = assert_same_results_with(sql, config.clone(), &setup).await;
+                assert_native(sql, &root);
+                let tree = format_operator_tree(&root);
+                assert_eq!(
+                    count::<PhysicalLateMaterialization>(&root),
+                    1,
+                    "{sql}\n{tree}"
+                );
+                assert_eq!(count::<PhysicalTopK>(&root), 1, "{sql}\n{tree}");
+            }
+            for sql in not_late {
+                let root = assert_same_results_with(sql, config.clone(), &setup).await;
+                assert_native(sql, &root);
+                let tree = format_operator_tree(&root);
+                assert_eq!(
+                    count::<PhysicalLateMaterialization>(&root),
+                    0,
+                    "{sql}\n{tree}"
+                );
+            }
+        }
+        // Nor by volatile keys, whose values the sort, and the scan of the rows
+        // of the TopK, would evaluate again; nor of the columns of fewer bytes
+        // than `min_bytes` (of 2,250 rows here, 18,000 bytes of `id`, more of
+        // `w`), also with the default options; nor with a `max_rows` of 0.
+        let late_of = async |sql: &str, config: SessionConfig| {
+            let (plan, _) = pipeline_plan(sql, config, &setup).await;
+            let root = plan.downcast_ref::<PipelineRootExec>().unwrap().operator();
+            count::<PhysicalLateMaterialization>(root)
+        };
+        let config = test_session_config().with_option_extension(any_size.clone());
+        for sql in [
+            "SELECT * FROM w ORDER BY random() LIMIT 3",
+            "SELECT *, random() AS r FROM w ORDER BY r LIMIT 3",
+        ] {
+            assert_eq!(late_of(sql, config.clone()).await, 0, "{sql}");
+        }
+        let sql = "SELECT * FROM w WHERE s LIKE '%1%' ORDER BY k, id LIMIT 10";
+        assert_eq!(late_of(sql, test_session_config()).await, 0);
+        let few_bytes = LateMaterializationOptions {
+            min_bytes: 20_000,
+            ..Default::default()
+        };
+        let few_bytes = test_session_config().with_option_extension(few_bytes);
+        assert_eq!(late_of(sql, few_bytes.clone()).await, 1);
+        let narrow = "SELECT id, k, d FROM w ORDER BY k, d LIMIT 10";
+        assert_eq!(late_of(narrow, few_bytes).await, 0, "{narrow}");
+        let no_rows = LateMaterializationOptions {
+            max_rows: 0,
+            ..any_size.clone()
+        };
+        let sql = "SELECT * FROM w ORDER BY k, id LIMIT 1";
+        let config = test_session_config().with_option_extension(no_rows);
+        assert_eq!(late_of(sql, config).await, 0);
+
+        // `hits23`: the TopK reads the columns of its keys and of its filter,
+        // and updates the dynamic filter of the TopK of the plan, which the
+        // scan reads; the late materialization reads the rows of the TopK.
+        let sql = "SELECT * FROM w WHERE s LIKE '%1%' ORDER BY k, id LIMIT 10";
+        let config = test_session_config().with_option_extension(any_size);
+        let (plan, ctx) = pipeline_plan(sql, config, &setup).await;
+        let filter = filter_of_native_topk(&plan);
+        let exec = plan.downcast_ref::<PipelineRootExec>().unwrap();
+        let root = exec.operator();
+        let tree = format_operator_tree(root);
+        let sort = root
+            .downcast_ref::<PhysicalSort>()
+            .expect("a sort of the rows");
+        let late = sort
+            .input()
+            .downcast_ref::<PhysicalLateMaterialization>()
+            .expect("a late materialization");
+        assert_eq!(late.schema(), plan.schema());
+        let topk = late.input().downcast_ref::<PhysicalTopK>().expect("a TopK");
+        assert_eq!(topk.k(), 10);
+        let scan = std::iter::successors(Some(Arc::clone(topk.input())), |operator| {
+            operator.children().first().map(Arc::clone)
+        })
+        .find_map(|operator| {
+            let scan = operator.downcast_ref::<ParquetScanSource>()?;
+            Some(scan.config().projected_schema().unwrap())
+        })
+        .expect("the scan of the TopK");
+        let read = scan
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(read.len(), 5, "{tree}");
+        assert_eq!(&read[..3], ["id", "k", "s"], "{tree}");
+        let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        assert!(filter.is_complete());
+        assert_ne!(filter.current()?.to_string(), "true");
+        let metrics = exec.execution_metrics().expect("metrics");
+        let (_, late) = metrics
+            .iter()
+            .find(|(operator, _)| operator.is::<PhysicalLateMaterialization>())
+            .expect("the late materialization");
+        assert_eq!(late.output_rows(), 10, "{tree}");
         Ok(())
     }
 
