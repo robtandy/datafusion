@@ -216,13 +216,13 @@ use arrow::compute::{and, prep_null_mask_filter};
 use arrow::datatypes::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::cast::as_boolean_array;
-use datafusion_common::config::ConfigOptions;
+use datafusion_common::config::{ConfigExtension, ConfigOptions};
 use datafusion_common::format::ExplainFormat;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
 use datafusion_common::{
-    JoinSide, JoinType, Result, ScalarValue, exec_err, internal_err,
+    JoinSide, JoinType, Result, ScalarValue, exec_err, extensions_options, internal_err,
 };
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::memory::MemorySourceConfig;
@@ -579,12 +579,42 @@ fn any_session_options() -> ConfigOptions {
     options
 }
 
-/// The most rows of a TopK whose rows are materialized late (see
-/// `Lowering::try_late_materialization`): DuckDB's default
-/// `late_materialization_max_rows`. The scan of the rows that a TopK keeps
-/// decodes, of every column, the pages of these rows, which many rows spread
-/// over all pages of a column.
-const LATE_MATERIALIZATION_MAX_ROWS: usize = 50;
+extensions_options! {
+    /// The session options of the late materialization of the TopKs over
+    /// Parquet scans of many columns (see the
+    /// [module documentation](self#lowering)), whose defaults the sessions
+    /// without them have.
+    ///
+    /// ```
+    /// use datafusion::prelude::SessionConfig;
+    /// use datafusion_physical_pipeline::planner::LateMaterializationOptions;
+    ///
+    /// // Never reads the rows of a TopK late.
+    /// let mut options = LateMaterializationOptions::default();
+    /// options.max_rows = 0;
+    /// let config = SessionConfig::new().with_option_extension(options);
+    /// ```
+    pub struct LateMaterializationOptions {
+        /// The most rows of a TopK whose rows are read late, DuckDB's default
+        /// `late_materialization_max_rows`: the scan of the rows that a TopK
+        /// keeps reads, of every column, the pages of these rows and the
+        /// dictionaries of their files, which many rows spread over all pages
+        /// and files. 0 disables late materialization.
+        pub max_rows: usize, default = 50
+        /// The least size, in bytes, of the columns that only the late scan
+        /// of the rows of a TopK reads (the columns that neither its keys nor
+        /// the filter of its scan read), in all files of its scan, as their
+        /// statistics estimate it: a TopK reads its rows late if not
+        /// decoding these columns for all rows of its scan saves more than
+        /// the scan of its rows costs. 0 reads the rows of every TopK late,
+        /// also of scans without statistics.
+        pub min_bytes: usize, default = 16 * 1024 * 1024
+    }
+}
+
+impl ConfigExtension for LateMaterializationOptions {
+    const PREFIX: &'static str = "pipeline_late_materialization";
+}
 
 /// Lowers the nodes of a plan, see [`lower_execution_plan_with_options`] and
 /// [`lower_execution_plan_with_runtime`].
@@ -973,12 +1003,14 @@ impl Lowering<'_> {
     /// Lower `lowered`, the native sort of `rows` (see
     /// [`Self::try_lower_sort`]), with the late materialization of its rows,
     /// as DuckDB's `LateMaterialization` plans a top-N over a scan of many
-    /// columns, if it is a [`PhysicalTopK`] of at most
-    /// [`LATE_MATERIALIZATION_MAX_ROWS`] rows, by keys that are not volatile,
-    /// of the rows of a Parquet scan without a limit, of a filter directly
-    /// above it, or of a projection of columns of either (through nodes that
-    /// only distribute or schedule their rows), of which its keys do not read
-    /// all columns:
+    /// columns, if it is a [`PhysicalTopK`] by keys that are not volatile of
+    /// the rows of a Parquet scan without a limit, of a filter directly above
+    /// it, or of a projection of columns of either (through nodes that only
+    /// distribute or schedule their rows), of at most
+    /// [`LateMaterializationOptions::max_rows`] rows, and if the columns of
+    /// the rows that neither its keys nor the filter read have at least
+    /// [`LateMaterializationOptions::min_bytes`] (in all files of the scan, as
+    /// their statistics estimate it, see [`ParquetRowPositions::bytes_of`]):
     ///
     /// * a TopK by the same keys of the rows of a scan of the columns that the
     ///   keys and the filter read, followed by the positions of the rows (see
@@ -992,7 +1024,11 @@ impl Lowering<'_> {
     ///
     /// So the columns that the keys and the filter do not read are read of
     /// the rows of the result only, instead of all rows that pass the filter
-    /// (but those that the dynamic filter skips). E.g. ClickBench's `SELECT *
+    /// (but those that the dynamic filter skips), which pays off unless they
+    /// are few bytes: the scan of the rows of the TopK reads, in every file
+    /// of these rows, the pages of the rows and the dictionaries of all
+    /// columns, and the TopK keeps the positions of the rows of its scan
+    /// too. E.g. ClickBench's `SELECT *
     /// FROM hits WHERE "URL" LIKE '%google%' ORDER BY "EventTime" LIMIT 10`
     /// reads `EventTime` and `URL` of the rows of the table, and its other
     /// columns of 10 rows only. The result is a top-k of the rows by the keys
@@ -1016,7 +1052,13 @@ impl Lowering<'_> {
         let Some(topk) = lowered.downcast_ref::<PhysicalTopK>() else {
             return Ok(None);
         };
-        if topk.k() > LATE_MATERIALIZATION_MAX_ROWS
+        let options = self
+            .options
+            .extensions
+            .get::<LateMaterializationOptions>()
+            .cloned()
+            .unwrap_or_default();
+        if topk.k() > options.max_rows
             || topk.ordering().iter().any(|key| is_volatile(&key.expr))
         {
             return Ok(None);
@@ -1110,6 +1152,21 @@ impl Lowering<'_> {
             );
         }
         let read = read.into_iter().collect::<Vec<_>>();
+        // The columns that only the late scan reads.
+        let late = (0..columns.len())
+            .filter(|column| keys.binary_search(column).is_err())
+            .map(|column| columns[column])
+            .filter(|column| read.binary_search(column).is_err())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let bytes = positions.bytes_of(&late);
+        if late.is_empty()
+            || (options.min_bytes > 0
+                && bytes.is_none_or(|bytes| bytes < options.min_bytes))
+        {
+            return Ok(None);
+        }
         let position = |column: usize| match read.binary_search(&column) {
             Ok(position) => Ok(position),
             Err(_) => internal_err!("The column {column} of the scan is not read"),
@@ -8347,8 +8404,19 @@ mod tests {
             // Keys of all columns.
             "SELECT k, id FROM w ORDER BY k, id LIMIT 10",
         ];
-        for target_partitions in [1, 4] {
-            let config = test_session_config().with_target_partitions(target_partitions);
+        // Of the scans of any size (these files are small). With
+        // `pushdown_filters`, DataFusion relies on the scan to apply the filters
+        // that it pushed into it, also those of columns that the scan of the
+        // positions does not produce.
+        let any_size = LateMaterializationOptions {
+            min_bytes: 0,
+            ..Default::default()
+        };
+        for (target_partitions, pushdown_filters) in [(1, false), (4, false), (4, true)] {
+            let mut config = test_session_config()
+                .with_target_partitions(target_partitions)
+                .with_option_extension(any_size.clone());
+            config.options_mut().execution.parquet.pushdown_filters = pushdown_filters;
             for sql in late {
                 let root = assert_same_results_with(sql, config.clone(), &setup).await;
                 assert_native(sql, &root);
@@ -8372,21 +8440,44 @@ mod tests {
             }
         }
         // Nor by volatile keys, whose values the sort, and the scan of the rows
-        // of the TopK, would evaluate again.
-        let config = test_session_config();
+        // of the TopK, would evaluate again; nor of the columns of fewer bytes
+        // than `min_bytes` (of 2,250 rows here, 18,000 bytes of `id`, more of
+        // `w`), also with the default options; nor with a `max_rows` of 0.
+        let late_of = async |sql: &str, config: SessionConfig| {
+            let (plan, _) = pipeline_plan(sql, config, &setup).await;
+            let root = plan.downcast_ref::<PipelineRootExec>().unwrap().operator();
+            count::<PhysicalLateMaterialization>(root)
+        };
+        let config = test_session_config().with_option_extension(any_size.clone());
         for sql in [
             "SELECT * FROM w ORDER BY random() LIMIT 3",
             "SELECT *, random() AS r FROM w ORDER BY r LIMIT 3",
         ] {
-            let (plan, _) = pipeline_plan(sql, config.clone(), &setup).await;
-            let root = plan.downcast_ref::<PipelineRootExec>().unwrap().operator();
-            assert_eq!(count::<PhysicalLateMaterialization>(root), 0, "{sql}");
+            assert_eq!(late_of(sql, config.clone()).await, 0, "{sql}");
         }
+        let sql = "SELECT * FROM w WHERE s LIKE '%1%' ORDER BY k, id LIMIT 10";
+        assert_eq!(late_of(sql, test_session_config()).await, 0);
+        let few_bytes = LateMaterializationOptions {
+            min_bytes: 20_000,
+            ..Default::default()
+        };
+        let few_bytes = test_session_config().with_option_extension(few_bytes);
+        assert_eq!(late_of(sql, few_bytes.clone()).await, 1);
+        let narrow = "SELECT id, k, d FROM w ORDER BY k, d LIMIT 10";
+        assert_eq!(late_of(narrow, few_bytes).await, 0, "{narrow}");
+        let no_rows = LateMaterializationOptions {
+            max_rows: 0,
+            ..any_size.clone()
+        };
+        let sql = "SELECT * FROM w ORDER BY k, id LIMIT 1";
+        let config = test_session_config().with_option_extension(no_rows);
+        assert_eq!(late_of(sql, config).await, 0);
 
         // `hits23`: the TopK reads the columns of its keys and of its filter,
         // and updates the dynamic filter of the TopK of the plan, which the
         // scan reads; the late materialization reads the rows of the TopK.
         let sql = "SELECT * FROM w WHERE s LIKE '%1%' ORDER BY k, id LIMIT 10";
+        let config = test_session_config().with_option_extension(any_size);
         let (plan, ctx) = pipeline_plan(sql, config, &setup).await;
         let filter = filter_of_native_topk(&plan);
         let exec = plan.downcast_ref::<PipelineRootExec>().unwrap();

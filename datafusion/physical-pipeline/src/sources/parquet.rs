@@ -5,6 +5,13 @@
 //! [`ParquetScanSource`]: a parallel, morsel-driven scan of Parquet files,
 //! which filters its rows with adaptive row filters and late
 //! materialization.
+//!
+//! The late materialization of a TopK over a Parquet scan reads the columns
+//! that the TopK does not need of the rows that it keeps only:
+//! [`ParquetRowPositions`] is the scan with the positions of its rows (the
+//! index of their file and their row number in it), and
+//! [`PhysicalLateMaterialization`] reads the rows at given positions of the
+//! files of a scan.
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2617,6 +2624,39 @@ impl ParquetRowPositions {
             .with_statistics(statistics)
             .build();
         Ok(DataSourceExec::from_data_source(config))
+    }
+
+    /// The estimated size, in bytes, of the columns `columns` of the scan
+    /// (indices of its output columns) in all of its files: the sizes of the
+    /// columns of its files that their expressions read, from the statistics
+    /// of the scan (the Arrow sizes of fixed-width values, and the
+    /// uncompressed Parquet sizes of the others). Partition columns, which a
+    /// scan does not decode, have no size. `None` if the statistics do not
+    /// have the size of a column.
+    pub fn bytes_of(&self, columns: &[usize]) -> Option<usize> {
+        let projection = self.config.file_source().projection()?;
+        let exprs = projection.iter().collect::<Vec<_>>();
+        let file_columns = self.config.file_schema().fields().len();
+        let mut read = HashSet::new();
+        for &column in columns {
+            read.extend(
+                collect_columns(&exprs.get(column)?.expr)
+                    .iter()
+                    .map(Column::index)
+                    .filter(|&column| column < file_columns),
+            );
+        }
+        let statistics = self.config.statistics();
+        read.into_iter()
+            .map(|column| {
+                statistics
+                    .column_statistics
+                    .get(column)?
+                    .byte_size
+                    .get_value()
+                    .copied()
+            })
+            .sum()
     }
 
     /// The columns of the positions in the table schema of the scans of the
@@ -5631,6 +5671,32 @@ mod tests {
         )?;
         let output = Executor::collect(Arc::new(empty), ctx.task_ctx(), 4).await?;
         assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sizes_of_columns_are_those_of_the_statistics() -> Result<()> {
+        // Of the 5107 rows of the table: 8 bytes of every `id` (`BIGINT`), the
+        // uncompressed size of `s` (`VARCHAR`) in the files, and nothing of
+        // the partition column `year`, which the scan does not decode.
+        let dir = table();
+        let ctx = SessionContext::new_with_config(test_session_config());
+        register_table(&ctx, dir.path()).await?;
+        let (positions, scan) = row_positions(&ctx, "SELECT * FROM p").await?;
+        let schema = scan.schema();
+        let [id, s, year] =
+            ["id", "s", "year"].map(|name| schema.index_of(name).unwrap());
+        assert_eq!(positions.bytes_of(&[id]), Some(8 * 5107));
+        assert_eq!(positions.bytes_of(&[year]), Some(0));
+        let strings = positions.bytes_of(&[s]).expect("the size of `s`");
+        assert!(strings > 0);
+        assert_eq!(positions.bytes_of(&[id, s, year]), Some(8 * 5107 + strings));
+        // Without statistics, the sizes are unknown.
+        let config = SessionConfig::new().with_collect_statistics(false);
+        let ctx = SessionContext::new_with_config(config);
+        register_table(&ctx, dir.path()).await?;
+        let (positions, _) = row_positions(&ctx, "SELECT * FROM p").await?;
+        assert_eq!(positions.bytes_of(&[id]), None);
         Ok(())
     }
 
