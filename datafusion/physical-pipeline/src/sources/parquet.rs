@@ -2428,8 +2428,8 @@ mod tests {
     };
     use crate::sources::try_create_scan_source;
     use crate::test_utils::{
-        compare_outputs, pipeline_context, register_test_tables, run_engines, run_sql,
-        test_session_config,
+        ComparisonOptions, pipeline_context, register_test_tables, run_both_engines,
+        run_sql, test_session_config,
     };
 
     /// Write the Hive-partitioned table of [`register_table`] to `dir`:
@@ -3459,9 +3459,10 @@ mod tests {
     ];
 
     /// Assert that `sql` has the same results on the pipeline engine as on
-    /// DataFusion (in their canonical forms, see `compare_outputs`), in
-    /// sessions configured with `config` and set up with `setup`. Returns the
-    /// operator tree of the pipeline engine.
+    /// DataFusion, compared by meaning (as
+    /// `test_utils::assert_same_results_as_datafusion_with_config`), in
+    /// sessions configured with `config` and set up with `setup`, and that
+    /// both engines run it. Returns the operator tree of the pipeline engine.
     async fn assert_same_results<F>(
         sql: &str,
         config: SessionConfig,
@@ -3470,10 +3471,29 @@ mod tests {
     where
         F: AsyncFn(&SessionContext) -> Result<()>,
     {
-        let (expected, actual) =
-            run_engines(sql, config, setup).await.unwrap_or_else(|e| {
+        assert_same_results_with_plan(sql, config, setup).await.0
+    }
+
+    /// [`assert_same_results`], which also returns the physical plan of
+    /// DataFusion.
+    async fn assert_same_results_with_plan<F>(
+        sql: &str,
+        config: SessionConfig,
+        setup: F,
+    ) -> (Arc<dyn PhysicalOperator>, Arc<dyn ExecutionPlan>)
+    where
+        F: AsyncFn(&SessionContext) -> Result<()>,
+    {
+        let options = ComparisonOptions::default();
+        let outcomes = run_both_engines(sql, config, setup, &options)
+            .await
+            .unwrap_or_else(|e| {
                 panic!("Failed to run query on both engines: {e}\n{sql}")
             });
+        let (Ok(expected), Ok(actual)) = (&outcomes.datafusion, &outcomes.pipeline)
+        else {
+            panic!("An engine failed: {outcomes:?}\n{sql}");
+        };
         let root = Arc::clone(
             actual
                 .plan
@@ -3481,13 +3501,13 @@ mod tests {
                 .expect("a pipeline plan")
                 .operator(),
         );
-        if let Err(message) = compare_outputs(&expected, &actual) {
+        if let Err(message) = outcomes.compare(&options) {
             panic!(
                 "Results differ: {message}\nquery: {sql}\nlowered:\n{}",
                 format_operator_tree(&root)
             );
         }
-        root
+        (root, Arc::clone(&expected.plan))
     }
 
     /// The operators of the tree `root`.
@@ -3649,15 +3669,10 @@ mod tests {
         // `pushdown_filters`) decodes every column of every row, and filters
         // the rows above its scan.
         let sql = "SELECT id, s FROM t WHERE k % 8192 < 256";
-        let (expected, actual) = run_engines(sql, test_session_config(), &setup).await?;
-        compare_outputs(&expected, &actual).unwrap();
-        let root = actual
-            .plan
-            .downcast_ref::<PipelineRootExec>()
-            .unwrap()
-            .operator();
-        let [scan] = parquet_scans(root)[..] else {
-            panic!("one scan\n{}", format_operator_tree(root));
+        let (root, datafusion_plan) =
+            assert_same_results_with_plan(sql, test_session_config(), &setup).await;
+        let [scan] = parquet_scans(&root)[..] else {
+            panic!("one scan\n{}", format_operator_tree(&root));
         };
         assert!(scan.filter().is_some());
         let selected = (rows / 32) as usize;
@@ -3675,7 +3690,7 @@ mod tests {
         // No more bytes than DataFusion (which reads every row of every
         // column).
         let bytes = metric(scan, "bytes_scanned");
-        let datafusion_bytes = plan_metric(&expected.plan, "bytes_scanned");
+        let datafusion_bytes = plan_metric(&datafusion_plan, "bytes_scanned");
         assert!(
             bytes <= datafusion_bytes,
             "{bytes} vs {datafusion_bytes} bytes scanned"
@@ -3694,15 +3709,9 @@ mod tests {
         };
         let sql = "SELECT id, s FROM big WHERE a % 8 <> 0";
         let config = test_session_config().with_target_partitions(1);
-        let (expected, actual) = run_engines(sql, config, &setup).await?;
-        compare_outputs(&expected, &actual).unwrap();
-        let root = actual
-            .plan
-            .downcast_ref::<PipelineRootExec>()
-            .unwrap()
-            .operator();
-        let [scan] = parquet_scans(root)[..] else {
-            panic!("one scan\n{}", format_operator_tree(root));
+        let root = assert_same_results(sql, config, &setup).await;
+        let [scan] = parquet_scans(&root)[..] else {
+            panic!("one scan\n{}", format_operator_tree(&root));
         };
         assert_eq!(
             metric(scan, "row_filter_evaluated_rows"),
@@ -3737,15 +3746,9 @@ mod tests {
             test_session_config().with_target_partitions(1),
         ] {
             let partitions = config.target_partitions();
-            let (expected, actual) = run_engines(sql, config, &setup).await?;
-            compare_outputs(&expected, &actual).unwrap();
-            let root = actual
-                .plan
-                .downcast_ref::<PipelineRootExec>()
-                .unwrap()
-                .operator();
-            let [scan] = parquet_scans(root)[..] else {
-                panic!("one scan\n{}", format_operator_tree(root));
+            let root = assert_same_results(sql, config, &setup).await;
+            let [scan] = parquet_scans(&root)[..] else {
+                panic!("one scan\n{}", format_operator_tree(&root));
             };
             let [candidate] = &scan.predicate.candidates[..] else {
                 panic!("one candidate: {:?}", scan.predicate.candidates);
