@@ -1185,7 +1185,7 @@ mod tests {
         // threads, as DataFusion does, so the scans prune the files whose
         // values are within the bounds: every file but the first one of every
         // thread (of 4), whichever thread publishes its bounds first (see
-        // `write_table_m`).
+        // `the_bounds_of_the_first_file_of_any_thread_prune_the_later_files`).
         let dir = write_tables()?;
         let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
         for pushdown_filters in [false, true] {
@@ -1260,6 +1260,36 @@ mod tests {
                     execution.scanned_rows
                 );
                 assert_aggregate_parity_with_setup(sql, config.clone(), &setup).await;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_bounds_of_the_first_file_of_any_thread_prune_the_later_files()
+    -> Result<()> {
+        // The threads of the scans of
+        // `aggregations_update_the_dynamic_filters_of_datafusion` (4) read
+        // the first files of `m` first. Whichever of them a thread aggregates,
+        // the filter of the bounds of its first chunk prunes all files after
+        // it, for every query of `BOUNDED_QUERIES` (see `write_table_m`): a
+        // scan on a single thread that starts at the file `first` (the files
+        // before it are pruned by their `id`s) reads that file only. So those
+        // threads read their first files only, whichever of them publishes its
+        // bounds first.
+        let dir = write_tables()?;
+        let config = test_session_config().with_target_partitions(1);
+        for (sql, _) in BOUNDED_QUERIES {
+            for first in 0..4 {
+                let sql = format!("{sql} AND id >= {}", first * M_ROWS);
+                let execution = execute(&sql, config.clone(), dir.path()).await?;
+                let pruned = pruned_by_statistics(&execution.scan);
+                assert!(pruned >= (M_FILES - 1) as usize, "{sql}: {pruned} pruned");
+                assert!(
+                    execution.scanned_rows <= M_ROWS as usize,
+                    "{sql}: {} rows scanned",
+                    execution.scanned_rows
+                );
             }
         }
         Ok(())
