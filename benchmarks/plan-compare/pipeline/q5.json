@@ -338,7 +338,7 @@
       "metrics": {
         "rows_in": {
           "unit": "rows",
-          "value": 16483
+          "value": 16549
         },
         "rows_out": {
           "unit": "rows",
@@ -393,11 +393,11 @@
       "metrics": {
         "rows_in": {
           "unit": "rows",
-          "value": 20362
+          "value": 20428
         },
         "rows_out": {
           "unit": "rows",
-          "value": 16281
+          "value": 16347
         }
       },
       "name": "PhysicalHashJoin: join_type=Inner, on=[(o_orderkey@1, l_orderkey@0)], projection=[c_nationkey@0, l_suppkey@3, l_extendedprice@4, l_discount@5]",
@@ -528,7 +528,7 @@
         },
         "rows_out": {
           "unit": "rows",
-          "value": 16281
+          "value": 16347
         }
       },
       "name": "ParquetScanSource: file_groups={16 groups: [[lineitem/part-0.parquet:0..2998168, lineitem/part-1.parquet:0..3502], [lineitem/part-1.parquet:3502..3005172], [lineitem/part-1.parquet:3005172..3006854, lineitem/part-10.parquet:0..2993390, lineitem/part-11.parquet:0..6598], [lineitem/part-11.parquet:6598..3001009, lineitem/part-12.parquet:0..7259], [lineitem/part-12.parquet:7259..3001903, lineitem/part-13.parquet:0..7026], ...]}, projection=[l_orderkey, l_suppkey, l_extendedprice, l_discount], file_type=parquet, predicate=DynamicFilter [ l_orderkey@0 >= 66 AND l_orderkey@0 <= 599976 AND hash_lookup(l_orderkey@0) ] AND DynamicFilter [ l_suppkey@2 >= 9 AND l_suppkey@2 <= 995 ], dynamic_rg_pruning=eligible, pruning_predicate=l_orderkey_null_count@1 != row_count@2 AND l_orderkey_max@0 >= 66 AND l_orderkey_null_count@1 != row_count@2 AND l_orderkey_min@3 <= 599976 AND l_suppkey_null_count@5 != row_count@2 AND l_suppkey_max@4 >= 9 AND l_suppkey_null_count@5 != row_count@2 AND l_suppkey_min@6 <= 995, required_guarantees=[]",

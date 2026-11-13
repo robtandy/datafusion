@@ -227,7 +227,7 @@
       "metrics": {
         "rows_in": {
           "unit": "rows",
-          "value": 160033
+          "value": 159865
         },
         "rows_out": {
           "unit": "rows",
@@ -285,11 +285,11 @@
       "metrics": {
         "rows_in": {
           "unit": "rows",
-          "value": 145033
+          "value": 144865
         },
         "rows_out": {
           "unit": "rows",
-          "value": 145033
+          "value": 144865
         }
       },
       "name": "CachingOperator: threshold=256",
@@ -311,7 +311,7 @@
         },
         "rows_out": {
           "unit": "rows",
-          "value": 145033
+          "value": 144865
         }
       },
       "name": "ParquetScanSource: file_groups={16 groups: [[orders/part-0.parquet:0..787425, orders/part-1.parquet:0..1907], [orders/part-1.parquet:1907..787499, orders/part-10.parquet:0..3740], [orders/part-10.parquet:3740..789414, orders/part-11.parquet:0..3658], [orders/part-11.parquet:3658..791310, orders/part-12.parquet:0..1680], [orders/part-12.parquet:1680..791012], ...]}, projection=[o_orderkey, o_custkey, o_comment], file_type=parquet, predicate=o_comment@8 NOT LIKE %special%requests% AND DynamicFilter [ o_custkey@1 >= 1 AND o_custkey@1 <= 15000 ], dynamic_rg_pruning=eligible, pruning_predicate=o_custkey_null_count@3 != row_count@4 AND o_custkey_max@2 >= 1 AND o_custkey_null_count@3 != row_count@4 AND o_custkey_min@5 <= 15000, required_guarantees=[], filter=o_comment@2 NOT LIKE %special%requests%, projection=[o_orderkey@0, o_custkey@1]",
