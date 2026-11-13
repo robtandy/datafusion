@@ -12,17 +12,25 @@ with DuckDB's. This directory holds DuckDB's plans (`EXPLAIN`) of the 47
 queries of the engine's benchmark,
 `datafusion/physical-pipeline/benches/pipeline_vs_default.rs` (the 22 TPC-H
 queries and the 25 ClickBench queries), over the Parquet files that the
-benchmark reads, and the scripts that reproduce them. These are fixtures only:
-plan shapes, no timings and no comparison.
+benchmark reads, our plans of the same queries, the differ that compares them
+(see [The comparison](#the-comparison) and `docs/planner-comparison.md`), and
+the scripts that reproduce all of it. Plan shapes only: no timings of DuckDB.
 
-| Path                 | Content                                                                                      |
-| -------------------- | -------------------------------------------------------------------------------------------- |
-| `duckdb/<query>.txt` | the output of DuckDB's `EXPLAIN` of the query `<query>` (`q1` … `q22`, `hits0` … `hits42`)   |
-| `queries.sql`        | the 47 queries, as the benchmark prints them (`PIPELINE_BENCH_MODE=queries`)                 |
-| `build_duckdb.sh`    | builds the DuckDB CLI at the commit of the plans                                             |
-| `materialize.sh`     | writes the data (`PIPELINE_BENCH_MODE=data`) and `queries.sql` with the benchmark            |
-| `capture.py`         | runs `EXPLAIN` for every query in DuckDB and writes `duckdb/`                                |
-| `data/`              | the Parquet files that `materialize.sh` writes (ignored by git, see `benchmarks/.gitignore`) |
+| Path                    | Content                                                                                        |
+| ----------------------- | ---------------------------------------------------------------------------------------------- |
+| `duckdb/<query>.txt`    | the output of DuckDB's `EXPLAIN` of the query `<query>` (`q1` … `q22`, `hits0` … `hits42`)     |
+| `duckdb/<query>.json`   | the same plan in JSON (`EXPLAIN (FORMAT JSON)`), which the differ reads                        |
+| `pipeline/<query>.json` | our plan of the query: the plan-shape part of the JSON dump of the profile of its execution    |
+| `queries.sql`           | the 47 queries, as the benchmark prints them (`PIPELINE_BENCH_MODE=queries`)                   |
+| `build_duckdb.sh`       | builds the DuckDB CLI at the commit of the plans                                               |
+| `materialize.sh`        | writes the data (`PIPELINE_BENCH_MODE=data`) and `queries.sql` with the benchmark              |
+| `capture.py`            | runs `EXPLAIN` for every query in DuckDB and writes `duckdb/`                                  |
+| `dump_plans/`           | a Rust program that plans and runs every query with the pipeline engine and writes `pipeline/` |
+| `differ.py`             | compares the plans and writes `docs/planner-comparison.md`                                     |
+| `test_differ.py`        | the tests of the differ                                                                        |
+| `experiments.sql`       | variants of queries with the shape of DuckDB's plans, for the likely costs of the divergences  |
+| `measure.py`            | measures the queries of `experiments.sql` on our engine                                        |
+| `data/`                 | the Parquet files that `materialize.sh` writes (ignored by git, see `benchmarks/.gitignore`)   |
 
 ## DuckDB
 
@@ -159,8 +167,9 @@ CREATE VIEW region AS SELECT * FROM read_parquet('region/*.parquet');
 EXPLAIN <query>;
 ```
 
-and writes its output to `duckdb/<query>.txt` (and removes the plans of
-queries that are no longer in `queries.sql`). It takes 5 seconds.
+and writes its output to `duckdb/<query>.txt`, and that of the same script
+with `EXPLAIN (FORMAT JSON) <query>;` to `duckdb/<query>.json` (and removes the
+plans of queries that are no longer in `queries.sql`). It takes 10 seconds.
 
 - The output is DuckDB's physical plan (`explain_output` is `physical_only` by
   default), as the CLI prints it when its output is not a terminal: every
@@ -175,6 +184,85 @@ queries that are no longer in `queries.sql`). It takes 5 seconds.
 - Running the capture again reproduces the plans byte for byte (with the same
   build and data, DuckDB's estimates do not change either), and DuckDB plans
   these queries the same on 1 thread as on 16.
+- The JSON plan is the same tree as the text plan, rendered by DuckDB's JSON
+  tree renderer: every operator is an object with its `name` (`READ_PARQUET`,
+  `HASH_JOIN`, ...), its `children` (the right child of a join is its build
+  side) and its `extra_info`, the details of the text plan by name, a list for
+  the details of several lines (e.g. one item per projection, filter or join
+  condition), with `Estimated Cardinality`.
+
+## Our plans
+
+`dump_plans/` is a Rust program (a package of its own, outside of the
+workspace of the repository, with the versions of its `Cargo.lock`) that
+plans and runs every query of `queries.sql` with the pipeline engine over the
+same Parquet files, as the benchmark's `parquet` source does (the session
+configuration of the benchmark: 16 target partitions, `PipelineQueryPlanner`,
+trusting DataFusion's built-in scalar and aggregate functions), with profiling
+on, and writes the JSON dump of the profile of the execution (the schema of
+`datafusion/physical-pipeline/docs/profiling.md`) to `pipeline/<query>.json`:
+
+```bash
+cargo run --locked --manifest-path benchmarks/plan-compare/dump_plans/Cargo.toml
+```
+
+(`--data-dir`, `--queries` and `--out` default to `data/`, `queries.sql` and
+`pipeline/`, `--threads` to 16.) It writes the plan-shape part of the dump: its
+`schema`, `version` and `root`, the `id`, `kind`, `name`, `inputs` and
+`pipelines` of every operator and its metrics `rows_in` and `rows_out` (the
+rows it consumed and produced), and the `id`, `meta_pipeline`, `source`,
+`operators`, `sink`, `dependencies` and `meta_dependencies` of every pipeline,
+and of the meta pipelines; `--full` writes the whole dump, with all the
+timings. The paths of the files in the descriptions of the scans are relative
+to the data directory, as in DuckDB's plans. Running it again reproduces the
+plans, but for the rows of the operators below dynamic filters and the
+thresholds of the dynamic filters of TopKs in the descriptions of the scans,
+which depend on the order in which the threads read their morsels. A build in
+the `dev` profile writes the plans of the 47 queries in 10 seconds.
+
+## The comparison
+
+`differ.py` reads both plans of every query from their machine-readable form
+(DuckDB's `duckdb/<query>.json` and our `pipeline/<query>.json`), normalizes
+them into one fingerprint (for every scan the columns it reads and the filters
+pushed into it; the join order, the join operators and their build sides; the
+aggregations and the tables below them; top-N and limits; and the pipeline
+breaks), compares the fingerprints, groups the differences of every query by
+their cause into its divergences, and classifies every divergence as a rule
+gap (our optimizer lacks a rule that DuckDB has) or as cost/statistics-driven
+(the rules agree, the choice differs). It prints the verdict of every query
+(matches, rule gap or cost/statistics-driven) and the summary of
+`docs/planner-comparison.md`, which it writes with `--report`:
+
+```bash
+benchmarks/plan-compare/differ.py            # verdicts and summary
+benchmarks/plan-compare/differ.py --verbose  # and the findings of every query
+benchmarks/plan-compare/differ.py --report   # and write docs/planner-comparison.md
+benchmarks/plan-compare/differ.py --check    # fail if it is not up to date
+python3 -m unittest discover -s benchmarks/plan-compare -p 'test_*.py'
+```
+
+It needs Python 3.9 or later and nothing else, and fails if a divergence has
+no cause (a new kind of divergence, to classify in `CAUSES`), or no note on
+what it likely costs (`NOTES`). The report documents the normalization, the
+causes and what the comparison leaves out.
+
+The likely costs of the notes are measured on our engine where SQL can give a
+query the shape of DuckDB's plan (`experiments.sql`: DuckDB's join order
+written out with explicit joins, the common table expression of q15
+`MATERIALIZED`, and the top-N of hits23 over its sort keys only):
+
+```bash
+benchmarks/plan-compare/measure.py
+```
+
+builds `dump_plans` in the `release` profile and runs it 3 times on 5 rounds
+of all queries of `experiments.sql` (with the PostgreSQL dialect, which parses
+`MATERIALIZED` and plans the benchmark's queries as the default dialect), and
+prints the medians of the elapsed time of every query and of the self time of
+its operators, from their profiles (so with profiling on). These are timings
+of our engine only, on 16 threads; on a busy machine, the differences of less
+than 3% are noise.
 
 ## Reproduce from a clean workspace
 
@@ -196,8 +284,16 @@ benchmarks/plan-compare/materialize.sh
 # 3. Capture the plans in benchmarks/plan-compare/duckdb.
 benchmarks/plan-compare/capture.py --duckdb ~/github/duckdb-plan-compare/build/release/duckdb
 
-# Nothing changed: the queries and plans are reproduced.
-git status --short benchmarks/plan-compare
+# 4. Dump our plans in benchmarks/plan-compare/pipeline.
+cargo run --locked --manifest-path benchmarks/plan-compare/dump_plans/Cargo.toml
+
+# 5. Compare them, and write docs/planner-comparison.md.
+benchmarks/plan-compare/differ.py --report
+
+# Nothing changed: the queries and the plans are reproduced (but for the rows
+# below dynamic filters in our plans, see "Our plans", and so in the excerpts
+# of the report), and so are the verdicts and the summary.
+git status --short benchmarks/plan-compare docs/planner-comparison.md
 ```
 
 To capture the plans of another commit of DuckDB, change `DUCKDB_COMMIT` in
