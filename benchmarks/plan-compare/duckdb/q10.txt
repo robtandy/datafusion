@@ -1,0 +1,44 @@
+╭─ Top N ────────────────────────────────╮
+│ Top: 20                                │
+│ Order By: revenue DESC                 │
+│ ~20 rows                               │
+╰────────────────────┬───────────────────╯
+╭─ Projection ───────┴───────────────────╮
+│ Projections: c_custkey, c_name,        │
+│              revenue, c_acctbal,       │
+│              n_name, c_address,        │
+│              c_phone, c_comment        │
+│ ~24,050 rows                           │
+╰────────────────────┬───────────────────╯
+╭─ Hash Group By ────┴───────────────────╮
+│ Groups: #0, #1, #2, #3, #4, #5, #6     │
+│ Aggregates: sum(#7)                    │
+│ ~24,050 rows                           │
+╰────────────────────┬───────────────────╯
+╭─ Projection ───────┴───────────────────╮
+│ Projections:                           │
+│ c_custkey, c_name, c_acctbal, c_phone, │
+│ n_name, c_address, c_comment,          │
+│ l_extendedprice * (1.00 - l_discount)  │
+│ ~24,050 rows                           │
+╰────────────────────┬───────────────────╯
+╭─ Hash Join ────────┴───────────────────╮
+│ Join Type: INNER                       │
+│ Conditions: c_custkey = o_custkey      │
+│ ~24,050 rows                           │
+╰────────────────────┬───────────────────╯
+                     ├────────────────────────────────────────────────────────────────────────╮
+╭─ Hash Join ────────┴───────────────────╮                                 ╭─ Hash Join ──────┴──────────────────╮
+│ Join Type: INNER                       │                                 │ Join Type: INNER                    │
+│ Conditions: c_nationkey = n_nationkey  │                                 │ Conditions: l_orderkey = o_orderkey │
+│ ~14,992 rows                           │                                 │ ~24,050 rows                        │
+╰────────────────────┬───────────────────╯                                 ╰──────────────────┬──────────────────╯
+                     ├────────────────────────────────────╮                                   ├────────────────────────────────────────────────────────────╮
+╭─ Read Parquet ─────┴───────────────────╮  ╭─ Read Parquet ────────────╮  ╭─ Read Parquet ───┴──────────────────╮  ╭─ Read Parquet ───────────────────────┴─────────────────────────────────────╮
+│ Function: READ_PARQUET                 │  │ Function: READ_PARQUET    │  │ Function: READ_PARQUET              │  │ Function: READ_PARQUET                                                     │
+│ Projections: c_custkey, c_name,        │  │ Projections: n_nationkey, │  │ Projections: l_orderkey,            │  │ Projections: o_orderkey, o_custkey                                         │
+│              c_address, c_nationkey,   │  │              n_name       │  │              l_extendedprice,       │  │ Filters:                                                                   │
+│              c_phone, c_acctbal,       │  │ ~16 rows                  │  │              l_discount             │  │ (o_orderdate >= '1993-10-01'::DATE) AND (o_orderdate < '1994-01-01'::DATE) │
+│              c_comment                 │  ╰───────────────────────────╯  │ Filters: l_returnflag = 'R'         │  │ ~30,000 rows                                                               │
+│ ~14,992 rows                           │                                 │ ~120,252 rows                       │  ╰────────────────────────────────────────────────────────────────────────────╯
+╰────────────────────────────────────────╯                                 ╰─────────────────────────────────────╯
