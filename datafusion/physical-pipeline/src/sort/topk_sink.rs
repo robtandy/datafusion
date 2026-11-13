@@ -45,10 +45,11 @@
 //! Which of the rows that tie with its last row it keeps, and in which order
 //! it emits rows with equal keys, is its own.
 //!
-//! The buffered rows and the top-ks of the threads are reserved in the memory
-//! pool of the session, and what reducing them allocates before it allocates
-//! it (see [`SortKeys::sort`]): the TopK fails with `ResourcesExhausted` when
-//! the pool cannot hold them.
+//! The buffered rows (copies of them if they are slices of larger arrays, see
+//! [`compact_to_keep`]) and the top-ks of the threads are reserved in the
+//! memory pool of the session, and what reducing them allocates before it
+//! allocates it (see [`SortKeys::sort`]): the TopK fails with
+//! `ResourcesExhausted` when the pool cannot hold them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,7 +72,8 @@ use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
 use super::{
-    SortKeys, SortPlan, SortedOutput, buffered_memory, memory_size, next_sorted_chunk,
+    SortKeys, SortPlan, SortedOutput, buffered_memory, compact_to_keep, memory_size,
+    next_sorted_chunk,
 };
 use crate::chunk::DataChunk;
 use crate::operator::{
@@ -590,6 +592,9 @@ impl PhysicalOperator for PhysicalTopK {
                 _ => {}
             }
         }
+        // The rows are kept until they are reduced: not the arrays that they
+        // may be slices of.
+        let batch = compact_to_keep(batch)?;
         let memory = buffered_memory(&batch);
         global.reservation.try_grow(memory)?;
         state.buffered_memory += memory;

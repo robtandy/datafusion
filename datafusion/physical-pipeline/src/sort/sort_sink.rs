@@ -30,9 +30,10 @@
 //! even fewer rows.)
 //!
 //! The buffered chunks are reserved in the memory pool of the session as
-//! they arrive, what sorting them allocates before it allocates it, and the
-//! runs until the merger emitted their rows (see [`super`]): the sort fails
-//! with `ResourcesExhausted` when the pool cannot hold them.
+//! they arrive (copies of their rows if they are slices of larger arrays, see
+//! [`compact_to_keep`]), what sorting them allocates before it allocates it,
+//! and the runs until the merger emitted their rows (see [`super`]): the sort
+//! fails with `ResourcesExhausted` when the pool cannot hold them.
 
 use std::sync::Arc;
 
@@ -46,7 +47,9 @@ use datafusion_physical_plan::ExecutionPlan;
 use parking_lot::Mutex;
 
 use super::merge::{RunMerger, SortedRun};
-use super::{SortKeys, SortPlan, SortedOutput, buffered_memory, next_sorted_chunk};
+use super::{
+    SortKeys, SortPlan, SortedOutput, buffered_memory, compact_to_keep, next_sorted_chunk,
+};
 use crate::chunk::DataChunk;
 use crate::operator::{
     ExecutionContext, GlobalSinkState, GlobalSourceState, LocalSinkState,
@@ -252,7 +255,9 @@ impl PhysicalOperator for PhysicalSort {
         let global = downcast_state::<SortSinkState>(gstate.as_any(), self.name())?;
         let state =
             downcast_state_mut::<SortLocalState>(lstate.as_any_mut(), self.name())?;
-        let batch = input.compact()?;
+        // The rows are kept until they are sorted: not the arrays that they
+        // may be slices of.
+        let batch = compact_to_keep(input.compact()?)?;
         let bytes = buffered_memory(&batch);
         global.reservation.try_grow(bytes)?;
         state.rows += batch.num_rows();

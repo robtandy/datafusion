@@ -194,6 +194,7 @@ use crate::operators::materialized_cte::{MaterializedCtes, OuterCte};
 use crate::operators::projection::PhysicalProjection;
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::planner::lower_execution_plan_with_cte_rows;
+pub(crate) use crate::sort::compact_to_keep;
 use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
 use crate::sort::{RunMerger, SortKeys, SortedRun, memory_size};
 
@@ -1859,59 +1860,6 @@ pub(crate) fn key_memory(keys: &[ArrayRef], batch: &RecordBatch) -> usize {
             .sum::<usize>()
         + (batch.num_rows() + 1) * size_of::<usize>()
         + size_of::<Rows>()
-}
-
-/// The bytes that a column of a batch that a join keeps may take beyond twice
-/// those of its rows before the join copies it (see [`compact_to_keep`]): of
-/// the structures of its arrays.
-const KEPT_EXCESS_BYTES: usize = 1024;
-
-/// `batch`, to keep (the joins keep the batches of their rows, reserving the
-/// bytes of their rows, see [`memory_size`]): with the columns that take more
-/// than twice the memory of their rows (and [`KEPT_EXCESS_BYTES`]) copied to
-/// arrays of their rows only, so that a kept batch takes at most about twice
-/// the memory that is reserved for it (as the arrays that builders make, whose
-/// buffers may have twice the capacity that they use, which are not copied).
-/// A zero-copy slice of an array keeps all of its buffers (e.g. a row of an
-/// array of 1 MiB), whose bytes beyond those of its rows `memory_size` does
-/// not count. (It counts whole the values that views, dictionaries and lists
-/// refer to, which the copies share.)
-pub(crate) fn compact_to_keep(batch: RecordBatch) -> Result<RecordBatch> {
-    let Ok(rows) = u32::try_from(batch.num_rows()) else {
-        return Ok(batch);
-    };
-    let mut indices = None;
-    let mut columns = None;
-    for (index, column) in batch.columns().iter().enumerate() {
-        let bytes = column_memory_size(column);
-        if column.get_array_memory_size() <= 2 * bytes + KEPT_EXCESS_BYTES {
-            continue;
-        }
-        let indices =
-            indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
-        // A column that `take` does not copy is kept as it is.
-        let Ok(copy) = take(column.as_ref(), indices, None) else {
-            continue;
-        };
-        columns.get_or_insert_with(|| batch.columns().to_vec())[index] = copy;
-    }
-    let Some(columns) = columns else {
-        return Ok(batch);
-    };
-    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-    Ok(RecordBatch::try_new_with_options(
-        batch.schema(),
-        columns,
-        &options,
-    )?)
-}
-
-/// The bytes of the rows of `column`, as [`memory_size`] counts them.
-fn column_memory_size(column: &ArrayRef) -> usize {
-    column
-        .to_data()
-        .get_slice_memory_size()
-        .unwrap_or_else(|_| column.get_array_memory_size())
 }
 
 /// About (an upper bound of) the bytes that the row format takes to encode

@@ -92,11 +92,13 @@
 //!
 //! The window operator keeps all rows in memory (it does not spill), and
 //! reserves it in the memory pool of the session: the chunks that the threads
-//! buffer as they arrive, what sorting them into runs and merging the runs of
-//! a bucket allocates before it allocates it, the sorted buckets until their
-//! rows were emitted, and the evaluated rows of a bucket until they are
-//! emitted. It fails with `ResourcesExhausted` when the pool cannot hold
-//! them.
+//! buffer as they arrive (copies of their rows if they are slices of larger
+//! arrays, see [`compact_to_keep`]; a chunk whose rows a thread distributes
+//! over several buckets, which keep slices of it, once, until all of them
+//! are sorted), what sorting them into runs and merging the runs of a bucket
+//! allocates before it allocates it, the sorted buckets until their rows were
+//! emitted, and the evaluated rows of a bucket until they are emitted. It
+//! fails with `ResourcesExhausted` when the pool cannot hold them.
 //!
 //! It reads all rows of its input before it emits anything, so windows over
 //! inputs that never end are left to DataFusion, whose windows stream (see
@@ -146,7 +148,10 @@ use crate::operator::{
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
 use crate::sort::merge::{RunMerger, SortedRun, is_capacity_error};
 use crate::sort::sort_sink::{SORT_RUN_BYTES, SORT_RUN_ROWS};
-use crate::sort::{ReservedMemory, SortKeys, array_memory, buffered_memory};
+use crate::sort::{
+    ReservedMemory, SortKeys, array_memory, buffered_memory, compact_to_keep,
+    memory_size, metadata_memory,
+};
 
 /// Evaluates window functions, with the semantics of DataFusion's
 /// `WindowAggExec` and `BoundedWindowAggExec`.
@@ -805,25 +810,39 @@ impl PhysicalWindow {
             return Ok(());
         };
         let batches = std::mem::take(&mut bucket.batches);
+        let chunks = std::mem::take(&mut bucket.chunks);
         bucket.rows = 0;
-        let bytes = std::mem::take(&mut bucket.bytes);
+        bucket.bytes = 0;
+        let reserved = std::mem::take(&mut bucket.reserved);
         let runs = keys.sort(&self.input().schema(), &batches, None, reservation)?;
         drop(batches);
-        reservation.shrink(bytes);
+        // The chunks that the rows are slices of are freed once the slices of
+        // all buckets are sorted.
+        drop(chunks);
+        reservation.shrink(reserved);
         bucket.runs.extend(runs);
         Ok(())
     }
 
     /// Add `batch` to the rows of `bucket`, sorting them into a run once
-    /// there are many. Its memory is reserved in `reservation`.
+    /// there are many. Its memory is reserved in `reservation`, unless it is a
+    /// slice of a chunk whose memory `chunk` reserves (for its slices in all
+    /// buckets of the thread).
     fn buffer(
         &self,
         bucket: &mut LocalBucket,
         batch: RecordBatch,
+        chunk: Option<&Arc<MemoryReservation>>,
         reservation: &MemoryReservation,
     ) -> Result<()> {
         let bytes = buffered_memory(&batch);
-        reservation.try_grow(bytes)?;
+        match chunk {
+            Some(chunk) => bucket.chunks.push(Arc::clone(chunk)),
+            None => {
+                reservation.try_grow(bytes)?;
+                bucket.reserved += bytes;
+            }
+        }
         bucket.rows += batch.num_rows();
         bucket.bytes += bytes;
         bucket.batches.push(batch);
@@ -1442,9 +1461,17 @@ struct LocalBucket {
     batches: Vec<RecordBatch>,
     /// The number of rows of `batches`.
     rows: usize,
-    /// The memory of `batches` (see [`buffered_memory`]), which the
-    /// reservation of the window holds.
+    /// The memory of `batches` (see [`buffered_memory`]).
     bytes: usize,
+    /// The memory of the batches of `batches` that the bucket holds alone
+    /// (the chunks of a window of a single bucket, or of a single bucket of
+    /// a chunk), which the reservation of the window holds.
+    reserved: usize,
+    /// The reservations of the chunks that the other batches of `batches` are
+    /// slices of (the slices of the rows of a chunk of every bucket): every
+    /// chunk is reserved once, for its slices in all buckets of the thread,
+    /// and freed once all of them are sorted.
+    chunks: Vec<Arc<MemoryReservation>>,
     /// The sorted runs of the thread, whose memory the reservation of the
     /// window holds.
     runs: Vec<SortedRun>,
@@ -1718,8 +1745,17 @@ impl PhysicalOperator for PhysicalWindow {
         let batch = input.compact()?;
         let reservation = &state.reservation;
         if local.buckets.len() == 1 {
-            self.buffer(&mut local.buckets[0], batch, reservation)?;
+            // The rows are kept until they are sorted (or evaluated): not the
+            // arrays that they may be slices of.
+            let batch = compact_to_keep(batch)?;
+            self.buffer(&mut local.buckets[0], batch, None, reservation)?;
             return Ok(SinkResult::NeedMoreInput);
+        }
+        if self.spec.keys.is_none() {
+            return internal_err!(
+                "{} distributes rows without order over several buckets",
+                self.name()
+            );
         }
         // Distribute the rows over the buckets by the hash of their keys (the
         // upper bits of the hash pick the bucket): gather them in the order of
@@ -1743,21 +1779,38 @@ impl PhysicalOperator for PhysicalWindow {
             order[next[bucket]] = row as u32;
             next[bucket] += 1;
         }
-        let sorted =
-            match (0..num_buckets).find(|&b| starts[b + 1] - starts[b] == num_rows) {
-                // All rows are in one bucket.
-                Some(_) => batch,
-                None => take_record_batch(&batch, &UInt32Array::from(order))?,
-            };
-        for bucket in 0..num_buckets {
-            let (start, end) = (starts[bucket], starts[bucket + 1]);
-            if end > start {
-                self.buffer(
-                    &mut local.buckets[bucket],
-                    sorted.slice(start, end - start),
-                    reservation,
-                )?;
-            }
+        if let Some(bucket) =
+            (0..num_buckets).find(|&b| starts[b + 1] - starts[b] == num_rows)
+        {
+            // All rows are in one bucket, which keeps them until it sorts
+            // them: not the arrays that they may be slices of.
+            let batch = compact_to_keep(batch)?;
+            self.buffer(&mut local.buckets[bucket], batch, None, reservation)?;
+            return Ok(SinkResult::NeedMoreInput);
+        }
+        let sorted = take_record_batch(&batch, &UInt32Array::from(order))?;
+        drop(batch);
+        // Every bucket keeps a slice of the rows of the chunk, which keeps all
+        // of the chunk: it is reserved once (its rows, and the metadata of all
+        // slices), until the slices of all buckets are sorted.
+        let slices = (0..num_buckets)
+            .filter(|&bucket| starts[bucket + 1] > starts[bucket])
+            .map(|bucket| {
+                let (start, end) = (starts[bucket], starts[bucket + 1]);
+                (bucket, sorted.slice(start, end - start))
+            })
+            .collect::<Vec<_>>();
+        let chunk = Arc::new(reservation.new_empty());
+        chunk.try_grow(
+            memory_size(&sorted)
+                + slices
+                    .iter()
+                    .map(|(_, slice)| metadata_memory(slice))
+                    .sum::<usize>(),
+        )?;
+        drop(sorted);
+        for (bucket, slice) in slices {
+            self.buffer(&mut local.buckets[bucket], slice, Some(&chunk), reservation)?;
         }
         Ok(SinkResult::NeedMoreInput)
     }
@@ -1773,13 +1826,21 @@ impl PhysicalOperator for PhysicalWindow {
             downcast_state_mut::<WindowLocalState>(lstate.as_any_mut(), self.name())?;
         for (bucket, global) in local.buckets.iter_mut().zip(&state.buckets) {
             self.sort_buffered_rows(bucket, &state.reservation)?;
+            // (The rows without order are those of a window of a single
+            // bucket: no slices of chunks of several buckets.)
+            if !bucket.chunks.is_empty() {
+                return internal_err!(
+                    "{} keeps the slices of chunks of several buckets",
+                    self.name()
+                );
+            }
             let mut global = global.lock();
             global.memory += bucket
                 .runs
                 .iter()
                 .map(SortedRun::memory_size)
                 .sum::<usize>()
-                + std::mem::take(&mut bucket.bytes);
+                + std::mem::take(&mut bucket.reserved);
             global.runs.append(&mut bucket.runs);
             global.batches.append(&mut bucket.batches);
         }
@@ -3846,6 +3907,70 @@ mod tests {
                 assert_eq!(count::<PhysicalWindow>(&root), 1, "fetch {fetch:?}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_chunks_of_several_buckets_are_reserved_until_their_slices_are_sorted()
+    -> Result<()> {
+        use datafusion_execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        // A window partitioned by `v % 7`, on 4 threads, distributes the rows
+        // of every chunk over several buckets: every bucket keeps a slice of
+        // the chunk reordered by bucket, which keeps all of the chunk. The
+        // reordered chunk is reserved once, until the slices of all buckets
+        // are sorted (and their runs are reserved instead).
+        let window = row_numbers(2048, 2048, true)?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+        let task_ctx = Arc::new(TaskContext::default().with_runtime(runtime));
+        let ctx = ExecutionContext::new(task_ctx, 0, 4);
+        let global = window.get_global_sink_state(&ctx)?;
+        let mut local = window.get_local_sink_state(&ctx, global.as_ref())?;
+        let chunk = values_chunk(0..2048);
+        window.sink(&ctx, &chunk, global.as_ref(), local.as_mut())?;
+        // The rows of the chunk, and the metadata of every slice.
+        let slices = local
+            .downcast_ref::<WindowLocalState>()
+            .expect("the local state of a window")
+            .buckets
+            .iter()
+            .flat_map(|bucket| &bucket.batches)
+            .map(metadata_memory)
+            .sum::<usize>();
+        let reordered = memory_size(&chunk.compact()?) + slices;
+        assert_eq!(pool.reserved(), reordered);
+        let state = global
+            .downcast_ref::<WindowState>()
+            .expect("the state of a window");
+        let buckets = &mut local
+            .downcast_mut::<WindowLocalState>()
+            .expect("the local state of a window")
+            .buckets;
+        let mut slices = buckets
+            .iter_mut()
+            .filter(|bucket| !bucket.batches.is_empty());
+        let first = slices.next().expect("a bucket with rows");
+        assert!(slices.count() > 0, "the rows of a single bucket");
+        // A bucket that sorts its rows (e.g. once it holds many of them)
+        // releases its slice, which the slices of the other buckets keep: the
+        // chunk stays reserved, with the run of the bucket.
+        window.sort_buffered_rows(first, &state.reservation)?;
+        let run = first.runs.iter().map(SortedRun::memory_size).sum::<usize>();
+        assert_eq!(pool.reserved(), reordered + run);
+        window.combine(&ctx, global.as_ref(), local.as_mut())?;
+        let runs = state
+            .buckets
+            .iter()
+            .map(|bucket| bucket.lock().memory)
+            .sum::<usize>();
+        assert!(runs > 0);
+        assert_eq!(pool.reserved(), runs);
+        drop(local);
+        drop(global);
+        assert_eq!(pool.reserved(), 0);
         Ok(())
     }
 

@@ -47,7 +47,7 @@ use datafusion_physical_plan::aggregates::group_values::{GroupValues, new_group_
 use datafusion_physical_plan::aggregates::order::GroupClustering;
 
 use super::hash_aggregate::{AggregateSpec, rebuilt_literal};
-use crate::sort::array_memory;
+use crate::sort::{array_memory, array_overhead};
 
 /// The group keys and the aggregate states of a set of groups, emitted by a
 /// [`GroupedHashTable`]: row `i` of every array belongs to the same group.
@@ -66,12 +66,17 @@ impl GroupedStates {
     }
 
     /// The memory that the keys and the states of the groups hold (see
-    /// [`array_memory`]).
+    /// [`array_memory`]), with the structures of their arrays (see
+    /// [`array_overhead`]).
     pub(crate) fn memory_size(&self) -> usize {
         self.keys
             .iter()
             .chain(self.states.iter().flatten())
-            .map(|array| array_memory(array.as_ref()) + size_of::<ArrayRef>())
+            .map(|array| {
+                array_memory(array.as_ref())
+                    + array_overhead(array.as_ref())
+                    + size_of::<ArrayRef>()
+            })
             .sum()
     }
 

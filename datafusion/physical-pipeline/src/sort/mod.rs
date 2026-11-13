@@ -72,10 +72,11 @@
 //!
 //! The native operators keep all rows in memory (they do not spill), and
 //! reserve it in the memory pool of the session: the chunks that the threads
-//! buffer as they arrive, what sorting them into runs allocates before it
-//! allocates it (see [`SortKeys::sort`]), and the runs until the merger
-//! emitted their rows. They fail with `ResourcesExhausted` when the pool
-//! cannot hold them.
+//! buffer as they arrive (with their metadata, and copies of their rows if
+//! they are slices of larger arrays, see [`compact_to_keep`]), what sorting
+//! them into runs allocates before it allocates it (see [`SortKeys::sort`]),
+//! and the runs until the merger emitted their rows. They fail with
+//! `ResourcesExhausted` when the pool cannot hold them.
 //!
 //! [`DynamicFilterPhysicalExpr`]: datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr
 
@@ -1063,10 +1064,90 @@ pub(crate) fn memory_size(batch: &RecordBatch) -> usize {
 }
 
 /// The memory that buffering `batch` holds: its rows (see [`memory_size`]),
-/// and the batch in a list of batches, which is all that a batch without
-/// columns holds.
+/// and its metadata (see [`metadata_memory`]), which is all that a batch
+/// without columns holds.
+///
+/// The operators that keep batches reserve this memory for them, and keep
+/// them as [`compact_to_keep`] makes them, so that they hold at most about
+/// twice that memory.
 pub(crate) fn buffered_memory(batch: &RecordBatch) -> usize {
-    memory_size(batch) + batch_overhead(batch)
+    memory_size(batch) + metadata_memory(batch)
+}
+
+/// The memory of the metadata of `batch`: the batch in a list of batches,
+/// and the structures of its arrays (see [`array_overhead`]).
+pub(crate) fn metadata_memory(batch: &RecordBatch) -> usize {
+    batch_overhead(batch)
+        + batch
+            .columns()
+            .iter()
+            .map(|column| array_overhead(column.as_ref()))
+            .sum::<usize>()
+}
+
+/// The memory of the structure of `array` besides its buffers (and its
+/// reference, e.g. in the columns of a batch): the array, in the allocation of
+/// its `Arc`.
+pub(crate) fn array_overhead(array: &dyn Array) -> usize {
+    size_of_val(array) + 2 * size_of::<usize>()
+}
+
+/// The bytes that a column of a batch that an operator keeps may take beyond
+/// twice those of its rows before the operator copies it (see
+/// [`compact_to_keep`]): of the structures of its arrays.
+const KEPT_EXCESS_BYTES: usize = 1024;
+
+/// `batch`, to keep (the operators keep the batches of their rows, e.g. the
+/// sorts until they sort them, reserving the bytes of their rows, see
+/// [`buffered_memory`]): with the columns that take more than twice the
+/// memory of their rows (and [`KEPT_EXCESS_BYTES`]) copied to arrays of their
+/// rows only, so that a kept batch takes at most about twice the memory that
+/// is reserved for it (as the arrays that builders make, whose buffers may
+/// have twice the capacity that they use, which are not copied). A zero-copy
+/// slice of an array keeps all of its buffers (e.g. a row of an array of 1
+/// MiB), whose bytes beyond those of its rows [`memory_size`] does not count.
+/// (It counts whole the values that views, dictionaries and lists refer to,
+/// which the copies share.)
+pub(crate) fn compact_to_keep(batch: RecordBatch) -> Result<RecordBatch> {
+    let Some(columns) = compacted_to_keep(batch.columns(), batch.num_rows()) else {
+        return Ok(batch);
+    };
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
+}
+
+/// The arrays `columns` (of the same rows), to keep, as [`compact_to_keep`]
+/// keeps the columns of a batch.
+pub(crate) fn columns_to_keep(columns: Vec<ArrayRef>) -> Vec<ArrayRef> {
+    let rows = columns.first().map_or(0, |column| column.len());
+    compacted_to_keep(&columns, rows).unwrap_or(columns)
+}
+
+/// The arrays `columns` (of `rows` rows) with the arrays that take more than
+/// twice the memory of their rows copied (see [`compact_to_keep`]), `None` if
+/// none does.
+fn compacted_to_keep(columns: &[ArrayRef], rows: usize) -> Option<Vec<ArrayRef>> {
+    let rows = u32::try_from(rows).ok()?;
+    let mut indices = None;
+    let mut compacted = None;
+    for (index, column) in columns.iter().enumerate() {
+        let bytes = array_memory(column.as_ref());
+        if column.get_array_memory_size() <= 2 * bytes + KEPT_EXCESS_BYTES {
+            continue;
+        }
+        let indices =
+            indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
+        // A column that `take` does not copy is kept as it is.
+        let Ok(copy) = take(column.as_ref(), indices, None) else {
+            continue;
+        };
+        compacted.get_or_insert_with(|| columns.to_vec())[index] = copy;
+    }
+    compacted
 }
 
 /// The data types of the sort keys `ordering` of rows with schema `schema`.

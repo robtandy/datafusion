@@ -3809,6 +3809,79 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn native_operators_keep_copies_of_rows_that_are_slices_of_larger_arrays()
+    -> Result<()> {
+        use crate::join::merge_join::allocations;
+        use crate::join::merge_join::tests::SlicedRows;
+        use datafusion::catalog::streaming::StreamingTable;
+        // A table of 64 rows, every one a zero-copy slice of a row of an array
+        // of 1 MiB of its own, made as the table is read (see `SlicedRows`),
+        // read by the native operators that keep the rows of their inputs
+        // (until they sort them, aggregate them in their order or join with
+        // them): they keep copies of the rows only, not the arrays that they
+        // are slices of (whose bytes beyond those of the rows, which they
+        // reserve, they would hold unreserved). In a pool of 4 MiB (the scan
+        // reserves the batch that it emits), every query returns its rows,
+        // allocating less than 16 MiB (on the thread of the test, as a runtime
+        // of the current thread runs all tasks of the query there), while the
+        // arrays of the rows take 64 MiB.
+        let mut config = test_session_config().with_target_partitions(1);
+        // The joins build on their left inputs, the table.
+        config.options_mut().optimizer.join_reordering = false;
+        for (sql, operator, rows) in [
+            ("SELECT k FROM sliced ORDER BY k DESC", "PhysicalSort", 64),
+            (
+                "SELECT k FROM sliced ORDER BY k DESC LIMIT 64",
+                "PhysicalTopK",
+                64,
+            ),
+            (
+                "SELECT k, ROW_NUMBER() OVER (ORDER BY k DESC) AS rn FROM sliced",
+                "PhysicalWindow",
+                64,
+            ),
+            (
+                "SELECT STRING_AGG(CAST(k AS VARCHAR), ',' ORDER BY k) AS ks FROM sliced",
+                "PhysicalHashAggregate",
+                1,
+            ),
+            // (A single row of `t2` has `k = 7`.)
+            (
+                "SELECT a.k, b.k AS bk FROM sliced a CROSS JOIN (SELECT k FROM t2 WHERE k = 7) b",
+                "PhysicalCrossJoin",
+                64,
+            ),
+            (
+                "SELECT a.k, b.k AS bk FROM sliced a JOIN (SELECT k FROM t2 WHERE k = 7) b ON a.k > b.k",
+                "PhysicalNestedLoopJoin",
+                56,
+            ),
+        ] {
+            let (ctx, _pool) = pipeline_context_with_pool(config.clone(), 4 << 20)?;
+            let partition = Arc::new(SlicedRows::new("", 64));
+            let schema = Arc::clone(&partition.schema);
+            let table = StreamingTable::try_new(schema, vec![partition])?;
+            ctx.register_table("sliced", Arc::new(table))?;
+            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+            let root = plan.downcast_ref::<PipelineRootExec>().expect("a pipeline");
+            assert_native(sql, root.operator());
+            let tree = format_operator_tree(root.operator());
+            assert!(tree.contains(operator), "{sql}\n{tree}");
+            allocations::reset_peak();
+            let before = allocations::held();
+            let output = collect(plan, ctx.task_ctx()).await?;
+            let allocated = allocations::peak() - before;
+            let num_rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(num_rows, rows, "{sql}");
+            assert!(
+                allocated < 16 << 20,
+                "{sql}: the query allocated {allocated} bytes\n{tree}"
+            );
+        }
+        Ok(())
+    }
+
     /// A partition of a `StreamingTableExec` that produces `batch`, and then
     /// what `tail` says.
     #[derive(Debug)]

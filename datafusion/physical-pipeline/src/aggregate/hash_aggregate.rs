@@ -48,7 +48,8 @@ use crate::operator::{
     LocalSourceState, PhysicalOperator, SinkFinalize, SinkResult, SourceResult,
 };
 use crate::sort::{
-    KERNEL_SORT_BYTES_PER_ROW, ReservedMemory, buffered_memory, memory_size,
+    KERNEL_SORT_BYTES_PER_ROW, ReservedMemory, buffered_memory, compact_to_keep,
+    memory_size,
 };
 
 /// A hash aggregation: a pipeline breaker that consumes the rows of its input
@@ -531,13 +532,16 @@ pub(crate) struct InputBuffer {
 }
 
 impl InputBuffer {
-    /// Buffer `batch`, reserving its memory in `reservation`.
+    /// Buffer `batch`, reserving its memory in `reservation` (and keeping a
+    /// copy of its rows if they are slices of larger arrays, see
+    /// [`compact_to_keep`]).
     pub(crate) fn push(
         &mut self,
         batch: RecordBatch,
         reservation: &MemoryReservation,
     ) -> Result<()> {
         if batch.num_rows() > 0 {
+            let batch = compact_to_keep(batch)?;
             let memory = buffered_memory(&batch);
             reservation.try_grow(memory)?;
             self.memory += memory;

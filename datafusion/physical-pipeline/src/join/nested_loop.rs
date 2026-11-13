@@ -70,11 +70,14 @@
 //! # Memory
 //!
 //! The build rows are reserved in the memory pool of the session as they
-//! arrive, and so is the bitmap of the build rows that matched before it is
-//! allocated: the join fails with `ResourcesExhausted` when the pool cannot
-//! hold them (it does not spill, while `NestedLoopJoinExec` spills its build
-//! side). What the probe side allocates is bounded by a block of pairs of
-//! rows and a chunk of output.
+//! arrive, with their batches (also those without columns), and copies of
+//! them are kept if they are slices of larger arrays (see
+//! [`compact_to_keep`]). So are the offsets of the segments of the build
+//! side, the bitmap of the build rows that matched and the blocks of the scan
+//! of the final build rows, before they are allocated: the join fails with
+//! `ResourcesExhausted` when the pool cannot hold them (it does not spill,
+//! while `NestedLoopJoinExec` spills its build side). What the probe side
+//! allocates is bounded by a block of pairs of rows and a chunk of output.
 
 use std::fmt::{self, Write};
 use std::marker::PhantomData;
@@ -110,7 +113,7 @@ use crate::operator::{
     SinkFinalize, SinkResult, SourceResult, downcast_state, downcast_state_mut,
 };
 use crate::pipeline::{MetaPipelineBuilder, PipelineBuilder};
-use crate::sort::memory_size;
+use crate::sort::{buffered_memory, compact_to_keep};
 
 /// The join filter is evaluated on blocks of at most this many pairs of rows
 /// (or on a single build row and all rows of a probe chunk).
@@ -1061,6 +1064,11 @@ impl SegmentedBatch {
         self.offsets[self.offsets.len() - 1]
     }
 
+    /// The memory of the offsets of `segments` segments.
+    fn offsets_memory(segments: usize) -> usize {
+        (segments + 1) * size_of::<usize>()
+    }
+
     /// The segment of the (existing) row `row`.
     fn segment_of(&self, row: usize) -> usize {
         self.offsets.partition_point(|&offset| offset <= row) - 1
@@ -1195,6 +1203,8 @@ struct FinalScanState {
     blocks: Vec<(usize, usize, usize)>,
     /// The next block to scan.
     next_block: AtomicUsize,
+    /// The memory of `blocks`.
+    _reservation: MemoryReservation,
 }
 
 impl GlobalSourceState for FinalScanState {
@@ -1292,8 +1302,11 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
         let state = downcast_state::<JoinState>(gstate.as_any(), self.name())?;
         let local =
             downcast_state_mut::<BuildLocalState>(lstate.as_any_mut(), self.name())?;
-        let batch = input.compact()?;
-        state.reserve(memory_size(&batch))?;
+        // The build rows are kept until the join ends: not the arrays that
+        // they may be slices of. Their batches are reserved with their rows,
+        // also those without columns.
+        let batch = compact_to_keep(input.compact()?)?;
+        state.reserve(buffered_memory(&batch))?;
         local.batches.push(batch);
         Ok(SinkResult::NeedMoreInput)
     }
@@ -1323,7 +1336,10 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
         if ctx.registry().is_sink_finished(self) {
             return Ok(SinkFinalize::NoOutputPossible);
         }
-        let rows = SegmentedBatch::new(std::mem::take(&mut *state.batches.lock()));
+        let batches = std::mem::take(&mut *state.batches.lock());
+        // The offsets of the segments.
+        state.reserve(SegmentedBatch::offsets_memory(batches.len()))?;
+        let rows = SegmentedBatch::new(batches);
         let num_rows = rows.num_rows();
         let matched = if self.spec.emits_final_build_rows() {
             state.reserve(MatchedRows::memory_size(num_rows))?;
@@ -1414,7 +1430,17 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
         &self,
         ctx: &ExecutionContext,
     ) -> Result<Arc<dyn GlobalSourceState>> {
-        let build = join_state(ctx, self)?.build(self.name())?;
+        let join = join_state(ctx, self)?;
+        let build = join.build(self.name())?;
+        // The blocks, reserved before they are allocated.
+        let num_blocks = build
+            .rows
+            .segments
+            .iter()
+            .map(|batch| batch.num_rows().div_ceil(DEFAULT_VECTOR_SIZE))
+            .sum::<usize>();
+        let reservation = join.reservation.new_empty();
+        reservation.try_grow(num_blocks * size_of::<(usize, usize, usize)>())?;
         let blocks = build
             .rows
             .segments
@@ -1433,6 +1459,7 @@ impl<K: LoopJoinKind> PhysicalOperator for LoopJoin<K> {
             build,
             blocks,
             next_block: AtomicUsize::new(0),
+            _reservation: reservation,
         }))
     }
 
@@ -2618,6 +2645,75 @@ mod tests {
                 1,
                 "{name}"
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_batches_of_the_build_side_are_reserved_with_their_rows() -> Result<()> {
+        use crate::executor::Executor;
+        use crate::operators::lowering_tests::{
+            assert_exhausted, task_context_with_memory_limit,
+        };
+        use crate::sort::test_support::assert_memory_freed;
+        // Build sides of 10,000 chunks of a row without columns, whose batches
+        // take 400 KB (and their offsets 80 KB), joined with the values 0, 1
+        // and 2: by a cross join, and by a nested loop join on `probe.v > 0`.
+        let empty = Arc::new(Schema::empty());
+        let build = || -> Result<Arc<dyn PhysicalOperator>> {
+            let chunks = (0..10_000)
+                .map(|_| DataChunk::try_new_without_columns(Arc::clone(&empty), 1))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(TestSource::with_schema(
+                Arc::clone(&empty),
+                chunks,
+            )))
+        };
+        let probe = || Arc::new(TestSource::new(vec![values_chunk(0..3)]));
+        let cross = || -> Result<Arc<dyn PhysicalOperator>> {
+            Ok(Arc::new(PhysicalCrossJoin::try_new(build()?, probe())?))
+        };
+        let nested_loop = || -> Result<Arc<dyn PhysicalOperator>> {
+            let filter_schema =
+                Arc::new(Schema::new(vec![Field::new("r", DataType::Int64, false)]));
+            let filter = JoinFilter::new(
+                Arc::new(BinaryExpr::new(
+                    col("r", &filter_schema)?,
+                    Operator::Gt,
+                    lit(0_i64),
+                )),
+                vec![ColumnIndex {
+                    index: 0,
+                    side: JoinSide::Right,
+                }],
+                filter_schema,
+            );
+            Ok(Arc::new(PhysicalNestedLoopJoin::try_new(
+                build()?,
+                probe(),
+                Some(filter),
+                JoinType::Inner,
+                None,
+            )?))
+        };
+        type MakeJoin<'a> = &'a dyn Fn() -> Result<Arc<dyn PhysicalOperator>>;
+        for (name, make, rows) in [
+            ("PhysicalCrossJoin", &cross as MakeJoin<'_>, 30_000),
+            ("PhysicalNestedLoopJoin", &nested_loop, 20_000),
+        ] {
+            // 32 KiB do not hold the batches of the build side.
+            let ctx = task_context_with_memory_limit(32 << 10);
+            let result = Executor::collect(make()?, Arc::clone(&ctx), 4).await;
+            let error = result.as_ref().map(|_| ()).unwrap_err().to_string();
+            assert!(error.contains(name), "{error}");
+            assert_exhausted(result);
+            assert_memory_freed(ctx.memory_pool().as_ref()).await;
+            // 16 MiB do: the join joins all of them, and frees their memory.
+            let ctx = task_context_with_memory_limit(16 << 20);
+            let output = Executor::collect(make()?, Arc::clone(&ctx), 4).await?;
+            let output_rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
+            assert_eq!(output_rows, rows, "{name}");
+            assert_eq!(ctx.memory_pool().reserved(), 0, "{name}");
         }
         Ok(())
     }
