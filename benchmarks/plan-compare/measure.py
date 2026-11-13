@@ -33,6 +33,47 @@ sys.path.insert(0, str(HERE))
 
 from capture import parse_queries  # noqa: E402
 
+#: The name of the executable of `dump_plans`.
+DUMP_PLANS = "plan-compare-dump-plans"
+
+
+def executable(messages, name: str = DUMP_PLANS) -> pathlib.Path:
+    """The executable `name` among the JSON messages of `cargo build
+    --message-format=json` (its `compiler-artifact`): wherever the target
+    directory is (`CARGO_TARGET_DIR`, `build.target-dir`, ...)."""
+    for line in messages:
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            message.get("reason") == "compiler-artifact"
+            and message.get("target", {}).get("name") == name
+            and message.get("executable")
+        ):
+            return pathlib.Path(message["executable"])
+    raise SystemExit(f"error: cargo built no executable {name}")
+
+
+def build(manifest: pathlib.Path) -> pathlib.Path:
+    """Build `dump_plans` in the `release` profile, and return its
+    executable, as cargo reports it."""
+    result = subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--locked",
+            "--release",
+            "--manifest-path",
+            str(manifest),
+            "--message-format=json-render-diagnostics",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        encoding="utf-8",
+    )
+    return executable(result.stdout.splitlines())
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -43,21 +84,16 @@ def main() -> None:
         help="the queries (default: %(default)s)",
     )
     parser.add_argument(
-        "--runs", type=int, default=3, help="the runs (default: %(default)s)"
+        "--runs", type=int, default=6, help="the runs (default: %(default)s)"
     )
     parser.add_argument(
         "--rounds",
         type=int,
-        default=5,
+        default=6,
         help="the rounds of all queries of a run (default: %(default)s)",
     )
     args = parser.parse_args()
-    manifest = HERE / "dump_plans" / "Cargo.toml"
-    subprocess.run(
-        ["cargo", "build", "--locked", "--release", "--manifest-path", str(manifest)],
-        check=True,
-    )
-    binary = HERE / "dump_plans" / "target" / "release" / "plan-compare-dump-plans"
+    binary = build(HERE / "dump_plans" / "Cargo.toml")
     queries = parse_queries(args.queries.read_text(encoding="utf-8"))
     names = [name for name, _ in queries]
     elapsed: dict[str, list[float]] = {name: [] for name in names}
