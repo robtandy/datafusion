@@ -3809,28 +3809,93 @@ mod tests {
         Ok(())
     }
 
+    /// A stream of `rows` batches of a row each, whose `k` (an `Int64` of a
+    /// dictionary) is the index of the batch, of a dictionary whose values are
+    /// a zero-copy slice of a row of an array of 1 MiB of its own, made as the
+    /// stream is read (which keeps none of them). (`take` shares the values
+    /// of a dictionary with the copies of its rows.)
+    #[derive(Debug)]
+    struct SlicedDictionaryValues {
+        schema: SchemaRef,
+        rows: usize,
+    }
+
+    impl SlicedDictionaryValues {
+        fn new(rows: usize) -> Self {
+            let data_type = DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Int64),
+            );
+            let schema = Schema::new(vec![Field::new("k", data_type, false)]);
+            Self {
+                schema: Arc::new(schema),
+                rows,
+            }
+        }
+    }
+
+    impl datafusion_physical_plan::streaming::PartitionStream for SlicedDictionaryValues {
+        fn schema(&self) -> &SchemaRef {
+            &self.schema
+        }
+
+        fn execute(
+            &self,
+            _ctx: Arc<TaskContext>,
+        ) -> datafusion_execution::SendableRecordBatchStream {
+            use arrow::array::{DictionaryArray, Int64Array};
+            let schema = Arc::clone(&self.schema);
+            let batches = (0..self.rows as i64).map(move |row| {
+                let values =
+                    Int64Array::from_iter_values(std::iter::repeat_n(row, 1 << 17));
+                let keys = Int32Array::from(vec![0]);
+                let column =
+                    DictionaryArray::try_new(keys, Arc::new(values.slice(0, 1)))?;
+                Ok(RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(column)],
+                )?)
+            });
+            Box::pin(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    futures::stream::iter(batches),
+                ),
+            )
+        }
+    }
+
     #[tokio::test]
     async fn native_operators_keep_copies_of_rows_that_are_slices_of_larger_arrays()
     -> Result<()> {
         use crate::join::merge_join::allocations;
         use crate::join::merge_join::tests::SlicedRows;
         use datafusion::catalog::streaming::StreamingTable;
-        // A table of 64 rows, every one a zero-copy slice of a row of an array
-        // of 1 MiB of its own, made as the table is read (see `SlicedRows`),
-        // read by the native operators that keep the rows of their inputs
-        // (until they sort them, aggregate them in their order or join with
-        // them), or whose accumulators keep the arrays of their arguments:
-        // they keep copies of the rows only, not the arrays that they are
-        // slices of (whose bytes beyond those of the rows, which they reserve,
-        // they would hold unreserved). In a pool of 4 MiB (the scan
+        use datafusion_physical_plan::streaming::PartitionStream;
+        // Tables of 64 rows, every one a zero-copy slice of a row of an array
+        // of 1 MiB of its own (see `SlicedRows`), or a dictionary whose values
+        // are such a slice (see `SlicedDictionaryValues`), made as the table is
+        // read, read by the native operators that keep the rows of their
+        // inputs (until they sort them, aggregate them in their order or join
+        // with them), or whose accumulators keep the arrays of their
+        // arguments: they keep copies of the rows only, not the arrays that
+        // they are slices of (whose bytes beyond those of the rows, which they
+        // reserve, they would hold unreserved). In a pool of 4 MiB (the scan
         // reserves the batch that it emits), every query returns its rows,
         // allocating less than 16 MiB (on the thread of the test, as a runtime
         // of the current thread runs all tasks of the query there), while the
         // arrays of the rows take 64 MiB.
+        type MakePartition = fn() -> Arc<dyn PartitionStream>;
+        let tables: [(&str, MakePartition); 2] = [
+            ("sliced", || Arc::new(SlicedRows::new("", 64))),
+            ("sliced_dictionaries", || {
+                Arc::new(SlicedDictionaryValues::new(64))
+            }),
+        ];
         let mut config = test_session_config().with_target_partitions(1);
         // The joins build on their left inputs, the table.
         config.options_mut().optimizer.join_reordering = false;
-        for (sql, operator, rows) in [
+        for (query, operator, rows) in [
             ("SELECT k FROM sliced ORDER BY k DESC", "PhysicalSort", 64),
             (
                 "SELECT k FROM sliced ORDER BY k DESC LIMIT 64",
@@ -3870,26 +3935,29 @@ mod tests {
                 56,
             ),
         ] {
-            let (ctx, _pool) = pipeline_context_with_pool(config.clone(), 4 << 20)?;
-            let partition = Arc::new(SlicedRows::new("", 64));
-            let schema = Arc::clone(&partition.schema);
-            let table = StreamingTable::try_new(schema, vec![partition])?;
-            ctx.register_table("sliced", Arc::new(table))?;
-            let plan = ctx.sql(sql).await?.create_physical_plan().await?;
-            let root = plan.downcast_ref::<PipelineRootExec>().expect("a pipeline");
-            assert_native(sql, root.operator());
-            let tree = format_operator_tree(root.operator());
-            assert!(tree.contains(operator), "{sql}\n{tree}");
-            allocations::reset_peak();
-            let before = allocations::held();
-            let output = collect(plan, ctx.task_ctx()).await?;
-            let allocated = allocations::peak() - before;
-            let num_rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
-            assert_eq!(num_rows, rows, "{sql}");
-            assert!(
-                allocated < 16 << 20,
-                "{sql}: the query allocated {allocated} bytes\n{tree}"
-            );
+            for (name, partition) in tables {
+                let sql = query.replace("sliced", name);
+                let (ctx, _pool) = pipeline_context_with_pool(config.clone(), 4 << 20)?;
+                let partition = partition();
+                let schema = Arc::clone(partition.schema());
+                let table = StreamingTable::try_new(schema, vec![partition])?;
+                ctx.register_table(name, Arc::new(table))?;
+                let plan = ctx.sql(&sql).await?.create_physical_plan().await?;
+                let root = plan.downcast_ref::<PipelineRootExec>().expect("a pipeline");
+                assert_native(&sql, root.operator());
+                let tree = format_operator_tree(root.operator());
+                assert!(tree.contains(operator), "{sql}\n{tree}");
+                allocations::reset_peak();
+                let before = allocations::held();
+                let output = collect(plan, ctx.task_ctx()).await?;
+                let allocated = allocations::peak() - before;
+                let num_rows = output.iter().map(RecordBatch::num_rows).sum::<usize>();
+                assert_eq!(num_rows, rows, "{sql}");
+                assert!(
+                    allocated < 16 << 20,
+                    "{sql}: the query allocated {allocated} bytes\n{tree}"
+                );
+            }
         }
         Ok(())
     }

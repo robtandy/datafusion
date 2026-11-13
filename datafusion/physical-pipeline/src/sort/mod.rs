@@ -83,7 +83,7 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array,
+    Array, ArrayRef, AsArray, RecordBatch, RecordBatchOptions, UInt32Array, make_array,
 };
 use arrow::compute::{SortColumn, SortOptions, concat, lexsort_to_indices, take};
 use arrow::datatypes::{DataType, Schema, SchemaRef};
@@ -1101,13 +1101,13 @@ const KEPT_EXCESS_BYTES: usize = 1024;
 /// sorts until they sort them, reserving the bytes of their rows, see
 /// [`buffered_memory`]): with the columns that take more than twice the
 /// memory of their rows (and [`KEPT_EXCESS_BYTES`]) copied to arrays of their
-/// rows only, so that a kept batch takes at most about twice the memory that
-/// is reserved for it (as the arrays that builders make, whose buffers may
-/// have twice the capacity that they use, which are not copied). A zero-copy
-/// slice of an array keeps all of its buffers (e.g. a row of an array of 1
-/// MiB), whose bytes beyond those of its rows [`memory_size`] does not count.
-/// (It counts whole the values that views, dictionaries and lists refer to,
-/// which the copies share.)
+/// rows only (see [`compacted_array`]), so that a kept batch takes at most
+/// about twice the memory that is reserved for it (as the arrays that
+/// builders make, whose buffers may have twice the capacity that they use,
+/// which are not copied). A zero-copy slice of an array keeps all of its
+/// buffers (e.g. a row of an array of 1 MiB), whose bytes beyond those of its
+/// rows [`memory_size`] does not count. (It counts whole the values that
+/// views, dictionaries and lists refer to, which the copies may share.)
 pub(crate) fn compact_to_keep(batch: RecordBatch) -> Result<RecordBatch> {
     let Some(columns) = compacted_to_keep(batch.columns(), batch.num_rows()) else {
         return Ok(batch);
@@ -1135,19 +1135,65 @@ fn compacted_to_keep(columns: &[ArrayRef], rows: usize) -> Option<Vec<ArrayRef>>
     let mut indices = None;
     let mut compacted = None;
     for (index, column) in columns.iter().enumerate() {
-        let bytes = array_memory(column.as_ref());
-        if column.get_array_memory_size() <= 2 * bytes + KEPT_EXCESS_BYTES {
+        if !holds_more_than_kept(column.as_ref()) {
             continue;
         }
         let indices =
             indices.get_or_insert_with(|| UInt32Array::from_iter_values(0..rows));
-        // A column that `take` does not copy is kept as it is.
-        let Ok(copy) = take(column.as_ref(), indices, None) else {
+        let Some(copy) = compacted_array(column, indices) else {
             continue;
         };
         compacted.get_or_insert_with(|| columns.to_vec())[index] = copy;
     }
     compacted
+}
+
+/// Whether `array` takes more than twice the memory of its rows (see
+/// [`array_memory`]) and [`KEPT_EXCESS_BYTES`]: a slice of larger arrays.
+fn holds_more_than_kept(array: &dyn Array) -> bool {
+    array.get_array_memory_size() > 2 * array_memory(array) + KEPT_EXCESS_BYTES
+}
+
+/// A copy of the rows `indices` (all of them) of `array`, which holds more
+/// than its rows (see [`holds_more_than_kept`]), that holds them only: `take`
+/// copies the rows of an array and of its children, but the values of
+/// dictionaries and of list views, which it shares with the copy (also
+/// nested in other arrays), so the children of the copy that hold more than
+/// their rows are copied too, in turn. `None` if the array is kept as it is:
+/// arrays that `take` does not copy.
+fn compacted_array(array: &ArrayRef, indices: &UInt32Array) -> Option<ArrayRef> {
+    let copy = take(array.as_ref(), indices, None).ok()?;
+    if !holds_more_than_kept(copy.as_ref()) {
+        return Some(copy);
+    }
+    let data = copy.to_data();
+    let mut copied = false;
+    let children = data
+        .child_data()
+        .iter()
+        .map(|child| {
+            let child = make_array(child.clone());
+            if !holds_more_than_kept(child.as_ref()) {
+                return child.to_data();
+            }
+            let Ok(rows) = u32::try_from(child.len()) else {
+                return child.to_data();
+            };
+            let indices = UInt32Array::from_iter_values(0..rows);
+            match compacted_array(&child, &indices) {
+                Some(compacted) => {
+                    copied = true;
+                    compacted.to_data()
+                }
+                None => child.to_data(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if !copied {
+        return Some(copy);
+    }
+    let data = data.into_builder().child_data(children).build().ok()?;
+    Some(make_array(data))
 }
 
 /// The data types of the sort keys `ordering` of rows with schema `schema`.
@@ -1645,6 +1691,68 @@ mod tests {
     fn unbounded_reservation() -> MemoryReservation {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         MemoryConsumer::new("test").register(&pool)
+    }
+
+    #[test]
+    fn kept_batches_copy_the_shared_values_that_are_slices_of_larger_arrays() {
+        use arrow::array::{GenericListViewArray, ListArray};
+        use arrow::buffer::ScalarBuffer;
+        // A value that is a slice of an array of 1 MiB, in the values of a
+        // dictionary (also nested in a list and in a struct) and of a list view,
+        // which `take` shares with its copies.
+        let sliced = || -> ArrayRef {
+            let values = Int64Array::from_iter_values(std::iter::repeat_n(7, 1 << 17));
+            Arc::new(values.slice(0, 1))
+        };
+        let dictionary = || -> ArrayRef {
+            Arc::new(DictionaryArray::new(Int32Array::from(vec![0]), sliced()))
+        };
+        let list = {
+            let field = Arc::new(Field::new_list_field(
+                dictionary().data_type().clone(),
+                false,
+            ));
+            let offsets = OffsetBuffer::from_lengths([1]);
+            Arc::new(ListArray::new(field, offsets, dictionary(), None)) as ArrayRef
+        };
+        let structure = {
+            let field =
+                Arc::new(Field::new("d", dictionary().data_type().clone(), false));
+            Arc::new(StructArray::new(
+                vec![field].into(),
+                vec![dictionary()],
+                None,
+            )) as ArrayRef
+        };
+        let list_view = {
+            let field = Arc::new(Field::new_list_field(DataType::Int64, false));
+            Arc::new(GenericListViewArray::<i32>::new(
+                field,
+                ScalarBuffer::from(vec![0]),
+                ScalarBuffer::from(vec![1]),
+                sliced(),
+                None,
+            )) as ArrayRef
+        };
+        for column in [dictionary(), list, structure, list_view] {
+            let data_type = column.data_type().clone();
+            assert!(column.get_array_memory_size() > 1 << 20, "{data_type}");
+            let schema =
+                Arc::new(Schema::new(vec![Field::new("c", data_type.clone(), false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::clone(&column)]).unwrap();
+            let kept = compact_to_keep(batch.clone()).unwrap();
+            // The kept batch has the rows of the batch, and holds at most about
+            // twice the memory that is reserved for it.
+            assert_eq!(kept.column(0).to_data(), column.to_data(), "{data_type}");
+            let held = kept.get_array_memory_size();
+            assert!(
+                held <= 2 * buffered_memory(&kept) + KEPT_EXCESS_BYTES,
+                "{data_type}: the kept batch holds {held} bytes"
+            );
+            // So do the arrays that `columns_to_keep` keeps.
+            let [kept] = columns_to_keep(vec![column]).try_into().unwrap();
+            assert!(kept.get_array_memory_size() < 1 << 16, "{data_type}");
+        }
     }
     use datafusion::catalog::streaming::StreamingTable;
     use datafusion::datasource::MemTable;

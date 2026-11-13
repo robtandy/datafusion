@@ -1788,7 +1788,10 @@ impl PhysicalOperator for PhysicalWindow {
             self.buffer(&mut local.buckets[bucket], batch, None, reservation)?;
             return Ok(SinkResult::NeedMoreInput);
         }
-        let sorted = take_record_batch(&batch, &UInt32Array::from(order))?;
+        // (`take` copies the rows of the chunk but the values of dictionaries
+        // and list views, which the reordered chunk then keeps.)
+        let sorted =
+            compact_to_keep(take_record_batch(&batch, &UInt32Array::from(order))?)?;
         drop(batch);
         // Every bucket keeps a slice of the rows of the chunk, which keeps all
         // of the chunk: it is reserved once (its rows, and the metadata of all
@@ -3906,6 +3909,78 @@ mod tests {
                     assert_lowered_plan_byte_eq(finite, lower, task_ctx(), false).await;
                 assert_eq!(count::<PhysicalWindow>(&root), 1, "fetch {fetch:?}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_buckets_keep_copies_of_the_values_of_dictionaries_that_are_slices()
+    -> Result<()> {
+        use arrow::array::DictionaryArray;
+        // `ROW_NUMBER() OVER (PARTITION BY d ORDER BY d)` on 4 threads, of a
+        // chunk of 64 rows of a dictionary whose values are a slice of an array
+        // of 1 MiB: the rows of the chunk are distributed over several buckets,
+        // which keep slices of the chunk reordered by bucket, and `take` shares
+        // the values of a dictionary with the reordered chunk. The buckets keep
+        // copies of the values only, not the array that they are a slice of.
+        let data_type =
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int64));
+        let schema = Arc::new(Schema::new(vec![Field::new("d", data_type, false)]));
+        let d = col("d", &schema)?;
+        let order_by = LexOrdering::new([PhysicalSortExpr::new_default(Arc::clone(&d))])
+            .expect("an ordering");
+        let window_expr = datafusion_physical_plan::windows::create_window_expr(
+            &datafusion_expr::WindowFunctionDefinition::WindowUDF(
+                datafusion::functions_window::row_number::row_number_udwf(),
+            ),
+            "rn".to_string(),
+            &[],
+            std::slice::from_ref(&d),
+            order_by.as_ref(),
+            Arc::new(datafusion_expr::WindowFrame::new(Some(true))),
+            Arc::clone(&schema),
+            false,
+            false,
+            None,
+        )?;
+        let input = Arc::new(TestSource::with_schema(Arc::clone(&schema), vec![]));
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new_default(Arc::clone(&d)),
+            PhysicalSortExpr::new_default(d),
+        ]);
+        let window = PhysicalWindow::try_new(input, vec![window_expr], ordering, false)?;
+        let ctx = ExecutionContext::new(Arc::new(TaskContext::default()), 0, 4);
+        let global = window.get_global_sink_state(&ctx)?;
+        let mut local = window.get_local_sink_state(&ctx, global.as_ref())?;
+        let values = Int64Array::from_iter_values(0..1 << 17);
+        let keys = Int32Array::from_iter_values(0..64);
+        let column = DictionaryArray::try_new(keys, Arc::new(values.slice(0, 64)))?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(column)])?;
+        window.sink(
+            &ctx,
+            &DataChunk::from_record_batch(batch),
+            global.as_ref(),
+            local.as_mut(),
+        )?;
+        let buckets = &local
+            .downcast_ref::<WindowLocalState>()
+            .expect("the local state of a window")
+            .buckets;
+        let slices = buckets
+            .iter()
+            .flat_map(|bucket| &bucket.batches)
+            .collect::<Vec<_>>();
+        assert!(slices.len() > 1, "the rows of a single bucket");
+        for slice in slices {
+            let values = slice
+                .column(0)
+                .as_dictionary::<arrow::datatypes::Int32Type>()
+                .values();
+            assert!(
+                values.get_array_memory_size() < 4096,
+                "{}",
+                values.get_array_memory_size()
+            );
         }
         Ok(())
     }
