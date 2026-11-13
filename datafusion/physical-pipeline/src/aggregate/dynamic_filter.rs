@@ -886,6 +886,11 @@ mod tests {
     const M_FILES: i64 = 16;
     const M_ROWS: i64 = 4096;
 
+    /// The rows of `m` whose row in their file passes `filter`.
+    fn rows_of_m(filter: fn(i64) -> bool) -> usize {
+        M_FILES as usize * (0..M_ROWS).filter(|&row| filter(row)).count()
+    }
+
     /// Write the Parquet table `m` into `dir`: [`M_FILES`] files of
     /// [`M_ROWS`] rows, in two row groups each (of chunks large enough that
     /// the filters of the queries do not cache them, see `CachingOperator`),
@@ -1376,7 +1381,8 @@ mod tests {
         // files leave out (a `NaN` of the last file of `m` is the `MAX` of
         // `f`, which the bounds of the files before would prune), nor of
         // functions that are only named `min` or `max`: DataFusion's filters
-        // stay `true`, and the scans read every row. The results are those of
+        // stay `true`, and the scans read every row (and produce those that
+        // pass the filters folded into them). The results are those of
         // DataFusion without its filters. A filter of an aggregate without
         // values (`n` is always `NULL`) is set to `true`.
         let dir = write_tables()?;
@@ -1387,10 +1393,13 @@ mod tests {
             .options_mut()
             .optimizer
             .enable_aggregate_dynamic_filter_pushdown = false;
-        let all_rows = (M_FILES * M_ROWS) as usize;
-        for sql in [
-            "SELECT MIN(f), MAX(f) FROM m WHERE e",
-            "SELECT MAX(f), MAX(x) FROM m WHERE g > 0",
+        let e_rows = rows_of_m(|row| row % 3 != 2);
+        for (sql, all_rows) in [
+            ("SELECT MIN(f), MAX(f) FROM m WHERE e", e_rows),
+            (
+                "SELECT MAX(f), MAX(x) FROM m WHERE g > 0",
+                rows_of_m(|row| row % 7 > 0),
+            ),
         ] {
             let execution = execute(sql, config.clone(), dir.path()).await?;
             assert_eq!(execution.datafusion_filters.len(), 1, "{sql}");
@@ -1427,7 +1436,7 @@ mod tests {
                 .await?;
         assert_eq!(execution.datafusion_filters.len(), 1, "{sql}");
         assert!(execution.native_filters.is_empty(), "{sql}");
-        assert_eq!(execution.scanned_rows, all_rows, "{sql}");
+        assert_eq!(execution.scanned_rows, e_rows, "{sql}");
         assert_lowered_results_with_setup(sql, config.clone(), reference, &lookalike)
             .await;
         // An aggregate without values.
@@ -1437,7 +1446,7 @@ mod tests {
             panic!("No filter is updated: {sql}\n{}", execution.tree);
         };
         assert_eq!(filter.current()?.to_string(), "true", "{sql}");
-        assert_eq!(execution.scanned_rows, all_rows, "{sql}");
+        assert_eq!(execution.scanned_rows, e_rows, "{sql}");
         assert_aggregate_parity_with_setup(sql, config, &setup).await;
         Ok(())
     }
@@ -1910,7 +1919,8 @@ mod tests {
         // Without dynamic filters of aggregations, DataFusion produces none,
         // and the filters that the native aggregations publish (which the
         // lowering, unaware of the session, pushes into the scans) stay
-        // `true`: the scans read every row.
+        // `true`: the scans read every row (and produce those that pass the
+        // filters folded into them).
         let dir = write_tables()?;
         let setup = async |ctx: &SessionContext| register_tables(ctx, dir.path()).await;
         for threads in [1, 4] {
@@ -1920,7 +1930,10 @@ mod tests {
                 .optimizer
                 .enable_aggregate_dynamic_filter_pushdown = false;
             for (sql, rows) in [
-                ("SELECT MIN(x), MAX(x) FROM m WHERE e", M_FILES * M_ROWS),
+                (
+                    "SELECT MIN(x), MAX(x) FROM m WHERE e",
+                    rows_of_m(|row| row % 3 != 2) as i64,
+                ),
                 (
                     "SELECT DISTINCT k FROM t ORDER BY k LIMIT 3",
                     T_FILES * T_ROWS,

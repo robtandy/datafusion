@@ -402,6 +402,11 @@ impl ParquetSource {
         self
     }
 
+    /// The optional schema provider, see [`Self::with_schema_provider`].
+    pub fn schema_provider(&self) -> Option<&Arc<dyn ParquetFileSchemaProvider>> {
+        self.schema_provider.as_ref()
+    }
+
     /// Derive each file's Arrow schema from its physical Parquet schema during
     /// lazy opening, before advisory Arrow metadata is parsed.
     ///
