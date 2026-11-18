@@ -77,10 +77,12 @@ timeout 240s taskset -c 0-7 "$py" -B "$b/harness.py" verify "$work/large" \
 
 The unittest smoke suite generates the default shape twice and compares the
 bytes and layout. With `MORSEL_STOCK_CLI` it also checks counts (279 low, 3,506
-high), exact projected values including nulls, and the analyzed plans. `verify`
-compares output with a NumPy reference independently of result order: it checks
-the count scalar and checks every projected row by ID, rejecting missing IDs,
-duplicates, extra rows and wrong values. CLI CSV serialization and temporary
+high), exact projected values including nulls, and the analyzed plans. It also
+runs a timed round with cache sampling on a 24-file fixture whose verbose
+plan contains long file paths. `verify` compares the count scalar and
+projected rows against a NumPy reference without relying on output order. It
+checks each row by ID, rejecting missing IDs, duplicates, extra rows and wrong
+values. CLI CSV serialization and temporary
 storage for these checks are not timed. Verification can use more memory and
 scratch space than timing, particularly for a large high-selectivity result.
 
@@ -92,8 +94,9 @@ settings and uses stock defaults except for target partitions, batch size
 (8,192), and EXPLAIN format; `--threads` sets Tokio workers and target
 partitions. Each round visits scan-low, count-low, scan-high, count-high in
 that order. `StockCli.measure()` uses
-`EXPLAIN ANALYZE VERBOSE` around the actual SQL. DataFusion's `AnalyzeExec`
-drains every input batch, counts the output rows and discards the batches. This
+`EXPLAIN ANALYZE VERBOSE` around the actual SQL and reads its newline-delimited
+JSON output to handle long plan fields. DataFusion's `AnalyzeExec` drains
+every input batch, counts the output rows and discards the batches. This
 keeps the projection in the executed plan instead of rewriting the scan as a
 count, and avoids serializing or collecting its rows at the CLI boundary.
 

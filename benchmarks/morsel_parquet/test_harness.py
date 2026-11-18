@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+import io
+import json
+import mmap
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import pyarrow.parquet as pq
 
-from harness import StockCli, fixture_files, generate, verify, workloads
+from harness import StockCli, bench, fixture_files, generate, verify, workloads
 
 
 class SmokeTest(unittest.TestCase):
@@ -91,3 +96,38 @@ class SmokeTest(unittest.TestCase):
                     if name.startswith("scan"):
                         self.assertIn("payload", result.plan)
                         self.assertIn("projected", result.plan)
+
+    @unittest.skipUnless(
+        os.getenv("MORSEL_STOCK_CLI"), "set MORSEL_STOCK_CLI to test the CLI"
+    )
+    def test_bench_with_large_verbose_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Full metrics repeat file paths, so this exceeds the 128 KiB CSV field limit.
+            path = Path(tmp) / ("many-parts-" + "x" * 180)
+            generate(path, 24, 2, 1000)
+            files = fixture_files(path)
+            backend = StockCli(Path(os.environ["MORSEL_STOCK_CLI"]), path, 8, 30)
+            measurement = backend.measure(workloads()["scan_high"])
+            self.assertEqual(measurement.output_rows, 28400)
+            self.assertIn("projected", measurement.plan)
+
+            with redirect_stdout(io.StringIO()) as output:
+                bench(backend, files, 48000, 0, 1)
+            trials = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(len(trials), 4)
+            self.assertEqual(
+                {trial["case"]: trial["output_rows"] for trial in trials},
+                {"scan_low": 2191, "count_low": 1, "scan_high": 28400, "count_high": 1},
+            )
+            pages = sum(
+                (p.stat().st_size + mmap.PAGESIZE - 1) // mmap.PAGESIZE for p in files
+            )
+            for trial in trials:
+                self.assertEqual(trial["rep"], 1)
+                self.assertGreater(trial["seconds"], 0)
+                for key in ("cache_pages_before", "cache_pages_after"):
+                    if sys.platform == "linux":
+                        self.assertEqual(trial[key]["total"], pages)
+                        self.assertLessEqual(trial[key]["resident"], pages)
+                    else:
+                        self.assertIsNone(trial[key])

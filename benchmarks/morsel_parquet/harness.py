@@ -3,7 +3,6 @@
 # SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
 import argparse
-import csv
 import ctypes
 import json
 import mmap
@@ -126,8 +125,19 @@ class StockCli:
         )
 
     def query(self, sql, output=subprocess.PIPE):
+        return self._query(sql, output, "csv")
+
+    def _query(self, sql, output, output_format):
         result = subprocess.run(
-            [str(self.binary), "--quiet", "--format", "csv", "-c", self.ddl, sql],
+            [
+                str(self.binary),
+                "--quiet",
+                "--format",
+                output_format,
+                "-c",
+                self.ddl,
+                sql,
+            ],
             env=self.env,
             stdout=output,
             timeout=self.timeout,
@@ -144,8 +154,16 @@ class StockCli:
         return result.stdout
 
     def measure(self, sql):
-        result = self.query(f"EXPLAIN ANALYZE VERBOSE {sql}").decode()
-        metrics = dict(csv.reader(result.splitlines(keepends=True)))
+        # The full metrics plan can exceed Python's CSV field size limit.
+        result = self._query(
+            f"EXPLAIN ANALYZE VERBOSE {sql}", subprocess.PIPE, "nd-json"
+        )
+        rows = (json.loads(line) for line in result.splitlines())
+        metrics = {
+            row["plan_type"]: row["plan"]
+            for row in rows
+            if row["plan_type"] in {"Output Rows", "Duration", "Plan with Metrics"}
+        }
         duration, unit = re.fullmatch(
             r"([0-9.]+)(s|ms|µs|ns)", metrics["Duration"]
         ).groups()
