@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
-//! Experimental, opt-in morsel execution for in-memory queries.
+//! Experimental, opt-in morsel execution for in-memory and Parquet queries.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -18,7 +18,7 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Result, exec_datafusion_err, internal_err, plan_err, project_schema,
 };
-use datafusion_common_runtime::SpawnedTask;
+use datafusion_common_runtime::{JoinSet, SpawnedTask};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::expr::physical_name;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
@@ -32,13 +32,16 @@ use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType, apply_expression_roots,
 };
 use datafusion_physical_plan::filter::batch_filter;
+use datafusion_physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion_session::{QueryPlanner, Session};
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
@@ -46,15 +49,20 @@ use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
 mod count;
 mod fallback;
+#[cfg(feature = "parquet")]
+mod parquet;
 
 use count::{CountSink, CountState, FinalizedCount};
+#[cfg(feature = "parquet")]
+use parquet::{ParquetScan, ReadyReaders};
 #[cfg(test)]
 mod tests;
 
 const BATCHES_PER_MORSEL: usize = 4;
 const RESULT_CAPACITY: usize = 2;
 
-/// Opt-in planner for an experimental, unordered pipeline over [`MemTable`].
+/// Opt-in planner for an experimental, unordered pipeline over [`MemTable`]
+/// and supported Parquet listing scans (with the `parquet` feature).
 /// Lowers scans, filters, and projections with synchronous scalar expressions,
 /// and ungrouped `COUNT(*)` over filtered input. Installing this planner
 /// explicitly opts in even when the session mode is off. Unsupported queries
@@ -139,6 +147,12 @@ impl MorselQueryPlanner {
                     node = &aggregate.input;
                 }
                 LogicalPlan::TableScan(scan) => break scan,
+                LogicalPlan::Limit(_) => {
+                    return Ok(Lowering::Unsupported(format!(
+                        "native morsels do not support LIMIT/OFFSET: {}",
+                        node.display()
+                    )));
+                }
                 _ => {
                     return Ok(Lowering::Unsupported(format!(
                         "unsupported logical operator: {}",
@@ -156,17 +170,17 @@ impl MorselQueryPlanner {
                 "COUNT(*) requires a filter on its input".into(),
             ));
         }
-        // MemTable does not push predicates into its scan; residual Filter nodes
-        // above it are evaluated by the pipeline.
-        if scan.fetch.is_some()
-            || scan.skip.is_some()
-            || !scan.filters.is_empty()
-            || !scan.statistics_requests.is_empty()
-        {
-            return Ok(Lowering::Unsupported(format!(
-                "scan of {} has pushed-down limits, filters, or statistics requests",
-                scan.table_name
-            )));
+        for (present, feature) in [
+            (scan.fetch.is_some(), "LIMIT"),
+            (scan.skip.is_some(), "OFFSET"),
+            (!scan.statistics_requests.is_empty(), "statistics requests"),
+        ] {
+            if present {
+                return Ok(Lowering::Unsupported(format!(
+                    "native morsel scan of {} does not support {feature}",
+                    scan.table_name
+                )));
+            }
         }
         let Ok(provider) = source_as_provider(&scan.source) else {
             return Ok(Lowering::Unsupported(format!(
@@ -174,23 +188,41 @@ impl MorselQueryPlanner {
                 scan.table_name
             )));
         };
-        let Some(table) = provider.downcast_ref::<MemTable>() else {
-            return Ok(Lowering::Unsupported(format!(
-                "unsupported table provider for {}: expected MemTable",
-                scan.table_name
-            )));
+        let source = if let Some(table) = provider.downcast_ref::<MemTable>() {
+            if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
+                return Ok(Lowering::Unsupported(format!(
+                    "MemTable scan of {} has advertised ordering or scan filters",
+                    scan.table_name
+                )));
+            }
+            // Like MemTable::scan, snapshot the batch handles at planning time.
+            let mut batches = Vec::new();
+            for partition in &table.batches {
+                batches.extend(partition.read().await.iter().cloned());
+            }
+            Source::Memory(MemorySource {
+                table: scan.table_name.to_string(),
+                batches,
+                projection: scan.projection.clone(),
+                schema: project_schema(&provider.schema(), scan.projection.as_deref())?,
+            })
+        } else {
+            #[cfg(feature = "parquet")]
+            if let Some(table) =
+                provider.downcast_ref::<crate::datasource::listing::ListingTable>()
+            {
+                match ParquetScan::lower(table, scan, session).await? {
+                    Ok(source) => Source::Parquet(source),
+                    Err(reason) => return Ok(Lowering::Unsupported(reason)),
+                }
+            } else {
+                return Ok(unsupported_provider(&scan.table_name));
+            }
+            #[cfg(not(feature = "parquet"))]
+            return Ok(unsupported_provider(&scan.table_name));
         };
-        if !table.sort_order.lock().is_empty() {
-            return Ok(Lowering::Unsupported(format!(
-                "scan of {} has an advertised sort order",
-                scan.table_name
-            )));
-        }
-
-        let source_schema =
-            project_schema(&provider.schema(), scan.projection.as_deref())?;
         let (operators, mut schema) =
-            Self::lower_operators(nodes, Arc::clone(&source_schema), session)?;
+            Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
         let sink = if let Some((aggregate, expr, result_nodes)) = count {
             let field = LoweredAggregateBuilder::new(
                 expr,
@@ -217,19 +249,9 @@ impl MorselQueryPlanner {
         } else {
             Sink::Result
         };
-        // Like MemTable::scan, snapshot the batch handles at planning time.
-        let mut batches = Vec::new();
-        for partition in &table.batches {
-            batches.extend(partition.read().await.iter().cloned());
-        }
         Ok(Lowering::Native(MorselExec::new(
             Pipeline {
-                source: MemorySource {
-                    table: scan.table_name.to_string(),
-                    batches,
-                    projection: scan.projection.clone(),
-                    schema: source_schema,
-                },
+                source,
                 operators,
                 workers: self.workers,
                 sink,
@@ -301,10 +323,22 @@ impl MorselQueryPlanner {
     }
 }
 
+fn unsupported_provider(table: &datafusion_common::TableReference) -> Lowering {
+    Lowering::Unsupported(format!("unsupported table provider for {table}"))
+}
+
 fn supported_expr(expr: &Expr) -> Result<bool> {
+    use datafusion_functions::core::{
+        file_row_index::FileRowIndexFunc, input_file_name::InputFileNameFunc,
+    };
+
     Ok(!expr.exists(|expr| {
         Ok(match expr {
-            Expr::ScalarFunction(fun) => fun.func.as_async().is_some(),
+            Expr::ScalarFunction(fun) => {
+                fun.func.as_async().is_some()
+                    || fun.func.inner().is::<InputFileNameFunc>()
+                    || fun.func.inner().is::<FileRowIndexFunc>()
+            }
             Expr::ScalarSubquery(_)
             | Expr::Exists(_)
             | Expr::InSubquery(_)
@@ -376,6 +410,23 @@ enum Operator {
 }
 
 #[derive(Debug)]
+enum Source {
+    Memory(MemorySource),
+    #[cfg(feature = "parquet")]
+    Parquet(ParquetScan),
+}
+
+impl Source {
+    fn schema(&self) -> &SchemaRef {
+        match self {
+            Self::Memory(source) => &source.schema,
+            #[cfg(feature = "parquet")]
+            Self::Parquet(source) => &source.schema,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct MemorySource {
     table: String,
     batches: Vec<RecordBatch>,
@@ -424,7 +475,7 @@ enum Sink {
 
 #[derive(Debug)]
 struct Pipeline {
-    source: MemorySource,
+    source: Source,
     operators: Vec<Operator>,
     workers: NonZeroUsize,
     sink: Sink,
@@ -432,32 +483,63 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    async fn run_worker(
+    async fn run_memory_worker(
         &self,
+        source: &MemorySource,
         next: &AtomicUsize,
         tx: mpsc::Sender<RecordBatch>,
     ) -> Result<Option<CountState>> {
         let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
-            if start >= self.source.batches.len() {
+            if start >= source.batches.len() {
                 break;
             }
-            let end = (start + BATCHES_PER_MORSEL).min(self.source.batches.len());
-            for input in &self.source.batches[start..end] {
-                if tx.is_closed() {
+            let end = (start + BATCHES_PER_MORSEL).min(source.batches.len());
+            for input in &source.batches[start..end] {
+                if tx.is_closed()
+                    || !self.consume(source.read(input)?, &tx, &mut count).await?
+                {
                     return Ok(None);
                 }
-                let batch = apply_operators(&self.operators, self.source.read(input)?)?;
-                if let Some(local) = &mut count {
-                    local.add_rows(batch.num_rows())?;
-                } else if batch.num_rows() > 0 && tx.send(batch).await.is_err() {
-                    return Ok(None);
-                }
-                tokio::task::yield_now().await;
             }
         }
         Ok(count)
+    }
+
+    #[cfg(feature = "parquet")]
+    async fn run_parquet_worker(
+        &self,
+        ready: ReadyReaders,
+        tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<Option<CountState>> {
+        let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
+        while let Some(morsel) = ready.claim().await {
+            let mut reader = morsel.into_stream();
+            while let Some(batch) = reader.next().await {
+                if tx.is_closed() || !self.consume(batch?, &tx, &mut count).await? {
+                    return Ok(None);
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(count)
+    }
+
+    async fn consume(
+        &self,
+        batch: RecordBatch,
+        tx: &mpsc::Sender<RecordBatch>,
+        count: &mut Option<CountState>,
+    ) -> Result<bool> {
+        let batch = apply_operators(&self.operators, batch)?;
+        if let Some(local) = count {
+            local.add_rows(batch.num_rows())?;
+        } else if batch.num_rows() > 0 && tx.send(batch).await.is_err() {
+            return Ok(false);
+        }
+        tokio::task::yield_now().await;
+        Ok(true)
     }
 
     async fn run_count_result(
@@ -472,32 +554,58 @@ impl Pipeline {
         Ok(())
     }
 
-    fn start(self: Arc<Self>) -> PipelineRun {
+    fn start(
+        self: Arc<Self>,
+        context: Arc<TaskContext>,
+        metrics: ExecutionPlanMetricsSet,
+    ) -> PipelineRun {
+        #[cfg(not(feature = "parquet"))]
+        let _ = context;
         let (tx, rx) = mpsc::channel(self.sink_capacity);
         // Supervise independently of the consumer: an error must abort peers
         // even when they are waiting for space and the stream isn't polled.
         let supervisor = SpawnedTask::spawn(async move {
-            let next = Arc::new(AtomicUsize::new(0));
-            let morsels = self.source.batches.len().div_ceil(BATCHES_PER_MORSEL);
-            let mut tasks = FuturesUnordered::new();
-            for _ in 0..self.workers.get().min(morsels) {
-                if tx.is_closed() {
-                    break;
+            let mut tasks = JoinSet::new();
+            match &self.source {
+                Source::Memory(source) => {
+                    let next = Arc::new(AtomicUsize::new(0));
+                    let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
+                    for _ in 0..self.workers.get().min(morsels) {
+                        let (pipeline, next, tx) =
+                            (Arc::clone(&self), Arc::clone(&next), tx.clone());
+                        tasks.spawn(async move {
+                            let source = match &pipeline.source {
+                                Source::Memory(source) => source,
+                                #[cfg(feature = "parquet")]
+                                Source::Parquet(_) => unreachable!(),
+                            };
+                            pipeline.run_memory_worker(source, &next, tx).await
+                        });
+                    }
                 }
-                let (pipeline, next, tx) =
-                    (Arc::clone(&self), Arc::clone(&next), tx.clone());
-                tasks.push(
-                    SpawnedTask::spawn(
-                        async move { pipeline.run_worker(&next, tx).await },
-                    )
-                    .join_unwind(),
-                );
+                #[cfg(feature = "parquet")]
+                Source::Parquet(source) => {
+                    let ready = source.start(&context, &mut tasks)?;
+                    for _ in 0..self.workers.get() {
+                        let (pipeline, ready, tx) =
+                            (Arc::clone(&self), ready.clone(), tx.clone());
+                        tasks.spawn(async move {
+                            pipeline.run_parquet_worker(ready, tx).await
+                        });
+                    }
+                }
             }
             let mut combined = CountState::default();
-            while let Some(result) = tasks.next().await {
-                let local = result.map_err(|err| {
-                    exec_datafusion_err!("Morsel worker failed: {err}")
-                })??;
+            while let Some(result) = tasks.join_next().await {
+                let local = match result {
+                    Ok(result) => result?,
+                    Err(err) if err.is_panic() => {
+                        std::panic::resume_unwind(err.into_panic())
+                    }
+                    Err(err) => {
+                        return Err(exec_datafusion_err!("Morsel task failed: {err}"));
+                    }
+                };
                 if let Some(local) = local {
                     combined.combine(local)?;
                 }
@@ -515,6 +623,9 @@ impl Pipeline {
                     gate.wait().await;
                 }
                 let finalized = sink.finalize(combined)?;
+                MetricBuilder::new(&metrics)
+                    .counter("count_finalizations", 0)
+                    .add(1);
                 Self::run_count_result(finalized, result_operators, tx).await?;
             }
             Ok(())
@@ -551,6 +662,7 @@ impl PipelineRun {
 struct MorselExec {
     pipeline: Arc<Pipeline>,
     properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl MorselExec {
@@ -559,7 +671,13 @@ impl MorselExec {
             Sink::Result => EmissionType::Incremental,
             Sink::Count { .. } => EmissionType::Final,
         };
+        let metrics = match &pipeline.source {
+            Source::Memory(_) => ExecutionPlanMetricsSet::new(),
+            #[cfg(feature = "parquet")]
+            Source::Parquet(source) => source.metrics.clone(),
+        };
         Self {
+            metrics,
             pipeline: Arc::new(pipeline),
             properties: Arc::new(
                 PlanProperties::new(
@@ -577,12 +695,16 @@ impl MorselExec {
 impl DisplayAs for MorselExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pipeline = &self.pipeline;
-        let source = &pipeline.source;
-        write!(
-            f,
-            "MorselExec: workers={}, MemTable[{}, projection={:?}]",
-            pipeline.workers, source.table, source.projection
-        )?;
+        write!(f, "MorselExec: workers={}, ", pipeline.workers)?;
+        match &pipeline.source {
+            Source::Memory(source) => write!(
+                f,
+                "MemTable[{}, projection={:?}]",
+                source.table, source.projection
+            )?,
+            #[cfg(feature = "parquet")]
+            Source::Parquet(source) => write!(f, "NativeParquet[{}]", source.table)?,
+        }
         display_operators(&pipeline.operators, f)?;
         if let Sink::Count {
             result_operators, ..
@@ -614,6 +736,10 @@ impl ExecutionPlan for MorselExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -671,7 +797,7 @@ impl ExecutionPlan for MorselExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
             return internal_err!(
@@ -679,8 +805,9 @@ impl ExecutionPlan for MorselExec {
             );
         }
         let pipeline = Arc::clone(&self.pipeline);
+        let metrics = self.metrics.clone();
         let stream = stream::once(async move {
-            stream::try_unfold(pipeline.start(), |mut run| async move {
+            stream::try_unfold(pipeline.start(context, metrics), |mut run| async move {
                 Ok(run.next().await?.map(|batch| (batch, run)))
             })
         })

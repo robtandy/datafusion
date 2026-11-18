@@ -65,12 +65,12 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
     )?;
     Ok((
         Pipeline {
-            source: MemorySource {
+            source: Source::Memory(MemorySource {
                 table: "test".to_owned(),
                 batches,
                 projection: None,
                 schema,
-            },
+            }),
             operators: vec![Operator::Filter(Arc::new(predicate))],
             workers: NonZeroUsize::new(WORKERS).unwrap(),
             sink: Sink::Result,
@@ -82,7 +82,7 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
 
 fn observed_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
     let (pipeline, observations) = observed_pipeline(fail_on)?;
-    let schema = Arc::clone(&pipeline.source.schema);
+    let schema = Arc::clone(pipeline.source.schema());
     Ok((MorselExec::new(pipeline, schema), observations))
 }
 
@@ -199,7 +199,7 @@ fn execute_does_not_need_a_runtime_before_poll() -> Result<()> {
 #[tokio::test]
 async fn workers_claim_disjoint_ranges_and_backpressure_bounds_the_queue() -> Result<()> {
     let (plan, mut observations) = observed_plan(None)?;
-    let mut run = plan.pipeline.start();
+    let mut run = plan.pipeline.start(Arc::default(), plan.metrics.clone());
     // Without consumption, the only evaluated batches can be the queued ones
     // and the one parked at each worker's send.
     let mut seen = observe_n(&mut observations, RESULT_CAPACITY + WORKERS).await;
