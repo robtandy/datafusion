@@ -4,10 +4,11 @@
 
 #![cfg(feature = "sql")]
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::Session;
@@ -16,12 +17,15 @@ use datafusion::datasource::{
 };
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, ScalarUDF, Volatility, create_udf};
 use datafusion::morsel::MorselQueryPlanner;
+use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, collect, displayable,
 };
 use datafusion::prelude::{SessionConfig, SessionContext};
+use tokio::sync::mpsc;
+use tokio::task::Id;
 
 const FILTERED_QUERY: &str =
     "SELECT id + 1 AS result, label FROM items WHERE threshold > 0";
@@ -152,6 +156,86 @@ async fn lowers_memory_filter_and_projection() -> Result<()> {
     Ok(())
 }
 
+fn count_input_observer() -> (ScalarUDF, mpsc::UnboundedReceiver<Id>) {
+    let (observed, scans) = mpsc::unbounded_channel();
+    let udf = create_udf(
+        "observe_predicate",
+        vec![DataType::Boolean],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            if let Some(worker) = tokio::task::try_id() {
+                let _ = observed.send(worker);
+            }
+            Ok(args[0].clone())
+        }),
+    );
+    (udf, scans)
+}
+
+#[tokio::test]
+async fn lowers_filtered_count_star() -> Result<()> {
+    for (empty, sql, count) in [
+        (true, "SELECT COUNT(*) FROM items WHERE threshold > 0", 0),
+        (false, "SELECT COUNT(*) FROM items WHERE threshold > 100", 0),
+        (
+            false,
+            "SELECT COUNT(*) AS matching_rows FROM items WHERE observe_predicate(threshold > 0)",
+            24,
+        ),
+    ] {
+        let table = items(empty)?;
+        let default = SessionContext::new();
+        default.register_table("items", table.clone())?;
+        default.register_udf(count_input_observer().0);
+        let expected = physical(&default, sql).await?;
+        let schema = expected.schema();
+        let expected_batches = collect(expected, default.task_ctx()).await?;
+        for workers in [1, 4] {
+            let morsel = morsel_context(workers);
+            morsel.register_table("items", table.clone())?;
+            let (observer, mut scans) = count_input_observer();
+            morsel.register_udf(observer);
+            let native = physical(&morsel, sql).await?;
+            let display = displayable(native.as_ref()).indent(false).to_string();
+            assert!(display.starts_with("MorselExec:"), "{sql}: {display}");
+            assert!(display.contains("-> Filter["), "{sql}: {display}");
+            assert!(
+                display.contains("-> CountSink; FinalizedCountSource"),
+                "{sql}: {display}"
+            );
+            assert_eq!(native.pipeline_behavior(), EmissionType::Final);
+            assert_eq!(native.schema(), schema, "{sql}");
+            let execute = || collect(Arc::clone(&native), morsel.task_ctx());
+            let batches = execute().await?;
+            assert_eq!(batches, expected_batches, "{sql}");
+            assert_eq!(batches.len(), 1, "{sql}");
+            assert_eq!(batches[0].schema(), schema, "{sql}");
+            let counts = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(counts, &Int64Array::from(vec![count]), "{sql}");
+            if count > 0 {
+                let mut seen = HashSet::new();
+                while let Ok(worker) = scans.try_recv() {
+                    seen.insert(worker);
+                }
+                if workers == 1 {
+                    assert_eq!(seen.len(), 1);
+                } else {
+                    assert!(seen.len() > 1, "expected workers to share the scan");
+                    let (a, b) = tokio::try_join!(execute(), execute())?;
+                    assert_eq!(a, batches);
+                    assert_eq!(b, batches);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
     let table = items(false)?;
@@ -172,6 +256,10 @@ async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
         "SELECT id FROM items ORDER BY id DESC",
         "SELECT id FROM items LIMIT 3",
         "SELECT COUNT(*) FROM items",
+        "SELECT COUNT(label) FROM items WHERE threshold > 0",
+        "SELECT COUNT(DISTINCT id) FROM items WHERE threshold > 0",
+        "SELECT COUNT(*) FILTER (WHERE id > 0) FROM items WHERE threshold > 0",
+        "SELECT label, COUNT(*) FROM items WHERE threshold > 0 GROUP BY label",
         "SELECT id + 1 FROM unknown WHERE id > 0",
         "SELECT id, (SELECT MAX(id) FROM items) FROM items",
     ] {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -22,6 +22,7 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr::expr::physical_name;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, LogicalPlan};
+use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs, Projector};
 use datafusion_physical_expr::{
     EquivalenceProperties, PhysicalExpr, create_physical_expr,
@@ -41,7 +42,10 @@ use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
 
+mod count;
 mod fallback;
+
+use count::{CountSink, CountState, FinalizedCount};
 #[cfg(test)]
 mod tests;
 
@@ -49,8 +53,9 @@ const BATCHES_PER_MORSEL: usize = 4;
 const RESULT_CAPACITY: usize = 2;
 
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`].
-/// Only scans, filters, and projections with synchronous scalar expressions
-/// are lowered. Queries requiring ordering or other operators use
+/// Lowers scans, filters, and projections with synchronous scalar expressions,
+/// and ungrouped `COUNT(*)` over filtered input. Queries requiring ordering or
+/// other operators use
 /// [`DefaultPhysicalPlanner`](crate::physical_planner::DefaultPhysicalPlanner).
 /// This experiment does not provide a stable scheduling API.
 ///
@@ -82,6 +87,7 @@ impl MorselQueryPlanner {
         session: &dyn Session,
     ) -> Result<Option<MorselExec>> {
         let mut nodes = Vec::new();
+        let mut count = None;
         let mut node = plan;
         let scan = loop {
             match node {
@@ -98,10 +104,30 @@ impl MorselQueryPlanner {
                     nodes.push(node);
                     node = &projection.input;
                 }
+                LogicalPlan::Aggregate(aggregate) if count.is_none() => {
+                    let Some(expr) = count::count_star(aggregate) else {
+                        return Ok(None);
+                    };
+                    if !nodes
+                        .iter()
+                        .all(|node| matches!(node, LogicalPlan::Projection(_)))
+                    {
+                        return Ok(None);
+                    }
+                    count = Some((aggregate, expr, std::mem::take(&mut nodes)));
+                    node = &aggregate.input;
+                }
                 LogicalPlan::TableScan(scan) => break scan,
                 _ => return Ok(None),
             }
         };
+        if count.is_some()
+            && !nodes
+                .iter()
+                .any(|node| matches!(node, LogicalPlan::Filter(_)))
+        {
+            return Ok(None);
+        }
         // MemTable does not push predicates into its scan; residual Filter nodes
         // above it are evaluated by the pipeline.
         if scan.fetch.is_some()
@@ -121,8 +147,63 @@ impl MorselQueryPlanner {
             return Ok(None);
         }
 
-        let mut schema = project_schema(&provider.schema(), scan.projection.as_deref())?;
-        let source_schema = Arc::clone(&schema);
+        let source_schema =
+            project_schema(&provider.schema(), scan.projection.as_deref())?;
+        let (operators, mut schema) =
+            Self::lower_operators(nodes, Arc::clone(&source_schema), session)?;
+        let sink = if let Some((aggregate, expr, result_nodes)) = count {
+            let field = LoweredAggregateBuilder::new(
+                expr,
+                aggregate.input.schema(),
+                &schema,
+                session.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )
+            .build()?
+            .aggregate
+            .field();
+            let count_schema = Arc::new(Schema::new_with_metadata(
+                vec![field],
+                schema.metadata().clone(),
+            ));
+            let sink = CountSink::new(Arc::clone(&count_schema));
+            let (result_operators, result_schema) =
+                Self::lower_operators(result_nodes, count_schema, session)?;
+            schema = result_schema;
+            Sink::Count {
+                sink,
+                result_operators,
+            }
+        } else {
+            Sink::Result
+        };
+        // Like MemTable::scan, snapshot the batch handles at planning time.
+        let mut batches = Vec::new();
+        for partition in &table.batches {
+            batches.extend(partition.read().await.iter().cloned());
+        }
+        Ok(Some(MorselExec::new(
+            Pipeline {
+                source: MemorySource {
+                    table: scan.table_name.to_string(),
+                    batches,
+                    projection: scan.projection.clone(),
+                    schema: source_schema,
+                },
+                operators,
+                workers: self.workers,
+                sink,
+                sink_capacity: RESULT_CAPACITY,
+            },
+            schema,
+        )))
+    }
+
+    fn lower_operators(
+        nodes: Vec<&LogicalPlan>,
+        mut schema: SchemaRef,
+        session: &dyn Session,
+    ) -> Result<(Vec<Operator>, SchemaRef)> {
         let mut operators = Vec::with_capacity(nodes.len());
         let props = session.execution_props();
         let planning_ctx = PhysicalPlanningContext::default();
@@ -176,25 +257,7 @@ impl MorselQueryPlanner {
                 _ => unreachable!(),
             }
         }
-        // Like MemTable::scan, snapshot the batch handles at planning time.
-        let mut batches = Vec::new();
-        for partition in &table.batches {
-            batches.extend(partition.read().await.iter().cloned());
-        }
-        Ok(Some(MorselExec::new(
-            Pipeline {
-                source: MemorySource {
-                    table: scan.table_name.to_string(),
-                    batches,
-                    projection: scan.projection.clone(),
-                    schema: source_schema,
-                },
-                operators,
-                workers: self.workers,
-                sink_capacity: RESULT_CAPACITY,
-            },
-            schema,
-        )))
+        Ok((operators, schema))
     }
 }
 
@@ -262,11 +325,37 @@ impl MemorySource {
     }
 }
 
+fn apply_operators(
+    operators: &[Operator],
+    mut batch: RecordBatch,
+) -> Result<RecordBatch> {
+    for operator in operators {
+        batch = match operator {
+            Operator::Filter(predicate) => batch_filter(&batch, predicate)?,
+            Operator::Projection(projector) => projector.project_batch(&batch)?,
+        };
+        if batch.num_rows() == 0 {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
+#[derive(Debug)]
+enum Sink {
+    Result,
+    Count {
+        sink: CountSink,
+        result_operators: Vec<Operator>,
+    },
+}
+
 #[derive(Debug)]
 struct Pipeline {
     source: MemorySource,
     operators: Vec<Operator>,
     workers: NonZeroUsize,
+    sink: Sink,
     sink_capacity: usize,
 }
 
@@ -275,7 +364,8 @@ impl Pipeline {
         &self,
         next: &AtomicUsize,
         tx: mpsc::Sender<RecordBatch>,
-    ) -> Result<()> {
+    ) -> Result<Option<CountState>> {
+        let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
             if start >= self.source.batches.len() {
@@ -284,25 +374,28 @@ impl Pipeline {
             let end = (start + BATCHES_PER_MORSEL).min(self.source.batches.len());
             for input in &self.source.batches[start..end] {
                 if tx.is_closed() {
-                    return Ok(());
+                    return Ok(None);
                 }
-                let mut batch = self.source.read(input)?;
-                for operator in &self.operators {
-                    batch = match operator {
-                        Operator::Filter(predicate) => batch_filter(&batch, predicate)?,
-                        Operator::Projection(projector) => {
-                            projector.project_batch(&batch)?
-                        }
-                    };
-                    if batch.num_rows() == 0 {
-                        break;
-                    }
-                }
-                if batch.num_rows() > 0 && tx.send(batch).await.is_err() {
-                    return Ok(());
+                let batch = apply_operators(&self.operators, self.source.read(input)?)?;
+                if let Some(local) = &mut count {
+                    local.add_rows(batch.num_rows())?;
+                } else if batch.num_rows() > 0 && tx.send(batch).await.is_err() {
+                    return Ok(None);
                 }
                 tokio::task::yield_now().await;
             }
+        }
+        Ok(count)
+    }
+
+    async fn run_count_result(
+        finalized: FinalizedCount,
+        operators: &[Operator],
+        tx: mpsc::Sender<RecordBatch>,
+    ) -> Result<()> {
+        if !tx.is_closed() {
+            let batch = apply_operators(operators, finalized.into_batch())?;
+            let _ = tx.send(batch).await;
         }
         Ok(())
     }
@@ -328,11 +421,29 @@ impl Pipeline {
                     .join_unwind(),
                 );
             }
-            drop(tx);
+            let mut combined = CountState::default();
             while let Some(result) = tasks.next().await {
-                result.map_err(|err| {
+                let local = result.map_err(|err| {
                     exec_datafusion_err!("Morsel worker failed: {err}")
                 })??;
+                if let Some(local) = local {
+                    combined.combine(local)?;
+                }
+            }
+            if let Sink::Count {
+                sink,
+                result_operators,
+            } = &self.sink
+                && !tx.is_closed()
+            {
+                // Run the dependent pipeline only on successful finalization. It
+                // has no independent task to wake on error or cancellation.
+                #[cfg(test)]
+                if let Some(gate) = &sink.finalize_gate {
+                    gate.wait().await;
+                }
+                let finalized = sink.finalize(combined)?;
+                Self::run_count_result(finalized, result_operators, tx).await?;
             }
             Ok(())
         });
@@ -372,13 +483,17 @@ struct MorselExec {
 
 impl MorselExec {
     fn new(pipeline: Pipeline, schema: SchemaRef) -> Self {
+        let emission = match pipeline.sink {
+            Sink::Result => EmissionType::Incremental,
+            Sink::Count { .. } => EmissionType::Final,
+        };
         Self {
             pipeline: Arc::new(pipeline),
             properties: Arc::new(
                 PlanProperties::new(
                     EquivalenceProperties::new(schema),
                     Partitioning::UnknownPartitioning(1),
-                    EmissionType::Incremental,
+                    emission,
                     Boundedness::Bounded,
                 )
                 .with_scheduling_type(SchedulingType::Cooperative),
@@ -396,16 +511,28 @@ impl DisplayAs for MorselExec {
             "MorselExec: workers={}, MemTable[{}, projection={:?}]",
             pipeline.workers, source.table, source.projection
         )?;
-        for operator in &pipeline.operators {
-            match operator {
-                Operator::Filter(predicate) => write!(f, " -> Filter[{predicate}]")?,
-                Operator::Projection(projector) => {
-                    write!(f, " -> {}", projector.projection())?
-                }
-            }
+        display_operators(&pipeline.operators, f)?;
+        if let Sink::Count {
+            result_operators, ..
+        } = &pipeline.sink
+        {
+            write!(f, " -> CountSink; FinalizedCountSource")?;
+            display_operators(result_operators, f)?;
         }
         write!(f, " -> ResultSink[capacity={}]", pipeline.sink_capacity)
     }
+}
+
+fn display_operators(operators: &[Operator], f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    for operator in operators {
+        match operator {
+            Operator::Filter(predicate) => write!(f, " -> Filter[{predicate}]")?,
+            Operator::Projection(projector) => {
+                write!(f, " -> {}", projector.projection())?
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ExecutionPlan for MorselExec {
@@ -425,10 +552,17 @@ impl ExecutionPlan for MorselExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
+        let result_operators = match &self.pipeline.sink {
+            Sink::Result => &[][..],
+            Sink::Count {
+                result_operators, ..
+            } => result_operators.as_slice(),
+        };
         apply_expression_roots(
             self.pipeline
                 .operators
                 .iter()
+                .chain(result_operators)
                 .flat_map(|operator| match operator {
                     Operator::Filter(predicate) => {
                         itertools::Either::Left(std::iter::once(predicate))
