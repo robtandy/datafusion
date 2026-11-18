@@ -29,6 +29,67 @@ fn cli() -> Command {
     Command::new(get_cargo_bin("datafusion-cli"))
 }
 
+const MORSEL_MODE_ENV: &str = "DATAFUSION_EXECUTION_MORSEL_MODE";
+
+#[test]
+fn morsel_mode_startup_and_sql_override() {
+    let output = cli()
+        .env_clear()
+        .env(MORSEL_MODE_ENV, "required")
+        .args([
+            "-q",
+            "--format=csv",
+            "--command",
+            "SHOW datafusion.execution.morsel_mode; \
+             SET datafusion.execution.morsel_mode = 'prefer'; \
+             SHOW datafusion.execution.morsel_mode; \
+             SELECT 42 AS stock_result; \
+             CREATE TABLE morsel_items AS VALUES (1), (2); \
+             EXPLAIN FORMAT INDENT SELECT column1 FROM morsel_items; \
+             RESET datafusion.execution.morsel_mode; \
+             SHOW datafusion.execution.morsel_mode;",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(
+        stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("datafusion.execution.morsel_mode,"))
+            .collect::<Vec<_>>(),
+        ["required", "prefer", "off"],
+        "{stdout}"
+    );
+    assert!(stdout.contains("stock_result\n42\n"), "{stdout}");
+    assert!(stdout.contains("MorselExec"), "{stdout}");
+}
+
+#[rstest]
+#[case("required", "morsel_mode=required")]
+#[case("invalid", "Invalid morsel_mode")]
+fn morsel_mode_startup_rejects_unsupported_queries_or_invalid_values(
+    #[case] mode: &str,
+    #[case] diagnostic: &str,
+) {
+    let output = cli()
+        .env_clear()
+        .env(MORSEL_MODE_ENV, mode)
+        .args(["-q", "--command", "SELECT 42 AS stock_result"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stdout}\n{stderr}");
+    assert!(!stdout.contains("stock_result"), "{stdout}");
+    assert!(stdout.contains(diagnostic), "{stdout}\n{stderr}");
+}
+
 fn make_settings() -> Settings {
     let mut settings = Settings::clone_current();
     settings.set_prepend_module_to_snapshot(false);

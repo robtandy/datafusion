@@ -7,17 +7,20 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::Session;
+use datafusion::common::{exec_err, plan_err};
 use datafusion::datasource::{
     MemTable, TableProvider, TableType, ViewTable, empty::EmptyTable,
 };
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
-use datafusion::logical_expr::{Expr, ScalarUDF, Volatility, create_udf};
+use datafusion::execution::context::QueryPlanner;
+use datafusion::logical_expr::{Expr, LogicalPlan, ScalarUDF, Volatility, create_udf};
 use datafusion::morsel::MorselQueryPlanner;
 use datafusion::physical_plan::execution_plan::EmissionType;
 use datafusion::physical_plan::{
@@ -74,6 +77,181 @@ fn items(empty: bool) -> Result<Arc<MemTable>> {
 
 async fn physical(ctx: &SessionContext, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
     ctx.sql(sql).await?.create_physical_plan().await
+}
+
+#[tokio::test]
+async fn sql_mode_selects_the_planner_for_new_queries() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.register_table("items", items(false)?)?;
+    let scan = "SELECT id FROM items";
+    let unsupported = "SELECT id FROM items ORDER BY id DESC";
+    let before_set = ctx.sql(scan).await?;
+    assert_ne!(physical(&ctx, scan).await?.name(), "MorselExec");
+
+    ctx.sql("SET datafusion.execution.morsel_mode = 'prefer'")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(physical(&ctx, scan).await?.name(), "MorselExec");
+    assert_ne!(
+        before_set.create_physical_plan().await?.name(),
+        "MorselExec"
+    );
+    ctx.sql(unsupported).await?.collect().await?;
+
+    let control = ctx
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    control.clone().collect().await?;
+    let (state, _) = control.into_parts();
+    let sorted = ctx.sql(unsupported).await?.into_unoptimized_plan();
+    assert!(state.create_physical_plan(&sorted).await.is_err());
+
+    assert_eq!(physical(&ctx, scan).await?.name(), "MorselExec");
+    let count = "SELECT COUNT(*) FROM items WHERE threshold > 0";
+    assert_eq!(physical(&ctx, count).await?.name(), "MorselExec");
+    let err = physical(&ctx, unsupported).await.unwrap_err().to_string();
+    assert!(
+        err.contains("morsel_mode=required") && err.contains("Sort"),
+        "{err}"
+    );
+    assert!(
+        ctx.sql("SET datafusion.execution.morsel_mode = 'invalid'")
+            .await
+            .is_err()
+    );
+    assert_eq!(physical(&ctx, scan).await?.name(), "MorselExec");
+
+    ctx.sql("RESET datafusion.execution.morsel_mode")
+        .await?
+        .collect()
+        .await?;
+    assert_ne!(physical(&ctx, scan).await?.name(), "MorselExec");
+    Ok(())
+}
+
+#[tokio::test]
+async fn explain_and_views_do_not_bypass_required_mode() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.register_table("items", items(false)?)?;
+    ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    ctx.sql("CREATE VIEW totals AS SELECT SUM(id) AS total FROM items")
+        .await?
+        .collect()
+        .await?;
+    for query in [
+        "SELECT * FROM totals",
+        "SELECT id FROM items WHERE false",
+        "EXPLAIN SELECT id FROM items ORDER BY id",
+        "EXPLAIN FORMAT PGJSON SELECT * FROM totals",
+        "EXPLAIN ANALYZE SELECT * FROM totals",
+    ] {
+        let err = physical(&ctx, query).await.unwrap_err().to_string();
+        assert!(err.contains("morsel_mode=required"), "{query}: {err}");
+    }
+
+    let count = "SELECT COUNT(*) FROM items WHERE threshold > 0";
+    for format in ["INDENT", "TREE"] {
+        let explain = ctx
+            .sql(&format!("EXPLAIN FORMAT {format} {count}"))
+            .await?
+            .collect()
+            .await?;
+        let explain = format!("{explain:?}");
+        assert!(explain.contains("MorselExec"), "{explain}");
+        assert!(explain.contains("CountSink"), "{explain}");
+    }
+    let analyzed = physical(&ctx, &format!("EXPLAIN ANALYZE {count}")).await?;
+    assert_eq!(analyzed.children()[0].name(), "MorselExec");
+    collect(analyzed, ctx.task_ctx()).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_execution_errors_are_not_retried_with_stock_execution() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.register_batch(
+        "input",
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1])) as _)])?,
+    )?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    ctx.register_udf(create_udf(
+        "fail_native",
+        vec![DataType::Int32],
+        DataType::Int32,
+        Volatility::Volatile,
+        Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            exec_err!("test native execution error")
+        }),
+    ));
+    for (i, mode) in ["prefer", "required"].into_iter().enumerate() {
+        ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+            .await?;
+        let plan = physical(&ctx, "SELECT fail_native(id) FROM input").await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let err = collect(plan, ctx.task_ctx()).await.unwrap_err().to_string();
+        assert!(err.contains("test native execution error"), "{err}");
+        assert_eq!(calls.load(Ordering::Relaxed), i + 1);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CustomPlanner;
+
+#[async_trait::async_trait]
+impl QueryPlanner for CustomPlanner {
+    async fn create_physical_plan(
+        &self,
+        _: &LogicalPlan,
+        _: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        plan_err!("custom planner invoked")
+    }
+}
+
+#[tokio::test]
+async fn required_mode_checks_explicit_planners() -> Result<()> {
+    let state = SessionStateBuilder::new_with_default_features()
+        .with_query_planner(Arc::new(CustomPlanner))
+        .build();
+    let custom = SessionContext::new_with_state(state);
+    let explicit = morsel_context(1);
+    for ctx in [&custom, &explicit] {
+        ctx.register_table("items", items(false)?)?;
+    }
+    let scan = "SELECT id FROM items";
+    assert_eq!(physical(&explicit, scan).await?.name(), "MorselExec");
+    for mode in ["off", "prefer", "required"] {
+        for ctx in [&custom, &explicit] {
+            ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
+                .await?;
+        }
+        let err = physical(&custom, scan).await.unwrap_err().to_string();
+        if mode == "required" {
+            assert!(
+                err.contains("morsel_mode=required cannot use a custom"),
+                "{err}"
+            );
+        } else {
+            assert!(err.contains("custom planner invoked"), "{err}");
+        }
+    }
+    custom
+        .sql("SHOW datafusion.execution.morsel_mode")
+        .await?
+        .collect()
+        .await?;
+    assert_eq!(physical(&explicit, scan).await?.name(), "MorselExec");
+    let err = physical(&explicit, "SELECT id FROM items ORDER BY id")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("morsel_mode=required"), "{err}");
+    Ok(())
 }
 
 fn sorted_rows(batches: &[RecordBatch]) -> Result<Vec<OwnedRow>> {
@@ -312,9 +490,13 @@ impl TableProvider for NotInlinedView {
 async fn fallback_keeps_nested_view_planning_on_the_default_engine() -> Result<()> {
     let config = SessionConfig::new().set_bool("datafusion.explain.show_sizes", false);
     let default = SessionContext::new_with_config(config.clone());
-    let morsel = morsel_context_with_config(4, config);
+    let morsel = morsel_context_with_config(4, config.clone());
+    let prefer = SessionContext::new_with_config(config);
+    prefer
+        .sql("SET datafusion.execution.morsel_mode = 'prefer'")
+        .await?;
     let table = items(false)?;
-    for ctx in [&default, &morsel] {
+    for ctx in [&default, &morsel, &prefer] {
         ctx.register_table("items", table.clone())?;
         let plan = ctx
             .sql("SELECT id FROM items")
@@ -329,22 +511,35 @@ async fn fallback_keeps_nested_view_planning_on_the_default_engine() -> Result<(
         )?;
     }
     let sql = "SELECT id FROM wrapped ORDER BY id DESC";
-    let fallback = physical(&morsel, sql).await?;
     let expected = physical(&default, sql).await?;
-    let display = displayable(fallback.as_ref()).indent(false).to_string();
-    assert!(!display.contains("MorselExec"), "{display}");
-    assert!(!display.contains("partition_sizes="), "{display}");
-    assert_eq!(
-        display,
-        displayable(expected.as_ref()).indent(false).to_string()
-    );
+    for ctx in [&morsel, &prefer] {
+        let fallback = physical(ctx, sql).await?;
+        let display = displayable(fallback.as_ref()).indent(false).to_string();
+        assert!(!display.contains("MorselExec"), "{display}");
+        assert!(!display.contains("partition_sizes="), "{display}");
+        assert_eq!(
+            display,
+            displayable(expected.as_ref()).indent(false).to_string()
+        );
+        assert!(
+            display.contains("SortExec") && display.contains("DataSourceExec"),
+            "{display}"
+        );
+        assert_eq!(
+            physical(ctx, "SELECT id FROM items").await?.name(),
+            "MorselExec"
+        );
+    }
+    prefer
+        .sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    let err = physical(&prefer, "SELECT id FROM wrapped")
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(
-        display.contains("SortExec") && display.contains("DataSourceExec"),
-        "{display}"
-    );
-    assert_eq!(
-        physical(&morsel, "SELECT id FROM items").await?.name(),
-        "MorselExec"
+        err.contains("unsupported table provider for wrapped"),
+        "{err}"
     );
     Ok(())
 }

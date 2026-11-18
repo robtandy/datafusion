@@ -36,7 +36,7 @@ pub(super) async fn create_physical_plan(
     let planner = DefaultPhysicalPlanner::default();
     if let Some(state) = session.as_any().downcast_ref::<SessionState>() {
         // Some providers downcast sessions to SessionState; keep those working.
-        let fallback = state.clone_with_default_query_planner();
+        let fallback = state.clone_with_stock_query_planner();
         planner.create_physical_plan(plan, &fallback).await
     } else {
         let fallback = FallbackSession {
@@ -71,7 +71,7 @@ impl Session for FallbackSession<'_> {
     }
 
     fn query_planner(&self) -> Arc<dyn QueryPlanner + Send + Sync> {
-        Arc::new(DefaultQueryPlanner {})
+        Arc::new(DefaultQueryPlanner::Stock)
     }
 
     fn optimize(&self, plan: &LogicalPlan) -> Result<LogicalPlan> {

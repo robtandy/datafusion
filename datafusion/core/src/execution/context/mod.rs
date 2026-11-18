@@ -53,7 +53,7 @@ use datafusion_catalog::{
     DynamicFileCatalog, TableFunction, TableFunctionImpl, UrlTableFactory,
 };
 use datafusion_catalog_listing::SchemaSource;
-use datafusion_common::config::{ConfigField, ConfigOptions};
+use datafusion_common::config::{ConfigField, ConfigOptions, MorselMode};
 use datafusion_common::metadata::ScalarAndMetadata;
 use datafusion_common::{
     DFSchema, DataFusionError, ParamValues, SchemaError, SchemaReference, TableReference,
@@ -810,10 +810,18 @@ impl SessionContext {
         self.state.read().create_physical_expr(expr, df_schema)
     }
 
-    // return an empty dataframe
     fn return_empty_dataframe(&self) -> Result<DataFrame> {
         let plan = LogicalPlanBuilder::empty(false).build()?;
-        Ok(DataFrame::new(self.state(), plan))
+        let state = self.state();
+        // Only this synthetic statement result is exempt from strict planning.
+        // An empty relation in a user's data query is not a control statement.
+        let state =
+            if state.config_options().execution.morsel_mode == MorselMode::Required {
+                state.clone_with_stock_query_planner()
+            } else {
+                state
+            };
+        Ok(DataFrame::new(state, plan))
     }
 
     async fn create_external_table(
