@@ -3229,18 +3229,21 @@ impl DefaultPhysicalPlanner {
         session_state: &dyn Session,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let execution_plan = match logical_plan {
-            LogicalPlan::Explain(e) => self.handle_explain(e, session_state).await?,
+            LogicalPlan::Explain(e) => {
+                self.handle_explain(e, session_state, None).await?
+            }
             LogicalPlan::Analyze(a) => self.handle_analyze(a, session_state).await?,
             _ => return Ok(None),
         };
         Ok(Some(execution_plan))
     }
 
-    /// Planner for `LogicalPlan::Explain`
-    async fn handle_explain(
+    /// Render `EXPLAIN`, reusing the final physical plan if already lowered by the morsel planner.
+    pub(crate) async fn handle_explain(
         &self,
         e: &Explain,
         session_state: &dyn Session,
+        native_plan: Option<&Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use PlanType::*;
         let mut stringified_plans = vec![];
@@ -3266,15 +3269,18 @@ impl DefaultPhysicalPlanner {
             ExplainFormat::Indent => { /* fall through */ }
             ExplainFormat::Tree => {
                 // Tree render does not try to explain errors,
-                let physical_plan = self
-                    .create_initial_plan(e.plan.as_ref(), session_state)
-                    .await?;
-
-                let optimized_plan = self.optimize_physical_plan(
-                    physical_plan,
-                    session_state,
-                    |_plan, _optimizer| {},
-                )?;
+                let optimized_plan = if let Some(plan) = native_plan {
+                    Arc::clone(plan)
+                } else {
+                    let physical_plan = self
+                        .create_initial_plan(e.plan.as_ref(), session_state)
+                        .await?;
+                    self.optimize_physical_plan(
+                        physical_plan,
+                        session_state,
+                        |_plan, _optimizer| {},
+                    )?
+                };
 
                 stringified_plans.push(StringifiedPlan::new(
                     FinalPhysicalPlan,
@@ -3325,10 +3331,14 @@ impl DefaultPhysicalPlanner {
                         .indent(e.verbose)
                         .to_string()
                 };
-            match self
-                .create_initial_plan(e.plan.as_ref(), session_state)
-                .await
-            {
+            let initial_plan = match native_plan {
+                Some(plan) => Ok(Arc::clone(plan)),
+                None => {
+                    self.create_initial_plan(e.plan.as_ref(), session_state)
+                        .await
+                }
+            };
+            match initial_plan {
                 Ok(input) => {
                     // Include statistics / schema if enabled
                     stringified_plans.push(StringifiedPlan::new(
@@ -3362,18 +3372,26 @@ impl DefaultPhysicalPlanner {
                         }
                     }
 
-                    let optimized_plan = self.optimize_physical_plan(
-                        input,
-                        session_state,
-                        |plan, optimizer| {
-                            let optimizer_name = optimizer.name().to_string();
-                            let plan_type = OptimizedPhysicalPlan { optimizer_name };
-                            stringified_plans.push(StringifiedPlan::new(
-                                plan_type,
-                                render_indent(plan, show_statistics, config.show_schema),
-                            ));
-                        },
-                    );
+                    let optimized_plan = if native_plan.is_some() {
+                        Ok(input)
+                    } else {
+                        self.optimize_physical_plan(
+                            input,
+                            session_state,
+                            |plan, optimizer| {
+                                let optimizer_name = optimizer.name().to_string();
+                                let plan_type = OptimizedPhysicalPlan { optimizer_name };
+                                stringified_plans.push(StringifiedPlan::new(
+                                    plan_type,
+                                    render_indent(
+                                        plan,
+                                        show_statistics,
+                                        config.show_schema,
+                                    ),
+                                ));
+                            },
+                        )
+                    };
                     match optimized_plan {
                         Ok(input) => {
                             // This plan will includes statistics if show_statistics is on
@@ -3438,6 +3456,14 @@ impl DefaultPhysicalPlanner {
         session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input = self.create_physical_plan(&a.input, session_state).await?;
+        Ok(Self::build_analyze(a, session_state, input))
+    }
+
+    pub(crate) fn build_analyze(
+        a: &Analyze,
+        session_state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
         let schema = Arc::clone(a.schema.inner());
         let show_statistics = session_state.config_options().explain.show_statistics;
         // Statement-level overrides take precedence over the session config.
@@ -3460,14 +3486,14 @@ impl DefaultPhysicalPlanner {
             .statistics_registry()
             .cloned()
             .unwrap_or_default();
-        Ok(Arc::new(
+        Arc::new(
             AnalyzeExec::builder(a.verbose, show_statistics, input, schema)
                 .with_metric_types(metric_types)
                 .with_metric_categories(metric_categories)
                 .with_format(a.format.clone())
                 .with_statistics_registry(statistics_registry)
                 .build(),
-        ))
+        )
     }
 
     /// Optimize a physical plan by applying each physical optimizer,
@@ -5514,7 +5540,7 @@ mod tests {
             show_statistics: None,
         };
         let plan = planner
-            .handle_explain(&explain, &ctx.state())
+            .handle_explain(&explain, &ctx.state(), None)
             .await
             .unwrap();
         if let Some(plan) = plan.downcast_ref::<ExplainExec>() {

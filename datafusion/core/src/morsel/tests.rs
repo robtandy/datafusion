@@ -383,16 +383,24 @@ async fn admitted_plan_reports_lowering_errors() -> Result<()> {
     let mut filter = Filter::try_new(lit(true), Arc::new(LogicalPlan::TableScan(scan)))?;
     filter.predicate = lit(42);
     let planner = MorselQueryPlanner::new(NonZeroUsize::MIN);
-    let state = SessionStateBuilder::new_with_default_features().build();
-    let error = planner
-        .create_physical_plan(&LogicalPlan::Filter(filter), &state)
-        .await
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("Morsel filter predicate must return Boolean"),
-        "{error}"
-    );
+    let mut state = SessionStateBuilder::new_with_default_features().build();
+    for mode in [MorselMode::Off, MorselMode::Prefer, MorselMode::Required] {
+        state.config_mut().options_mut().execution.morsel_mode = mode;
+        let planner: &dyn QueryPlanner = if mode == MorselMode::Off {
+            &planner
+        } else {
+            state.query_planner().as_ref()
+        };
+        let error = planner
+            .create_physical_plan(&LogicalPlan::Filter(filter.clone()), &state)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Morsel filter predicate must return Boolean"),
+            "{error}"
+        );
+    }
     Ok(())
 }

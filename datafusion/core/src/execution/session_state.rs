@@ -8,6 +8,7 @@ use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::catalog::{
@@ -18,6 +19,7 @@ use crate::datasource::file_format::FileFormatFactory;
 use crate::datasource::provider_as_source;
 use crate::execution::SessionStateDefaults;
 use crate::execution::context::{EmptySerializerRegistry, FunctionFactory, QueryPlanner};
+use crate::morsel::MorselQueryPlanner;
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 #[cfg(feature = "sql")]
 use arrow_schema::DataType;
@@ -30,7 +32,9 @@ use datafusion_catalog::{TableFunction, TableFunctionImpl};
 use datafusion_common::alias::AliasGenerator;
 #[cfg(feature = "sql")]
 use datafusion_common::config::Dialect;
-use datafusion_common::config::{ConfigExtension, ConfigOptions, TableOptions};
+use datafusion_common::config::{
+    ConfigExtension, ConfigOptions, MorselMode, TableOptions,
+};
 use datafusion_common::display::{PlanType, StringifiedPlan, ToStringifiedPlan};
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
@@ -777,9 +781,10 @@ impl SessionState {
         &self.inner.query_planner
     }
 
-    pub(crate) fn clone_with_default_query_planner(&self) -> Self {
+    pub(crate) fn clone_with_stock_query_planner(&self) -> Self {
         let mut state = self.clone();
-        Arc::make_mut(&mut state.inner).query_planner = Arc::new(DefaultQueryPlanner {});
+        Arc::make_mut(&mut state.inner).query_planner =
+            Arc::new(DefaultQueryPlanner::Stock);
         state
     }
 
@@ -787,6 +792,8 @@ impl SessionState {
     pub fn optimize(&self, plan: &LogicalPlan) -> datafusion_common::Result<LogicalPlan> {
         if let LogicalPlan::Explain(e) = plan {
             let mut stringified_plans = e.stringified_plans.clone();
+            let report_errors_in_plan =
+                self.config_options().execution.morsel_mode != MorselMode::Required;
 
             // analyze & capture output of each rule
             let analyzer_result = self.inner.analyzer.execute_and_check(
@@ -800,7 +807,9 @@ impl SessionState {
             );
             let analyzed_plan = match analyzer_result {
                 Ok(plan) => plan,
-                Err(DataFusionError::Context(analyzer_name, err)) => {
+                Err(DataFusionError::Context(analyzer_name, err))
+                    if report_errors_in_plan =>
+                {
                     let plan_type = PlanType::AnalyzedLogicalPlan { analyzer_name };
                     stringified_plans
                         .push(StringifiedPlan::new(plan_type, err.to_string()));
@@ -834,7 +843,9 @@ impl SessionState {
             );
             let (plan, logical_optimization_succeeded) = match optimized_plan {
                 Ok(plan) => (Arc::new(plan), true),
-                Err(DataFusionError::Context(optimizer_name, err)) => {
+                Err(DataFusionError::Context(optimizer_name, err))
+                    if report_errors_in_plan =>
+                {
                     let plan_type = PlanType::OptimizedLogicalPlan { optimizer_name };
                     stringified_plans
                         .push(StringifiedPlan::new(plan_type, err.to_string()));
@@ -879,10 +890,23 @@ impl SessionState {
         logical_plan: &LogicalPlan,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let logical_plan = self.optimize(logical_plan)?;
-        self.inner
-            .query_planner
-            .create_physical_plan(&logical_plan, self)
-            .await
+        let planner = self.query_planner();
+        if self.config_options().execution.morsel_mode == MorselMode::Required {
+            let planner_type = planner.as_ref() as &dyn Any;
+            if !planner_type.is::<DefaultQueryPlanner>()
+                && !planner_type.is::<MorselQueryPlanner>()
+            {
+                if matches!(logical_plan, LogicalPlan::Show(_)) {
+                    return DefaultPhysicalPlanner::default()
+                        .create_physical_plan(&logical_plan, self)
+                        .await;
+                }
+                return plan_err!(
+                    "morsel_mode=required cannot use a custom query planner other than MorselQueryPlanner"
+                );
+            }
+        }
+        planner.create_physical_plan(&logical_plan, self).await
     }
 
     /// Create a [`PhysicalExpr`] from an [`Expr`] after applying type
@@ -1466,7 +1490,10 @@ impl SessionStateBuilder {
         self
     }
 
-    /// Set the [`QueryPlanner`]
+    /// Set the [`QueryPlanner`]. An explicit planner takes precedence over
+    /// `morsel_mode=off` and `morsel_mode=prefer`. With `morsel_mode=required`,
+    /// data queries planned by [`SessionState`] require the built-in planner or
+    /// an explicitly installed [`MorselQueryPlanner`].
     pub fn with_query_planner(
         mut self,
         query_planner: Arc<dyn QueryPlanner + Send + Sync>,
@@ -1752,7 +1779,7 @@ impl SessionStateBuilder {
             optimizer: optimizer.unwrap_or_default(),
             physical_optimizers: physical_optimizers.unwrap_or_default(),
             query_planner: query_planner
-                .unwrap_or_else(|| Arc::new(DefaultQueryPlanner {})),
+                .unwrap_or_else(|| Arc::new(DefaultQueryPlanner::Session)),
             catalog_list: catalog_list.unwrap_or_else(|| {
                 Arc::new(MemoryCatalogProviderList::new()) as Arc<dyn CatalogProviderList>
             }),
@@ -2505,7 +2532,10 @@ impl From<&SessionState> for TaskContext {
 
 /// The query planner used if no user defined planner is provided
 #[derive(Debug)]
-pub(crate) struct DefaultQueryPlanner {}
+pub(crate) enum DefaultQueryPlanner {
+    Session,
+    Stock,
+}
 
 #[async_trait]
 impl QueryPlanner for DefaultQueryPlanner {
@@ -2541,8 +2571,24 @@ impl DefaultQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &dyn Session,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let planner = DefaultPhysicalPlanner::default();
-        planner
+        let use_morsels =
+            match (self, session_state.config_options().execution.morsel_mode) {
+                (Self::Stock, MorselMode::Required) => {
+                    // In a required session only the synthetic statement result can use stock.
+                    !matches!(logical_plan, LogicalPlan::EmptyRelation(empty)
+                    if !empty.produce_one_row && empty.schema.fields().is_empty())
+                }
+                (Self::Session, MorselMode::Prefer | MorselMode::Required) => true,
+                _ => false,
+            };
+        if use_morsels {
+            let workers = NonZeroUsize::new(session_state.config().target_partitions())
+                .unwrap_or(NonZeroUsize::MIN);
+            return MorselQueryPlanner::new(workers)
+                .create_physical_plan(logical_plan, session_state)
+                .await;
+        }
+        DefaultPhysicalPlanner::default()
             .create_physical_plan(logical_plan, session_state)
             .await
     }

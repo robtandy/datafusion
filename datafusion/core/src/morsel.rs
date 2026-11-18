@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion_common::config::MorselMode;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
@@ -41,6 +42,7 @@ use futures::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
+use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
 mod count;
 mod fallback;
@@ -54,9 +56,10 @@ const RESULT_CAPACITY: usize = 2;
 
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`].
 /// Lowers scans, filters, and projections with synchronous scalar expressions,
-/// and ungrouped `COUNT(*)` over filtered input. Queries requiring ordering or
-/// other operators use
-/// [`DefaultPhysicalPlanner`](crate::physical_planner::DefaultPhysicalPlanner).
+/// and ungrouped `COUNT(*)` over filtered input. Installing this planner
+/// explicitly opts in even when the session mode is off. Unsupported queries
+/// use [`DefaultPhysicalPlanner`] unless the mode is
+/// [`MorselMode::Required`], which produces a planning error instead.
 /// This experiment does not provide a stable scheduling API.
 ///
 /// ```
@@ -75,6 +78,11 @@ pub struct MorselQueryPlanner {
     workers: NonZeroUsize,
 }
 
+enum Lowering {
+    Native(MorselExec),
+    Unsupported(String),
+}
+
 impl MorselQueryPlanner {
     /// Set the maximum number of workers per execution of a native pipeline.
     pub fn new(workers: NonZeroUsize) -> Self {
@@ -85,20 +93,28 @@ impl MorselQueryPlanner {
         &self,
         plan: &LogicalPlan,
         session: &dyn Session,
-    ) -> Result<Option<MorselExec>> {
+    ) -> Result<Lowering> {
         let mut nodes = Vec::new();
         let mut count = None;
         let mut node = plan;
         let scan = loop {
             match node {
-                LogicalPlan::Filter(filter) if supported_expr(&filter.predicate)? => {
+                LogicalPlan::Filter(filter) => {
+                    if !supported_expr(&filter.predicate)? {
+                        return Ok(Lowering::Unsupported(format!(
+                            "unsupported filter predicate: {}",
+                            filter.predicate
+                        )));
+                    }
                     nodes.push(node);
                     node = &filter.input;
                 }
                 LogicalPlan::Projection(projection) => {
                     for expr in &projection.expr {
                         if !supported_expr(expr)? {
-                            return Ok(None);
+                            return Ok(Lowering::Unsupported(format!(
+                                "unsupported projection expression: {expr}"
+                            )));
                         }
                     }
                     nodes.push(node);
@@ -106,19 +122,29 @@ impl MorselQueryPlanner {
                 }
                 LogicalPlan::Aggregate(aggregate) if count.is_none() => {
                     let Some(expr) = count::count_star(aggregate) else {
-                        return Ok(None);
+                        return Ok(Lowering::Unsupported(
+                            "only an ungrouped COUNT(*) over filtered input is supported"
+                                .into(),
+                        ));
                     };
                     if !nodes
                         .iter()
                         .all(|node| matches!(node, LogicalPlan::Projection(_)))
                     {
-                        return Ok(None);
+                        return Ok(Lowering::Unsupported(
+                            "only projection is supported above COUNT(*)".into(),
+                        ));
                     }
                     count = Some((aggregate, expr, std::mem::take(&mut nodes)));
                     node = &aggregate.input;
                 }
                 LogicalPlan::TableScan(scan) => break scan,
-                _ => return Ok(None),
+                _ => {
+                    return Ok(Lowering::Unsupported(format!(
+                        "unsupported logical operator: {}",
+                        node.display()
+                    )));
+                }
             }
         };
         if count.is_some()
@@ -126,7 +152,9 @@ impl MorselQueryPlanner {
                 .iter()
                 .any(|node| matches!(node, LogicalPlan::Filter(_)))
         {
-            return Ok(None);
+            return Ok(Lowering::Unsupported(
+                "COUNT(*) requires a filter on its input".into(),
+            ));
         }
         // MemTable does not push predicates into its scan; residual Filter nodes
         // above it are evaluated by the pipeline.
@@ -135,16 +163,28 @@ impl MorselQueryPlanner {
             || !scan.filters.is_empty()
             || !scan.statistics_requests.is_empty()
         {
-            return Ok(None);
+            return Ok(Lowering::Unsupported(format!(
+                "scan of {} has pushed-down limits, filters, or statistics requests",
+                scan.table_name
+            )));
         }
         let Ok(provider) = source_as_provider(&scan.source) else {
-            return Ok(None);
+            return Ok(Lowering::Unsupported(format!(
+                "unsupported table source for {}",
+                scan.table_name
+            )));
         };
         let Some(table) = provider.downcast_ref::<MemTable>() else {
-            return Ok(None);
+            return Ok(Lowering::Unsupported(format!(
+                "unsupported table provider for {}: expected MemTable",
+                scan.table_name
+            )));
         };
         if !table.sort_order.lock().is_empty() {
-            return Ok(None);
+            return Ok(Lowering::Unsupported(format!(
+                "scan of {} has an advertised sort order",
+                scan.table_name
+            )));
         }
 
         let source_schema =
@@ -182,7 +222,7 @@ impl MorselQueryPlanner {
         for partition in &table.batches {
             batches.extend(partition.read().await.iter().cloned());
         }
-        Ok(Some(MorselExec::new(
+        Ok(Lowering::Native(MorselExec::new(
             Pipeline {
                 source: MemorySource {
                     table: scan.table_name.to_string(),
@@ -290,9 +330,41 @@ impl QueryPlanner for MorselQueryPlanner {
         logical_plan: &LogicalPlan,
         session: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        match self.try_lower(logical_plan, session).await? {
-            Some(exec) => Ok(Arc::new(exec)),
-            None => fallback::create_physical_plan(logical_plan, session).await,
+        let query = match logical_plan {
+            LogicalPlan::Show(_) => {
+                return DefaultPhysicalPlanner::default()
+                    .create_physical_plan(logical_plan, session)
+                    .await;
+            }
+            LogicalPlan::Explain(explain) if !explain.logical_optimization_succeeded => {
+                return DefaultPhysicalPlanner::default()
+                    .handle_explain(explain, session, None)
+                    .await;
+            }
+            LogicalPlan::Explain(explain) => &explain.plan,
+            LogicalPlan::Analyze(analyze) => &analyze.input,
+            _ => logical_plan,
+        };
+        let exec: Arc<dyn ExecutionPlan> = match self.try_lower(query, session).await? {
+            Lowering::Native(exec) => Arc::new(exec),
+            Lowering::Unsupported(reason) => {
+                if session.config_options().execution.morsel_mode == MorselMode::Required
+                {
+                    return plan_err!("morsel_mode=required: {reason}");
+                }
+                return fallback::create_physical_plan(logical_plan, session).await;
+            }
+        };
+        match logical_plan {
+            LogicalPlan::Explain(explain) => {
+                DefaultPhysicalPlanner::default()
+                    .handle_explain(explain, session, Some(&exec))
+                    .await
+            }
+            LogicalPlan::Analyze(analyze) => Ok(DefaultPhysicalPlanner::build_analyze(
+                analyze, session, exec,
+            )),
+            _ => Ok(exec),
         }
     }
 }

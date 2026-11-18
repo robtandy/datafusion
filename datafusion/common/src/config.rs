@@ -887,6 +887,54 @@ impl From<SpillCompression> for Option<CompressionType> {
     }
 }
 
+/// Selects the experimental morsel engine when planning queries in a session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum MorselMode {
+    /// Use the stock engine unless an explicit planner was installed.
+    #[default]
+    Off,
+    /// Try the native engine, falling back only for unsupported queries.
+    Prefer,
+    /// Require native planning for data queries.
+    Required,
+}
+
+impl FromStr for MorselMode {
+    type Err = DataFusionError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "prefer" => Ok(Self::Prefer),
+            "required" => Ok(Self::Required),
+            _ => _config_err!(
+                "Invalid morsel_mode '{value}'; expected off, prefer, or required"
+            ),
+        }
+    }
+}
+
+impl Display for MorselMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Prefer => "prefer",
+            Self::Required => "required",
+        })
+    }
+}
+
+impl ConfigField for MorselMode {
+    fn visit<V: Visit>(&self, v: &mut V, key: &str, description: &'static str) {
+        v.some(key, self, description)
+    }
+
+    fn set(&mut self, _: &str, value: &str) -> Result<()> {
+        *self = value.parse()?;
+        Ok(())
+    }
+}
+
 /// The directory name Hive compliant writers use in place of a null partition value, and the
 /// default for [`ExecutionOptions::listing_table_hive_default_partition_name`].
 pub const HIVE_DEFAULT_PARTITION_NAME: &str = "__HIVE_DEFAULT_PARTITION__";
@@ -898,6 +946,9 @@ config_namespace! {
     ///
     /// [`SessionConfig`]: https://docs.rs/datafusion/latest/datafusion/prelude/struct.SessionConfig.html
     pub struct ExecutionOptions {
+        /// Selects the experimental morsel engine: off, prefer (fall back for unsupported queries), or required (reject unsupported queries).
+        pub morsel_mode: MorselMode, default = MorselMode::Off
+
         /// Default batch size while creating new batches, it's especially useful for
         /// buffer-in-memory batches since creating tiny batches would result in too much
         /// metadata memory consumption
