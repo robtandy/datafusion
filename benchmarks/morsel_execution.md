@@ -60,10 +60,12 @@ and checks the single count value against the fixture cardinality.
 
 Plans are made once per query and mode. Fixture generation, session and task
 context creation, SQL planning/optimization, plan reset, and oracle checks
-are outside the timer. There are five discarded warmups and 31 timed runs per
-row; the fork alternates which mode runs first on each warmup and repetition.
-Durations are reported as median [p10, p90] of the observed runs, not confidence
-intervals.
+are outside the timer. After five untimed warmups per mode, each of the 31
+timed runs is immediately preceded by an untimed drain of the same query in
+the same mode. The fork alternates which mode goes first per repetition, but
+both modes (and the Apache baseline) start each sample after their own primer
+rather than after the other executor. Durations are reported as median [p10,
+p90] of the observed runs, not confidence intervals.
 
 ## Reproduce
 
@@ -98,7 +100,9 @@ printf '\n[[bench]]\nharness = false\nname = "morsel_execution"\nrequired-featur
 
 For a short plan-selection and result-parity test instead of timing, pass
 `-- --verify` to the fork benchmark, or run the test command below. Both paths
-use a 16-batch fixture with the same layouts.
+use a 16-batch fixture with the same layouts. Positional filters and Criterion
+options such as `--save-baseline` forwarded by Cargo are ignored by this
+harness.
 
 ```sh
 timeout 900 cargo test -p datafusion --bench morsel_execution
@@ -109,13 +113,18 @@ timeout 900 cargo test -p datafusion --bench morsel_execution
 Measured 2026-11-18 UTC on `rob-tandy-dduck1` (Ubuntu 24.04.5 LTS, Linux
 `7.0.0-1014-aws`, 16 ARM Neoverse-N1 vCPUs, 61 GiB RAM). Both processes were
 restricted to CPUs 12–15; individual runtime threads were not pinned. The
-fork revision was `d9a0de0564ad3902393362e3b880045032ccc6c7` (integration
+fork revision was `366d34a61bbef2791e947b357ade51ab3079b497` (integration
 base `3dad9ce14977da4bb36a8c0d4c22c92c87a8ca25`). The baseline revision was
 `7e3d65161046baf484e9552b65f71256fc8837bb` plus the two benchmark files described
 above. Both used rustc and Cargo 1.99.1 (`aarch64-unknown-linux-gnu`), the
 workspace's Clang 18.1.3/lld linker, Tokio 1.54.1, and `release-nonlto`
 (optimized, LTO off, 16 codegen units) with only the `sql` package feature enabled.
 No Tokio I/O/time drivers or custom blocking pool settings were used.
+
+The Apache run started at 23:27:37 UTC with a host load average (1/5/15 min)
+of `2.43 / 3.86 / 9.98`; the fork run started at 23:27:59 UTC with
+`1.94 / 3.66 / 9.79`. In two one-second `vmstat` samples just before each
+launch, CPU idle time was 91–98% for Apache and 93–99% for the fork.
 
 All modes selected 2,094,791 input rows in every layout. Stock and Apache
 main used the same plan shapes, including per-partition partial aggregation
@@ -124,39 +133,39 @@ for the four-partition count. The native plans showed `MorselExec` with
 
 | Layout  | Workers | Query      | Mode        | Input Mrows/s |                First ms |                Total ms |
 | ------- | ------: | ---------- | ----------- | ------------: | ----------------------: | ----------------------: |
-| uniform |       1 | projection | off         |         424.1 |    0.684 [0.325, 0.704] | 19.782 [19.455, 19.994] |
-| uniform |       1 | projection | required    |         314.7 |    0.042 [0.030, 0.052] | 26.657 [26.478, 26.831] |
-| uniform |       1 | projection | apache-main |         417.1 |    0.328 [0.311, 0.360] | 20.110 [19.774, 20.940] |
-| uniform |       1 | count      | off         |         802.6 | 10.447 [10.100, 10.635] | 10.452 [10.104, 10.640] |
-| uniform |       1 | count      | required    |         579.8 | 14.460 [14.381, 14.569] | 14.469 [14.383, 14.571] |
-| uniform |       1 | count      | apache-main |         848.2 |   9.886 [9.807, 10.066] |   9.890 [9.811, 10.070] |
-| uniform |       4 | projection | off         |         610.7 |    0.344 [0.275, 0.850] |  13.737 [6.809, 18.912] |
-| uniform |       4 | projection | required    |         558.3 |    0.044 [0.036, 0.072] |  15.025 [7.805, 16.491] |
-| uniform |       4 | projection | apache-main |         898.3 |    0.298 [0.262, 0.407] |   9.338 [6.939, 14.966] |
-| uniform |       4 | count      | off         |        2854.8 |    2.936 [2.765, 6.276] |    2.938 [2.767, 6.278] |
-| uniform |       4 | count      | required    |        1964.5 |    4.268 [4.046, 7.465] |    4.270 [4.048, 7.468] |
-| uniform |       4 | count      | apache-main |        2166.7 |    3.869 [2.740, 5.183] |    3.872 [2.743, 5.186] |
-| skewed  |       4 | projection | off         |         435.7 |    0.338 [0.215, 0.836] | 19.253 [18.762, 20.795] |
-| skewed  |       4 | projection | required    |         754.6 |    0.051 [0.034, 0.072] |  11.116 [9.966, 18.186] |
-| skewed  |       4 | projection | apache-main |         349.4 |    0.429 [0.224, 0.909] | 24.007 [18.966, 27.377] |
-| skewed  |       4 | count      | off         |         925.3 |    9.063 [8.725, 9.569] |    9.066 [8.728, 9.572] |
-| skewed  |       4 | count      | required    |        1558.4 |    5.380 [5.292, 6.603] |    5.383 [5.295, 6.606] |
-| skewed  |       4 | count      | apache-main |         806.7 |  10.396 [8.979, 11.259] |  10.398 [8.981, 11.261] |
+| uniform |       1 | projection | off         |         454.3 |    0.305 [0.292, 0.323] | 18.467 [18.328, 18.764] |
+| uniform |       1 | projection | required    |         325.5 |    0.029 [0.028, 0.032] | 25.770 [25.540, 26.185] |
+| uniform |       1 | projection | apache-main |         443.5 |    0.279 [0.259, 0.295] | 18.913 [18.828, 18.999] |
+| uniform |       1 | count      | off         |         946.7 |    8.855 [8.805, 9.093] |    8.861 [8.811, 9.099] |
+| uniform |       1 | count      | required    |         611.6 | 13.714 [13.596, 13.921] | 13.716 [13.598, 13.923] |
+| uniform |       1 | count      | apache-main |         955.7 |    8.773 [8.746, 8.815] |    8.777 [8.750, 8.820] |
+| uniform |       4 | projection | off         |        1312.7 |    0.264 [0.234, 0.280] |    6.391 [6.227, 6.656] |
+| uniform |       4 | projection | required    |        1138.4 |    0.040 [0.039, 0.046] |    7.369 [7.307, 7.434] |
+| uniform |       4 | projection | apache-main |        1311.7 |    0.256 [0.222, 0.277] |    6.395 [6.152, 6.615] |
+| uniform |       4 | count      | off         |        3264.3 |    2.566 [2.505, 2.612] |    2.570 [2.509, 2.615] |
+| uniform |       4 | count      | required    |        2183.5 |    3.839 [3.798, 3.915] |    3.842 [3.801, 3.917] |
+| uniform |       4 | count      | apache-main |        3324.4 |    2.520 [2.462, 2.562] |    2.523 [2.465, 2.565] |
+| skewed  |       4 | projection | off         |         475.1 |    0.209 [0.183, 0.230] | 17.657 [17.471, 17.941] |
+| skewed  |       4 | projection | required    |        1112.8 |    0.040 [0.039, 0.054] |    7.538 [7.423, 7.601] |
+| skewed  |       4 | projection | apache-main |         483.7 |    0.197 [0.166, 0.217] | 17.341 [17.152, 17.472] |
+| skewed  |       4 | count      | off         |        1050.8 |    7.979 [7.894, 8.084] |    7.983 [7.897, 8.087] |
+| skewed  |       4 | count      | required    |        2162.4 |    3.876 [3.849, 3.919] |    3.879 [3.851, 3.922] |
+| skewed  |       4 | count      | apache-main |        1114.9 |    7.521 [7.481, 7.566] |    7.524 [7.484, 7.570] |
 
 Against fork `off`, native delivered the first projected batch sooner in
-all three cases, but took 35% longer to drain the single-worker projection
-and 38% longer for the single-worker count. In the balanced four-worker case,
-native medians were slower for both queries (9% for projection and 45% for
-count), with overlapping p10–p90 ranges. Under four-worker partition skew,
-native cut median total time by 42% for projection and 41% for count. Count
-emits only after finalization, so its first-result and total times are close.
+all three cases, but took 40% longer to drain the single-worker projection
+and 55% longer for the single-worker count. With four balanced partitions,
+native median total times were 15% longer for projection and 49% longer for
+count, with disjoint p10–p90 ranges. Under four-worker partition skew,
+native cut median total times by 57% and 51%, respectively. Native median
+total times differed by less than 3% between the two four-worker layouts.
+Count emits only after finalization, so its first-result and total times are close.
+Apache main median total times were within 6% of fork `off` across all six cases.
 
-**Limitations.** One invocation per binary on a shared, non-isolated workspace
-with other builds and tests running. The Apache comparison is not interleaved
-with the fork runs; even the two stock builds showed substantially different
-medians on some parallel cases. These results do not isolate a scheduler cost:
-operators can emit different batch sizes and the stock parallel projection
-stream also merges partitions. Skew here is a partition-size imbalance, not
-unequal cost per row or per morsel. The results cover only these warm,
-in-memory integer workloads, not cold runs, I/O, joins, grouped aggregation,
-or spill.
+**Limitations.** The table reports one invocation per binary on a shared
+workspace. The Apache comparison ran in a separate process, not interleaved
+with the fork modes. These results do not isolate scheduler cost: operators
+can emit different batch sizes, and stock parallel projection also merges
+partitions. Skew here is a partition-size imbalance, not unequal cost per
+row or per morsel. The results cover only these warm, in-memory integer
+workloads, not cold runs, I/O, joins, grouped aggregation, or spill.
