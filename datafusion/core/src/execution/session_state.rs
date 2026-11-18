@@ -777,6 +777,12 @@ impl SessionState {
         &self.inner.query_planner
     }
 
+    pub(crate) fn clone_with_default_query_planner(&self) -> Self {
+        let mut state = self.clone();
+        Arc::make_mut(&mut state.inner).query_planner = Arc::new(DefaultQueryPlanner {});
+        state
+    }
+
     /// Optimizes the logical plan by applying optimizer rules.
     pub fn optimize(&self, plan: &LogicalPlan) -> datafusion_common::Result<LogicalPlan> {
         if let LogicalPlan::Explain(e) = plan {
@@ -2499,7 +2505,7 @@ impl From<&SessionState> for TaskContext {
 
 /// The query planner used if no user defined planner is provided
 #[derive(Debug)]
-struct DefaultQueryPlanner {}
+pub(crate) struct DefaultQueryPlanner {}
 
 #[async_trait]
 impl QueryPlanner for DefaultQueryPlanner {
