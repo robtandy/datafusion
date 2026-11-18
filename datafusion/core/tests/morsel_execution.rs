@@ -8,22 +8,31 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Int32Array, RecordBatch, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
-use datafusion::datasource::{MemTable, empty::EmptyTable};
+use datafusion::catalog::Session;
+use datafusion::datasource::{
+    MemTable, TableProvider, TableType, ViewTable, empty::EmptyTable,
+};
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::logical_expr::Expr;
 use datafusion::morsel::MorselQueryPlanner;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, collect, displayable,
 };
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 
 const FILTERED_QUERY: &str =
     "SELECT id + 1 AS result, label FROM items WHERE threshold > 0";
 
 fn morsel_context(workers: usize) -> SessionContext {
+    morsel_context_with_config(workers, SessionConfig::new())
+}
+
+fn morsel_context_with_config(workers: usize, config: SessionConfig) -> SessionContext {
     let state = SessionStateBuilder::new_with_default_features()
+        .with_config(config)
         .with_query_planner(Arc::new(MorselQueryPlanner::new(
             NonZeroUsize::new(workers).unwrap(),
         )))
@@ -179,6 +188,76 @@ async fn falls_back_to_the_default_planner_for_the_whole_query() -> Result<()> {
             "{sql}"
         );
     }
+    Ok(())
+}
+
+// Hide the view's logical plan so the physical planner must call scan.
+#[derive(Debug)]
+struct NotInlinedView {
+    view: ViewTable,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for NotInlinedView {
+    fn schema(&self) -> SchemaRef {
+        self.view.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.view.table_type()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&[usize]>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        assert_eq!(state.session_id(), self.session_id);
+        self.view.scan(state, projection, filters, limit).await
+    }
+}
+
+#[tokio::test]
+async fn fallback_keeps_nested_view_planning_on_the_default_engine() -> Result<()> {
+    let config = SessionConfig::new().set_bool("datafusion.explain.show_sizes", false);
+    let default = SessionContext::new_with_config(config.clone());
+    let morsel = morsel_context_with_config(4, config);
+    let table = items(false)?;
+    for ctx in [&default, &morsel] {
+        ctx.register_table("items", table.clone())?;
+        let plan = ctx
+            .sql("SELECT id FROM items")
+            .await?
+            .into_optimized_plan()?;
+        ctx.register_table(
+            "wrapped",
+            Arc::new(NotInlinedView {
+                view: ViewTable::new(plan, None),
+                session_id: ctx.session_id(),
+            }),
+        )?;
+    }
+    let sql = "SELECT id FROM wrapped ORDER BY id DESC";
+    let fallback = physical(&morsel, sql).await?;
+    let expected = physical(&default, sql).await?;
+    let display = displayable(fallback.as_ref()).indent(false).to_string();
+    assert!(!display.contains("MorselExec"), "{display}");
+    assert!(!display.contains("partition_sizes="), "{display}");
+    assert_eq!(
+        display,
+        displayable(expected.as_ref()).indent(false).to_string()
+    );
+    assert!(
+        display.contains("SortExec") && display.contains("DataSourceExec"),
+        "{display}"
+    );
+    assert_eq!(
+        physical(&morsel, "SELECT id FROM items").await?.name(),
+        "MorselExec"
+    );
     Ok(())
 }
 

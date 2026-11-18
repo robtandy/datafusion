@@ -40,8 +40,8 @@ use futures::stream::{self, FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
-use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
 
+mod fallback;
 #[cfg(test)]
 mod tests;
 
@@ -51,8 +51,8 @@ const RESULT_CAPACITY: usize = 2;
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`].
 /// Only scans, filters, and projections with synchronous scalar expressions
 /// are lowered. Queries requiring ordering or other operators use
-/// [`DefaultPhysicalPlanner`]. This experiment does not provide a stable
-/// scheduling API.
+/// [`DefaultPhysicalPlanner`](crate::physical_planner::DefaultPhysicalPlanner).
+/// This experiment does not provide a stable scheduling API.
 ///
 /// ```
 /// use std::num::NonZeroUsize;
@@ -229,11 +229,7 @@ impl QueryPlanner for MorselQueryPlanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match self.try_lower(logical_plan, session).await? {
             Some(exec) => Ok(Arc::new(exec)),
-            None => {
-                DefaultPhysicalPlanner::default()
-                    .create_physical_plan(logical_plan, session)
-                    .await
-            }
+            None => fallback::create_physical_plan(logical_plan, session).await,
         }
     }
 }
