@@ -14,6 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::instant::Instant;
 use datafusion::datasource::MemTable;
 use datafusion::error::Result;
+use datafusion::execution::TaskContext;
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -158,6 +159,24 @@ async fn verify(
     Ok(())
 }
 
+async fn drain(
+    plan: Arc<dyn ExecutionPlan>,
+    task: Arc<TaskContext>,
+    mut on_first: impl FnMut(),
+) -> Result<usize> {
+    let mut stream = execute_stream(plan, task)?;
+    let mut rows = 0;
+    while let Some(batch) = stream.try_next().await? {
+        let batch = black_box(batch);
+        let batch_rows = batch.num_rows();
+        if rows == 0 && batch_rows > 0 {
+            on_first();
+        }
+        rows += batch_rows;
+    }
+    Ok(rows)
+}
+
 async fn measure(
     ctx: &SessionContext,
     plan: &Arc<dyn ExecutionPlan>,
@@ -165,16 +184,9 @@ async fn measure(
 ) -> Result<(Duration, Duration)> {
     let plan = reset_plan_states(Arc::clone(plan))?;
     let task = ctx.task_ctx();
-    let start = Instant::now();
-    let mut stream = execute_stream(plan, task)?;
     let mut first = None;
-    let mut rows = 0;
-    while let Some(batch) = stream.try_next().await? {
-        if first.is_none() && batch.num_rows() > 0 {
-            first = Some(start.elapsed());
-        }
-        rows += black_box(batch).num_rows();
-    }
+    let start = Instant::now();
+    let rows = drain(plan, task, || first = Some(start.elapsed())).await?;
     let total = start.elapsed();
     assert_eq!(rows, expected_rows);
     Ok((first.expect("expected a non-empty result"), total))
@@ -248,9 +260,11 @@ async fn run_case(
             for offset in 0..plans.len() {
                 let index = (offset + rep) % plans.len();
                 let (ctx, plan) = &plans[index];
-                let sample = measure(ctx, plan, expected_rows).await?;
+                // Condition each sample on the same engine, not the previous mode.
+                let warm = reset_plan_states(Arc::clone(plan))?;
+                assert_eq!(drain(warm, ctx.task_ctx(), || {}).await?, expected_rows);
                 if rep >= WARMUPS {
-                    samples[index].push(sample);
+                    samples[index].push(measure(ctx, plan, expected_rows).await?);
                 }
             }
         }
@@ -270,7 +284,8 @@ fn main() -> Result<()> {
             "--bench" => bench = true,
             "--test" | "--verify" => verify_only = true,
             "--apache-main" => modes = &["apache-main"],
-            _ => panic!("unknown argument: {arg}"),
+            // Cargo can forward another harness's filters and Criterion flags.
+            _ => {}
         }
     }
     // Cargo's test invocation (without --bench) runs just the small parity check.
