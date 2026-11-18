@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use arrow::array::Int32Array;
 use arrow::datatypes::{Field, Schema};
-use datafusion_common::cast::as_int32_array;
+use datafusion_common::cast::{as_int32_array, as_int64_array};
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::logical_plan::{Filter, TableScanBuilder};
 use datafusion_expr::{ColumnarValue, Volatility, create_udf, lit};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::Column;
+use tokio::sync::Semaphore;
 use tokio::task::Id;
 use tokio::time::timeout;
 
@@ -26,7 +27,7 @@ const WORKERS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(10);
 type Observations = mpsc::UnboundedReceiver<(i32, Id)>;
 
-fn observed_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
+fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batches = (0..INPUT_BATCHES)
         .map(|i| {
@@ -63,22 +64,97 @@ fn observed_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
         Arc::default(),
     )?;
     Ok((
-        MorselExec::new(
-            Pipeline {
-                source: MemorySource {
-                    table: "test".to_owned(),
-                    batches,
-                    projection: None,
-                    schema: Arc::clone(&schema),
-                },
-                operators: vec![Operator::Filter(Arc::new(predicate))],
-                workers: NonZeroUsize::new(WORKERS).unwrap(),
-                sink_capacity: RESULT_CAPACITY,
+        Pipeline {
+            source: MemorySource {
+                table: "test".to_owned(),
+                batches,
+                projection: None,
+                schema,
             },
-            schema,
-        ),
+            operators: vec![Operator::Filter(Arc::new(predicate))],
+            workers: NonZeroUsize::new(WORKERS).unwrap(),
+            sink: Sink::Result,
+            sink_capacity: RESULT_CAPACITY,
+        },
         observations,
     ))
+}
+
+fn observed_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
+    let (pipeline, observations) = observed_pipeline(fail_on)?;
+    let schema = Arc::clone(&pipeline.source.schema);
+    Ok((MorselExec::new(pipeline, schema), observations))
+}
+
+#[derive(Debug)]
+pub(super) struct FinalizeGate {
+    entered: mpsc::UnboundedSender<()>,
+    resume: Arc<Semaphore>,
+}
+
+impl FinalizeGate {
+    pub(super) async fn wait(&self) {
+        self.entered.send(()).unwrap();
+        self.resume.acquire().await.unwrap().forget();
+    }
+}
+
+struct ObservedCount {
+    plan: MorselExec,
+    scans: Observations,
+    finalizing: mpsc::UnboundedReceiver<()>,
+    resume: Arc<Semaphore>,
+    results: mpsc::UnboundedReceiver<i64>,
+}
+
+fn observed_count(fail_on: Option<usize>) -> Result<ObservedCount> {
+    let (mut pipeline, scans) = observed_pipeline(fail_on)?;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::Int64,
+        false,
+    )]));
+    let (entered, finalizing) = mpsc::unbounded_channel();
+    let resume = Arc::new(Semaphore::new(0));
+    let mut sink = CountSink::new(Arc::clone(&schema));
+    sink.finalize_gate = Some(FinalizeGate {
+        entered,
+        resume: Arc::clone(&resume),
+    });
+    let (started, results) = mpsc::unbounded_channel();
+    let observe = create_udf(
+        "observe_count",
+        vec![DataType::Int64],
+        DataType::Int64,
+        Volatility::Volatile,
+        Arc::new(move |args| {
+            let ColumnarValue::Array(count) = &args[0] else {
+                unreachable!()
+            };
+            started.send(as_int64_array(count)?.value(0)).unwrap();
+            Ok(args[0].clone())
+        }),
+    );
+    let expr = ScalarFunctionExpr::try_new(
+        Arc::new(observe),
+        vec![Arc::new(Column::new("count", 0))],
+        &schema,
+        Arc::default(),
+    )?;
+    let projector = ProjectionExprs::new([ProjectionExpr::new(Arc::new(expr), "count")])
+        .make_projector(&schema)?;
+    let output_schema = Arc::clone(projector.output_schema());
+    pipeline.sink = Sink::Count {
+        sink,
+        result_operators: vec![Operator::Projection(projector)],
+    };
+    Ok(ObservedCount {
+        plan: MorselExec::new(pipeline, output_schema),
+        scans,
+        finalizing,
+        resume,
+        results,
+    })
 }
 
 async fn observe_n(observations: &mut Observations, n: usize) -> Vec<(i32, Id)> {
@@ -90,7 +166,7 @@ async fn observe_n(observations: &mut Observations, n: usize) -> Vec<(i32, Id)> 
         seen
     })
     .await
-    .expect("workers did not reach the full sink")
+    .expect("workers did not evaluate the expected number of batches")
 }
 
 async fn assert_workers_stopped(pipeline: &Weak<Pipeline>) {
@@ -195,6 +271,107 @@ async fn worker_error_cancels_peers_without_polling_the_full_sink() -> Result<()
     let error = stream.next().await.unwrap().unwrap_err();
     assert!(error.to_string().contains("test morsel failure"), "{error}");
     assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_result_waits_for_finalization_after_all_workers_finish() -> Result<()> {
+    let ObservedCount {
+        plan,
+        mut scans,
+        mut finalizing,
+        resume,
+        mut results,
+    } = observed_count(None)?;
+    let mut stream = plan.execute(0, Arc::default())?;
+    drop(plan);
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    let seen = observe_n(&mut scans, INPUT_BATCHES).await;
+    assert!(seen.iter().any(|&(_, worker)| worker != seen[0].1));
+    assert_eq!(results.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    assert!(futures::poll!(stream.next()).is_pending());
+
+    resume.add_permits(1);
+    let batch = timeout(DEADLINE, stream.next()).await.unwrap().unwrap()?;
+    assert_eq!(
+        as_int64_array(batch.column(0))?.values().as_ref(),
+        &[INPUT_BATCHES as i64]
+    );
+    assert_eq!(results.try_recv(), Ok(INPUT_BATCHES as i64));
+    assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    assert_eq!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_count_before_finalization_never_starts_result() -> Result<()> {
+    let ObservedCount {
+        plan,
+        mut finalizing,
+        mut results,
+        scans: _scans,
+        ..
+    } = observed_count(None)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, Arc::default())?;
+    drop(plan);
+    assert!(futures::poll!(stream.next()).is_pending());
+    assert_eq!(
+        timeout(DEADLINE, finalizing.recv()).await.unwrap(),
+        Some(())
+    );
+    drop(stream);
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    assert_eq!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn count_worker_error_skips_finalization_and_result() -> Result<()> {
+    let ObservedCount {
+        plan,
+        mut finalizing,
+        mut results,
+        scans: _scans,
+        ..
+    } = observed_count(Some(3))?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, Arc::default())?;
+    drop(plan);
+    let error = timeout(DEADLINE, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("test morsel failure"), "{error}");
+    assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+    assert_workers_stopped(&pipeline).await;
+    assert_eq!(
+        finalizing.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    assert_eq!(
+        results.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
     Ok(())
 }
 
