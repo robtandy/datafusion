@@ -51,21 +51,25 @@ do not treat a run during a build or other shared-host activity as performance s
   starts polling its own stream. This proves overlap of query execution, not
   simultaneous CPU residency, and can miss scans that start later in the sample.
   A mixed run without a successful overlapping sample is invalid.
-- Requests are offered at `epoch + id * interval`, even if earlier work has not
-  completed. A single foreground consumer takes FIFO requests; the driver does
-  not block on this bounded queue. `queued` counts accepted requests that had an
-  earlier accepted request outstanding. `dropped` means the channel was full.
-  A late driver still attempts every offer against the original timestamps;
-  `late_offers` counts offers at least one interarrival late. `overdue` means
-  the time from scheduled arrival to finish (or rejection for a drop) exceeded
-  `--overdue-ms`. These flags can overlap other counts.
-- End-to-end latency is **scheduled arrival to end of stream**, including timer
-  wake lag, queueing, SQL parsing, logical and physical planning, execution,
-  and draining. Planning is dequeue to physical-plan creation. No query plans
-  are reused. Draining counts rows and captures a scalar when requested without
-  retaining all output. Result assertions run after both workloads drain, outside
-  latency and throughput timers. Dataset generation, fixture registration and
-  warm-up are also outside the timers.
+- Requests are scheduled for `epoch + id * interval`, regardless of when
+  earlier work completes. The caller thread sleeps until each deadline on the
+  monotonic clock, without relying on Tokio's worker timers. OS scheduling can
+  still delay the driver. A late driver attempts every offer against the
+  original timestamps; `late_offers` counts offers at least one interarrival
+  late. The driver never blocks on the bounded FIFO queue: `queued` counts
+  accepted requests that had an earlier accepted request outstanding, and
+  `dropped` means the channel was full. `overdue` means the time from scheduled
+  arrival to finish (or rejection for a drop) exceeded `--overdue-ms`. These
+  flags can overlap other counts.
+- End-to-end latency is **scheduled arrival to end of stream**. It includes
+  `offer_lag` (scheduled to actual offer), `queue_wait` (offer to dequeue,
+  including worker wake-up), and `service_time` (dequeue to end of stream).
+  `planning` covers dequeue to physical-plan creation, including SQL parsing
+  and logical planning. No query plans are reused. Draining counts rows and
+  captures a scalar when requested without retaining all output. Result
+  assertions run after both workloads drain, outside latency and throughput
+  timers. Dataset generation, fixture registration and warm-up are also
+  outside the timers.
 - The cooperative timeout applies from scheduled arrival for foreground work
   (including queueing) and from query start for background work. There are finite
   request, window, queue and background scan limits (10,000 scans per lane per
@@ -85,10 +89,10 @@ CPU workload. All overrides use the same arrival and drain logic.
 ## Reading the JSON
 
 There is one report per invocation. Pair `runs` by zero-based `repetition` and
-compare `mode` (`isolated` or `mixed`). The latency/planning distributions have
-nearest-rank p50, p95 and p99 in nanoseconds, sample counts, and sample variance
-in ns² (null for fewer than two samples). Only successful requests contribute to
-latency statistics. Per-offer timestamps are relative to that run's scheduled
+compare `mode` (`isolated` or `mixed`). Each timing distribution has nearest-rank
+p50, p95 and p99 in nanoseconds, a sample count, and sample variance in ns²
+(null for fewer than two samples). All distributions use the same set of
+successful requests. Per-offer timestamps are relative to that run's scheduled
 start. Check drops, failures, overdue and overlap counts before comparing
 percentiles; a sample with heavy drops is not directly comparable to a lossless
 one.
@@ -104,7 +108,7 @@ the nominal window during the measured run.
 ## Stock validation on dduck2
 
 One release invocation of the commands above (Rust 1.99.1, aarch64 Neoverse-N1,
-DataFusion base `3dad9ce14977da4bb36a8c0d4c22c92c87a8ca25`). It offered 200
+DataFusion base `d649cacf00fee7125f45ea1427a023b2eab732b1`). It offered 200
 requests/s per phase with four CPUs, four async workers, up to two blocking
 workers, four target partitions and three background lanes. There were no drops
 or failures. The expected foreground count was 236 and the background sum was
@@ -113,17 +117,18 @@ performance or a performance threshold.
 
 | Pair | Mode     | Samples | p50 ms | p95 ms | p99 ms | Variance ms² | Overlap | Completed/s | Scans/s |
 | ---: | :------- | ------: | -----: | -----: | -----: | -----------: | ------: | ----------: | ------: |
-|    0 | Isolated |     300 |   2.32 |   2.85 |   3.42 |         0.14 |       0 |      200.00 |    0.00 |
-|    0 | Mixed    |     300 |  10.59 |  31.18 |  38.80 |        85.19 |     299 |      198.25 |   33.33 |
-|    1 | Isolated |     300 |   2.43 |   2.95 |   3.06 |         0.10 |       0 |      200.00 |    0.00 |
-|    1 | Mixed    |     300 |  10.68 |  30.04 |  40.64 |        87.84 |     298 |      199.10 |   34.00 |
-|    2 | Isolated |     300 |   2.29 |   2.79 |   2.88 |         0.10 |       0 |      200.00 |    0.00 |
-|    2 | Mixed    |     300 |  10.17 |  30.77 |  38.20 |        76.53 |     300 |      199.64 |   36.00 |
+|    0 | Isolated |     300 |   0.95 |   1.07 |   1.46 |        0.015 |       0 |      200.00 |    0.00 |
+|    0 | Mixed    |     300 |   5.52 |  23.61 |  30.36 |       48.789 |     299 |      200.00 |   33.33 |
+|    1 | Isolated |     300 |   0.97 |   1.11 |   1.19 |        0.005 |       0 |      200.00 |    0.00 |
+|    1 | Mixed    |     300 |   4.42 |  21.13 |  27.27 |       40.819 |     298 |      200.00 |   34.67 |
+|    2 | Isolated |     300 |   0.98 |   1.15 |   2.01 |        0.024 |       0 |      200.00 |    0.00 |
+|    2 | Mixed    |     300 |   4.24 |  18.27 |  27.44 |       33.273 |     299 |      200.00 |   34.00 |
 
 All three lanes overlapped at least one foreground execution in each mixed run.
-Mixed runs had 172–178 queued, 147–150 late offers and 51–62 overdue requests;
-isolated runs had none. Late wake-ups are part of end-to-end latency under this
-CPU budget; the planning p50 was 0.71–0.74 ms across all six runs.
+No offer was a full interval late. Mean offer lag was 0.06–0.07 ms isolated
+and 0.14–0.16 ms mixed; the mixed median queue wait was 2.90–4.41 ms.
+Mixed runs had 133–160 queued and 12–24 overdue requests; isolated runs had
+none. The planning p50 was 0.71–0.74 ms across all six runs.
 
 ## Smoke test
 
@@ -134,4 +139,3 @@ timeout 1200 cargo test --release --locked --manifest-path benchmarks/morsel_mix
 The integration tests exercise the binary, check fixed arrivals, stock result
 validation and real execution overlap, and verify that a wrong expected row
 count across several output batches is reported as a failure after draining.
-EOF

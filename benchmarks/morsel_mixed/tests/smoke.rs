@@ -43,7 +43,15 @@ fn stock_pair_drains_queries_and_overlaps_scans() {
     for run in [isolated, mixed] {
         assert_eq!(run["offered"], 40);
         assert_eq!(run["failed"], 0);
-        assert_eq!(run["latency"]["samples"], run["completed"]);
+        for timing in [
+            "latency",
+            "offer_lag",
+            "queue_wait",
+            "service_time",
+            "planning",
+        ] {
+            assert_eq!(run[timing]["samples"], run["completed"], "{timing}");
+        }
         assert_eq!(
             run["completed"].as_u64().unwrap() + run["dropped"].as_u64().unwrap(),
             40

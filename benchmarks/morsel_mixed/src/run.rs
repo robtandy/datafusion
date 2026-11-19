@@ -37,6 +37,9 @@ pub(crate) struct Report {
     offered_per_second: f64,
     completed_per_second: f64,
     latency: Distribution,
+    offer_lag: Distribution,
+    queue_wait: Distribution,
+    service_time: Distribution,
     planning: Distribution,
     background: BackgroundReport,
     requests: Vec<Request>,
@@ -173,8 +176,10 @@ pub(crate) async fn measure(
     let mut requests = Vec::with_capacity(args.requests as usize);
     for id in 0..args.requests {
         let scheduled = epoch + interval * id;
-        if scheduled > Instant::now() {
-            sleep_until(scheduled).await;
+        // This is the block_on caller; offer pacing does not need a Tokio timer.
+        let wait = scheduled.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
         let offered = Instant::now();
         match tx.try_reserve() {
@@ -316,6 +321,15 @@ pub(crate) async fn measure(
         completed_per_second: completed as f64 / foreground_elapsed.as_secs_f64(),
         latency: Distribution::new(
             successful().filter_map(|r| Some(r.finished_ns? - r.scheduled_ns)),
+        ),
+        offer_lag: Distribution::new(
+            successful().map(|r| r.offered_ns.saturating_sub(r.scheduled_ns)),
+        ),
+        queue_wait: Distribution::new(
+            successful().filter_map(|r| Some(r.started_ns? - r.offered_ns)),
+        ),
+        service_time: Distribution::new(
+            successful().filter_map(|r| Some(r.finished_ns? - r.started_ns?)),
         ),
         planning: Distribution::new(
             successful().filter_map(|r| Some(r.plan_ready_ns? - r.started_ns?)),
