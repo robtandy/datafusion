@@ -4,10 +4,11 @@ SPDX-FileCopyrightText: See the NOTICE file distributed with this work for addit
 SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 -->
 
-# Morsel Parquet workload: stock baseline
+# Morsel Parquet benchmark
 
-This fork-only harness runs stock DataFusion without the morsel planner or a
-native morsel Parquet adapter. It is not a comparison between backends.
+This fork-only harness compares stock and native morsel execution on the same
+Parquet fixture and SQL (#128). The original stock CLI baseline (#130) remains
+available below; its timing boundary is different.
 
 ## Fixture and SQL
 
@@ -46,7 +47,155 @@ values; row-group min/max or footer row counts cannot answer it. The payload
 is used only for the projection and can be skipped by the filtered count;
 `unused` can be skipped in all four cases.
 
-## Run
+## Native Parquet A/B (#128)
+
+Build one release-mode executable for both arms. Pin the first comparison to
+`d649cacf00fee7125f45ea1427a023b2eab732b1` (the merge of PR #143 for #126),
+before the optimizations in #145 or metrics changes in #138. Keep that checkout
+and its binary separate from any later-revision comparison. The recipe copies a
+benchmark-only Cargo example into the detached checkout so it can reuse the
+pinned workspace's `Cargo.lock`, features, profiles and toolchain without
+changing any manifests.
+
+From the harness checkout on a Linux remote workspace with `uv` and `taskset`:
+
+```bash
+set -e
+b=benchmarks/morsel_parquet
+work=$(mktemp -d "$HOME/.cache/issue128.XXXXXX")
+revision=d649cacf00fee7125f45ea1427a023b2eab732b1
+
+git worktree add --detach "$work/pinned" "$revision"
+mkdir -p "$work/pinned/datafusion/core/examples"
+cp "$b/stream_runner.rs" "$work/pinned/datafusion/core/examples/morsel_parquet_stream.rs"
+(
+  cd "$work/pinned"
+  MORSEL_BENCH_REVISION="$(git rev-parse HEAD)" CARGO_TARGET_DIR="$work/target" \
+    timeout --kill-after=20s 35m cargo build --locked --profile release-nonlto -j 10 \
+      -p datafusion --no-default-features --features parquet,sql --example morsel_parquet_stream
+)
+runner="$work/target/release-nonlto/examples/morsel_parquet_stream"
+timeout 120s uv venv --python 3.12.10 "$work/venv"
+timeout 180s uv pip install --python "$work/venv/bin/python" -r "$b/requirements.txt"
+py="$work/venv/bin/python"
+
+MORSEL_PARQUET_RUNNER="$runner" MORSEL_BENCH_REVISION="$revision" \
+  timeout 120s "$py" -B -m unittest discover -s "$b" -v
+
+timeout 60s "$py" -B "$b/harness.py" generate "$work/large" \
+  --files 16 --groups 8 --group-rows 131072
+# Adapt the CPU list to your host. Run on an otherwise idle workspace.
+for cache in warm page-cache-cold; do
+  timeout --kill-after=10s 240s taskset -c 0-7 "$py" -B "$b/harness.py" ab "$work/large" \
+    --runner "$runner" --revision "$revision" --threads 8 --timeout 120 \
+    --cache "$cache" --warmups 1 --repeats 8 > "$work/$cache.jsonl"
+done
+```
+
+### A/B controls and timing
+
+- `ab` uses `morsel_mode=off` and `morsel_mode=required` explicitly. Both arms
+  must match the same exact NumPy oracle (including nullable projected values,
+  duplicate/missing ID checks, and both count scalars) before timing. The first
+  NDJSON record contains untimed plan evidence for all eight arm/query pairs.
+  Native runs must show `NativeParquet[fixture]` under `MorselExec`, claim all
+  fixture row groups, and show `CountSink` plus one count finalization for count
+  queries only. The stock runs must show a stock Parquet `DataSourceExec`.
+  Each trial rechecks the engine revision, path and drained row count.
+- Every invocation starts a fresh process, runtime and session. Both arms use
+  the same registration SQL and 8,192-row batch size. `--threads` sets target
+  partitions, Tokio workers and the Tokio blocking-thread limit (all eight in
+  this run); all threads inherit the same eight-CPU affinity. File splitting,
+  listing-statistics collection, row-group statistics pruning, row filter
+  pushdown, page-index and Bloom pruning are disabled in both arms. The scan
+  needs `row_id`, `score`, `delta`, `payload`; count needs only `score`, `delta`.
+  Other session options use defaults, not environment overrides.
+- The clock starts just before `CREATE EXTERNAL TABLE`, including file listing,
+  schema inference and SQL/physical planning (`plan_seconds`). It ends at
+  stream exhaustion. First output is the first **nonempty** result batch from
+  the same clock. Both arms use `execute_stream` and count/drain the result
+  batches, with no CSV or collection during timing. Process/runtime/session
+  startup, validation, plan/metrics formatting and teardown are not timed.
+  Throughput is **logical input rows / total seconds**, not storage bandwidth.
+  Each workload pairs the two arms and alternates which arm goes first by round.
+- `warm` reads the entire private fixture into the Linux file page cache and
+  requires 100% residency via `mincore` before each timed arm. `page-cache-cold`
+  is for **exclusively used, locally generated fixture files only**. The driver
+  syncs those files and requests `POSIX_FADV_DONTNEED` on each before each timed
+  arm. It requires zero resident file pages before launching the runner. Cache
+  reset and sampling are outside the clock; registration's own footer reads
+  occur inside it. Both regimes log residency again after execution. If a
+  residency check fails, the driver stops; do not treat partial/unverified
+  output as a completed regime. Neither regime resets global/shared caches or
+  controls filesystem metadata, hypervisor or storage-device caches. Cold here
+  means **Linux file pages only**, not cold physical storage.
+
+### Pinned A/B results: `rob-tandy-dduck1`, 2026-11-19 UTC
+
+- Ubuntu 24.04.5 LTS, Linux `7.0.0-1014-aws`, 16 ARM Neoverse-N1 vCPUs
+  (one thread per core), 61 GiB RAM. The run used CPUs 0–7 as above. The
+  workspace was not reserved, but no builds were active during the run; the
+  local Clippy job was suspended. One-second `vmstat -y 1 3` samples showed
+  78–90% host CPU idle just before warm verification, 93–100% between the two
+  regimes, and 95–99% afterward.
+- Both modes used the one locked `release-nonlto` build from the pinned
+  `d649cacf00fee7125f45ea1427a023b2eab732b1` checkout. Rust 1.99.1 (`58cf8f9c3`,
+  `aarch64-unknown-linux-gnu`), Cargo 1.99.1, Clang/lld 18.1.3, Tokio 1.54.1,
+  Python 3.12.10, and the pinned NumPy and PyArrow versions. The 16-file,
+  128-row-group fixture was 311,529,117 bytes on the local Btrfs workspace
+  volume (Zstandard level 3).
+- All 64 warm samples started and ended with 76,063/76,063 file pages
+  resident (4 KiB). All 64 page-cache-cold samples started with 0/76,063
+  resident; 20,556–54,559 were resident afterward. Device cache state was
+  not measured or controlled.
+- Both arms matched all 759,841 low-selectivity and 9,883,940 high-selectivity
+  projected rows and count scalars. The stock source had eight groups of two
+  whole files, with a residual filter and partial/final aggregates for count.
+  In the native arm `MorselExec: workers=8, NativeParquet[fixture]` claimed all
+  128 row groups in every case, with `CountSink; FinalizedCountSource` and
+  `count_finalizations=1` for count (zero for scans). Both arms reported
+  `bytes_scanned=196691567` for scans and `75280626` for counts at both
+  selectivities. These are Parquet source metrics, not device I/O counters.
+- In the pinned implementation, stock scans stream file groups per partition
+  and merge outputs, while the morsel source publishes buffered row-group
+  readers using up to four file lanes, two pending I/O slots and a ready queue
+  of two readers. The native result channel has capacity two; the native count
+  sink combines worker-local counts before emitting its single row. The same
+  thread budgets and scan options do not imply the same scheduling or I/O
+  overlap.
+
+One warmup and eight timed samples per case and mode in each regime. The
+entries are medians; parentheses give the observed minimum and maximum for
+first output and total runtime. Registration/planning is included and took
+5.7–8.9 ms across all samples.
+
+| Cache           | Case         | Mode       | Input Mrows/s |  First ms (min–max) |  Total ms (min–max) |
+| --------------- | ------------ | ---------- | ------------: | ------------------: | ------------------: |
+| Warm            | `scan_low`   | `off`      |          99.5 |    31.3 (30.7–32.8) | 168.6 (163.6–176.8) |
+| Warm            | `scan_low`   | `required` |          27.3 |    15.0 (14.4–15.8) | 615.5 (607.3–627.9) |
+| Warm            | `count_low`  | `off`      |         185.1 |    90.7 (87.8–99.9) |    90.7 (87.8–99.9) |
+| Warm            | `count_low`  | `required` |          68.4 | 245.3 (239.7–251.8) | 245.4 (239.8–251.8) |
+| Warm            | `scan_high`  | `off`      |          86.4 |    16.9 (15.9–17.7) | 194.3 (188.1–211.9) |
+| Warm            | `scan_high`  | `required` |          27.1 |    14.6 (14.3–15.5) | 618.0 (611.2–634.6) |
+| Warm            | `count_high` | `off`      |         184.1 |    91.1 (87.4–97.0) |    91.1 (87.4–97.0) |
+| Warm            | `count_high` | `required` |          68.8 | 244.0 (238.7–252.7) | 244.0 (238.8–252.7) |
+| Page-cache-cold | `scan_low`   | `off`      |          84.5 |    36.1 (31.3–38.5) | 198.5 (195.2–200.2) |
+| Page-cache-cold | `scan_low`   | `required` |          27.1 |    19.1 (18.3–19.6) | 619.8 (613.8–624.0) |
+| Page-cache-cold | `count_low`  | `off`      |         159.7 |  105.1 (99.6–113.6) |  105.1 (99.7–113.6) |
+| Page-cache-cold | `count_low`  | `required` |          67.7 | 247.6 (243.2–249.0) | 247.7 (243.2–249.1) |
+| Page-cache-cold | `scan_high`  | `off`      |          76.8 |    21.8 (19.2–23.8) | 218.6 (211.4–229.0) |
+| Page-cache-cold | `scan_high`  | `required` |          27.0 |    19.1 (18.3–19.5) | 621.4 (615.8–624.8) |
+| Page-cache-cold | `count_high` | `off`      |         160.1 | 104.8 (103.8–108.8) | 104.8 (103.8–108.8) |
+| Page-cache-cold | `count_high` | `required` |          67.9 | 247.0 (244.6–248.7) | 247.1 (244.6–248.8) |
+
+Native scans reached their first result earlier in both regimes, but took
+3.18–3.65× as long to drain warm and 2.84–3.12× as long page-cache-cold.
+Both counts regressed in first output and total time; native total medians
+were 2.68–2.71× stock warm and 2.36× stock page-cache-cold. The comparison
+measures the whole path; it does not isolate the cost of buffering, decoding
+or the scheduler, and is not a prediction for later revisions.
+
+## Stock-only run (#130)
 
 From the repository root on a Linux host with `uv`, `taskset` and the pinned Rust
 toolchain (use CPUs available to your process):
@@ -86,7 +235,7 @@ values. CLI CSV serialization and temporary
 storage for these checks are not timed. Verification can use more memory and
 scratch space than timing, particularly for a large high-selectivity result.
 
-### Timing and adding another backend (#128)
+### Stock CLI timing
 
 Every warmup or timed query gets a fresh CLI process/session with the same
 fixture registered as `fixture`. The harness clears inherited `DATAFUSION_*`
@@ -111,15 +260,6 @@ before and after using Linux `mincore`; this does not prove what storage I/O
 occurred. No cache is flushed or evicted. `--warmups 0` skips warmup but does
 not imply any pages are cold (generation and metadata reads can warm them).
 
-For #128, import `workloads()`, `verify()` and `bench()` from `harness.py`.
-Supply a backend with `query(sql, output=...)` for verification (return CSV
-bytes or write them to the supplied binary file; include a header, use empty
-fields for nulls, and emit no bytes for an empty result). Implement
-`measure(sql)` to return a `Measurement`. Use the same fixture and drain all
-result batches with equivalent work; keep CSV and parity validation separate
-from timing. If the public API in #128 permits first-batch measurement, use it
-on **both** backends and define the start and end boundaries identically.
-
 ## Stock evidence: `dduck2`, 2026-11-18 UTC
 
 - `datafusion-cli 57.0.0-dev`, optimized Cargo `release-nonlto` profile, built
@@ -142,6 +282,6 @@ on **both** backends and define the start and end boundaries identically.
 | `count_high` |            1 |          0.085 |     0.085–0.087 |                       196.3 |
 
 Untimed verification matched all projected rows and both `COUNT(*)` values:
-759,841 (low, 4.53%) and 9,883,940 (high, 58.91%). Compare both backends on
-one quiet host in #128 rather than using these timings as the stock half of
-that comparison.
+759,841 (low, 4.53%) and 9,883,940 (high, 58.91%). Do not use these timings
+as the stock half of the A/B comparison, which uses a different timing boundary
+and build.
