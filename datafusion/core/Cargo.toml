@@ -340,3 +340,8 @@ name = "reset_plan_states"
 [[bench]]
 harness = false
 name = "partition_metrics"
+
+[[bench]]
+harness = false
+name = "morsel_execution"
+required-features = ["sql"]
