@@ -61,7 +61,7 @@ class SmokeTest(unittest.TestCase):
     def test_ab_verifies_both_plans_before_recording_stream_timings(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fixture with spaces"
-            generate(path, 2, 3, 1000)
+            generate(path, 2, 3, 4000)
             result = subprocess.check_output(
                 [
                     sys.executable,
@@ -88,12 +88,12 @@ class SmokeTest(unittest.TestCase):
                 timeout=120,
             )
             header, *trials = (json.loads(line) for line in result.splitlines())
-            self.assertEqual(header["verified_matches"], {"low": 279, "high": 3506})
+            self.assertEqual(header["verified_matches"], {"low": 1085, "high": 14227})
             self.assertEqual(len(header["evidence"]), 8)
             expected = {
-                "scan_low": 279,
+                "scan_low": 1085,
                 "count_low": 1,
-                "scan_high": 3506,
+                "scan_high": 14227,
                 "count_high": 1,
             }
             self.assertEqual(len(trials), 16)
@@ -111,6 +111,18 @@ class SmokeTest(unittest.TestCase):
                     self.assertLessEqual(
                         trial["first_output_seconds"], trial["seconds"]
                     )
+                    self.assertGreater(trial["output_batches"], 0)
+                    if trial["case"].startswith("count_"):
+                        self.assertEqual(trial["output_batches"], 1)
+                    if trial["output_rows"] >= 8192:
+                        self.assertLessEqual(
+                            trial["first_output_seconds"], trial["first_8192_seconds"]
+                        )
+                        self.assertLessEqual(
+                            trial["first_8192_seconds"], trial["seconds"]
+                        )
+                    else:
+                        self.assertIsNone(trial["first_8192_seconds"])
                     pages = trial["cache_pages_before"]
                     self.assertGreater(pages["total"], 0)
                     self.assertEqual(pages["resident"], pages["total"])

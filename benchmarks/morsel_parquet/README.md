@@ -82,11 +82,17 @@ py="$work/venv/bin/python"
 MORSEL_PARQUET_RUNNER="$runner" MORSEL_BENCH_REVISION="$revision" \
   timeout 120s "$py" -B -m unittest discover -s "$b" -v
 
-timeout 60s "$py" -B "$b/harness.py" generate "$work/large" \
+# Choose a private fixture directory on the device under test, independent of
+# the build location. On dduck1 this root is on Btrfs on local instance-store.
+fixture_root=$(mktemp -d "${MORSEL_PARQUET_FIXTURE_ROOT:-$HOME/.cache}/morsel-parquet-fixture.XXXXXX")
+fixture="$fixture_root/large"
+findmnt -T "$fixture_root" -o TARGET,SOURCE,FSTYPE,OPTIONS
+lsblk -o NAME,TYPE,MODEL,PKNAME
+timeout 60s "$py" -B "$b/harness.py" generate "$fixture" \
   --files 16 --groups 8 --group-rows 131072
 # Adapt the CPU list to your host. Run on an otherwise idle workspace.
 for cache in warm page-cache-cold; do
-  timeout --kill-after=10s 240s taskset -c 0-7 "$py" -B "$b/harness.py" ab "$work/large" \
+  timeout --kill-after=10s 240s taskset -c 0-7 "$py" -B "$b/harness.py" ab "$fixture" \
     --runner "$runner" --revision "$revision" --threads 8 --timeout 120 \
     --cache "$cache" --warmups 1 --repeats 8 > "$work/$cache.jsonl"
 done
@@ -112,12 +118,20 @@ done
   Other session options use defaults, not environment overrides.
 - The clock starts just before `CREATE EXTERNAL TABLE`, including file listing,
   schema inference and SQL/physical planning (`plan_seconds`). It ends at
-  stream exhaustion. First output is the first **nonempty** result batch from
-  the same clock. Both arms use `execute_stream` and count/drain the result
-  batches, with no CSV or collection during timing. Process/runtime/session
+  stream exhaustion. `first_output_seconds` is the time to the first nonempty
+  result batch; `first_8192_seconds` is the time to at least 8,192 cumulative
+  result rows (`null` if the result is smaller). `output_batches` counts
+  nonempty batches. Both arms use `execute_stream` and drain all batches,
+  with no CSV or collection during timing. Process/runtime/session
   startup, validation, plan/metrics formatting and teardown are not timed.
   Throughput is **logical input rows / total seconds**, not storage bandwidth.
   Each workload pairs the two arms and alternates which arm goes first by round.
+- The same configured batch size does not imply the same result batch size.
+  Stock `FilterExec` uses a `LimitedBatchCoalescer`: it combines small filtered
+  batches toward 8,192 rows, and batches above 4,096 rows can bypass coalescing.
+  Native `MorselExec` emits nonempty filtered/projected batches without
+  coalescing. Compare the time to 8,192 cumulative rows for equivalent output
+  volume rather than treating first-batch latency alone as a speedup.
 - `warm` reads the entire private fixture into the Linux file page cache and
   requires 100% residency via `mincore` before each timed arm. `page-cache-cold`
   is for **exclusively used, locally generated fixture files only**. The driver
@@ -133,17 +147,18 @@ done
 ### Pinned A/B results: `rob-tandy-dduck1`, 2026-11-19 UTC
 
 - Ubuntu 24.04.5 LTS, Linux `7.0.0-1014-aws`, 16 ARM Neoverse-N1 vCPUs
-  (one thread per core), 61 GiB RAM. The run used CPUs 0–7 as above. The
-  workspace was not reserved, but no builds were active during the run; the
-  local Clippy job was suspended. One-second `vmstat -y 1 3` samples showed
-  78–90% host CPU idle just before warm verification, 93–100% between the two
-  regimes, and 95–99% afterward.
+  (one thread per core), 61 GiB RAM. The run used CPUs 0–7 as above and no
+  builds were active. The workspace was not reserved; one-second
+  `vmstat -y 1 3` samples just before launching each regime showed 99–100%
+  host CPU idle.
 - Both modes used the one locked `release-nonlto` build from the pinned
   `d649cacf00fee7125f45ea1427a023b2eab732b1` checkout. Rust 1.99.1 (`58cf8f9c3`,
   `aarch64-unknown-linux-gnu`), Cargo 1.99.1, Clang/lld 18.1.3, Tokio 1.54.1,
   Python 3.12.10, and the pinned NumPy and PyArrow versions. The 16-file,
-  128-row-group fixture was 311,529,117 bytes on the local Btrfs workspace
-  volume (Zstandard level 3).
+  128-row-group fixture was 311,529,117 bytes (Parquet Zstandard level 3).
+  It was generated under `$HOME/.cache` on the local EC2 NVMe instance-store
+  LVM volume `/dev/mapper/vg_ws_ephemeral-volume1p1` (Btrfs, mounted with
+  `compress=zstd:1`), not on the EBS-backed overlay root used by `/var/tmp`.
 - All 64 warm samples started and ended with 76,063/76,063 file pages
   resident (4 KiB). All 64 page-cache-cold samples started with 0/76,063
   resident; 20,556–54,559 were resident afterward. Device cache state was
@@ -164,36 +179,57 @@ done
   thread budgets and scan options do not imply the same scheduling or I/O
   overlap.
 
-One warmup and eight timed samples per case and mode in each regime. The
-entries are medians; parentheses give the observed minimum and maximum for
-first output and total runtime. Registration/planning is included and took
-5.7–8.9 ms across all samples.
+One warmup and eight timed samples per case and mode in each regime. Batch
+counts were constant within each case and mode. Timings and throughput are
+medians, with observed minimum and maximum times in parentheses. `—` means
+fewer than 8,192 rows were returned. Registration/planning is included and
+took 5.6–11.5 ms across all samples.
 
-| Cache           | Case         | Mode       | Input Mrows/s |  First ms (min–max) |  Total ms (min–max) |
-| --------------- | ------------ | ---------- | ------------: | ------------------: | ------------------: |
-| Warm            | `scan_low`   | `off`      |          99.5 |    31.3 (30.7–32.8) | 168.6 (163.6–176.8) |
-| Warm            | `scan_low`   | `required` |          27.3 |    15.0 (14.4–15.8) | 615.5 (607.3–627.9) |
-| Warm            | `count_low`  | `off`      |         185.1 |    90.7 (87.8–99.9) |    90.7 (87.8–99.9) |
-| Warm            | `count_low`  | `required` |          68.4 | 245.3 (239.7–251.8) | 245.4 (239.8–251.8) |
-| Warm            | `scan_high`  | `off`      |          86.4 |    16.9 (15.9–17.7) | 194.3 (188.1–211.9) |
-| Warm            | `scan_high`  | `required` |          27.1 |    14.6 (14.3–15.5) | 618.0 (611.2–634.6) |
-| Warm            | `count_high` | `off`      |         184.1 |    91.1 (87.4–97.0) |    91.1 (87.4–97.0) |
-| Warm            | `count_high` | `required` |          68.8 | 244.0 (238.7–252.7) | 244.0 (238.8–252.7) |
-| Page-cache-cold | `scan_low`   | `off`      |          84.5 |    36.1 (31.3–38.5) | 198.5 (195.2–200.2) |
-| Page-cache-cold | `scan_low`   | `required` |          27.1 |    19.1 (18.3–19.6) | 619.8 (613.8–624.0) |
-| Page-cache-cold | `count_low`  | `off`      |         159.7 |  105.1 (99.6–113.6) |  105.1 (99.7–113.6) |
-| Page-cache-cold | `count_low`  | `required` |          67.7 | 247.6 (243.2–249.0) | 247.7 (243.2–249.1) |
-| Page-cache-cold | `scan_high`  | `off`      |          76.8 |    21.8 (19.2–23.8) | 218.6 (211.4–229.0) |
-| Page-cache-cold | `scan_high`  | `required` |          27.0 |    19.1 (18.3–19.5) | 621.4 (615.8–624.8) |
-| Page-cache-cold | `count_high` | `off`      |         160.1 | 104.8 (103.8–108.8) | 104.8 (103.8–108.8) |
-| Page-cache-cold | `count_high` | `required` |          67.9 | 247.0 (244.6–248.7) | 247.1 (244.6–248.8) |
+| Cache           | Case         | Mode       | Batches | Input Mrows/s | First batch ms (min–max) | First 8,192 rows ms (min–max) |  Total ms (min–max) |
+| --------------- | ------------ | ---------- | ------: | ------------: | -----------------------: | ----------------------------: | ------------------: |
+| Warm            | `scan_low`   | `off`      |      96 |          99.1 |         30.8 (30.1–32.4) |              30.8 (30.1–32.4) | 169.3 (167.1–201.3) |
+| Warm            | `scan_low`   | `required` |   2,048 |          27.2 |         14.8 (14.4–17.6) |              29.7 (29.3–36.0) | 617.6 (614.4–664.3) |
+| Warm            | `count_low`  | `off`      |       1 |         182.1 |        92.1 (89.7–110.7) |                             — |   92.1 (89.7–110.7) |
+| Warm            | `count_low`  | `required` |       1 |          67.9 |      246.9 (242.4–256.6) |                             — | 246.9 (242.4–256.6) |
+| Warm            | `scan_high`  | `off`      |   2,048 |          86.3 |         16.9 (15.8–19.6) |              16.9 (15.8–19.6) | 194.3 (191.4–237.0) |
+| Warm            | `scan_high`  | `required` |   2,048 |          27.0 |         15.0 (14.4–16.3) |              21.7 (20.9–23.1) | 621.9 (616.9–665.5) |
+| Warm            | `count_high` | `off`      |       1 |         181.5 |        92.4 (88.1–112.7) |                             — |   92.4 (88.1–112.7) |
+| Warm            | `count_high` | `required` |       1 |          68.7 |      244.3 (241.2–263.9) |                             — | 244.3 (241.3–264.0) |
+| Page-cache-cold | `scan_low`   | `off`      |      96 |          82.2 |         38.9 (33.3–40.7) |              38.9 (33.3–40.7) | 204.1 (196.0–210.3) |
+| Page-cache-cold | `scan_low`   | `required` |   2,048 |          26.9 |         20.0 (18.0–21.4) |              35.0 (33.0–36.9) | 624.2 (619.6–638.0) |
+| Page-cache-cold | `count_low`  | `off`      |       1 |         158.8 |      105.7 (102.6–114.7) |                             — | 105.7 (102.6–114.7) |
+| Page-cache-cold | `count_low`  | `required` |       1 |          66.7 |      251.5 (245.1–255.8) |                             — | 251.5 (245.1–255.8) |
+| Page-cache-cold | `scan_high`  | `off`      |   2,048 |          75.1 |         23.9 (19.7–26.7) |              24.0 (20.0–26.7) | 223.5 (218.9–235.5) |
+| Page-cache-cold | `scan_high`  | `required` |   2,048 |          26.7 |         19.2 (18.6–21.7) |              25.9 (25.2–28.5) | 628.3 (624.3–640.3) |
+| Page-cache-cold | `count_high` | `off`      |       1 |         152.2 |      110.2 (102.1–114.7) |                             — | 110.2 (102.1–114.8) |
+| Page-cache-cold | `count_high` | `required` |       1 |          67.3 |      249.2 (245.0–256.5) |                             — | 249.2 (245.1–256.6) |
 
-Native scans reached their first result earlier in both regimes, but took
-3.18–3.65× as long to drain warm and 2.84–3.12× as long page-cache-cold.
-Both counts regressed in first output and total time; native total medians
-were 2.68–2.71× stock warm and 2.36× stock page-cache-cold. The comparison
+On instance-store, the low-selectivity scan's earlier native first batch
+mostly reflects batching, not faster delivery of the same number of rows.
+Stock emitted 96 batches averaging about 7,915 rows; native emitted 2,048
+averaging 371 rows.
+Warm, the first-batch medians were 30.8 ms stock and 14.8 ms native, but both
+reached 8,192 rows at about 30 ms. Page-cache-cold, the median difference
+shrank from 18.9 ms at the first batch to 3.9 ms at 8,192 rows, with overlapping
+ranges. For the high-selectivity scan, the native first batch was a few
+milliseconds earlier, but native reached 8,192 rows later in both regimes.
+
+Native scans took 3.20–3.65× as long to drain warm and 2.81–3.06× as long
+page-cache-cold. Both counts regressed in first output and total time, with
+native total medians of 2.64–2.68× stock warm and 2.26–2.38× page-cache-cold.
+The page-cache-cold ratios (2.36–3.12× in the original run, 2.26–3.06× here)
+apply only to this local instance-store configuration. This comparison
 measures the whole path; it does not isolate the cost of buffering, decoding
 or the scheduler, and is not a prediction for later revisions.
+
+A separate storage check used the same pinned binary and recipe with
+`MORSEL_PARQUET_FIXTURE_ROOT=/var/tmp`, only `page-cache-cold`, and `--repeats 3`.
+The fixtures were on the EBS-backed overlay root, and all 24 timed samples
+started with zero resident file pages. Median total times were 1.87–1.89 s
+for scans and 0.90–0.92 s for counts; native total medians were 0.99–1.03×
+stock. The native scans reached 8,192 rows earlier in this check (35–36 ms
+versus 85–203 ms), but had similar total runtimes. Neither check establishes
+cold physical-device caches.
 
 ## Stock-only run (#130)
 

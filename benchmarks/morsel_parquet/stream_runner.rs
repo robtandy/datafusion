@@ -14,6 +14,8 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::TryStreamExt;
 use serde_json::json;
 
+const BATCH_SIZE: usize = 8192;
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [operation, mode, workers, ddl, sql] = args.as_slice() else {
@@ -46,7 +48,7 @@ async fn run(
     sql: &str,
 ) -> Result<(), Box<dyn Error>> {
     let mut config = SessionConfig::new()
-        .with_batch_size(8192)
+        .with_batch_size(BATCH_SIZE)
         .with_target_partitions(workers)
         .with_collect_statistics(false)
         .with_repartition_file_scans(false);
@@ -68,11 +70,24 @@ async fn run(
     let plan_seconds = start.elapsed().as_secs_f64();
     let mut stream = execute_stream(Arc::clone(&plan), task_ctx)?;
     let mut first_output_seconds = None;
+    let mut first_8192_seconds = None;
     let mut output_rows = 0;
+    let mut output_batches = 0;
     while let Some(batch) = stream.try_next().await? {
         if batch.num_rows() != 0 {
-            first_output_seconds.get_or_insert_with(|| start.elapsed().as_secs_f64());
+            let before = output_rows;
             output_rows += batch.num_rows();
+            output_batches += 1;
+            let reached_8192 = before < BATCH_SIZE && output_rows >= BATCH_SIZE;
+            if output_batches == 1 || reached_8192 {
+                let elapsed = start.elapsed().as_secs_f64();
+                if output_batches == 1 {
+                    first_output_seconds = Some(elapsed);
+                }
+                if reached_8192 {
+                    first_8192_seconds = Some(elapsed);
+                }
+            }
             if let Some(writer) = &mut writer {
                 writer.write(&batch)?;
             }
@@ -85,7 +100,9 @@ async fn run(
             json!({
                 "build_revision": env!("MORSEL_BENCH_REVISION"),
                 "output_rows": output_rows,
+                "output_batches": output_batches,
                 "first_output_seconds": first_output_seconds,
+                "first_8192_seconds": first_8192_seconds,
                 "seconds": seconds,
                 "plan_seconds": plan_seconds,
                 "plan": displayable(plan.as_ref()).indent(false).to_string(),
