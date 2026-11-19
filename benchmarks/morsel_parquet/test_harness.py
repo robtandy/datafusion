@@ -6,11 +6,13 @@ import io
 import json
 import mmap
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import pyarrow.parquet as pq
 
@@ -18,6 +20,113 @@ from harness import StockCli, bench, fixture_files, generate, verify, workloads
 
 
 class SmokeTest(unittest.TestCase):
+    def test_ab_evidence_rejects_fallback_and_missing_count_finalization(self):
+        from harness import validate_path
+
+        stock = {"plan": "DataSourceExec: file_type=parquet\n"}
+        native = {
+            "plan": "MorselExec: workers=2, NativeParquet[fixture] -> CountSink",
+            "parquet_morsels_claimed": 6,
+            "count_finalizations": 1,
+        }
+        validate_path(stock, "off", "scan_low", 6)
+        validate_path(native, "required", "count_low", 6)
+        for evidence in (
+            stock,
+            dict(native, parquet_morsels_claimed=0),
+            dict(native, count_finalizations=0),
+            dict(native, plan=native["plan"].replace("CountSink", "ResultSink")),
+        ):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                validate_path(evidence, "required", "count_low", 6)
+        with self.assertRaises(ValueError):
+            validate_path(native, "off", "count_low", 6)
+
+    def test_ab_rejects_unverified_cache_regimes(self):
+        from harness import prepare_cache
+
+        with patch("harness.cache_pages", return_value={"resident": 1, "total": 2}):
+            for regime in ("warm", "page-cache-cold"):
+                with self.subTest(regime=regime), self.assertRaisesRegex(
+                    ValueError, f"cannot verify {regime}"
+                ):
+                    prepare_cache([], regime)
+
+    @unittest.skipUnless(
+        sys.platform == "linux"
+        and os.getenv("MORSEL_PARQUET_RUNNER")
+        and os.getenv("MORSEL_BENCH_REVISION"),
+        "set MORSEL_PARQUET_RUNNER and MORSEL_BENCH_REVISION for the Linux A/B smoke test",
+    )
+    def test_ab_verifies_both_plans_before_recording_stream_timings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fixture with spaces"
+            generate(path, 2, 3, 4000)
+            result = subprocess.check_output(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(__file__).with_name("harness.py")),
+                    "ab",
+                    str(path),
+                    "--runner",
+                    os.environ["MORSEL_PARQUET_RUNNER"],
+                    "--revision",
+                    os.environ["MORSEL_BENCH_REVISION"],
+                    "--threads",
+                    "2",
+                    "--timeout",
+                    "30",
+                    "--cache",
+                    "warm",
+                    "--warmups",
+                    "0",
+                    "--repeats",
+                    "2",
+                ],
+                text=True,
+                timeout=120,
+            )
+            header, *trials = (json.loads(line) for line in result.splitlines())
+            self.assertEqual(header["verified_matches"], {"low": 1085, "high": 14227})
+            self.assertEqual(len(header["evidence"]), 8)
+            expected = {
+                "scan_low": 1085,
+                "count_low": 1,
+                "scan_high": 14227,
+                "count_high": 1,
+            }
+            self.assertEqual(len(trials), 16)
+            for index in range(0, len(trials), 2):
+                first, second = trials[index : index + 2]
+                self.assertEqual(first["case"], second["case"])
+                self.assertEqual(first["rep"], second["rep"])
+                modes = (
+                    ["off", "required"] if first["rep"] == 1 else ["required", "off"]
+                )
+                self.assertEqual([first["mode"], second["mode"]], modes)
+                for trial in (first, second):
+                    self.assertEqual(trial["output_rows"], expected[trial["case"]])
+                    self.assertGreater(trial["first_output_seconds"], 0)
+                    self.assertLessEqual(
+                        trial["first_output_seconds"], trial["seconds"]
+                    )
+                    self.assertGreater(trial["output_batches"], 0)
+                    if trial["case"].startswith("count_"):
+                        self.assertEqual(trial["output_batches"], 1)
+                    if trial["output_rows"] >= 8192:
+                        self.assertLessEqual(
+                            trial["first_output_seconds"], trial["first_8192_seconds"]
+                        )
+                        self.assertLessEqual(
+                            trial["first_8192_seconds"], trial["seconds"]
+                        )
+                    else:
+                        self.assertIsNone(trial["first_8192_seconds"])
+                    pages = trial["cache_pages_before"]
+                    self.assertGreater(pages["total"], 0)
+                    self.assertEqual(pages["resident"], pages["total"])
+
     def test_fixture_is_repeatable(self):
         with tempfile.TemporaryDirectory() as tmp:
             first, second = (Path(tmp) / name for name in ("first", "second"))
