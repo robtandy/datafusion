@@ -90,6 +90,10 @@ def fixture_files(path):
     return files
 
 
+def fixture_ddl(path):
+    return f"CREATE EXTERNAL TABLE fixture STORED AS PARQUET LOCATION '{path.resolve().as_uri()}/'"
+
+
 def workloads():
     queries = {}
     for selectivity, limit in LIMITS.items():
@@ -112,7 +116,7 @@ class Measurement:
 class StockCli:
     def __init__(self, binary, path, threads, timeout):
         self.binary = binary.resolve(strict=True)
-        self.ddl = f"CREATE EXTERNAL TABLE fixture STORED AS PARQUET LOCATION '{path.resolve().as_uri()}/'"
+        self.ddl = fixture_ddl(path)
         self.timeout = timeout
         self.env = {
             k: v for k, v in os.environ.items() if not k.startswith("DATAFUSION_")
@@ -171,6 +175,52 @@ class StockCli:
         return Measurement(
             int(metrics["Output Rows"]), seconds, metrics["Plan with Metrics"]
         )
+
+
+class StreamRunner:
+    def __init__(self, binary, path, threads, timeout, mode):
+        self.binary = binary.resolve(strict=True)
+        self.args = (mode, str(threads), fixture_ddl(path))
+        self.timeout = timeout
+
+    def _run(self, operation, sql, output):
+        return subprocess.run(
+            [str(self.binary), operation, *self.args, sql],
+            stdout=output,
+            check=True,
+            timeout=self.timeout,
+        ).stdout
+
+    def query(self, sql, output=subprocess.PIPE):
+        return self._run("query", sql, output)
+
+    def measure(self, sql):
+        return json.loads(self._run("measure", sql, subprocess.PIPE))
+
+
+def validate_path(evidence, mode, case, row_groups):
+    plan = evidence["plan"]
+    if mode == "off":
+        if "MorselExec:" in plan or not re.search(
+            r"DataSourceExec: .*file_type=parquet", plan
+        ):
+            raise ValueError(f"{case}: expected a stock Parquet plan, got {plan}")
+    else:
+        if not plan.startswith("MorselExec:") or "NativeParquet[fixture]" not in plan:
+            raise ValueError(
+                f"{case}: expected a native Parquet morsel plan, got {plan}"
+            )
+        if evidence["parquet_morsels_claimed"] != row_groups:
+            raise ValueError(
+                f"{case}: expected to claim all {row_groups} Parquet row groups"
+            )
+        count = case.startswith("count_")
+        if ("CountSink" in plan) != count or evidence["count_finalizations"] != int(
+            count
+        ):
+            raise ValueError(
+                f"{case}: unexpected native count sink or finalization count"
+            )
 
 
 def expected_mask(rows, limit):
@@ -283,6 +333,120 @@ def bench(backend, files, rows, warmups, repeats):
                 )
 
 
+def prepare_cache(files, regime):
+    if regime == "page-cache-cold":
+        # Only evict private fixture files, never host-wide caches.
+        for path in files:
+            with path.open("rb") as file:
+                info = os.fstat(file.fileno())
+                if (
+                    info.st_uid != os.getuid()
+                    or info.st_nlink != 1
+                    or path.is_symlink()
+                ):
+                    raise ValueError(f"cold runs require private, owned files: {path}")
+                # DONTNEED can leave dirty pages behind after fixture generation.
+                os.fsync(file.fileno())
+                os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    pages = cache_pages(files)
+    target = pages["total"] if regime == "warm" else 0
+    if pages["resident"] != target:
+        raise ValueError(f"cannot verify {regime} file page cache: {pages}")
+    return pages
+
+
+def ab_bench(args, files, info):
+    if platform.system() != "Linux":
+        raise ValueError("A/B requires Linux to verify file page residency")
+    backends = {
+        mode: StreamRunner(args.runner, args.path, args.threads, args.timeout, mode)
+        for mode in ("off", "required")
+    }
+    queries = workloads()
+    # Both arms must match the same exact, unordered oracle before recording timings.
+    matches = verify(backends["off"], info["input_rows"])
+    verify(backends["required"], info["input_rows"])
+    expected = {f"scan_{selectivity}": n for selectivity, n in matches.items()}
+    expected.update({f"count_{selectivity}": 1 for selectivity in matches})
+
+    def sample(mode, case, sql):
+        result = backends[mode].measure(sql)
+        validate_path(result, mode, case, info["row_groups"])
+        if result["build_revision"] != args.revision:
+            raise ValueError(
+                f"runner revision does not match --revision: {result['build_revision']}"
+            )
+        if result["output_rows"] != expected[case]:
+            raise ValueError(
+                f"{mode}/{case}: unexpected output_rows: {result['output_rows']}"
+            )
+        return result
+
+    evidence = []
+    for mode in backends:
+        for case, sql in queries.items():
+            result = sample(mode, case, sql)
+            evidence.append(
+                {
+                    "mode": mode,
+                    "case": case,
+                    **{
+                        k: result[k]
+                        for k in (
+                            "plan",
+                            "output_rows",
+                            "parquet_morsels_claimed",
+                            "count_finalizations",
+                            "bytes_scanned",
+                        )
+                    },
+                }
+            )
+    print(
+        json.dumps(
+            {
+                **info,
+                "cache_regime": args.cache,
+                "verified_matches": matches,
+                "evidence": evidence,
+            }
+        ),
+        flush=True,
+    )
+
+    if args.cache == "warm":
+        # Warm the entire (identical) fixture, including columns not read by the queries.
+        for path in files:
+            with path.open("rb") as file:
+                while file.read(1 << 20):
+                    pass
+    for rep in range(1 - args.warmups, args.repeats + 1):
+        order = tuple(backends) if rep % 2 else tuple(reversed(backends))
+        for case, sql in queries.items():
+            for mode in order:
+                before = prepare_cache(files, args.cache) if rep > 0 else None
+                result = sample(mode, case, sql)
+                if rep > 0:
+                    result.pop("plan")
+                    result.pop("build_revision")
+                    print(
+                        json.dumps(
+                            {
+                                **result,
+                                "mode": mode,
+                                "case": case,
+                                "rep": rep,
+                                "input_rows_per_s": round(
+                                    info["input_rows"] / result["seconds"]
+                                ),
+                                "cache_pages_before": before,
+                                "cache_pages_after": cache_pages(files),
+                            }
+                        ),
+                        flush=True,
+                    )
+
+
 def positive(value):
     number = int(value)
     if number < 1:
@@ -292,7 +456,7 @@ def positive(value):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Opt-in stock DataFusion Parquet workload"
+        description="Stock DataFusion and native morsel Parquet workloads"
     )
     commands = parser.add_subparsers(dest="command", required=True)
     gen = commands.add_parser("generate")
@@ -302,17 +466,25 @@ def main():
     gen.add_argument(
         "--group-rows", type=positive, default=1000, help="rows per row group"
     )
-    for mode in ("verify", "bench"):
+    for mode in ("verify", "bench", "ab"):
         command = commands.add_parser(mode)
         command.add_argument("path", type=Path)
-        command.add_argument("--cli", type=Path, required=True)
+        command.add_argument(
+            "--runner" if mode == "ab" else "--cli", type=Path, required=True
+        )
         command.add_argument("--threads", type=positive, default=4)
         command.add_argument(
-            "--timeout", type=positive, default=120, help="seconds per CLI query"
+            "--timeout", type=positive, default=120, help="seconds per subprocess query"
         )
-        if mode == "bench":
+        if mode == "ab":
             command.add_argument(
-                "--revision", required=True, help="git revision used to build the CLI"
+                "--cache", choices=("warm", "page-cache-cold"), required=True
+            )
+        if mode != "verify":
+            command.add_argument(
+                "--revision",
+                required=True,
+                help="git revision used to build the executable",
             )
             command.add_argument(
                 "--warmups", type=int, default=1, help="unmeasured rounds"
@@ -329,47 +501,49 @@ def main():
         generate(args.path, args.files, args.groups, args.group_rows)
         return
 
-    backend = StockCli(args.cli, args.path, args.threads, args.timeout)
     files = fixture_files(args.path)
     metadata = [pq.read_metadata(path) for path in files]
     rows = sum(m.num_rows for m in metadata)
     if args.command == "verify":
+        backend = StockCli(args.cli, args.path, args.threads, args.timeout)
         print(
             json.dumps({"input_rows": rows, "verified_matches": verify(backend, rows)})
         )
+        return
+
+    if args.warmups < 0:
+        parser.error("--warmups must be non-negative")
+    info = {
+        "build_revision": args.revision,
+        "host": platform.node(),
+        "arch": platform.machine(),
+        "kernel": platform.release(),
+        "cpu_affinity": (
+            sorted(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else None
+        ),
+        "tokio_workers": args.threads,
+        "target_partitions": args.threads,
+        "batch_size": 8192,
+        "seed": SEED,
+        "input_rows": rows,
+        "row_groups": sum(m.num_row_groups for m in metadata),
+        "files": len(files),
+        "parquet_bytes": sum(path.stat().st_size for path in files),
+        "page_size": mmap.PAGESIZE,
+        "warmups": args.warmups,
+        "repeats": args.repeats,
+    }
+    if args.command == "ab":
+        ab_bench(args, files, info)
     else:
-        if args.warmups < 0:
-            parser.error("--warmups must be non-negative")
+        backend = StockCli(args.cli, args.path, args.threads, args.timeout)
         version = subprocess.check_output(
             [str(backend.binary), "--version"], timeout=args.timeout, text=True
         )
         print(
-            json.dumps(
-                {
-                    "backend": "stock",
-                    "version": version.strip(),
-                    "build_revision": args.revision,
-                    "host": platform.node(),
-                    "arch": platform.machine(),
-                    "kernel": platform.release(),
-                    "cpu_affinity": (
-                        sorted(os.sched_getaffinity(0))
-                        if hasattr(os, "sched_getaffinity")
-                        else None
-                    ),
-                    "tokio_workers": args.threads,
-                    "target_partitions": args.threads,
-                    "batch_size": 8192,
-                    "seed": SEED,
-                    "input_rows": rows,
-                    "row_groups": sum(m.num_row_groups for m in metadata),
-                    "files": len(files),
-                    "parquet_bytes": sum(path.stat().st_size for path in files),
-                    "page_size": mmap.PAGESIZE,
-                    "warmups": args.warmups,
-                    "repeats": args.repeats,
-                }
-            ),
+            json.dumps({"backend": "stock", "version": version.strip(), **info}),
             flush=True,
         )
         bench(backend, files, rows, args.warmups, args.repeats)
