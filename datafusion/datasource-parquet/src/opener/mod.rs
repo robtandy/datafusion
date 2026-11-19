@@ -4,10 +4,12 @@
 
 //! [`ParquetMorselizer`] state machines for opening Parquet files
 
+mod buffered;
 mod early_stop;
 #[cfg(feature = "parquet_encryption")]
 mod encryption;
 
+use self::buffered::BufferedReaders;
 use self::early_stop::EarlyStoppingStream;
 #[cfg(feature = "parquet_encryption")]
 use self::encryption::EncryptionContext;
@@ -307,6 +309,7 @@ pub(super) struct ParquetMorselizer {
     /// Per-scan virtual-column state (validation already performed). `None`
     /// when no virtual columns are requested — the common path.
     pub(crate) virtual_state: Option<Arc<VirtualColumnsState>>,
+    pub(super) buffered: bool,
 }
 
 impl fmt::Debug for ParquetMorselizer {
@@ -395,12 +398,12 @@ enum ParquetOpenState {
     LoadBloomFilters(BoxFuture<'static, Result<BloomFiltersLoadedParquetOpen>>),
     /// Pruning with preloaded Bloom Filters
     PruneWithBloomFilters(Box<BloomFiltersLoadedParquetOpen>),
-    /// Builds the final reader stream
-    ///
-    /// TODO: split state as this currently does both I/O and CPU work.
+    /// Initialize the decoder for the selected row groups.
     BuildStream(Box<RowGroupsPrunedParquetOpen>),
-    /// Terminal state: the final opened stream is ready to return.
+    /// Stock scan: drive data I/O while polling the file stream.
     Ready(BoxStream<'static, Result<RecordBatch>>),
+    /// Native scan: drive data I/O in pending planners before publishing readers.
+    Buffered(Box<BufferedReaders>),
     /// Terminal state: reading complete
     Done,
 }
@@ -420,6 +423,7 @@ impl fmt::Debug for ParquetOpenState {
             ParquetOpenState::PruneWithBloomFilters(_) => "PruneWithBloomFilters",
             ParquetOpenState::BuildStream(_) => "BuildStream",
             ParquetOpenState::Ready(_) => "Ready",
+            ParquetOpenState::Buffered(_) => "Buffered",
             ParquetOpenState::Done => "Done",
         };
         f.write_str(state)
@@ -610,7 +614,7 @@ impl ParquetOpenState {
     /// driver loop can poll their inner futures separately.
     ///
     /// Implements state machine described in [`ParquetOpenState`]
-    fn transition(self) -> Result<ParquetOpenState> {
+    fn transition(self, buffered: bool) -> Result<ParquetOpenState> {
         match self {
             ParquetOpenState::Start {
                 prepared,
@@ -697,10 +701,10 @@ impl ParquetOpenState {
                 }
                 Ok(ParquetOpenState::BuildStream(Box::new(pruned)))
             }
-            ParquetOpenState::BuildStream(prepared) => {
-                Ok(ParquetOpenState::Ready(prepared.build_stream()?))
+            ParquetOpenState::BuildStream(prepared) => prepared.build_output(buffered),
+            ready @ (ParquetOpenState::Ready(_) | ParquetOpenState::Buffered(_)) => {
+                Ok(ready)
             }
-            ParquetOpenState::Ready(stream) => Ok(ParquetOpenState::Ready(stream)),
             ParquetOpenState::Done => {
                 panic!("ParquetOpenFuture polled after completion");
             }
@@ -736,6 +740,7 @@ impl Morsel for ParquetStreamMorsel {
 struct ParquetMorselPlanner {
     /// Ready to perform CPU-only planning work.
     state: ParquetOpenState,
+    buffered: bool,
 }
 
 impl fmt::Debug for ParquetMorselPlanner {
@@ -758,7 +763,10 @@ impl ParquetMorselPlanner {
         let state = ParquetOpenState::Start {
             prepared: Box::new(prepared),
         };
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            buffered: morselizer.buffered,
+        })
     }
 
     /// Schedule an I/O future that resolves to the next planner to run.
@@ -770,13 +778,16 @@ impl ParquetMorselPlanner {
     /// 3. returns a [`MorselPlan`] containing the boxed future for the caller
     ///    to poll
     ///
-    fn schedule_io<F>(future: F) -> MorselPlan
+    fn schedule_io<F>(buffered: bool, future: F) -> MorselPlan
     where
         F: Future<Output = Result<ParquetOpenState>> + Send + 'static,
     {
         let io_future = async move {
             let next_state = future.await?;
-            Ok(Box::new(ParquetMorselPlanner { state: next_state }) as _)
+            Ok(Box::new(ParquetMorselPlanner {
+                state: next_state,
+                buffered,
+            }) as _)
         };
         MorselPlan::new().with_pending_planner(io_future)
     }
@@ -788,29 +799,30 @@ impl MorselPlanner for ParquetMorselPlanner {
             return Ok(None);
         }
 
-        let state = self.state.transition()?;
+        let buffered = self.buffered;
+        let state = self.state.transition(buffered)?;
 
         match state {
             #[cfg(feature = "parquet_encryption")]
             ParquetOpenState::LoadEncryption(future) => {
-                Ok(Some(Self::schedule_io(async move {
+                Ok(Some(Self::schedule_io(buffered, async move {
                     Ok(ParquetOpenState::PruneFile(future.await?))
                 })))
             }
             ParquetOpenState::LoadMetadata(future) => {
-                Ok(Some(Self::schedule_io(async move {
+                Ok(Some(Self::schedule_io(buffered, async move {
                     Ok(ParquetOpenState::PrepareFilters(Box::new(future.await?)))
                 })))
             }
             ParquetOpenState::LoadPageIndex(future) => {
-                Ok(Some(Self::schedule_io(async move {
+                Ok(Some(Self::schedule_io(buffered, async move {
                     Ok(ParquetOpenState::LoadBloomFilters(
                         future.await?.load_bloom_filters().boxed(),
                     ))
                 })))
             }
             ParquetOpenState::LoadBloomFilters(future) => {
-                Ok(Some(Self::schedule_io(async move {
+                Ok(Some(Self::schedule_io(buffered, async move {
                     Ok(ParquetOpenState::PruneWithBloomFilters(Box::new(
                         future.await?,
                     )))
@@ -821,11 +833,14 @@ impl MorselPlanner for ParquetMorselPlanner {
                     vec![Box::new(ParquetStreamMorsel::new(stream))];
                 Ok(Some(MorselPlan::new().with_morsels(morsels)))
             }
+            ParquetOpenState::Buffered(readers) => readers.plan(),
             ParquetOpenState::Done => Ok(None),
-            cpu_state => Ok(Some(
-                MorselPlan::new()
-                    .with_planners(vec![Box::new(Self { state: cpu_state })]),
-            )),
+            cpu_state => Ok(Some(MorselPlan::new().with_planners(vec![Box::new(
+                Self {
+                    state: cpu_state,
+                    buffered,
+                },
+            )]))),
         }
     }
 }
@@ -1646,8 +1661,8 @@ impl BloomFiltersLoadedParquetOpen {
 }
 
 impl RowGroupsPrunedParquetOpen {
-    /// Build the final parquet stream once all pruning work is complete.
-    fn build_stream(self) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+    /// Build the common decoder after pruning, then choose how to drive it.
+    fn build_output(self, buffered: bool) -> Result<ParquetOpenState> {
         let RowGroupsPrunedParquetOpen {
             prepared,
             mut row_groups,
@@ -1901,6 +1916,19 @@ impl RowGroupsPrunedParquetOpen {
         let planned_bytes: u64 = rg_plan.iter().map(|entry| entry.bytes).sum();
         byte_progress.credit(in_range_bytes.saturating_sub(planned_bytes));
 
+        if buffered {
+            return Ok(ParquetOpenState::Buffered(Box::new(BufferedReaders {
+                decoder,
+                reader: prepared.async_file_reader,
+                projection: Arc::new(decoder_projection),
+                file_name: prepared.file_name.into(),
+                baseline: prepared.baseline_metrics,
+                rg_plan,
+                byte_progress,
+                ranges: None,
+            })));
+        }
+
         let predicate_cache_inner_records =
             prepared.file_metrics.predicate_cache_inner_records.clone();
         let predicate_cache_records =
@@ -1982,14 +2010,16 @@ impl RowGroupsPrunedParquetOpen {
         // per-batch re-checking would only add overhead.
         match prepared.file_pruner {
             Some(file_pruner) if file_pruner.is_watching() => {
-                Ok(EarlyStoppingStream::new(
-                    stream,
-                    file_pruner,
-                    files_ranges_pruned_statistics,
-                )
-                .boxed())
+                Ok(ParquetOpenState::Ready(
+                    EarlyStoppingStream::new(
+                        stream,
+                        file_pruner,
+                        files_ranges_pruned_statistics,
+                    )
+                    .boxed(),
+                ))
             }
-            _ => Ok(stream),
+            _ => Ok(ParquetOpenState::Ready(stream)),
         }
     }
 }
@@ -2744,6 +2774,7 @@ mod test {
                 memory_pool: self.memory_pool.clone(),
                 sort_order_for_reorder: None,
                 virtual_state,
+                buffered: false,
             })
         }
     }

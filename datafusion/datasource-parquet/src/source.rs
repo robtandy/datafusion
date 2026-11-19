@@ -57,9 +57,9 @@ use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use log::warn;
 
-use datafusion_execution::memory_pool::MemoryPool;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_execution::parquet_encryption::EncryptionFactory;
+use datafusion_execution::{TaskContext, memory_pool::MemoryPool};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use itertools::Itertools;
 use object_store::ObjectStore;
@@ -547,23 +547,73 @@ impl From<ParquetSource> for Arc<dyn FileSource> {
     }
 }
 
-impl FileSource for ParquetSource {
-    fn create_file_opener(
-        &self,
-        _object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
-        _partition: usize,
-    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
-        datafusion_common::internal_err!(
-            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
-        )
+impl ParquetSource {
+    /// Return the configured source feature that prevents buffered morsel execution.
+    /// A preconfigured predicate is not assumed to be pruning-only.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn unsupported_buffered_morsel_source(&self) -> Option<&'static str> {
+        if self.reverse_row_groups
+            || self.reverse_rows
+            || self.sort_order_for_reorder.is_some()
+        {
+            return Some("Parquet sort pushdown");
+        }
+        if self.predicate.is_some() || self.schema_provider.is_some() {
+            return Some("a preconfigured Parquet predicate or schema provider");
+        }
+        let crypto = &self.table_parquet_options.crypto;
+        if crypto.file_decryption.is_some() || crypto.factory_id.is_some() {
+            return Some("Parquet encryption");
+        }
+        #[cfg(feature = "parquet_encryption")]
+        if self.encryption_factory.is_some() {
+            return Some("Parquet encryption");
+        }
+        None
     }
 
-    fn create_morselizer(
+    /// Open a morselizer that publishes buffered row-group readers, not file streams.
+    /// The caller must admit only unordered whole files with static pruning predicates.
+    ///
+    /// # Public Only for Internal Use:
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    pub fn create_buffered_morselizer(
+        &self,
+        base_config: &FileScanConfig,
+        context: &TaskContext,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        let store = context
+            .runtime_env()
+            .object_store(&base_config.object_store_url)?;
+        let mut source = self.clone();
+        source.batch_size = Some(
+            base_config
+                .batch_size
+                .unwrap_or_else(|| context.session_config().batch_size()),
+        );
+        source.memory_pool = Some(Arc::clone(context.memory_pool()));
+        if source.pushdown_filters() {
+            return datafusion_common::internal_err!(
+                "Buffered Parquet morsels require residual, not pushed-down, row filtering"
+            );
+        }
+        source.make_morselizer(store, base_config, 0, true)
+    }
+
+    fn make_morselizer(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
+        buffered: bool,
     ) -> datafusion_common::Result<Box<dyn Morselizer>> {
         let expr_adapter_factory = base_config
             .expr_adapter_factory
@@ -660,7 +710,30 @@ impl FileSource for ParquetSource {
             memory_pool: self.memory_pool.clone(),
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
+            buffered,
         }))
+    }
+}
+
+impl FileSource for ParquetSource {
+    fn create_file_opener(
+        &self,
+        _object_store: Arc<dyn ObjectStore>,
+        _base_config: &FileScanConfig,
+        _partition: usize,
+    ) -> datafusion_common::Result<Arc<dyn FileOpener>> {
+        datafusion_common::internal_err!(
+            "ParquetSource::create_file_opener called but it supports the Morsel API, please use that instead"
+        )
+    }
+
+    fn create_morselizer(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> datafusion_common::Result<Box<dyn Morselizer>> {
+        self.make_morselizer(object_store, base_config, partition, false)
     }
 
     fn reorder_files(
