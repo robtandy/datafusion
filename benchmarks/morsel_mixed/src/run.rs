@@ -36,6 +36,8 @@ pub(crate) struct Report {
     foreground_elapsed_ns: u64,
     offered_per_second: f64,
     completed_per_second: f64,
+    completion_rate: f64,
+    drop_rate: f64,
     latency: Distribution,
     offer_lag: Distribution,
     queue_wait: Distribution,
@@ -282,6 +284,11 @@ pub(crate) async fn measure(
         .iter()
         .filter(|r| r.status == Status::Failed)
         .count();
+    let dropped = requests
+        .iter()
+        .filter(|r| r.status == Status::Dropped)
+        .count();
+    let offered = requests.len();
     let overlap_requests = successful()
         .filter(|r| r.active_scans_at_execution_start > 0)
         .count();
@@ -297,12 +304,9 @@ pub(crate) async fn measure(
             }),
         mode: if large.is_some() { "mixed" } else { "isolated" },
         repetition,
-        offered: requests.len(),
+        offered,
         queued: requests.iter().filter(|r| r.queued).count(),
-        dropped: requests
-            .iter()
-            .filter(|r| r.status == Status::Dropped)
-            .count(),
+        dropped,
         failed,
         overdue: requests.iter().filter(|r| r.overdue).count(),
         late_offers: requests
@@ -317,8 +321,10 @@ pub(crate) async fn measure(
             .unwrap_or(0),
         offer_window_ns: ns(window),
         foreground_elapsed_ns: ns(foreground_elapsed),
-        offered_per_second: requests.len() as f64 / window.as_secs_f64(),
+        offered_per_second: offered as f64 / window.as_secs_f64(),
         completed_per_second: completed as f64 / foreground_elapsed.as_secs_f64(),
+        completion_rate: completed as f64 / offered as f64,
+        drop_rate: dropped as f64 / offered as f64,
         latency: Distribution::new(
             successful().filter_map(|r| Some(r.finished_ns? - r.scheduled_ns)),
         ),

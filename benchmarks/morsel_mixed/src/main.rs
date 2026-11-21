@@ -9,18 +9,28 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use datafusion::common::runtime::SpawnedTask;
 use serde::Serialize;
 use tokio::runtime::Builder;
 
 use workload::{Query, QueryMetadata};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum Backend {
+    Off,
+    Required,
+}
+
 #[derive(Debug, Parser, Serialize)]
 #[command(
-    about = "Measure stock DataFusion small-query latency with and without shared-runtime scans"
+    about = "Measure DataFusion small-query latency with and without shared-runtime scans"
 )]
 struct Args {
+    /// Require native morsels, or use only stock execution.
+    #[arg(long, value_enum, default_value = "off")]
+    morsel_mode: Backend,
     /// Tokio async worker threads, excluding the arrival driver.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=64))]
     workers: u32,
@@ -74,6 +84,9 @@ struct Args {
     /// Number of isolated/mixed pairs, alternating which mode runs first.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=50))]
     repetitions: u32,
+    /// Start the first pair with the mixed phase rather than the isolated phase.
+    #[arg(long)]
+    mixed_first: bool,
     /// Foreground requests scheduled per run (including drops).
     #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u32).range(1..=50_000))]
     requests: u32,
@@ -109,6 +122,7 @@ fn main() -> Result<()> {
 #[derive(Serialize)]
 struct Output<'a> {
     schema_version: u32,
+    build_revision: Option<&'static str>,
     backend: &'static str,
     valid: bool,
     config: Args,
@@ -121,7 +135,7 @@ struct Output<'a> {
 
 #[derive(Serialize)]
 struct RuntimeMetadata {
-    morsel_mode: &'static str,
+    morsel_mode: Backend,
     available_parallelism: Option<usize>,
     linux_cpus_allowed_list: Option<String>,
     driver_threads: usize,
@@ -139,26 +153,32 @@ async fn benchmark(args: Args) -> Result<()> {
 
     let mut runs = Vec::new();
     for repetition in 0..args.repetitions {
-        for mixed in [repetition % 2 != 0, repetition % 2 == 0] {
+        let mixed_first = args.mixed_first ^ (repetition % 2 != 0);
+        for mixed in [mixed_first, !mixed_first] {
             runs.push(
                 run::measure(&args, repetition, &small, mixed.then_some(&large)).await?,
             );
         }
     }
     let valid = runs.iter().all(|run| run.valid);
+    let morsel_mode = args.morsel_mode;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     serde_json::to_writer(
         &mut stdout,
         &Output {
             schema_version: 1,
-            backend: "datafusion_stock",
+            build_revision: option_env!("MORSEL_BENCH_REVISION"),
+            backend: match morsel_mode {
+                Backend::Off => "datafusion_stock",
+                Backend::Required => "datafusion_native",
+            },
             valid,
             config: args,
             small: small.metadata(),
             large: large.metadata(),
             runtime: RuntimeMetadata {
-                morsel_mode: "off",
+                morsel_mode,
                 available_parallelism: std::thread::available_parallelism()
                     .ok()
                     .map(|n| n.get()),

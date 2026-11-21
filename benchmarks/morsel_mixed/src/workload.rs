@@ -14,14 +14,14 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::config::MorselMode;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SQLOptions;
-use datafusion::physical_plan::execute_stream;
-use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
+use datafusion::prelude::{DataFrame, ParquetReadOptions, SessionConfig, SessionContext};
 use futures::StreamExt;
 use serde::Serialize;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout_at};
 
-use crate::Args;
+use crate::{Args, Backend};
 
 const SMALL_SQL: &str = "SELECT COUNT(*) FROM small WHERE v % 17 = 0";
 const LARGE_SQL: &str = "SELECT SUM((v * v + v * 13) % 1000033) FROM large";
@@ -29,6 +29,7 @@ const LARGE_SQL: &str = "SELECT SUM((v * v + v * 13) % 1000033) FROM large";
 #[derive(Clone)]
 pub(crate) struct Query {
     ctx: SessionContext,
+    backend: Backend,
     metadata: QueryMetadata,
 }
 
@@ -38,6 +39,7 @@ pub(crate) struct QueryMetadata {
     fixture: Option<String>,
     expected: Expected,
     generated_rows: Option<u32>,
+    plan: Option<String>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -99,7 +101,20 @@ impl Query {
         let mut config = SessionConfig::new()
             .with_target_partitions(args.partitions as usize)
             .with_batch_size(args.batch_size as usize);
-        config.options_mut().execution.morsel_mode = MorselMode::Off;
+        if fixture.is_some() {
+            config = config
+                .with_collect_statistics(false)
+                .with_repartition_file_scans(false);
+            let parquet = &mut config.options_mut().execution.parquet;
+            parquet.pruning = false;
+            parquet.pushdown_filters = false;
+            parquet.enable_page_index = false;
+            parquet.bloom_filter_on_read = false;
+        }
+        config.options_mut().execution.morsel_mode = match args.morsel_mode {
+            Backend::Off => MorselMode::Off,
+            Backend::Required => MorselMode::Required,
+        };
         let ctx = SessionContext::new_with_config(config);
         let expected = if let Some(path) = fixture {
             ctx.register_parquet(table, path, ParquetReadOptions::default())
@@ -110,15 +125,24 @@ impl Query {
             ctx.register_table(table, Arc::new(mem))?;
             expectation.unwrap_or(Expected::Scalar(scalar))
         };
-        Ok(Self {
+        let mut query = Self {
             ctx,
+            backend: args.morsel_mode,
             metadata: QueryMetadata {
                 sql: sql.clone().unwrap_or_else(|| default_sql.to_owned()),
                 fixture: fixture.clone(),
                 expected,
                 generated_rows: fixture.is_none().then_some(rows),
+                plan: None,
             },
-        })
+        };
+        if fixture.is_some() || query.backend == Backend::Required {
+            let plan = query.dataframe().await?.create_physical_plan().await?;
+            query.check_backend(plan.as_ref())?;
+            query.metadata.plan =
+                Some(displayable(plan.as_ref()).indent(false).to_string());
+        }
+        Ok(query)
     }
 
     pub(crate) fn metadata(&self) -> &QueryMetadata {
@@ -155,23 +179,38 @@ impl Query {
             .context("query timed out")?
     }
 
-    async fn drain(
-        &self,
-        activity: Activity<'_>,
-        progress: &mut Progress,
-    ) -> Result<Digest> {
+    async fn dataframe(&self) -> Result<DataFrame> {
         let options = SQLOptions::new()
             .with_allow_ddl(false)
             .with_allow_dml(false)
             .with_allow_copy(false)
             .with_allow_statements(false);
-        let df = self
+        Ok(self
             .ctx
             .sql_with_options(&self.metadata.sql, options)
-            .await?;
+            .await?)
+    }
+
+    fn check_backend(&self, plan: &dyn ExecutionPlan) -> Result<()> {
+        ensure!(
+            self.backend != Backend::Required || plan.name() == "MorselExec",
+            "expected MorselExec for {}, got {}",
+            self.metadata.sql,
+            plan.name(),
+        );
+        Ok(())
+    }
+
+    async fn drain(
+        &self,
+        activity: Activity<'_>,
+        progress: &mut Progress,
+    ) -> Result<Digest> {
+        let df = self.dataframe().await?;
         let task_ctx = Arc::new(df.task_ctx());
         let plan = df.create_physical_plan().await?;
         progress.plan_ready = Some(Instant::now());
+        self.check_backend(plan.as_ref())?;
         let mut stream = execute_stream(plan, task_ctx)?;
         let (_scan, ready) = match activity {
             Activity::Background(active, ready) => (Some(ActiveScan::new(active)), ready),

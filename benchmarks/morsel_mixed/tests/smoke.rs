@@ -2,8 +2,15 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
+use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::file::properties::WriterProperties;
 use serde_json::Value;
 
 #[test]
@@ -70,6 +77,105 @@ fn stock_pair_drains_queries_and_overlaps_scans() {
             .count();
         assert_eq!(run["overlap_requests"], overlapped);
     }
+}
+
+struct FixtureDir(PathBuf);
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_fixture(dir: &Path, name: &str, rows: i64) -> PathBuf {
+    let path = dir.join(name);
+    let batch = RecordBatch::try_from_iter([(
+        "v",
+        Arc::new(Int64Array::from_iter_values(0..rows)) as _,
+    )])
+    .unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(8192))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+#[test]
+fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
+    let dir = FixtureDir(
+        std::env::temp_dir().join(format!("morsel-mixed-{}", std::process::id())),
+    );
+    fs::create_dir(&dir.0).unwrap();
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"));
+    command.args([
+        "--morsel-mode",
+        "required",
+        "--mixed-first",
+        "--workers",
+        "2",
+        "--partitions",
+        "2",
+        "--small-fixture",
+        small.to_str().unwrap(),
+        "--large-fixture",
+        large.to_str().unwrap(),
+        "--small-expected-scalar",
+        "61",
+        "--large-expected-scalar",
+        "30841",
+        "--small-sql",
+        "SELECT COUNT(*) FROM small WHERE v % 17 = 0",
+        "--repetitions",
+        "1",
+        "--requests",
+        "40",
+        "--interval-ms",
+        "4",
+    ]);
+    let allowed = command
+        .args(["--large-sql", "SELECT COUNT(*) FROM large WHERE v % 17 = 0"])
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let report: Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(report["runtime"]["morsel_mode"], "required");
+    for table in ["small", "large"] {
+        let plan = report[table]["plan"].as_str().unwrap();
+        assert!(plan.starts_with("MorselExec: workers=2, "), "{plan}");
+        assert!(plan.contains(&format!("NativeParquet[{table}]")), "{plan}");
+    }
+    assert_eq!(report["runs"][0]["mode"], "mixed");
+    assert!(report["runs"][0]["overlap_requests"].as_u64().unwrap() > 0);
+    assert_eq!(report["runs"][1]["mode"], "isolated");
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"))
+        .args([
+            "--morsel-mode",
+            "required",
+            "--small-fixture",
+            small.to_str().unwrap(),
+            "--small-sql",
+            "SELECT v FROM small LIMIT 1",
+            "--small-expected-rows",
+            "1",
+            "--warmup",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("LIMIT"));
 }
 
 #[test]
