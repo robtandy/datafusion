@@ -6,10 +6,12 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 
 # Same-runtime mixed-query latency
 
-This standalone, fork-only benchmark runs **stock DataFusion** (`morsel_mode=off`).
-It compares a foreground SQL query alone with the same query under concurrent
-scans. Separate DataFusion sessions share **one process and one multi-threaded
-Tokio runtime** in both modes. The harness needs no external data by default.
+This standalone, fork-only benchmark compares a foreground SQL query alone
+with the same query under concurrent scans. Separate DataFusion sessions share
+**one process and one multi-threaded Tokio runtime** within each run. The harness
+needs no external data for the default stock DataFusion workload. The Parquet
+comparison below runs the same harness in both `morsel_mode=off` and
+`morsel_mode=required`.
 
 ## Build and run
 
@@ -84,7 +86,11 @@ optionally `--small-fixture` or `--large-fixture` with a Parquet file/directory
 own `--*-expected-rows` or `--*-expected-scalar` (a single non-null 64-bit integer
 such as `COUNT(*)`). Use read-only queries. Choose background SQL that actually
 scans its input; a metadata-only count or constant query does not reproduce this
-CPU workload. All overrides use the same arrival and drain logic.
+load. All overrides use the same arrival and drain logic. With
+`--morsel-mode required`, every executed query must have a `MorselExec` root;
+unsupported SQL fails instead of falling back. Parquet and required-mode plans
+are recorded before timing. `--mixed-first` reverses the phase order of the
+first repetition; subsequent repetitions still alternate.
 
 ## Reading the JSON
 
@@ -99,7 +105,8 @@ one.
 
 `offered_per_second` divides all offers by the nominal window (`requests * interval`).
 `completed_per_second` divides successful requests by the window extended through
-any foreground drain. Background throughput (`completed_in_window_per_second`)
+any foreground drain. `completion_rate` and `drop_rate` are fractions of offers.
+Background throughput (`completed_in_window_per_second`)
 counts validated scans finishing inside the nominal window per second. It does
 not credit partial scans or those finishing during warm-up/drain;
 `background.completed` also counts successful scans that finish before or after
@@ -130,12 +137,166 @@ and 0.14–0.16 ms mixed; the mixed median queue wait was 2.90–4.41 ms.
 Mixed runs had 133–160 queued and 12–24 overdue requests; isolated runs had
 none. The planning p50 was 0.71–0.74 ms across all six runs.
 
-## Smoke test
+## Pinned Parquet comparison (#139)
+
+Use the same engine revision as the [single-query comparison](../morsel_parquet/README.md):
+`d649cacf00fee7125f45ea1427a023b2eab732b1`, the #126 merge, before later
+optimizations or instrumentation. Build **one** executable for both backends;
+copy only this standalone harness into a detached checkout. The runner rejects
+reports whose build revision does not match the pin.
+
+From the harness checkout on a Linux remote workspace, with `uv`, `taskset`,
+and a private directory on the device under test:
+
+```bash
+set -e
+b=benchmarks/morsel_mixed
+p=benchmarks/morsel_parquet
+work=$(mktemp -d "$HOME/.cache/issue139.XXXXXX")
+revision=d649cacf00fee7125f45ea1427a023b2eab732b1
+
+git worktree add --detach "$work/pinned" "$revision"
+mkdir -p "$work/pinned/$b"
+cp -r "$b"/{Cargo.toml,Cargo.lock,src,tests} "$work/pinned/$b/"
+(
+  cd "$work/pinned"
+  MORSEL_BENCH_REVISION="$(git rev-parse HEAD)" CARGO_TARGET_DIR="$work/target" \
+    CARGO_PROFILE_RELEASE_OPT_LEVEL=2 timeout --kill-after=15s 20m \
+    cargo build -j 10 --release --locked --manifest-path "$b/Cargo.toml"
+)
+timeout 120s uv venv --python 3.12.10 "$work/venv"
+timeout 180s uv pip install --python "$work/venv/bin/python" -r "$p/requirements.txt"
+py="$work/venv/bin/python"
+timeout 60s "$py" -B "$p/harness.py" generate "$work/small" \
+  --files 4 --groups 2 --group-rows 4096
+timeout 60s "$py" -B "$p/harness.py" generate "$work/large" \
+  --files 16 --groups 8 --group-rows 131072
+
+# Check that the host is quiet and no builds are running. Adapt the CPU list.
+vmstat -y 1 3
+ps -eo pid,pcpu,comm --sort=-pcpu | head -20
+timeout --kill-after=10s 360s taskset --cpu-list 12-15 "$py" -B "$b/compare_parquet.py" \
+  --runner "$work/target/release/morsel-mixed" --small "$work/small" --large "$work/large" \
+  --workers 4 --blocking-threads 2 --partitions 4 --background-lanes 3 \
+  --pairs 4 --requests 600 --interval-ms 20 5 > "$work/mixed-parquet.jsonl"
+
+# Lower-load follow-up to compare tails without foreground drops.
+vmstat -y 1 3
+ps -eo pid,pcpu,comm --sort=-pcpu | head -20
+timeout --kill-after=10s 260s taskset --cpu-list 12-15 "$py" -B "$b/compare_parquet.py" \
+  --runner "$work/target/release/morsel-mixed" --small "$work/small" --large "$work/large" \
+  --workers 4 --blocking-threads 2 --partitions 4 --background-lanes 3 \
+  --pairs 4 --requests 200 --interval-ms 50 > "$work/mixed-parquet-low.jsonl"
+```
+
+- The small query uses the low-selectivity filtered count from #128; the long
+  scan uses the high-selectivity filtered count on the larger fixture. Native
+  execution at the pin does not admit the in-memory harness's default `SUM`,
+  so both arms use the admitted `COUNT(*)` with a two-column modulo filter.
+  This still reads row values throughout the input; footer counts cannot answer
+  it. The returned scalar is checked against the #130 generator's independent
+  array oracle for **every** completed query, including in-flight scans draining
+  past the window. Each arm checks the physical plans of both Parquet queries:
+  stock `DataSourceExec` or `MorselExec` with `NativeParquet` and `CountSink`.
+- As in #128, the Parquet sessions disable listing-statistics collection,
+  repartitioning of file scans, Parquet row-filter pushdown, and row-group,
+  page-index and Bloom pruning. Both sessions use 8,192-row batches; native
+  workers **per pipeline** are capped by the same target-partitions setting used
+  by stock.
+  This is not a per-process task limit; the four affined CPUs and shared Tokio
+  runtime are the process-wide budget. Both backends drain to the same scalar,
+  using the same harness clocks, two warm-up queries per workload, bounded
+  foreground FIFO, and three continuously reissuing background lanes. This
+  matches background **concurrency**, not background arrival rate: faster
+  completions allow the lane to submit another scan sooner.
+- Each arm is a fresh process; within it, its isolated and mixed phases share
+  the runtime and sessions. Arms alternate which backend starts the pair, and
+  both backends in a pair use the same phase order (balanced over four pairs).
+  Files are read into the Linux page cache before each arm and verified fully
+  resident with `mincore`. Residency is sampled again after the arm, not
+  continuously. Registration and warm-up precede timing; this is not a cold-I/O
+  test and does not reset filesystem metadata, allocator, CPU, hypervisor or
+  storage-device caches. Affinity does not reserve the CPUs or isolate their
+  caches, memory bandwidth, or storage from other activity.
+- The first NDJSON line records fixture shape, expected counts, host, affinity,
+  revision and load levels. Each subsequent line holds one arm of a pair:
+  match `interval_ms` and `pair`, then compare the same phase under `off` and
+  `required`. The nested report retains the individual offer records, p50/p95/p99
+  and variance, samples, completion/drop fractions, overlap, and foreground
+  and background throughput. Background **logical input rows/s** credits only
+  complete scans finishing inside the nominal offer window. A comparison that
+  exits nonzero is incomplete; do not use preceding lines as a full comparison.
+
+### Pinned comparison on dduck2, 2026-11-21 UTC
+
+`rob-tandy-dduck2`, Ubuntu 24.04.5 LTS, Linux `7.0.0-1012-aws`, 16 aarch64
+Neoverse-N1 vCPUs (one thread per core), 61 GiB RAM. Both backends used the
+locked release build above (opt-level 2, Rust 1.99.1, Clang/lld 18.1.3) with
+CPUs 12–15, four Tokio workers, up to two blocking threads and four target
+partitions. The fixtures were on Btrfs on the local NVMe instance-store
+volume under `$HOME/.cache`. The short input was 32,768 rows, eight row groups
+and 627,668 bytes across four files (expected count 1,456); the long input was
+16,777,216 rows, 128 row groups and 311,529,117 bytes across 16 files (expected
+count 9,883,940). All 76,219 file pages (4 KiB) were resident before and
+just after every arm. One-second `vmstat` samples immediately before each
+comparison showed 98–99% CPU idle; no builds were active. The workspace was
+not reserved, and the samples do not exclude transient host activity.
+
+Each load has four pairs: 600 offers per phase at 50 and 200 offers/s, and
+200 per phase at 20 offers/s. The 20 offers/s follow-up was chosen after the
+initial comparison showed drops at both higher rates. Latencies are scheduled
+arrival to stream exhaustion among completed requests. Timings and throughput
+below are **medians of the four runs, with min–max across runs**, not pooled
+percentiles. Counts and percentages are over all offers for the row. No query
+or scalar checks failed; 7,330 of 7,334 completed mixed foreground queries
+started execution while a scan was in flight.
+
+| Offers/s | Phase    | Backend    | Completed samples (% of offers) | Dropped (% of offers) |                 p50 ms |                 p95 ms |                 p99 ms |
+| -------: | :------- | :--------- | ------------------------------: | --------------------: | ---------------------: | ---------------------: | ---------------------: |
+|       20 | Isolated | `off`      |                   800 (100.00%) |             0 (0.00%) |       2.72 (2.71–2.76) |       3.24 (3.08–3.43) |       3.59 (3.45–4.09) |
+|       20 | Isolated | `required` |                   800 (100.00%) |             0 (0.00%) |       2.77 (2.75–2.80) |       2.94 (2.91–3.04) |       3.15 (3.09–3.39) |
+|       20 | Mixed    | `off`      |                   800 (100.00%) |             0 (0.00%) |    43.81 (36.23–44.78) |   87.69 (77.29–113.44) |  111.79 (99.68–124.49) |
+|       20 | Mixed    | `required` |                   800 (100.00%) |             0 (0.00%) |    12.20 (11.81–12.25) |    17.36 (16.69–17.76) |    19.76 (19.62–22.26) |
+|       50 | Isolated | `off`      |                 2,400 (100.00%) |             0 (0.00%) |       2.61 (2.57–2.67) |       2.92 (2.85–3.12) |       3.44 (3.10–3.55) |
+|       50 | Isolated | `required` |                 2,400 (100.00%) |             0 (0.00%) |       2.70 (2.66–2.75) |       2.91 (2.84–3.12) |       3.14 (2.96–3.49) |
+|       50 | Mixed    | `off`      |                  1,781 (74.21%) |          619 (25.79%) | 440.37 (395.02–448.69) | 604.81 (576.06–646.65) | 653.88 (600.55–707.71) |
+|       50 | Mixed    | `required` |                 2,400 (100.00%) |             0 (0.00%) |    12.07 (11.78–12.08) |    17.39 (17.31–17.92) |    20.30 (19.86–21.14) |
+|      200 | Isolated | `off`      |                 2,400 (100.00%) |             0 (0.00%) |       2.32 (2.32–2.42) |       2.68 (2.65–2.84) |       3.23 (2.74–3.84) |
+|      200 | Isolated | `required` |                 2,400 (100.00%) |             0 (0.00%) |       2.41 (2.40–2.43) |       2.64 (2.59–2.65) |       3.07 (2.76–3.81) |
+|      200 | Mixed    | `off`      |                    503 (20.96%) |        1,897 (79.04%) | 424.98 (395.70–445.91) | 583.51 (563.99–609.22) | 627.16 (596.03–642.10) |
+|      200 | Mixed    | `required` |                  1,050 (43.75%) |        1,350 (56.25%) | 201.41 (196.32–206.35) | 224.40 (223.26–229.00) | 231.67 (230.03–234.68) |
+
+| Offers/s | Backend    | Isolated foreground completions/s | Mixed foreground completions/s | Mixed background scans/s | Mixed background million input rows/s |
+| -------: | :--------- | --------------------------------: | -----------------------------: | -----------------------: | ------------------------------------: |
+|       20 | `off`      |                                20 |            19.99 (19.93–20.00) |         6.60 (6.40–6.70) |                110.73 (107.37–112.41) |
+|       20 | `required` |                                20 |                          20.00 |         6.00 (5.80–6.00) |                 100.66 (97.31–100.66) |
+|       50 | `off`      |                                50 |            36.64 (35.35–37.96) |         6.50 (6.42–6.58) |                109.05 (107.65–110.45) |
+|       50 | `required` |                                50 |                          50.00 |                     5.75 |                                 96.47 |
+|      200 | `off`      |                               200 |            39.16 (38.03–41.21) |         6.17 (6.00–6.33) |                103.46 (100.66–106.26) |
+|      200 | `required` |                               200 |            83.19 (80.26–85.29) |                     5.00 |                                 83.89 |
+
+At the lossless 20 offers/s level, the isolated p99s were similar, but the
+native mixed p99 was 19.76 ms vs. 111.79 ms for stock. Native gave up about 9%
+of long-scan throughput (6.00 vs. 6.60 scans/s). At 50 offers/s, native
+completed all foreground requests while stock dropped 25.79%; at 200 offers/s
+both dropped requests, but native completed 43.75% vs. 20.96% for stock.
+Native mixed p99 was also lower at those rates, but the percentiles describe
+different subsets of requests and are not lossless speedup measurements.
+Native background throughput was 12% lower at 50 and 19% lower at 200 offers/s
+by median scans/s. This is a trade-off under the measured three-lane load,
+not a single-query scan throughput result or a measurement of the scheduler
+in isolation.
+
+## Tests
 
 ```bash
 timeout 1200 cargo test --release --locked --manifest-path benchmarks/morsel_mixed/Cargo.toml
+# Use the Python environment with the #130 requirements installed above.
+timeout 120s "$py" -B -m unittest discover -s benchmarks/morsel_mixed -v
 ```
 
-The integration tests exercise the binary, check fixed arrivals, stock result
-validation and real execution overlap, and verify that a wrong expected row
-count across several output batches is reported as a failure after draining.
+The binary tests check fixed arrivals, result validation, execution overlap,
+and rejection of an incorrect expected row count after draining. The Parquet
+cases check both stock and native plans, completion and drop rates, and
+rejection of unsupported SQL in required mode. The Python tests check report
+validation and the counterbalanced pair order without running a benchmark.

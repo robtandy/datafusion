@@ -2,8 +2,15 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
+use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::file::properties::WriterProperties;
 use serde_json::Value;
 
 #[test]
@@ -70,6 +77,158 @@ fn stock_pair_drains_queries_and_overlaps_scans() {
             .count();
         assert_eq!(run["overlap_requests"], overlapped);
     }
+}
+
+struct FixtureDir(PathBuf);
+
+impl FixtureDir {
+    fn new(mode: &str) -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("morsel-mixed-{}-{mode}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_fixture(dir: &Path, name: &str, rows: i64) -> PathBuf {
+    let path = dir.join(name);
+    let batch = RecordBatch::try_from_iter([(
+        "v",
+        Arc::new(Int64Array::from_iter_values(0..rows)) as _,
+    )])
+    .unwrap();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(8192))
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props))
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+fn parquet_count_command(mode: &str, small: &Path, large: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"));
+    command.args([
+        "--morsel-mode",
+        mode,
+        "--workers",
+        "2",
+        "--partitions",
+        "2",
+        "--small-fixture",
+        small.to_str().unwrap(),
+        "--large-fixture",
+        large.to_str().unwrap(),
+        "--small-expected-scalar",
+        "61",
+        "--large-expected-scalar",
+        "30841",
+        "--small-sql",
+        "SELECT COUNT(*) FROM small WHERE v % 17 = 0",
+        "--large-sql",
+        "SELECT COUNT(*) FROM large WHERE v % 17 = 0",
+        "--repetitions",
+        "1",
+        "--requests",
+        "40",
+        "--interval-ms",
+        "4",
+    ]);
+    command
+}
+
+#[test]
+fn stock_parquet_pair_reports_stock_plans_and_offer_rates() {
+    let dir = FixtureDir::new("off");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let output = parquet_count_command("off", &small, &large)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["runtime"]["morsel_mode"], "off");
+    for table in ["small", "large"] {
+        let plan = report[table]["plan"].as_str().unwrap();
+        assert!(!plan.contains("MorselExec"), "{plan}");
+        assert!(
+            plan.lines().any(|line| {
+                line.contains("DataSourceExec:") && line.contains("file_type=parquet")
+            }),
+            "{plan}"
+        );
+    }
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    for run in runs {
+        assert_eq!(run["offered"], 40);
+        for (rate, count) in [("completion_rate", "completed"), ("drop_rate", "dropped")]
+        {
+            let fraction =
+                run[count].as_f64().unwrap() / run["offered"].as_f64().unwrap();
+            let reported = run[rate].as_f64().unwrap();
+            assert!(
+                (reported - fraction).abs() <= f64::EPSILON,
+                "{rate}: {reported} != {fraction}"
+            );
+        }
+    }
+}
+
+#[test]
+fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
+    let dir = FixtureDir::new("required");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let allowed = parquet_count_command("required", &small, &large)
+        .arg("--mixed-first")
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let report: Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(report["runtime"]["morsel_mode"], "required");
+    for table in ["small", "large"] {
+        let plan = report[table]["plan"].as_str().unwrap();
+        assert!(plan.starts_with("MorselExec: workers=2, "), "{plan}");
+        assert!(plan.contains(&format!("NativeParquet[{table}]")), "{plan}");
+    }
+    assert_eq!(report["runs"][0]["mode"], "mixed");
+    assert!(report["runs"][0]["overlap_requests"].as_u64().unwrap() > 0);
+    assert_eq!(report["runs"][1]["mode"], "isolated");
+
+    let denied = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"))
+        .args([
+            "--morsel-mode",
+            "required",
+            "--small-fixture",
+            small.to_str().unwrap(),
+            "--small-sql",
+            "SELECT v FROM small LIMIT 1",
+            "--small-expected-rows",
+            "1",
+            "--warmup",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("LIMIT"));
 }
 
 #[test]
