@@ -81,6 +81,15 @@ fn stock_pair_drains_queries_and_overlaps_scans() {
 
 struct FixtureDir(PathBuf);
 
+impl FixtureDir {
+    fn new(mode: &str) -> Self {
+        let path = std::env::temp_dir()
+            .join(format!("morsel-mixed-{}-{mode}", std::process::id()));
+        fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+}
+
 impl Drop for FixtureDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -105,19 +114,11 @@ fn write_fixture(dir: &Path, name: &str, rows: i64) -> PathBuf {
     path
 }
 
-#[test]
-fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
-    let dir = FixtureDir(
-        std::env::temp_dir().join(format!("morsel-mixed-{}", std::process::id())),
-    );
-    fs::create_dir(&dir.0).unwrap();
-    let small = write_fixture(&dir.0, "small.parquet", 1024);
-    let large = write_fixture(&dir.0, "large.parquet", 524288);
+fn parquet_count_command(mode: &str, small: &Path, large: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_morsel-mixed"));
     command.args([
         "--morsel-mode",
-        "required",
-        "--mixed-first",
+        mode,
         "--workers",
         "2",
         "--partitions",
@@ -132,6 +133,8 @@ fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
         "30841",
         "--small-sql",
         "SELECT COUNT(*) FROM small WHERE v % 17 = 0",
+        "--large-sql",
+        "SELECT COUNT(*) FROM large WHERE v % 17 = 0",
         "--repetitions",
         "1",
         "--requests",
@@ -139,8 +142,58 @@ fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
         "--interval-ms",
         "4",
     ]);
-    let allowed = command
-        .args(["--large-sql", "SELECT COUNT(*) FROM large WHERE v % 17 = 0"])
+    command
+}
+
+#[test]
+fn stock_parquet_pair_reports_stock_plans_and_offer_rates() {
+    let dir = FixtureDir::new("off");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let output = parquet_count_command("off", &small, &large)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["runtime"]["morsel_mode"], "off");
+    for table in ["small", "large"] {
+        let plan = report[table]["plan"].as_str().unwrap();
+        assert!(!plan.contains("MorselExec"), "{plan}");
+        assert!(
+            plan.lines().any(|line| {
+                line.contains("DataSourceExec:") && line.contains("file_type=parquet")
+            }),
+            "{plan}"
+        );
+    }
+    let runs = report["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    for run in runs {
+        assert_eq!(run["offered"], 40);
+        for (rate, count) in [("completion_rate", "completed"), ("drop_rate", "dropped")]
+        {
+            let fraction =
+                run[count].as_f64().unwrap() / run["offered"].as_f64().unwrap();
+            let reported = run[rate].as_f64().unwrap();
+            assert!(
+                (reported - fraction).abs() <= f64::EPSILON,
+                "{rate}: {reported} != {fraction}"
+            );
+        }
+    }
+}
+
+#[test]
+fn required_parquet_pair_checks_both_paths_and_rejects_unsupported_sql() {
+    let dir = FixtureDir::new("required");
+    let small = write_fixture(&dir.0, "small.parquet", 1024);
+    let large = write_fixture(&dir.0, "large.parquet", 524288);
+    let allowed = parquet_count_command("required", &small, &large)
+        .arg("--mixed-first")
         .output()
         .unwrap();
     assert!(

@@ -80,6 +80,13 @@ def validate(report, mode, mixed_first, partitions):
             raise ValueError(f"unexpected {mode}/{table} plan: {plan}")
 
 
+def pair_schedule(pair):
+    first, second = ("off", "required") if pair % 2 == 0 else ("required", "off")
+    # Balance phase order independently of which backend runs first.
+    mixed_first = pair % 4 in (1, 2)
+    return (first, mixed_first), (second, mixed_first)
+
+
 def compare(args):
     if platform.system() != "Linux":
         raise ValueError("the comparison requires Linux file page-cache verification")
@@ -121,11 +128,8 @@ def compare(args):
         ]
     for interval in args.interval_ms:
         for pair in range(args.pairs):
-            order = ("off", "required") if pair % 2 == 0 else ("required", "off")
-            # Balance phase order independently of which backend runs first.
-            mixed_first = pair % 4 in (1, 2)
-            phase_flag = ["--mixed-first"] if mixed_first else []
-            for mode in order:
+            for mode, mixed_first in pair_schedule(pair):
+                phase_flag = ["--mixed-first"] if mixed_first else []
                 before = warm(files)
                 completed = subprocess.run(
                     command

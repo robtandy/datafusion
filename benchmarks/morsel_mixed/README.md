@@ -287,14 +287,16 @@ by median scans/s. This is a trade-off under the measured three-lane load,
 not a single-query scan throughput result or a measurement of the scheduler
 in isolation.
 
-## Smoke test
+## Tests
 
 ```bash
 timeout 1200 cargo test --release --locked --manifest-path benchmarks/morsel_mixed/Cargo.toml
+# Use the Python environment with the #130 requirements installed above.
+timeout 120s "$py" -B -m unittest discover -s benchmarks/morsel_mixed -v
 ```
 
-The integration tests exercise the binary, check fixed arrivals, stock result
-validation and real execution overlap, and verify that a wrong expected row
-count across several output batches is reported as a failure after draining.
-The Parquet test checks both native plans and result counts, and verifies that
-unsupported SQL fails in required mode.
+The binary tests check fixed arrivals, result validation, execution overlap,
+and rejection of an incorrect expected row count after draining. The Parquet
+cases check both stock and native plans, completion and drop rates, and
+rejection of unsupported SQL in required mode. The Python tests check report
+validation and the counterbalanced pair order without running a benchmark.
