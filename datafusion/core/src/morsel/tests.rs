@@ -8,7 +8,7 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use arrow::array::Int32Array;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{Field, FieldRef, Schema};
 use datafusion_common::cast::{as_int32_array, as_int64_array};
 use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::logical_plan::{Filter, TableScanBuilder};
@@ -374,6 +374,149 @@ async fn worker_error_cancels_peers_without_polling_the_full_sink() -> Result<()
     assert!(error.to_string().contains("test morsel failure"), "{error}");
     assert!(stream.next().await.is_none());
     Ok(())
+}
+
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn memory_count_mask_is_selected_for_lowered_sql() -> Result<()> {
+    let ctx = crate::prelude::SessionContext::new();
+    ctx.register_batch(
+        "t",
+        RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![1, -1])) as _,
+        )])?,
+    )?;
+    let logical = ctx
+        .sql("SELECT COUNT(*) FROM t WHERE id > 0")
+        .await?
+        .into_optimized_plan()?;
+    let planner = MorselQueryPlanner::new(NonZeroUsize::MIN);
+    let Lowering::Native(mut plan) = planner.try_lower(&logical, &ctx.state()).await?
+    else {
+        panic!("expected native count plan for {logical:?}");
+    };
+    let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+    assert!(matches!(pipeline.sink, Sink::Count { .. }));
+    let [Operator::Filter { .. }, Operator::Projection(projector)] =
+        pipeline.operators.as_slice()
+    else {
+        panic!(
+            "expected Filter followed by Projection: {:?}",
+            pipeline.operators
+        );
+    };
+    assert!(projector.projection().as_ref().is_empty());
+    assert!(pipeline.memory_count_filter().is_some());
+
+    pipeline.operators.insert(
+        1,
+        Operator::Filter {
+            predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
+            projection: None,
+        },
+    );
+    assert!(pipeline.memory_count_filter().is_none());
+    Ok(())
+}
+
+// ScalarFunctionExpr rejects the wrong length before the runtime sees the mask.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct OversizedMask;
+
+impl fmt::Display for OversizedMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OversizedMask")
+    }
+}
+
+impl PhysicalExpr for OversizedMask {
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+
+    fn return_field(&self, _schema: &Schema) -> Result<FieldRef> {
+        Ok(Arc::new(Field::new("mask", DataType::Boolean, false)))
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(vec![
+            true;
+            batch.num_rows() + 1
+        ]))))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        assert!(children.is_empty());
+        Ok(self)
+    }
+}
+
+fn oversized_mask_pipeline(projection: Option<Vec<usize>>) -> Result<Pipeline> {
+    let (mut pipeline, _observations) = observed_pipeline(None)?;
+    pipeline.workers = NonZeroUsize::MIN;
+    pipeline.operators = vec![Operator::Filter {
+        predicate: Arc::new(OversizedMask),
+        projection,
+    }];
+    Ok(pipeline)
+}
+
+async fn assert_oversized_mask_error(
+    pipeline: Pipeline,
+    schema: SchemaRef,
+) -> Result<()> {
+    let plan = MorselExec::new(pipeline, schema);
+    let mut stream = plan.execute(0, Arc::default())?;
+    let error = timeout(DEADLINE, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "Filter predicate of length 2 is larger than target array of length 1"
+        ),
+        "{error}"
+    );
+    assert!(timeout(DEADLINE, stream.next()).await.unwrap().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn projected_filter_rejects_oversized_physical_mask() -> Result<()> {
+    let mut pipeline = oversized_mask_pipeline(Some(vec![]))?;
+    let projector = ProjectionExprs::new([ProjectionExpr::new(
+        Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
+        "constant",
+    )])
+    .make_projector(&Schema::empty())?;
+    let schema = Arc::clone(projector.output_schema());
+    pipeline.operators.push(Operator::Projection(projector));
+    assert_oversized_mask_error(pipeline, schema).await
+}
+
+#[tokio::test]
+async fn count_mask_rejects_oversized_physical_mask() -> Result<()> {
+    let mut pipeline = oversized_mask_pipeline(None)?;
+    assert!(pipeline.memory_count_filter().is_some());
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "count",
+        DataType::Int64,
+        false,
+    )]));
+    pipeline.sink = Sink::Count {
+        sink: CountSink::new(Arc::clone(&schema)),
+        result_operators: vec![],
+    };
+    assert_oversized_mask_error(pipeline, schema).await
 }
 
 #[tokio::test]

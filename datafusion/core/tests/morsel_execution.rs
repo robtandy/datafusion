@@ -293,24 +293,44 @@ async fn lowers_memory_filter_and_projection() -> Result<()> {
                 .sql("SET datafusion.execution.morsel_mode = 'required'")
                 .await?;
             morsel.register_table("items", table.clone())?;
-            for sql in [
-                FILTERED_QUERY,
-                "SELECT label FROM items WHERE threshold > 0",
-                "SELECT 42 AS constant FROM items WHERE threshold > 0",
-                "SELECT label, id FROM items",
-                "SELECT 42 AS constant FROM items",
+            for (sql, pruned_columns) in [
+                (FILTERED_QUERY, Some("[0, 2]")),
+                ("SELECT label FROM items WHERE threshold > 0", Some("[1]")),
+                (
+                    "SELECT 42 AS constant FROM items WHERE threshold > 0",
+                    Some("[]"),
+                ),
+                ("SELECT label, id FROM items", None),
+                ("SELECT 42 AS constant FROM items", None),
             ] {
                 let native = physical(&morsel, sql).await?;
                 let display = displayable(native.as_ref()).indent(false).to_string();
                 assert!(display.starts_with("MorselExec:"), "{display}");
+                let sink = if workers == 1 {
+                    "-> ResultSink[inline]"
+                } else {
+                    "-> ResultSink[capacity=2]"
+                };
+                assert!(display.contains(sink), "{sql}: {display}");
+                if let Some(columns) = pruned_columns {
+                    let (_, filter) = display
+                        .split_once("-> Filter[")
+                        .unwrap_or_else(|| panic!("missing filter for {sql}: {display}"));
+                    let (filter, _) =
+                        filter.split_once("] -> Projection[").unwrap_or_else(|| {
+                            panic!("missing projection after filter for {sql}: {display}")
+                        });
+                    if workers == 1 {
+                        assert!(
+                            filter.ends_with(&format!(", projection={columns}")),
+                            "{sql}: {display}"
+                        );
+                    } else {
+                        assert!(!filter.contains(", projection=["), "{sql}: {display}");
+                    }
+                }
                 if sql == FILTERED_QUERY {
                     assert!(display.contains("projection=Some([0, 1, 3])"), "{display}");
-                    assert!(
-                        display.contains("-> Filter[")
-                            && display.contains("-> Projection[")
-                            && display.contains("-> ResultSink["),
-                        "{display}"
-                    );
                 }
                 assert_eq!(native.output_partitioning().partition_count(), 1);
                 assert!(native.output_ordering().is_none());
@@ -425,7 +445,7 @@ async fn lowers_filtered_count_star() -> Result<()> {
 }
 
 #[tokio::test]
-async fn optimized_memory_filters_report_malformed_predicate_masks() -> Result<()> {
+async fn native_memory_filters_propagate_udf_length_errors() -> Result<()> {
     let ctx = morsel_context(1);
     ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
         .await?;
