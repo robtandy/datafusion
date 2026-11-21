@@ -14,7 +14,7 @@ use datafusion_common::{ScalarValue, exec_err};
 use datafusion_expr::logical_plan::{Filter, TableScanBuilder};
 use datafusion_expr::{ColumnarValue, Volatility, create_udf, lit};
 use datafusion_physical_expr::ScalarFunctionExpr;
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{Column, Literal};
 use tokio::sync::Semaphore;
 use tokio::task::Id;
 use tokio::time::timeout;
@@ -25,7 +25,7 @@ use crate::execution::SessionStateBuilder;
 const INPUT_BATCHES: usize = 4 * BATCHES_PER_MORSEL + 1;
 const WORKERS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(10);
-type Observations = mpsc::UnboundedReceiver<(i32, Id)>;
+type Observations = mpsc::UnboundedReceiver<(i32, Option<Id>)>;
 
 fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -50,7 +50,7 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
             };
             let id = as_int32_array(ids.as_ref())?.value(0);
             let count = evaluated.fetch_add(1, Ordering::Relaxed) + 1;
-            observed.send((id, tokio::task::id())).unwrap();
+            observed.send((id, tokio::task::try_id())).unwrap();
             if fail_on == Some(count) {
                 return exec_err!("test morsel failure");
             }
@@ -71,7 +71,10 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
                 projection: None,
                 schema,
             }),
-            operators: vec![Operator::Filter(Arc::new(predicate))],
+            operators: vec![Operator::Filter {
+                predicate: Arc::new(predicate),
+                projection: None,
+            }],
             workers: NonZeroUsize::new(WORKERS).unwrap(),
             sink: Sink::Result,
             sink_capacity: RESULT_CAPACITY,
@@ -82,6 +85,13 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
 
 fn observed_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
     let (pipeline, observations) = observed_pipeline(fail_on)?;
+    let schema = Arc::clone(pipeline.source.schema());
+    Ok((MorselExec::new(pipeline, schema), observations))
+}
+
+fn inline_plan(fail_on: Option<usize>) -> Result<(MorselExec, Observations)> {
+    let (mut pipeline, observations) = observed_pipeline(fail_on)?;
+    pipeline.workers = NonZeroUsize::MIN;
     let schema = Arc::clone(pipeline.source.schema());
     Ok((MorselExec::new(pipeline, schema), observations))
 }
@@ -157,7 +167,7 @@ fn observed_count(fail_on: Option<usize>) -> Result<ObservedCount> {
     })
 }
 
-async fn observe_n(observations: &mut Observations, n: usize) -> Vec<(i32, Id)> {
+async fn observe_n(observations: &mut Observations, n: usize) -> Vec<(i32, Option<Id>)> {
     timeout(DEADLINE, async {
         let mut seen = Vec::new();
         for _ in 0..n {
@@ -192,6 +202,98 @@ fn execute_does_not_need_a_runtime_before_poll() -> Result<()> {
     assert_eq!(
         observations.try_recv(),
         Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_worker_stream_is_lazy_and_does_not_run_ahead() -> Result<()> {
+    let (plan, mut observations) = inline_plan(None)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, Arc::default())?;
+    drop(plan);
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+
+    let std::task::Poll::Ready(Some(batch)) = futures::poll!(stream.next()) else {
+        panic!("the consumer's first poll should produce an in-memory batch inline");
+    };
+    assert_eq!(as_int32_array(batch?.column(0))?.values().as_ref(), &[0]);
+    assert_eq!(observations.try_recv().unwrap().0, 0);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    drop(stream);
+    assert_eq!(pipeline.strong_count(), 0);
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_worker_stream_allows_other_query_progress() -> Result<()> {
+    // Exercise both repeated Ready polls and an all-rejected scan whose first
+    // call to next() would otherwise consume the whole input.
+    for reject_all in [false, true] {
+        let (mut long, mut scans) = observed_pipeline(None)?;
+        long.workers = NonZeroUsize::MIN;
+        if reject_all {
+            long.operators.push(Operator::Filter {
+                predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(false)))),
+                projection: None,
+            });
+        }
+        let schema = Arc::clone(long.source.schema());
+        let long = MorselExec::new(long, schema);
+        let (short, _scans) = inline_plan(None)?;
+        let mut long_stream = long.execute(0, Arc::default())?;
+        let mut short_stream = short.execute(0, Arc::default())?;
+        let (long_result, short_result) = timeout(DEADLINE, async {
+            tokio::join!(
+                biased;
+                async {
+                    let mut rows = 0;
+                    while let Some(batch) = long_stream.next().await {
+                        rows += batch?.num_rows();
+                    }
+                    Ok::<_, datafusion_common::DataFusionError>(rows)
+                },
+                async {
+                    let batch = short_stream.next().await.unwrap()?;
+                    let scanned = std::iter::from_fn(|| scans.try_recv().ok()).count();
+                    assert_eq!(scanned, BATCHES_PER_MORSEL);
+                    Ok::<_, datafusion_common::DataFusionError>(batch)
+                },
+            )
+        })
+        .await
+        .expect("queries did not make progress");
+        assert_eq!(long_result?, if reject_all { 0 } else { INPUT_BATCHES });
+        assert_eq!(short_result?.num_rows(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_worker_stream_error_terminates_without_reading_more_input() -> Result<()>
+{
+    let (plan, mut observations) = inline_plan(Some(2))?;
+    let mut stream = plan.execute(0, Arc::default())?;
+    assert_eq!(stream.next().await.unwrap()?.num_rows(), 1);
+    let error = stream.next().await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("test morsel failure"), "{error}");
+    assert!(stream.next().await.is_none());
+    assert_eq!(observations.try_recv().unwrap().0, 0);
+    assert_eq!(observations.try_recv().unwrap().0, 1);
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
     );
     Ok(())
 }
