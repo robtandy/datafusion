@@ -9,7 +9,9 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use datafusion::arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{
+    BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion::catalog::Session;
@@ -287,23 +289,48 @@ async fn lowers_memory_filter_and_projection() -> Result<()> {
         default.register_table("items", table.clone())?;
         for workers in [1, 4] {
             let morsel = morsel_context(workers);
+            morsel
+                .sql("SET datafusion.execution.morsel_mode = 'required'")
+                .await?;
             morsel.register_table("items", table.clone())?;
-            for sql in [
-                FILTERED_QUERY,
-                "SELECT label, id FROM items",
-                "SELECT 42 AS constant FROM items",
+            for (sql, pruned_columns) in [
+                (FILTERED_QUERY, Some("[0, 2]")),
+                ("SELECT label FROM items WHERE threshold > 0", Some("[1]")),
+                (
+                    "SELECT 42 AS constant FROM items WHERE threshold > 0",
+                    Some("[]"),
+                ),
+                ("SELECT label, id FROM items", None),
+                ("SELECT 42 AS constant FROM items", None),
             ] {
                 let native = physical(&morsel, sql).await?;
                 let display = displayable(native.as_ref()).indent(false).to_string();
                 assert!(display.starts_with("MorselExec:"), "{display}");
+                let sink = if workers == 1 {
+                    "-> ResultSink[inline]"
+                } else {
+                    "-> ResultSink[capacity=2]"
+                };
+                assert!(display.contains(sink), "{sql}: {display}");
+                if let Some(columns) = pruned_columns {
+                    let (_, filter) = display
+                        .split_once("-> Filter[")
+                        .unwrap_or_else(|| panic!("missing filter for {sql}: {display}"));
+                    let (filter, _) =
+                        filter.split_once("] -> Projection[").unwrap_or_else(|| {
+                            panic!("missing projection after filter for {sql}: {display}")
+                        });
+                    if workers == 1 {
+                        assert!(
+                            filter.ends_with(&format!(", projection={columns}")),
+                            "{sql}: {display}"
+                        );
+                    } else {
+                        assert!(!filter.contains(", projection=["), "{sql}: {display}");
+                    }
+                }
                 if sql == FILTERED_QUERY {
                     assert!(display.contains("projection=Some([0, 1, 3])"), "{display}");
-                    assert!(
-                        display.contains("-> Filter[")
-                            && display.contains("-> Projection[")
-                            && display.contains("-> ResultSink["),
-                        "{display}"
-                    );
                 }
                 assert_eq!(native.output_partitioning().partition_count(), 1);
                 assert!(native.output_ordering().is_none());
@@ -371,6 +398,9 @@ async fn lowers_filtered_count_star() -> Result<()> {
         let expected_batches = collect(expected, default.task_ctx()).await?;
         for workers in [1, 4] {
             let morsel = morsel_context(workers);
+            morsel
+                .sql("SET datafusion.execution.morsel_mode = 'required'")
+                .await?;
             morsel.register_table("items", table.clone())?;
             let (observer, mut scans) = count_input_observer();
             morsel.register_udf(observer);
@@ -410,6 +440,40 @@ async fn lowers_filtered_count_star() -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_memory_filters_propagate_udf_length_errors() -> Result<()> {
+    let ctx = morsel_context(1);
+    ctx.sql("SET datafusion.execution.morsel_mode = 'required'")
+        .await?;
+    ctx.register_table("items", items(false)?)?;
+    ctx.register_udf(create_udf(
+        "oversized_mask",
+        vec![DataType::Int32],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(|_| {
+            Ok(datafusion::logical_expr::ColumnarValue::Array(Arc::new(
+                BooleanArray::from(vec![true; 4]),
+            )))
+        }),
+    ));
+    for sql in [
+        "SELECT 42 AS constant FROM items WHERE oversized_mask(id)",
+        "SELECT COUNT(*) FROM items WHERE oversized_mask(id)",
+    ] {
+        let plan = physical(&ctx, sql).await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let error = collect(plan, ctx.task_ctx()).await.unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "UDF oversized_mask returned a different number of rows than expected"
+            ),
+            "{error}"
+        );
     }
     Ok(())
 }

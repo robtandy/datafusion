@@ -9,9 +9,11 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::MorselMode;
 use datafusion_common::nested_struct::adapt_batch_to_schema;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
@@ -41,7 +43,7 @@ use datafusion_physical_plan::{
     PlanProperties, ReplaceChildrenOptions,
 };
 use datafusion_session::{QueryPlanner, Session};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
@@ -221,8 +223,14 @@ impl MorselQueryPlanner {
             #[cfg(not(feature = "parquet"))]
             return Ok(unsupported_provider(&scan.table_name));
         };
-        let (operators, mut schema) =
+        let (mut operators, mut schema) =
             Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
+        if self.workers == NonZeroUsize::MIN
+            && count.is_none()
+            && matches!(source, Source::Memory(_))
+        {
+            prune_filter_input(&mut operators, source.schema());
+        }
         let sink = if let Some((aggregate, expr, result_nodes)) = count {
             let field = LoweredAggregateBuilder::new(
                 expr,
@@ -283,7 +291,10 @@ impl MorselQueryPlanner {
                             "Morsel filter predicate must return Boolean: {predicate}"
                         );
                     }
-                    operators.push(Operator::Filter(predicate));
+                    operators.push(Operator::Filter {
+                        predicate,
+                        projection: None,
+                    });
                 }
                 LogicalPlan::Projection(projection) => {
                     let input = projection.input.schema();
@@ -405,7 +416,10 @@ impl QueryPlanner for MorselQueryPlanner {
 
 #[derive(Debug)]
 enum Operator {
-    Filter(Arc<dyn PhysicalExpr>),
+    Filter {
+        predicate: Arc<dyn PhysicalExpr>,
+        projection: Option<Vec<usize>>,
+    },
     Projection(Projector),
 }
 
@@ -448,13 +462,73 @@ impl MemorySource {
     }
 }
 
+fn prune_filter_input(operators: &mut [Operator], schema: &Schema) {
+    let [
+        Operator::Filter { projection, .. },
+        Operator::Projection(projector),
+    ] = operators
+    else {
+        return;
+    };
+    let columns = projector.projection().column_indices();
+    if columns.len() == schema.fields().len() {
+        return;
+    }
+    // The predicate still reads the full input; only the selected rows are
+    // materialized in the narrowed schema.
+    let input_projection = ProjectionExprs::from_indices(&columns, schema);
+    let remap = || {
+        projector
+            .projection()
+            .clone()
+            .try_map_exprs(|expr| input_projection.project_expr(&expr))?
+            .make_projector_with_schema_metadata(
+                &schema.project(&columns)?,
+                projector.output_schema(),
+            )
+    };
+    if let Ok(remapped) = remap()
+        && remapped.output_schema() == projector.output_schema()
+    {
+        *projection = Some(columns);
+        *projector = remapped;
+    }
+}
+
+fn with_filter_mask<T>(
+    batch: &RecordBatch,
+    predicate: &Arc<dyn PhysicalExpr>,
+    apply: impl FnOnce(&BooleanArray) -> Result<T>,
+) -> Result<T> {
+    let mask = predicate.evaluate(batch)?.into_array(batch.num_rows())?;
+    let Ok(mask) = as_boolean_array(&mask) else {
+        return internal_err!("Cannot create filter_array from non-boolean predicates");
+    };
+    apply(mask)
+}
+
 fn apply_operators(
     operators: &[Operator],
     mut batch: RecordBatch,
 ) -> Result<RecordBatch> {
     for operator in operators {
         batch = match operator {
-            Operator::Filter(predicate) => batch_filter(&batch, predicate)?,
+            Operator::Filter {
+                predicate,
+                projection: None,
+            } => batch_filter(&batch, predicate)?,
+            Operator::Filter {
+                predicate,
+                projection: Some(columns),
+            } => with_filter_mask(&batch, predicate, |mask| {
+                // Keep the original filter's handling of mismatched lengths,
+                // including when the projection keeps no columns.
+                if mask.len() != batch.num_rows() {
+                    Ok(filter_record_batch(&batch, mask)?.project(columns)?)
+                } else {
+                    Ok(filter_record_batch(&batch.project(columns)?, mask)?)
+                }
+            })?,
             Operator::Projection(projector) => projector.project_batch(&batch)?,
         };
         if batch.num_rows() == 0 {
@@ -483,6 +557,57 @@ struct Pipeline {
 }
 
 impl Pipeline {
+    fn is_inline_memory_stream(&self) -> bool {
+        self.workers == NonZeroUsize::MIN
+            && matches!(self.source, Source::Memory(_))
+            && matches!(self.sink, Sink::Result)
+    }
+
+    fn inline_memory_stream(self: Arc<Self>) -> impl Stream<Item = Result<RecordBatch>> {
+        stream::try_unfold((self, 0usize), |(pipeline, mut next)| async move {
+            let source = match &pipeline.source {
+                Source::Memory(source) => source,
+                #[cfg(feature = "parquet")]
+                Source::Parquet(_) => unreachable!(),
+            };
+            while let Some(input) = source.batches.get(next) {
+                // A drain can immediately poll again, and a filter can consume
+                // input without emitting anything. Budget by input, not output.
+                if next != 0 && next.is_multiple_of(BATCHES_PER_MORSEL) {
+                    tokio::task::yield_now().await;
+                }
+                next += 1;
+                let batch = apply_operators(&pipeline.operators, source.read(input)?)?;
+                if batch.num_rows() != 0 {
+                    return Ok(Some((batch, (pipeline, next))));
+                }
+            }
+            Ok(None)
+        })
+    }
+
+    fn memory_count_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        let [
+            Operator::Filter {
+                predicate,
+                projection: None,
+            },
+            rest @ ..,
+        ] = self.operators.as_slice()
+        else {
+            return None;
+        };
+        match rest {
+            [] => Some(predicate),
+            [Operator::Projection(projector)]
+                if projector.projection().as_ref().is_empty() =>
+            {
+                Some(predicate)
+            }
+            _ => None,
+        }
+    }
+
     async fn run_memory_worker(
         &self,
         source: &MemorySource,
@@ -490,6 +615,7 @@ impl Pipeline {
         tx: mpsc::Sender<RecordBatch>,
     ) -> Result<Option<CountState>> {
         let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
+        let count_filter = count.and_then(|_| self.memory_count_filter());
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
             if start >= source.batches.len() {
@@ -497,9 +623,21 @@ impl Pipeline {
             }
             let end = (start + BATCHES_PER_MORSEL).min(source.batches.len());
             for input in &source.batches[start..end] {
-                if tx.is_closed()
-                    || !self.consume(source.read(input)?, &tx, &mut count).await?
-                {
+                if tx.is_closed() {
+                    return Ok(None);
+                }
+                let batch = source.read(input)?;
+                if let (Some(local), Some(predicate)) = (&mut count, count_filter) {
+                    let rows = with_filter_mask(&batch, predicate, |mask| {
+                        if mask.len() == batch.num_rows() {
+                            Ok(mask.true_count())
+                        } else {
+                            Ok(filter_record_batch(&batch, mask)?.num_rows())
+                        }
+                    })?;
+                    local.add_rows(rows)?;
+                    tokio::task::yield_now().await;
+                } else if !self.consume(batch, &tx, &mut count).await? {
                     return Ok(None);
                 }
             }
@@ -713,14 +851,27 @@ impl DisplayAs for MorselExec {
             write!(f, " -> CountSink; FinalizedCountSource")?;
             display_operators(result_operators, f)?;
         }
-        write!(f, " -> ResultSink[capacity={}]", pipeline.sink_capacity)
+        if pipeline.is_inline_memory_stream() {
+            write!(f, " -> ResultSink[inline]")
+        } else {
+            write!(f, " -> ResultSink[capacity={}]", pipeline.sink_capacity)
+        }
     }
 }
 
 fn display_operators(operators: &[Operator], f: &mut fmt::Formatter<'_>) -> fmt::Result {
     for operator in operators {
         match operator {
-            Operator::Filter(predicate) => write!(f, " -> Filter[{predicate}]")?,
+            Operator::Filter {
+                predicate,
+                projection,
+            } => {
+                write!(f, " -> Filter[{predicate}")?;
+                if let Some(columns) = projection {
+                    write!(f, ", projection={columns:?}")?;
+                }
+                write!(f, "]")?;
+            }
             Operator::Projection(projector) => {
                 write!(f, " -> {}", projector.projection())?
             }
@@ -762,7 +913,7 @@ impl ExecutionPlan for MorselExec {
                 .iter()
                 .chain(result_operators)
                 .flat_map(|operator| match operator {
-                    Operator::Filter(predicate) => {
+                    Operator::Filter { predicate, .. } => {
                         itertools::Either::Left(std::iter::once(predicate))
                     }
                     Operator::Projection(projector) => itertools::Either::Right(
@@ -805,6 +956,12 @@ impl ExecutionPlan for MorselExec {
             );
         }
         let pipeline = Arc::clone(&self.pipeline);
+        if pipeline.is_inline_memory_stream() {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema(),
+                pipeline.inline_memory_stream(),
+            )));
+        }
         let metrics = self.metrics.clone();
         let stream = stream::once(async move {
             stream::try_unfold(pipeline.start(context, metrics), |mut run| async move {
