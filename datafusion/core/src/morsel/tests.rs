@@ -28,6 +28,11 @@ const WORKERS: usize = 2;
 const DEADLINE: Duration = Duration::from_secs(10);
 type Observations = mpsc::UnboundedReceiver<(i32, Option<Id>)>;
 
+fn task_with_batch_size(size: usize) -> Arc<TaskContext> {
+    let config = crate::prelude::SessionConfig::new().with_batch_size(size);
+    Arc::new(TaskContext::default().with_session_config(config))
+}
+
 fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)> {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let batches = (0..INPUT_BATCHES)
@@ -78,7 +83,7 @@ fn observed_pipeline(fail_on: Option<usize>) -> Result<(Pipeline, Observations)>
             }],
             workers: NonZeroUsize::new(WORKERS).unwrap(),
             sink: Sink::Result,
-            sink_capacity: RESULT_CAPACITY,
+            sink_capacity: result_capacity(NonZeroUsize::new(WORKERS).unwrap()),
         },
         observations,
     ))
@@ -211,7 +216,7 @@ fn execute_does_not_need_a_runtime_before_poll() -> Result<()> {
 async fn single_worker_stream_is_lazy_and_does_not_run_ahead() -> Result<()> {
     let (plan, mut observations) = inline_plan(None)?;
     let pipeline = Arc::downgrade(&plan.pipeline);
-    let mut stream = plan.execute(0, Arc::default())?;
+    let mut stream = plan.execute(0, task_with_batch_size(1))?;
     drop(plan);
     assert_eq!(
         observations.try_recv(),
@@ -241,7 +246,9 @@ async fn single_worker_stream_is_lazy_and_does_not_run_ahead() -> Result<()> {
 async fn detailed_metrics_are_opt_in_and_isolated_on_reused_plans() -> Result<()> {
     let (plan, _scans) = inline_plan(None)?;
     let collector = Arc::new(MorselMetrics::default());
-    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+    let cfg = crate::prelude::SessionConfig::new()
+        .with_batch_size(1)
+        .with_extension(Arc::clone(&collector));
     let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
 
     let mut cancelled = plan.execute(0, Arc::clone(&ctx))?;
@@ -302,7 +309,9 @@ async fn concurrent_worker_runs_report_separate_queue_and_work_totals() -> Resul
 
     let (plan, _scans) = observed_plan(None)?;
     let collector = Arc::new(MorselMetrics::default());
-    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+    let cfg = crate::prelude::SessionConfig::new()
+        .with_batch_size(2)
+        .with_extension(Arc::clone(&collector));
     let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
     let first = plan.execute(0, Arc::clone(&ctx))?;
     let second = plan.execute(0, ctx)?;
@@ -324,7 +333,10 @@ async fn concurrent_worker_runs_report_separate_queue_and_work_totals() -> Resul
         let expected = INPUT_BATCHES.div_ceil(BATCHES_PER_MORSEL);
         assert_eq!(metric("morsels_claimed"), expected);
         assert_eq!(metric("morsels_completed"), expected);
-        assert!((1..=RESULT_CAPACITY).contains(&metric("morsel_peak_output_depth")));
+        assert!(
+            (1..=plan.pipeline.sink_capacity)
+                .contains(&metric("morsel_peak_output_depth"))
+        );
     }
     Ok(())
 }
@@ -345,8 +357,9 @@ async fn single_worker_stream_allows_other_query_progress() -> Result<()> {
         let schema = Arc::clone(long.source.schema());
         let long = MorselExec::new(long, schema);
         let (short, _scans) = inline_plan(None)?;
-        let mut long_stream = long.execute(0, Arc::default())?;
-        let mut short_stream = short.execute(0, Arc::default())?;
+        let mut long_stream =
+            long.execute(0, task_with_batch_size(2 * BATCHES_PER_MORSEL))?;
+        let mut short_stream = short.execute(0, task_with_batch_size(1))?;
         let (long_result, short_result) = timeout(DEADLINE, async {
             tokio::join!(
                 biased;
@@ -383,11 +396,12 @@ async fn single_worker_stream_error_terminates_without_reading_more_input(
     let (plan, mut observations) = inline_plan(Some(2))?;
     let collector = Arc::new(MorselMetrics::default());
     let ctx = if measure {
-        let cfg =
-            crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+        let cfg = crate::prelude::SessionConfig::new()
+            .with_batch_size(1)
+            .with_extension(Arc::clone(&collector));
         Arc::new(TaskContext::default().with_session_config(cfg))
     } else {
-        Arc::default()
+        task_with_batch_size(1)
     };
     let mut stream = plan.execute(0, ctx)?;
     assert_eq!(stream.next().await.unwrap()?.num_rows(), 1);
@@ -410,33 +424,90 @@ async fn single_worker_stream_error_terminates_without_reading_more_input(
     Ok(())
 }
 
+#[test]
+fn result_channel_capacity_is_capped() {
+    assert_eq!(result_capacity(NonZeroUsize::MIN), 2);
+    assert_eq!(result_capacity(NonZeroUsize::new(8).unwrap()), 16);
+    assert_eq!(result_capacity(NonZeroUsize::MAX), MAX_RESULT_CAPACITY);
+}
+
+#[test]
+fn large_filtered_batch_bypasses_the_coalescer() -> Result<()> {
+    let batch = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int32Array::from_iter_values(0..6)) as _,
+    )])?;
+    let operators = [Operator::Filter {
+        predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        projection: None,
+    }];
+    let mut buffer = ResultBuffer::new(&operators, 10);
+    buffer.push_from(&operators, 0, batch.clone())?;
+    let output = buffer.next(&operators, false)?.unwrap();
+    assert!(Arc::ptr_eq(batch.column(0), output.column(0)));
+    assert!(buffer.next(&operators, true)?.is_none());
+    Ok(())
+}
+
 #[tokio::test]
-async fn workers_claim_disjoint_ranges_and_backpressure_bounds_the_queue() -> Result<()> {
+async fn dropping_inline_stream_discards_partial_batch() -> Result<()> {
+    let (plan, mut observations) = inline_plan(None)?;
+    let pipeline = Arc::downgrade(&plan.pipeline);
+    let mut stream = plan.execute(0, task_with_batch_size(2 * BATCHES_PER_MORSEL))?;
+    drop(plan);
+    assert!(futures::poll!(stream.next()).is_pending());
+    observe_n(&mut observations, BATCHES_PER_MORSEL).await;
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    );
+    drop(stream);
+    assert_eq!(pipeline.strong_count(), 0);
+    assert_eq!(
+        observations.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workers_coalesce_disjoint_ranges_and_backpressure_bounds_the_queue() -> Result<()>
+{
     let (plan, mut observations) = observed_plan(None)?;
-    let mut run = plan
-        .pipeline
-        .start(Arc::default(), plan.metrics.clone(), None);
-    // Without consumption, the only evaluated batches can be the queued ones
-    // and the one parked at each worker's send.
-    let mut seen = observe_n(&mut observations, RESULT_CAPACITY + WORKERS).await;
-    assert_eq!(run.rx.len(), RESULT_CAPACITY);
+    let target = 2;
+    let capacity = plan.pipeline.sink_capacity;
+    let mut run =
+        plan.pipeline
+            .start(task_with_batch_size(target), plan.metrics.clone(), None);
+    // Each output consumes two single-row inputs. Without consumption, workers
+    // fill the channel and then each park at their next send, without reading ahead.
+    let mut seen = observe_n(&mut observations, (capacity + WORKERS) * target).await;
+    assert_eq!(run.rx.len(), capacity);
     assert_eq!(run.rx.capacity(), 0);
     assert_eq!(
         observations.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     );
 
-    let mut output = [0; INPUT_BATCHES];
+    let mut output = Vec::new();
     timeout(DEADLINE, async {
         while let Some(batch) = run.next().await? {
-            let id = as_int32_array(batch.column(0))?.value(0) as usize;
-            output[id] += 1;
+            output.push(as_int32_array(batch.column(0))?.values().to_vec());
         }
         Ok::<_, datafusion_common::DataFusionError>(())
     })
     .await
     .expect("pipeline did not drain")?;
-    assert_eq!(output, [1; INPUT_BATCHES]);
+    assert_eq!(output.len(), INPUT_BATCHES.div_ceil(target));
+    assert!(
+        output[..output.len() - 1]
+            .iter()
+            .all(|ids| ids.len() == target)
+    );
+    assert_eq!(output.last().unwrap().len(), 1);
+    let mut rows: Vec<_> = output.iter().flatten().copied().collect();
+    rows.sort_unstable();
+    assert_eq!(rows, (0..INPUT_BATCHES as i32).collect::<Vec<_>>());
 
     while let Ok(claim) = observations.try_recv() {
         seen.push(claim);
@@ -450,6 +521,13 @@ async fn workers_claim_disjoint_ranges_and_backpressure_bounds_the_queue() -> Re
     for range in seen.chunks(BATCHES_PER_MORSEL) {
         assert!(range.iter().all(|&(_, worker)| worker == range[0].1));
     }
+    for batch in output {
+        assert!(
+            batch
+                .iter()
+                .all(|&id| seen[id as usize].1 == seen[batch[0] as usize].1)
+        );
+    }
     Ok(())
 }
 
@@ -457,10 +535,11 @@ async fn workers_claim_disjoint_ranges_and_backpressure_bounds_the_queue() -> Re
 async fn dropping_stream_cancels_workers_parked_on_the_full_sink() -> Result<()> {
     let (plan, mut observations) = observed_plan(None)?;
     let pipeline = Arc::downgrade(&plan.pipeline);
-    let mut stream = plan.execute(0, Arc::default())?;
+    let capacity = plan.pipeline.sink_capacity;
+    let mut stream = plan.execute(0, task_with_batch_size(2))?;
     drop(plan);
     assert!(futures::poll!(stream.next()).is_pending());
-    observe_n(&mut observations, RESULT_CAPACITY + WORKERS).await;
+    observe_n(&mut observations, (capacity + WORKERS) * 2).await;
     drop(stream);
     assert_workers_stopped(&pipeline).await;
     assert_eq!(
@@ -472,10 +551,11 @@ async fn dropping_stream_cancels_workers_parked_on_the_full_sink() -> Result<()>
 
 #[tokio::test]
 async fn worker_error_cancels_peers_without_polling_the_full_sink() -> Result<()> {
-    let fail_on = RESULT_CAPACITY + WORKERS;
+    let workers = NonZeroUsize::new(WORKERS).unwrap();
+    let fail_on = (result_capacity(workers) + WORKERS) * 2;
     let (plan, mut observations) = observed_plan(Some(fail_on))?;
     let pipeline = Arc::downgrade(&plan.pipeline);
-    let mut stream = plan.execute(0, Arc::default())?;
+    let mut stream = plan.execute(0, task_with_batch_size(2))?;
     drop(plan);
     assert!(futures::poll!(stream.next()).is_pending());
     observe_n(&mut observations, fail_on).await;
@@ -487,6 +567,59 @@ async fn worker_error_cancels_peers_without_polling_the_full_sink() -> Result<()
     let error = stream.next().await.unwrap().unwrap_err();
     assert!(error.to_string().contains("test morsel failure"), "{error}");
     assert!(stream.next().await.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_error_discards_other_workers_eof_tails() -> Result<()> {
+    let (mut pipeline, mut observations) = observed_pipeline(None)?;
+    let schema = Arc::clone(pipeline.source.schema());
+    let projected = Arc::new(AtomicUsize::new(0));
+    let observe = create_udf(
+        "observe_eof_tail",
+        vec![DataType::Int32],
+        DataType::Int32,
+        Volatility::Volatile,
+        Arc::new({
+            let projected = Arc::clone(&projected);
+            move |args| {
+                let ColumnarValue::Array(ids) = &args[0] else {
+                    unreachable!()
+                };
+                assert!(ids.len() >= BATCHES_PER_MORSEL);
+                if projected.fetch_add(1, Ordering::Relaxed) > 0 {
+                    return exec_err!("test EOF projection failure");
+                }
+                Ok(args[0].clone())
+            }
+        }),
+    );
+    let expr = ScalarFunctionExpr::try_new(
+        Arc::new(observe),
+        vec![Arc::new(Column::new("id", 0))],
+        &schema,
+        Arc::default(),
+    )?;
+    let projector = ProjectionExprs::new([ProjectionExpr::new(Arc::new(expr), "id")])
+        .make_projector(&schema)?;
+    pipeline.operators.push(Operator::Projection(projector));
+    let pipeline = Arc::new(pipeline);
+    let weak = Arc::downgrade(&pipeline);
+    // Every worker has fewer rows than this target, so projection runs only at EOF.
+    let mut run = pipeline.start(
+        task_with_batch_size(2 * INPUT_BATCHES),
+        Default::default(),
+        None,
+    );
+    observe_n(&mut observations, INPUT_BATCHES).await;
+    assert_workers_stopped(&weak).await;
+    assert_eq!(projected.load(Ordering::Relaxed), WORKERS);
+    assert!(
+        run.rx.is_empty(),
+        "an EOF tail was queued despite a worker error"
+    );
+    let error = run.next().await.unwrap_err().to_string();
+    assert!(error.contains("test EOF projection failure"), "{error}");
     Ok(())
 }
 

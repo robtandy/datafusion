@@ -187,6 +187,31 @@ async fn filtered_projection_matches_stock_with_or_without_row_pushdown() -> Res
 }
 
 #[tokio::test]
+async fn parquet_filter_coalesces_across_row_groups() -> Result<()> {
+    let dir = fixture()?;
+    let native = context(&dir, "required", false).await?;
+    native
+        .sql("SET datafusion.execution.target_partitions = 1")
+        .await?;
+    native
+        .sql("SET datafusion.execution.batch_size = 4")
+        .await?;
+    let sql = "SELECT payload AS p, id FROM t WHERE gate > 10";
+    let plan = native.sql(sql).await?.create_physical_plan().await?;
+    assert_eq!(plan.name(), "MorselExec");
+    let batches = collect(Arc::clone(&plan), native.task_ctx()).await?;
+    assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 6);
+    assert_eq!(
+        batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect::<Vec<_>>(),
+        [4, 2]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn pruned_empty_and_zero_width_scans_preserve_row_counts() -> Result<()> {
     let dir = fixture()?;
     let native = context(&dir, "required", false).await?;
