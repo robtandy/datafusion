@@ -237,6 +237,98 @@ async fn single_worker_stream_is_lazy_and_does_not_run_ahead() -> Result<()> {
 }
 
 #[tokio::test]
+async fn detailed_metrics_are_opt_in_and_isolated_on_reused_plans() -> Result<()> {
+    let (plan, _scans) = inline_plan(None)?;
+    let collector = Arc::new(MorselMetrics::default());
+    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+    let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
+
+    let mut cancelled = plan.execute(0, Arc::clone(&ctx))?;
+    let mut complete = plan.execute(0, Arc::clone(&ctx))?;
+    let never_polled = plan.execute(0, ctx)?;
+    drop(never_polled);
+    assert!(collector.take_runs().is_empty());
+    assert_eq!(cancelled.next().await.unwrap()?.num_rows(), 1);
+    assert_eq!(complete.next().await.unwrap()?.num_rows(), 1);
+    drop(cancelled);
+    let cancelled = collector.take_runs();
+    assert_eq!(cancelled.len(), 1);
+    let value = |report: &MetricsSet, name| {
+        report
+            .iter()
+            .find(|m| m.value().name() == name)
+            .unwrap()
+            .value()
+            .as_usize()
+    };
+    assert_eq!(value(&cancelled[0], "morsels_claimed"), 1);
+    assert_eq!(value(&cancelled[0], "morsels_completed"), 0);
+    assert_eq!(value(&cancelled[0], "morsel_peak_output_depth"), 0);
+    assert_eq!(value(&cancelled[0], "morsel_output_wait"), 0);
+
+    let mut rows = 1;
+    while let Some(batch) = complete.next().await {
+        rows += batch?.num_rows();
+    }
+    assert_eq!(rows, INPUT_BATCHES);
+    let complete = collector.take_runs();
+    assert_eq!(complete.len(), 1);
+    let expected = INPUT_BATCHES.div_ceil(BATCHES_PER_MORSEL);
+    assert_eq!(value(&complete[0], "morsels_claimed"), expected);
+    assert_eq!(value(&complete[0], "morsels_completed"), expected);
+    assert_eq!(value(&complete[0], "morsel_ready_wait"), 0);
+    assert_eq!(value(&complete[0], "morsel_output_wait"), 0);
+    assert_eq!(value(&complete[0], "morsel_decode_work"), 0);
+    assert!(value(&complete[0], "morsel_process_work") > 0);
+
+    let mut disabled = plan.execute(0, Arc::default())?;
+    while let Some(batch) = disabled.next().await {
+        batch?;
+    }
+    assert!(collector.take_runs().is_empty());
+    assert!(
+        plan.metrics()
+            .unwrap()
+            .sum_by_name("morsels_claimed")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_worker_runs_report_separate_queue_and_work_totals() -> Result<()> {
+    use datafusion_physical_plan::common::collect;
+
+    let (plan, _scans) = observed_plan(None)?;
+    let collector = Arc::new(MorselMetrics::default());
+    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+    let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
+    let first = plan.execute(0, Arc::clone(&ctx))?;
+    let second = plan.execute(0, ctx)?;
+    let (first, second) = timeout(DEADLINE, async {
+        tokio::try_join!(collect(first), collect(second))
+    })
+    .await
+    .expect("concurrent runs did not finish")?;
+    for batches in [first, second] {
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            INPUT_BATCHES
+        );
+    }
+    let reports = collector.take_runs();
+    assert_eq!(reports.len(), 2);
+    for report in reports {
+        let metric = |name| report.sum_by_name(name).unwrap().as_usize();
+        let expected = INPUT_BATCHES.div_ceil(BATCHES_PER_MORSEL);
+        assert_eq!(metric("morsels_claimed"), expected);
+        assert_eq!(metric("morsels_completed"), expected);
+        assert!((1..=RESULT_CAPACITY).contains(&metric("morsel_peak_output_depth")));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn single_worker_stream_allows_other_query_progress() -> Result<()> {
     // Exercise both repeated Ready polls and an all-rejected scan whose first
     // call to next() would otherwise consume the whole input.
@@ -284,7 +376,10 @@ async fn single_worker_stream_allows_other_query_progress() -> Result<()> {
 async fn single_worker_stream_error_terminates_without_reading_more_input() -> Result<()>
 {
     let (plan, mut observations) = inline_plan(Some(2))?;
-    let mut stream = plan.execute(0, Arc::default())?;
+    let collector = Arc::new(MorselMetrics::default());
+    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+    let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
+    let mut stream = plan.execute(0, ctx)?;
     assert_eq!(stream.next().await.unwrap()?.num_rows(), 1);
     let error = stream.next().await.unwrap().unwrap_err();
     assert!(error.to_string().contains("test morsel failure"), "{error}");
@@ -295,13 +390,20 @@ async fn single_worker_stream_error_terminates_without_reading_more_input() -> R
         observations.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     );
+    let reports = collector.take_runs();
+    assert_eq!(reports.len(), 1);
+    let count = |name| reports[0].sum_by_name(name).unwrap().as_usize();
+    assert_eq!(count("morsels_claimed"), 1);
+    assert_eq!(count("morsels_completed"), 0);
     Ok(())
 }
 
 #[tokio::test]
 async fn workers_claim_disjoint_ranges_and_backpressure_bounds_the_queue() -> Result<()> {
     let (plan, mut observations) = observed_plan(None)?;
-    let mut run = plan.pipeline.start(Arc::default(), plan.metrics.clone());
+    let mut run = plan
+        .pipeline
+        .start(Arc::default(), plan.metrics.clone(), None);
     // Without consumption, the only evaluated batches can be the queued ones
     // and the one parked at each worker's send.
     let mut seen = observe_n(&mut observations, RESULT_CAPACITY + WORKERS).await;

@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::datasource::listing::ListingTable;
 
+use super::metrics::{self, Footprint, RunMetrics};
 use super::{CountState, supported_expr};
 
 #[cfg(test)]
@@ -201,6 +202,7 @@ impl ParquetScan {
         &self,
         context: &TaskContext,
         tasks: &mut JoinSet<Result<Option<CountState>>>,
+        measurement: Option<Arc<RunMetrics>>,
     ) -> Result<ReadyReaders> {
         let (publish, ready) = mpsc::channel(READY_READERS);
         if let Some(config) = &self.config {
@@ -219,14 +221,16 @@ impl ParquetScan {
             for _ in 0..FILE_LANES.min(self.files.len()) {
                 let work = Arc::clone(&work);
                 let publish = publish.clone();
+                let measurement = measurement.clone();
                 tasks.spawn(async move {
-                    work.produce(publish).await?;
+                    work.produce(publish, measurement.as_ref()).await?;
                     Ok(None)
                 });
             }
         }
         Ok(ReadyReaders {
             queue: Arc::new(Mutex::new(ready)),
+            measurement,
             claimed: MetricBuilder::new(&self.metrics)
                 .counter("parquet_morsels_claimed", 0),
         })
@@ -236,12 +240,15 @@ impl ParquetScan {
 #[derive(Clone)]
 pub(super) struct ReadyReaders {
     queue: Arc<Mutex<mpsc::Receiver<Box<dyn Morsel>>>>,
+    measurement: Option<Arc<RunMetrics>>,
     claimed: Count,
 }
 
 impl ReadyReaders {
     pub(super) async fn claim(&self) -> Option<Box<dyn Morsel>> {
-        let reader = self.queue.lock().await.recv().await?;
+        let stats = self.measurement.as_ref().map(|run| &run.ready);
+        let mut queue = self.queue.lock().await;
+        let reader = metrics::recv(stats, &mut queue).await?;
         self.claimed.add(1);
         Some(reader)
     }
@@ -255,16 +262,22 @@ struct FileWork {
 }
 
 impl FileWork {
-    async fn produce(&self, publish: mpsc::Sender<Box<dyn Morsel>>) -> Result<()> {
+    async fn produce(
+        &self,
+        publish: mpsc::Sender<Box<dyn Morsel>>,
+        measurement: Option<&Arc<RunMetrics>>,
+    ) -> Result<()> {
         while !publish.is_closed()
             && let Some(file) = self.files.get(self.next.fetch_add(1, Ordering::Relaxed))
         {
-            self.produce_file(file, &publish).await.map_err(|error| {
-                error.context(format!(
-                    "Planning Parquet morsels for {}",
-                    file.object_meta.location
-                ))
-            })?;
+            self.produce_file(file, &publish, measurement)
+                .await
+                .map_err(|error| {
+                    error.context(format!(
+                        "Planning Parquet morsels for {}",
+                        file.object_meta.location
+                    ))
+                })?;
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -274,6 +287,7 @@ impl FileWork {
         &self,
         file: &PartitionedFile,
         publish: &mpsc::Sender<Box<dyn Morsel>>,
+        measurement: Option<&Arc<RunMetrics>>,
     ) -> Result<()> {
         let mut planner = self.morselizer.plan_file(file.clone())?;
         loop {
@@ -293,7 +307,13 @@ impl FileWork {
                 );
             }
             if let Some(morsel) = morsels.pop() {
-                permit.send(morsel);
+                if let Some(run) = measurement {
+                    run.ready.publish(permit, morsel, |m| {
+                        Footprint::estimated(m.buffered_bytes_estimate())
+                    });
+                } else {
+                    permit.send(morsel);
+                }
             } else {
                 drop(permit);
             }
@@ -305,7 +325,12 @@ impl FileWork {
                     .acquire()
                     .await
                     .expect("semaphore is never closed");
-                planner = SpawnedTask::spawn(io).join_unwind().await.map_err(|e| {
+                let task = if let Some(run) = measurement {
+                    SpawnedTask::spawn(Arc::clone(run).io(io))
+                } else {
+                    SpawnedTask::spawn(io)
+                };
+                planner = task.join_unwind().await.map_err(|e| {
                     datafusion_common::exec_datafusion_err!(
                         "Parquet morsel I/O task failed: {e}"
                     )
