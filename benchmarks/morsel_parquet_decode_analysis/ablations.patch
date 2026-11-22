@@ -1,0 +1,298 @@
+diff --git a/datafusion/core/src/morsel.rs b/datafusion/core/src/morsel.rs
+index 892db0a54..7efd6c969 100644
+--- a/datafusion/core/src/morsel.rs
++++ b/datafusion/core/src/morsel.rs
+@@ -233 +233,2 @@ impl MorselQueryPlanner {
+-            && matches!(source, Source::Memory(_))
++            && (matches!(source, Source::Memory(_))
++                || std::env::var_os("MORSEL_SCRATCH_PRUNE").is_some())
+@@ -235,0 +237,9 @@ impl MorselQueryPlanner {
++            if std::env::var_os("MORSEL_SCRATCH_PRUNE").is_some() {
++                assert!(matches!(
++                    operators.first(),
++                    Some(Operator::Filter {
++                        projection: Some(_),
++                        ..
++                    })
++                ));
++            }
+@@ -269 +279,5 @@ impl MorselQueryPlanner {
+-                sink_capacity: RESULT_CAPACITY,
++                sink_capacity: if std::env::var_os("MORSEL_SCRATCH_OUTPUT").is_some() {
++                    32
++                } else {
++                    RESULT_CAPACITY
++                },
+@@ -681,0 +696,11 @@ impl Pipeline {
++        let direct = std::env::var_os("MORSEL_SCRATCH_DIRECT").is_some();
++        let batch_yield = std::env::var_os("MORSEL_SCRATCH_NO_YIELD").is_none();
++        let count_filter =
++            if count.is_some() && std::env::var_os("MORSEL_SCRATCH_COUNT").is_some() {
++                Some(
++                    self.memory_count_filter()
++                        .expect("expected COUNT filter shape"),
++                )
++            } else {
++                None
++            };
+@@ -684,5 +709,13 @@ impl Pipeline {
+-            let mut reader = worker.decode(|| morsel.into_stream());
+-            while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
+-                if tx.is_closed()
+-                    || !self.consume(batch?, &tx, &mut count, &mut worker).await?
+-                {
++            let (mut morsel, mut stream) = if direct {
++                (Some(morsel), None)
++            } else {
++                (None, Some(worker.decode(|| morsel.into_stream())))
++            };
++            loop {
++                let batch = if let Some(morsel) = &mut morsel {
++                    worker.decode(|| morsel.scratch_next_batch())
++                } else {
++                    metrics::decode(&mut worker, stream.as_mut().unwrap().next()).await
++                };
++                let Some(batch) = batch else { break };
++                if tx.is_closed() {
+@@ -691 +724,18 @@ impl Pipeline {
+-                tokio::task::yield_now().await;
++                let batch = batch?;
++                if let (Some(local), Some(predicate)) = (&mut count, count_filter) {
++                    worker.process(|| {
++                        let rows = with_filter_mask(&batch, predicate, |mask| {
++                            if mask.len() == batch.num_rows() {
++                                Ok(mask.true_count())
++                            } else {
++                                Ok(filter_record_batch(&batch, mask)?.num_rows())
++                            }
++                        })?;
++                        local.add_rows(rows)
++                    })?;
++                } else if !self.consume(batch, &tx, &mut count, &mut worker).await? {
++                    return Ok(None);
++                }
++                if batch_yield {
++                    tokio::task::yield_now().await;
++                }
+diff --git a/datafusion/core/src/morsel/parquet.rs b/datafusion/core/src/morsel/parquet.rs
+index 60b99380c..17a312c36 100644
+--- a/datafusion/core/src/morsel/parquet.rs
++++ b/datafusion/core/src/morsel/parquet.rs
+@@ -207 +207,2 @@ impl ParquetScan {
+-        let (publish, ready) = mpsc::channel(READY_READERS);
++        let wide = std::env::var_os("MORSEL_SCRATCH_PRODUCER").is_some();
++        let (publish, ready) = mpsc::channel(if wide { 8 } else { READY_READERS });
+@@ -219 +220 @@ impl ParquetScan {
+-                io_slots: Semaphore::new(PENDING_IO),
++                io_slots: Semaphore::new(if wide { 8 } else { PENDING_IO }),
+@@ -221 +222 @@ impl ParquetScan {
+-            for _ in 0..FILE_LANES.min(self.files.len()) {
++            for _ in 0..(if wide { 8 } else { FILE_LANES }).min(self.files.len()) {
+diff --git a/datafusion/datasource-parquet/src/decoder_projection.rs b/datafusion/datasource-parquet/src/decoder_projection.rs
+index ed4eb51b5..194446ebd 100644
+--- a/datafusion/datasource-parquet/src/decoder_projection.rs
++++ b/datafusion/datasource-parquet/src/decoder_projection.rs
+@@ -135,0 +136,4 @@ impl DecoderProjection {
++        crate::scratch_timing::PROJECT.measure(|| self.map_impl(batch))
++    }
++
++    fn map_impl(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+diff --git a/datafusion/datasource-parquet/src/mod.rs b/datafusion/datasource-parquet/src/mod.rs
+index 4bb7166fa..4e52b939a 100644
+--- a/datafusion/datasource-parquet/src/mod.rs
++++ b/datafusion/datasource-parquet/src/mod.rs
+@@ -30,0 +31 @@ mod schema_coercion;
++pub mod scratch_timing;
+diff --git a/datafusion/datasource-parquet/src/opener/buffered.rs b/datafusion/datasource-parquet/src/opener/buffered.rs
+index 1b99804fe..4ecaf38bf 100644
+--- a/datafusion/datasource-parquet/src/opener/buffered.rs
++++ b/datafusion/datasource-parquet/src/opener/buffered.rs
+@@ -20,0 +21 @@ use crate::push_decoder::RgPlanEntry;
++use crate::scratch_timing::{self, BATCH, RANGE, READER};
+@@ -46 +47 @@ impl MorselPlanner for BufferedReaders {
+-        let plan = match self.decoder.try_next_reader()? {
++        let plan = match READER.measure(|| self.decoder.try_next_reader())? {
+@@ -49 +50,5 @@ impl MorselPlanner for BufferedReaders {
+-                    let bytes = self.reader.get_byte_ranges(ranges.clone()).await?;
++                    let bytes = scratch_timing::io(
++                        &RANGE,
++                        self.reader.get_byte_ranges(ranges.clone()),
++                    )
++                    .await?;
+@@ -100,19 +105,17 @@ impl Morsel for BufferedReader {
+-        let Self {
+-            mut reader,
+-            projection,
+-            file_name,
+-            elapsed_compute,
+-            ..
+-        } = *self;
+-        stream::iter(std::iter::from_fn(move || {
+-            let _timer = elapsed_compute.timer();
+-            reader.next().map(|batch| {
+-                batch
+-                    .map_err(DataFusionError::from)
+-                    .and_then(|batch| projection.map(&batch))
+-                    .map_err(|err| {
+-                        err.context(format!("Decoding Parquet morsel from {file_name}"))
+-                    })
+-            })
+-        }))
+-        .boxed()
++        let mut reader = *self;
++        stream::iter(std::iter::from_fn(move || reader.scratch_next_batch())).boxed()
++    }
++
++    fn scratch_next_batch(&mut self) -> Option<Result<RecordBatch>> {
++        let _timer = self.elapsed_compute.timer();
++        BATCH.measure(|| self.reader.next()).map(|batch| {
++            batch
++                .map_err(DataFusionError::from)
++                .and_then(|batch| self.projection.map(&batch))
++                .map_err(|err| {
++                    err.context(format!(
++                        "Decoding Parquet morsel from {}",
++                        self.file_name
++                    ))
++                })
++        })
+diff --git a/datafusion/datasource-parquet/src/push_decoder.rs b/datafusion/datasource-parquet/src/push_decoder.rs
+index 8469036f8..a52c3bd7f 100644
+--- a/datafusion/datasource-parquet/src/push_decoder.rs
++++ b/datafusion/datasource-parquet/src/push_decoder.rs
+@@ -448 +448 @@ impl PushDecoderStreamState {
+-                match reader.next() {
++                match crate::scratch_timing::BATCH.measure(|| reader.next()) {
+@@ -531 +531 @@ impl PushDecoderStreamState {
+-            match decoder.try_next_reader() {
++            match crate::scratch_timing::READER.measure(|| decoder.try_next_reader()) {
+@@ -535,5 +535,6 @@ impl PushDecoderStreamState {
+-                    let data = self
+-                        .reader
+-                        .get_byte_ranges(ranges.clone())
+-                        .await
+-                        .map_err(DataFusionError::from);
++                    let data = crate::scratch_timing::io(
++                        &crate::scratch_timing::RANGE,
++                        self.reader.get_byte_ranges(ranges.clone()),
++                    )
++                    .await
++                    .map_err(DataFusionError::from);
+diff --git a/datafusion/datasource-parquet/src/scratch_timing.rs b/datafusion/datasource-parquet/src/scratch_timing.rs
+new file mode 100644
+index 000000000..0399bbe17
+--- /dev/null
++++ b/datafusion/datasource-parquet/src/scratch_timing.rs
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: Apache-2.0
++// SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
++// SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
++
++// Linux-only scratch experiment. Timed closures do not await or move threads.
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::time::Instant;
++
++static ENABLED: OnceLock<bool> = OnceLock::new();
++fn enabled() -> bool {
++    *ENABLED.get_or_init(|| std::env::var_os("MORSEL_SCRATCH_PROFILE").is_some())
++}
++
++fn thread_cpu_ns() -> u64 {
++    #[repr(C)]
++    struct Timespec {
++        sec: i64,
++        nsec: i64,
++    }
++    unsafe extern "C" {
++        fn clock_gettime(id: i32, tp: *mut Timespec) -> i32;
++    }
++    let mut tp = Timespec { sec: 0, nsec: 0 };
++    assert_eq!(unsafe { clock_gettime(3, &mut tp) }, 0);
++    tp.sec as u64 * 1_000_000_000 + tp.nsec as u64
++}
++
++pub struct Phase {
++    calls: AtomicU64,
++    elapsed_ns: AtomicU64,
++    cpu_ns: AtomicU64,
++}
++
++impl Phase {
++    const fn new() -> Self {
++        Self {
++            calls: AtomicU64::new(0),
++            elapsed_ns: AtomicU64::new(0),
++            cpu_ns: AtomicU64::new(0),
++        }
++    }
++
++    pub fn measure<T>(&self, f: impl FnOnce() -> T) -> T {
++        if !enabled() {
++            return f();
++        }
++        let cpu = thread_cpu_ns();
++        let start = Instant::now();
++        let result = f();
++        let elapsed = start.elapsed().as_nanos() as u64;
++        self.cpu_ns.fetch_add(thread_cpu_ns() - cpu, Relaxed);
++        self.elapsed_ns.fetch_add(elapsed, Relaxed);
++        self.calls.fetch_add(1, Relaxed);
++        result
++    }
++}
++
++pub async fn io<T>(phase: &Phase, f: impl Future<Output = T>) -> T {
++    if !enabled() {
++        return f.await;
++    }
++    let start = Instant::now();
++    let result = f.await;
++    phase
++        .elapsed_ns
++        .fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
++    phase.calls.fetch_add(1, Relaxed);
++    result
++}
++
++pub static BATCH: Phase = Phase::new();
++pub static READER: Phase = Phase::new();
++pub static PROJECT: Phase = Phase::new();
++pub static RANGE: Phase = Phase::new();
++
++pub fn snapshot() -> [(&'static str, u64, u64, u64); 4] {
++    [
++        ("batch", &BATCH),
++        ("reader", &READER),
++        ("project", &PROJECT),
++        ("range", &RANGE),
++    ]
++    .map(|(key, p)| {
++        (
++            key,
++            p.calls.load(Relaxed),
++            p.elapsed_ns.load(Relaxed),
++            p.cpu_ns.load(Relaxed),
++        )
++    })
++}
+diff --git a/datafusion/datasource/src/morsel/mod.rs b/datafusion/datasource/src/morsel/mod.rs
+index cf9e1da09..5782d8af0 100644
+--- a/datafusion/datasource/src/morsel/mod.rs
++++ b/datafusion/datasource/src/morsel/mod.rs
+@@ -42,0 +43,4 @@ pub trait Morsel: Send + Debug {
++    fn scratch_next_batch(&mut self) -> Option<Result<RecordBatch>> {
++        panic!("scratch direct path supports only buffered Parquet")
++    }
++
+--- a/datafusion/core/examples/morsel_parquet_stream.rs
++++ b/datafusion/core/examples/morsel_parquet_stream.rs
+@@ -38 +38,5 @@
+-        .max_blocking_threads(workers)
++        .max_blocking_threads(if std::env::var_os("MORSEL_SCRATCH_BLOCKING").is_some() {
++            16
++        } else {
++            workers
++        })
+@@ -124,0 +129 @@
++                "phases": datafusion_datasource_parquet::scratch_timing::snapshot(),
