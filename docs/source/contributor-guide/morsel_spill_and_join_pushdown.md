@@ -21,7 +21,7 @@ context ([apache/datafusion#21719][upstream-scheduling],
 
 ## Starting point and reference
 
-At fork revision `2aee01e23408a688828675d4c0cd489448759b33`:
+At fork revision `18425fd6c2da7c4813f7a27ca0f68553bb36cac9`:
 
 - [`ParquetScan::lower`][morsel-parquet-lower] currently forces
   `with_pushdown_filters(false)` (line 148), attaches only static pruning hints
@@ -51,7 +51,7 @@ The local DuckDB reference checkout is `~/github/duckdb-morsel-reference/`
 
 - `src/execution/operator/join/physical_join.cpp` (`PhysicalJoin::BuildJoinPipelines`,
   line 31; `EmptyResultIfRHSIsEmpty`, line 14; `IsSource()` ->
-  `meta_pipeline.CreateChildPipeline`, lines 74–78) shows how a hash join builds
+  `meta_pipeline.CreateChildPipeline`, lines 79–82) shows how a hash join builds
   its RHS in a child `MetaPipeline`, probes on the LHS pipeline, and attaches a
   child pipeline in the same `MetaPipeline` when the join must also act as a
   source (for `RIGHT`/`FULL` unmatched scans or out-of-core spilled partitions).
@@ -72,7 +72,7 @@ The local DuckDB reference checkout is `~/github/duckdb-morsel-reference/`
 In stock [`HashJoinExec`][stock-join-allow], the build and probe streams can be
 polled concurrently, so pushdown requires a mutable
 [`DynamicFilterPhysicalExpr`][dyn-filter] coordinated by
-[`SharedBoundsAccumulator`][shared-bounds], `wait_complete()`, and a per-row-group
+[`SharedBuildAccumulator`][shared-bounds], `wait_complete()`, and a per-row-group
 [`RowGroupPruner`][rg-pruner] watching `DynamicFilterTracking::Watching`
 transitions.
 
@@ -158,17 +158,28 @@ How each tier is constructed:
    [`config.rs`][config-inlist]). When the distinct build keys fit both limits,
    emit an `InListExpr::try_new_from_array` (single column, or `StructArray`
    over `struct(...)` for multi-column keys, matching
-   [`shared_bounds.rs`][shared-bounds-membership]). Small `InList` predicates
-   have a major advantage over bloom filters at container level: DataFusion's
-   `PruningPredicate` evaluates `IN (...)` directly against Parquet row-group
-   min/max stats, page indexes, **and** Parquet file-stored SBBF bloom filters
-   (`prune_by_bloom_filters`). For larger single-column integer/date builds
-   with sparse key ranges, optionally build DataFusion's existing
-   [`KeyRangeBitmap`][key-range-bitmap] (capped at `128 KiB`,
-   `MAX_BUCKETS = 1 << 20`, with container pruning already implemented by
-   [`KeyRangeBitmapPruningExpr`][key-range-pruning]).
+   [`shared_bounds.rs`][shared-bounds-membership]). Keep the container-pruning
+   boundary explicit:
+   - In [`PruningPredicate`][pruning-inlist], `IN (...)` is rewritten for
+     row-group min/max and page-index pruning **only** on a bare `Column` up to
+     `execution.parquet.max_in_list_size` (default `20`,
+     [`config.rs:1495`][config-max-inlist]). Single-column lists of 21–150
+     values and multi-key `struct(...)` lists get **no** row-group min/max or
+     page-index rewrite under the default cap.
+   - Consequently, for `<= 20` single-column keys, `InListExpr` provides both
+     container pruning (min/max, page index, and Parquet file-stored SBBF bloom
+     filters via `prune_by_bloom_filters`) and exact `RowFilter` evaluation.
+     For 21–150 single-column keys or multi-key `struct(...)` lists,
+     `InListExpr` provides exact zero-false-positive `RowFilter` evaluation
+     (plus Parquet file bloom-filter pruning on single-column keys via
+     `LiteralGuarantee`), while container-level min/max and page pruning come
+     from the companion per-key `bounds` predicate and, for larger sparse
+     single-column integer/date builds, DataFusion's [`KeyRangeBitmap`][key-range-bitmap]
+     (capped at `128 KiB`, `MAX_BUCKETS = 1 << 20`, with container pruning
+     already implemented by [`KeyRangeBitmapPruningExpr`][key-range-pruning]).
 3. **Cache-resident split-block Bloom filter (`finalize`):** When the build
-   exceeds the `InList` threshold (for example, 5K–5M distinct keys), build a
+   exceeds the `InList` threshold (for example, 5K–5M distinct keys) and stays
+   in memory (or spills with hash-column replay; see Section 3.3), build a
    single-cache-line split-block bloom filter (`256-bit` or `512-bit` blocks,
    8–12 bits per distinct key, targeting ~1%–2% FPP, capped at a configurable
    ceiling such as `4 MiB`–`8 MiB` and reserved in `MemoryPool`):
@@ -177,12 +188,24 @@ How each tier is constructed:
    - Populate it directly from the 64-bit `foldhash` values already retained
      per radix partition (Section 2.2), using parallel bitwise-OR or
      partition-local shard inserts if the filter uses power-of-two blocks.
+     **Spilled-build soundness invariant:** Never populate a bloom filter from
+     only resident partitions `M` while omitting evicted partitions `S` (that
+     would cause false negatives). On spilled builds, either fall back cleanly
+     to **bounds-only** dynamic pushdown (`JoinMembershipFilter::None`, the
+     recommended v1 default since builds large enough to spill typically exceed
+     the bloom FPP budget anyway), or—when total build cardinality still fits
+     the bloom FPP budget—stream the mandatory spilled `u64` hash column of
+     every partition in `S` during `finalize` to insert all `M ∪ S` hashes
+     before publishing `FinalizedJoinFilter`.
    - Wrap it in a private `JoinBloomFilterExpr: PhysicalExpr` (analogous to
      [`HashTableLookupExpr`][hash-table-lookup] in `partitioned_hash_eval.rs`,
      but probing a compact L2/L3-resident bitset instead of the full build hash
      table). In `evaluate()`, compute `create_hashes` over the probe key
-     column(s) with the exact same `SeededRandomState`, check 4–8 bits inside
-     one cache line per row (`block = (h >> 32) & mask`), and return a
+     column(s) with the exact same `SeededRandomState`, select the cache-line
+     block from the low bits (`block = (h as usize) & block_mask`) and derive
+     intra-block bit positions from the upper 32 bits (`(h >> 32) as u32` via
+     standard split-block multiplicative salts) so block selection is orthogonal
+     to the radix partition window `[33..57]` (Section 2.2), and return a
      `BooleanArray`.
 
 #### Publication into `ParquetScan::open`
@@ -274,6 +297,18 @@ constructed:
 
 #### Impact on star-schema joins (TPC-H Q3 and Q12)
 
+In standard TPC-H `dbgen` data (including the `#165` Parquet fixture in
+`benchmarks/morsel_tpch/`, where `orders` is ordered by `o_orderkey` and
+`lineitem` by `l_orderkey, l_linenumber`), `o_orderdate` and `l_receiptdate`
+are drawn **independently** of `o_orderkey` / `l_orderkey`. Consequently,
+filtering by date still produces build keys spanning nearly the entire
+`orderkey` domain (`[1, 6_000_000]` at SF1), so min/max bounds prune **no**
+row groups on `orders` or `lineitem` in Q3 or Q12. The large wins in Q3 and
+Q12 therefore come from the **L2-resident `JoinBloomFilterExpr` evaluated inside
+Parquet `RowFilter`** (`#150`), whereas min/max and `KeyRangeBitmap` pruning
+shine on **key-correlated or time-clustered** star-schema tables (e.g., fact
+tables clustered by event date or surrogate key ranges):
+
 - **TPC-H Q3 (`customer ⋈ orders ⋈ lineitem`, `GROUP BY`, `ORDER BY ... LIMIT 10`):**
 
   ```text
@@ -290,30 +325,31 @@ constructed:
   ```
 
   1. `P0` filters `customer` to ~20% of rows (~30K keys at SF1) and publishes a
-     ~45 KiB `J1` bloom filter + `[min, max]` on `o_custkey`.
+     ~45 KiB `J1` bloom filter on `o_custkey`.
   2. `P1` scans `orders` with `o_orderdate < '1995-03-15'` AND `J1_filter(o_custkey)`.
      With `#150`, ~80% of date-passing `orders` rows are rejected by the
-     L2-resident `J1` bloom filter before decoding `o_shippriority` or probing
-     `J1`, leaving ~147K surviving `(o_orderkey, o_orderdate, o_shippriority)`
-     build rows for `J2` (~9.8% of `orders`).
-  3. `P2` receives `J2`'s `l_orderkey` min/max bounds (pruning `lineitem` row
-     groups/pages whose `l_orderkey` range falls outside the pre-1995-03-15
-     orders, since `orders` and `lineitem` are naturally correlated by
-     `orderkey` in TPC-H!) **plus** a ~220 KiB L2-resident `J2` bloom filter.
-     On surviving `lineitem` row groups, `RowFilter` rejects ~90%+ of rows
-     using only `l_shipdate` and `l_orderkey` without ever decoding
-     `l_extendedprice` or `l_discount`.
+     L2-resident `J1` bloom filter inside `RowFilter` before decoding
+     `o_shippriority` or probing `J1`, leaving ~147K surviving
+     `(o_orderkey, o_orderdate, o_shippriority)` build rows for `J2` (~9.8% of
+     `orders`).
+  3. `P2` receives `J2`'s ~220 KiB L2-resident bloom filter on `l_orderkey`.
+     Although `J2`'s `l_orderkey` min/max spans the full table range and prunes
+     no `lineitem` row groups, `RowFilter` evaluates `l_shipdate` and the `J2`
+     bloom filter on `l_orderkey` alone, rejecting ~90%+ of date-passing
+     `lineitem` rows before ever decoding `l_extendedprice` or `l_discount` and
+     avoiding ~90% of `J2` hash-table probes.
 
 - **TPC-H Q12 (`orders ⋈ lineitem`, `GROUP BY l_shipmode`, `ORDER BY l_shipmode`):**
   - `lineitem` has selective predicates (`l_shipmode IN ('MAIL', 'SHIP')`,
     `l_commitdate < l_receiptdate`, `l_shipdate < l_commitdate`,
     `l_receiptdate ∈ [1994-01-01, 1995-01-01)`), reducing 6M SF1 rows to ~31K
     rows (~0.5%), whereas `orders` has 1.5M unfiltered rows.
-  - Putting the filtered `lineitem` on the build side (`P0`) produces a tiny
-    ~48 KiB `o_orderkey` bloom filter + tight `[min, max]` bounds pushed into
-    `ParquetScan(orders)` (`P1`). Even when `o_orderkey` spans most of `orders`,
-    the L2-resident bloom filter rejects ~98% of `orders` rows inside `RowFilter`
-    before decoding `o_orderpriority` (a string column!) and before probing `J1`.
+  - Putting the filtered `lineitem` on the build side (`P0`) produces a ~48 KiB
+    `o_orderkey` bloom filter pushed into `ParquetScan(orders)` (`P1`). Again,
+    `o_orderkey` min/max spans almost the entire `orders` range and does not
+    prune `orders` row groups; the win comes from the L2-resident bloom filter
+    rejecting ~98% of `orders` rows inside `RowFilter` before decoding the
+    string column `o_orderpriority` and before probing `J1`.
 
 ### 1.3 Exactness, NULL semantics, and safety matrix
 
@@ -323,29 +359,39 @@ wrong-result bug. Follow DataFusion's exact semantics in
 [`JoinType::on_lr_is_preserved`][join-type-preserved],
 [`empty_build_side_produces_empty_result`][join-type-empty-build],
 [`empty_map_produces_empty_result`][join-type-empty-map],
-[`HashJoinExec::allow_join_dynamic_filter_pushdown`][stock-join-allow], and
-[`SharedBoundsAccumulator::preserve_probe_nulls`][preserve-probe-nulls].
+[`HashJoinExec::allow_join_dynamic_filter_pushdown`][stock-join-allow],
+[`state_after_build_ready`][stream-after-build], and
+[`SharedBuildAccumulator::preserve_probe_nulls`][preserve-probe-nulls].
 
 Convention below: **build = left**, **probe = right** (matching DataFusion's
 `HashJoinExec`; swap labels if the planner chooses right-as-build).
 
-| Join type (build=L, probe=R)                 | Push filter into probe (`R`)?                                                | Empty build (`!has_rows`) short-circuits probe?  | Non-empty all-NULL build (`has_rows && !has_matchable_keys`, `NullEqualsNothing`) |
-| -------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------------------------------- |
-| `Inner`                                      | **Yes**                                                                      | **Yes** (`lit(false)`)                           | Short-circuit probe (`lit(false)`); 0 output rows                                 |
-| `Left` (build preserved)                     | **Yes**                                                                      | **Yes** (`lit(false)`)                           | Short-circuit probe (`lit(false)`); emit unmatched build rows via child pipeline  |
-| `LeftSemi`, `RightSemi`                      | **Yes**                                                                      | **Yes** (`lit(false)`)                           | Short-circuit probe (`lit(false)`); 0 output rows                                 |
-| `LeftAnti`, `LeftMark` (regular)             | **Yes**                                                                      | **Yes** (`lit(false)`)                           | Short-circuit probe (`lit(false)`); unmatched build rows still emitted            |
-| `LeftAnti`, `LeftMark` (null-aware `NOT IN`) | **Only if build keys are NOT NULL** (see [`exec.rs:1084`][stock-join-allow]) | **No** (probe emptiness affects NULL build rows) | **Disable pushdown**; must scan probe                                             |
-| `Right`, `Full` (probe preserved)            | **No** (unmatched probe rows must survive)                                   | **No**                                           | **No**                                                                            |
-| `RightAnti`, `RightMark`                     | **No** (unmatched probe rows are the output)                                 | **No**                                           | **No**                                                                            |
+| Join type (build=L, probe=R)                 | Push filter into probe (`R`)?                                                                                                                                             | Empty build (`!has_rows`) short-circuits probe?                                 | Non-empty all-NULL build (`has_rows && !has_matchable_keys`, `NullEqualsNothing`) |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `Inner`                                      | **Yes**                                                                                                                                                                   | **Yes** (`lit(false)`)                                                          | Short-circuit probe (`lit(false)`); 0 output rows                                 |
+| `Left` (build preserved)                     | **Yes**                                                                                                                                                                   | **Yes** (`lit(false)`)                                                          | Short-circuit probe (`lit(false)`); emit unmatched build rows via child pipeline  |
+| `LeftSemi`, `RightSemi`                      | **Yes**                                                                                                                                                                   | **Yes** (`lit(false)`)                                                          | Short-circuit probe (`lit(false)`); 0 output rows                                 |
+| `LeftAnti`, `LeftMark` (regular)             | **Yes**                                                                                                                                                                   | **Yes** (`lit(false)`)                                                          | Short-circuit probe (`lit(false)`); unmatched build rows still emitted            |
+| `LeftAnti`, `LeftMark` (null-aware `NOT IN`) | **Only if build keys are NOT NULL** ([`exec.rs:1084`][stock-join-allow]); **must** add `OR probe_value_key IS NULL` for nullable `on_right[..V]` (`preserve_probe_nulls`) | **Yes** (`lit(false)`; [`stream.rs:618-636`][stream-after-build], 0 build rows) | **Disable pushdown**; must scan probe (pruning probe rows hides probe emptiness)  |
+| `Right`, `Full` (probe preserved)            | **No** (unmatched probe rows must survive)                                                                                                                                | **No**                                                                          | **No**                                                                            |
+| `RightAnti`, `RightMark`                     | **No** (unmatched probe rows are the output)                                                                                                                              | **No**                                                                          | **No**                                                                            |
 
 Additional soundness invariants:
 
 - **`NullEquality::NullEqualsNothing` (SQL `=`):** Build rows with `NULL` in
   _any_ join key column cannot match any probe row; exclude them from min/max
-  bounds, `InList`, and the bloom filter. Probe rows with `NULL` keys evaluate
-  to `NULL`/false under `col >= min AND col <= max` and `JoinBloomFilterExpr`
-  and are safely dropped.
+  bounds, `InList`, and the bloom filter.
+  - For **regular** (non-null-aware) joins, probe rows with `NULL` keys evaluate
+    to `NULL`/false under `col >= min AND col <= max` and `JoinBloomFilterExpr`
+    and are safely dropped.
+  - For **null-aware `NOT IN`** joins (`LeftAnti` / `LeftMark` with
+    `null_aware = true`), probe rows with a `NULL` in any `NOT IN` value key
+    (`on_right[..V]`, where `on_right[V..]` are correlation scope keys) **must
+    never be dropped**, because one probe `NULL` makes `NOT IN` evaluate to
+    `UNKNOWN` against every build row in that scope. Always wrap the pushed
+    filter with `OR k_i IS NULL` for every nullable key in `on_right[..V]`
+    (matching [`SharedBuildAccumulator::preserve_probe_nulls`][preserve-probe-nulls]),
+    regardless of whether the build side contained any `NULL`s.
 - **`NullEquality::NullEqualsNull` (`IS NOT DISTINCT FROM`):**
   - **Single-key join:** If `key_has_null[0]` is true and the probe key is
     nullable, wrap the pushed predicate as `(bounds AND membership) OR probe_key IS NULL`
@@ -361,15 +407,21 @@ Additional soundness invariants:
     `OR k0 IS NULL` escape that would let `(NULL, 999)` bypass the bloom filter.
 - **Multi-key joins under `NullEqualsNothing`:** Per-key min/max bounds are
   conjunctive (`(k0 BETWEEN min0 AND max0) AND (k1 BETWEEN min1 AND max1)`),
-  which is sound because matching requires every key to match simultaneously.
+  which is sound because matching requires every key to match simultaneously
+  (wrapped with the `on_right[..V]` `IS NULL` escape above when null-aware).
   The bloom filter hashes the full composite tuple `(k0, k1, ...)` with
   `create_hashes`, preserving full composite selectivity.
-- **Floating-point `NaN` and `-0.0`:** Normalize `-0.0` to `+0.0` in both hash
-  computation (matching `float_semantics` in `create_hashes`) and min/max
-  bounds. If any build key is `NaN`: under `NullEqualsNothing`, disable min/max
-  bounds on that key column (or exclude `NaN` since `NaN != NaN` in SQL
-  equality, while under `NullEqualsNull` or Arrow total-order semantics disable
-  bounds on that column to stay conservatively sound).
+- **Floating-point `NaN` and `-0.0`:** DataFusion's hash-join equality uses
+  Arrow's IEEE 754 `totalOrder` `make_comparator` and normalizes only `-0.0` to
+  `+0.0` via [`float_semantics::normalize`][join-float-norm]
+  (`utils.rs:2830-2860`), so `NaN` build keys **do match** `NaN` probe keys
+  (and `create_hashes` hashes canonicalized `NaN` consistently). Always retain
+  `NaN` keys in `InList` and the bloom filter. Because standard SQL range
+  comparisons (`col >= min AND col <= max`) and Parquet statistics do not
+  guarantee total-order inclusion of `NaN`, if any `NaN` build key is observed
+  on column `i`, **drop the min/max range bound for column `i`** (or preserve
+  `NaN` explicitly via total-order bounds; dropping column `i`'s range bound
+  while keeping `InList`/bloom active is simple and conservatively exact).
 - **Expression keys & schema coercion:** Only push filters whose probe-side
   expressions pass
   [`can_expr_be_pushed_down_with_schemas`][can-push-down] against the scan's
@@ -430,38 +482,62 @@ all three problems at once:
 
 [`create_hashes`][create-hashes] computes 64-bit hashes using
 `foldhash::fast::FixedState` ([`hash_utils.rs:30`][hash-random-state]).
-`hashbrown::HashTable` (SwissTable) extracts its 7-bit SIMD control-byte tag
-(`h2`) from the **top 7 bits** (`h >> 57`) on 64-bit targets.
+`hashbrown::HashTable` (SwissTable, 0.17) extracts **two** bit ranges from `h`:
 
-**Hazard:** If radix partitioning also selects the top `R` bits
-(`p = (h >> (64 - R)) as usize`) and passes the unmodified `h` into a
-per-partition `hashbrown::HashTable`, every key inside partition `p` has the
-same top `R` bits of `h2` — collapsing SwissTable's 128-tag entropy to
-`2^(7 - R)` tags (just **1 tag** when `R >= 7`!), causing severe false-positive
-tag matches inside every 16-slot SIMD group.
+- **`h2` (7-bit SIMD control tag):** top 7 bits (`h >> 57`) on 64-bit targets.
+- **`h1` (initial probe bucket index):** low bits (`(h as usize) & bucket_mask`).
 
-**Required fix:** Never share the same bits between radix partition selection
-and `hashbrown`'s `h2` tag:
+**Two hazards to avoid:**
+
+1. Selecting radix partition bits from `[64 - R .. 64]` and passing `h`
+   unchanged collapses SwissTable's `h2` tag entropy inside each partition to
+   `2^(7 - R)` tags (1 tag when `R >= 7`).
+2. Rotating `h` left (`h.rotate_left(R)`) moves the constant partition bits
+   straight into the low `R` bits `[0..R]` used by `h1`, collapsing initial
+   probe positions to `1 / 2^R` of the bucket array (e.g., for `R = 8` on a
+   16,384-slot table, every key in a partition probes from only 64 start slots!).
+
+**Required fix:** Carve out disjoint middle bit windows clear of both `h2`
+(`[57..64]`) and `h1` (`[0..33]`), and pass `h` **unchanged** into
+`hashbrown::HashTable`:
+
+```text
+63      57 56     49 48     41 40     33 32                             0
++---------+---------+---------+---------+-------------------------------+
+| h2 (7b) | L0 (8b) | L1 (8b) | L2 (8b) | h1 bucket / bloom block (33b) |
++---------+---------+---------+---------+-------------------------------+
+```
 
 ```rust
-/// Extract partition index from top `radix_bits` of `h` (0..=12), and return a
-/// rotated hash whose top 7 bits come from unused mid-bits for `hashbrown` `h2`.
+/// Extract radix partition index from a middle bit window disjoint from
+/// `hashbrown`'s `h2` ([57..64]) and low `h1` bucket bits ([0..33]).
+/// Pass `h` unchanged into `hashbrown::HashTable`.
 #[inline]
-fn split_radix_hash(h: u64, radix_bits: u32) -> (usize, u64) {
+fn radix_partition(h: u64, shift: u32, radix_bits: u32) -> usize {
+    debug_assert!(shift + radix_bits <= 57);
     if radix_bits == 0 {
-        return (0, h);
+        return 0;
     }
-    let part = (h >> (64 - radix_bits)) as usize;
-    let local_hash = h.rotate_left(radix_bits);
-    (part, local_hash)
+    ((h >> shift) & ((1u64 << radix_bits) - 1)) as usize
 }
 ```
 
-Rotating left by `radix_bits` moves the next 7 independent bits into `[57..64]`
-for `hashbrown`'s `h2` while preserving full 64-bit entropy for low-bit bucket
-indexing (`h1`) and recursive re-partitioning (`radix_bits_level_2` simply
-rotates again!). For custom join tables using a 16-bit hash salt array, store
-`(local_hash >> 48) as u16` for the same reason.
+- **Level 0** (`R0 <= 10`, default `R0 = 6..8`): `shift = 57 - R0` (bits
+  `[49..57]` for `R0 = 8`).
+- **Recursive spill levels 1 and 2** (`R1, R2 <= 8`): step down to the next
+  disjoint window `shift = 57 - R0 - R1` (`[41..49]`) and
+  `shift = 57 - R0 - R1 - R2` (`[33..41]`).
+- **`h1` and `h2` stay 100% intact** across every level (full 7-bit `h2` tag
+  entropy and 33 independent low bits for `h1`, covering tables up to `2^33`
+  buckets).
+- **Bloom filter orthogonality:** As noted in Section 1.1, `SplitBlockBloomFilter`
+  indexes its cache-line block from low bits `(h as usize) & block_mask`
+  (`[0..33]`) and mixes the upper 32 bits `(h >> 32) as u32` with multiplicative
+  salts for intra-block bit positions, keeping bloom block addressing disjoint
+  from the radix partition window `[33..57]`.
+- For custom join tables storing a 16-bit hash salt array, avoid the active
+  radix window by hashing/extracting from `(h >> 25) as u16` or mixing `h`
+  solely for the salt byte/word while keeping `h` unchanged for `h1`/`h2`.
 
 #### Operator-specific adaptive partitioning
 
@@ -495,19 +571,19 @@ rotates again!). For custom join tables using a 16-bit hash salt array, store
      partitions `p ∈ 0..2^R` to bounded tracked tasks; each task builds an
      immutable `PartitionJoinTable` (and sets bits in the build bloom filter).
      The committed `Arc<RadixJoinTable>` exposes lock-free probe lookup:
-     `let (p, lh) = split_radix_hash(h, table.radix_bits); table.partitions[p].probe(lh, ...)`.
+     `let p = radix_partition(h, table.radix_shift, table.radix_bits); table.partitions[p].probe(h, ...)`.
 
 ### 2.3 Concrete Rust data layouts over Arrow / `RowConverter` + `MemoryPool`
 
 Two candidate physical layouts inside each radix partition:
 
-| Dimension                 | Layout A: Hybrid specialized + `RowConverter` columnar chunks (**Recommended v1**)                                                                                                                                                                       | Layout B: Packed row-store blocks (DuckDB `TupleDataCollection` analogy)                                                             |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| **Group keys**            | Single fixed-width key (`Int32`/`Int64`/`UInt64`/`Date32`): dense `Vec<T>` + `hashbrown::HashTable<(u64, u32)>` (as in `GroupValuesPrimitive`). Multi-column / string / decimal: [`arrow::row::RowConverter`][group-values-rows] (`Rows` per partition). | Custom variable-width row arena (`Vec<AlignedBlock>`) storing key bytes + inline fixed accumulator state.                            |
-| **Aggregate states**      | Columnar typed vectors per partition (`Vec<i64>`, `Vec<i128>`, `Vec<f64>`, `NullBufferBuilder`) indexed by dense `group_id: u32`.                                                                                                                        | Inline fixed-size structs per row; variable states (`String` min/max) stored in side heap.                                           |
-| **Join build storage**    | Per-partition coalesced `RecordBatch` (or `Vec<RecordBatch>`) + per-partition [`JoinHashMapU32`][join-hash-map] (`head` table + `next: Vec<u32>`, since each of `2^R` partitions fits in `u32`) + optional `Vec<u16>` hash salts.                        | Packed build rows `(next_ptr, hash_salt, key_bytes, payload_bytes)` in 256 KiB blocks.                                               |
-| **Arrow / Spill interop** | Zero-copy or single-copy conversion to `RecordBatch` for `MorselExec` output and `SpillManager` IPC serialization; reuses Arrow kernels and `gc_view_arrays`.                                                                                            | Requires custom per-`DataType` serializer/deserializer to and from Arrow `RecordBatch` and `SpillManager`.                           |
-| **Cache locality**        | High: every partition's hash table, `Rows` buffer, and columnar state vectors fit together inside L2 during `finalize` and `probe`.                                                                                                                      | Highest for wide multi-column probes/aggregates (single cache miss per row instead of 1 per column), at much higher code complexity. |
+| Dimension                 | Layout A: Hybrid specialized + `RowConverter` columnar chunks (**Recommended v1**)                                                                                                                                                                                                                                                                       | Layout B: Packed row-store blocks (DuckDB `TupleDataCollection` analogy)                                                             |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| **Group keys**            | Single fixed-width key (`Int32`/`Int64`/`UInt64`/`Date32`): dense `Vec<T>` + `hashbrown::HashTable<(u32, u64)>` (per-partition `u32` group IDs, modeled on stock [`GroupValuesPrimitive`][group-values-primitive]'s `HashTable<(usize, u64)>`). Multi-column / string / decimal: [`arrow::row::RowConverter`][group-values-rows] (`Rows` per partition). | Custom variable-width row arena (`Vec<AlignedBlock>`) storing key bytes + inline fixed accumulator state.                            |
+| **Aggregate states**      | Columnar typed vectors per partition (`Vec<i64>`, `Vec<i128>`, `Vec<f64>`, `NullBufferBuilder`) indexed by dense `group_id: u32`.                                                                                                                                                                                                                        | Inline fixed-size structs per row; variable states (`String` min/max) stored in side heap.                                           |
+| **Join build storage**    | Per-partition coalesced `RecordBatch` (or `Vec<RecordBatch>`) + per-partition [`JoinHashMapU32`][join-hash-map] (`head` table + `next: Vec<u32>`, since each of `2^R` partitions fits in `u32`) + optional `Vec<u16>` hash salts.                                                                                                                        | Packed build rows `(next_ptr, hash_salt, key_bytes, payload_bytes)` in 256 KiB blocks.                                               |
+| **Arrow / Spill interop** | Zero-copy or single-copy conversion to `RecordBatch` for `MorselExec` output and `SpillManager` IPC serialization; reuses Arrow kernels and `gc_view_arrays`.                                                                                                                                                                                            | Requires custom per-`DataType` serializer/deserializer to and from Arrow `RecordBatch` and `SpillManager`.                           |
+| **Cache locality**        | High: every partition's hash table, `Rows` buffer, and columnar state vectors fit together inside L2 during `finalize` and `probe`.                                                                                                                                                                                                                      | Highest for wide multi-column probes/aggregates (single cache miss per row instead of 1 per column), at much higher code complexity. |
 
 **Recommendation:** Adopt **Layout A** for the first radix + spill milestones.
 It keeps Arrow `RecordBatch` and `RowConverter` as the universal data model
@@ -647,9 +723,9 @@ P1: FinalizedOrSpilledGroupsSource -> [Proj/TopN/Result]                       [
 4. **Single-partition overflow and skew fallback:** If reloading a single
    partition `p` still fails `try_grow`:
    - **Recursive radix split (up to `MAX_RADIX_DEPTH = 2`):** Re-partition `p`'s
-     chunks + spill files using the next `R'` unused hash bits
-     (`h.rotate_left(R)`), spill the sub-partitions, and process each
-     sub-partition sequentially.
+     chunks + spill files using the next lower disjoint hash window
+     (`radix_partition(h, 57 - R0 - R1, R1)`), spill the sub-partitions, and
+     process each sub-partition sequentially.
    - **Heavy-hitter / collision fallback:** If recursive splitting fails to
      reduce max sub-partition size (for example, hash collisions or huge
      per-group state like `ARRAY_AGG`), fall back to DataFusion's sorted-run
@@ -660,7 +736,7 @@ P1: FinalizedOrSpilledGroupsSource -> [Proj/TopN/Result]                       [
 ### 3.3 Out-of-core `HashJoin`: partition eviction, `ProbeSpill`, and child pipeline
 
 Mirroring DuckDB's `PhysicalJoin::BuildJoinPipelines`
-(`~/github/duckdb-morsel-reference/src/execution/operator/join/physical_join.cpp:74-78`)
+(`~/github/duckdb-morsel-reference/src/execution/operator/join/physical_join.cpp:79-82`)
 and `JoinHashTable` / `ProbeSpill`, out-of-core `HashJoin` maps onto `#157`'s
 existing `Pipeline` / `MetaPipeline` DAG with **zero new DAG primitives**:
 
@@ -682,23 +758,36 @@ and drains immediately.
 
 1. **Build pipeline (`P0` -> `G0`):**
    - Workers scatter build rows + `u64` hashes into `2^R` partitions and update
-     `LocalJoinFilterSummary` over **every** build row (so dynamic Parquet
-     pruning on `P1` stays active even when `P0` spills!).
+     `LocalJoinFilterSummary` (min/max bounds and null flags) over **every**
+     build row before any eviction occurs.
    - Whenever `local_reservation.try_grow` fails during `P0::sink`, evict the
-     worker's largest in-memory radix partition(s) to disk via `SpillManager`
-     (writing canonical build payload batches + optional `u64` hash column) and
-     `shrink` the reservation.
+     worker's largest in-memory radix partition(s) to disk via `SpillManager`,
+     **always writing the precomputed `u64` hash column alongside the build
+     payload batches** (avoiding re-hashing on reload in `P2` and enabling
+     hash-only bloom replay if needed), and `shrink` the reservation.
    - In `G0::finalize`, compute the total memory required for each partition
      `p ∈ 0..2^R` (payload batches + `JoinHashMapU32` directory). Greedily pack
      the largest subset of partitions `M ⊆ 0..2^R` that fits within
      `available_budget - probe_spill_headroom` (keeping already-in-memory
      partitions first to avoid unnecessary I/O). Spill any remaining unspilled
-     partitions into `S = (0..2^R) \ M`.
+     partitions into `S = (0..2^R) \ M` (again including their `u64` hashes).
    - Build immutable `PartitionJoinTable`s in parallel for `p ∈ M` only.
+   - Finalize `dynamic_filter` soundly over `M ∪ S`:
+     - Per-key min/max bounds and null flags already cover **all** `M ∪ S` rows.
+     - If `S` is empty, size and populate `SplitBlockBloomFilter` (or `InList`)
+       in parallel from the in-memory hashes of `M`.
+     - If `S` is non-empty, **never** build a bloom filter from `M` alone.
+       Default in v1 to **bounds-only** (`JoinMembershipFilter::None`), since
+       spilled builds usually exceed the memory-capped bloom FPP budget anyway;
+       optionally, when total build cardinality across `M ∪ S` still fits the
+       bloom FPP budget (e.g., tight-RAM pool with moderate NDV), size the
+       filter from total `M ∪ S` count, insert `M`'s in-memory hashes, and
+       stream the spilled `u64` hash column from `S` before publishing
+       `FinalizedJoinFilter`.
    - Commit `Arc<RadixJoinArtifact>`:
      - `resident: HashMap<usize, PartitionJoinTable>` (`p ∈ M`),
      - `spilled_build: HashMap<usize, Vec<Arc<dyn SpillFile>>>` (`p ∈ S`),
-     - `dynamic_filter: FinalizedJoinFilter` (built over all `M ∪ S`),
+     - `dynamic_filter: FinalizedJoinFilter` (guaranteed sound over `M ∪ S`),
      - `probe_spill_manifest: Mutex<SpilledProbeManifest>` (populated on `P1`
        worker exits).
 
@@ -748,14 +837,22 @@ and drains immediately.
      partition `p ∈ S` alone exceeds the memory budget:
      1. If recursion depth `< MAX_RADIX_DEPTH` and distinct key count permits
         splitting, recursively re-partition both `spilled_build[p]` and
-        `spilled_probe[p]` on the next `R'` rotated hash bits.
+        `spilled_probe[p]` on the next lower disjoint hash window
+        (`radix_partition(h, 57 - R0 - R1, R1)`).
      2. Otherwise (e.g., 100% duplicate-key skew that no hash function can
         split), execute a **block-nested-loop hash sub-pass** over `p`: load a
         memory-bounded slice of `spilled_build[p]` into an in-memory hash table,
-        stream all of `spilled_probe[p]` against that slice (carrying a compact
-        probe-matched bitmap per probe spill file only if the join preserves
-        unmatched probe rows), repeat for the next build slice, emit unmatched
-        probe rows after the final slice if required, and drop `p`'s files.
+        stream all of `spilled_probe[p]` against that slice, repeat for the next
+        build slice, and drop `p`'s files. Maintain a compact probe-matched
+        bitmap per probe spill file for **every join type whose probe emission
+        depends on cross-slice match status** — `Right`, `Full`, `RightSemi`,
+        `RightAnti`, and `RightMark`:
+        - For `RightSemi`, emit a matching probe row only on its first `0 -> 1`
+          bit transition so a probe row matching multiple build slices is never
+          emitted more than once.
+        - For `Right`, `Full`, `RightAnti`, and `RightMark`, record matches
+          across all build slices and emit unmatched probe rows (or final mark
+          booleans) once after the final build slice finishes.
 
 ### 3.4 Out-of-core `Sort` (and `TopN`)
 
@@ -779,10 +876,11 @@ P1: FinalizedSortMergeSource -> Result                                          
   [`ExternalSorter::sort`][stock-sorter-spill-inmem], so in-memory runs cannot
   push the merge over budget) and commit `SpilledSortRuns`.
 - **`P1` (`FinalizedSortMergeSource`):** Single ordered reader driving
-  DataFusion's [`StreamingMergeBuilder`][sorted-spill-file] /
-  [`MultiLevelMergeBuilder`][multi-level-merge] (`FanInHeadroom`), automatically
-  respecting `DiskManager::max_spill_merge_fan_in` and `MemoryPool` limits via
-  multi-level spill merges when the run count exceeds what fits in memory.
+  DataFusion's [`StreamingMergeBuilder`][streaming-merge-builder] /
+  [`MultiLevelMergeBuilder`][multi-level-merge] (with
+  [`FanInHeadroom`][fan-in-headroom]), automatically respecting
+  `DiskManager::max_spill_merge_fan_in` and `MemoryPool` limits via multi-level
+  spill merges when the run count exceeds what fits in memory.
 - **`TopN` (`ORDER BY ... LIMIT K OFFSET O`):** Worker-local heaps stay bounded
   to `O(K + O)`. If an unusually large `K + O` causes `try_grow` to fail during
   `TopN`, degrade cleanly to the same sorted-run spill + bounded merge +
@@ -809,7 +907,7 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
 | Path                                        | Responsibility                                                                                                                                                                                                         |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `datafusion/core/src/morsel/join_filter.rs` | `LocalJoinFilterSummary`, `FinalizedJoinFilter`, `SplitBlockBloomFilter`, `JoinBloomFilterExpr`, join-type/NULL safety gating, and `ParquetScan::open` predicate binding.                                              |
-| `datafusion/core/src/morsel/radix.rs`       | `split_radix_hash`, adaptive radix bit selection, per-partition scatter buffers, parallel partition finalize driver over tracked `JoinSet` tasks, and `MemoryReservation` handoffs.                                    |
+| `datafusion/core/src/morsel/radix.rs`       | `radix_partition`, adaptive radix bit selection, per-partition scatter buffers, parallel partition finalize driver over tracked `JoinSet` tasks, and `MemoryReservation` handoffs.                                     |
 | `datafusion/core/src/morsel/spill.rs`       | Thin wrapper over `SpillManager` / `InProgressSpillFile`, spill-headroom reservation management, partition-scoped `Arc<dyn SpillFile>` manifests, `abort_async` cancellation helper, and `#138` `SpillMetrics` wiring. |
 | `datafusion/physical-plan/src/spill/mod.rs` | Minimal `#[doc(hidden)]` internal re-export of `InProgressSpillFile` (only when Phase 4 lands) if `datafusion/core` invokes incremental async spilling directly.                                                       |
 
@@ -832,12 +930,19 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
      `LeftAnti` / `RightAnti` / null-aware `NOT IN`, and multi-join chains
      (TPC-H Q3 and Q12 shapes) with both `pushdown_filters = true` and `false`,
      and with `#167` sub-RG splitting enabled.
-   - **Config & isolation:** Verify `enable_join_dynamic_filter_pushdown = false`
-     disables pushdown cleanly, and repeated/concurrent executions of one
-     prepared `MorselExec` never leak dynamic filters across runs.
+   - **Config, spill soundness & isolation:** Verify
+     `enable_join_dynamic_filter_pushdown = false` disables pushdown cleanly,
+     verify spilled builds with dynamic pushdown enabled (both bounds-only
+     fallback and optional hash-column bloom replay) drop zero valid matches
+     across resident `M` and spilled `S` partitions, and verify
+     repeated/concurrent executions of one prepared `MorselExec` never leak
+     dynamic filters across runs.
 2. **Radix-partitioned hash tables (`datafusion/core/src/morsel/tests.rs` + integration tests):**
-   - **Bit-layout unit test:** Verify `split_radix_hash` yields uniform top-7
-     `h2` tag distribution inside every radix partition for `R ∈ 0..=12`.
+   - **Bit-layout unit test:** Verify `radix_partition` yields uniform **both**
+     low-bit `h1` bucket-start distribution (`h & ((1 << k) - 1)` for `k <= 16`)
+     **and** top-7-bit `h2` tag distribution (`h >> 57`) inside every radix
+     partition across level 0 and recursive spill levels (`R0, R1 ∈ 0..=8`),
+     plus uniform bloom block spread.
    - **Parity & skew:** High-cardinality (1M+ groups / build rows), low-cardinality
      (fast path `R = 0`), heavy-hitter Zipf skew, empty input, and multi-column
      / string / decimal keys matching stock `off`.
@@ -853,8 +958,9 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
      `spill_file_count > 0`.
    - **Skew & recursive spill:** Force a single radix partition to exceed the
      pool (both distinct-key skew triggering recursive radix split and 100%
-     identical-key skew triggering `HashJoin` block-nested-loop sub-pass /
-     `GROUP BY` sorted fallback).
+     identical-key skew triggering `HashJoin` block-nested-loop sub-pass —
+     including `RightSemi` deduplication and `Right`/`Full`/`RightAnti`/`RightMark`
+     probe-matched bitmap parity — and `GROUP BY` sorted fallback).
    - **Disk quota & cleanup invariants:** Test `DiskManager`
      `max_temp_directory_size` exhaustion (verifying clean `ResourcesExhausted`
      without stock fallback), mid-spill I/O error injection, and early stream
@@ -879,7 +985,7 @@ minimal file overlap:
 | ----------- | ------------------------------------------------------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Phase 1** | Dynamic join min/max + small `InList` pushdown into native Parquet probe scans  | `#150`, `#158`, `#167` | `LocalJoinFilterSummary`, `FinalizedJoinFilter` (bounds + `InList` + optional `KeyRangeBitmap`), empty/all-NULL build short-circuit, full NULL/join-type safety matrix, Parquet pruning proofs.                                                    |
 | **Phase 2** | Cache-resident split-block Bloom filter `RowFilter` pushdown                    | Phase 1                | `SplitBlockBloomFilter` + `JoinBloomFilterExpr` evaluated on decode workers under `pushdown_filters = true`; paired TPC-H SF1 Q3 & Q12 benchmark showing reduced `bytes_scanned` / decode time.                                                    |
-| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin` | `#158`, `#168`         | `radix.rs` with `split_radix_hash`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                        |
+| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin` | `#158`, `#168`         | `radix.rs` with `radix_partition`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                         |
 | **Phase 4** | Out-of-core spilling for `GROUP BY` and `Sort` via `SpillManager`               | Phase 3, `#159`        | `spill.rs` + `#[doc(hidden)]` `InProgressSpillFile` seam; radix partition spill + recursive/sorted skew fallback for `GROUP BY`; sorted-run spill + `MultiLevelMergeBuilder` for `Sort`; tight-pool parity & zero-leak cleanup tests.              |
 | **Phase 5** | Out-of-core `HashJoin` (`ProbeSpill` + `Drained(P1)` child pipeline)            | Phase 3, Phase 4       | Build partition eviction (`M` / `S`) preserving full dynamic filter, `LocalProbeSpill` + `SpilledProbeManifest`, `P2` child pipeline in `G1`, single-partition skew block sub-pass, outer-join unmatched emission, constrained-RAM join benchmark. |
 
@@ -889,51 +995,58 @@ minimal file overlap:
 [morsel_metrics.md]: morsel_metrics.md
 [upstream-scheduling]: https://github.com/apache/datafusion/issues/21719
 [upstream-parallelism]: https://github.com/apache/datafusion/pull/2226
-[morsel-parquet-lower]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/core/src/morsel/parquet.rs#L55-L201
-[parquet-create-morselizer]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/source.rs#L588-L611
-[parquet-buffered]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/opener/buffered.rs#L22-L116
-[dyn-filter]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-expr/src/expressions/dynamic_filters/mod.rs#L57-L398
-[shared-bounds]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L50-L120
-[partition-bounds]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L66-L115
-[shared-bounds-membership]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L123-L176
-[preserve-probe-nulls]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L917-L968
-[stock-join-allow]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/exec.rs#L1078-L1126
-[hash-table-lookup]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/hash_join/partitioned_hash_eval.rs#L266-L421
-[key-range-bitmap]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/key_range_bitmap.rs#L57-L115
-[key-range-pruning]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/pruning/src/key_range_bitmap_expr.rs#L20-L56
-[rg-pruner]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/push_decoder.rs#L146-L250
-[row-filter-prebuild]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/row_filter.rs#L475-L514
-[row-filter-from-prebuilt]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/row_filter.rs#L520-L560
-[can-push-down]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/row_filter.rs#L364-L405
-[opener-rg-stats]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/opener/mod.rs#L1358-L1364
-[opener-rg-bloom]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/opener/mod.rs#L1652-L1657
-[opener-page-prune]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/datasource-parquet/src/opener/mod.rs#L1707-L1725
-[config-inlist]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/config.rs#L1939-L1960
-[join-type-preserved]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/join_type.rs#L103-L116
-[join-type-empty-build]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/join_type.rs#L136-L147
-[join-type-empty-map]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/join_type.rs#L159-L164
-[hash-random-state]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/hash_utils.rs#L30-L31
-[create-hashes]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/common/src/hash_utils.rs#L1362-L1390
-[group-values-rows]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/aggregates/group_values/row.rs#L32-L108
-[join-hash-map]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/joins/join_hash_map.rs#L40-L110
-[mem-consumer]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/memory_pool/mod.rs#L319-L322
-[mem-try-grow]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/memory_pool/mod.rs#L467-L476
-[mem-take]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/memory_pool/mod.rs#L507-L512
-[memory-pools]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/memory_pool/pool.rs#L64-L170
-[spill-manager]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/spill_manager.rs#L27-L100
-[spill-manager-abort]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/spill_manager.rs#L155-L162
-[spill-read-unbuffered]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/spill_manager.rs#L199-L209
-[spill-manager-abort-test]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/spill_manager.rs#L248-L320
-[in-progress-spill]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L27-L100
-[in-progress-async]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L103-L152
-[in-progress-abort]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L219-L232
-[spill-reader-stream]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/mod.rs#L56-L86
-[gc-view-arrays]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/spill/mod.rs#L852-L865
-[spill-file]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/spill_file.rs#L17-L95
-[refcounted-tmp]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/disk_manager.rs#L396-L435
-[refcounted-drop]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/execution/src/disk_manager.rs#L437-L453
-[stock-agg-spill]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/aggregates/spill.rs#L49-L120
-[stock-sorter]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/sorts/sort.rs#L250-L315
-[stock-sorter-spill-inmem]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/sorts/sort.rs#L445-L465
-[sorted-spill-file]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/sorts/streaming_merge.rs#L50-L65
-[multi-level-merge]: https://github.com/robtandy/datafusion/blob/2aee01e23408a688828675d4c0cd489448759b33/datafusion/physical-plan/src/sorts/multi_level_merge.rs#L34-L55
+[morsel-parquet-lower]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/core/src/morsel/parquet.rs#L55-L201
+[parquet-create-morselizer]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/source.rs#L588-L611
+[parquet-buffered]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/opener/buffered.rs#L22-L116
+[dyn-filter]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-expr/src/expressions/dynamic_filters/mod.rs#L57-L398
+[shared-bounds]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L274-L320
+[partition-bounds]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L50-L115
+[shared-bounds-membership]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L123-L176
+[preserve-probe-nulls]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L917-L968
+[stock-join-allow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/exec.rs#L1078-L1126
+[stream-after-build]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/stream.rs#L618-L636
+[join-float-norm]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/utils.rs#L2830-L2860
+[hash-table-lookup]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/partitioned_hash_eval.rs#L266-L421
+[key-range-bitmap]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/key_range_bitmap.rs#L57-L115
+[key-range-pruning]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/pruning/src/key_range_bitmap_expr.rs#L20-L56
+[pruning-inlist]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/pruning/src/pruning_predicate.rs#L1586-L1845
+[rg-pruner]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/push_decoder.rs#L146-L250
+[row-filter-prebuild]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/row_filter.rs#L475-L514
+[row-filter-from-prebuilt]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/row_filter.rs#L520-L560
+[can-push-down]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/row_filter.rs#L364-L405
+[opener-rg-stats]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/opener/mod.rs#L1358-L1364
+[opener-rg-bloom]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/opener/mod.rs#L1652-L1657
+[opener-page-prune]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/opener/mod.rs#L1707-L1725
+[config-max-inlist]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/config.rs#L1495-L1500
+[config-inlist]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/config.rs#L1939-L1960
+[join-type-preserved]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/join_type.rs#L103-L116
+[join-type-empty-build]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/join_type.rs#L136-L147
+[join-type-empty-map]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/join_type.rs#L159-L164
+[hash-random-state]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/hash_utils.rs#L30-L31
+[create-hashes]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/hash_utils.rs#L1362-L1390
+[group-values-primitive]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/single_group_by/primitive.rs#L87-L105
+[group-values-rows]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/row.rs#L32-L108
+[join-hash-map]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/join_hash_map.rs#L40-L110
+[mem-consumer]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L319-L322
+[mem-try-grow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L467-L476
+[mem-take]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L507-L512
+[memory-pools]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/pool.rs#L64-L170
+[spill-manager]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L27-L100
+[spill-manager-abort]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L155-L162
+[spill-read-unbuffered]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L199-L209
+[spill-manager-abort-test]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L248-L320
+[in-progress-spill]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L27-L100
+[in-progress-async]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L103-L152
+[in-progress-abort]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/in_progress_spill_file.rs#L219-L232
+[spill-reader-stream]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/mod.rs#L56-L86
+[gc-view-arrays]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/mod.rs#L852-L865
+[spill-file]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/spill_file.rs#L17-L95
+[refcounted-tmp]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/disk_manager.rs#L396-L435
+[refcounted-drop]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/disk_manager.rs#L437-L453
+[stock-agg-spill]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/spill.rs#L49-L120
+[stock-sorter]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/sort.rs#L250-L315
+[stock-sorter-spill-inmem]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/sort.rs#L445-L465
+[sorted-spill-file]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/streaming_merge.rs#L50-L65
+[streaming-merge-builder]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/streaming_merge.rs#L76-L115
+[fan-in-headroom]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/multi_level_merge.rs#L34-L55
+[multi-level-merge]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/sorts/multi_level_merge.rs#L149-L175
