@@ -1,0 +1,42 @@
+--- a/datafusion/core/examples/morsel_parquet_stream.rs
++++ b/datafusion/core/examples/morsel_parquet_stream.rs
+@@ -11,0 +12 @@
++use datafusion::morsel::MorselMetrics;
+@@ -60,0 +62,4 @@
++    let metrics = Arc::new(MorselMetrics::default());
++    if std::env::var_os("MORSEL_NO_METRICS").is_none() {
++        config.set_extension(Arc::clone(&metrics));
++    }
+@@ -64,0 +70 @@
++    let cpu_start = cpu_seconds();
+@@ -96,0 +103,2 @@
++    let cpu_seconds = cpu_seconds() - cpu_start;
++    drop(stream);
+@@ -97,0 +106,7 @@
++        let runs: Vec<Vec<_>> = metrics.take_runs().iter().map(|run| {
++            run.iter().map(|m| json!({
++                "name": m.value().name(),
++                "worker": m.labels().iter().find(|l| l.name() == "worker").map(|l| l.value()),
++                "value": m.value().as_usize(),
++            })).collect()
++        }).collect();
+@@ -106,0 +122 @@
++                "cpu_seconds": cpu_seconds,
+@@ -107,0 +124 @@
++                "runs": runs,
+@@ -115,0 +133,15 @@
++}
++
++// Linux clock_gettime: process CPU across query and blocking threads.
++fn cpu_seconds() -> f64 {
++    #[repr(C)]
++    struct Timespec {
++        sec: i64,
++        nsec: i64,
++    }
++    unsafe extern "C" {
++        fn clock_gettime(id: i32, tp: *mut Timespec) -> i32;
++    }
++    let mut tp = Timespec { sec: 0, nsec: 0 };
++    assert_eq!(unsafe { clock_gettime(2, &mut tp) }, 0);
++    tp.sec as f64 + tp.nsec as f64 / 1e9

@@ -302,14 +302,6 @@ pub(super) struct Footprint {
 }
 
 impl Footprint {
-    #[cfg(feature = "parquet")]
-    pub(super) fn estimated(bytes: usize) -> Self {
-        Self {
-            estimate: bytes,
-            buffers: vec![],
-        }
-    }
-
     fn batch(batch: &RecordBatch) -> Self {
         fn collect(data: &ArrayData, buffers: &mut Vec<(usize, usize)>) {
             for buffer in data
@@ -350,6 +342,21 @@ impl QueueStats {
         let mut state = self.0.lock();
         state.push(footprint);
         permit.send(item);
+    }
+
+    // The Parquet queue calls these while holding its queue lock, keeping
+    // accounting in the same order as the corresponding queue operations.
+    #[cfg(feature = "parquet")]
+    pub(super) fn push_estimate(&self, bytes: usize) {
+        self.0.lock().push(Footprint {
+            estimate: bytes,
+            buffers: vec![],
+        });
+    }
+
+    #[cfg(feature = "parquet")]
+    pub(super) fn pop_estimate(&self) {
+        self.0.lock().pop();
     }
 
     fn report(
