@@ -433,10 +433,16 @@ Additional soundness invariants:
     probe tuple `(NULL, 5)`. Per-key bounds on `k_i` must use
     `(k_i >= min_i AND k_i <= max_i) OR k_i IS NULL` whenever `key_has_null[i]`
     is true (or omit the range bound on `k_i` if all build values of `k_i` are
-    `NULL`). The composite bloom filter hashes `(k0, k1, ...)` with
-    `create_hashes` (which hashes `NULL`s deterministically!) so `(NULL, 5)` is
-    inserted into and probed from the bloom filter **without** needing a wide
-    `OR k0 IS NULL` escape that would let `(NULL, 999)` bypass the bloom filter.
+    `NULL`). For the composite bloom filter: [`create_hashes`][create-hashes]
+    skips `NULL` slots and leaves whatever value was already in `hashes_buffer`
+    ([`hash_utils.rs:314-326`][hash-null-skip]). Therefore, the build sink,
+    radix routing, and `JoinBloomFilterExpr::evaluate()` **must zero-fill
+    `hashes_buffer` (`hashes_buffer.fill(0)`) for every batch** before calling
+    `create_hashes` (matching stock DataFusion). With zero-initialized hash
+    buffers, `(NULL, 5)` hashes identically on build and probe without stale
+    scratch bytes, so it can be inserted into and probed from the bloom filter
+    without needing a wide `OR k0 IS NULL` escape that would let `(NULL, 999)`
+    bypass the bloom filter.
 - **Multi-key joins under `NullEqualsNothing`:** Per-key min/max bounds are
   conjunctive (`(k0 BETWEEN min0 AND max0) AND (k1 BETWEEN min1 AND max1)`),
   which is sound because matching requires every key to match simultaneously
@@ -491,9 +497,10 @@ maps and merge them in `combine` / `finalize`. Once distinct group cardinality
 or build-side size grows beyond per-core L2 (~256 KiB–1 MiB) and shared L3
 (~16–64 MiB):
 
-1. **Random DRAM latency on insert/probe:** A 256 MiB hash table misses L3 and
-   dTLB on almost every lookup (~60–100 ns/probe), turning vectorized 8-core
-   execution memory-latency bound instead of compute bound.
+1. **Random DRAM latency on build/insert (and unpartitioned probe):** A 256 MiB
+   hash table misses L3 and dTLB on almost every lookup (~60–100 ns), turning
+   vectorized 8-core build/merge and large-table probe memory-latency bound
+   instead of compute bound.
 2. **Serial Amdahl bottleneck in `combine`/`finalize`:** Merging `W` large
    worker-local tables into one global table on the coordinator thread
    serializes `O(W * N)` hashing/equality work and creates a `2×` peak memory
@@ -506,7 +513,13 @@ or build-side size grows beyond per-core L2 (~256 KiB–1 MiB) and shared L3
 ### 2.2 Radix partitioning in the `#157` trait lifecycle
 
 Partitioning keys by `R` hash bits into `P = 2^R` disjoint partitions solves
-all three problems at once:
+build/finalize cache misses, serial `combine`/`finalize` bottlenecks, and
+per-partition spill eviction directly (note that probing `table.partitions[p]`
+row by row from an unpartitioned probe batch still touches the full resident
+table across partitions; improving probe-side locality on very large in-memory
+builds requires either the Section 1 bloom `RowFilter` or an optional
+probe-side radix clustering pass, while spilled probe partitions in Section 3.3
+are naturally partitioned per round):
 
 - **L2-resident build/finalize:** With `R = 6` (`64` partitions) or `R = 8`
   (`256` partitions), a 64 MiB build/group table splits into `256 KiB`–`1 MiB`
@@ -632,7 +645,7 @@ Two candidate physical layouts inside each radix partition:
 | **Aggregate states**      | Columnar typed vectors per partition (`Vec<i64>`, `Vec<i128>`, `Vec<f64>`, `NullBufferBuilder`) indexed by dense `group_id: u32`.                                                                                                                                                                                                                        | Inline fixed-size structs per row; variable states (`String` min/max) stored in side heap.                                           |
 | **Join build storage**    | Per-partition coalesced `RecordBatch` (or `Vec<RecordBatch>`) + per-partition [`JoinHashMapU32`][join-hash-map] (`head` table + `next: Vec<u32>`, since each of `2^R` partitions fits in `u32`) + optional `Vec<u16>` hash salts.                                                                                                                        | Packed build rows `(next_ptr, hash_salt, key_bytes, payload_bytes)` in 256 KiB blocks.                                               |
 | **Arrow / Spill interop** | Zero-copy or single-copy conversion to `RecordBatch` for `MorselExec` output and `SpillManager` IPC serialization; reuses Arrow kernels and `gc_view_arrays`.                                                                                                                                                                                            | Requires custom per-`DataType` serializer/deserializer to and from Arrow `RecordBatch` and `SpillManager`.                           |
-| **Cache locality**        | High: every partition's hash table, `Rows` buffer, and columnar state vectors fit together inside L2 during `finalize` and `probe`.                                                                                                                                                                                                                      | Highest for wide multi-column probes/aggregates (single cache miss per row instead of 1 per column), at much higher code complexity. |
+| **Cache locality**        | High during build/finalize (and per-round spilled probes): each partition's hash table, `Rows` buffer, and columnar state vectors fit together inside L2 while building/merging that partition; unpartitioned in-memory probe batches still touch all resident partitions unless probe-clustered.                                                        | Highest for wide multi-column probes/aggregates (single cache miss per row instead of 1 per column), at much higher code complexity. |
 
 **Recommendation:** Adopt **Layout A** for the first radix + spill milestones.
 It keeps Arrow `RecordBatch` and `RowConverter` as the universal data model
@@ -720,8 +733,8 @@ DataFusion already provides a battle-tested spill substrate under
   is `pub(crate)` inside `datafusion-physical-plan`. When morsel spill code in
   `datafusion/core/src/morsel/` uses incremental spill files, expose a minimal
   `#[doc(hidden)]` re-export of `InProgressSpillFile` (following DataFusion's
-  [internal public APIs](api-health.md#internal-public-apis) policy) rather than
-  duplicating IPC framing or `gc_view_arrays`.
+  [internal public APIs](api-health.md#datafusion-internal-public-apis) policy)
+  rather than duplicating IPC framing or `gc_view_arrays`.
 
 #### Shared runtime invariants across all spilling operators
 
@@ -844,16 +857,17 @@ existing `Pipeline` / `MetaPipeline` DAG with **zero new DAG primitives**:
 ```text
 P0: Scan(build) -> RadixHashBuildSink                                     [G0]
 P1: Scan(probe) -> HashProbe(resident M, ProbeSpill S) -> [suffix] -> S1  [G1]  req Finalized(G0)
-P2: SpilledJoinSource(S) -> [suffix] -> S1                                [G1]  req Drained(P1)
+P2: SpilledJoinSource(S) -> [suffix] -> S1                                [G1]  req Finalized(G0), Drained(P1)
 ```
 
 `P1` and `P2` belong to the **same** `MetaPipeline` `G1` (feeding the same
 downstream sink `S1`, whether `Result`, `GroupBy`, or a parent join's build
-sink), and `P2` declares `requires: [Drained(P1)]`. This is the exact same
-`Drained(P1)` barrier [morsel_pipeline_architecture.md] already uses for
-emitting unmatched build rows in `LEFT`/`FULL` outer joins! When `S` is empty
-and no unmatched build scan is required, `P2` opens as a 0-work empty source
-and drains immediately.
+sink), and `P2` declares `requires: [Finalized(G0), Drained(P1)]`. This matches
+[morsel_pipeline_architecture.md] (where the unmatched-build source also binds
+`Finalized(G0)` so the supervisor retains `RadixJoinArtifact`'s slot until
+`P2` binds it after `P1` drains, and uses `Drained(P1)` to wait for all probe
+workers to finish!). When `S` is empty and no unmatched build scan is required,
+`P2` opens as a 0-work empty source and drains immediately.
 
 #### Step-by-step execution flow
 
@@ -942,7 +956,7 @@ and drains immediately.
      per partition `p ∈ S` (plus worker-local build match bitmaps for `M`) to
      `probe_spill_manifest`.
 
-3. **Follow-up spilled-join pipeline (`P2`, `requires: [Drained(P1)]`):**
+3. **Follow-up spilled-join pipeline (`P2`, `requires: [Finalized(G0), Drained(P1)]`):**
    - Because `Drained(P1)` guarantees every `P1` worker has already exited and
      dropped its `Arc<ResidentPartitions>` clone (and the supervisor drops its
      artifact-slot reference once `P2` binds it), `P2::open` takes exclusive
@@ -1102,7 +1116,9 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
      `NullEqualsNothing`.
    - **Exactness & NULL parity against stock (`morsel_mode = off`):** Cover
      `NullEqualsNothing`, `NullEqualsNull` (`IS NOT DISTINCT FROM`), single-key
-     and multi-key `(NULL, 5)` combinations, `NaN` / `-0.0` float keys,
+     and multi-key `(NULL, 5)` combinations across multiple batches with reused
+     scratch hash buffers (verifying `hashes_buffer.fill(0)` prevents stale
+     hashes on `NULL` slots), `NaN` / `-0.0` float keys,
      truncated string stats, `Inner` / `Left` / `Right` / `Full` / `LeftSemi` /
      `LeftAnti` / `RightAnti` / null-aware `NOT IN`, intervening `LEFT` /
      `FULL` joins beneath a downstream `IS NOT DISTINCT FROM` join and beneath
@@ -1173,13 +1189,13 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
 Each phase is scoped to land as a self-contained PR with clear dependencies and
 minimal file overlap:
 
-| Phase       | Proposed follow-up issue                                                        | Depends on             | Scope & acceptance highlight                                                                                                                                                                                                                                                          |
-| ----------- | ------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Phase 1** | Dynamic join min/max + small `InList` pushdown into native Parquet probe scans  | `#150`, `#158`, `#167` | `LocalJoinFilterSummary`, `FinalizedJoinFilter` (bounds + `InList`), empty/all-NULL build short-circuit, full NULL/join-type safety matrix, Parquet pruning proofs (zero cross-crate pruning changes).                                                                                |
-| **Phase 2** | Cache-resident split-block Bloom filter `RowFilter` pushdown                    | Phase 1                | `SplitBlockBloomFilter` + `JoinBloomFilterExpr` evaluated on decode workers under `pushdown_filters = true`, plus optional `#[doc(hidden)]` `KeyRangeBitmap` pruning hook in `datafusion-pruning`; paired TPC-H SF1 Q3 & Q12 benchmark showing reduced `bytes_scanned` / decode time. |
-| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin` | `#158`, `#168`         | `radix.rs` with `radix_partition`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                                                            |
-| **Phase 4** | Out-of-core spilling for `GROUP BY` and `Sort` via `SpillManager`               | Phase 3, `#159`        | `spill.rs` + `#[doc(hidden)]` `InProgressSpillFile` seam; radix partition spill + recursive/sorted skew fallback for `GROUP BY`; sorted-run spill + `MultiLevelMergeBuilder` for `Sort`; tight-pool parity & zero-leak cleanup tests.                                                 |
-| **Phase 5** | Out-of-core `HashJoin` (`ProbeSpill` + `Drained(P1)` child pipeline)            | Phase 3, Phase 4       | Build partition eviction (`M` / `S`) preserving full dynamic filter, `LocalProbeSpill` + `SpilledProbeManifest`, `P2` child pipeline in `G1`, single-partition skew block sub-pass, outer-join unmatched emission, constrained-RAM join benchmark.                                    |
+| Phase       | Proposed follow-up issue                                                             | Depends on             | Scope & acceptance highlight                                                                                                                                                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 1** | Dynamic join min/max + small `InList` pushdown into native Parquet probe scans       | `#150`, `#158`, `#167` | `LocalJoinFilterSummary`, `FinalizedJoinFilter` (bounds + `InList`), empty/all-NULL build short-circuit, full NULL/join-type safety matrix, Parquet pruning proofs (zero cross-crate pruning changes).                                                                                |
+| **Phase 2** | Cache-resident split-block Bloom filter `RowFilter` pushdown                         | Phase 1                | `SplitBlockBloomFilter` + `JoinBloomFilterExpr` evaluated on decode workers under `pushdown_filters = true`, plus optional `#[doc(hidden)]` `KeyRangeBitmap` pruning hook in `datafusion-pruning`; paired TPC-H SF1 Q3 & Q12 benchmark showing reduced `bytes_scanned` / decode time. |
+| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin`      | `#158`, `#168`         | `radix.rs` with `radix_partition`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                                                            |
+| **Phase 4** | Out-of-core spilling for `GROUP BY` and `Sort` via `SpillManager`                    | Phase 3, `#159`        | `spill.rs` + `#[doc(hidden)]` `InProgressSpillFile` seam; radix partition spill + recursive/sorted skew fallback for `GROUP BY`; sorted-run spill + `MultiLevelMergeBuilder` for `Sort`; tight-pool parity & zero-leak cleanup tests.                                                 |
+| **Phase 5** | Out-of-core `HashJoin` (`ProbeSpill` + `Finalized(G0)`/`Drained(P1)` child pipeline) | Phase 3, Phase 4       | Build partition eviction (`M` / `S`) preserving full dynamic filter, `LocalProbeSpill` + `SpilledProbeManifest`, `P2` child pipeline in `G1`, single-partition skew block sub-pass, outer-join unmatched emission, constrained-RAM join benchmark.                                    |
 
 [morsel_pipeline_architecture.md]: morsel_pipeline_architecture.md
 [morsel_parquet_adapter.md]: morsel_parquet_adapter.md
@@ -1220,6 +1236,7 @@ minimal file overlap:
 [join-type-empty-build]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/join_type.rs#L136-L147
 [join-type-empty-map]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/join_type.rs#L159-L164
 [hash-random-state]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/hash_utils.rs#L30-L31
+[hash-null-skip]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/hash_utils.rs#L314-L326
 [create-hashes]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/common/src/hash_utils.rs#L1362-L1390
 [group-values-primitive]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/single_group_by/primitive.rs#L87-L105
 [group-values-rows]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/row.rs#L32-L108
