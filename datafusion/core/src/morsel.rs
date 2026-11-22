@@ -765,8 +765,12 @@ impl Pipeline {
                 }
                 #[cfg(feature = "parquet")]
                 Source::Parquet(source) => {
-                    let ready =
-                        source.start(&context, &mut tasks, measurement.clone())?;
+                    let ready = source.start(
+                        &context,
+                        &mut tasks,
+                        self.workers,
+                        measurement.clone(),
+                    )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, tx) =
                             (Arc::clone(&self), ready.clone(), tx.clone());

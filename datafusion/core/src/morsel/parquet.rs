@@ -2,18 +2,19 @@
 // SPDX-FileCopyrightText: See the NOTICE file distributed with this work for additional information regarding copyright ownership
 // SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one or more contributor license agreements
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_catalog::{ScanArgs, TableProvider};
 use datafusion_common::{Result, internal_datafusion_err, internal_err};
-use datafusion_common_runtime::{JoinSet, SpawnedTask};
+use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_scan_config::FileScanConfig;
-use datafusion_datasource::morsel::{Morsel, Morselizer};
+use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_datasource_parquet::{file_format::ParquetFormat, source::ParquetSource};
 use datafusion_execution::TaskContext;
@@ -23,21 +24,22 @@ use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
-use datafusion_physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
+use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
 use datafusion_session::Session;
-use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use crate::datasource::listing::ListingTable;
 
-use super::metrics::{self, Footprint, RunMetrics};
+use super::metrics::RunMetrics;
 use super::{CountState, supported_expr};
 
+mod ready;
 #[cfg(test)]
 mod tests;
 
-const FILE_LANES: usize = 4;
-const PENDING_IO: usize = 2;
-const READY_READERS: usize = 2;
+use ready::Publisher;
+pub(super) use ready::ReadyReaders;
+
+const MAX_READ_AHEAD: usize = 16;
 
 #[derive(Debug)]
 pub(super) struct ParquetScan {
@@ -202,9 +204,15 @@ impl ParquetScan {
         &self,
         context: &TaskContext,
         tasks: &mut JoinSet<Result<Option<CountState>>>,
+        workers: NonZeroUsize,
         measurement: Option<Arc<RunMetrics>>,
     ) -> Result<ReadyReaders> {
-        let (publish, ready) = mpsc::channel(READY_READERS);
+        let read_ahead = workers.get().min(MAX_READ_AHEAD);
+        let (publish, ready) = ready::channel(
+            read_ahead,
+            measurement.clone(),
+            MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
+        );
         if let Some(config) = &self.config {
             let parquet = config
                 .file_source()
@@ -216,41 +224,20 @@ impl ParquetScan {
                 morselizer: parquet.create_buffered_morselizer(config, context)?,
                 files: Arc::clone(&self.files),
                 next: AtomicUsize::new(0),
-                io_slots: Semaphore::new(PENDING_IO),
+                publish,
+                measurement,
             });
-            for _ in 0..FILE_LANES.min(self.files.len()) {
+            // Each lane owns one planner and can drive at most one pending I/O
+            // phase or hold one reader waiting to publish.
+            for _ in 0..read_ahead.min(self.files.len()) {
                 let work = Arc::clone(&work);
-                let publish = publish.clone();
-                let measurement = measurement.clone();
                 tasks.spawn(async move {
-                    work.produce(publish, measurement.as_ref()).await?;
+                    work.produce().await?;
                     Ok(None)
                 });
             }
         }
-        Ok(ReadyReaders {
-            queue: Arc::new(Mutex::new(ready)),
-            measurement,
-            claimed: MetricBuilder::new(&self.metrics)
-                .counter("parquet_morsels_claimed", 0),
-        })
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct ReadyReaders {
-    queue: Arc<Mutex<mpsc::Receiver<Box<dyn Morsel>>>>,
-    measurement: Option<Arc<RunMetrics>>,
-    claimed: Count,
-}
-
-impl ReadyReaders {
-    pub(super) async fn claim(&self) -> Option<Box<dyn Morsel>> {
-        let stats = self.measurement.as_ref().map(|run| &run.ready);
-        let mut queue = self.queue.lock().await;
-        let reader = metrics::recv(stats, &mut queue).await?;
-        self.claimed.add(1);
-        Some(reader)
+        Ok(ready)
     }
 }
 
@@ -258,46 +245,28 @@ struct FileWork {
     morselizer: Box<dyn Morselizer>,
     files: Arc<[PartitionedFile]>,
     next: AtomicUsize,
-    io_slots: Semaphore,
+    publish: Publisher,
+    measurement: Option<Arc<RunMetrics>>,
 }
 
 impl FileWork {
-    async fn produce(
-        &self,
-        publish: mpsc::Sender<Box<dyn Morsel>>,
-        measurement: Option<&Arc<RunMetrics>>,
-    ) -> Result<()> {
-        while !publish.is_closed()
-            && let Some(file) = self.files.get(self.next.fetch_add(1, Ordering::Relaxed))
-        {
-            self.produce_file(file, &publish, measurement)
-                .await
-                .map_err(|error| {
-                    error.context(format!(
-                        "Planning Parquet morsels for {}",
-                        file.object_meta.location
-                    ))
-                })?;
-            tokio::task::yield_now().await;
+    async fn produce(&self) -> Result<()> {
+        while let Some(file) = self.files.get(self.next.fetch_add(1, Ordering::Relaxed)) {
+            self.produce_file(file).await.map_err(|error| {
+                error.context(format!(
+                    "Planning Parquet morsels for {}",
+                    file.object_meta.location
+                ))
+            })?;
+            // Files pruned without publishing a reader may not suspend in I/O.
+            tokio::task::coop::consume_budget().await;
         }
         Ok(())
     }
 
-    async fn produce_file(
-        &self,
-        file: &PartitionedFile,
-        publish: &mpsc::Sender<Box<dyn Morsel>>,
-        measurement: Option<&Arc<RunMetrics>>,
-    ) -> Result<()> {
+    async fn produce_file(&self, file: &PartitionedFile) -> Result<()> {
         let mut planner = self.morselizer.plan_file(file.clone())?;
-        loop {
-            // Reserve before CPU preparation: no reader is parked outside the queue.
-            let Ok(permit) = publish.reserve().await else {
-                return Ok(());
-            };
-            let Some(mut step) = planner.plan()? else {
-                return Ok(());
-            };
+        while let Some(mut step) = planner.plan()? {
             let mut morsels = step.take_morsels();
             let mut ready = step.take_ready_planners();
             let pending = step.take_pending_planner();
@@ -307,40 +276,19 @@ impl FileWork {
                 );
             }
             if let Some(morsel) = morsels.pop() {
-                if let Some(run) = measurement {
-                    run.ready.publish(permit, morsel, |m| {
-                        Footprint::estimated(m.buffered_bytes_estimate())
-                    });
-                } else {
-                    permit.send(morsel);
+                self.publish.send(morsel).await;
+            }
+            planner = if let Some(io) = pending {
+                match &self.measurement {
+                    Some(run) => Arc::clone(run).io(io).await?,
+                    None => io.await?,
                 }
-            } else {
-                drop(permit);
-            }
-            if let Some(io) = pending {
-                // The I/O task only polls the pending phase. Its abort-on-drop
-                // handle is owned by this lane, and there is one phase per lane.
-                let _slot = self
-                    .io_slots
-                    .acquire()
-                    .await
-                    .expect("semaphore is never closed");
-                let task = if let Some(run) = measurement {
-                    SpawnedTask::spawn(Arc::clone(run).io(io))
-                } else {
-                    SpawnedTask::spawn(io)
-                };
-                planner = task.join_unwind().await.map_err(|e| {
-                    datafusion_common::exec_datafusion_err!(
-                        "Parquet morsel I/O task failed: {e}"
-                    )
-                })??;
             } else if let Some(next) = ready.pop() {
-                planner = next;
+                next
             } else {
-                return Ok(());
-            }
-            tokio::task::yield_now().await;
+                break;
+            };
         }
+        Ok(())
     }
 }

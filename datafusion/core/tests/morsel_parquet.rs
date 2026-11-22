@@ -19,8 +19,12 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use tempfile::TempDir;
 
 fn fixture() -> Result<TempDir> {
+    fixture_with_files(2)
+}
+
+fn fixture_with_files(num_files: i32) -> Result<TempDir> {
     let dir = TempDir::new()?;
-    for file in 0..2 {
+    for file in 0..num_files {
         let batch = RecordBatch::try_from_iter([
             (
                 "id",
@@ -75,6 +79,41 @@ async fn context(dir: &TempDir, mode: &str, pushdown: bool) -> Result<SessionCon
     ctx.sql(&format!("SET datafusion.execution.morsel_mode = '{mode}'"))
         .await?;
     Ok(ctx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn parallel_parquet_scan_claims_each_row_group_once() -> Result<()> {
+    let file_count = 24;
+    let dir = fixture_with_files(file_count)?;
+    let native = context(&dir, "required", false).await?;
+    native
+        .sql("SET datafusion.execution.target_partitions = 8")
+        .await?;
+    let plan = native
+        .sql("SELECT id FROM t")
+        .await?
+        .create_physical_plan()
+        .await?;
+    let display = displayable(plan.as_ref()).indent(false).to_string();
+    assert!(display.contains("workers=8, NativeParquet"), "{display}");
+    let batches = collect(Arc::clone(&plan), native.task_ctx()).await?;
+    let mut ids: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..file_count * 8).collect::<Vec<_>>());
+    assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 96);
+    Ok(())
 }
 
 #[tokio::test]
