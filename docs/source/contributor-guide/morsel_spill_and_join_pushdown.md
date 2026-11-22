@@ -173,10 +173,18 @@ How each tier is constructed:
      `InListExpr` provides exact zero-false-positive `RowFilter` evaluation
      (plus Parquet file bloom-filter pruning on single-column keys via
      `LiteralGuarantee`), while container-level min/max and page pruning come
-     from the companion per-key `bounds` predicate and, for larger sparse
+     from the companion per-key `bounds` predicate. For larger sparse
      single-column integer/date builds, DataFusion's [`KeyRangeBitmap`][key-range-bitmap]
-     (capped at `128 KiB`, `MAX_BUCKETS = 1 << 20`, with container pruning
-     already implemented by [`KeyRangeBitmapPruningExpr`][key-range-pruning]).
+     (capped at `128 KiB`, `MAX_BUCKETS = 1 << 20`) can also prune containers,
+     but [`KeyRangeBitmapPruningExpr`][key-range-pruning] is `pub(crate)` in
+     `datafusion-pruning` and [`build_hash_lookup_pruning_expr`][hash-lookup-pruning]
+     (`pruning_predicate.rs:1537-1567`) currently builds it **only** by
+     downcasting [`HashTableLookupExpr`][hash-table-lookup] and reading
+     `pruning_bitmap()`. A private `JoinBloomFilterExpr` or `InListExpr` in
+     `datafusion/core` therefore gets **no** `KeyRangeBitmap` container pruning
+     without a narrow workspace-internal seam (for example, a `#[doc(hidden)]`
+     `KeyRangeBitmap` provider/pruning hook in `datafusion-pruning`, tracked in
+     Section 4.1 and Phase 2 below).
 3. **Cache-resident split-block Bloom filter (`finalize`):** When the build
    exceeds the `InList` threshold (for example, 5K–5M distinct keys) and stays
    in memory (or spills with hash-column replay; see Section 3.3), build a
@@ -249,7 +257,11 @@ When `#150` enables Parquet `RowFilter` on the decode workers:
   key column(s)** on the pipeline workers, skipping decoding of all wide
   non-key payload columns for rejected rows (late materialization).
 - When `pushdown_filters = false`, `ParquetSource` still uses `bounds`,
-  `InListExpr`, and `KeyRangeBitmap` during file open for:
+  `InListExpr` (container min/max and page pruning up to
+  `max_in_list_size = 20` on bare `Column`s; Parquet file bloom pruning via
+  `LiteralGuarantee` for single-column lists), and—once the Phase 2
+  `#[doc(hidden)]` `datafusion-pruning` hook lands—`KeyRangeBitmap` during file
+  open for:
   - row-group min/max statistics pruning
     ([`prune_by_statistics_with_metadata`][opener-rg-stats]),
   - Parquet file bloom-filter pruning
@@ -282,9 +294,10 @@ metadata -> prune_by_statistics_with_metadata -> prune_by_bloom_filters
 Because `FinalizedJoinFilter` is installed **before** `ParquetAccessPlan` is
 constructed:
 
-- Entire row groups outside `[min, max]` (or excluded by `KeyRangeBitmap` /
-  file bloom filters) are removed before `#167` evaluates split eligibility or
-  initializes a row-group-local range broker.
+- Entire row groups outside `[min, max]` (or excluded by file bloom filters,
+  or by `KeyRangeBitmap` once the Phase 2 `#[doc(hidden)]` pruning hook lands)
+  are removed before `#167` evaluates split eligibility or initializes a
+  row-group-local range broker.
 - Surviving row groups have non-matching data pages pruned by the Page Index
   into a row-group-local `RowSelection` _before_ `#167` intersects each
   128 Ki-row `[lo, hi)` slice with that selection and drops empty
@@ -514,7 +527,7 @@ all three problems at once:
 /// Pass `h` unchanged into `hashbrown::HashTable`.
 #[inline]
 fn radix_partition(h: u64, shift: u32, radix_bits: u32) -> usize {
-    debug_assert!(shift + radix_bits <= 57);
+    debug_assert!(shift >= 33 && shift + radix_bits <= 57);
     if radix_bits == 0 {
         return 0;
     }
@@ -522,22 +535,27 @@ fn radix_partition(h: u64, shift: u32, radix_bits: u32) -> usize {
 }
 ```
 
-- **Level 0** (`R0 <= 10`, default `R0 = 6..8`): `shift = 57 - R0` (bits
-  `[49..57]` for `R0 = 8`).
-- **Recursive spill levels 1 and 2** (`R1, R2 <= 8`): step down to the next
-  disjoint window `shift = 57 - R0 - R1` (`[41..49]`) and
-  `shift = 57 - R0 - R1 - R2` (`[33..41]`).
+- **Strict bit budget (`R0 + R1 + R2 <= 24`):**
+  - **Level 0** (`R0 <= 8`, default `R0 = 6..8`): `shift = 57 - R0` (bits
+    `[49..57)` for `R0 = 8`).
+  - **Recursive spill levels 1 and 2** (`R1 <= 8`, `R2 <= 8`, with
+    `R0 + R1 + R2 <= 24` so `shift >= 33` always holds): step down to the next
+    disjoint window `shift = 57 - R0 - R1` (`[41..49)`) and
+    `shift = 57 - R0 - R1 - R2` (`[33..41)`).
 - **`h1` and `h2` stay 100% intact** across every level (full 7-bit `h2` tag
-  entropy and 33 independent low bits for `h1`, covering tables up to `2^33`
-  buckets).
+  entropy in `[57..64)` and 33 independent low bits in `[0..33)` for `h1`,
+  covering tables up to `2^33` buckets).
 - **Bloom filter orthogonality:** As noted in Section 1.1, `SplitBlockBloomFilter`
   indexes its cache-line block from low bits `(h as usize) & block_mask`
-  (`[0..33]`) and mixes the upper 32 bits `(h >> 32) as u32` with multiplicative
+  (`[0..33)`) and mixes the upper 32 bits `(h >> 32) as u32` with multiplicative
   salts for intra-block bit positions, keeping bloom block addressing disjoint
-  from the radix partition window `[33..57]`.
-- For custom join tables storing a 16-bit hash salt array, avoid the active
-  radix window by hashing/extracting from `(h >> 25) as u16` or mixing `h`
-  solely for the salt byte/word while keeping `h` unchanged for `h1`/`h2`.
+  from the radix partition window `[33..57)`.
+- For custom join tables storing a 16-bit hash salt array, extract from bits
+  `[17..33)` (`(h >> 17) as u16`) — completely disjoint from the entire radix
+  window `[33..57)` and `h2` `[57..64)`, and above `h1` bucket bits for
+  L2-sized partitions up to `2^17 = 131,072` buckets (or mix `(h >> 32) ^ h`
+  purely for the salt word if a partition exceeds `2^17` buckets) while keeping
+  `h` unchanged for `h1`/`h2`.
 
 #### Operator-specific adaptive partitioning
 
@@ -638,8 +656,10 @@ DataFusion already provides a battle-tested spill substrate under
   `finish_async`, and [`abort_async`][in-progress-abort].
 - [`SpillFile`][spill-file] and [`RefCountedTempFile`][refcounted-tmp]:
   local temp files are unlinked and subtracted from
-  `DiskManager::used_disk_space` / `active_files_count` automatically when the
-  last `Arc<dyn SpillFile>` drops ([`disk_manager.rs:437`][refcounted-drop]).
+  `DiskManager::spilling_progress().current_bytes` /
+  [`DiskManager::spilling_progress().active_files_count`][disk-spilling-progress]
+  automatically when the last `Arc<dyn SpillFile>` drops
+  ([`disk_manager.rs:437`][refcounted-drop]).
 - **Crate visibility note:** `datafusion_physical_plan::spill::SpillManager` is
   currently re-exported with `#[doc(hidden)]`, while `in_progress_spill_file`
   is `pub(crate)` inside `datafusion-physical-plan`. When morsel spill code in
@@ -800,39 +820,90 @@ and drains immediately.
      `LocalProbeSpill` with memory-reserved append buffers for partitions in `S`.
      For each probe batch:
      - Compute `create_hashes` on probe keys once.
-     - Rows with `p ∈ M` probe `resident[p]` immediately and emit matches
-       downstream (using `#157`'s `HaveMoreOutput` continuation to bound fanout).
+     - Rows with `p ∈ M` probe `resident[p]` immediately:
+       - For `Inner`, `Left`, `Right`, `Full`, `RightSemi`, `RightAnti`, and
+         `RightMark`: emit matched (and, where applicable, probe-side
+         unmatched/marked) batches downstream (using `#157`'s `HaveMoreOutput`
+         continuation to bound fanout), and record build match bits in
+         worker-local bitmaps for `Left` / `Full`.
+       - For **`LeftSemi`, `LeftAnti`, and `LeftMark`**: **only set build-side
+         match bits** in worker-local match bitmaps — do **not** emit build rows
+         during `P1`, so every build row is emitted at most once after all probe
+         workers drain and bitmaps merge in `P2`.
      - Rows with `p ∈ S` are appended to `LocalProbeSpill::buffers[p]`; when a
        buffer reaches its flush threshold (or `try_grow` triggers), flush it
        via `SpillManager` (`append_batch_async` / `spill_record_batch_and_finish`)
        into a probe spill file for partition `p`.
-     - For `Right` / `Full` / `RightAnti` / `RightMark` joins, unmatched probe
-       rows with `NULL` keys (under `NullEqualsNothing`) never match any build
-       partition and can be emitted directly during `P1` without spilling!
+     - **Non-null-aware `Right` / `Full` / `RightAnti` / `RightMark` shortcut:**
+       Under `NullEqualsNothing`, for **non-null-aware** `Right`, `Full`,
+       `RightAnti`, and `RightMark` joins only, probe rows with a `NULL` key
+       never match any build partition and can be emitted directly during `P1`
+       without spilling. **Never** apply this shortcut to **null-aware
+       `RightAnti`** (`probe.key NOT IN (build.key)`, stock `NotIn::ProbeRows`,
+       [`not_in.rs:64-85`][not-in-scope]): with a non-empty build side,
+       `NULL`-key probe rows evaluate to `UNKNOWN` and must be **dropped**, and
+       for uncorrelated `NotIn::ProbeRows` if any build key is `NULL`
+       (`key_has_null`), **zero** rows may be emitted.
    - On `P1` worker normal EOF (`final_execute` + worker exit handoff), flush
      and finish all `LocalProbeSpill` buffers (`finish_async`) and hand their
-     `Vec<Arc<dyn SpillFile>>` per partition `p ∈ S` to `probe_spill_manifest`.
+     `Vec<Arc<dyn SpillFile>>` per partition `p ∈ S` (plus worker-local build
+     match bitmaps for `M`) to `probe_spill_manifest`.
 
 3. **Follow-up spilled-join pipeline (`P2`, `requires: [Drained(P1)]`):**
-   - `P2::open` first emits any unmatched build rows for resident partitions `M`
-     (for `Left` / `Full` / `LeftAnti` / `LeftMark` joins using `#157`'s
-     merged probe match bitmaps), then drops `M`'s hash tables and releases `M`'s
-     memory reservations so the full `MemoryPool` budget is available for `S`.
-   - Partition `S` into memory-fitting rounds `B_1, B_2, ..., B_k` (discarding
-     any partition `p ∈ S` whose probe spill list is empty if unmatched build
-     rows are not needed, e.g. `Inner` / `LeftSemi` / `RightSemi`!).
+   - `P2::open` first merges worker-local build match bitmaps for resident
+     partitions `M` and emits build-driven results for `M` once:
+     - **`LeftSemi`**: emit **matched** build rows (`bit == 1`) once.
+     - **`Left`, `Full`, `LeftAnti`**: emit **unmatched** build rows
+       (`bit == 0`) once.
+     - **`LeftMark`**: emit every build row with its final Boolean mark.
+       Then drop `M`'s hash tables and release `M`'s memory reservations so the
+       full `MemoryPool` budget is available for `S`.
+   - Partition `S` into memory-fitting rounds `B_1, B_2, ..., B_k`. Any
+     partition `p ∈ S` with an empty probe spill list can be dropped immediately
+     for joins that emit nothing for unmatched build rows (`Inner`, `LeftSemi`,
+     `RightSemi`, `Right`, `RightAnti`, `RightMark`); for `Left`, `Full`,
+     `LeftAnti`, and `LeftMark`, stream `p`'s unmatched build rows directly
+     without building a hash table.
    - For each round `B_i`:
      1. Load build spill files for all `p ∈ B_i` in parallel and build
         immutable `PartitionJoinTable`s for `B_i`.
      2. Workers claim probe spill files for `p ∈ B_i` dynamically via
-        `SpillManager::read_spill_as_stream_unbuffered`, probe `B_i`'s hash
-        tables lock-free, and drive matched batches through `P2`'s downstream
-        suffix into `G1`'s sink `S1`.
-     3. If the join emits unmatched build rows, merge `B_i`'s match bitmaps
-        after `B_i`'s probe files finish and emit unmatched build rows of `B_i`.
+        `SpillManager::read_spill_as_stream_unbuffered` and probe `B_i`'s hash
+        tables lock-free: drive matched/probe-driven batches through `P2`'s
+        downstream suffix into `G1`'s sink `S1` (for `Inner`, `Left`, `Right`,
+        `Full`, `RightSemi`, `RightAnti`, `RightMark`), or **only set
+        build-side match bits** in worker-local bitmaps for `B_i` (for
+        `LeftSemi`, `LeftAnti`, `LeftMark`).
+     3. Merge worker-local build match bitmaps for `B_i` after `B_i`'s probe
+        files finish, and emit `B_i`'s build-driven rows once (`LeftSemi`
+        matched rows; `Left` / `Full` / `LeftAnti` unmatched rows; `LeftMark`
+        all build rows with their marks).
      4. Drop `B_i`'s hash tables **and** immediately drop all build and probe
         `Arc<dyn SpillFile>` handles for `B_i` before advancing to `B_{i+1}`,
         bounding peak disk space as well as peak RAM.
+   - **Null-aware `NOT IN` (`LeftAnti` / `LeftMark` / `RightAnti`) and radix spill:**
+     Build-driven null-aware joins (`NotIn::BuildRows`) require global state
+     across all probe rows and all build partitions `M ∪ S`: an uncorrelated
+     `(probe_is_non_empty, probe_saw_null)` summary, plus—for correlated
+     forms—a per-build-row `UNKNOWN` bitmap populated by probing `NULL`-valued
+     probe rows against a correlation-scope map covering all of `M ∪ S`. Stock
+     DataFusion rejects `PartitionMode::Partitioned` for null-aware joins for
+     this exact reason ([`not_in.rs:119-126`][not-in-partitioned]). **In v1
+     (Phase 5), exclude `null_aware = true` joins from radix-partitioned spill**:
+     keep them on the unpartitioned in-memory `R = 0` path (returning
+     `ResourcesExhausted` if a null-aware build exceeds memory, or using
+     `prefer` fallback / `required` rejection if null-aware spill is requested).
+     To support out-of-core null-aware joins in a subsequent slice:
+     - _Uncorrelated `LeftAnti` / `LeftMark`_: reduce every `P1` worker's
+       `(probe_is_non_empty, probe_saw_null)` summary at `Drained(P1)` **before**
+       `P2` emits any build row from `M` or `B_i` (so `probe_saw_null == true`
+       suppresses unmatched `LeftAnti` rows and marks unmatched `LeftMark` rows
+       `NULL` across all of `M ∪ S`).
+     - _Correlated `LeftAnti` / `LeftMark`_: radix-partition by the
+       **correlation scope keys** `on[value_keys..]` (not all keys `on[..]`) so
+       every `NULL`-valued probe row routes to the same radix partition as its
+       build scope peers and sets per-build-row `UNKNOWN` bits cleanly within
+       `M` or round `B_i`.
    - **Single-partition build overflow (extreme key skew):** If one build
      partition `p ∈ S` alone exceeds the memory budget:
      1. If recursion depth `< MAX_RADIX_DEPTH` and distinct key count permits
@@ -892,7 +963,7 @@ Strict resource cleanup extends `#157`'s teardown invariants to disk state:
 
 | Failure / exit path                                                                    | Cleanup guarantee                                                                                                                                                                                                                                                                                                                                                          |
 | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Normal completion**                                                                  | Partition spill files are dropped eagerly as soon as their partition/round finishes (not held until query EOF). At stream EOF, `DiskManager::active_files_count() == 0` and all `MemoryReservation`s are `0`.                                                                                                                                                              |
+| **Normal completion**                                                                  | Partition spill files are dropped eagerly as soon as their partition/round finishes (not held until query EOF). At stream EOF, `DiskManager::spilling_progress().active_files_count == 0` and all `MemoryReservation`s are `0`.                                                                                                                                            |
 | **Worker error or disk-quota exhaustion (`DiskManager::max_temp_directory_size`)**     | The worker calls best-effort `InProgressSpillFile::abort_async().await` on any open async writer before returning the error (matching [`spill_manager.rs:155-162`][spill-manager-abort]), then signals the supervisor's terminal failure transition. The supervisor never falls back to stock DataFusion after native execution has started.                               |
 | **Peer error / supervisor cancellation**                                               | The supervisor closes the result receiver, cancels the run token, aborts and joins all worker/producer/finalize tasks (`JoinSet`), and drops `GlobalSinkState`, `SpilledProbeManifest`, and all run artifacts. Dropping every `Arc<dyn SpillFile>` invokes [`RefCountedTempFile::drop`][refcounted-drop] to unlink local files and reclaim `DiskManager::used_disk_space`. |
 | **Early consumer stream drop (e.g., `LIMIT` above `MorselExec` or client disconnect)** | `MorselExec`'s stream drop triggers the abort-on-drop `JoinSet` owner and drops run-owned artifact slots. Workers unwind, run best-effort cleanup of in-progress writers on cancellation checks, and drop all `Arc<dyn SpillFile>` and `MemoryReservation` handles; no `SpillFile` or reservation is ever stored on `MorselExec` or `PipelineGraph`.                       |
@@ -904,12 +975,13 @@ Strict resource cleanup extends `#157`'s teardown invariants to disk state:
 
 Extending the private module layout in [morsel_pipeline_architecture.md]:
 
-| Path                                        | Responsibility                                                                                                                                                                                                         |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `datafusion/core/src/morsel/join_filter.rs` | `LocalJoinFilterSummary`, `FinalizedJoinFilter`, `SplitBlockBloomFilter`, `JoinBloomFilterExpr`, join-type/NULL safety gating, and `ParquetScan::open` predicate binding.                                              |
-| `datafusion/core/src/morsel/radix.rs`       | `radix_partition`, adaptive radix bit selection, per-partition scatter buffers, parallel partition finalize driver over tracked `JoinSet` tasks, and `MemoryReservation` handoffs.                                     |
-| `datafusion/core/src/morsel/spill.rs`       | Thin wrapper over `SpillManager` / `InProgressSpillFile`, spill-headroom reservation management, partition-scoped `Arc<dyn SpillFile>` manifests, `abort_async` cancellation helper, and `#138` `SpillMetrics` wiring. |
-| `datafusion/physical-plan/src/spill/mod.rs` | Minimal `#[doc(hidden)]` internal re-export of `InProgressSpillFile` (only when Phase 4 lands) if `datafusion/core` invokes incremental async spilling directly.                                                       |
+| Path                                          | Responsibility                                                                                                                                                                                                         |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `datafusion/core/src/morsel/join_filter.rs`   | `LocalJoinFilterSummary`, `FinalizedJoinFilter`, `SplitBlockBloomFilter`, `JoinBloomFilterExpr`, join-type/NULL safety gating, and `ParquetScan::open` predicate binding.                                              |
+| `datafusion/core/src/morsel/radix.rs`         | `radix_partition`, adaptive radix bit selection, per-partition scatter buffers, parallel partition finalize driver over tracked `JoinSet` tasks, and `MemoryReservation` handoffs.                                     |
+| `datafusion/core/src/morsel/spill.rs`         | Thin wrapper over `SpillManager` / `InProgressSpillFile`, spill-headroom reservation management, partition-scoped `Arc<dyn SpillFile>` manifests, `abort_async` cancellation helper, and `#138` `SpillMetrics` wiring. |
+| `datafusion/physical-plan/src/spill/mod.rs`   | Minimal `#[doc(hidden)]` internal re-export of `InProgressSpillFile` (only when Phase 4 lands) if `datafusion/core` invokes incremental async spilling directly.                                                       |
+| `datafusion/pruning/src/pruning_predicate.rs` | Optional `#[doc(hidden)]` internal `KeyRangeBitmap` pruning hook (only when Phase 2 lands) if `JoinBloomFilterExpr` exposes a `KeyRangeBitmap` for container pruning alongside `HashTableLookupExpr`.                  |
 
 ### 4.2 Concrete test plan
 
@@ -951,11 +1023,20 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
      time separately, and `MemoryPool::reserved() == 0` after completion,
      error, or early drop.
 3. **Out-of-core spilling (`datafusion/core/tests/morsel_spill.rs`):**
-   - **Forced-OOM spill parity:** Run `GROUP BY`, `HashJoin` (inner + outer),
-     and `Sort` / `TopN` under tight [`GreedyMemoryPool`][memory-pools] and
+   - **Forced-OOM spill parity:** Run `GROUP BY`, `HashJoin` (inner, outer
+     `Left`/`Right`/`Full`, semi `LeftSemi`/`RightSemi`, anti
+     `LeftAnti`/`RightAnti`, and mark `LeftMark`/`RightMark`, verifying
+     exactly-once `LeftSemi`/`LeftAnti`/`LeftMark` emission from merged `P2`
+     bitmaps and no premature `P1` build emission), and `Sort` / `TopN` under
+     tight [`GreedyMemoryPool`][memory-pools] and
      [`FairSpillPool`][memory-pools] budgets (e.g., 1–8 MiB) on multi-partition
      inputs, asserting exact parity with stock `off` AND `spilled_bytes > 0` /
      `spill_file_count > 0`.
+   - **Null-aware `NOT IN` spill/admission parity:** Cover uncorrelated and
+     correlated null-aware `LeftAnti`, `LeftMark`, and `RightAnti` with probe
+     `NULL`s, build `NULL`s, and empty builds (asserting v1 excludes them from
+     radix spill cleanly without wrong results — and, once lifted, verifying
+     exact spilled parity against stock `off`).
    - **Skew & recursive spill:** Force a single radix partition to exceed the
      pool (both distinct-key skew triggering recursive radix split and 100%
      identical-key skew triggering `HashJoin` block-nested-loop sub-pass —
@@ -964,9 +1045,11 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
    - **Disk quota & cleanup invariants:** Test `DiskManager`
      `max_temp_directory_size` exhaustion (verifying clean `ResourcesExhausted`
      without stock fallback), mid-spill I/O error injection, and early stream
-     drop with full output channel — asserting `active_files_count == 0`,
-     `used_disk_space == 0`, `pool.reserved() == 0`, and `abort_count` tracking
-     using a mock `TempFileFactory` (matching `AbortTrackingTempFileFactory` in
+     drop with full output channel — asserting
+     `disk_manager.spilling_progress().active_files_count == 0`,
+     `disk_manager.spilling_progress().current_bytes == 0`,
+     `pool.reserved() == 0`, and `abort_count` tracking using a mock
+     `TempFileFactory` (matching `AbortTrackingTempFileFactory` in
      [`spill_manager.rs:248`][spill-manager-abort-test]).
 4. **Benchmarks (after implementation phases):**
    - Paired Stock DataFusion vs DuckDB vs Morsel (`morsel_mode = required`)
@@ -981,13 +1064,13 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
 Each phase is scoped to land as a self-contained PR with clear dependencies and
 minimal file overlap:
 
-| Phase       | Proposed follow-up issue                                                        | Depends on             | Scope & acceptance highlight                                                                                                                                                                                                                       |
-| ----------- | ------------------------------------------------------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Phase 1** | Dynamic join min/max + small `InList` pushdown into native Parquet probe scans  | `#150`, `#158`, `#167` | `LocalJoinFilterSummary`, `FinalizedJoinFilter` (bounds + `InList` + optional `KeyRangeBitmap`), empty/all-NULL build short-circuit, full NULL/join-type safety matrix, Parquet pruning proofs.                                                    |
-| **Phase 2** | Cache-resident split-block Bloom filter `RowFilter` pushdown                    | Phase 1                | `SplitBlockBloomFilter` + `JoinBloomFilterExpr` evaluated on decode workers under `pushdown_filters = true`; paired TPC-H SF1 Q3 & Q12 benchmark showing reduced `bytes_scanned` / decode time.                                                    |
-| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin` | `#158`, `#168`         | `radix.rs` with `radix_partition`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                         |
-| **Phase 4** | Out-of-core spilling for `GROUP BY` and `Sort` via `SpillManager`               | Phase 3, `#159`        | `spill.rs` + `#[doc(hidden)]` `InProgressSpillFile` seam; radix partition spill + recursive/sorted skew fallback for `GROUP BY`; sorted-run spill + `MultiLevelMergeBuilder` for `Sort`; tight-pool parity & zero-leak cleanup tests.              |
-| **Phase 5** | Out-of-core `HashJoin` (`ProbeSpill` + `Drained(P1)` child pipeline)            | Phase 3, Phase 4       | Build partition eviction (`M` / `S`) preserving full dynamic filter, `LocalProbeSpill` + `SpilledProbeManifest`, `P2` child pipeline in `G1`, single-partition skew block sub-pass, outer-join unmatched emission, constrained-RAM join benchmark. |
+| Phase       | Proposed follow-up issue                                                        | Depends on             | Scope & acceptance highlight                                                                                                                                                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Phase 1** | Dynamic join min/max + small `InList` pushdown into native Parquet probe scans  | `#150`, `#158`, `#167` | `LocalJoinFilterSummary`, `FinalizedJoinFilter` (bounds + `InList`), empty/all-NULL build short-circuit, full NULL/join-type safety matrix, Parquet pruning proofs (zero cross-crate pruning changes).                                                                                |
+| **Phase 2** | Cache-resident split-block Bloom filter `RowFilter` pushdown                    | Phase 1                | `SplitBlockBloomFilter` + `JoinBloomFilterExpr` evaluated on decode workers under `pushdown_filters = true`, plus optional `#[doc(hidden)]` `KeyRangeBitmap` pruning hook in `datafusion-pruning`; paired TPC-H SF1 Q3 & Q12 benchmark showing reduced `bytes_scanned` / decode time. |
+| **Phase 3** | Radix-partitioned hash tables & parallel finalize for `GROUP BY` and `HashJoin` | `#158`, `#168`         | `radix.rs` with `radix_partition`, adaptive `R = 0 -> 6..8`, Layout A over Arrow/`RowConverter`, parallel `JoinSet` partition finalize, `MemoryPool` transfer accounting, high-cardinality microbenchmark.                                                                            |
+| **Phase 4** | Out-of-core spilling for `GROUP BY` and `Sort` via `SpillManager`               | Phase 3, `#159`        | `spill.rs` + `#[doc(hidden)]` `InProgressSpillFile` seam; radix partition spill + recursive/sorted skew fallback for `GROUP BY`; sorted-run spill + `MultiLevelMergeBuilder` for `Sort`; tight-pool parity & zero-leak cleanup tests.                                                 |
+| **Phase 5** | Out-of-core `HashJoin` (`ProbeSpill` + `Drained(P1)` child pipeline)            | Phase 3, Phase 4       | Build partition eviction (`M` / `S`) preserving full dynamic filter, `LocalProbeSpill` + `SpilledProbeManifest`, `P2` child pipeline in `G1`, single-partition skew block sub-pass, outer-join unmatched emission, constrained-RAM join benchmark.                                    |
 
 [morsel_pipeline_architecture.md]: morsel_pipeline_architecture.md
 [morsel_parquet_adapter.md]: morsel_parquet_adapter.md
@@ -1006,9 +1089,12 @@ minimal file overlap:
 [stock-join-allow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/exec.rs#L1078-L1126
 [stream-after-build]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/stream.rs#L618-L636
 [join-float-norm]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/utils.rs#L2830-L2860
+[not-in-scope]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/not_in.rs#L64-L85
+[not-in-partitioned]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/not_in.rs#L119-L126
 [hash-table-lookup]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/partitioned_hash_eval.rs#L266-L421
 [key-range-bitmap]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/key_range_bitmap.rs#L57-L115
 [key-range-pruning]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/pruning/src/key_range_bitmap_expr.rs#L20-L56
+[hash-lookup-pruning]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/pruning/src/pruning_predicate.rs#L1537-L1567
 [pruning-inlist]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/pruning/src/pruning_predicate.rs#L1586-L1845
 [rg-pruner]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/push_decoder.rs#L146-L250
 [row-filter-prebuild]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/datasource-parquet/src/row_filter.rs#L475-L514
@@ -1041,6 +1127,7 @@ minimal file overlap:
 [spill-reader-stream]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/mod.rs#L56-L86
 [gc-view-arrays]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/mod.rs#L852-L865
 [spill-file]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/spill_file.rs#L17-L95
+[disk-spilling-progress]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/disk_manager.rs#L303-L309
 [refcounted-tmp]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/disk_manager.rs#L396-L435
 [refcounted-drop]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/disk_manager.rs#L437-L453
 [stock-agg-spill]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/spill.rs#L49-L120
