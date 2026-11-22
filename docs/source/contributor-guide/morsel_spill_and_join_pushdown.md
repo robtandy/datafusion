@@ -218,12 +218,31 @@ How each tier is constructed:
 
 #### Publication into `ParquetScan::open`
 
-When `ParquetScan` is lowered as the source of a probe pipeline (or an upstream
-scan feeding a `Filter -> Projection -> HashProbe` pipeline with no blocking
-operator in between), the planner records a `Vec<JoinFilterBinding>` on the
-`ParquetScan` spec mapping each upstream `ArtifactKey<JoinBuildArtifact>` to the
-probe key column expression(s) in the scan's projected coordinates (remapped
-through any intervening projections/aliases).
+When `ParquetScan` is lowered as the source of a probe pipeline (feeding
+`Filter -> Projection -> HashProbe` and possibly further downstream
+`HashProbe`s on the same pipeline with no blocking operator in between), the
+planner records a `Vec<JoinFilterBinding>` on the `ParquetScan` spec mapping
+each eligible downstream `ArtifactKey<JoinBuildArtifact>` to the probe key
+column expression(s) in the scan's projected coordinates (remapped by position
+through intervening projections/aliases and intervening joins).
+
+**Intervening `HashProbe` push-through rule (`lr_is_preserved`):** A downstream
+join `J_down`'s dynamic filter may cross an intervening `HashProbe(J_mid)` onto
+`J_mid`'s probe-side scan **only** when `J_mid` preserves its probe (right)
+side under DataFusion's [`lr_is_preserved`][lr-is-preserved] and
+[`HashJoinExec::gather_filters_for_pushdown`][gather-filters-pushdown] rules
+(`exec.rs:1961-2058`, `2810-2827`):
+
+- **Allowed intervening `J_mid` types** (`right_preserved == true`): `Inner`,
+  `Right`, `RightSemi`, `RightAnti`, and `RightMark`.
+- **Forbidden intervening `J_mid` types** (`right_preserved == false`): `Left`,
+  `Full`, `LeftAnti`, and `LeftMark` — stop walking upstream and do **not**
+  bind `J_down`'s filter onto `J_mid`'s probe scan.
+- For an allowed `J_mid`, map every column reference in `J_down`'s probe key
+  expression **by position** through `J_mid`'s output `column_indices` to
+  `J_mid`'s probe-side input (rejecting expressions that reference build-side
+  or mark columns, unless transferred across equi-join keys where
+  `supports_key_transfer` holds and `right_preserved == true`).
 
 At `Source::open`, before calling `create_buffered_morselizer`:
 
@@ -442,6 +461,18 @@ Additional soundness invariants:
   key involves an implicit cast (e.g., `Int32 -> Int64`), push the cast
   expression in the `RowFilter` / `PruningPredicate` using DataFusion's normal
   `PhysicalExprAdapter` path, or skip pushdown for that key if unsupported.
+- **Intervening joins (`lr_is_preserved`):** Never push a downstream join's
+  dynamic filter past an intervening `Left`, `Full`, `LeftAnti`, or `LeftMark`
+  `HashProbe` onto its probe-side scan (matching
+  [`lr_is_preserved`][lr-is-preserved] in `exec.rs:2810-2827`). Pruning probe
+  rows below a `Left` or `Full` join leaves previously-matched build rows
+  unmatched, causing the outer join to emit synthetic `NULL`-filled probe
+  columns that were not present in the unfiltered result — which then falsely
+  match a downstream `IS NOT DISTINCT FROM` join or turn a downstream
+  null-aware `NOT IN` into `UNKNOWN` (dropping valid rows). Only cross
+  intervening joins where `right_preserved == true` (`Inner`, `Right`,
+  `RightSemi`, `RightAnti`, `RightMark`) and remap key columns by position
+  through the intervening join's output projection.
 - **Parquet truncated string/binary statistics:** Handled automatically by
   `RowGroupAccessPlanFilter::prune_by_statistics_with_metadata` when evaluating
   `col >= min AND col <= max`.
@@ -613,25 +644,49 @@ dominating wide-payload probes.
 
 #### `MemoryPool` accounting discipline
 
-- Register one run-local [`MemoryConsumer`][mem-consumer] per blocking sink
-  pipeline with `.with_can_spill(true)` (once spill is enabled for that
+Respect two exact invariants of DataFusion's `MemoryPool` API
+([`memory_pool/mod.rs:304-345`][mem-consumer],
+[`pool.rs:223-244`][fair-spill-try-grow]):
+
+1. `MemoryConsumer::register(self, pool)` consumes the consumer by value, and
+   `MemoryConsumer` is not `Clone`; creating distinct consumers requires
+   [`MemoryConsumer::clone_with_new_id`][mem-clone-id].
+2. [`FairSpillPool::try_grow`][fair-spill-try-grow] checks
+   `reservation.size() + additional > available` on the **individual
+   `MemoryReservation`**, not the sum across multiple `split()` reservations
+   sharing one consumer ID. Calling `try_grow` independently on `2^R` split
+   reservations would bypass the fair-share cap by up to `2^R×`.
+
+Apply this discipline across radix stages:
+
+- Create a template run-local [`MemoryConsumer`][mem-consumer] per blocking
+  sink pipeline with `.with_can_spill(true)` (once spill is enabled for that
   operator; `.with_can_spill(false)` before spill lands so `FairSpillPool`
   classifies it accurately).
-- Every worker registers its own `MemoryReservation` (`consumer.register(&pool)`)
-  for `LocalSinkState` and calls [`try_grow`][mem-try-grow] **before** growing
-  partition chunk buffers, `Rows` arenas, `HashTable` allocations, or
-  accumulator vectors.
-- On `combine`, transfer reservations using [`MemoryReservation::take`][mem-take]
-  / `split` into per-partition reservations inside `GlobalSinkState` — zero
-  unreserved window and zero double-counting.
-- During parallel `finalize`, each partition task receives ownership of
-  `partition_reservation`. When compacting partition chunks into a single
-  partition `RecordBatch` + `JoinHashMapU32`, reserve the transient peak while
-  inputs and compacted output coexist, then `shrink` immediately after dropping
-  the uncompacted input chunks.
+- **One growing reservation per registered consumer:**
+  - Either register **one shared `Arc<MemoryReservation>`** for the stage (note
+    [`MemoryReservation::try_grow(&self, ...)`][mem-try-grow] and `shrink(&self, ...)`
+    use `AtomicUsize`, so all workers / finalize tasks share one aggregate byte
+    count checked accurately against `FairSpillPool`), **or**
+  - Register a distinct consumer per active worker via
+    `template.clone_with_new_id().register(&pool)` (bounded by worker count
+    `W`, **never** `2^R`!), calling [`try_grow`][mem-try-grow] before growing
+    partition chunk buffers, `Rows` arenas, `HashTable` allocations, or
+    accumulator vectors.
+- **Use `split()` / `take()` only for static/shrinking RAII leases:** When
+  moving already-reserved partition chunks into `GlobalSinkState` or attaching
+  a finalized partition lease to an artifact, `split()` / [`take()`][mem-take]
+  transfers ownership with zero unreserved gap and zero double-counting — but
+  **never call `try_grow` on a `split()` child reservation**. Any fresh growth
+  during parallel `finalize` (e.g., transient peak while compacting chunks and
+  building `JoinHashMapU32`) must grow either on the stage's single shared
+  `Arc<MemoryReservation>` or on a per-task `clone_with_new_id()` reservation,
+  then `shrink` / drop the transient growth immediately after dropping the
+  uncompacted input chunks.
 - Never charge cloned `Arc` references to already-accounted Arrow buffers; keep
-  the reservation attached to the `Arc<RadixArtifact>` (or backing-batch lease)
-  so dropping the last consumer releases the reservation automatically.
+  each static lease attached to its take-once partition slot (Section 3.2/3.3)
+  so dropping a completed partition or round releases its reservation
+  immediately.
 
 ## 3. Out-of-core spilling for `GROUP BY`, `HashJoin`, and `Sort`
 
@@ -676,11 +731,29 @@ DataFusion already provides a battle-tested spill substrate under
    budget is tiny). When a `try_grow` fails during `sink` or `probe`, the
    operator already holds the scratch budget needed for `gc_view_arrays` and
    IPC framing so spilling itself does not immediately fail with OOM.
-2. **Async spill I/O without holding locks:** Call `append_batch_async` /
-   `finish_async` on worker tasks without holding any mutex or supervisor
-   state gate across `.await`. Keep `InProgressSpillFile`s strictly worker-local
-   during `sink` and `probe`; only immutable `Arc<dyn SpillFile>` handles cross
-   into `GlobalSinkState` or run artifacts.
+2. **Async vs synchronous spill I/O across `#157` traits:**
+   - **`Sink::sink` (`P0` build / `GROUP BY` / `Sort`)** is `async` in
+     [morsel_pipeline_architecture.md], so sink workers call
+     `InProgressSpillFile::append_batch_async` / `finish_async` /
+     `abort_async().await` directly without holding any mutex or supervisor
+     state gate across `.await`.
+   - **`Operator::execute` and `Operator::final_execute` (`HashProbe` in `P1`)**
+     are **synchronous** in `#157`, so `LocalProbeSpill` cannot `.await`
+     `append_batch_async`, `finish_async`, or `abort_async().await` inside
+     `execute` / `final_execute`. Phase 5 v1 therefore uses `SpillManager`'s
+     **synchronous** APIs (`spill_record_batch_and_finish` when flushing a
+     coalesced partition buffer, or `InProgressSpillFile::append_batch` +
+     `finish`) inside `LocalProbeSpill` — noting explicitly that local OS
+     temp-file writes perform synchronous buffered file I/O on the probe worker
+     and that async-only custom `TempFileFactory` backends are not supported on
+     the sync probe-spill path. If non-blocking or async-only backend probe
+     spills are required later, add an optional async spill hook to `Operator`
+     (e.g., `OperatorStep::NeedAsyncFlush` + `async fn flush_spill` /
+     `async fn abort_spill` driven by `driver.rs` on flush, EOF, and teardown)
+     without changing the synchronous hot path for non-spilling operators.
+   - Keep all `InProgressSpillFile` writers strictly worker-local; only
+     finished `Arc<dyn SpillFile>` handles cross into `GlobalSinkState` or run
+     artifacts.
 3. **Bounded open file descriptors:** With `W = 8` workers and `P = 64` radix
    partitions, keeping `W * P = 512` simultaneously open `InProgressSpillFile`s
    is wasteful and can hit OS `RLIMIT_NOFILE`. Instead, buffer small batches
@@ -729,17 +802,25 @@ P1: FinalizedOrSpilledGroupsSource -> [Proj/TopN/Result]                       [
    - **Spilled path:** `finalize` does **not** load all `2^R` partitions into
      memory simultaneously (which would OOM again). Instead, it flushes any
      remaining large in-memory partition chunks if needed, commits a
-     `SpilledGroupsArtifact { partitions: Arc<[PartitionSpillInput]>, spill_manager, next_partition: AtomicUsize }`,
-     and lets `P1` workers claim **one radix partition `p` at a time** (with
-     concurrency bounded by available `MemoryPool` budget):
-     1. Read all in-memory chunks + spill files for partition `p` via
+     `SpilledGroupsArtifact { partitions: Arc<[Mutex<Option<PartitionSpillInput>>]>, spill_manager, next_partition: AtomicUsize }`
+     with **take-once per-partition slots**, and lets `P1` workers claim **one
+     radix partition `p` at a time** (with concurrency bounded by available
+     `MemoryPool` budget):
+     1. Claim `p = next_partition.fetch_add(1, Ordering::Relaxed)` and move
+        exclusive ownership out of the shared artifact via
+        `partitions[p].lock().take()` (taking partition `p`'s in-memory chunks,
+        `Vec<Arc<dyn SpillFile>>`, and static `MemoryReservation` lease).
+     2. Read all in-memory chunks + spill files for partition `p` via
         `SpillManager::read_spill_as_stream_unbuffered`.
-     2. Merge partial states into a partition-local hash table (`try_grow`
+     3. Merge partial states into a partition-local hash table (`try_grow`
         checked).
-     3. Emit finalized group batches downstream through `P1`'s operators/sink.
-     4. Immediately drop partition `p`'s hash table **and** its
-        `Vec<Arc<dyn SpillFile>>` handles so memory and disk space are freed
-        before claiming partition `p + 1`.
+     4. Emit finalized group batches downstream through `P1`'s operators/sink.
+     5. Drop the worker-local hash table **and** the taken
+        `PartitionSpillInput` immediately — because the take-once slot no
+        longer holds any `Arc<dyn SpillFile>` or reservation for `p`, this
+        drops the **last** reference, invoking `RefCountedTempFile::drop` to
+        unlink `p`'s temp files and freeing `p`'s memory before claiming
+        partition `p + 1`.
 4. **Single-partition overflow and skew fallback:** If reloading a single
    partition `p` still fails `try_grow`:
    - **Recursive radix split (up to `MAX_RADIX_DEPTH = 2`):** Re-partition `p`'s
@@ -804,19 +885,27 @@ and drains immediately.
        filter from total `M ∪ S` count, insert `M`'s in-memory hashes, and
        stream the spilled `u64` hash column from `S` before publishing
        `FinalizedJoinFilter`.
-   - Commit `Arc<RadixJoinArtifact>`:
-     - `resident: HashMap<usize, PartitionJoinTable>` (`p ∈ M`),
-     - `spilled_build: HashMap<usize, Vec<Arc<dyn SpillFile>>>` (`p ∈ S`),
+   - Commit `Arc<RadixJoinArtifact>` using **take-once ownership slots** so
+     `P2` can release `M` and each completed round `B_i` eagerly rather than
+     pinning them behind an immutable shared `Arc`:
+     - `resident: RwLock<Option<Arc<ResidentPartitions>>>` (`p ∈ M`, plus `M`'s
+       static `MemoryReservation` lease; `P1` workers clone the inner
+       `Arc<ResidentPartitions>` at worker start and drop their clones before
+       `Drained(P1)`),
+     - `spilled_build: Arc<[Mutex<Option<Vec<Arc<dyn SpillFile>>>>]>`
+       (take-once slot per partition `p ∈ S`),
      - `dynamic_filter: FinalizedJoinFilter` (guaranteed sound over `M ∪ S`),
      - `probe_spill_manifest: Mutex<SpilledProbeManifest>` (populated on `P1`
-       worker exits).
+       worker exits; per-partition entries are `take()`n by `P2` at round
+       start).
 
 2. **Primary probe pipeline (`P1`, `requires: [Finalized(G0)]`):**
    - `ParquetScan::open` binds `dynamic_filter` and prunes probe files/row
      groups/pages/rows before decode.
    - **In-memory fast path (`S.is_empty()`):** Workers allocate no
      `LocalProbeSpill` state at all and probe `resident[p]` lock-free.
-   - **Hybrid spill path (`!S.is_empty()`):** Each probe worker owns a
+   - **Hybrid spill path (`!S.is_empty()`):** Each probe worker clones the
+     inner `Arc<ResidentPartitions>` once at `Operator::local`, and owns a
      `LocalProbeSpill` with memory-reserved append buffers for partitions in `S`.
      For each probe batch:
      - Compute `create_hashes` on probe keys once.
@@ -832,8 +921,10 @@ and drains immediately.
          workers drain and bitmaps merge in `P2`.
      - Rows with `p ∈ S` are appended to `LocalProbeSpill::buffers[p]`; when a
        buffer reaches its flush threshold (or `try_grow` triggers), flush it
-       via `SpillManager` (`append_batch_async` / `spill_record_batch_and_finish`)
-       into a probe spill file for partition `p`.
+       synchronously via `SpillManager::spill_record_batch_and_finish` (or
+       sync `InProgressSpillFile::append_batch` + `finish`; see Section 3.1 for
+       the optional async `Operator` flush hook) into a probe spill file for
+       partition `p`.
      - **Non-null-aware `Right` / `Full` / `RightAnti` / `RightMark` shortcut:**
        Under `NullEqualsNothing`, for **non-null-aware** `Right`, `Full`,
        `RightAnti`, and `RightMark` joins only, probe rows with a `NULL` key
@@ -845,28 +936,40 @@ and drains immediately.
        for uncorrelated `NotIn::ProbeRows` if any build key is `NULL`
        (`key_has_null`), **zero** rows may be emitted.
    - On `P1` worker normal EOF (`final_execute` + worker exit handoff), flush
-     and finish all `LocalProbeSpill` buffers (`finish_async`) and hand their
-     `Vec<Arc<dyn SpillFile>>` per partition `p ∈ S` (plus worker-local build
-     match bitmaps for `M`) to `probe_spill_manifest`.
+     and finish all `LocalProbeSpill` buffers synchronously (`finish` /
+     `spill_record_batch_and_finish`), drop the worker's
+     `Arc<ResidentPartitions>` clone, and hand its `Vec<Arc<dyn SpillFile>>`
+     per partition `p ∈ S` (plus worker-local build match bitmaps for `M`) to
+     `probe_spill_manifest`.
 
 3. **Follow-up spilled-join pipeline (`P2`, `requires: [Drained(P1)]`):**
-   - `P2::open` first merges worker-local build match bitmaps for resident
-     partitions `M` and emits build-driven results for `M` once:
+   - Because `Drained(P1)` guarantees every `P1` worker has already exited and
+     dropped its `Arc<ResidentPartitions>` clone (and the supervisor drops its
+     artifact-slot reference once `P2` binds it), `P2::open` takes exclusive
+     ownership of `M` via `artifact.resident.write().take()`. It merges
+     worker-local build match bitmaps for `M` and emits build-driven results
+     for `M` once:
      - **`LeftSemi`**: emit **matched** build rows (`bit == 1`) once.
      - **`Left`, `Full`, `LeftAnti`**: emit **unmatched** build rows
        (`bit == 0`) once.
      - **`LeftMark`**: emit every build row with its final Boolean mark.
-       Then drop `M`'s hash tables and release `M`'s memory reservations so the
-       full `MemoryPool` budget is available for `S`.
+       Then `P2` drops the taken `Arc<ResidentPartitions>` — dropping the
+       **last** strong reference to `M`'s hash tables and releasing `M`'s
+       `MemoryReservation` lease immediately so the full `MemoryPool` budget is
+       available for `S`.
    - Partition `S` into memory-fitting rounds `B_1, B_2, ..., B_k`. Any
-     partition `p ∈ S` with an empty probe spill list can be dropped immediately
-     for joins that emit nothing for unmatched build rows (`Inner`, `LeftSemi`,
-     `RightSemi`, `Right`, `RightAnti`, `RightMark`); for `Left`, `Full`,
-     `LeftAnti`, and `LeftMark`, stream `p`'s unmatched build rows directly
-     without building a hash table.
+     partition `p ∈ S` with an empty probe spill list can be `take()`n and
+     dropped immediately (unlinking its build spill files) for joins that emit
+     nothing for unmatched build rows (`Inner`, `LeftSemi`, `RightSemi`,
+     `Right`, `RightAnti`, `RightMark`); for `Left`, `Full`, `LeftAnti`, and
+     `LeftMark`, `take()` and stream `p`'s unmatched build rows directly
+     without building a hash table, then drop `p`'s files.
    - For each round `B_i`:
-     1. Load build spill files for all `p ∈ B_i` in parallel and build
-        immutable `PartitionJoinTable`s for `B_i`.
+     1. Move exclusive ownership of every `p ∈ B_i`'s build and probe
+        `Vec<Arc<dyn SpillFile>>` out of `artifact.spilled_build[p]` and
+        `artifact.probe_spill_manifest` via `.take()`, then load build spill
+        files for `B_i` in parallel and build immutable `PartitionJoinTable`s
+        for `B_i`.
      2. Workers claim probe spill files for `p ∈ B_i` dynamically via
         `SpillManager::read_spill_as_stream_unbuffered` and probe `B_i`'s hash
         tables lock-free: drive matched/probe-driven batches through `P2`'s
@@ -878,8 +981,10 @@ and drains immediately.
         files finish, and emit `B_i`'s build-driven rows once (`LeftSemi`
         matched rows; `Left` / `Full` / `LeftAnti` unmatched rows; `LeftMark`
         all build rows with their marks).
-     4. Drop `B_i`'s hash tables **and** immediately drop all build and probe
-        `Arc<dyn SpillFile>` handles for `B_i` before advancing to `B_{i+1}`,
+     4. Drop `B_i`'s round-local hash tables **and** the taken build/probe
+        `Arc<dyn SpillFile>` vectors before advancing to `B_{i+1}` — because no
+        shared artifact slot still retains references for `B_i`,
+        `RefCountedTempFile::drop` unlinks `B_i`'s temp files immediately,
         bounding peak disk space as well as peak RAM.
    - **Null-aware `NOT IN` (`LeftAnti` / `LeftMark` / `RightAnti`) and radix spill:**
      Build-driven null-aware joins (`NotIn::BuildRows`) require global state
@@ -961,13 +1066,13 @@ P1: FinalizedSortMergeSource -> Result                                          
 
 Strict resource cleanup extends `#157`'s teardown invariants to disk state:
 
-| Failure / exit path                                                                    | Cleanup guarantee                                                                                                                                                                                                                                                                                                                                                          |
-| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Normal completion**                                                                  | Partition spill files are dropped eagerly as soon as their partition/round finishes (not held until query EOF). At stream EOF, `DiskManager::spilling_progress().active_files_count == 0` and all `MemoryReservation`s are `0`.                                                                                                                                            |
-| **Worker error or disk-quota exhaustion (`DiskManager::max_temp_directory_size`)**     | The worker calls best-effort `InProgressSpillFile::abort_async().await` on any open async writer before returning the error (matching [`spill_manager.rs:155-162`][spill-manager-abort]), then signals the supervisor's terminal failure transition. The supervisor never falls back to stock DataFusion after native execution has started.                               |
-| **Peer error / supervisor cancellation**                                               | The supervisor closes the result receiver, cancels the run token, aborts and joins all worker/producer/finalize tasks (`JoinSet`), and drops `GlobalSinkState`, `SpilledProbeManifest`, and all run artifacts. Dropping every `Arc<dyn SpillFile>` invokes [`RefCountedTempFile::drop`][refcounted-drop] to unlink local files and reclaim `DiskManager::used_disk_space`. |
-| **Early consumer stream drop (e.g., `LIMIT` above `MorselExec` or client disconnect)** | `MorselExec`'s stream drop triggers the abort-on-drop `JoinSet` owner and drops run-owned artifact slots. Workers unwind, run best-effort cleanup of in-progress writers on cancellation checks, and drop all `Arc<dyn SpillFile>` and `MemoryReservation` handles; no `SpillFile` or reservation is ever stored on `MorselExec` or `PipelineGraph`.                       |
-| **Async / custom `TempFileFactory` backends**                                          | Because `Drop` cannot `.await`, workers check the cancellation token between batches and before/after each `append_batch_async` and call `abort_async().await` explicitly on cancellation before exiting. As documented on [`AsyncSpillWriter`][spill-file], backends also rely on lifecycle rules only as a crash backstop.                                               |
+| Failure / exit path                                                                    | Cleanup guarantee                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Normal completion**                                                                  | Take-once artifact slots transfer exclusive ownership of each partition/round to its active consumer, so spill files are unlinked eagerly as soon as their partition/round finishes (not held until query EOF). At stream EOF, `DiskManager::spilling_progress().active_files_count == 0` and all `MemoryReservation`s are `0`.                                                                                                                                                               |
+| **Worker error or disk-quota exhaustion (`DiskManager::max_temp_directory_size`)**     | Async sink workers (`P0` build/`GROUP BY`/`Sort`) call best-effort `InProgressSpillFile::abort_async().await` on any open async writer before returning the error (matching [`spill_manager.rs:155-162`][spill-manager-abort]); synchronous `LocalProbeSpill` writers drop their `InProgressSpillFile` directly (`RefCountedTempFile::drop` unlinks local files). The supervisor transitions to terminal failure and never falls back to stock DataFusion after native execution has started. |
+| **Peer error / supervisor cancellation**                                               | The supervisor closes the result receiver, cancels the run token, aborts and joins all worker/producer/finalize tasks (`JoinSet`), and drops `GlobalSinkState`, `SpilledProbeManifest`, and all run artifacts. Dropping every `Arc<dyn SpillFile>` invokes [`RefCountedTempFile::drop`][refcounted-drop] to unlink local files and reclaim `DiskManager::used_disk_space`.                                                                                                                    |
+| **Early consumer stream drop (e.g., `LIMIT` above `MorselExec` or client disconnect)** | `MorselExec`'s stream drop triggers the abort-on-drop `JoinSet` owner and drops run-owned artifact slots. Workers unwind, run best-effort cleanup of open writers on cancellation checks, and drop all `Arc<dyn SpillFile>` and `MemoryReservation` handles; no `SpillFile` or reservation is ever stored on `MorselExec` or `PipelineGraph`.                                                                                                                                                 |
+| **Async / custom `TempFileFactory` backends**                                          | Because `Drop` cannot `.await`, async sink workers (`P0`) check the cancellation token between batches and before/after each `append_batch_async` and call `abort_async().await` explicitly on cancellation before exiting (sync `LocalProbeSpill` in v1 requires local/sync `SpillWriter` unless the optional async `Operator` hook from Section 3.1 is enabled). As documented on [`AsyncSpillWriter`][spill-file], backends also rely on lifecycle rules only as a crash backstop.         |
 
 ## 4. Test plan, module layout, and phased follow-up issues
 
@@ -999,9 +1104,13 @@ Extending the private module layout in [morsel_pipeline_architecture.md]:
      `NullEqualsNothing`, `NullEqualsNull` (`IS NOT DISTINCT FROM`), single-key
      and multi-key `(NULL, 5)` combinations, `NaN` / `-0.0` float keys,
      truncated string stats, `Inner` / `Left` / `Right` / `Full` / `LeftSemi` /
-     `LeftAnti` / `RightAnti` / null-aware `NOT IN`, and multi-join chains
-     (TPC-H Q3 and Q12 shapes) with both `pushdown_filters = true` and `false`,
-     and with `#167` sub-RG splitting enabled.
+     `LeftAnti` / `RightAnti` / null-aware `NOT IN`, intervening `LEFT` /
+     `FULL` joins beneath a downstream `IS NOT DISTINCT FROM` join and beneath
+     a downstream null-aware `NOT IN` join (verifying the downstream join
+     filter does **not** push past the `LEFT`/`FULL` join onto its probe scan),
+     and multi-join chains (TPC-H Q3 and Q12 shapes) with both
+     `pushdown_filters = true` and `false`, and with `#167` sub-RG splitting
+     enabled.
    - **Config, spill soundness & isolation:** Verify
      `enable_join_dynamic_filter_pushdown = false` disables pushdown cleanly,
      verify spilled builds with dynamic pushdown enabled (both bounds-only
@@ -1087,6 +1196,8 @@ minimal file overlap:
 [shared-bounds-membership]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L123-L176
 [preserve-probe-nulls]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/shared_bounds.rs#L917-L968
 [stock-join-allow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/exec.rs#L1078-L1126
+[gather-filters-pushdown]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/exec.rs#L1961-L2058
+[lr-is-preserved]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/exec.rs#L2810-L2827
 [stream-after-build]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/stream.rs#L618-L636
 [join-float-norm]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/utils.rs#L2830-L2860
 [not-in-scope]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/hash_join/not_in.rs#L64-L85
@@ -1113,10 +1224,12 @@ minimal file overlap:
 [group-values-primitive]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/single_group_by/primitive.rs#L87-L105
 [group-values-rows]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/aggregates/group_values/row.rs#L32-L108
 [join-hash-map]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/joins/join_hash_map.rs#L40-L110
-[mem-consumer]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L319-L322
+[mem-clone-id]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L304-L312
+[mem-consumer]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L304-L345
 [mem-try-grow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L467-L476
 [mem-take]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/mod.rs#L507-L512
 [memory-pools]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/pool.rs#L64-L170
+[fair-spill-try-grow]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/execution/src/memory_pool/pool.rs#L223-L258
 [spill-manager]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L27-L100
 [spill-manager-abort]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L155-L162
 [spill-read-unbuffered]: https://github.com/robtandy/datafusion/blob/18425fd6c2da7c4813f7a27ca0f68553bb36cac9/datafusion/physical-plan/src/spill/spill_manager.rs#L199-L209
