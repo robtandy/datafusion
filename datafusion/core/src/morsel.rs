@@ -30,10 +30,10 @@ use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs, Proj
 use datafusion_physical_expr::{
     EquivalenceProperties, PhysicalExpr, create_physical_expr,
 };
+use datafusion_physical_plan::coalesce::LimitedBatchCoalescer;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType, apply_expression_roots,
 };
-use datafusion_physical_plan::filter::batch_filter;
 use datafusion_physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
@@ -44,6 +44,7 @@ use datafusion_physical_plan::{
 };
 use datafusion_session::{QueryPlanner, Session};
 use futures::stream::{self, Stream, StreamExt};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::datasource::{MemTable, source_as_provider};
@@ -64,7 +65,12 @@ use parquet::{ParquetScan, ReadyReaders};
 mod tests;
 
 const BATCHES_PER_MORSEL: usize = 4;
-const RESULT_CAPACITY: usize = 2;
+const COUNT_RESULT_CAPACITY: usize = 2;
+const MAX_RESULT_CAPACITY: usize = 32;
+
+fn result_capacity(workers: NonZeroUsize) -> usize {
+    workers.get().saturating_mul(2).min(MAX_RESULT_CAPACITY)
+}
 
 /// Opt-in planner for an experimental, unordered pipeline over [`MemTable`]
 /// and supported Parquet listing scans (with the `parquet` feature).
@@ -260,13 +266,17 @@ impl MorselQueryPlanner {
         } else {
             Sink::Result
         };
+        let sink_capacity = match sink {
+            Sink::Result => result_capacity(self.workers),
+            Sink::Count { .. } => COUNT_RESULT_CAPACITY,
+        };
         Ok(Lowering::Native(MorselExec::new(
             Pipeline {
                 source,
                 operators,
                 workers: self.workers,
                 sink,
-                sink_capacity: RESULT_CAPACITY,
+                sink_capacity,
             },
             schema,
         )))
@@ -499,15 +509,30 @@ fn prune_filter_input(operators: &mut [Operator], schema: &Schema) {
 }
 
 fn with_filter_mask<T>(
-    batch: &RecordBatch,
+    batch: RecordBatch,
     predicate: &Arc<dyn PhysicalExpr>,
-    apply: impl FnOnce(&BooleanArray) -> Result<T>,
+    apply: impl FnOnce(RecordBatch, &BooleanArray) -> Result<T>,
 ) -> Result<T> {
-    let mask = predicate.evaluate(batch)?.into_array(batch.num_rows())?;
+    let mask = predicate.evaluate(&batch)?.into_array(batch.num_rows())?;
     let Ok(mask) = as_boolean_array(&mask) else {
         return internal_err!("Cannot create filter_array from non-boolean predicates");
     };
-    apply(mask)
+    apply(batch, mask)
+}
+
+fn filter_batch(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+    projection: Option<&[usize]>,
+) -> Result<RecordBatch> {
+    match projection {
+        Some(columns) if mask.len() == batch.num_rows() => {
+            Ok(filter_record_batch(&batch.project(columns)?, mask)?)
+        }
+        // Validate mismatched masks on the original batch, even if no columns are kept.
+        Some(columns) => Ok(filter_record_batch(batch, mask)?.project(columns)?),
+        None => Ok(filter_record_batch(batch, mask)?),
+    }
 }
 
 fn apply_operators(
@@ -518,19 +543,9 @@ fn apply_operators(
         batch = match operator {
             Operator::Filter {
                 predicate,
-                projection: None,
-            } => batch_filter(&batch, predicate)?,
-            Operator::Filter {
-                predicate,
-                projection: Some(columns),
-            } => with_filter_mask(&batch, predicate, |mask| {
-                // Keep the original filter's handling of mismatched lengths,
-                // including when the projection keeps no columns.
-                if mask.len() != batch.num_rows() {
-                    Ok(filter_record_batch(&batch, mask)?.project(columns)?)
-                } else {
-                    Ok(filter_record_batch(&batch.project(columns)?, mask)?)
-                }
+                projection,
+            } => with_filter_mask(batch, predicate, |batch, mask| {
+                filter_batch(&batch, mask, projection.as_deref())
             })?,
             Operator::Projection(projector) => projector.project_batch(&batch)?,
         };
@@ -541,6 +556,109 @@ fn apply_operators(
     Ok(batch)
 }
 
+struct ResultBuffer {
+    batch_size: usize,
+    filters: Vec<Option<LimitedBatchCoalescer>>,
+    output: Option<RecordBatch>,
+    next_to_finish: usize,
+}
+
+impl ResultBuffer {
+    fn new(operators: &[Operator], batch_size: usize) -> Self {
+        let slots = operators
+            .iter()
+            .rposition(|op| matches!(op, Operator::Filter { .. }));
+        Self {
+            batch_size,
+            filters: std::iter::repeat_with(|| None)
+                .take(slots.map_or(0, |i| i + 1))
+                .collect(),
+            output: None,
+            next_to_finish: 0,
+        }
+    }
+
+    fn push_from(
+        &mut self,
+        operators: &[Operator],
+        start: usize,
+        mut batch: RecordBatch,
+    ) -> Result<()> {
+        for (index, op) in operators.iter().enumerate().skip(start) {
+            match op {
+                Operator::Filter {
+                    predicate,
+                    projection,
+                } => {
+                    return with_filter_mask(batch, predicate, |batch, mask| {
+                        let (batch, mask) = if mask.len() == batch.num_rows() {
+                            let batch = match projection {
+                                Some(columns) => batch.project(columns)?,
+                                None => batch,
+                            };
+                            (batch, Some(mask))
+                        } else {
+                            (filter_batch(&batch, mask, projection.as_deref())?, None)
+                        };
+                        let coalescer = self.filters[index].get_or_insert_with(|| {
+                            LimitedBatchCoalescer::new(
+                                batch.schema(),
+                                self.batch_size,
+                                None,
+                            )
+                        });
+                        if let Some(mask) = mask {
+                            coalescer.push_batch_with_filter(batch, mask)?;
+                        } else {
+                            coalescer.push_batch(batch)?;
+                        }
+                        Ok(())
+                    });
+                }
+                Operator::Projection(projector) => {
+                    batch = projector.project_batch(&batch)?
+                }
+            }
+            if batch.num_rows() == 0 {
+                return Ok(());
+            }
+        }
+        if batch.num_rows() != 0 {
+            debug_assert!(self.output.is_none());
+            self.output = Some(batch);
+        }
+        Ok(())
+    }
+
+    fn next(&mut self, operators: &[Operator], eof: bool) -> Result<Option<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.output.take() {
+                return Ok(Some(batch));
+            }
+            // Drain downstream before feeding it again, so completed batches cannot pile up
+            // behind a blocked send. At EOF finish upstream first to feed downstream tails.
+            let completed =
+                self.filters
+                    .iter_mut()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, slot)| {
+                        Some((index, slot.as_mut()?.next_completed_batch()?))
+                    });
+            if let Some((index, batch)) = completed {
+                self.push_from(operators, index + 1, batch)?;
+            } else if eof && self.next_to_finish < self.filters.len() {
+                if let Some(coalescer) = &mut self.filters[self.next_to_finish] {
+                    coalescer.finish()?;
+                }
+                self.next_to_finish += 1;
+            } else {
+                return Ok(None);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Sink {
     Result,
@@ -548,6 +666,20 @@ enum Sink {
         sink: CountSink,
         result_operators: Vec<Operator>,
     },
+}
+
+enum WorkerSink {
+    Result(ResultBuffer),
+    Count(CountState),
+}
+
+type WorkerTail = (Vec<RecordBatch>, WorkerMetrics);
+
+#[derive(Clone)]
+struct WorkerOutput {
+    tx: mpsc::Sender<RecordBatch>,
+    batch_size: usize,
+    tails: Arc<Mutex<Vec<WorkerTail>>>,
 }
 
 #[derive(Debug)]
@@ -568,17 +700,28 @@ impl Pipeline {
 
     fn inline_memory_stream(
         self: Arc<Self>,
+        batch_size: usize,
         worker: WorkerMetrics,
     ) -> impl Stream<Item = Result<RecordBatch>> {
+        let buffer = ResultBuffer::new(&self.operators, batch_size);
         stream::try_unfold(
-            (self, 0usize, worker),
-            |(pipeline, mut next, mut worker)| async move {
+            (self, 0usize, worker, buffer),
+            |(pipeline, mut next, mut worker, mut buffer)| async move {
                 let source = match &pipeline.source {
                     Source::Memory(source) => source,
                     #[cfg(feature = "parquet")]
                     Source::Parquet(_) => unreachable!(),
                 };
-                while let Some(input) = source.batches.get(next) {
+                loop {
+                    let output = worker.process(|| {
+                        buffer.next(&pipeline.operators, next == source.batches.len())
+                    })?;
+                    if let Some(batch) = output {
+                        return Ok(Some((batch, (pipeline, next, worker, buffer))));
+                    }
+                    let Some(input) = source.batches.get(next) else {
+                        return Ok(None);
+                    };
                     // A drain can immediately poll again, and a filter can consume
                     // input without emitting anything. Budget by input, not output.
                     if next != 0 && next.is_multiple_of(BATCHES_PER_MORSEL) {
@@ -588,19 +731,15 @@ impl Pipeline {
                         worker.claim();
                     }
                     next += 1;
-                    let batch = worker.process(|| {
-                        apply_operators(&pipeline.operators, source.read(input)?)
+                    worker.process(|| {
+                        buffer.push_from(&pipeline.operators, 0, source.read(input)?)
                     })?;
                     if next.is_multiple_of(BATCHES_PER_MORSEL)
                         || next == source.batches.len()
                     {
                         worker.complete();
                     }
-                    if batch.num_rows() != 0 {
-                        return Ok(Some((batch, (pipeline, next, worker))));
-                    }
                 }
-                Ok(None)
             },
         )
     }
@@ -627,15 +766,29 @@ impl Pipeline {
         }
     }
 
+    fn worker_sink(&self, batch_size: usize) -> WorkerSink {
+        match self.sink {
+            Sink::Result => {
+                WorkerSink::Result(ResultBuffer::new(&self.operators, batch_size))
+            }
+            Sink::Count { .. } => WorkerSink::Count(CountState::default()),
+        }
+    }
+
     async fn run_memory_worker(
         &self,
         source: &MemorySource,
         next: &AtomicUsize,
-        tx: mpsc::Sender<RecordBatch>,
+        output: WorkerOutput,
         mut worker: WorkerMetrics,
     ) -> Result<Option<CountState>> {
-        let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
-        let count_filter = count.and_then(|_| self.memory_count_filter());
+        let mut sink = self.worker_sink(output.batch_size);
+        let tx = &output.tx;
+        let count_filter = if matches!(sink, WorkerSink::Count(_)) {
+            self.memory_count_filter()
+        } else {
+            None
+        };
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
             if start >= source.batches.len() {
@@ -648,18 +801,20 @@ impl Pipeline {
                     return Ok(None);
                 }
                 let batch = worker.process(|| source.read(input))?;
-                if let (Some(local), Some(predicate)) = (&mut count, count_filter) {
+                if let (WorkerSink::Count(local), Some(predicate)) =
+                    (&mut sink, count_filter)
+                {
                     worker.process(|| {
-                        let rows = with_filter_mask(&batch, predicate, |mask| {
-                            if mask.len() == batch.num_rows() {
-                                Ok(mask.true_count())
+                        with_filter_mask(batch, predicate, |batch, mask| {
+                            let rows = if mask.len() == batch.num_rows() {
+                                mask.true_count()
                             } else {
-                                Ok(filter_record_batch(&batch, mask)?.num_rows())
-                            }
-                        })?;
-                        local.add_rows(rows)
+                                filter_record_batch(&batch, mask)?.num_rows()
+                            };
+                            local.add_rows(rows)
+                        })
                     })?;
-                } else if !self.consume(batch, &tx, &mut count, &mut worker).await? {
+                } else if !self.consume(batch, tx, &mut sink, &mut worker).await? {
                     return Ok(None);
                 }
                 if index + 1 == end {
@@ -668,23 +823,24 @@ impl Pipeline {
                 tokio::task::yield_now().await;
             }
         }
-        Ok(count)
+        self.finish_worker(sink, &output, worker)
     }
 
     #[cfg(feature = "parquet")]
     async fn run_parquet_worker(
         &self,
         ready: ReadyReaders,
-        tx: mpsc::Sender<RecordBatch>,
+        output: WorkerOutput,
         mut worker: WorkerMetrics,
     ) -> Result<Option<CountState>> {
-        let mut count = matches!(self.sink, Sink::Count { .. }).then(CountState::default);
+        let mut sink = self.worker_sink(output.batch_size);
+        let tx = &output.tx;
         while let Some(morsel) = worker.ready(ready.claim()).await {
             worker.claim();
             let mut reader = worker.decode(|| morsel.into_stream());
             while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
                 if tx.is_closed()
-                    || !self.consume(batch?, &tx, &mut count, &mut worker).await?
+                    || !self.consume(batch?, tx, &mut sink, &mut worker).await?
                 {
                     return Ok(None);
                 }
@@ -693,24 +849,59 @@ impl Pipeline {
             worker.complete();
             tokio::task::yield_now().await;
         }
-        Ok(count)
+        self.finish_worker(sink, &output, worker)
     }
 
     async fn consume(
         &self,
         batch: RecordBatch,
         tx: &mpsc::Sender<RecordBatch>,
-        count: &mut Option<CountState>,
+        sink: &mut WorkerSink,
         worker: &mut WorkerMetrics,
     ) -> Result<bool> {
-        let batch = worker.process(|| {
-            let batch = apply_operators(&self.operators, batch)?;
-            if let Some(local) = count {
-                local.add_rows(batch.num_rows())?;
+        match sink {
+            WorkerSink::Count(local) => worker.process(|| {
+                local.add_rows(apply_operators(&self.operators, batch)?.num_rows())?;
+                Ok(true)
+            }),
+            WorkerSink::Result(buffer) => {
+                let mut output = worker.process(|| {
+                    buffer.push_from(&self.operators, 0, batch)?;
+                    buffer.next(&self.operators, false)
+                })?;
+                while let Some(batch) = output {
+                    if !worker.send(tx, batch).await {
+                        return Ok(false);
+                    }
+                    output = worker.process(|| buffer.next(&self.operators, false))?;
+                }
+                Ok(true)
             }
-            Ok::<_, datafusion_common::DataFusionError>(batch)
-        })?;
-        Ok(count.is_some() || batch.num_rows() == 0 || worker.send(tx, batch).await)
+        }
+    }
+
+    fn finish_worker(
+        &self,
+        sink: WorkerSink,
+        output: &WorkerOutput,
+        mut worker: WorkerMetrics,
+    ) -> Result<Option<CountState>> {
+        let mut buffer = match sink {
+            WorkerSink::Count(local) => return Ok(Some(local)),
+            WorkerSink::Result(buffer) => buffer,
+        };
+        let mut tail = Vec::new();
+        while !output.tx.is_closed() {
+            let Some(batch) = worker.process(|| buffer.next(&self.operators, true))?
+            else {
+                if !tail.is_empty() {
+                    output.tails.lock().push((tail, worker));
+                }
+                break;
+            };
+            tail.push(batch);
+        }
+        Ok(None)
     }
 
     async fn run_count_result(
@@ -736,9 +927,14 @@ impl Pipeline {
         metrics: ExecutionPlanMetricsSet,
         measurement: Option<Arc<RunMetrics>>,
     ) -> PipelineRun {
-        #[cfg(not(feature = "parquet"))]
-        let _ = context;
         let (tx, rx) = mpsc::channel(self.sink_capacity);
+        let output = WorkerOutput {
+            tx,
+            batch_size: context.session_config().batch_size(),
+            tails: Arc::default(),
+        };
+        #[cfg(not(feature = "parquet"))]
+        drop(context);
         // Supervise independently of the consumer: an error must abort peers
         // even when they are waiting for space and the stream isn't polled.
         let worker_measurement = measurement.clone();
@@ -750,8 +946,8 @@ impl Pipeline {
                     let next = Arc::new(AtomicUsize::new(0));
                     let morsels = source.batches.len().div_ceil(BATCHES_PER_MORSEL);
                     for id in 0..self.workers.get().min(morsels) {
-                        let (pipeline, next, tx) =
-                            (Arc::clone(&self), Arc::clone(&next), tx.clone());
+                        let (pipeline, next, output) =
+                            (Arc::clone(&self), Arc::clone(&next), output.clone());
                         let worker = WorkerMetrics::new(measurement.clone(), id);
                         tasks.spawn(async move {
                             let source = match &pipeline.source {
@@ -759,7 +955,9 @@ impl Pipeline {
                                 #[cfg(feature = "parquet")]
                                 Source::Parquet(_) => unreachable!(),
                             };
-                            pipeline.run_memory_worker(source, &next, tx, worker).await
+                            pipeline
+                                .run_memory_worker(source, &next, output, worker)
+                                .await
                         });
                     }
                 }
@@ -772,11 +970,11 @@ impl Pipeline {
                         measurement.clone(),
                     )?;
                     for id in 0..self.workers.get() {
-                        let (pipeline, ready, tx) =
-                            (Arc::clone(&self), ready.clone(), tx.clone());
+                        let (pipeline, ready, output) =
+                            (Arc::clone(&self), ready.clone(), output.clone());
                         let worker = WorkerMetrics::new(measurement.clone(), id);
                         tasks.spawn(async move {
-                            pipeline.run_parquet_worker(ready, tx, worker).await
+                            pipeline.run_parquet_worker(ready, output, worker).await
                         });
                     }
                 }
@@ -794,6 +992,17 @@ impl Pipeline {
                 };
                 if let Some(local) = local {
                     combined.combine(local)?;
+                }
+            }
+            // A worker's EOF is not necessarily a clean pipeline EOF. Publish its
+            // buffered tail only after all workers and any scan producers succeed.
+            let tails = std::mem::take(&mut *output.tails.lock());
+            let tx = output.tx;
+            for (batches, mut worker) in tails {
+                for batch in batches {
+                    if !worker.send(&tx, batch).await {
+                        return Ok(());
+                    }
                 }
             }
             if let Sink::Count {
@@ -1015,19 +1224,13 @@ impl ExecutionPlan for MorselExec {
         let pipeline = Arc::clone(&self.pipeline);
         let collector = context.session_config().get_extension::<MorselMetrics>();
         if pipeline.is_inline_memory_stream() {
-            let stream = match collector {
-                Some(collector) => stream::once(async move {
-                    pipeline.inline_memory_stream(WorkerMetrics::new(
-                        Some(RunMetrics::start(collector)),
-                        0,
-                    ))
-                })
-                .flatten()
-                .left_stream(),
-                None => pipeline
-                    .inline_memory_stream(WorkerMetrics::default())
-                    .right_stream(),
-            };
+            let stream = stream::once(async move {
+                pipeline.inline_memory_stream(
+                    context.session_config().batch_size(),
+                    WorkerMetrics::new(collector.map(RunMetrics::start), 0),
+                )
+            })
+            .flatten();
             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                 self.schema(),
                 stream,

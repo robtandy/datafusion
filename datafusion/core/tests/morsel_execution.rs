@@ -281,6 +281,26 @@ fn sorted_rows(batches: &[RecordBatch]) -> Result<Vec<OwnedRow>> {
     Ok(rows)
 }
 
+#[tokio::test]
+async fn filtered_results_coalesce_to_session_batch_size() -> Result<()> {
+    let ctx = morsel_context_with_config(1, SessionConfig::new().with_batch_size(10));
+    ctx.register_table("items", items(false)?)?;
+    ctx.register_table("empty_items", items(true)?)?;
+    for (sql, expected) in [
+        (FILTERED_QUERY, &[10, 10, 4][..]),
+        ("SELECT id FROM items WHERE id % 3 = 0", &[10, 10, 4][..]),
+        ("SELECT label FROM items WHERE threshold = 100", &[][..]),
+        ("SELECT label FROM empty_items WHERE threshold > 0", &[][..]),
+    ] {
+        let plan = physical(&ctx, sql).await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let batches = collect(plan, ctx.task_ctx()).await?;
+        let sizes: Vec<_> = batches.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, expected, "{sql}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lowers_memory_filter_and_projection() -> Result<()> {
     for empty in [false, true] {
@@ -309,7 +329,7 @@ async fn lowers_memory_filter_and_projection() -> Result<()> {
                 let sink = if workers == 1 {
                     "-> ResultSink[inline]"
                 } else {
-                    "-> ResultSink[capacity=2]"
+                    "-> ResultSink[capacity=8]"
                 };
                 assert!(display.contains(sink), "{sql}: {display}");
                 if let Some(columns) = pruned_columns {
