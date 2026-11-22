@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use arrow::array::{Int32Array, RecordBatch};
 use bytes::Bytes;
+use datafusion_common::ScalarValue;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource_parquet::{
     DefaultParquetFileReaderFactory, ParquetFileReaderFactory,
 };
 use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_plan::metrics::MetricsSet;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory};
@@ -24,12 +26,12 @@ use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use rstest::rstest;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
 use super::*;
 use crate::morsel::{
-    CountSink, MorselExec, MorselMetrics, Pipeline, PipelineRun, Sink, Source,
+    CountSink, MorselExec, MorselMetrics, Operator, Pipeline, PipelineRun, Sink, Source,
 };
 
 const GROUPS: usize = 8;
@@ -128,7 +130,7 @@ struct ControlledScan {
 }
 
 impl ControlledScan {
-    async fn new(num_files: usize, count: bool) -> Result<Self> {
+    async fn new(num_files: usize, workers: usize, count: bool) -> Result<Self> {
         let batch = RecordBatch::try_from_iter([(
             "id",
             Arc::new(Int32Array::from_iter_values(0..GROUPS as i32)) as _,
@@ -208,7 +210,7 @@ impl ControlledScan {
                     metrics,
                 }),
                 operators: vec![],
-                workers: NonZeroUsize::new(WORKERS).unwrap(),
+                workers: NonZeroUsize::new(workers).unwrap(),
                 sink,
                 sink_capacity: SINK_CAPACITY,
             },
@@ -267,9 +269,11 @@ impl ControlledScan {
     }
 
     async fn wait_stopped(&self) {
+        // No opened readers should still own gates; only the scan and factory.
         timeout(DEADLINE, async {
             while Arc::strong_count(&self.plan.pipeline) != 1
                 || self.gates.active.load(Ordering::SeqCst) != 0
+                || Arc::strong_count(&self.gates) != 2
             {
                 tokio::task::yield_now().await;
             }
@@ -286,14 +290,17 @@ impl ControlledScan {
 async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure(
     #[case] measure: bool,
 ) -> Result<()> {
-    let mut scan = ControlledScan::new(1, false).await?;
+    let mut scan = ControlledScan::new(1, WORKERS, false).await?;
     let mut run = scan.start(measure);
-    let capacity = SINK_CAPACITY + WORKERS + READY_READERS;
+    let ready_capacity = WORKERS;
+    let capacity = SINK_CAPACITY + WORKERS + ready_capacity;
     for _ in 0..capacity {
         scan.request().await.send(Ok(())).unwrap();
     }
-    // One result is buffered, two workers each hold one reader blocked at the
-    // sink, and both ready slots are occupied. The same file supplies all five.
+    // Even with the sink, workers and ready queue full, the lane should start
+    // the next row-group read without waiting for a ready-queue permit.
+    scan.request().await.send(Ok(())).unwrap();
+    // The completed reader now waits for space; the lane cannot fetch another.
     assert!(timeout(QUIET, scan.requests.recv()).await.is_err());
     assert_eq!(run.rx.len(), SINK_CAPACITY);
     assert_eq!(
@@ -321,7 +328,7 @@ async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure
                 Ok::<_, datafusion_common::DataFusionError>((rows, peak_batch_bytes))
             },
             async {
-                for _ in capacity..GROUPS {
+                for _ in (capacity + 1)..GROUPS {
                     scan.request().await.send(Ok(())).unwrap();
                 }
                 Ok(())
@@ -361,10 +368,10 @@ async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure
         assert!(value("morsel_process_work") > 0);
     }
     assert!(metric("morsel_output_wait") >= (QUIET / 2).as_nanos() as usize);
-    assert_eq!(metric("morsel_peak_ready_depth"), READY_READERS);
+    assert_eq!(metric("morsel_peak_ready_depth"), ready_capacity);
     assert_eq!(
         metric("morsel_peak_ready_compressed_bytes_estimate"),
-        READY_READERS * scan.group_bytes
+        ready_capacity * scan.group_bytes
     );
     assert_eq!(metric("morsel_peak_output_depth"), SINK_CAPACITY);
     assert_eq!(metric("morsel_peak_output_arrow_bytes"), peak_batch_bytes);
@@ -378,7 +385,7 @@ async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure
 async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop(
     #[case] measure: bool,
 ) -> Result<()> {
-    let mut scan = ControlledScan::new(1, true).await?;
+    let mut scan = ControlledScan::new(1, WORKERS, true).await?;
     let mut run = scan.start(measure);
     let first = scan.request().await;
     assert_eq!(scan.metric("parquet_morsels_claimed"), 0);
@@ -407,20 +414,27 @@ async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop(
 }
 
 #[rstest]
-#[case::unmeasured(false)]
-#[case::measured(true)]
+#[case::unmeasured(WORKERS, WORKERS, false)]
+#[case::eight_workers(8, 8, true)]
+#[case::capped(24, 16, true)]
 #[tokio::test]
 async fn bounded_pending_io_releases_peers_on_error_without_finalizing(
+    #[case] workers: usize,
+    #[case] lanes: usize,
     #[case] measure: bool,
 ) -> Result<()> {
-    let mut scan = ControlledScan::new(FILE_LANES + 2, true).await?;
+    let mut scan = ControlledScan::new(lanes + 2, workers, true).await?;
     let mut run = scan.start(measure);
-    let first = scan.request().await;
-    let mut second = scan.request().await;
+    let mut pending = Vec::new();
+    for _ in 0..lanes {
+        pending.push(scan.request().await);
+    }
     assert!(timeout(QUIET, scan.requests.recv()).await.is_err());
-    assert_eq!(scan.gates.opened.load(Ordering::SeqCst), FILE_LANES);
-    assert_eq!(scan.gates.active.load(Ordering::SeqCst), PENDING_IO);
-    first
+    assert_eq!(scan.gates.opened.load(Ordering::SeqCst), lanes);
+    assert_eq!(scan.gates.active.load(Ordering::SeqCst), lanes);
+    pending
+        .pop()
+        .unwrap()
         .send(Err(ParquetError::General("gated data read failed".into())))
         .unwrap();
     let error = timeout(DEADLINE, run.next())
@@ -432,9 +446,11 @@ async fn bounded_pending_io_releases_peers_on_error_without_finalizing(
         error.contains("gated data read failed") && error.contains(".parquet"),
         "{error}"
     );
-    timeout(DEADLINE, second.closed())
-        .await
-        .expect("peer I/O not cancelled");
+    for mut request in pending {
+        timeout(DEADLINE, request.closed())
+            .await
+            .expect("peer I/O not cancelled");
+    }
     drop(run);
     scan.wait_stopped().await;
     assert_eq!(scan.metric("count_finalizations"), 0);
@@ -463,11 +479,12 @@ async fn bounded_pending_io_releases_peers_on_error_without_finalizing(
 async fn io_error_aborts_peers_even_with_full_result_and_ready_queues(
     #[case] measure: bool,
 ) -> Result<()> {
-    let mut scan = ControlledScan::new(2, false).await?;
+    let mut scan = ControlledScan::new(2, WORKERS, false).await?;
     let mut run = scan.start(measure);
     let held = scan.request().await;
-    // One file is stalled in I/O and the other fills both queues.
-    for _ in 0..SINK_CAPACITY + WORKERS + READY_READERS {
+    // One file is stalled in I/O and the other fills both queues and parks
+    // with one more reader waiting to publish.
+    for _ in 0..=SINK_CAPACITY + 2 * WORKERS {
         scan.request().await.send(Ok(())).unwrap();
     }
     assert!(timeout(QUIET, scan.requests.recv()).await.is_err());
@@ -492,8 +509,40 @@ async fn io_error_aborts_peers_even_with_full_result_and_ready_queues(
 }
 
 #[tokio::test]
+async fn worker_error_cancels_in_flight_parquet_lanes() -> Result<()> {
+    let mut scan = ControlledScan::new(2, WORKERS, true).await?;
+    Arc::get_mut(&mut scan.plan.pipeline)
+        .unwrap()
+        .operators
+        .push(Operator::Filter {
+            predicate: Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            projection: Some(vec![]),
+        });
+    let mut run = scan.start(true);
+    let first = scan.request().await;
+    let mut peer = scan.request().await;
+    first.send(Ok(())).unwrap();
+    let error = timeout(DEADLINE, run.next())
+        .await
+        .expect("worker error was not reported")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("non-boolean predicates"), "{error}");
+    timeout(DEADLINE, peer.closed())
+        .await
+        .expect("peer I/O not cancelled on worker error");
+    drop(run);
+    scan.wait_stopped().await;
+    assert_eq!(scan.metric("count_finalizations"), 0);
+    let report = scan.report(true).await.unwrap();
+    assert_eq!(metric_total(&report, "morsels_claimed"), 1);
+    assert_eq!(metric_total(&report, "morsels_completed"), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stock_morsel_drives_data_io_when_polled() -> Result<()> {
-    let mut scan = ControlledScan::new(1, false).await?;
+    let mut scan = ControlledScan::new(1, WORKERS, false).await?;
     let Source::Parquet(source) = &scan.plan.pipeline.source else {
         unreachable!()
     };
