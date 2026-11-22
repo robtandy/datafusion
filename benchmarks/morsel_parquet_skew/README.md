@@ -59,6 +59,7 @@ fixture_root=$(mktemp -d "${MORSEL_PARQUET_FIXTURE_ROOT:-$HOME/.cache}/morsel-pa
 findmnt -T "$fixture_root" -o TARGET,SOURCE,FSTYPE
 for case in file-skew large-row-groups; do
   timeout --kill-after=10s 90s "$py" -B "$b/bench.py" generate "$case" "$fixture_root/$case"
+  (uptime; vmstat 1 3) > "$work/$case.host-before.log"
   timeout --kill-after=10s 240s taskset -c 0-7 "$py" -B "$b/bench.py" ab \
     "$case" "$fixture_root/$case" --runner "$runner" --revision "$revision" \
     --timeout 120 --warmups 1 --repeats 5 > "$work/$case.jsonl"
@@ -92,8 +93,13 @@ the leading mode alternating by round.
 ## dduck2 warm-cache baseline
 
 Recorded on `rob-tandy-dduck2` (AArch64 Neoverse-N1, Linux `7.0.0-1012-aws`,
-CPUs 0–7, Btrfs on instance storage) with Rust 1.99.1 and the pinned Python
-packages above. Each query ran for one warmup pair and five measured pairs.
+CPUs 0–7, Btrfs on instance storage) on 2026-11-22 with Rust 1.99.1 and the
+pinned Python packages above. No builds or lint jobs were running. Before
+`file-skew`, `uptime` reported load averages of 1.80, 1.46, 5.08; before
+`large-row-groups`, it reported 1.77, 1.48, 4.97. The two one-second
+`vmstat 1 3` samples before each case reported 99% and 98% CPU idle,
+excluding the since-boot average. Each query ran for one warmup pair and five
+measured pairs.
 Both arms of both fixtures matched exactly 378,916 rows at low selectivity
 and 4,941,572 at high selectivity, including the scan values and count scalars.
 `file-skew` was 155,785,925 bytes (38,046 resident pages before each sample);
@@ -101,26 +107,26 @@ and 4,941,572 at high selectivity, including the scan values and count scalars.
 
 | Fixture            | Query        | Stock ms, median (range) | Native ms, median (range) | Native claims by worker ID, round 1 |
 | ------------------ | ------------ | -----------------------: | ------------------------: | ----------------------------------- |
-| `file-skew`        | `scan_low`   |      389.4 (274.3–533.3) |       564.3 (360.3–671.5) | `[7, 7, 8, 9, 8, 8, 8, 9]`          |
-| `file-skew`        | `count_low`  |      173.2 (128.1–214.3) |       225.5 (203.1–319.2) | `[8, 9, 8, 9, 7, 7, 8, 8]`          |
-| `file-skew`        | `scan_high`  |      401.2 (357.6–403.4) |       663.8 (540.1–682.9) | `[8, 8, 8, 8, 8, 8, 8, 8]`          |
-| `file-skew`        | `count_high` |      224.3 (192.2–296.8) |       282.3 (246.4–295.1) | `[8, 7, 10, 8, 8, 8, 7, 8]`         |
-| `large-row-groups` | `scan_low`   |      422.5 (365.5–445.9) |       560.1 (264.2–644.9) | `[1, 1, 1, 0, 0, 0, 0, 1]`          |
-| `large-row-groups` | `count_low`  |      197.4 (153.6–331.4) |       169.0 (120.0–198.0) | `[1, 1, 1, 0, 0, 0, 0, 1]`          |
-| `large-row-groups` | `scan_high`  |      382.0 (310.5–459.3) |       547.9 (336.7–634.4) | `[1, 1, 1, 0, 0, 0, 0, 1]`          |
-| `large-row-groups` | `count_high` |      238.9 (163.2–369.2) |       181.9 (132.5–212.9) | `[1, 1, 1, 0, 0, 0, 0, 1]`          |
+| `file-skew`        | `scan_low`   |      226.5 (224.1–235.3) |       321.2 (316.1–322.3) | `[7, 8, 9, 8, 8, 8, 8, 8]`          |
+| `file-skew`        | `count_low`  |      118.3 (116.4–141.7) |       129.9 (128.8–131.1) | `[7, 8, 8, 9, 8, 8, 8, 8]`          |
+| `file-skew`        | `scan_high`  |      242.3 (240.7–244.3) |       322.7 (321.1–324.1) | `[8, 8, 8, 8, 8, 8, 8, 8]`          |
+| `file-skew`        | `count_high` |      117.4 (116.9–118.5) |       131.5 (129.3–133.0) | `[7, 8, 9, 8, 8, 8, 8, 8]`          |
+| `large-row-groups` | `scan_low`   |      289.1 (286.4–290.7) |       207.7 (206.9–211.2) | `[1, 1, 1, 0, 0, 0, 0, 1]`          |
+| `large-row-groups` | `count_low`  |      142.2 (141.2–150.8) |       108.8 (108.1–109.0) | `[1, 1, 0, 1, 0, 0, 0, 1]`          |
+| `large-row-groups` | `scan_high`  |      290.9 (290.3–294.0) |       215.1 (213.8–215.8) | `[0, 0, 0, 1, 1, 1, 0, 1]`          |
+| `large-row-groups` | `count_high` |      143.1 (140.6–143.9) |       112.6 (112.1–113.2) | `[0, 0, 0, 1, 1, 1, 0, 1]`          |
 
 Stock `file-skew` plans used eight file partitions, with 25, 25, 4, 2, 2,
 2, 2 and 2 row groups assigned statically. Native distributed the 64 readers
-across all eight workers in every trial (6–11 claims per worker across all
-trials), but that did not improve median elapsed time. Stock `large-row-groups`
-used two file partitions; repartitioning batches downstream does not split the
-scan itself. Native used four of the eight workers in every trial, each
-claiming and completing one reader, with the worker IDs varying by trial.
-Native counts had lower medians on this layout, but native projected scans did
-not. Claim counts measure scheduling, not CPU utilization; elapsed times also
-include path-specific filtering, output handling or count reduction. Other
-jobs ran on the host, so the timing ranges are descriptive, not a speedup claim.
+across all eight workers in every trial (7–9 claims per worker), but stock
+had lower median elapsed times for all four queries on this layout.
+Stock `large-row-groups` used two file partitions; repartitioning batches
+downstream does not split the scan itself. Native used four of the eight
+workers in every trial, each claiming and completing one reader, with the
+worker IDs varying by trial. Native had lower median elapsed times for all four
+queries on this layout despite leaving four workers without a reader. Claim
+counts describe work assignment, not CPU utilization; elapsed times also
+include filtering, output handling or count reduction.
 
 See the [intra-row-group splitting design](../../docs/source/contributor-guide/morsel_parquet_splitting.md)
 for proposed changes to the native source. This benchmark does not implement
