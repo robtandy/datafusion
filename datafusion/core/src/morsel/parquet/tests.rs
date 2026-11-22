@@ -23,6 +23,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
+use rstest::rstest;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
@@ -223,21 +224,25 @@ impl ControlledScan {
         })
     }
 
-    fn start(&self) -> PipelineRun {
+    fn start(&self, measure: bool) -> PipelineRun {
         Arc::clone(&self.plan.pipeline).start(
             Arc::clone(&self.context),
             self.plan.metrics.clone(),
-            Some(RunMetrics::start(Arc::clone(&self.measurement))),
+            measure.then(|| RunMetrics::start(Arc::clone(&self.measurement))),
         )
     }
 
-    async fn report(&self) -> MetricsSet {
+    async fn report(&self, measure: bool) -> Option<MetricsSet> {
+        if !measure {
+            assert!(self.measurement.take_runs().is_empty());
+            return None;
+        }
         timeout(DEADLINE, async {
             loop {
                 let mut reports = self.measurement.take_runs();
                 if let Some(report) = reports.pop() {
                     assert!(reports.is_empty());
-                    return report;
+                    return Some(report);
                 }
                 tokio::task::yield_now().await;
             }
@@ -274,11 +279,15 @@ impl ControlledScan {
     }
 }
 
+#[rstest]
+#[case::unmeasured(false)]
+#[case::measured(true)]
 #[tokio::test]
-async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure()
--> Result<()> {
+async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure(
+    #[case] measure: bool,
+) -> Result<()> {
     let mut scan = ControlledScan::new(1, false).await?;
-    let mut run = scan.start();
+    let mut run = scan.start(measure);
     let capacity = SINK_CAPACITY + WORKERS + READY_READERS;
     for _ in 0..capacity {
         scan.request().await.send(Ok(())).unwrap();
@@ -325,7 +334,9 @@ async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure
     assert_eq!(rows, (0..GROUPS as i32).collect::<Vec<_>>());
     assert_eq!(scan.metric("parquet_morsels_claimed"), GROUPS);
     drop(run);
-    let report = scan.report().await;
+    let Some(report) = scan.report(measure).await else {
+        return Ok(());
+    };
     let metric = |name| report.sum_by_name(name).unwrap().as_usize();
     assert_eq!(metric("morsels_claimed"), GROUPS);
     assert_eq!(metric("morsels_completed"), GROUPS);
@@ -360,10 +371,15 @@ async fn shared_workers_claim_one_stock_groups_readers_with_bounded_backpressure
     Ok(())
 }
 
+#[rstest]
+#[case::unmeasured(false)]
+#[case::measured(true)]
 #[tokio::test]
-async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop() -> Result<()> {
+async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop(
+    #[case] measure: bool,
+) -> Result<()> {
     let mut scan = ControlledScan::new(1, true).await?;
-    let mut run = scan.start();
+    let mut run = scan.start(measure);
     let first = scan.request().await;
     assert_eq!(scan.metric("parquet_morsels_claimed"), 0);
     first.send(Ok(())).unwrap();
@@ -377,7 +393,9 @@ async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop() -> Res
         .expect("pending I/O not cancelled");
     scan.wait_stopped().await;
     assert_eq!(scan.metric("count_finalizations"), 0);
-    let report = scan.report().await;
+    let Some(report) = scan.report(measure).await else {
+        return Ok(());
+    };
     let metric = |name| metric_total(&report, name);
     assert_eq!(metric("morsels_claimed"), 1);
     assert_eq!(metric("morsels_completed"), 1);
@@ -388,10 +406,15 @@ async fn pending_data_io_prevents_finalization_and_is_cancelled_on_drop() -> Res
     Ok(())
 }
 
+#[rstest]
+#[case::unmeasured(false)]
+#[case::measured(true)]
 #[tokio::test]
-async fn bounded_pending_io_releases_peers_on_error_without_finalizing() -> Result<()> {
+async fn bounded_pending_io_releases_peers_on_error_without_finalizing(
+    #[case] measure: bool,
+) -> Result<()> {
     let mut scan = ControlledScan::new(FILE_LANES + 2, true).await?;
-    let mut run = scan.start();
+    let mut run = scan.start(measure);
     let first = scan.request().await;
     let mut second = scan.request().await;
     assert!(timeout(QUIET, scan.requests.recv()).await.is_err());
@@ -415,7 +438,9 @@ async fn bounded_pending_io_releases_peers_on_error_without_finalizing() -> Resu
     drop(run);
     scan.wait_stopped().await;
     assert_eq!(scan.metric("count_finalizations"), 0);
-    let report = scan.report().await;
+    let Some(report) = scan.report(measure).await else {
+        return Ok(());
+    };
     let metric = |name| metric_total(&report, name);
     assert!(metric("morsel_pending_io") > 0);
     assert!(metric("morsel_ready_wait") > 0);
@@ -431,10 +456,15 @@ async fn bounded_pending_io_releases_peers_on_error_without_finalizing() -> Resu
     Ok(())
 }
 
+#[rstest]
+#[case::unmeasured(false)]
+#[case::measured(true)]
 #[tokio::test]
-async fn io_error_aborts_peers_even_with_full_result_and_ready_queues() -> Result<()> {
+async fn io_error_aborts_peers_even_with_full_result_and_ready_queues(
+    #[case] measure: bool,
+) -> Result<()> {
     let mut scan = ControlledScan::new(2, false).await?;
-    let mut run = scan.start();
+    let mut run = scan.start(measure);
     let held = scan.request().await;
     // One file is stalled in I/O and the other fills both queues.
     for _ in 0..SINK_CAPACITY + WORKERS + READY_READERS {
@@ -451,7 +481,9 @@ async fn io_error_aborts_peers_even_with_full_result_and_ready_queues() -> Resul
     let error = run.next().await.unwrap_err().to_string();
     assert!(error.contains("test I/O error with full sink"), "{error}");
     drop(run);
-    let report = scan.report().await;
+    let Some(report) = scan.report(measure).await else {
+        return Ok(());
+    };
     let metric = |name| metric_total(&report, name);
     assert_eq!(metric("morsels_claimed"), SINK_CAPACITY + WORKERS);
     assert_eq!(metric("morsels_completed"), SINK_CAPACITY);

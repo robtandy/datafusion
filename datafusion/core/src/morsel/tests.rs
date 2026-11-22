@@ -15,6 +15,7 @@ use datafusion_expr::logical_plan::{Filter, TableScanBuilder};
 use datafusion_expr::{ColumnarValue, Volatility, create_udf, lit};
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr::expressions::{Column, Literal};
+use rstest::rstest;
 use tokio::sync::Semaphore;
 use tokio::task::Id;
 use tokio::time::timeout;
@@ -372,13 +373,22 @@ async fn single_worker_stream_allows_other_query_progress() -> Result<()> {
     Ok(())
 }
 
+#[rstest]
+#[case::unmeasured(false)]
+#[case::measured(true)]
 #[tokio::test]
-async fn single_worker_stream_error_terminates_without_reading_more_input() -> Result<()>
-{
+async fn single_worker_stream_error_terminates_without_reading_more_input(
+    #[case] measure: bool,
+) -> Result<()> {
     let (plan, mut observations) = inline_plan(Some(2))?;
     let collector = Arc::new(MorselMetrics::default());
-    let cfg = crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
-    let ctx = Arc::new(TaskContext::default().with_session_config(cfg));
+    let ctx = if measure {
+        let cfg =
+            crate::prelude::SessionConfig::new().with_extension(Arc::clone(&collector));
+        Arc::new(TaskContext::default().with_session_config(cfg))
+    } else {
+        Arc::default()
+    };
     let mut stream = plan.execute(0, ctx)?;
     assert_eq!(stream.next().await.unwrap()?.num_rows(), 1);
     let error = stream.next().await.unwrap().unwrap_err();
@@ -391,10 +401,12 @@ async fn single_worker_stream_error_terminates_without_reading_more_input() -> R
         Err(mpsc::error::TryRecvError::Empty)
     );
     let reports = collector.take_runs();
-    assert_eq!(reports.len(), 1);
-    let count = |name| reports[0].sum_by_name(name).unwrap().as_usize();
-    assert_eq!(count("morsels_claimed"), 1);
-    assert_eq!(count("morsels_completed"), 0);
+    assert_eq!(reports.len(), usize::from(measure));
+    if let [report] = reports.as_slice() {
+        let count = |name| report.sum_by_name(name).unwrap().as_usize();
+        assert_eq!(count("morsels_claimed"), 1);
+        assert_eq!(count("morsels_completed"), 0);
+    }
     Ok(())
 }
 
