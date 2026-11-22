@@ -128,6 +128,12 @@ queries on this layout despite leaving four workers without a reader. Claim
 counts describe work assignment, not CPU utilization; elapsed times also
 include filtering, output handling or count reduction.
 
+The `c2809d3b` baseline predates the [#148 read-ahead change](../morsel_parquet/issue-148.md),
+and [#155](../morsel_parquet_decode_analysis.md) found that waiting for ready
+readers was the largest share of native worker time on eight-worker scans at
+that revision, so the file-skew timing advantage for stock may not hold on the
+current branch.
+
 See the [intra-row-group splitting design](../../docs/source/contributor-guide/morsel_parquet_splitting.md)
 for proposed changes to the native source. This benchmark does not implement
 splitting.

@@ -22,7 +22,7 @@ then initializes and reads it with local state. The [DuckDB performance guide]
 also identifies row groups as the unit of Parquet parallelism. Reuse the
 claim-next/local-reader pattern, not its interfaces; subdivisions inside a
 Parquet row group are the proposed extension, not a claim about what DuckDB
-does. In this fork, [the native scheduler] receives buffered readers from file
+does. In this fork, the [native scheduler] receives buffered readers from file
 lanes. [The buffered planner] calls `try_next_reader`, drives `NeedsData` by
 fetching byte ranges, and publishes one reader for each surviving row group.
 This is the handoff to subdivide. Stock file-range repartitioning does not
@@ -128,16 +128,23 @@ a time; readers from a prior group can finish using their owned views.
 
 ## Bounds, cancellation and metrics
 
-- Retain the scheduler's current four file lanes, two pending I/O phases, two
-  ready-reader slots, and one claimed reader per worker. Keep the two-slot
-  output queue and batch-level yielding. Create at most one next-slice
-  descriptor per lane; no task, reader or future per slice up front.
+- Keep the current [native scheduler] and [ready queue] item limits. With
+  `read_ahead = min(workers, MAX_READ_AHEAD)` and `MAX_READ_AHEAD = 16`, run
+  `min(read_ahead, files)` file lanes and allow `read_ahead` queued readers.
+  Each lane can drive one pending I/O phase or hold one reader waiting to
+  publish. Each worker can hold one claimed reader. Keep the two-slot output
+  queue and batch-level yielding. Create at most one next-slice descriptor
+  per lane; no task, reader or future per slice up front.
 - Start experiments with a 256 MiB query-wide **compressed split-buffer** cap
   and a 16 MiB per-slice compressed estimate (including dictionary and shared
-  pages). Charge object-store requests before issuing them, and retain the
-  reservation with the backing allocation through I/O, the broker, ready
-  readers, and worker decode. Do not count each `Bytes` view as a new
-  allocation, or release the reservation when only the broker drops its view.
+  pages). The byte cap intentionally throttles read-ahead below the item
+  limits: with 16 workers and at least 16 files, 16 lane buffers, 16 queued
+  readers and 16 claimed readers would require 768 MiB at 16 MiB apiece
+  without sharing, before any additional frontier buffers. Charge object-store
+  requests before issuing them, and retain the reservation with the backing
+  allocation through I/O, the broker, ready readers, and worker decode. Do not
+  count each `Bytes` view as a new allocation or release the reservation when
+  only the broker drops its view.
   Use an execution memory-pool reservation as well as a split-specific cap.
   Bound coalescing (start at 1 MiB, except for an individual larger page within
   the per-slice cap); account for the full returned buffer, not just its views.
@@ -146,11 +153,12 @@ a time; readers from a prior group can finish using their owned views.
   If an individual group cannot fit the split policy, use the existing reader
   before publishing any of its slices. Under transient pressure, let workers
   drain published work. Reserve the full incremental footprint before starting
-  the read, without holding a ready slot or I/O permit while waiting for memory.
-  Reserve frontier headroom for each admitted lane up front (or reduce the
-  number of lanes); otherwise all lanes could pin shared pages and wait for
-  more memory that none can release. A memory-pool denial that cannot make
-  progress must return an error, not wait on its own reservation.
+  the read, without holding a ready slot while waiting for memory. Budget
+  frontier headroom within the cap for each admitted lane up front and reduce
+  the number of active lanes if necessary to leave room for at least one
+  next slice. Otherwise all lanes could pin shared pages and wait for memory
+  that none can release. A memory-pool denial that cannot make progress must
+  return an error, not wait on its own reservation.
 - Compressed bounds are not decoded-memory bounds. Limit concurrent decoders
   and emitted Arrow batches as above, and estimate their workspace separately
   from the split cap. In v1 limit the supported projection to flat fixed-width
@@ -216,7 +224,8 @@ a time; readers from a prior group can finish using their owned views.
 [skew benchmark]: https://github.com/robtandy/datafusion/tree/morsel-execution/benchmarks/morsel_parquet_skew
 [DuckDB's Parquet source]: https://github.com/duckdb/duckdb/blob/e55f794cae98443cfaf302f41ce8a83a95a7872a/extension/parquet/parquet_multi_file_info.cpp#L592-L612
 [DuckDB performance guide]: https://duckdb.org/docs/current/guides/performance/file_formats.html#parquet
-[the native scheduler]: https://github.com/robtandy/datafusion/blob/c2809d3b3ee73936b182429e1646af290d797c6e/datafusion/core/src/morsel/parquet.rs
+[native scheduler]: https://github.com/robtandy/datafusion/blob/61f4035d226359549517f792b5f0a03be7ca4565/datafusion/core/src/morsel/parquet.rs#L203-L239
+[ready queue]: https://github.com/robtandy/datafusion/blob/61f4035d226359549517f792b5f0a03be7ca4565/datafusion/core/src/morsel/parquet/ready.rs
 [The buffered planner]: https://github.com/robtandy/datafusion/blob/c2809d3b3ee73936b182429e1646af290d797c6e/datafusion/datasource-parquet/src/opener/buffered.rs
 [`ParquetAccessPlan`]: https://github.com/robtandy/datafusion/blob/c2809d3b3ee73936b182429e1646af290d797c6e/datafusion/datasource-parquet/src/access_plan.rs
 [`ParquetPushDecoder`]: https://docs.rs/parquet/60.1.0/parquet/arrow/push_decoder/struct.ParquetPushDecoder.html
