@@ -55,12 +55,14 @@ impl MorselPlanner for BufferedReaders {
                 // After extraction the decoder is at a boundary. It may have
                 // skipped empty selections before arriving at this reader.
                 let remaining = self.decoder.row_groups_remaining();
+                let mut compressed_bytes = 0;
                 while self.rg_plan.len() > remaining {
-                    self.byte_progress
-                        .credit(self.rg_plan.pop_front().unwrap().bytes);
+                    compressed_bytes = self.rg_plan.pop_front().unwrap().bytes;
+                    self.byte_progress.credit(compressed_bytes);
                 }
                 let reader = BufferedReader {
                     reader,
+                    compressed_bytes,
                     projection: Arc::clone(&self.projection),
                     file_name: Arc::clone(&self.file_name),
                     elapsed_compute: elapsed_compute.clone(),
@@ -77,6 +79,7 @@ impl MorselPlanner for BufferedReaders {
 
 struct BufferedReader {
     reader: ParquetRecordBatchReader,
+    compressed_bytes: u64,
     projection: Arc<DecoderProjection>,
     file_name: Arc<str>,
     elapsed_compute: Time,
@@ -89,12 +92,17 @@ impl fmt::Debug for BufferedReader {
 }
 
 impl Morsel for BufferedReader {
+    fn buffered_bytes_estimate(&self) -> usize {
+        self.compressed_bytes as usize
+    }
+
     fn into_stream(self: Box<Self>) -> stream::BoxStream<'static, Result<RecordBatch>> {
         let Self {
             mut reader,
             projection,
             file_name,
             elapsed_compute,
+            ..
         } = *self;
         stream::iter(std::iter::from_fn(move || {
             let _timer = elapsed_compute.timer();

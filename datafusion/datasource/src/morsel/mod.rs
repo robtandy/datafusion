@@ -39,6 +39,18 @@ pub trait Morsel: Send + Debug {
     /// Note: This may do CPU work to decode already-loaded data, but should not
     /// do any I/O work such as reading from the file.
     fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>>;
+
+    /// Return an estimate of the buffered input bytes, or zero if unavailable.
+    ///
+    /// # Public Only for Internal Use:
+    ///
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    fn buffered_bytes_estimate(&self) -> usize {
+        0
+    }
 }
 
 /// A Morselizer takes a single [`PartitionedFile`] and creates the initial planner
