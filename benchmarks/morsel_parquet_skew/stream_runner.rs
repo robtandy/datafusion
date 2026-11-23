@@ -9,6 +9,9 @@ use std::sync::Arc;
 use arrow::csv::Writer;
 use datafusion::common::config::MorselMode;
 use datafusion::common::instant::Instant;
+use datafusion::datasource::physical_plan::parquet::ParquetSplitConfig;
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::morsel::MorselMetrics;
 use datafusion::physical_plan::{ExecutionPlan, displayable, execute_stream};
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -16,6 +19,21 @@ use futures::TryStreamExt;
 use serde_json::json;
 
 const BATCH_SIZE: usize = 8192;
+
+fn env_bool(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "TRUE") => true,
+        Some("0" | "false" | "FALSE") => false,
+        _ => default,
+    }
+}
+
+fn env_usize(name: &str) -> Result<Option<usize>, Box<dyn Error>> {
+    match std::env::var(name) {
+        Ok(val) if !val.is_empty() => Ok(Some(val.parse()?)),
+        _ => Ok(None),
+    }
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -48,6 +66,12 @@ async fn run(
     ddl: &str,
     sql: &str,
 ) -> Result<(), Box<dyn Error>> {
+    let enable_page_index = env_bool("MORSEL_ENABLE_PAGE_INDEX", false);
+    let pushdown_filters = env_bool("MORSEL_PUSHDOWN_FILTERS", false);
+    let split_enabled = env_bool("MORSEL_SPLIT_ENABLED", true);
+    let split_buffer_cap_bytes = env_usize("MORSEL_SPLIT_BUFFER_CAP_BYTES")?;
+    let memory_pool_bytes = env_usize("MORSEL_MEMORY_POOL_BYTES")?;
+
     let mut config = SessionConfig::new()
         .with_batch_size(BATCH_SIZE)
         .with_target_partitions(workers)
@@ -56,14 +80,31 @@ async fn run(
     let execution = &mut config.options_mut().execution;
     execution.morsel_mode = mode;
     execution.parquet.pruning = false;
-    execution.parquet.pushdown_filters = false;
-    execution.parquet.enable_page_index = false;
+    execution.parquet.pushdown_filters = pushdown_filters;
+    execution.parquet.enable_page_index = enable_page_index;
     execution.parquet.bloom_filter_on_read = false;
+    if !split_enabled || split_buffer_cap_bytes.is_some() {
+        let mut split_cfg = ParquetSplitConfig {
+            enabled: split_enabled,
+            ..Default::default()
+        };
+        if let Some(cap) = split_buffer_cap_bytes {
+            split_cfg.split_buffer_cap_bytes = cap;
+        }
+        config.set_extension(Arc::new(split_cfg));
+    }
     let metrics = Arc::new(MorselMetrics::default());
     if !csv {
         config.set_extension(Arc::clone(&metrics));
     }
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = if let Some(limit) = memory_pool_bytes {
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(limit)))
+            .build_arc()?;
+        SessionContext::new_with_config_rt(config, runtime)
+    } else {
+        SessionContext::new_with_config(config)
+    };
     let mut writer = csv.then(|| Writer::new(io::stdout().lock()));
 
     let start = Instant::now();
@@ -84,20 +125,25 @@ async fn run(
     drop(stream);
     if !csv {
         let runs = metrics.take_runs();
-        let (claims, completions) = match (mode, runs.as_slice()) {
-            (MorselMode::Required, [run]) => (
-                Some(worker_counts(run, "morsels_claimed", workers)?),
-                Some(worker_counts(run, "morsels_completed", workers)?),
-            ),
-            (MorselMode::Off, []) => (None, None),
-            _ => {
-                return Err(format!(
-                    "unexpected number of native reports: {}",
-                    runs.len()
-                )
-                .into());
-            }
-        };
+        let (claims, completions, decode_ms, process_ms, ready_wait_ms, pending_io_ms) =
+            match (mode, runs.as_slice()) {
+                (MorselMode::Required, [run]) => (
+                    Some(worker_counts(run, "morsels_claimed", workers)?),
+                    Some(worker_counts(run, "morsels_completed", workers)?),
+                    Some(run_time_ms(run, "morsel_decode_work")),
+                    Some(run_time_ms(run, "morsel_process_work")),
+                    Some(run_time_ms(run, "morsel_ready_wait")),
+                    Some(run_time_ms(run, "morsel_pending_io")),
+                ),
+                (MorselMode::Off, []) => (None, None, None, None, None, None),
+                _ => {
+                    return Err(format!(
+                        "unexpected number of native reports: {}",
+                        runs.len()
+                    )
+                    .into());
+                }
+            };
         println!(
             "{}",
             json!({
@@ -108,12 +154,33 @@ async fn run(
                 "plan": displayable(plan.as_ref()).indent(false).to_string(),
                 "parquet_morsels_claimed": metric(plan.as_ref(), "parquet_morsels_claimed"),
                 "count_finalizations": metric(plan.as_ref(), "count_finalizations"),
+                "parquet_split_row_groups": metric(plan.as_ref(), "parquet_split_row_groups"),
+                "parquet_unsplit_row_groups": metric(plan.as_ref(), "parquet_unsplit_row_groups"),
+                "parquet_split_slices": metric(plan.as_ref(), "parquet_split_slices"),
+                "parquet_split_selected_rows": metric(plan.as_ref(), "parquet_split_selected_rows"),
+                "parquet_split_storage_requests": metric(plan.as_ref(), "parquet_split_storage_requests"),
+                "parquet_split_data_bytes_returned": metric(plan.as_ref(), "parquet_split_data_bytes_returned"),
+                "parquet_split_reused_bytes": metric(plan.as_ref(), "parquet_split_reused_bytes"),
+                "parquet_split_peak_unique_compressed_bytes": metric(plan.as_ref(), "parquet_split_peak_unique_compressed_bytes"),
+                "bytes_scanned": metric(plan.as_ref(), "bytes_scanned"),
                 "worker_claims": claims,
                 "worker_completions": completions,
+                "morsel_decode_work_ms": decode_ms,
+                "morsel_process_work_ms": process_ms,
+                "morsel_ready_wait_ms": ready_wait_ms,
+                "morsel_pending_io_ms": pending_io_ms,
             })
         );
     }
     Ok(())
+}
+
+fn run_time_ms(
+    run: &datafusion::physical_plan::metrics::MetricsSet,
+    name: &str,
+) -> f64 {
+    run.sum_by_name(name)
+        .map_or(0.0, |v| v.as_usize() as f64 / 1e6)
 }
 
 fn worker_counts(

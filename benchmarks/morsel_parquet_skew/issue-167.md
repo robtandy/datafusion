@@ -11,9 +11,11 @@ splitting disabled via `ParquetSplitConfig { enabled: false }`), and split nativ
 (`morsel_mode = required`, default splitting: `min_row_group_rows = 1 Mi`,
 `target_slice_rows = 128 Ki`, page-aligned boundary selection, `256 MiB`
 query-wide compressed split-buffer cap, `16 MiB` per-slice compressed cap,
-`128 MiB` decoded workspace ceiling) on the same files and binary built from
-`agent/morsel-issue-167` (based on `9c3079473`). This note does not replace the
-pinned [#156 baseline](README.md#dduck2-warm-cache-baseline) or the pinned
+slice-sized decoded workspace estimate capped at `128 MiB`, and atomic Phase-2
+budget reservation for row-filter pushdown) on the same files and binary built
+from `benchmarks/morsel_parquet_skew/stream_runner.rs` on `agent/morsel-issue-167`.
+This note does not replace the pinned
+[#156 baseline](README.md#dduck2-warm-cache-baseline) or the pinned
 [#128 baseline](../morsel_parquet/README.md).
 
 ## Method
@@ -21,9 +23,8 @@ pinned [#156 baseline](README.md#dduck2-warm-cache-baseline) or the pinned
 `rob-tandy-dduck1`, November 23, 2026 UTC: Ubuntu 24.04.5, Linux
 `7.0.0-1014-aws`, AArch64 Neoverse-N1, Btrfs on local EC2 NVMe instance storage,
 Rust `1.99.1 (58cf8f9c3)`, Python `3.12.10` (`numpy 2.2.6`, `pyarrow 20.0.0`).
-No builds or lint jobs ran during measurement (`vmstat 1 3` reported 97% CPU
-idle before launch). All runs were pinned to CPUs 0–7 (`taskset -c 0-7`) with
-8 workers, `batch_size = 8192`, `repartition_file_scans = false`,
+All runs were pinned to CPUs 0–7 (`taskset -c 0-7`) with 8 workers,
+`batch_size = 8192`, `repartition_file_scans = false`,
 `collect_statistics = false`, `pruning = false`, `bloom_filter_on_read = false`,
 1 warmup round, and 5 measured paired rounds rotating arm order each round.
 Full Linux page-cache residency was verified via `mincore` before every timed
@@ -34,12 +35,12 @@ sample. Every arm passed #128's exact NumPy oracle before timing
 Fixtures (Zstandard level 3, PLAIN encoding, `use_dictionary = False`, statistics
 enabled, PyArrow default 1 MiB data pages):
 
-| Fixture                    | Files | Row groups per file            | Rows / RG | Page/Offset Index | Total bytes |
-| -------------------------- | ----: | ------------------------------ | --------: | ----------------- | ----------: |
-| `large-row-groups-noindex` |     2 | `2, 2` (4 RGs)                 | 2,097,152 | No                | 155,608,030 |
-| `large-row-groups-indexed` |     2 | `2, 2` (4 RGs)                 | 2,097,152 | Yes               | 155,607,514 |
-| `file-skew-indexed`        |    16 | `24, 1, 24, 1, 2, 2, 1×10`     |   131,072 | Yes               | 155,793,381 |
-| `uniform-128rg` (#128)     |    16 | `8 × 16` (128 RGs)             |   131,072 | No                | 311,529,117 |
+| Fixture                    | Files | Row groups per file        | Rows / RG | Page/Offset Index | Total bytes |
+| -------------------------- | ----: | -------------------------- | --------: | ----------------- | ----------: |
+| `large-row-groups-noindex` |     2 | `2, 2` (4 RGs)             | 2,097,152 | No                | 155,608,030 |
+| `large-row-groups-indexed` |     2 | `2, 2` (4 RGs)             | 2,097,152 | Yes               | 155,607,514 |
+| `file-skew-indexed`        |    16 | `24, 1, 24, 1, 2, 2, 1×10` |   131,072 | Yes               | 155,793,381 |
+| `uniform-128rg` (#128)     |    16 | `8 × 16` (128 RGs)         |   131,072 | No                | 311,529,117 |
 
 ## 1. `#156` `large-row-groups` no-index control (`pushdown_filters = false`)
 
@@ -49,10 +50,10 @@ Index cleanly fall back to unsplit row groups (`parquet_split_row_groups = 0`,
 
 | Query        | Stock ms, median (range) | Native (no-index) ms, median (range) | Active workers | Claims (round 1)           | `bytes_scanned` |
 | ------------ | -----------------------: | -----------------------------------: | -------------: | -------------------------- | --------------: |
-| `scan_low`   |      299.7 (294.8–302.9) |                  186.8 (184.8–190.2) |            4/8 | `[0, 0, 0, 1, 1, 1, 0, 1]` |      98,222,226 |
-| `count_low`  |      145.9 (143.9–147.3) |                    94.1 (92.4–95.0)  |            4/8 | `[0, 0, 0, 1, 1, 1, 0, 1]` |      37,497,725 |
-| `scan_high`  |      302.1 (300.4–305.3) |                  193.3 (189.0–196.4) |            4/8 | `[0, 1, 0, 1, 1, 0, 0, 1]` |      98,222,226 |
-| `count_high` |      145.5 (143.2–147.3) |                    94.3 (92.3–94.3)  |            4/8 | `[0, 0, 0, 1, 1, 1, 0, 1]` |      37,497,725 |
+| `scan_low`   |      298.3 (297.1–300.8) |                  186.3 (184.6–188.8) |            4/8 | `[1, 0, 0, 1, 1, 0, 0, 1]` |      98,222,226 |
+| `count_low`  |      145.5 (143.5–146.7) |                    93.0 (92.7–93.6)  |            4/8 | `[0, 0, 0, 1, 1, 1, 0, 1]` |      37,497,725 |
+| `scan_high`  |      297.3 (294.2–302.9) |                  190.2 (189.8–193.5) |            4/8 | `[1, 0, 0, 1, 1, 0, 0, 1]` |      98,222,226 |
+| `count_high` |      146.6 (144.5–147.6) |                    93.8 (93.0–94.4)  |            4/8 | `[1, 0, 0, 1, 0, 1, 0, 1]` |      37,497,725 |
 
 ## 2. `#156` `large-row-groups` indexed (`pushdown_filters = false`)
 
@@ -60,75 +61,128 @@ All 4 large row groups split cleanly into page-aligned slices (`60` slices for
 `scan_*`, `32` slices for `count_*`). **All 8 workers claim and complete slices
 in every trial**, `bytes_scanned` is **byte-for-byte identical (1.000×)** to
 unsplit storage reads, and peak unique compressed buffer residency stays at
-20–33 MiB (well below the 256 MiB cap).
+21–33 MiB (well below the 256 MiB cap).
 
 | Query        | Stock ms, median (range) | Legacy native ms (4/8 workers) | Split native ms (8/8 workers) | Split vs legacy | Split vs stock | Split claims (round 1)     | `bytes_scanned` (all arms) | Reused bytes | Peak unique bytes |
 | ------------ | -----------------------: | -----------------------------: | ----------------------------: | --------------: | -------------: | -------------------------- | -------------------------: | -----------: | ----------------: |
-| `scan_low`   |      293.0 (290.4–295.5) |            183.1 (181.2–184.4) |           157.7 (151.5–166.3) |          -13.9% |         -46.2% | `[8, 7, 7, 8, 7, 8, 7, 8]` |                 98,214,742 |   74,547,897 |        34,762,249 |
-| `count_low`  |      142.7 (139.6–143.6) |              91.3 (91.0–92.7)  |             66.7 (65.0–68.0)  |          -26.9% |         -53.3% | `[4, 4, 4, 4, 4, 3, 5, 4]` |                 37,495,813 |   16,371,853 |        22,227,078 |
-| `scan_high`  |      294.0 (292.3–298.5) |            188.2 (188.0–190.3) |           167.9 (159.2–172.9) |          -10.8% |         -42.9% | `[7, 7, 7, 8, 8, 7, 8, 8]` |                 98,214,742 |   74,547,897 |        34,022,386 |
-| `count_high` |      140.6 (139.9–142.9) |              91.5 (90.9–92.5)  |             65.5 (62.9–72.4)  |          -28.4% |         -53.4% | `[4, 4, 4, 4, 4, 4, 4, 4]` |                 37,495,813 |   16,371,853 |        20,595,937 |
+| `scan_low`   |      300.0 (298.8–301.9) |            186.0 (185.5–186.1) |           158.4 (155.7–161.0) |          -14.8% |         -47.2% | `[7, 6, 8, 9, 7, 7, 8, 8]` |                 98,214,742 |   74,547,897 |        34,154,405 |
+| `count_low`  |      145.2 (143.7–146.0) |              94.1 (93.2–94.2)  |             68.2 (65.3–71.7)  |          -27.5% |         -53.0% | `[3, 3, 4, 4, 5, 4, 4, 5]` |                 37,495,813 |   16,371,853 |        22,446,309 |
+| `scan_high`  |      301.4 (300.3–302.6) |            192.5 (189.6–193.9) |           164.9 (162.4–173.6) |          -14.3% |         -45.3% | `[7, 7, 7, 9, 8, 7, 7, 8]` |                 98,214,742 |   74,547,897 |        33,888,195 |
+| `count_high` |      144.6 (143.3–147.1) |              93.7 (93.4–93.9)  |             70.8 (66.8–73.1)  |          -24.4% |         -51.0% | `[4, 4, 5, 5, 4, 3, 4, 3]` |                 37,495,813 |   16,371,853 |        22,718,476 |
 
 Worker ready-wait drops sharply when all 8 workers have claimable slices:
-`scan_low` aggregate `morsel_ready_wait` drops from `231.4 ms` → `49.7 ms`, and
-`count_low` drops from `98.2 ms` → `31.5 ms`. On `count_*`, snapping slice
+`scan_low` aggregate `morsel_ready_wait` drops from `243.0 ms` → `44.1 ms`, and
+`count_low` drops from `98.4 ms` → `34.4 ms`. On `count_*`, snapping slice
 boundaries to `delta`'s ~273 Ki-row pages yields `32` slices with only `1.44×`
 decode bytes (`16.4 MiB` reused from the broker, zero extra storage reads),
-cutting wall time by **26.9–28.4%** over legacy native and **53.3–53.4%** over
+cutting wall time by **24.4–27.5%** over legacy native and **51.0–53.0%** over
 stock. On `scan_*`, snapping to `payload`'s ~140 Ki-row pages keeps `payload`
 at `1.00×` while `score`, `delta`, and `row_id` straddle boundaries (`1.76×`
 total decode bytes, `74.5 MiB` served from the broker with zero duplicate I/O),
-yielding **10.8–13.9%** wall-time wins over legacy native and **42.9–46.2%**
+yielding **14.3–14.8%** wall-time wins over legacy native and **45.3–47.2%**
 over stock.
 
 ## 3. `#156` `large-row-groups` indexed (`pushdown_filters = true`)
 
 Splitting also applies to `FilteredBufferedReaders` (with `AsyncRangeBroker`
-deduplicating shared boundary pages across Phase-1 and concurrent Phase-2 lanes
-and `RowGroupCache` batch-boundary expansion scoped strictly to cached leaves).
+deduplicating shared boundary pages across Phase-1 and concurrent Phase-2 lanes,
+`RowGroupCache` batch-boundary expansion scoped strictly to cached leaves, and
+atomic Phase-2 budget pre-reservation at slice admission).
 
-| Query        | Stock ms, median (range) | Legacy native ms (4/8 workers) | Split native ms (8/8 workers) | Split vs legacy | Split vs stock | Split claims (round 1)     | `bytes_scanned` (all arms) | Peak unique bytes |
-| ------------ | -----------------------: | -----------------------------: | ----------------------------: | --------------: | -------------: | -------------------------- | -------------------------: | ----------------: |
-| `scan_low`   |      328.4 (326.3–336.8) |            177.3 (176.1–180.1) |           173.2 (171.8–175.7) |           -2.3% |         -47.3% | `[8, 6, 9, 8, 8, 7, 9, 5]` |                 98,214,742 |        19,500,222 |
-| `count_low`  |      159.0 (157.8–159.2) |              88.9 (88.5–89.2)  |             69.4 (64.9–74.1)  |          -21.9% |         -56.4% | `[3, 4, 5, 3, 5, 4, 4, 4]` |                 37,495,813 |        14,181,107 |
-| `scan_high`  |      346.1 (345.0–347.9) |            183.7 (183.0–186.2) |           185.6 (184.3–187.2) |           +1.0% |         -46.4% | `[7, 5, 8, 7, 8, 9, 8, 8]` |                 98,214,742 |        18,089,304 |
-| `count_high` |      159.9 (159.5–161.0) |              89.3 (88.9–90.0)  |             84.4 (79.6–85.1)  |           -5.5% |         -47.2% | `[4, 4, 4, 4, 3, 4, 4, 5]` |                 37,495,813 |        14,577,361 |
+| Query        | Stock ms, median (range) | Legacy native ms (4/8 workers) | Split native ms (8/8 workers) | Split vs legacy | Split vs stock | Split claims (round 1)      | `bytes_scanned` (all arms) | Peak unique bytes |
+| ------------ | -----------------------: | -----------------------------: | ----------------------------: | --------------: | -------------: | --------------------------- | -------------------------: | ----------------: |
+| `scan_low`   |      328.9 (326.5–337.3) |            177.2 (174.7–178.1) |           175.1 (171.6–179.9) |           -1.2% |         -46.8% | `[8, 8, 9, 8, 8, 4, 6, 9]`  |                 98,214,742 |        28,687,416 |
+| `count_low`  |      159.8 (158.6–160.2) |              89.5 (88.5–90.2)  |             68.2 (65.1–78.0)  |          -23.8% |         -57.3% | `[5, 4, 4, 4, 4, 3, 4, 4]`  |                 37,495,813 |        13,565,828 |
+| `scan_high`  |      344.4 (343.7–345.5) |            183.2 (183.1–183.5) |           178.1 (174.8–196.8) |           -2.8% |         -48.3% | `[6, 10, 7, 5, 7, 7, 8, 10]`|                 98,214,742 |        29,176,464 |
+| `count_high` |      160.1 (159.6–161.5) |              90.2 (89.7–90.6)  |             85.9 (82.7–96.1)  |           -4.8% |         -46.3% | `[4, 4, 4, 4, 4, 4, 4, 4]`  |                 37,495,813 |        13,960,903 |
 
 All 8 workers claim work across all 4 queries with zero duplicate storage I/O
-(`bytes_scanned` identical across all arms) and lower peak unique compressed
-residency (`13.5–18.6 MiB`). On `count_low`, split native drops wall time by
-**21.9%** vs legacy native (`88.9 → 69.4 ms`) and **56.4%** vs stock. On
-`scan_high` with `pushdown_filters = true`, per-slice `RowFilter` + `RowGroupCache`
-boundary decompression overhead (`1242 ms` vs `593 ms` aggregate worker decode
-work across 8 vs 4 workers) balances out the 4→8 worker concurrency gain
-(`185.6` vs `183.7 ms`, still **46.4%** ahead of stock).
+(`bytes_scanned` identical across all arms), beating both stock (**46.3–57.3%**
+faster) and legacy native (**1.2–23.8%** faster) across all four queries.
 
 ## 4. `#156` `file-skew` indexed control (`pushdown_filters = false`)
 
 Row groups are `131,072` rows (`< 1 Mi` threshold), so `parquet_split_row_groups = 0`:
 all 64 row groups stay unsplit and take the fast single-decoder path, spreading
-across all 8 workers with zero regression (**2.2–2.3× faster than stock**).
+across all 8 workers with zero regression (**2.2–2.4× faster than stock**).
 
 | Query        | Stock ms, median (range) | Legacy native ms (8/8 workers) | Split native ms (8/8 workers) | Split RGs | Claims (round 1)           |
 | ------------ | -----------------------: | -----------------------------: | ----------------------------: | --------: | -------------------------- |
-| `scan_low`   |      225.9 (222.4–230.8) |              96.8 (95.0–104.9) |              97.5 (96.0–98.4) |         0 | `[8, 8, 8, 9, 7, 7, 8, 9]` |
-| `count_low`  |      118.2 (114.6–119.2) |              50.9 (49.9–52.4)  |              51.4 (49.0–54.5) |         0 | `[9, 9, 7, 9, 7, 8, 8, 7]` |
-| `scan_high`  |      239.1 (238.0–241.5) |            108.0 (103.9–111.9) |            108.6 (107.1–113.5)|         0 | `[8, 8, 7, 9, 8, 8, 8, 8]` |
-| `count_high` |      116.8 (115.3–119.7) |              50.4 (48.9–51.8)  |              50.3 (49.9–51.0) |         0 | `[9, 8, 7, 8, 8, 8, 7, 9]` |
+| `scan_low`   |      232.5 (222.2–235.0) |              99.2 (94.8–106.4) |              99.0 (96.0–101.7)|         0 | `[8, 8, 8, 8, 8, 8, 8, 8]` |
+| `count_low`  |      116.9 (115.5–119.2) |              51.0 (50.3–52.1)  |              52.5 (50.1–57.2) |         0 | `[9, 8, 7, 8, 8, 9, 7, 8]` |
+| `scan_high`  |      244.3 (237.9–246.4) |            110.3 (107.4–115.5) |            112.6 (106.7–115.4)|         0 | `[8, 8, 7, 8, 8, 8, 9, 8]` |
+| `count_high` |      123.1 (117.7–124.5) |              51.6 (49.8–54.5)  |              51.7 (51.0–53.4) |         0 | `[8, 8, 9, 9, 7, 7, 8, 8]` |
 
-## 5. `#128` uniform 128-RG non-regression check
+## 5. `#128` uniform 128-RG non-regression check (`pushdown_filters = false`)
 
 Row groups are `131,072` rows (`< 1 Mi` threshold), so `parquet_split_row_groups = 0`
 and all 128 row groups stay on the unsplit fast path with identical `bytes_scanned`
-and zero regression for both `pushdown_filters = false` and `pushdown_filters = true`.
+and zero regression (all four queries beat paired stock).
 
-| `pushdown_filters` | Query        | Stock ms, median (range) | Legacy native ms, median (range) | Split native ms, median (range) | Split RGs |
-| ------------------ | ------------ | -----------------------: | -------------------------------: | ------------------------------: | --------: |
-| `false`            | `scan_low`   |      171.8 (167.0–175.1) |              171.0 (170.6–173.7) |             171.4 (168.9–172.7) |         0 |
-| `false`            | `count_low`  |        90.2 (89.4–95.8)  |                87.7 (86.5–91.0)  |               91.4 (87.5–96.4)  |         0 |
-| `false`            | `scan_high`  |      193.8 (189.7–195.6) |              195.4 (189.3–206.9) |             193.1 (190.6–200.0) |         0 |
-| `false`            | `count_high` |        89.8 (88.5–92.4)  |                88.1 (87.3–92.5)  |               89.7 (88.8–90.0)  |         0 |
-| `true`             | `scan_low`   |      211.2 (205.4–215.3) |              216.9 (209.3–220.2) |             213.6 (208.8–217.3) |         0 |
-| `true`             | `count_low`  |        90.0 (88.5–92.7)  |                87.5 (85.4–91.8)  |               88.2 (86.7–89.5)  |         0 |
-| `true`             | `scan_high`  |      203.8 (202.1–207.6) |              203.8 (196.2–210.2) |             203.6 (202.8–238.7) |         0 |
-| `true`             | `count_high` |        92.3 (88.7–93.4)  |                90.1 (87.7–92.2)  |               87.8 (84.7–90.7)  |         0 |
+| Query        | Stock ms, median (range) | Legacy native (`MORSEL_SPLIT_ENABLED=0`) | Split native (`MORSEL_SPLIT_ENABLED=1`) | Split RGs |
+| ------------ | -----------------------: | ---------------------------------------: | --------------------------------------: | --------: |
+| `scan_low`   |      174.9 (168.7–179.1) |                      176.2 (172.5–177.8) |                     174.4 (171.5–176.0) |         0 |
+| `count_low`  |        93.3 (90.9–95.6)  |                        93.6 (91.8–106.1) |                       91.4 (89.2–93.1)  |         0 |
+| `scan_high`  |      197.7 (195.2–199.3) |                      196.4 (194.0–198.1) |                     195.0 (194.2–202.5) |         0 |
+| `count_high` |        93.2 (90.5–93.9)  |                        92.5 (91.5–94.5)  |                       90.1 (88.9–93.7)  |         0 |
+
+## Reproduction
+
+Run from the repository root using the committed `benchmarks/morsel_parquet_skew/stream_runner.rs`,
+`benchmarks/morsel_parquet_skew/bench.py`, and `benchmarks/morsel_parquet/harness.py`:
+
+```bash
+set -e
+b=benchmarks/morsel_parquet_skew
+work=$(mktemp -d "$HOME/.cache/issue167-repro.XXXXXX")
+rev=$(git rev-parse HEAD)
+
+git worktree add --detach "$work/checkout" "$rev"
+mkdir -p "$work/checkout/datafusion/core/examples"
+cp "$b/stream_runner.rs" "$work/checkout/datafusion/core/examples/morsel_parquet_skew.rs"
+(
+  cd "$work/checkout"
+  MORSEL_BENCH_REVISION="$rev" CARGO_TARGET_DIR="$work/target" \
+    cargo build --locked --profile release-nonlto -j 10 \
+      -p datafusion --no-default-features --features parquet,sql --example morsel_parquet_skew
+)
+runner="$work/target/release-nonlto/examples/morsel_parquet_skew"
+uv venv --python 3.12.10 "$work/venv"
+uv pip install --python "$work/venv/bin/python" -r benchmarks/morsel_parquet/requirements.txt
+py="$work/venv/bin/python"
+
+# Verify harness unit + smoke tests
+MORSEL_PARQUET_RUNNER="$runner" MORSEL_BENCH_REVISION="$rev" \
+  taskset -c 0-7 "$py" -B -m unittest discover -s "$b" -v
+
+# Generate fixtures
+"$py" -B "$b/bench.py" generate large-row-groups "$work/large-row-groups-noindex"
+"$py" -B "$b/bench.py" generate large-row-groups "$work/large-row-groups-indexed" --page-index
+"$py" -B "$b/bench.py" generate file-skew "$work/file-skew-indexed" --page-index
+"$py" -B benchmarks/morsel_parquet/harness.py generate "$work/uniform-128rg"
+
+# 1. No-index control
+taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-noindex" \
+  --runner "$runner" --revision "$rev" --enable-page-index --warmups 1 --repeats 5 > "$work/lrg-noindex.jsonl"
+
+# 2. Indexed large-row-groups (pushdown_filters = false): stock vs legacy native vs split native
+taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-indexed" \
+  --runner "$runner" --revision "$rev" --enable-page-index --compare-split --warmups 1 --repeats 5 > "$work/lrg-pd0.jsonl"
+
+# 3. Indexed large-row-groups (pushdown_filters = true): stock vs legacy native vs split native
+taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-indexed" \
+  --runner "$runner" --revision "$rev" --enable-page-index --pushdown-filters --compare-split \
+  --warmups 1 --repeats 5 > "$work/lrg-pd1.jsonl"
+
+# 4. Indexed file-skew control
+taskset -c 0-7 "$py" -B "$b/bench.py" ab file-skew "$work/file-skew-indexed" \
+  --runner "$runner" --revision "$rev" --enable-page-index --compare-split --warmups 1 --repeats 5 > "$work/file-skew.jsonl"
+
+# 5. #128 uniform 128-RG non-regression check
+MORSEL_ENABLE_PAGE_INDEX=1 MORSEL_SPLIT_ENABLED=0 MORSEL_PUSHDOWN_FILTERS=0 \
+  taskset -c 0-7 "$py" -B benchmarks/morsel_parquet/harness.py ab "$work/uniform-128rg" \
+  --runner "$runner" --threads 8 --cache warm --revision "$rev" --warmups 1 --repeats 5 > "$work/uniform-legacy.jsonl"
+MORSEL_ENABLE_PAGE_INDEX=1 MORSEL_SPLIT_ENABLED=1 MORSEL_PUSHDOWN_FILTERS=0 \
+  taskset -c 0-7 "$py" -B benchmarks/morsel_parquet/harness.py ab "$work/uniform-128rg" \
+  --runner "$runner" --threads 8 --cache warm --revision "$rev" --warmups 1 --repeats 5 > "$work/uniform-split.jsonl"
+```
