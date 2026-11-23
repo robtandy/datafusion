@@ -107,6 +107,19 @@ pub trait MorselPlanner: Send + Debug {
     ///
     /// See the comments on [`MorselPlan`] for the logical output order.
     fn plan(self: Box<Self>) -> Result<Option<MorselPlan>>;
+
+    /// Return an estimate of the buffered input bytes held by this planner, or
+    /// zero if unavailable.
+    ///
+    /// # Public Only for Internal Use:
+    ///
+    /// This is not a public API and is for internal use only; see [API policy] for details.
+    ///
+    /// [API policy]: https://datafusion.apache.org/contributor-guide/api-health.html#internal-public-apis
+    #[doc(hidden)]
+    fn buffered_bytes_estimate(&self) -> usize {
+        0
+    }
 }
 
 /// Return result of [`MorselPlanner::plan`].

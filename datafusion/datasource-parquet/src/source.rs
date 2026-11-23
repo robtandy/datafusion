@@ -7,6 +7,7 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use crate::CachedParquetFileReaderFactory;
 use crate::DefaultParquetFileReaderFactory;
 use crate::ParquetFileReaderFactory;
 use crate::ParquetFileSchemaProvider;
@@ -578,7 +579,7 @@ impl ParquetSource {
     }
 
     /// Open a morselizer that publishes buffered row-group readers, not file streams.
-    /// The caller must admit only unordered whole files with static pruning predicates.
+    /// The caller must admit only unordered whole files with static predicates.
     ///
     /// # Public Only for Internal Use:
     /// This is not a public API and is for internal use only; see [API policy] for details.
@@ -600,11 +601,6 @@ impl ParquetSource {
                 .unwrap_or_else(|| context.session_config().batch_size()),
         );
         source.memory_pool = Some(Arc::clone(context.memory_pool()));
-        if source.pushdown_filters() {
-            return datafusion_common::internal_err!(
-                "Buffered Parquet morsels require residual, not pushed-down, row filtering"
-            );
-        }
         source.make_morselizer(store, base_config, 0, true)
     }
 
@@ -619,6 +615,15 @@ impl ParquetSource {
             .expr_adapter_factory
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory) as _);
+
+        let direct_store = self
+            .parquet_file_reader_factory
+            .as_ref()
+            .is_none_or(|factory| {
+                factory.is::<DefaultParquetFileReaderFactory>()
+                    || factory.is::<CachedParquetFileReaderFactory>()
+            })
+            .then(|| Arc::clone(&object_store));
 
         let parquet_file_reader_factory =
             self.parquet_file_reader_factory.clone().unwrap_or_else(|| {
@@ -711,6 +716,7 @@ impl ParquetSource {
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
             buffered,
+            direct_store,
         }))
     }
 }

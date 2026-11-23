@@ -441,7 +441,7 @@ fn large_filtered_batch_bypasses_the_coalescer() -> Result<()> {
         predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
         projection: None,
     }];
-    let mut buffer = ResultBuffer::new(&operators, 10);
+    let mut buffer = ResultBuffer::new(&operators, 10, false);
     buffer.push_from(&operators, 0, batch.clone())?;
     let output = buffer.next(&operators, false)?.unwrap();
     assert!(Arc::ptr_eq(batch.column(0), output.column(0)));

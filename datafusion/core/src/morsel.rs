@@ -60,7 +60,7 @@ use count::{CountSink, CountState, FinalizedCount};
 pub use metrics::MorselMetrics;
 use metrics::{RunMetrics, WorkerMetrics};
 #[cfg(feature = "parquet")]
-use parquet::{ParquetScan, ReadyReaders};
+use parquet::{ClaimedWork, ParquetScan, ReadyReaders};
 #[cfg(test)]
 mod tests;
 
@@ -199,7 +199,7 @@ impl MorselQueryPlanner {
                 scan.table_name
             )));
         };
-        let source = if let Some(table) = provider.downcast_ref::<MemTable>() {
+        let mut source = if let Some(table) = provider.downcast_ref::<MemTable>() {
             if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
                 return Ok(Lowering::Unsupported(format!(
                     "MemTable scan of {} has advertised ordering or scan filters",
@@ -234,6 +234,16 @@ impl MorselQueryPlanner {
         };
         let (mut operators, mut schema) =
             Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
+        #[cfg(feature = "parquet")]
+        if let Source::Parquet(ref mut parquet_scan) = source {
+            parquet_scan.pushdown_operators(
+                &mut operators,
+                count.is_some(),
+                &scan.filters,
+                &scan.projected_schema,
+                session,
+            )?;
+        }
         if self.workers == NonZeroUsize::MIN
             && count.is_none()
             && matches!(source, Source::Memory(_))
@@ -451,6 +461,14 @@ impl Source {
             Self::Parquet(source) => &source.schema,
         }
     }
+
+    fn has_pushed_filter(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            #[cfg(feature = "parquet")]
+            Self::Parquet(source) => source.pushed_predicate().is_some(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -558,24 +576,44 @@ fn apply_operators(
 
 struct ResultBuffer {
     batch_size: usize,
+    coalesce_source: bool,
+    source_coalescer: Option<LimitedBatchCoalescer>,
+    source_finished: bool,
     filters: Vec<Option<LimitedBatchCoalescer>>,
     output: Option<RecordBatch>,
     next_to_finish: usize,
 }
 
 impl ResultBuffer {
-    fn new(operators: &[Operator], batch_size: usize) -> Self {
+    fn new(operators: &[Operator], batch_size: usize, coalesce_source: bool) -> Self {
         let slots = operators
             .iter()
             .rposition(|op| matches!(op, Operator::Filter { .. }));
         Self {
             batch_size,
+            coalesce_source,
+            source_coalescer: None,
+            source_finished: !coalesce_source,
             filters: std::iter::repeat_with(|| None)
                 .take(slots.map_or(0, |i| i + 1))
                 .collect(),
             output: None,
             next_to_finish: 0,
         }
+    }
+
+    fn push_input(&mut self, operators: &[Operator], batch: RecordBatch) -> Result<()> {
+        if !self.coalesce_source {
+            return self.push_from(operators, 0, batch);
+        }
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let coalescer = self.source_coalescer.get_or_insert_with(|| {
+            LimitedBatchCoalescer::new(batch.schema(), self.batch_size, None)
+        });
+        coalescer.push_batch(batch)?;
+        Ok(())
     }
 
     fn push_from(
@@ -647,6 +685,17 @@ impl ResultBuffer {
                     });
             if let Some((index, batch)) = completed {
                 self.push_from(operators, index + 1, batch)?;
+            } else if let Some(batch) = self
+                .source_coalescer
+                .as_mut()
+                .and_then(LimitedBatchCoalescer::next_completed_batch)
+            {
+                self.push_from(operators, 0, batch)?;
+            } else if eof && !self.source_finished {
+                if let Some(coalescer) = &mut self.source_coalescer {
+                    coalescer.finish()?;
+                }
+                self.source_finished = true;
             } else if eof && self.next_to_finish < self.filters.len() {
                 if let Some(coalescer) = &mut self.filters[self.next_to_finish] {
                     coalescer.finish()?;
@@ -669,7 +718,7 @@ enum Sink {
 }
 
 enum WorkerSink {
-    Result(ResultBuffer),
+    Result(Box<ResultBuffer>),
     Count(CountState),
 }
 
@@ -703,7 +752,7 @@ impl Pipeline {
         batch_size: usize,
         worker: WorkerMetrics,
     ) -> impl Stream<Item = Result<RecordBatch>> {
-        let buffer = ResultBuffer::new(&self.operators, batch_size);
+        let buffer = ResultBuffer::new(&self.operators, batch_size, false);
         stream::try_unfold(
             (self, 0usize, worker, buffer),
             |(pipeline, mut next, mut worker, mut buffer)| async move {
@@ -768,9 +817,11 @@ impl Pipeline {
 
     fn worker_sink(&self, batch_size: usize) -> WorkerSink {
         match self.sink {
-            Sink::Result => {
-                WorkerSink::Result(ResultBuffer::new(&self.operators, batch_size))
-            }
+            Sink::Result => WorkerSink::Result(Box::new(ResultBuffer::new(
+                &self.operators,
+                batch_size,
+                self.source.has_pushed_filter(),
+            ))),
             Sink::Count { .. } => WorkerSink::Count(CountState::default()),
         }
     }
@@ -835,8 +886,52 @@ impl Pipeline {
     ) -> Result<Option<CountState>> {
         let mut sink = self.worker_sink(output.batch_size);
         let tx = &output.tx;
-        while let Some(morsel) = worker.ready(ready.claim()).await {
-            worker.claim();
+        while let Some(claimed) = worker.ready(ready.claim()).await {
+            if tx.is_closed() {
+                return Ok(None);
+            }
+            let morsel = match claimed {
+                ClaimedWork::Morsel {
+                    morsel,
+                    count_claim,
+                } => {
+                    if count_claim {
+                        worker.claim();
+                    }
+                    morsel
+                }
+                ClaimedWork::FilterStep {
+                    planner,
+                    permit,
+                    filter_guard,
+                    count_claim,
+                } => {
+                    if count_claim {
+                        worker.claim();
+                    }
+                    let step = worker.decode(|| planner.plan())?;
+                    let Some(mut plan) = step else {
+                        drop(permit);
+                        drop(filter_guard);
+                        worker.complete();
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    if let Some(morsel) = plan.take_morsels().pop() {
+                        drop(permit);
+                        drop(filter_guard);
+                        morsel
+                    } else if let Some(io) = plan.take_pending_planner() {
+                        ready.submit_phase2(io, permit, filter_guard);
+                        tokio::task::yield_now().await;
+                        continue;
+                    } else {
+                        return internal_err!(
+                            "Expected decode morsel or Phase-2 I/O from Parquet RowFilter step"
+                        );
+                    }
+                }
+            };
             let mut reader = worker.decode(|| morsel.into_stream());
             while let Some(batch) = metrics::decode(&mut worker, reader.next()).await {
                 if tx.is_closed()
@@ -866,7 +961,7 @@ impl Pipeline {
             }),
             WorkerSink::Result(buffer) => {
                 let mut output = worker.process(|| {
-                    buffer.push_from(&self.operators, 0, batch)?;
+                    buffer.push_input(&self.operators, batch)?;
                     buffer.next(&self.operators, false)
                 })?;
                 while let Some(batch) = output {
@@ -967,7 +1062,7 @@ impl Pipeline {
                         &context,
                         &mut tasks,
                         self.workers,
-                        measurement.clone(),
+                        measurement.as_ref(),
                     )?;
                     for id in 0..self.workers.get() {
                         let (pipeline, ready, output) =
@@ -1107,7 +1202,12 @@ impl DisplayAs for MorselExec {
                 source.table, source.projection
             )?,
             #[cfg(feature = "parquet")]
-            Source::Parquet(source) => write!(f, "NativeParquet[{}]", source.table)?,
+            Source::Parquet(source) => match source.pushed_predicate() {
+                Some(predicate) => {
+                    write!(f, "NativeParquet[{}, predicate={predicate}]", source.table)?
+                }
+                None => write!(f, "NativeParquet[{}]", source.table)?,
+            },
         }
         display_operators(&pipeline.operators, f)?;
         if let Sink::Count {
@@ -1167,6 +1267,12 @@ impl ExecutionPlan for MorselExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
+        #[cfg(feature = "parquet")]
+        if let Source::Parquet(source) = &self.pipeline.source
+            && source.apply_expressions(f)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
+        }
         let result_operators = match &self.pipeline.sink {
             Sink::Result => &[][..],
             Sink::Count {

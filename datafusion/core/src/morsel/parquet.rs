@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_catalog::{ScanArgs, TableProvider};
-use datafusion_common::{Result, internal_datafusion_err, internal_err};
+use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::{DFSchema, Result, internal_datafusion_err, internal_err};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
@@ -18,10 +19,13 @@ use datafusion_datasource::morsel::Morselizer;
 use datafusion_datasource::source::{DataSource, DataSourceExec};
 use datafusion_datasource_parquet::{file_format::ParquetFormat, source::ParquetSource};
 use datafusion_execution::TaskContext;
-use datafusion_expr::TableScan;
 use datafusion_expr::expr_rewriter::unnormalize_cols;
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
-use datafusion_physical_expr::create_physical_expr;
+use datafusion_expr::{Expr, TableScan};
+use datafusion_physical_expr::projection::ProjectionExprs;
+use datafusion_physical_expr::utils::{collect_columns, split_conjunction};
+use datafusion_physical_expr::{PhysicalExpr, conjunction, create_physical_expr};
+use datafusion_physical_expr_common::physical_expr::is_volatile;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
@@ -30,14 +34,14 @@ use datafusion_session::Session;
 use crate::datasource::listing::ListingTable;
 
 use super::metrics::RunMetrics;
-use super::{CountState, supported_expr};
+use super::{CountState, Operator, supported_expr};
 
 mod ready;
 #[cfg(test)]
 mod tests;
 
-use ready::Publisher;
-pub(super) use ready::ReadyReaders;
+pub(super) use ready::{ClaimedWork, ReadyReaders};
+use ready::{Phase2Queue, Phase2Task, Publisher};
 
 const MAX_READ_AHEAD: usize = 16;
 
@@ -48,6 +52,7 @@ pub(super) struct ParquetScan {
     // An admitted listing scan may have no files, without losing its projected schema.
     config: Option<Box<FileScanConfig>>,
     files: Arc<[PartitionedFile]>,
+    pushdown_filters: bool,
     pub(super) metrics: ExecutionPlanMetricsSet,
 }
 
@@ -99,6 +104,7 @@ impl ParquetScan {
             schema: plan.schema(),
             config: None,
             files: Arc::default(),
+            pushdown_filters: false,
             metrics: ExecutionPlanMetricsSet::new(),
         };
         if source.schema.as_ref() != scan.projected_schema.as_arrow() {
@@ -144,24 +150,50 @@ impl ParquetScan {
             return unsupported(feature);
         }
 
+        let pushdown_filters =
+            session.config_options().execution.parquet.pushdown_filters
+                || parquet.table_parquet_options().global.pushdown_filters;
         let mut config = config.clone();
-        config.file_source = Arc::new(parquet.clone().with_pushdown_filters(false));
+        if !pushdown_filters {
+            config.file_source = Arc::new(parquet.clone().with_pushdown_filters(false));
+            Self::attach_pruning_hints(
+                &mut config,
+                &scan.filters,
+                &scan.projected_schema,
+                session,
+            )?;
+        }
+        source.pushdown_filters = pushdown_filters;
+        source.metrics = config.file_source().metrics().clone();
+        source.files = std::mem::take(&mut config.file_groups)
+            .into_iter()
+            .flat_map(|group| group.into_inner())
+            .collect();
+        source.config = Some(Box::new(config));
+        Ok(Ok(source))
+    }
+
+    fn attach_pruning_hints(
+        config: &mut FileScanConfig,
+        scan_filters: &[Expr],
+        projected_schema: &DFSchema,
+        session: &dyn Session,
+    ) -> Result<()> {
         // The listing provider's file predicates are inexact. Attach pruning
         // hints in projected coordinates, without removing any logical Filter.
-        let physical_hints = scan
-            .filters
+        let physical_hints = scan_filters
             .iter()
             .filter(|expr| {
                 !expr.is_volatile()
                     && expr
                         .column_refs()
                         .iter()
-                        .all(|col| scan.projected_schema.has_column(col))
+                        .all(|col| projected_schema.has_column(col))
             })
             .map(|expr| {
                 create_physical_expr(
                     expr,
-                    &scan.projected_schema,
+                    projected_schema,
                     session.execution_props(),
                     &PhysicalPlanningContext::default(),
                 )
@@ -181,7 +213,7 @@ impl ParquetScan {
                 );
             }
             if let Some(updated) = update.updated_node {
-                config = updated
+                *config = updated
                     .downcast_ref::<FileScanConfig>()
                     .ok_or_else(|| {
                         internal_datafusion_err!(
@@ -191,13 +223,195 @@ impl ParquetScan {
                     .clone();
             }
         }
-        source.metrics = config.file_source().metrics().clone();
-        source.files = std::mem::take(&mut config.file_groups)
-            .into_iter()
-            .flat_map(|group| group.into_inner())
-            .collect();
-        source.config = Some(Box::new(config));
-        Ok(Ok(source))
+        Ok(())
+    }
+
+    pub(super) fn pushdown_operators(
+        &mut self,
+        operators: &mut Vec<Operator>,
+        is_count_sink: bool,
+        scan_filters: &[Expr],
+        scan_projected_schema: &DFSchema,
+        session: &dyn Session,
+    ) -> Result<()> {
+        if !self.pushdown_filters {
+            return Ok(());
+        }
+        let Some(config) = self.config.as_mut() else {
+            return Ok(());
+        };
+
+        let leading_filters = operators
+            .iter()
+            .take_while(|op| {
+                matches!(
+                    op,
+                    Operator::Filter {
+                        projection: None,
+                        ..
+                    }
+                )
+            })
+            .count();
+        if leading_filters == 0 {
+            if !scan_filters.is_empty() {
+                if let Some(parquet) =
+                    config.file_source().downcast_ref::<ParquetSource>()
+                {
+                    config.file_source =
+                        Arc::new(parquet.clone().with_pushdown_filters(false));
+                }
+                Self::attach_pruning_hints(
+                    config,
+                    scan_filters,
+                    scan_projected_schema,
+                    session,
+                )?;
+                self.metrics = config.file_source().metrics().clone();
+            }
+            return Ok(());
+        }
+
+        let drained: Vec<_> = operators.drain(..leading_filters).collect();
+        let mut candidates = Vec::new();
+        let mut residual = Vec::new();
+        for op in drained {
+            let Operator::Filter { predicate, .. } = op else {
+                unreachable!();
+            };
+            for expr in split_conjunction(&predicate) {
+                if is_volatile(expr) {
+                    residual.push(Arc::clone(expr));
+                } else {
+                    candidates.push(Arc::clone(expr));
+                }
+            }
+        }
+        if !candidates.is_empty() {
+            let mut pushdown_cfg = session.config_options().clone();
+            pushdown_cfg.execution.parquet.pushdown_filters = true;
+            let update =
+                config.try_pushdown_filters(candidates.clone(), &pushdown_cfg)?;
+            if update.filters.len() != candidates.len() {
+                return internal_err!(
+                    "Parquet filter pushdown returned {} results for {} filters",
+                    update.filters.len(),
+                    candidates.len()
+                );
+            }
+            for (expr, pushed) in candidates.into_iter().zip(update.filters) {
+                if matches!(pushed, PushedDown::No) {
+                    residual.push(expr);
+                }
+            }
+            if let Some(updated) = update.updated_node {
+                **config = updated
+                    .downcast_ref::<FileScanConfig>()
+                    .ok_or_else(|| {
+                        internal_datafusion_err!(
+                            "Expected FileScanConfig from Parquet filter pushdown"
+                        )
+                    })?
+                    .clone();
+            }
+        }
+        if !residual.is_empty() {
+            operators.insert(
+                0,
+                Operator::Filter {
+                    predicate: conjunction(residual),
+                    projection: None,
+                },
+            );
+        }
+
+        // Narrow the Parquet output projection when pushed-down filter columns
+        // are no longer referenced by remaining operators or the sink.
+        let mut needed_cols = Vec::new();
+        let mut first_projection = None;
+        for (idx, op) in operators.iter().enumerate() {
+            match op {
+                Operator::Filter { predicate, .. } => {
+                    needed_cols.extend(
+                        collect_columns(predicate).into_iter().map(|c| c.index()),
+                    );
+                }
+                Operator::Projection(projector) => {
+                    needed_cols.extend(projector.projection().column_indices());
+                    first_projection = Some(idx);
+                    break;
+                }
+            }
+        }
+        if first_projection.is_some() || is_count_sink {
+            needed_cols.sort_unstable();
+            needed_cols.dedup();
+            if needed_cols.len() < self.schema.fields().len() {
+                let narrow = ProjectionExprs::from_indices(&needed_cols, &self.schema);
+                if let Some(updated) = config.try_swapping_with_projection(&narrow)? {
+                    let updated = updated
+                        .downcast_ref::<FileScanConfig>()
+                        .ok_or_else(|| {
+                            internal_datafusion_err!(
+                                "Expected FileScanConfig from Parquet projection pushdown"
+                            )
+                        })?
+                        .clone();
+                    let narrowed_schema = updated.projected_schema()?;
+                    if narrowed_schema.as_ref() == &self.schema.project(&needed_cols)? {
+                        let end = first_projection.map_or(operators.len(), |i| i + 1);
+                        let mut remapped = Vec::with_capacity(end);
+                        for op in &operators[..end] {
+                            match op {
+                                Operator::Filter {
+                                    predicate,
+                                    projection,
+                                } => {
+                                    debug_assert!(projection.is_none());
+                                    remapped.push(Operator::Filter {
+                                        predicate: narrow.project_expr(predicate)?,
+                                        projection: None,
+                                    });
+                                }
+                                Operator::Projection(projector) => {
+                                    let proj = projector
+                                        .projection()
+                                        .clone()
+                                        .try_map_exprs(|expr| narrow.project_expr(&expr))?
+                                        .make_projector_with_schema_metadata(
+                                            &narrowed_schema,
+                                            projector.output_schema(),
+                                        )?;
+                                    remapped.push(Operator::Projection(proj));
+                                }
+                            }
+                        }
+                        for (slot, op) in operators[..end].iter_mut().zip(remapped) {
+                            *slot = op;
+                        }
+                        **config = updated;
+                        self.schema = narrowed_schema;
+                    }
+                }
+            }
+        }
+
+        self.metrics = config.file_source().metrics().clone();
+        Ok(())
+    }
+
+    pub(super) fn pushed_predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.config.as_ref()?.file_source().exact_filter()
+    }
+
+    pub(super) fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        match &self.config {
+            Some(config) => config.apply_expressions(f),
+            None => Ok(TreeNodeRecursion::Continue),
+        }
     }
 
     pub(super) fn start(
@@ -205,12 +419,12 @@ impl ParquetScan {
         context: &TaskContext,
         tasks: &mut JoinSet<Result<Option<CountState>>>,
         workers: NonZeroUsize,
-        measurement: Option<Arc<RunMetrics>>,
+        measurement: Option<&Arc<RunMetrics>>,
     ) -> Result<ReadyReaders> {
         let read_ahead = workers.get().min(MAX_READ_AHEAD);
-        let (publish, ready) = ready::channel(
+        let (publish, phase2, ready) = ready::channel(
             read_ahead,
-            measurement.clone(),
+            measurement.cloned(),
             MetricBuilder::new(&self.metrics).counter("parquet_morsels_claimed", 0),
         );
         if let Some(config) = &self.config {
@@ -220,12 +434,13 @@ impl ParquetScan {
                 .ok_or_else(|| {
                     internal_datafusion_err!("Expected the admitted ParquetSource")
                 })?;
+            let has_pushed_filter = self.pushed_predicate().is_some();
             let work = Arc::new(FileWork {
                 morselizer: parquet.create_buffered_morselizer(config, context)?,
                 files: Arc::clone(&self.files),
                 next: AtomicUsize::new(0),
                 publish,
-                measurement,
+                measurement: measurement.cloned(),
             });
             // Each lane owns one planner and can drive at most one pending I/O
             // phase or hold one reader waiting to publish.
@@ -236,9 +451,73 @@ impl ParquetScan {
                     Ok(None)
                 });
             }
+            if has_pushed_filter && !self.files.is_empty() {
+                // Phase-2 I/O lanes fetch post-RowFilter output ranges requested
+                // by workers so workers never await object-store I/O.
+                for _ in 0..read_ahead {
+                    let phase2 = phase2.clone();
+                    let measurement = measurement.cloned();
+                    tasks.spawn(async move {
+                        run_phase2_lane(phase2, measurement).await?;
+                        Ok(None)
+                    });
+                }
+            }
         }
         Ok(ready)
     }
+}
+
+async fn run_phase2_lane(
+    phase2: Phase2Queue,
+    measurement: Option<Arc<RunMetrics>>,
+) -> Result<()> {
+    while let Some(Phase2Task {
+        mut io,
+        permit,
+        filter_guard,
+    }) = phase2.claim().await
+    {
+        loop {
+            let next = match &measurement {
+                Some(run) => Arc::clone(run).io(io).await?,
+                None => io.await?,
+            };
+            let Some(mut step) = next.plan()? else {
+                break;
+            };
+            let mut morsels = step.take_morsels();
+            let mut ready = step.take_ready_planners();
+            let pending = step.take_pending_planner();
+            if let Some(morsel) = morsels.pop() {
+                if !morsels.is_empty() || !ready.is_empty() || pending.is_some() {
+                    return internal_err!(
+                        "Expected a single decode-only Parquet morsel from Phase-2 planner"
+                    );
+                }
+                phase2.publish_morsel(morsel, permit, filter_guard);
+                break;
+            }
+            if ready.len() == 2 && pending.is_none() {
+                let rg_filter = ready.pop().unwrap();
+                phase2.publish_filter(rg_filter, permit, filter_guard);
+                break;
+            }
+            if let Some(more_io) = pending {
+                if !ready.is_empty() {
+                    return internal_err!(
+                        "Unexpected ready planner alongside Phase-2 pending I/O"
+                    );
+                }
+                io = more_io;
+                continue;
+            }
+            return internal_err!(
+                "Unexpected MorselPlan from Phase-2 Parquet continuation"
+            );
+        }
+    }
+    Ok(())
 }
 
 struct FileWork {
@@ -270,6 +549,13 @@ impl FileWork {
             let mut morsels = step.take_morsels();
             let mut ready = step.take_ready_planners();
             let pending = step.take_pending_planner();
+            if ready.len() == 2 && morsels.is_empty() && pending.is_none() {
+                let rg_filter = ready.pop().unwrap();
+                let file_continuation = ready.pop().unwrap();
+                self.publish.send_filter(rg_filter).await;
+                planner = file_continuation;
+                continue;
+            }
             if morsels.len() > 1 || ready.len() + usize::from(pending.is_some()) > 1 {
                 return internal_err!(
                     "Expected at most one Parquet reader and one file continuation per step"
