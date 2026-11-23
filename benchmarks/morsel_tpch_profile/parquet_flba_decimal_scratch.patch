@@ -1,0 +1,295 @@
+--- /home/bits/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parquet-60.1.0/src/arrow/array_reader/fixed_len_byte_array.rs	2006-07-24 01:21:28.000000000 +0000
++++ /home/bits/.cache/morsel-tpch-profile-180/parquet-60.1.0-patched/src/arrow/array_reader/fixed_len_byte_array.rs	2026-11-23 17:30:24.565016233 +0000
+@@ -32,7 +32,7 @@
+     FixedSizeBinaryArray, Float16Array, IntervalDayTimeArray, IntervalYearMonthArray,
+     OffsetSizeTrait,
+ };
+-use arrow_buffer::{Buffer, IntervalDayTime, i256};
++use arrow_buffer::{Buffer, IntervalDayTime, NullBuffer, ScalarBuffer, i256};
+ use arrow_data::ArrayDataBuilder;
+ use arrow_schema::{DataType as ArrowType, IntervalUnit};
+ use bytes::Bytes;
+@@ -125,6 +125,20 @@
+         }
+     }
+
++    if let ArrowType::Decimal128(p, s) = data_type
++        && std::env::var_os("MORSEL_SCRATCH_FLBA_DIRECT").is_some()
++    {
++        return Ok(Box::new(DirectDecimal128Reader::new(
++            pages,
++            column_desc,
++            data_type,
++            p,
++            s,
++            batch_size,
++            padding_threshold,
++        )));
++    }
++
+     Ok(Box::new(FixedLenByteArrayReader::new(
+         pages,
+         column_desc,
+@@ -135,6 +149,262 @@
+     )))
+ }
+
++#[inline]
++fn decode_be_i128(b: &[u8]) -> i128 {
++    if b.len() == 7 {
++        let sign: u8 = if (b[0] & 0x80) != 0 { 0xFF } else { 0x00 };
++        let bytes = [sign, b[0], b[1], b[2], b[3], b[4], b[5], b[6]];
++        i64::from_be_bytes(bytes) as i128
++    } else {
++        i128::from_be_bytes(sign_extend_be(b))
++    }
++}
++
++struct DirectDecimal128Reader {
++    data_type: ArrowType,
++    precision: u8,
++    scale: i8,
++    pages: Box<dyn PageIterator>,
++    def_levels_buffer: Option<Vec<i16>>,
++    rep_levels_buffer: Option<Vec<i16>>,
++    record_reader: GenericRecordReader<Vec<i128>, Decimal128ValueDecoder>,
++}
++
++impl DirectDecimal128Reader {
++    fn new(
++        pages: Box<dyn PageIterator>,
++        column_desc: ColumnDescPtr,
++        data_type: ArrowType,
++        precision: u8,
++        scale: i8,
++        batch_size: usize,
++        padding_threshold: Option<i16>,
++    ) -> Self {
++        let mut record_reader = GenericRecordReader::new(column_desc, batch_size);
++        if let Some(threshold) = padding_threshold {
++            record_reader.set_padding_threshold(threshold);
++        }
++        Self {
++            data_type,
++            precision,
++            scale,
++            pages,
++            def_levels_buffer: None,
++            rep_levels_buffer: None,
++            record_reader,
++        }
++    }
++}
++
++impl ArrayReader for DirectDecimal128Reader {
++    fn as_any(&self) -> &dyn Any {
++        self
++    }
++
++    fn get_data_type(&self) -> &ArrowType {
++        &self.data_type
++    }
++
++    fn read_records(&mut self, batch_size: usize) -> Result<usize> {
++        read_records(&mut self.record_reader, self.pages.as_mut(), batch_size)
++    }
++
++    fn consume_batch(&mut self) -> Result<ArrayRef> {
++        let len = self.record_reader.values_written();
++        let values = self.record_reader.consume_record_data();
++        debug_assert_eq!(values.len(), len);
++        let nulls = self
++            .record_reader
++            .consume_compact_bitmap()
++            .map(|buf| NullBuffer::new(arrow_buffer::BooleanBuffer::new(buf, 0, len)));
++        let array = Decimal128Array::new(ScalarBuffer::from(values), nulls)
++            .with_precision_and_scale(self.precision, self.scale)?;
++        self.def_levels_buffer = self.record_reader.consume_def_levels();
++        self.rep_levels_buffer = self.record_reader.consume_rep_levels();
++        self.record_reader.reset();
++        Ok(Arc::new(array) as ArrayRef)
++    }
++
++    fn skip_records(&mut self, num_records: usize) -> Result<usize> {
++        skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
++    }
++
++    fn get_def_levels(&self) -> Option<&[i16]> {
++        self.def_levels_buffer.as_deref()
++    }
++
++    fn get_rep_levels(&self) -> Option<&[i16]> {
++        self.rep_levels_buffer.as_deref()
++    }
++
++    fn max_def_level(&self) -> i16 {
++        self.record_reader.max_def_level()
++    }
++}
++
++struct Decimal128ValueDecoder {
++    byte_length: usize,
++    dict_i128: Vec<i128>,
++    decoder: Option<Decoder>,
++}
++
++impl ColumnValueDecoder for Decimal128ValueDecoder {
++    type Buffer = Vec<i128>;
++
++    fn new(col: &ColumnDescPtr) -> Self {
++        Self {
++            byte_length: col.type_length() as usize,
++            dict_i128: Vec::new(),
++            decoder: None,
++        }
++    }
++
++    fn set_dict(
++        &mut self,
++        buf: Bytes,
++        num_values: u32,
++        encoding: Encoding,
++        _is_sorted: bool,
++    ) -> Result<()> {
++        if !matches!(
++            encoding,
++            Encoding::PLAIN | Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
++        ) {
++            return Err(nyi_err!(
++                "Invalid/Unsupported encoding type for dictionary: {}",
++                encoding
++            ));
++        }
++        let buf = normalize_fixed_len_byte_array_payload(
++            buf,
++            num_values as usize,
++            self.byte_length,
++            "dictionary page",
++        )?;
++        self.dict_i128.clear();
++        self.dict_i128.reserve(num_values as usize);
++        if self.byte_length > 0 {
++            for chunk in buf.chunks_exact(self.byte_length) {
++                self.dict_i128.push(decode_be_i128(chunk));
++            }
++        }
++        Ok(())
++    }
++
++    fn set_data(
++        &mut self,
++        encoding: Encoding,
++        data: Bytes,
++        num_levels: usize,
++        num_values: Option<usize>,
++    ) -> Result<()> {
++        self.decoder = Some(match encoding {
++            Encoding::PLAIN => Decoder::Plain {
++                buf: data,
++                offset: 0,
++            },
++            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => Decoder::Dict {
++                decoder: DictIndexDecoder::new(data, num_levels, num_values)?,
++            },
++            Encoding::DELTA_BYTE_ARRAY => Decoder::Delta {
++                decoder: DeltaByteArrayDecoder::new(data)?,
++            },
++            Encoding::BYTE_STREAM_SPLIT => Decoder::ByteStreamSplit {
++                buf: data,
++                offset: 0,
++            },
++            _ => {
++                return Err(general_err!(
++                    "unsupported encoding for fixed length byte array: {}",
++                    encoding
++                ));
++            }
++        });
++        Ok(())
++    }
++
++    fn read(&mut self, out: &mut Self::Buffer, num_values: usize) -> Result<usize> {
++        if self.byte_length == 0 {
++            out.resize(out.len() + num_values, 0);
++            return Ok(num_values);
++        }
++        match self.decoder.as_mut().unwrap() {
++            Decoder::Dict { decoder } => {
++                let dict = &self.dict_i128;
++                if dict.is_empty() {
++                    return Ok(0);
++                }
++                decoder.read(num_values, |keys| {
++                    out.reserve(keys.len());
++                    for &key in keys {
++                        out.push(dict[key as usize]);
++                    }
++                    Ok(())
++                })
++            }
++            Decoder::Plain { offset, buf } => {
++                let to_read =
++                    (num_values * self.byte_length).min(buf.len() - *offset) / self.byte_length;
++                let end_offset = *offset + to_read * self.byte_length;
++                out.reserve(to_read);
++                for chunk in buf.as_ref()[*offset..end_offset].chunks_exact(self.byte_length) {
++                    out.push(decode_be_i128(chunk));
++                }
++                *offset = end_offset;
++                Ok(to_read)
++            }
++            Decoder::Delta { decoder } => {
++                let to_read = num_values.min(decoder.remaining());
++                out.reserve(to_read);
++                decoder.read(to_read, |slice| {
++                    if slice.len() != self.byte_length {
++                        return Err(general_err!(
++                            "encountered array with incorrect length, got {} expected {}",
++                            slice.len(),
++                            self.byte_length
++                        ));
++                    }
++                    out.push(decode_be_i128(slice));
++                    Ok(())
++                })
++            }
++            Decoder::ByteStreamSplit { buf, offset } => {
++                let total_values = buf.len() / self.byte_length;
++                let to_read = num_values.min(total_values - *offset);
++                let mut tmp = Vec::with_capacity(to_read * self.byte_length);
++                read_byte_stream_split(&mut tmp, buf, *offset, to_read, self.byte_length);
++                out.reserve(to_read);
++                for chunk in tmp.chunks_exact(self.byte_length) {
++                    out.push(decode_be_i128(chunk));
++                }
++                *offset += to_read;
++                Ok(to_read)
++            }
++        }
++    }
++
++    fn skip_values(&mut self, num_values: usize) -> Result<usize> {
++        if self.byte_length == 0 {
++            return Ok(num_values);
++        }
++        match self.decoder.as_mut().unwrap() {
++            Decoder::Plain { offset, buf } => {
++                let to_read = num_values.min((buf.len() - *offset) / self.byte_length);
++                *offset += to_read * self.byte_length;
++                Ok(to_read)
++            }
++            Decoder::Dict { decoder } => decoder.skip(num_values),
++            Decoder::Delta { decoder } => decoder.skip(num_values),
++            Decoder::ByteStreamSplit { offset, buf } => {
++                let total_values = buf.len() / self.byte_length;
++                let to_read = num_values.min(total_values - *offset);
++                *offset += to_read;
++                Ok(to_read)
++            }
++        }
++    }
++}
++
+ struct FixedLenByteArrayReader {
+     data_type: ArrowType,
+     byte_length: usize,
