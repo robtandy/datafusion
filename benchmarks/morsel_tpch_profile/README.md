@@ -16,13 +16,16 @@ gap to **DuckDB 2.0.1**.
 ## Bottom Line
 
 Post-`#149`/`#150`/`#166`, **Morsel DataFusion (`morsel_no_pushdown`)** improved
-from `47.3 ms` → **`46.4 ms`** fresh total (`35.6 ms` warm exec) on `q6_count`
-and from `105.8 ms` → **`94.0 ms`** fresh total (`75.4 ms` warm exec; 16
-coalesced batches vs. 736 pre-`#149`) on `q6_scan`, beating `stock_default` by
-`10.1 ms` on `q6_count` and `13.8 ms` on `q6_scan`. Yet **DuckDB 2.0.1** still
-finishes in **`25.1 ms`** fresh (`20.9 ms` warm) on `q6_count` (**`+21.3 ms`**
-fresh / **`+14.7 ms`** warm gap) and **`68.3 ms`** fresh (`52.7 ms` warm) on
-`q6_scan` (**`+25.7 ms`** fresh / **`+22.7 ms`** warm gap).
+from `47.3 ms` → **`46.4 ms`** fresh total (`35.6 ms` warm exec-only / `36.8 ms`
+warm plan+exec) on `q6_count` and from `105.8 ms` → **`94.0 ms`** fresh total
+(`75.4 ms` warm exec-only / `76.5 ms` warm plan+exec; 16 coalesced batches vs.
+736 pre-`#149`) on `q6_scan`, beating `stock_default` by `10.1 ms` on `q6_count`
+and `13.8 ms` on `q6_scan`. Yet **DuckDB 2.0.1** still finishes in **`25.1 ms`**
+fresh (`17.2 ms` warm exec-only / `20.6 ms` warm plan+exec Arrow drain) on
+`q6_count` (**`+21.3 ms`** fresh / **`+18.4 ms`** warm exec-only / **`+16.2 ms`**
+warm plan+exec gap) and **`68.3 ms`** fresh (`48.6 ms` warm exec-only /
+`52.7 ms` warm plan+exec Arrow drain) on `q6_scan` (**`+25.7 ms`** fresh /
+**`+26.8 ms`** warm exec-only / **`+23.8 ms`** warm plan+exec gap).
 
 **One single bottleneck explains nearly the entire execution gap on both
 queries:**
@@ -37,42 +40,51 @@ queries:**
   into a temporary `FixedSizeBinaryArray` (`35.8%` of `q6_count` cycles) and
   then runs a second pass of **12–18 million `sign_extend_be` +
   `i128::from_be_bytes` conversions** (`34.4%` of `q6_count` cycles).
-- **Direct empirical proof on the exact, unmodified `#165` SF1 Parquet files:**
-  a ~130-line disposable `DirectDecimal128Reader` scratch patch to
-  `parquet 60.1.0` (pre-decoding the dictionary once into `Vec<i128>` and
-  gathering `dict[key]` directly) cut `morsel_no_pushdown` warm exec on
-  `q6_count` from **`37.2 ms` → `16.9 ms`** (**`-20.3 ms`, `2.20×` faster —
-  beating DuckDB's `20.9 ms` warm by `4.0 ms`!**) and fresh total from
-  `46.7 ms` → **`27.8 ms`** (within `2.7 ms` of DuckDB's `25.1 ms`), and cut
-  `q6_scan` warm exec from **`75.6 ms` → `52.3 ms`** (**`-23.3 ms`, `1.45×`
-  faster — matching DuckDB's `52.7 ms` warm!**) and fresh total from
-  `92.2 ms` → **`69.6 ms`** (within `1.3 ms` of DuckDB's `68.3 ms`).
+- **Direct empirical proof on the exact, unmodified `#165` SF1 Parquet files
+  (single paired quiet-host session):** a ~130-line disposable
+  `DirectDecimal128Reader` scratch patch to `parquet 60.1.0` (pre-decoding the
+  dictionary once into `Vec<i128>` and gathering `dict[key]` directly) cut
+  `morsel_no_pushdown` warm exec-only on `q6_count` from **`35.8 ms` →
+  `16.7 ms`** (**`−19.1 ms`, `2.14×` faster — reaching parity with DuckDB's
+  `17.2 ms` warm exec-only!**) and fresh total from `45.5 ms` → **`25.8 ms`**
+  (**`−19.7 ms`**, at parity with DuckDB's `25.5 ms` fresh). On `q6_scan`, it
+  cut warm exec-only from **`76.0 ms` → `50.2 ms`** (**`−25.8 ms`, `1.51×`
+  faster** — still **`+1.6 ms`** behind DuckDB's `48.6 ms` warm exec-only, while
+  `direct_flba_stock` reaches `47.9 ms` exec-only / `64.8 ms` fresh, at parity
+  with DuckDB's `48.6 ms` / `64.9 ms`).
 - **The remaining gaps are clearly separated and quantified:**
   - **Fresh-process registration + planning overhead** accounts for **`7.3 ms`**
     in DataFusion (`4.6 ms` Parquet footer reads / schema inference + `2.7 ms`
-    first-query planning) vs. ~`4.2 ms` first-query overhead in DuckDB (`~3.1 ms`
-    net fresh-process disadvantage).
-  - **Zstd decompression is NOT the bottleneck on `q6_count` (`2.9%` of cycles)**,
-    because `l_shipdate`, `l_discount`, and `l_quantity` are low-ratio
-    dictionary index pages (`1.00–1.14×`). On `q6_scan`, Zstd decompression of
-    `l_extendedprice` (31.2 MB compressed, `1.65×`) + `l_orderkey` (9.6 MB) is
-    `25.8%` of cycles (~`19 ms` wall), which DuckDB must also decompress because
-    1.90% uniformly scattered matches touch every page.
+    first-query planning), compared to DuckDB's `~8.3 ms` total fresh-to-warm
+    exec delta on `q6_count` (`25.5 − 17.2 ms`, including footer reads,
+    planning, buffer-pool warmup, and Arrow bridge).
+  - **Zstd decompression is NOT the bottleneck on `q6_count` (`2.9%` of
+    cycles)**, because `l_shipdate`, `l_discount`, and `l_quantity` are
+    low-ratio dictionary index pages (`1.00–1.14×`). On `q6_scan`, Zstd
+    decompression of `l_extendedprice` (31.2 MB compressed, `1.65×`) +
+    `l_orderkey` (9.6 MB) is `25.8%` of cycles (~`19 ms` wall), which DuckDB
+    must also decompress because 1.90% uniformly scattered matches touch every
+    page.
   - **Post-decode predicate evaluation (`process_work`) is small**: `32.9 ms`
     aggregate across 8 workers (`4.1 ms` wall, `11.4%` of cycles) on `q6_count`
     and `43.2 ms` (`5.4 ms` wall, `5.7%` of cycles) on `q6_scan`. DataFusion
     emits zero casts on `Decimal128` or `Date32`. Naive Arrow `filter()`-based
     conjunct short-circuiting on already-decoded batches actually _increased_
-    `process_work` (`32.9 → 38.0 ms`) because materializing 15% of `i128` rows
+    `process_work` (`33.3 → 38.1 ms`) because materializing 15% of `i128` rows
     costs more than scanning the L2-resident `Decimal128Array`.
   - **`pushdown_filters=true` (`RowFilter`) regresses (`+13.7 ms` on `q6_count`,
-    `+34.5 ms` on `q6_scan`)** for two concrete reasons: (a)
+    `+34.5 ms` on `q6_scan`)** for two distinct reasons: (a)
+    `reorder_filters=true` evaluates smallest-bytes-first (`l_discount` →
+    `l_quantity` → `l_shipdate`) instead of SQL order (`l_shipdate` first),
+    costing `+4.3 ms` on `q6_count` and `+5.4 ms` on `q6_scan` (`pushdown_base`
+    vs. existing config `pushdown_noreorder`), and (b)
     `prebuild_row_filter_candidates` splits `l_discount BETWEEN 0.05 AND 0.07`
     and `l_shipdate >= ... AND < ...` into **5 separate `ArrowPredicate`s**,
-    decoding `l_shipdate` 2× and `l_discount` 2–3×, and (b)
-    `RowSelection::and_then` burns `15.3%` of `q6_count` cycles (`8.2%` on
-    `q6_scan`). Merging same-column conjuncts and evaluating `l_shipdate` first
-    recovers **`-9.5 ms`** on `q6_count` and **`-9.2 ms`** on `q6_scan`.
+    decoding `l_shipdate` 2× and `l_discount` 2–3× while burning `15.3%` of
+    `q6_count` cycles in `RowSelection::and_then`. Merging same-column conjuncts
+    alone (`pushdown_base → pushdown_grouped`) saves **`−5.8 ms`** on `q6_count`
+    and **`−2.9 ms`** on `q6_scan` (`−5.1 ms` / `−1.7 ms` incremental on top of
+    `reorder_filters=false`, for **`−9.4 ms` / `−7.1 ms`** combined).
   - **Smaller batch sizes (`2048`) hurt DataFusion despite better L2 locality:**
     hardware counters confirm `2048` cuts L2D cache refills by **33%**
     (`1,626K → 1,091K`), but quadrupling batches adds **`+97.6M` instructions**
@@ -149,24 +161,32 @@ DataFusion starts the clock before `register_parquet` (`reg` + `plan` + `exec` =
 
 ### Warm In-Session Execution (Excluding Table Registration, 7 repeats after 2 warmups)
 
-| Query      | Arm                          | Warm plan ms | Warm exec ms | Warm plan+exec ms | Warm CPU ms | Notes                                                |
-| ---------- | ---------------------------- | -----------: | -----------: | ----------------: | ----------: | ---------------------------------------------------- |
-| `q6_count` | `stock_no_pushdown`          |          1.6 |         36.8 |              38.4 |       268.3 | Same `SessionContext`, re-planned each iteration     |
-| `q6_count` | **`morsel_no_pushdown`**     |      **1.2** |     **35.6** |          **36.8** |   **263.3** | `exec_only` loop: `35.5 ms`                          |
-| `q6_count` | `morsel_pruning`             |          1.7 |         36.8 |              38.5 |       277.3 | `statistics_eval_time` ~2.2 ms aggregate, 0 pruned   |
-| `q6_count` | `morsel_pushdown`            |          1.7 |         50.2 |              51.9 |       325.9 | `exec_only` loop: `48.3 ms`                          |
-| `q6_count` | `morsel_pushdown_noreorder`  |          1.7 |         44.5 |              46.2 |       298.2 | `exec_only` loop: `45.0 ms`                          |
-| `q6_count` | `stock_default`              |          2.2 |         45.9 |              48.1 |           — | Byte-range splitting adds ~9 ms vs `no_pushdown`     |
-| `q6_count` | `stock_pushdown`             |          2.2 |         57.8 |              59.9 |           — | `RowFilter` + byte-range split                       |
-| `q6_count` | **`duckdb_default` (Arrow)** |      **1.7** |     **19.2** |          **20.9** |   **127.4** | `fetchall()`: `18.8 ms`; Arrow bridge adds ~`1.7 ms` |
-| `q6_scan`  | `stock_no_pushdown`          |          1.4 |         76.4 |              77.8 |       553.1 | Same `SessionContext`, re-planned each iteration     |
-| `q6_scan`  | **`morsel_no_pushdown`**     |      **1.1** |     **75.4** |          **76.5** |   **565.3** | `exec_only` loop: `76.9 ms`                          |
-| `q6_scan`  | `morsel_pruning`             |          1.6 |         79.7 |              81.3 |       580.3 | 0 / 48 row groups pruned                             |
-| `q6_scan`  | `morsel_pushdown`            |          1.6 |        109.6 |             111.2 |       755.8 | `exec_only` loop: `112.2 ms`                         |
-| `q6_scan`  | `morsel_pushdown_noreorder`  |          1.6 |        105.7 |             107.4 |       729.0 | `exec_only` loop: `109.0 ms`                         |
-| `q6_scan`  | `stock_default`              |          2.0 |         92.0 |              94.0 |           — | Byte-range splitting overhead                        |
-| `q6_scan`  | `stock_pushdown`             |          2.0 |        129.4 |             131.3 |           — | `RowFilter` + byte-range split                       |
-| `q6_scan`  | **`duckdb_default` (Arrow)** |      **1.7** |     **51.3** |          **52.7** |   **371.2** | Internal query time `51.3 ms`; Arrow bridge `1.4 ms` |
+DuckDB's JSON profile `query.total_time` includes `planner + optimizer +
+physical_planner` (~`1.7 ms`). Therefore we compute DuckDB **warm exec-only** as
+`total_time − (planner + optimizer + physical_planner)` (median across 7
+profiled iterations) so DataFusion `exec-only` compares apples-to-apples against
+DuckDB `exec-only`, and DataFusion `plan+exec` compares apples-to-apples against
+DuckDB `to_arrow_reader` wall time (which includes DuckDB planning + execution +
+Arrow C-stream export).
+
+| Query      | Arm                          | Warm plan ms | Warm exec-only ms | Warm plan+exec ms | Warm CPU ms | Notes                                                                                          |
+| ---------- | ---------------------------- | -----------: | ----------------: | ----------------: | ----------: | ---------------------------------------------------------------------------------------------- |
+| `q6_count` | `stock_no_pushdown`          |          1.6 |              36.8 |              38.4 |       268.3 | Same `SessionContext`, re-planned each iteration                                               |
+| `q6_count` | **`morsel_no_pushdown`**     |      **1.2** |          **35.6** |          **36.8** |   **263.3** | `exec_only` loop: `35.5 ms`                                                                    |
+| `q6_count` | `morsel_pruning`             |          1.7 |              36.8 |              38.5 |       277.3 | `statistics_eval_time` ~2.2 ms aggregate, 0 pruned                                             |
+| `q6_count` | `morsel_pushdown`            |          1.7 |              50.2 |              51.9 |       325.9 | `exec_only` loop: `48.3 ms`                                                                    |
+| `q6_count` | `morsel_pushdown_noreorder`  |          1.7 |              44.5 |              46.2 |       298.2 | `exec_only` loop: `45.0 ms`                                                                    |
+| `q6_count` | `stock_default`              |          2.2 |              45.9 |              48.1 |           — | Byte-range splitting adds ~9 ms vs `no_pushdown`                                               |
+| `q6_count` | `stock_pushdown`             |          2.2 |              57.8 |              59.9 |           — | `RowFilter` + byte-range split                                                                 |
+| `q6_count` | **`duckdb_default` (Arrow)** |      **1.7** |          **17.2** |          **20.6** |   **126.6** | Profile `total_time = 18.9 ms` (`plan 1.7 + exec 17.2`); `fetchall = 19.4 ms`; Arrow `20.6 ms` |
+| `q6_scan`  | `stock_no_pushdown`          |          1.4 |              76.4 |              77.8 |       553.1 | Same `SessionContext`, re-planned each iteration                                               |
+| `q6_scan`  | **`morsel_no_pushdown`**     |      **1.1** |          **75.4** |          **76.5** |   **565.3** | `exec_only` loop: `76.9 ms`                                                                    |
+| `q6_scan`  | `morsel_pruning`             |          1.6 |              79.7 |              81.3 |       580.3 | 0 / 48 row groups pruned                                                                       |
+| `q6_scan`  | `morsel_pushdown`            |          1.6 |             109.6 |             111.2 |       755.8 | `exec_only` loop: `112.2 ms`                                                                   |
+| `q6_scan`  | `morsel_pushdown_noreorder`  |          1.6 |             105.7 |             107.4 |       729.0 | `exec_only` loop: `109.0 ms`                                                                   |
+| `q6_scan`  | `stock_default`              |          2.0 |              92.0 |              94.0 |           — | Byte-range splitting overhead                                                                  |
+| `q6_scan`  | `stock_pushdown`             |          2.0 |             129.4 |             131.3 |           — | `RowFilter` + byte-range split                                                                 |
+| `q6_scan`  | **`duckdb_default` (Arrow)** |      **1.7** |          **48.6** |          **52.7** |   **369.5** | Profile `total_time = 50.3 ms` (`plan 1.7 + exec 48.6`); Arrow drain `52.7 ms`                 |
 
 ### `#138` Morsel Per-Run Metrics & DuckDB Operator Profile
 
@@ -192,62 +212,67 @@ per worker** (`6.5 / 8`) on `q6_count` and **2.1 ms per worker** (`16.5 / 8`) on
 `q6_scan`, and `output_wait` is **0.0 ms**. **`decode_work` accounts for 87.1%
 of active worker time on `q6_count` and 91.7% on `q6_scan`.**
 
-**DuckDB 2.0.1 internal operator profile (`PRAGMA enable_profiling = 'json'`):**
+**DuckDB 2.0.1 internal operator profile (`PRAGMA enable_profiling = 'json'`,
+7-repeat median):**
 
-- **`q6_count`** (`total_time = 19.16 ms`, `cpu_time = 125.55 ms`,
-  `blocked_thread_time = 0.74 ms`, `bytes_scanned = 16,509,334`):
-  - `planner` (`1.13 ms`) + `optimizer` (`0.54 ms`) + `physical_planner`
-    (`0.02 ms`) = **`1.69 ms`**
-  - `READ_PARQUET` (with all 3 filters pushed): **`123.93 ms` CPU** (160 read
-    ops, `5.61 ms` read time, 48/48 RGs)
-  - `PROJECTION` (constant `42`): `0.94 ms` CPU; `UNGROUPED_AGGREGATE`:
-    `0.68 ms` CPU
-- **`q6_scan`** (`total_time = 51.28 ms`, `cpu_time = 365.29 ms`,
-  `blocked_thread_time = 0.09 ms`, `bytes_scanned = 57,252,505`):
-  - `planner` + `optimizer` + `physical_planner` = **`1.70 ms`**
+- **`q6_count`** (`total_time = 18.92 ms`, `plan = 1.68 ms`,
+  **`exec_only = 17.24 ms`** (`16.45–17.40 ms`), `cpu_time = 122.81 ms`,
+  `blocked_thread_time = 0.60 ms`, `bytes_scanned = 16,509,334`):
+  - `planner` (`1.12 ms`) + `optimizer` (`0.52 ms`) + `physical_planner`
+    (`0.04 ms`) = **`1.68 ms`**
+  - `READ_PARQUET` (with all 3 filters pushed): **`121.16 ms` CPU** (160 read
+    ops, `5.63 ms` read time, 48/48 RGs)
+  - `PROJECTION` (constant `42`): `0.95 ms` CPU; `UNGROUPED_AGGREGATE`:
+    `0.70 ms` CPU
+- **`q6_scan`** (`total_time = 50.33 ms`, `plan = 1.72 ms`,
+  **`exec_only = 48.60 ms`** (`47.74–50.01 ms`), `cpu_time = 364.30 ms`,
+  `blocked_thread_time = 1.34 ms`, `bytes_scanned = 57,252,505`):
+  - `planner` (`1.17 ms`) + `optimizer` (`0.54 ms`) + `physical_planner`
+    (`0.02 ms`) = **`1.72 ms`**
   - `READ_PARQUET` (projects `l_orderkey, l_extendedprice, l_discount`; all 3
-    filters pushed): **`354.92 ms` CPU** (157 read ops, `16.94 ms` read time)
-  - `PROJECTION` (`l_orderkey, l_extendedprice * l_discount`): `5.83 ms` CPU;
-    `RESULT_COLLECTOR`: `4.54 ms` CPU
+    filters pushed): **`353.49 ms` CPU** (158 read ops, `28.55 ms` read time)
+  - `PROJECTION` (`l_orderkey, l_extendedprice * l_discount`): `5.54 ms` CPU;
+    `RESULT_COLLECTOR`: `5.26 ms` CPU
 
 ## 2. Millisecond Waterfall: Decomposing the Gap to DuckDB
 
-### Waterfall A: `q6_count` (`46.4 ms` Fresh / `35.6 ms` Warm Exec vs. DuckDB `25.1 ms` Fresh / `20.9 ms` Warm)
+To avoid mixing baselines across runs, **every figure in both waterfalls below
+comes from one single paired quiet-host session** (`sf1_flba_paired.jsonl` +
+`sf1_duckdb_fresh_paired.jsonl` + `sf1_duckdb_warm_paired.jsonl`, 7 repeats
+each, `taskset -c 0-7`, 92–99% host idle). Every row is an exact measured delta
+between consecutive milestones (`B − A`), with zero fudge factors.
 
-| Component                                                                                                           | Fresh gap (ms) | Warm exec gap (ms) | Evidence / Basis                                                                                                     |
-| ------------------------------------------------------------------------------------------------------------------- | -------------: | -----------------: | -------------------------------------------------------------------------------------------------------------------- |
-| **Starting point: `morsel_no_pushdown` at HEAD `9c3079473`**                                                        |    **46.4 ms** |        **35.6 ms** | Median of 7 repeats (`taskset -c 0-7`, 8 threads)                                                                    |
-| 1. `FLBA(7)` → `Decimal128` 2-pass decode (`memcpy` + `from_unary`)                                                 |   **−18.9 ms** |       **−20.3 ms** | `70.2%` of CPU cycles in `perf record`; **measured `-20.3 ms` warm / `-18.9 ms` fresh** in `DirectDecimal128Reader`! |
-| 2. Fixed startup delta: `register_parquet` (`4.6 ms`) + `plan` (`2.7 ms`) vs DuckDB first-query overhead (`4.2 ms`) |    **−3.1 ms** |                  — | Fresh `reg + plan = 7.3 ms` vs DuckDB `25.1 − 20.9 = 4.2 ms`; warm plan is `1.2 ms` vs DuckDB `1.7 ms`               |
-| 3. Residual post-FLBA decode & scheduling vs DuckDB                                                                 |    **+0.7 ms** |        **+5.6 ms** | Post-FLBA `morsel_no_pushdown` warm exec is **`16.9 ms`** — **already `4.0 ms` FASTER than DuckDB's `20.9 ms`!**     |
-| **Target: DuckDB 2.0.1 (`duckdb_default`)**                                                                         |    **25.1 ms** |        **20.9 ms** | Fresh `25.1 ms`; warm Arrow drain `20.9 ms` (`19.2 ms` internal)                                                     |
+### Waterfall A: `q6_count` (`45.5 ms` Fresh / `35.8 ms` Warm Exec vs. DuckDB `25.5 ms` Fresh / `17.2 ms` Warm Exec-Only)
 
-_Note on the post-FLBA warm breakdown (`16.9 ms` wall / `117.9 ms` CPU on
-`q6_count`):_ `decode_work` drops from `222.9 → 69.4 ms` (`8.7 ms`/worker:
-Zstd/RLE/bit-unpack + `i128` gather for 3 columns), `process_work` stays
-`32.8 ms` (`4.1 ms`/worker: 128-bit & 32-bit predicate eval + `true_count`),
-`ready_wait` + scheduling + tail imbalance is ~`4.1 ms`/worker. Once
-`FLBA(7) → Decimal128` is fixed, Morsel DataFusion's execution engine **already
-beats DuckDB on `q6_count` (`16.9 ms` vs `20.9 ms` warm)** without even needing
-dictionary filter pushdown, leaving only DataFusion's `+3.1 ms` fresh-process
-registration/planning overhead (`27.8 ms` vs `25.1 ms`)!
+| Step / Derived Formula                                                           | Fresh total (ms) | Warm exec-only (ms) | Derivation / Evidence                                                                                |
+| -------------------------------------------------------------------------------- | ---------------: | ------------------: | ---------------------------------------------------------------------------------------------------- |
+| **Start: `baseline_flba` (`morsel_no_pushdown` at HEAD `9c3079473`)**            |      **45.5 ms** |         **35.8 ms** | Paired 7-repeat median (`263.5 ms` CPU; `decode = 213.9 ms`, `process = 32.6 ms`)                    |
+| 1. `FLBA(7) → Decimal128` 2-pass decode (`direct_flba_dec128 − baseline_flba`)   |     **−19.7 ms** |        **−19.1 ms** | `25.8 − 45.5 = −19.7 ms` fresh; `16.7 − 35.8 = −19.1 ms` warm (`70.2%` of cycles in `perf record`)   |
+| _Subtotal: `direct_flba_dec128` (`morsel_no_pushdown` with direct FLBA decode)_  |        _25.8 ms_ |           _16.7 ms_ | _`117.5 ms` CPU (`decode = 67.4 ms`, `process = 32.7 ms`)_                                           |
+| 2. Fresh startup delta: `DF(fresh − warm_exec) − DuckDB(fresh − warm_exec_only)` |      **−0.8 ms** |                   — | `(25.8 − 16.7) − (25.5 − 17.2) = 9.1 − 8.3 = −0.8 ms` (DataFusion `reg+plan+cold` vs DuckDB 1st-run) |
+| 3. Post-FLBA warm exec delta: `DuckDB exec_only − direct_flba_dec128`            |      **+0.5 ms** |         **+0.5 ms** | `17.2 − 16.7 = +0.5 ms` (within parity: `15.7–17.9 ms` vs DuckDB `16.5–17.4 ms`)                     |
+| **Target: DuckDB 2.0.1 (`duckdb_default`)**                                      |      **25.5 ms** |         **17.2 ms** | Fresh Arrow `25.5 ms`; warm `exec_only = 17.2 ms` (`total 18.9 − plan 1.7`; warm Arrow `20.6 ms`)    |
 
-### Waterfall B: `q6_scan` (`94.0 ms` Fresh / `75.4 ms` Warm Exec vs. DuckDB `68.3 ms` Fresh / `52.7 ms` Warm)
+_Exact sum check:_ Fresh `45.5 − 19.7 − 0.8 + 0.5 = 25.5 ms`; Warm exec-only
+`35.8 − 19.1 + 0.5 = 17.2 ms`. Once `FLBA(7) → Decimal128` is fixed,
+`morsel_no_pushdown` is at parity with DuckDB on `q6_count` (`16.7 ms` vs.
+`17.2 ms` warm exec-only; `25.8 ms` vs. `25.5 ms` fresh total).
 
-| Component                                                                                 | Fresh gap (ms) | Warm exec gap (ms) | Evidence / Basis                                                                                                                        |
-| ----------------------------------------------------------------------------------------- | -------------: | -----------------: | --------------------------------------------------------------------------------------------------------------------------------------- |
-| **Starting point: `morsel_no_pushdown` at HEAD `9c3079473`**                              |    **94.0 ms** |        **75.4 ms** | Median of 7 repeats (`taskset -c 0-7`, 8 threads, 16 coalesced batches)                                                                 |
-| 1. `FLBA(7)` → `Decimal128` 2-pass decode (`l_discount`, `l_quantity`, `l_extendedprice`) |   **−22.6 ms** |       **−23.3 ms** | `54.1%` of CPU cycles in `perf record`; **measured `-23.3 ms` warm / `-22.6 ms` fresh** in `DirectDecimal128Reader`!                    |
-| 2. Morsel scheduling / `ready_wait` + per-batch `yield_now()` vs Stock                    |    **−2.5 ms** |        **−3.0 ms** | `ready_wait = 16.5 ms` (`2.1 ms`/worker) + `no_batch_yield` (`-1.7 ms` warm); `direct_flba_stock` hits `48.3 ms` warm / `65.4 ms` fresh |
-| 3. Fixed startup (`reg + plan` = `7.1 ms`) + residual vs DuckDB                           |    **−0.6 ms** |        **+3.6 ms** | Post-FLBA `morsel_no_pushdown` hits **`52.3 ms` warm** (`372.7 ms` CPU) vs DuckDB **`52.7 ms` warm** (`371.2 ms` CPU)                   |
-| **Target: DuckDB 2.0.1 (`duckdb_default`)**                                               |    **68.3 ms** |        **52.7 ms** | Fresh `68.3 ms`; warm Arrow drain `52.7 ms` (`51.3 ms` internal)                                                                        |
+### Waterfall B: `q6_scan` (`91.3 ms` Fresh / `76.0 ms` Warm Exec vs. DuckDB `64.9 ms` Fresh / `48.6 ms` Warm Exec-Only)
 
-_After fixing `FLBA(7) → Decimal128`, `q6_scan` warm execution drops from
-`75.6 ms` → **`52.3 ms`** (`372.7 ms` CPU), matching DuckDB (`52.7 ms`,
-`371.2 ms` CPU)!_ Further wins beyond parity come from (a) skipping
-`l_extendedprice`/`l_orderkey` value decoding for the 98.1% non-matching rows
-once `RowFilter` is fixed, and (b) reducing `q6_scan`'s `4.0 ms` Morsel vs.
-Stock gap (`52.3 ms` vs. `48.3 ms` post-FLBA).
+| Step / Derived Formula                                                               | Fresh total (ms) | Warm exec-only (ms) | Derivation / Evidence                                                                                                             |
+| ------------------------------------------------------------------------------------ | ---------------: | ------------------: | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Start: `baseline_flba` (`morsel_no_pushdown` at HEAD `9c3079473`)**                |      **91.3 ms** |         **76.0 ms** | Paired 7-repeat median (`563.2 ms` CPU; `decode = 485.8 ms`, `process = 43.7 ms`)                                                 |
+| 1. `FLBA(7) → Decimal128` 2-pass decode (`direct_flba_dec128 − baseline_flba`)       |     **−22.9 ms** |        **−25.8 ms** | `68.4 − 91.3 = −22.9 ms` fresh; `50.2 − 76.0 = −25.8 ms` warm (`54.1%` of cycles in `perf record`)                                |
+| _Subtotal: `direct_flba_dec128` (`morsel_no_pushdown` with direct FLBA decode)_      |        _68.4 ms_ |           _50.2 ms_ | _`369.6 ms` CPU (`decode = 298.9 ms`, `process = 42.5 ms`); still `+1.6 ms` behind DuckDB exec-only_                              |
+| 2. Morsel-vs-Stock `q6_scan` gap (`direct_flba_stock − direct_flba_dec128`)          |      **−3.6 ms** |         **−2.3 ms** | `64.8 − 68.4 = −3.6 ms` fresh; `47.9 − 50.2 = −2.3 ms` warm (`347.2` vs `369.6 ms` CPU: `ready_wait` + `ResultBuffer` coalescing) |
+| _Subtotal: `direct_flba_stock` (`stock_no_pushdown` with direct FLBA decode)_        |        _64.8 ms_ |           _47.9 ms_ | _`347.2 ms` CPU; at parity with DuckDB (`48.6 ms` warm exec-only / `64.9 ms` fresh)_                                              |
+| 3. Fresh startup delta: `Stock(fresh − warm_exec) − DuckDB(fresh − warm_exec_only)`  |      **−0.6 ms** |                   — | `(64.8 − 47.9) − (64.9 − 48.6) = 16.9 − 16.3 = −0.6 ms`                                                                           |
+| 4. Post-FLBA Stock vs DuckDB exec-only delta: `DuckDB exec_only − direct_flba_stock` |      **+0.7 ms** |         **+0.7 ms** | `48.6 − 47.9 = +0.7 ms` (within parity: `46.7–51.3 ms` vs DuckDB `47.7–50.0 ms`)                                                  |
+| **Target: DuckDB 2.0.1 (`duckdb_default`)**                                          |      **64.9 ms** |         **48.6 ms** | Fresh Arrow `64.9 ms`; warm `exec_only = 48.6 ms` (`total 50.3 − plan 1.7`; warm Arrow `52.7 ms`)                                 |
+
+_Exact sum check:_ Fresh `91.3 − 22.9 − 3.6 − 0.6 + 0.7 = 64.9 ms`; Warm
+exec-only `76.0 − 25.8 − 2.3 + 0.7 = 48.6 ms`.
 
 ## 3. Deep-Dive Evidence Across All 5 Investigation Axes
 
@@ -313,13 +338,13 @@ dictionary indices into a `SelectionVector` without expanding `FLBA(7)` to
 
 _\*`p8_orderkey_only` and `p9_extprice_only` have `min > 0` in every row group,
 so `morsel_pushdown` (which enables statistics pruning) satisfies `col > 0`
-directly via metadata without reading data pages._
+directly via metadata without reading data pages. Note DuckDB probe column shows
+`to_arrow_reader` wall time (including ~1.7 ms planning)._
 
 Look at what these probes prove:
 
-1. **Morsel DataFusion is ALREADY 2.4× faster than DuckDB on `l_shipdate`
-   (`INT32`: `5.0 ms` vs. `12.2 ms`) and 1.65× faster on `l_orderkey` (`INT64`:
-   `9.2 ms` vs. `15.2 ms`)!**
+1. **Morsel DataFusion is ALREADY faster than DuckDB on `l_shipdate` (`INT32`:
+   `5.0 ms` vs. `12.2 ms`) and `l_orderkey` (`INT64`: `9.2 ms` vs. `15.2 ms`)!**
 2. **Despite `l_discount` being 3.5× smaller on disk than `l_shipdate` (2.66 MB
    vs. 9.30 MB), `arrow-rs` burns `8.2×` more decode CPU on `l_discount`
    (`104.5 ms` vs. `12.7 ms`)** purely due to `FixedLenByteArrayReader`'s
@@ -327,7 +352,7 @@ Look at what these probes prove:
 3. **Pure additivity vs. DuckDB short-circuiting:** In `morsel_no_pushdown`,
    `p1 + p2 + p3` decode (`12.7 + 104.5 + 100.6 = 217.8 ms`) equals `p5_q6_count`
    (`221.1 ms`) — all 3 columns are 100% decoded and evaluated. In DuckDB,
-   `p1 + p2 + p3 = 194.6 ms` CPU drops to `126.3 ms` on `p5_q6_count` (-35% CPU)
+   `p1 + p2 + p3 = 194.6 ms` CPU drops to `126.3 ms` on `p5_q6_count` (−35% CPU)
    via dictionary-level filter evaluation and `SelectionVector` pruning.
 4. **Decimal128 multiply (`l_extendedprice * l_discount`) is negligible:**
    `p6_q6_scan_no_mul` (`78.8 ms`) vs. `p7_q6_scan` (`76.1 ms`) shows `< 1 ms`
@@ -344,31 +369,35 @@ We validated the `FLBA(7) → Decimal128` diagnosis two independent ways (all
 pinned `taskset -c 0-7`, 8 threads, 7 repeats, exact DuckDB parity verified):
 
 1. **Direct scratch fix on the exact, unmodified `#165` FLBA(7) Parquet files**
-   (`parquet_flba_decimal_scratch.patch` in a disposable worktree, toggling
-   `MORSEL_SCRATCH_FLBA_DIRECT=1` inside the same binary):
+   (`parquet_flba_decimal_scratch.patch` in a disposable worktree, paired in the
+   same quiet session with DuckDB fresh + warm 7-repeat profile; this is the
+   single dataset backing Waterfalls A and B):
 
-| Query      | Variant (`#165` FLBA(7) files) | Warm exec ms (min–max) | Warm CPU ms | Decode ms | Process ms | Fresh total ms (min–max) |
-| ---------- | ------------------------------ | ---------------------: | ----------: | --------: | ---------: | -----------------------: |
-| `q6_count` | `baseline_flba` (Morsel)       |       37.2 (35.4–40.9) |       271.8 |     222.9 |       32.6 |         46.7 (43.8–52.5) |
-| `q6_count` | **`direct_flba_dec128`**       |   **16.9 (16.4–18.1)** |   **117.9** |  **69.4** |       32.8 |     **27.8 (25.8–29.9)** |
-| `q6_count` | `baseline_pushdown` (Morsel)   |       50.5 (49.5–93.6) |       338.0 |     313.8 |        0.0 |         60.5 (58.9–64.1) |
-| `q6_count` | `direct_flba_pushdown`         |       30.8 (30.1–32.1) |       202.2 |     177.3 |        0.0 |         39.6 (39.0–42.3) |
-| `q6_count` | `direct_flba_stock`            |       16.6 (15.2–17.0) |       110.5 |         — |          — |         27.0 (25.9–27.9) |
-| `q6_count` | _DuckDB 2.0.1 reference_       |     _20.9 (20.3–21.3)_ |     _127.4_ |         — |          — |       _25.1 (23.3–26.1)_ |
-| `q6_scan`  | `baseline_flba` (Morsel)       |       75.6 (74.1–80.1) |       567.8 |     487.5 |       43.6 |         92.2 (91.2–96.3) |
-| `q6_scan`  | **`direct_flba_dec128`**       |   **52.3 (48.8–53.9)** |   **372.7** | **299.3** |       42.3 |     **69.6 (68.8–70.4)** |
-| `q6_scan`  | `baseline_pushdown` (Morsel)   |    109.5 (107.0–114.7) |       748.7 |     705.0 |        1.2 |      128.8 (126.7–132.7) |
-| `q6_scan`  | `direct_flba_pushdown`         |       86.6 (83.9–89.0) |       569.9 |     519.1 |        1.4 |      104.2 (103.7–111.2) |
-| `q6_scan`  | `direct_flba_stock`            |       48.3 (45.1–51.3) |       348.4 |         — |          — |         65.4 (64.5–69.9) |
-| `q6_scan`  | _DuckDB 2.0.1 reference_       |     _52.7 (51.4–55.0)_ |     _371.2_ |         — |          — |       _68.3 (62.4–71.0)_ |
+| Query      | Variant (`#165` FLBA(7) files)   | Warm exec-only ms (min–max) | Warm CPU ms | Decode ms | Process ms | Fresh total ms |
+| ---------- | -------------------------------- | --------------------------: | ----------: | --------: | ---------: | -------------: |
+| `q6_count` | `baseline_flba` (Morsel)         |            35.8 (33.8–39.3) |       263.5 |     213.9 |       32.6 |           45.5 |
+| `q6_count` | **`direct_flba_dec128`**         |        **16.7 (15.7–17.9)** |   **117.5** |  **67.4** |       32.7 |       **25.8** |
+| `q6_count` | `baseline_pushdown` (Morsel)     |            50.7 (49.5–55.7) |       338.4 |     313.5 |        0.0 |           60.1 |
+| `q6_count` | `direct_flba_pushdown`           |            30.9 (29.7–32.9) |       202.7 |     177.5 |        0.0 |           42.3 |
+| `q6_count` | `direct_flba_stock`              |            17.0 (16.5–18.2) |       112.2 |         — |          — |           26.1 |
+| `q6_count` | _DuckDB 2.0.1 (exec-only)_       |          _17.2 (16.5–17.4)_ |     _122.8_ |         — |          — |         _25.5_ |
+| `q6_count` | _DuckDB 2.0.1 (plan+exec Arrow)_ |          _20.6 (20.2–21.2)_ |     _126.6_ |         — |          — |         _25.5_ |
+| `q6_scan`  | `baseline_flba` (Morsel)         |            76.0 (74.9–80.9) |       563.2 |     485.8 |       43.7 |           91.3 |
+| `q6_scan`  | **`direct_flba_dec128`**         |        **50.2 (47.9–51.6)** |   **369.6** | **298.9** |       42.5 |       **68.4** |
+| `q6_scan`  | `baseline_pushdown` (Morsel)     |         109.9 (107.0–114.0) |       748.0 |     704.5 |        1.4 |          132.2 |
+| `q6_scan`  | `direct_flba_pushdown`           |            85.0 (83.9–89.9) |       560.9 |     509.7 |        1.5 |          106.0 |
+| `q6_scan`  | `direct_flba_stock`              |            47.9 (46.7–51.3) |       347.2 |         — |          — |           64.8 |
+| `q6_scan`  | _DuckDB 2.0.1 (exec-only)_       |          _48.6 (47.7–50.0)_ |     _363.9_ |         — |          — |         _64.9_ |
+| `q6_scan`  | _DuckDB 2.0.1 (plan+exec Arrow)_ |          _52.7 (51.9–53.0)_ |     _369.5_ |         — |          — |         _64.9_ |
 
 2. **Parquet physical-type diagnostic control (`INT64`-stored `Decimal(15,2)`):**
-   Re-exporting SF1 `lineitem` via DuckDB `COPY` stores `Decimal(15,2)` as
-   Parquet physical `INT64` (identical compressed size on `q6_count`: 16.46 MB
-   vs. 16.51 MB). On those files, unmodified `baseline_runner`
-   (`morsel_no_pushdown`) ran `q6_count` in **`14.2 ms` warm** (`99.6 ms` CPU,
-   `decode = 49.5 ms`) vs. DuckDB's `18.1 ms`, independently confirming that
-   DataFusion's `PrimitiveArrayReader` dictionary path already outperforms
+   Re-exporting SF1 `lineitem` via DuckDB `COPY` (see Section 5 for exact
+   command) stores `Decimal(15,2)` as Parquet physical `INT64` (identical
+   compressed size on `q6_count`: 16.46 MB vs. 16.51 MB). On those files,
+   unmodified `baseline_runner` (`morsel_no_pushdown`) ran `q6_count` in
+   **`14.2 ms` warm exec** (`99.6 ms` CPU, `decode = 49.5 ms`) vs. DuckDB's
+   `18.1 ms` warm Arrow drain (~`16.4 ms` exec-only), independently confirming
+   that DataFusion's `PrimitiveArrayReader` dictionary path reaches parity with
    DuckDB once `FixedLenByteArrayReader` is bypassed.
 
 ### Axis 2 & Axis 3: Batch-Size Sweep (`2048` / `4096` / `8192` / `16384`)
@@ -397,56 +426,69 @@ introduced.
 
 ### Axis 4 & Axis 5: Disposable Scratch Ablations (`ablations.patch`)
 
-All seven variants built from `ablations.patch` in a disposable worktree,
-verified against DuckDB oracle parity, pinned `taskset -c 0-7`, 7 repeats warm:
+All eight variants built from `ablations.patch` in a disposable worktree,
+verified against DuckDB oracle parity, pinned `taskset -c 0-7`, 7 repeats warm
+(with `pushdown_noreorder` included separately to isolate the existing
+`reorder_filters=false` config from same-column conjunct grouping):
 
-| Query      | Variant                          |       Exec ms (min–max) |    CPU ms | Decode ms | Process ms | Ready wait ms | Pending I/O ms |
-| ---------- | -------------------------------- | ----------------------: | --------: | --------: | ---------: | ------------: | -------------: |
-| `q6_count` | `native` (control)               |        38.4 (35.1–42.2) |     273.2 |     230.2 |       32.9 |           5.9 |           21.0 |
-| `q6_count` | `no_batch_yield`                 |        37.7 (36.3–38.8) |     269.5 |     223.7 |       32.8 |           9.0 |       **74.6** |
-| `q6_count` | `short_circuit`                  |        39.2 (36.9–39.8) |     279.2 |     225.3 |   **38.0** |           5.8 |           25.0 |
-| `q6_count` | `no_yield_and_short_circuit`     |        38.6 (36.5–40.3) |     270.5 |     221.5 |       38.5 |          11.3 |           77.8 |
-| `q6_count` | `pushdown_base` (5 preds)        |        51.1 (48.4–52.8) |     333.2 |     308.5 |        0.0 |          38.1 |           59.6 |
-| `q6_count` | `pushdown_grouped` (3 preds)     |        44.7 (42.7–45.4) |     291.6 |     266.2 |        0.0 |          32.8 |           49.9 |
-| `q6_count` | **`pushdown_grouped_noreorder`** |    **41.6 (40.7–43.0)** | **273.1** | **248.3** |        0.0 |          30.6 |           32.3 |
-| `q6_scan`  | `native` (control)               |        78.2 (76.4–81.7) |     580.8 |     503.1 |       45.4 |          16.7 |           68.2 |
-| `q6_scan`  | `no_batch_yield`                 |       76.5 (75.4–100.0) |     563.3 |     490.8 |       45.3 |          16.6 |      **141.7** |
-| `q6_scan`  | `short_circuit`                  |        78.2 (75.7–78.7) |     577.7 |     488.5 |   **54.7** |          15.7 |           61.0 |
-| `q6_scan`  | `no_yield_and_short_circuit`     |        80.1 (76.6–82.5) |     583.3 |     504.5 |       55.3 |          13.8 |          157.3 |
-| `q6_scan`  | `pushdown_base` (5 preds)        |     111.9 (109.7–114.5) |     751.7 |     708.9 |        1.2 |          40.0 |           85.0 |
-| `q6_scan`  | `pushdown_grouped` (3 preds)     |     107.2 (105.6–110.6) |     715.4 |     668.9 |        1.3 |          41.9 |           82.0 |
-| `q6_scan`  | **`pushdown_grouped_noreorder`** | **102.7 (100.0–107.9)** | **692.3** | **645.9** |        1.2 |          28.5 |           63.2 |
+| Query      | Variant                                       |       Exec ms (min–max) |    CPU ms | Decode ms | Process ms | Ready wait ms | Pending I/O ms |
+| ---------- | --------------------------------------------- | ----------------------: | --------: | --------: | ---------: | ------------: | -------------: |
+| `q6_count` | `native` (control)                            |        36.8 (36.1–40.3) |     273.7 |     224.0 |       33.3 |           5.9 |           22.7 |
+| `q6_count` | `no_batch_yield`                              |        37.5 (36.1–38.1) |     266.5 |     227.7 |       32.8 |           8.3 |       **72.6** |
+| `q6_count` | `short_circuit`                               |        37.8 (36.2–40.3) |     278.4 |     223.4 |   **38.1** |           5.8 |           20.1 |
+| `q6_count` | `no_yield_and_short_circuit`                  |        38.5 (36.1–39.0) |     275.3 |     225.5 |       37.6 |           8.5 |           84.9 |
+| `q6_count` | `pushdown_base` (5 preds, `reorder=true`)     |        50.6 (50.1–51.4) |     332.2 |     307.6 |        0.0 |          41.6 |           56.3 |
+| `q6_count` | `pushdown_noreorder` (5 preds, `false`)       |        46.3 (44.3–47.4) |     307.7 |     281.6 |        0.0 |          35.8 |           36.7 |
+| `q6_count` | `pushdown_grouped` (3 preds, `true`)          |        44.8 (44.1–46.0) |     292.4 |     266.5 |        0.0 |          36.1 |           52.0 |
+| `q6_count` | **`pushdown_grouped_noreorder`** (3, `false`) |    **41.2 (40.5–42.6)** | **278.5** | **252.5** |        0.0 |          28.6 |           30.6 |
+| `q6_scan`  | `native` (control)                            |        78.2 (75.7–79.8) |     579.7 |     497.3 |       46.8 |          16.5 |           64.7 |
+| `q6_scan`  | `no_batch_yield`                              |        77.5 (74.2–80.7) |     571.0 |     496.6 |       43.8 |          15.3 |      **152.3** |
+| `q6_scan`  | `short_circuit`                               |        78.3 (76.7–81.5) |     581.8 |     491.5 |   **53.4** |          18.8 |           60.3 |
+| `q6_scan`  | `no_yield_and_short_circuit`                  |        78.7 (75.9–81.9) |     580.1 |     501.6 |       55.3 |          15.8 |          146.1 |
+| `q6_scan`  | `pushdown_base` (5 preds, `reorder=true`)     |     111.0 (109.0–112.8) |     750.5 |     707.7 |        1.2 |          37.7 |           85.0 |
+| `q6_scan`  | `pushdown_noreorder` (5 preds, `false`)       |     105.6 (102.9–109.1) |     720.8 |     674.8 |        1.2 |          31.9 |           69.7 |
+| `q6_scan`  | `pushdown_grouped` (3 preds, `true`)          |     108.1 (102.5–110.8) |     717.8 |     668.9 |        1.3 |          39.7 |           75.8 |
+| `q6_scan`  | **`pushdown_grouped_noreorder`** (3, `false`) | **103.9 (100.0–110.2)** | **696.4** | **648.7** |        1.6 |          35.3 |           59.1 |
 
 Findings from the ablations:
 
-- **`no_batch_yield`**: Saves only `0.7 ms` (`q6_count`) / `1.7 ms` (`q6_scan`)
-  while tripling `pending_io` latency (`21 → 75 ms` and `68 → 142 ms`) and
-  causing a `100.0 ms` tail spike on `q6_scan`. Do **not** remove cooperative
-  yields.
+- **`no_batch_yield`**: Within noise on wall time (`+0.7 ms` on `q6_count`,
+  `−0.7 ms` on `q6_scan`) while tripling `pending_io` latency (`22.7 → 72.6 ms`
+  and `64.7 → 152.3 ms`). Do **not** remove cooperative yields.
 - **`short_circuit`** (group conjuncts by column, evaluate `l_shipdate` first,
   then `arrow::compute::filter` the next `Decimal128` column to 15.2% / 4.1%
-  rows): Increases `process_work` (`32.9 → 38.0 ms` on `q6_count`,
-  `45.4 → 54.7 ms` on `q6_scan`) because copying 15% of `i128` rows + scattering
+  rows): Increases `process_work` (`33.3 → 38.1 ms` on `q6_count`,
+  `46.8 → 53.4 ms` on `q6_scan`) because copying 15% of `i128` rows + scattering
   bits costs more than scanning contiguous `i128` arrays linearly. Short-circuit
   savings on decoded batches have a hard ceiling of ~`2.5 ms` wall (`7.43%`
   `apply_op<&[i128]>`), which requires zero-copy selection-vector / set-bit
   evaluation rather than Arrow `filter()`.
-- **`pushdown_grouped_noreorder`**: Grouping same-column conjuncts in
-  `row_filter.rs` (5 → 3 predicates) and evaluating `l_shipdate` first instead of
-  smallest-bytes-first (`l_discount` → `l_quantity` → `l_shipdate`) recovers
-  **`-9.5 ms`** (`-60.1 ms` CPU) on `q6_count` and **`-9.2 ms`** (`-59.4 ms` CPU)
-  on `q6_scan`. However, `RowFilter` still lags `native` by `3.2 ms` (`q6_count`)
-  and `24.5 ms` (`q6_scan`) because `RowSelection::and_then` churn, Phase-2
-  `ready_wait`, and decoding `l_discount` a second time for `q6_scan` projection
-  still outweigh skipping rows inside already-decompressed pages.
+- **Separating `RowFilter` ordering vs. same-column grouping:**
+  - Disabling `reorder_filters` alone (`pushdown_base → pushdown_noreorder`,
+    already an existing DataFusion config option) saves **`−4.3 ms`** on
+    `q6_count` (`50.6 → 46.3 ms`) and **`−5.4 ms`** on `q6_scan`
+    (`111.0 → 105.6 ms`) by evaluating `l_shipdate` first instead of
+    smallest-bytes-first (`l_discount` → `l_quantity` → `l_shipdate`).
+  - Merging same-column conjuncts alone (`pushdown_base → pushdown_grouped`,
+    5 → 3 predicates) saves **`−5.8 ms`** (`−39.8 ms` CPU) on `q6_count`
+    (`50.6 → 44.8 ms`) and **`−2.9 ms`** (`−32.7 ms` CPU) on `q6_scan`
+    (`111.0 → 108.1 ms`). Applied on top of `reorder_filters=false`
+    (`pushdown_noreorder → pushdown_grouped_noreorder`), merging saves an
+    additional **`−5.1 ms`** on `q6_count` (`46.3 → 41.2 ms`) and **`−1.7 ms`**
+    on `q6_scan` (`105.6 → 103.9 ms`) — **`−9.4 ms` / `−7.1 ms`** combined.
+  - Even with both improvements, `RowFilter` still lags `native` by `4.4 ms`
+    (`q6_count`) and `25.7 ms` (`q6_scan`) because `RowSelection::and_then`
+    churn, Phase-2 `ready_wait`, and decoding `l_discount` a second time for
+    `q6_scan` output projection still outweigh skipping rows inside
+    already-decompressed pages.
 
 ## 4. Ranked Top-3 Engineering Follow-Ups
 
-|  Rank | Optimization                                                                                                 |                                                  Expected savings (`q6_count`) |                                                         Expected savings (`q6_scan`) | Scope & notes                                                                                                                                                                                                                                                                                                                                                                                                              |
-| ----: | ------------------------------------------------------------------------------------------------------------ | -----------------------------------------------------------------------------: | -----------------------------------------------------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **1** | **Direct `FixedLenByteArray` → `Decimal128` (and `Decimal64`/`Decimal32`) dictionary & plain decoding**      |                      **−19 to −20 ms** (warm: `35.6 → 16.9 ms`, beats DuckDB!) |                          **−22 to −23 ms** (warm: `75.4 → 52.3 ms`, matches DuckDB!) | Upstream `arrow-rs` (`parquet::arrow::array_reader::fixed_len_byte_array`) or custom morsel Parquet decoder: decode FLBA dictionary page once into `Vec<i128>` and gather `dict[key]` directly, eliminating 12–18M 7-byte `memcpy`s and 12–18M `sign_extend_be` calls. Proven on exact `#165` files!                                                                                                                       |
-| **2** | **Group same-column `RowFilter` conjuncts + Parquet dictionary-level filter pushdown & output-column reuse** | **−9.5 ms** on `pushdown=true`; **−2 to −4 ms** beyond post-FLBA `no_pushdown` | **−9 to −25 ms** on `pushdown=true`; **−5 to −10 ms** beyond post-FLBA `no_pushdown` | (a) In `datafusion/datasource-parquet/src/row_filter.rs`, merge same-column conjuncts in `prebuild_row_filter_candidates` so `BETWEEN` / range predicates decode each column once (proven `-9.5 ms` / `-9.2 ms` immediately); (b) evaluate single-column predicates directly on Parquet dictionary pages (matching `duckdb::DictionaryDecoder::Filter`) and avoid re-decoding `l_discount` in `q6_scan` output projection. |
-| **3** | **Cut fresh-process Parquet metadata/planning overhead + eliminate `q6_scan` Morsel-vs-Stock tail gap**      |             **−3 to −4 ms** fresh total (`27.8 → ~24 ms`, beats DuckDB fresh!) |          **−4 to −6 ms** fresh & warm (`52.3 → ~47 ms` warm, `69.6 → ~64 ms` fresh!) | (a) Reduce `register_parquet` (`4.6 ms` listing + sequential/redundant footer reads for 16 files) and `plan_seconds` (`2.7 ms`) by parallelizing footer reads / reusing cached `ParquetMetaData` between registration and `MorselExec` planning; (b) investigate `q6_scan`'s `4.0 ms` Morsel-vs-Stock gap (`52.3` vs `48.3 ms` post-FLBA) driven by `ready_wait` (`16.5 ms`) and `ResultBuffer` coalescing copies.         |
+|  Rank | Optimization                                                                                                 |                                                                                                                                                    Expected savings (`q6_count`) |                                                                                                                                                            Expected savings (`q6_scan`) | Scope & notes                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----: | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1** | **Direct `FixedLenByteArray` → `Decimal128` (and `Decimal64`/`Decimal32`) dictionary & plain decoding**      |                                                                   **−19 to −20 ms** (warm: `35.8 → 16.7 ms`, parity with DuckDB `17.2 ms`; fresh: `45.5 → 25.8 ms` vs `25.5 ms`) |                                                                          **−23 to −26 ms** (warm: `76.0 → 50.2 ms` vs DuckDB `48.6 ms` exec-only; fresh: `91.3 → 68.4 ms` vs `64.9 ms`) | Upstream `arrow-rs` (`parquet::arrow::array_reader::fixed_len_byte_array`) or custom morsel Parquet decoder: decode FLBA dictionary page once into `Vec<i128>` and gather `dict[key]` directly, eliminating 12–18M 7-byte `memcpy`s and 12–18M `sign_extend_be` calls. Proven on exact `#165` files!                                                                                                                                                                       |
+| **2** | **Merge same-column `RowFilter` conjuncts + Parquet dictionary-level filter pushdown & output-column reuse** | **−5.1 to −5.8 ms** from merging alone on `pushdown=true` (plus `−4.3 ms` from existing `reorder_filters=false`); **−2 to −4 ms** beyond post-FLBA `no_pushdown` via dict filter | **−1.7 to −2.9 ms** from merging alone on `pushdown=true` (plus `−5.4 ms` from `reorder_filters=false`); **−5 to −10 ms** beyond post-FLBA `no_pushdown` via dict filter + column reuse | (a) In `datafusion/datasource-parquet/src/row_filter.rs`, merge same-column conjuncts in `prebuild_row_filter_candidates` so `BETWEEN` / range predicates decode each column once (`−5.8 ms` / `−2.9 ms` at `reorder=true`, `−5.1 ms` / `−1.7 ms` at `reorder=false`); (b) evaluate pushed single-column predicates directly on Parquet dictionary pages (matching `duckdb::DictionaryDecoder::Filter`) and avoid re-decoding `l_discount` in `q6_scan` output projection. |
+| **3** | **Close `q6_scan`'s Morsel-vs-Stock gap + cut fresh-process metadata/planning overhead**                     |                                                                                                                                    **−2 to −3 ms** fresh total (`25.8 → ~23 ms`) |                        **−2.3 to −3.6 ms** from closing Morsel-vs-Stock gap (`50.2 → 47.9 ms` warm, `68.4 → 64.8 ms` fresh, reaching DuckDB parity!) plus **−2 to −3 ms** fresh startup | (a) Eliminate `q6_scan`'s `2.3 ms` warm / `3.6 ms` fresh Morsel-vs-Stock gap (`50.2` vs `47.9 ms` post-FLBA, `369.6` vs `347.2 ms` CPU) driven by `ready_wait` (`16.5 ms`) and `ResultBuffer` coalescing copies; (b) reduce fresh `register_parquet` (`4.6 ms` listing + footer reads for 16 files) and `plan_seconds` (`2.7 ms`) by parallelizing footer reads / reusing cached `ParquetMetaData`.                                                                        |
 
 ## 5. Exact Reproduction Commands
 
@@ -527,7 +569,7 @@ timeout 240s taskset -c 0-7 "$py" -B "$p/run_ablations.py" \
   --threads 8 --warmups 2 --repeats 7 --metrics \
   > "$work/sf1_ablations.jsonl"
 
-# 6. Disposable parquet-60.1.0 DirectDecimal128Reader validation (parquet_flba_decimal_scratch.patch).
+# 6. Disposable parquet-60.1.0 DirectDecimal128Reader paired validation (Waterfalls A & B).
 parquet_src=$(ls -d "$HOME/.cargo/registry/src"/*/parquet-60.1.0 | head -n 1)
 cp -r "$parquet_src" "$work/parquet-60.1.0-patched"
 patch "$work/parquet-60.1.0-patched/src/arrow/array_reader/fixed_len_byte_array.rs" \
@@ -549,9 +591,31 @@ cp "$work/target_flba/release-nonlto/examples/morsel_tpch_profile_runner" "$work
 timeout 240s taskset -c 0-7 "$py" -B "$p/run_ablations.py" \
   "$work/tpch_sf1" --runner "$work/flba_runner" --suite flba \
   --threads 8 --warmups 2 --repeats 7 --metrics --fresh \
-  > "$work/sf1_flba_direct.jsonl"
+  > "$work/sf1_flba_paired.jsonl"
+timeout 180s taskset -c 0-7 "$py" -B "$p/profile_harness.py" baseline \
+  "$work/tpch_sf1" --runner "$runner" --threads 8 --warmups 1 --repeats 7 \
+  --arms duckdb_default > "$work/sf1_duckdb_fresh_paired.jsonl"
+timeout 180s taskset -c 0-7 "$py" -B "$p/profile_harness.py" warm \
+  "$work/tpch_sf1" --runner "$runner" --threads 8 --warmups 2 --repeats 7 \
+  --arms duckdb_default > "$work/sf1_duckdb_warm_paired.jsonl"
 
-# 7. Clean up all disposable worktrees.
+# 7. Optional diagnostic control: INT64-stored Decimal(15,2) Parquet (re-exported via DuckDB COPY).
+mkdir -p "$work/tpch_sf1_int64dec/lineitem"
+"$py" -c "
+import duckdb
+con = duckdb.connect(':memory:')
+con.execute('SET threads = 4')
+for i in range(16):
+    src = f'$work/tpch_sf1/lineitem/part-{i:06d}.parquet'
+    dst = f'$work/tpch_sf1_int64dec/lineitem/part-{i:06d}.parquet'
+    con.execute(f\"COPY (SELECT * FROM read_parquet('{src}')) TO '{dst}' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 3, ROW_GROUP_SIZE 131072)\")
+"
+timeout 120s taskset -c 0-7 "$py" -B "$p/profile_harness.py" warm \
+  "$work/tpch_sf1_int64dec" --runner "$runner" --threads 8 --warmups 2 --repeats 7 --metrics \
+  --arms morsel_no_pushdown,morsel_pushdown,stock_no_pushdown,duckdb_default \
+  > "$work/sf1_int64dec_warm.jsonl"
+
+# 8. Clean up all disposable worktrees.
 git worktree remove --force "$work/pinned"
 git worktree remove --force "$work/ablation_tree"
 git worktree remove --force "$work/flba_tree"

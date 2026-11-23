@@ -13,6 +13,7 @@ import pyarrow as pa
 
 import profile_harness as ph
 import profile_perf as pp
+import run_ablations as ra
 
 
 class ProfileHarnessTest(unittest.TestCase):
@@ -88,6 +89,29 @@ class ProfileHarnessTest(unittest.TestCase):
             self.assertEqual(parsed["cycles:u"], 123456.0)
             self.assertEqual(parsed["instructions:u"], 234567.0)
             self.assertNotIn("cpu-migrations", parsed)
+
+    def test_extract_duckdb_profile_timings_subtracts_planning(self):
+        profile = {
+            "planner": {"total_time": 0.0011},
+            "optimizer": {"total_time": 0.0005},
+            "physical_planner": {"total_time": 0.0001},
+            "query": {"total_time": 0.0192, "cpu_time": 0.1255},
+        }
+        timings = ph.extract_duckdb_profile_timings(profile)
+        self.assertAlmostEqual(timings["plan_seconds"], 0.0017, places=6)
+        self.assertAlmostEqual(timings["total_seconds"], 0.0192, places=6)
+        self.assertAlmostEqual(timings["exec_only_seconds"], 0.0175, places=6)
+        self.assertAlmostEqual(timings["cpu_seconds"], 0.1255, places=6)
+
+    def test_ablation_variants_separate_reorder_and_grouping(self):
+        names = [v[0] for v in ra.VARIANTS]
+        for expected in (
+            "pushdown_base",
+            "pushdown_noreorder",
+            "pushdown_grouped",
+            "pushdown_grouped_noreorder",
+        ):
+            self.assertIn(expected, names)
 
 
 if __name__ == "__main__":

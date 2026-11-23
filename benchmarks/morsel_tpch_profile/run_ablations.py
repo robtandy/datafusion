@@ -37,6 +37,7 @@ VARIANTS: list[tuple[str, str, dict[str, str]]] = [
         {"MORSEL_SCRATCH_NO_YIELD": "1", "MORSEL_SCRATCH_SHORT_CIRCUIT": "1"},
     ),
     ("pushdown_base", "morsel_pushdown", {}),
+    ("pushdown_noreorder", "morsel_pushdown_noreorder", {}),
     (
         "pushdown_grouped",
         "morsel_pushdown",

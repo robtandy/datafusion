@@ -499,6 +499,25 @@ def _duckdb_exec_fresh(
     raise ValueError(f"unknown _duckdb-exec operation: {operation}")
 
 
+def extract_duckdb_profile_timings(profile: dict) -> dict[str, float]:
+    """Split DuckDB's JSON profile total_time into planning vs. exec-only time.
+
+    DuckDB's `query.total_time` includes `planner + optimizer + physical_planner`.
+    """
+    planner_s = float(profile.get("planner", {}).get("total_time", 0.0))
+    optimizer_s = float(profile.get("optimizer", {}).get("total_time", 0.0))
+    physical_s = float(profile.get("physical_planner", {}).get("total_time", 0.0))
+    plan_s = planner_s + optimizer_s + physical_s
+    total_s = float(profile.get("query", {}).get("total_time", 0.0))
+    cpu_s = float(profile.get("query", {}).get("cpu_time", 0.0))
+    return {
+        "total_seconds": total_s,
+        "plan_seconds": plan_s,
+        "exec_only_seconds": max(0.0, total_s - plan_s),
+        "cpu_seconds": cpu_s,
+    }
+
+
 def _duckdb_exec_warm(
     threads: int,
     batch_size: int,
@@ -536,15 +555,6 @@ def _duckdb_exec_warm(
             rows = con.execute(sql).fetchall()
             output_rows = len(rows)
             output_batches = 1
-        elif drain_mode == "execute_only":
-            # Drain inside C++ without Python tuple materialization or Arrow export.
-            res = con.execute(
-                f"SELECT COUNT(*) FROM ({sql}) _t"
-                if "COUNT(*)" not in sql.upper()
-                else sql
-            ).fetchall()
-            output_rows = int(res[0][0])
-            output_batches = 1
         else:
             raise ValueError(f"unknown drain_mode: {drain_mode}")
         wall = time.perf_counter() - t0
@@ -562,6 +572,7 @@ def _duckdb_exec_warm(
     iterations = [run_once() for _ in range(repeats)]
 
     operator_profile = None
+    profile_iterations = []
     if profile_operators:
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
             prof_path = tf.name
@@ -569,11 +580,17 @@ def _duckdb_exec_warm(
             con.execute("PRAGMA enable_profiling = 'json'")
             con.execute(f"PRAGMA profiling_output = '{prof_path}'")
             con.execute("PRAGMA profiling_mode = 'detailed'")
-            # Run once with profiling enabled
-            reader = con.sql(sql).to_arrow_reader(batch_size=batch_size)
-            for _ in reader:
-                pass
-            operator_profile = json.loads(Path(prof_path).read_text())
+            profiles = []
+            for _ in range(max(1, repeats)):
+                reader = con.sql(sql).to_arrow_reader(batch_size=batch_size)
+                for _ in reader:
+                    pass
+                prof = json.loads(Path(prof_path).read_text())
+                timings = extract_duckdb_profile_timings(prof)
+                profile_iterations.append(timings)
+                profiles.append((timings["exec_only_seconds"], prof))
+            profiles.sort(key=lambda item: item[0])
+            operator_profile = profiles[len(profiles) // 2][1]
         finally:
             Path(prof_path).unlink(missing_ok=True)
 
@@ -585,6 +602,7 @@ def _duckdb_exec_warm(
                 "view_seconds": view_seconds,
                 "first_run": first_run,
                 "iterations": iterations,
+                "profile_iterations": profile_iterations,
                 "operator_profile": operator_profile,
             }
         )
@@ -799,7 +817,11 @@ def cmd_warm(args):
             arm = ARMS[arm_name]
             before_pages = require_warm_cache(files)
             if arm.engine == "duckdb":
-                for drain_mode in ("arrow", "native", "execute_only"):
+                # Only run native fetchall() for scalar COUNT(*) workloads; for
+                # wide scans, fetchall() measures Python tuple materialization
+                # and wrapping in SELECT COUNT(*) would prune projected columns.
+                drain_modes = ("arrow", "native") if wl.is_count else ("arrow",)
+                for drain_mode in drain_modes:
                     res = json.loads(
                         run_duckdb_subprocess(
                             "_duckdb-warm",
