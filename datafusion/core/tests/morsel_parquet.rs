@@ -247,8 +247,9 @@ async fn pushdown_filters_evaluates_parquet_row_filter_and_skips_unmatched_colum
 
     let display_with = displayable(plan_with.as_ref()).indent(false).to_string();
     assert!(
-        !display_with.contains("Filter["),
-        "expected pushable filter to be pushed into NativeParquet: {display_with}"
+        display_with.contains("NativeParquet[t, predicate=")
+            && !display_with.contains("Filter["),
+        "expected pushed predicate in NativeParquet display: {display_with}"
     );
     assert_eq!(metric(plan_without.as_ref(), "pushdown_rows_pruned"), 0);
     assert_eq!(metric(plan_with.as_ref(), "pushdown_rows_pruned"), 64);
@@ -265,25 +266,38 @@ async fn pushdown_filters_evaluates_parquet_row_filter_and_skips_unmatched_colum
 #[tokio::test]
 async fn parquet_filter_coalesces_across_row_groups() -> Result<()> {
     let dir = fixture()?;
-    let native = context(&dir, "required", false).await?;
-    native
-        .sql("SET datafusion.execution.target_partitions = 1")
-        .await?;
-    native
-        .sql("SET datafusion.execution.batch_size = 4")
-        .await?;
-    let sql = "SELECT payload AS p, id FROM t WHERE gate > 10";
-    let plan = native.sql(sql).await?.create_physical_plan().await?;
-    assert_eq!(plan.name(), "MorselExec");
-    let batches = collect(Arc::clone(&plan), native.task_ctx()).await?;
-    assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 6);
-    assert_eq!(
-        batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .collect::<Vec<_>>(),
-        [4, 2]
-    );
+    for pushdown in [false, true] {
+        let native = context(&dir, "required", pushdown).await?;
+        native
+            .sql("SET datafusion.execution.target_partitions = 1")
+            .await?;
+        native
+            .sql("SET datafusion.execution.batch_size = 4")
+            .await?;
+        let sql = "SELECT payload AS p, id FROM t WHERE gate > 10";
+        let plan = native.sql(sql).await?.create_physical_plan().await?;
+        assert_eq!(plan.name(), "MorselExec");
+        let display = displayable(plan.as_ref()).indent(false).to_string();
+        if pushdown {
+            assert!(
+                display.contains("NativeParquet[t, predicate=gate@1 > 10]")
+                    && !display.contains("Filter["),
+                "{display}"
+            );
+        } else {
+            assert!(display.contains("NativeParquet[t] -> Filter["), "{display}");
+        }
+        let batches = collect(Arc::clone(&plan), native.task_ctx()).await?;
+        assert_eq!(metric(plan.as_ref(), "parquet_morsels_claimed"), 6);
+        assert_eq!(
+            batches
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [4, 2],
+            "pushdown={pushdown}"
+        );
+    }
     Ok(())
 }
 
@@ -558,7 +572,7 @@ async fn pushdown_filters_parity_across_selectivities_nulls_and_count() -> Resul
                     let display =
                         displayable(actual_plan.as_ref()).indent(false).to_string();
                     assert!(
-                        display.contains("NativeParquet")
+                        display.contains("NativeParquet[t, predicate=")
                             && display.contains("CountSink")
                             && !display.contains("Filter["),
                         "{display}"
@@ -779,7 +793,8 @@ async fn pushdown_filters_runs_row_filter_concurrently_on_workers_not_producer()
     let plan = native.sql(sql).await?.create_physical_plan().await?;
     let display = displayable(plan.as_ref()).indent(false).to_string();
     assert!(
-        display.contains("workers=4, NativeParquet") && !display.contains("Filter["),
+        display.contains("workers=4, NativeParquet[t, predicate=")
+            && !display.contains("Filter["),
         "expected UDF predicate pushed into NativeParquet RowFilter: {display}"
     );
 
