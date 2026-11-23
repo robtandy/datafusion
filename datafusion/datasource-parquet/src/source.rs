@@ -608,12 +608,14 @@ impl ParquetSource {
             .get_extension::<ParquetSplitConfig>()
             .map(|c| (*c).clone())
             .unwrap_or_default();
-        let split_context = Arc::new(SplitContext::new(
-            split_config,
-            source.memory_pool.as_ref().map(Arc::clone),
-            self.metrics().clone(),
-        ));
-        source.make_morselizer(store, base_config, 0, true, Some(split_context))
+        let split_context = split_config.enabled.then(|| {
+            Arc::new(SplitContext::new(
+                split_config,
+                source.memory_pool.as_ref().map(Arc::clone),
+                self.metrics().clone(),
+            ))
+        });
+        source.make_morselizer(store, base_config, 0, true, split_context)
     }
 
     fn make_morselizer(

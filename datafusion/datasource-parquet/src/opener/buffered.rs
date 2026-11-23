@@ -92,7 +92,7 @@ pub struct ParquetSplitConfig {
 impl Default for ParquetSplitConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             min_row_group_rows: DEFAULT_MIN_ROW_GROUP_ROWS,
             target_slice_rows: DEFAULT_TARGET_SLICE_ROWS,
             split_buffer_cap_bytes: DEFAULT_SPLIT_BUFFER_CAP_BYTES,
@@ -896,6 +896,9 @@ impl Drop for InFlightReaderGuard {
 /// Backing buffer owner wrapped via `Bytes::from_owner` so every zero-copy
 /// `Bytes::slice` view across broker, ready queue, and worker decode shares
 /// one reservation and releases it only when the final owner drops.
+///
+/// Field drop order is load-bearing: `data` drops before `_lease` so the
+/// backing allocation is freed before `SplitBudget::live_bytes` decrements.
 struct TrackedBytes {
     data: Bytes,
     _lease: SplitBufferLease,
@@ -909,6 +912,28 @@ impl AsRef<[u8]> for TrackedBytes {
 
 fn wrap_tracked_bytes(data: Bytes, lease: SplitBufferLease) -> Bytes {
     Bytes::from_owner(TrackedBytes {
+        data,
+        _lease: lease,
+    })
+}
+
+/// View returned from a multi-range `get_byte_ranges` call sharing a single
+/// [`SplitBufferLease`] across every non-detached view from that call, so
+/// object-store coalesced backing allocations stay accounted while any view
+/// can still reference them.
+struct SharedTrackedBytes {
+    data: Bytes,
+    _lease: Arc<SplitBufferLease>,
+}
+
+impl AsRef<[u8]> for SharedTrackedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_ref()
+    }
+}
+
+fn wrap_shared_tracked_bytes(data: Bytes, lease: Arc<SplitBufferLease>) -> Bytes {
+    Bytes::from_owner(SharedTrackedBytes {
         data,
         _lease: lease,
     })
@@ -1374,20 +1399,36 @@ fn plan_row_group_splits(
     }
 
     // Simulate sequential slice progression to compute the exact peak broker
-    // frontier (retained shared pages/dicts + incremental miss bytes for one slice)
-    // and peak memory-pool footprint (including that slice's decoded workspace).
+    // frontier (retained shared pages/dicts + incremental miss bytes for one
+    // slice + temporary detached copies of newly retained ranges when the same
+    // fetch also contains ephemeral ranges) and peak memory-pool footprint.
     let mut cached: HashMap<(u64, u64), usize> = HashMap::new();
     let mut cached_bytes: usize = 0;
     let mut frontier_bytes: usize = 0;
     let mut pool_frontier_bytes: usize = 0;
     for (slice_idx, ranges) in per_slice_ranges.iter().enumerate() {
         let mut new_bytes: usize = 0;
+        let mut newly_retained_bytes: usize = 0;
+        let mut has_ephemeral_miss = false;
         for &key in ranges {
             if !cached.contains_key(&key) {
-                new_bytes = new_bytes.saturating_add((key.1 - key.0) as usize);
+                let len = (key.1 - key.0) as usize;
+                new_bytes = new_bytes.saturating_add(len);
+                if last_consumer[&key] > slice_idx {
+                    newly_retained_bytes = newly_retained_bytes.saturating_add(len);
+                } else {
+                    has_ephemeral_miss = true;
+                }
             }
         }
-        let compressed_at_slice = cached_bytes.saturating_add(new_bytes);
+        let extra_detach_bytes = if has_ephemeral_miss {
+            newly_retained_bytes
+        } else {
+            0
+        };
+        let compressed_at_slice = cached_bytes
+            .saturating_add(new_bytes)
+            .saturating_add(extra_detach_bytes);
         frontier_bytes = frontier_bytes.max(compressed_at_slice);
         pool_frontier_bytes = pool_frontier_bytes
             .max(compressed_at_slice.saturating_add(slices[slice_idx].decoded_estimate));
@@ -1527,6 +1568,46 @@ fn coalesce_adjacent_ranges(
     groups
 }
 
+/// Build reservation lengths for one `RangeBroker` `get_byte_ranges` call:
+/// - If any member is ephemeral (`last_consumer <= slice_idx`), lease 0 covers
+///   the entire call's bytes and is shared across all ephemeral views from that
+///   call (object stores may merge separately requested ranges into one buffer).
+/// - Each retained member (`last_consumer > slice_idx`) gets its own lease so
+///   it is copied into a standalone buffer before caching and never pins the
+///   object store's coalesced backing allocation past the current slice.
+fn plan_range_broker_leases(
+    coalesced: &[CoalescedRequest],
+    last_consumer: &HashMap<(u64, u64), usize>,
+    slice_idx: usize,
+) -> (Vec<usize>, bool) {
+    let call_total: usize = coalesced
+        .iter()
+        .map(|c| (c.range.end - c.range.start) as usize)
+        .sum();
+    let mut retained_lengths = Vec::new();
+    let mut has_ephemeral = false;
+    for req in coalesced {
+        for member in &req.members {
+            let last = last_consumer
+                .get(&(member.start, member.end))
+                .copied()
+                .unwrap_or(slice_idx);
+            if last > slice_idx {
+                retained_lengths.push((member.end - member.start) as usize);
+            } else {
+                has_ephemeral = true;
+            }
+        }
+    }
+    let mut lease_lengths =
+        Vec::with_capacity(usize::from(has_ephemeral) + retained_lengths.len());
+    if has_ephemeral {
+        lease_lengths.push(call_total);
+    }
+    lease_lengths.extend(retained_lengths);
+    (lease_lengths, has_ephemeral)
+}
+
 /// Row-group-local range broker owned solely by the file I/O lane (no lock).
 struct RangeBroker {
     entries: HashMap<(u64, u64), (Bytes, usize)>,
@@ -1548,9 +1629,11 @@ impl RangeBroker {
             .collect()
     }
 
-    /// Ingest newly fetched coalesced buffers, populate cache entries still
-    /// needed after `slice_idx`, assemble the exact `Vec<Bytes>` matching
-    /// `requested`, and evict entries whose `last_consumer <= slice_idx`.
+    /// Ingest newly fetched coalesced buffers, detach and cache entries still
+    /// needed after `slice_idx` under individual leases, attach one shared call
+    /// lease to all ephemeral views from this `get_byte_ranges` call, assemble
+    /// the exact `Vec<Bytes>` matching `requested`, and evict entries whose
+    /// `last_consumer <= slice_idx`.
     #[expect(clippy::too_many_arguments)]
     fn complete_fetch(
         &mut self,
@@ -1558,6 +1641,7 @@ impl RangeBroker {
         coalesced: &[CoalescedRequest],
         raw_bytes: Vec<Bytes>,
         leases: Vec<SplitBufferLease>,
+        has_ephemeral: bool,
         last_consumer: &HashMap<(u64, u64), usize>,
         slice_idx: usize,
         metrics: &SplitMetrics,
@@ -1570,9 +1654,17 @@ impl RangeBroker {
                 coalesced.len()
             ));
         }
+        let mut lease_iter = leases.into_iter();
+        let call_lease = has_ephemeral.then(|| {
+            Arc::new(
+                lease_iter
+                    .next()
+                    .expect("missing call lease for ephemeral views"),
+            )
+        });
         let mut fetched_map: HashMap<(u64, u64), Bytes> = HashMap::new();
         let mut total_returned = 0usize;
-        for ((req, buf), lease) in coalesced.iter().zip(raw_bytes).zip(leases) {
+        for (req, buf) in coalesced.iter().zip(raw_bytes) {
             let expected_len = (req.range.end - req.range.start) as usize;
             if buf.len() != expected_len {
                 return Err(internal_datafusion_err!(
@@ -1583,19 +1675,44 @@ impl RangeBroker {
                 ));
             }
             total_returned += buf.len();
-            let tracked = wrap_tracked_bytes(buf, lease);
+            let req_has_ephemeral = req.members.iter().any(|m| {
+                last_consumer
+                    .get(&(m.start, m.end))
+                    .copied()
+                    .unwrap_or(slice_idx)
+                    <= slice_idx
+            });
+            let shared_buf = req_has_ephemeral.then(|| {
+                wrap_shared_tracked_bytes(
+                    buf.clone(),
+                    Arc::clone(call_lease.as_ref().expect("call lease present")),
+                )
+            });
             for member in &req.members {
                 let rel_start = (member.start - req.range.start) as usize;
                 let rel_end = (member.end - req.range.start) as usize;
-                let view = tracked.slice(rel_start..rel_end);
                 let key = (member.start, member.end);
                 let last = last_consumer.get(&key).copied().unwrap_or(slice_idx);
                 if last > slice_idx {
-                    self.entries.insert(key, (view.clone(), last));
+                    // Detach cached bytes into an independent buffer so this
+                    // cache entry never pins the store's coalesced allocation.
+                    let detached = Bytes::copy_from_slice(&buf[rel_start..rel_end]);
+                    let member_lease = lease_iter
+                        .next()
+                        .expect("missing individual lease for retained range");
+                    let tracked = wrap_tracked_bytes(detached, member_lease);
+                    self.entries.insert(key, (tracked.clone(), last));
+                    fetched_map.insert(key, tracked);
+                } else {
+                    let view = shared_buf
+                        .as_ref()
+                        .expect("shared_buf created for ephemeral member")
+                        .slice(rel_start..rel_end);
+                    fetched_map.insert(key, view);
                 }
-                fetched_map.insert(key, view);
             }
         }
+        drop(call_lease);
         if !coalesced.is_empty() {
             metrics.record_storage_fetch(coalesced.len(), total_returned);
         }
@@ -1713,20 +1830,32 @@ impl AsyncRangeBroker {
         }
     }
 
-    /// Total bytes among `candidates` that are not yet `Ready` in this broker.
+    /// Total bytes among `candidates` that are not yet `Ready` in this broker,
+    /// including temporary detached-copy headroom when a Phase-2 call contains
+    /// both private and uncached shared ranges.
     fn uncached_bytes(&self, candidates: &[(u64, u64)]) -> usize {
         if candidates.is_empty() {
             return 0;
         }
         let map = self.state.lock();
-        candidates
-            .iter()
-            .filter(|key| {
-                !map.get(*key)
-                    .is_some_and(|e| matches!(e.status, AsyncRangeStatus::Ready(_)))
-            })
-            .map(|&(s, e)| (e - s) as usize)
-            .sum()
+        let mut private_bytes = 0usize;
+        let mut shared_bytes = 0usize;
+        for key in candidates {
+            let len = (key.1 - key.0) as usize;
+            match map.get(key) {
+                Some(entry) if matches!(entry.status, AsyncRangeStatus::Ready(_)) => {}
+                Some(_) => {
+                    shared_bytes = shared_bytes.saturating_add(len);
+                }
+                None => {
+                    private_bytes = private_bytes.saturating_add(len);
+                }
+            }
+        }
+        let extra_detach = if private_bytes > 0 { shared_bytes } else { 0 };
+        private_bytes
+            .saturating_add(shared_bytes)
+            .saturating_add(extra_detach)
     }
 
     /// Release unconsumed shared range claims when a slice finishes (e.g.,
@@ -1867,10 +1996,22 @@ impl AsyncRangeBroker {
             });
         }
 
-        let lengths: Vec<usize> = coalesced
+        let call_total_bytes: usize = coalesced
+            .iter()
+            .map(|c| (c.range.end - c.range.start) as usize)
+            .sum();
+        let has_private = private_count > 0;
+        let shared_lengths: Vec<usize> = coalesced[private_count..]
             .iter()
             .map(|c| (c.range.end - c.range.start) as usize)
             .collect();
+        let mut lease_lengths =
+            Vec::with_capacity(usize::from(has_private) + shared_lengths.len());
+        if has_private {
+            lease_lengths.push(call_total_bytes);
+        }
+        lease_lengths.extend(shared_lengths);
+
         let leases = match &mut admission {
             RangeAdmission::Phase1 {
                 phase2_candidates,
@@ -1881,7 +2022,7 @@ impl AsyncRangeBroker {
                     .split_context
                     .budget
                     .reserve_for_fetch(
-                        &lengths,
+                        &lease_lengths,
                         || self.uncached_bytes(phase2_candidates),
                         *decoded_estimate,
                     )
@@ -1895,7 +2036,7 @@ impl AsyncRangeBroker {
                 } else {
                     self.split_context
                         .budget
-                        .reserve_phase2_fetch(&lengths, phase2_lease.as_deref_mut())
+                        .reserve_phase2_fetch(&lease_lengths, phase2_lease.as_deref_mut())
                         .await?
                 }
             }
@@ -1906,7 +2047,7 @@ impl AsyncRangeBroker {
                     let (leases, _, _) = self
                         .split_context
                         .budget
-                        .reserve_for_fetch(&lengths, || 0, 0)
+                        .reserve_for_fetch(&lease_lengths, || 0, 0)
                         .await?;
                     leases
                 }
@@ -1937,12 +2078,18 @@ impl AsyncRangeBroker {
                     coalesced.len()
                 ));
             }
+            let mut lease_iter = leases.into_iter();
+            let call_lease = has_private.then(|| {
+                Arc::new(
+                    lease_iter
+                        .next()
+                        .expect("missing call lease for private views"),
+                )
+            });
             let mut total_returned = 0usize;
             let mut completed_shared: HashMap<(u64, u64), Bytes> =
                 HashMap::with_capacity(shared_keys_only.len());
-            for (idx, ((req, buf), lease)) in
-                coalesced.iter().zip(raw_bytes).zip(leases).enumerate()
-            {
+            for (idx, (req, buf)) in coalesced.iter().zip(raw_bytes).enumerate() {
                 let expected_len = (req.range.end - req.range.start) as usize;
                 if buf.len() != expected_len {
                     return Err(internal_datafusion_err!(
@@ -1953,8 +2100,11 @@ impl AsyncRangeBroker {
                     ));
                 }
                 total_returned += buf.len();
-                let tracked = wrap_tracked_bytes(buf, lease);
                 if idx < private_count {
+                    let tracked = wrap_shared_tracked_bytes(
+                        buf,
+                        Arc::clone(call_lease.as_ref().expect("call lease present")),
+                    );
                     for member in &req.members {
                         let rel_start = (member.start - req.range.start) as usize;
                         let rel_end = (member.end - req.range.start) as usize;
@@ -1964,11 +2114,19 @@ impl AsyncRangeBroker {
                         );
                     }
                 } else {
+                    // Detach shared bytes into an independent buffer so `Ready`
+                    // cache entries never pin the store's coalesced allocation.
+                    let detached = Bytes::copy_from_slice(&buf);
+                    let shared_lease = lease_iter
+                        .next()
+                        .expect("missing individual lease for shared range");
+                    let tracked = wrap_tracked_bytes(detached, shared_lease);
                     let key = (req.range.start, req.range.end);
                     resolved.insert(key, tracked.clone());
                     completed_shared.insert(key, tracked);
                 }
             }
+            drop(call_lease);
             self.split_context
                 .metrics
                 .record_storage_fetch(coalesced.len(), total_returned);
@@ -2102,7 +2260,9 @@ impl AsyncRangeBroker {
                             ));
                         }
                         self.split_context.metrics.record_storage_fetch(1, len);
-                        let tracked = wrap_tracked_bytes(buf, lease);
+                        let detached = Bytes::copy_from_slice(&buf);
+                        drop(buf);
+                        let tracked = wrap_tracked_bytes(detached, lease);
                         resolved.insert(key, tracked.clone());
                         let mut evicted = Vec::new();
                         {
@@ -2782,19 +2942,19 @@ impl SplitPlainBufferedReaders {
                                     slice_idx,
                                     self.split_context.config.max_coalesced_request_bytes,
                                 );
+                                let (lease_lengths, has_ephemeral) =
+                                    plan_range_broker_leases(
+                                        &coalesced,
+                                        &rg.plan.last_consumer,
+                                        slice_idx,
+                                    );
                                 self.active = Some(ActivePlainRg::Split(rg));
                                 return Ok(Some(MorselPlan::new().with_pending_planner(
                                     async move {
-                                        let lengths: Vec<usize> = coalesced
-                                            .iter()
-                                            .map(|c| {
-                                                (c.range.end - c.range.start) as usize
-                                            })
-                                            .collect();
                                         let (leases, _, _) = self
                                             .split_context
                                             .budget
-                                            .reserve_for_fetch(&lengths, || 0, 0)
+                                            .reserve_for_fetch(&lease_lengths, || 0, 0)
                                             .await?;
                                         let fetch_ranges: Vec<Range<u64>> = coalesced
                                             .iter()
@@ -2823,6 +2983,7 @@ impl SplitPlainBufferedReaders {
                                                 &coalesced,
                                                 raw,
                                                 leases,
+                                                has_ephemeral,
                                                 &rg.plan.last_consumer,
                                                 slice_idx,
                                                 &self.split_context.metrics,
@@ -3006,10 +3167,11 @@ impl SplitPlainBufferedReaders {
                                 slice.slice_idx,
                                 self.split_context.config.max_coalesced_request_bytes,
                             );
-                            let lengths: Vec<usize> = coalesced
-                                .iter()
-                                .map(|c| (c.range.end - c.range.start) as usize)
-                                .collect();
+                            let (lease_lengths, has_ephemeral) = plan_range_broker_leases(
+                                &coalesced,
+                                &rg.plan.last_consumer,
+                                slice.slice_idx,
+                            );
                             let fetch_ranges: Vec<Range<u64>> =
                                 coalesced.iter().map(|c| c.range.clone()).collect();
                             self.active = Some(ActivePlainRg::Split(rg));
@@ -3019,7 +3181,7 @@ impl SplitPlainBufferedReaders {
                                         .split_context
                                         .budget
                                         .reserve_for_fetch(
-                                            &lengths,
+                                            &lease_lengths,
                                             || 0,
                                             decoded_estimate,
                                         )
@@ -3054,6 +3216,7 @@ impl SplitPlainBufferedReaders {
                                             &coalesced,
                                             raw,
                                             leases,
+                                            has_ephemeral,
                                             &rg.plan.last_consumer,
                                             slice.slice_idx,
                                             &self.split_context.metrics,
@@ -5531,6 +5694,362 @@ mod tests {
         assert_eq!(split_ctx.budget.live_bytes(), 128);
         drop(res2);
         // Final view dropped -> back to 0!
+        assert_eq!(split_ctx.budget.live_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+        assert!(broker.state.lock().is_empty());
+    }
+
+    /// Backing buffer owner that tracks live allocated bytes returned by
+    /// `MergingAllocReader` (mimicking `LocalFileSystem::get_ranges` merging
+    /// contiguous ranges into a single allocation).
+    struct CountedAlloc {
+        buf: Vec<u8>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl CountedAlloc {
+        fn into_bytes(buf: Vec<u8>, live: Arc<AtomicUsize>) -> Bytes {
+            live.fetch_add(buf.len(), Ordering::SeqCst);
+            Bytes::from_owner(Self { buf, live })
+        }
+    }
+
+    impl AsRef<[u8]> for CountedAlloc {
+        fn as_ref(&self) -> &[u8] {
+            &self.buf
+        }
+    }
+
+    impl Drop for CountedAlloc {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.buf.len(), Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct MergingAllocReader {
+        data: Bytes,
+        live_allocated: Arc<AtomicUsize>,
+        merged_calls: Arc<AtomicUsize>,
+    }
+
+    impl MergingAllocReader {
+        fn new(data: Bytes) -> Self {
+            Self {
+                data,
+                live_allocated: Arc::new(AtomicUsize::new(0)),
+                merged_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn live_allocated(&self) -> usize {
+            self.live_allocated.load(Ordering::SeqCst)
+        }
+
+        /// Merge contiguous ranges into single `CountedAlloc` buffers and
+        /// return slices matching the exact order of `ranges`.
+        fn fetch_merged(&self, ranges: &[Range<u64>]) -> Vec<Bytes> {
+            if ranges.is_empty() {
+                return Vec::new();
+            }
+            let mut indexed: Vec<(usize, Range<u64>)> =
+                ranges.iter().cloned().enumerate().collect();
+            indexed.sort_unstable_by_key(|(_, r)| (r.start, r.end));
+
+            struct MergedSpan {
+                range: Range<u64>,
+                members: Vec<(usize, Range<u64>)>,
+            }
+            // Group contiguous/overlapping ranges into merged spans.
+            let mut spans: Vec<MergedSpan> = Vec::new();
+            for (orig_idx, r) in indexed {
+                if let Some(last) = spans.last_mut()
+                    && r.start <= last.range.end
+                {
+                    last.range.end = last.range.end.max(r.end);
+                    last.members.push((orig_idx, r));
+                } else {
+                    spans.push(MergedSpan {
+                        range: r.clone(),
+                        members: vec![(orig_idx, r)],
+                    });
+                }
+            }
+            if spans.len() < ranges.len() {
+                self.merged_calls.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let mut out = vec![Bytes::new(); ranges.len()];
+            for span in spans {
+                let raw = self.data[span.range.start as usize..span.range.end as usize]
+                    .to_vec();
+                let merged =
+                    CountedAlloc::into_bytes(raw, Arc::clone(&self.live_allocated));
+                for (orig_idx, r) in span.members {
+                    let lo = (r.start - span.range.start) as usize;
+                    let hi = (r.end - span.range.start) as usize;
+                    out[orig_idx] = merged.slice(lo..hi);
+                }
+            }
+            out
+        }
+    }
+
+    impl AsyncFileReader for MergingAllocReader {
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+            let mut res = self.fetch_merged(std::slice::from_ref(&range));
+            let slice = res.pop().unwrap();
+            Box::pin(async move { Ok(slice) })
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+            let out = self.fetch_merged(&ranges);
+            Box::pin(async move { Ok(out) })
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+            let meta = load_metadata(&self.data, true).metadata().clone();
+            Box::pin(async move { Ok(meta) })
+        }
+    }
+
+    #[tokio::test]
+    async fn merging_reader_range_broker_live_allocations_bounded_by_budget() {
+        let n = 2400usize;
+        let (data, _) = build_indexed_dict_fixture(n);
+        let reader_metadata = load_metadata(&data, true);
+        let file_schema = Arc::clone(reader_metadata.schema());
+        let proj_indices = [0usize, 1];
+        let output_schema = Arc::new(file_schema.project(&proj_indices).unwrap());
+        let projection_exprs = ProjectionExprs::from_indices(&proj_indices, &file_schema);
+        let projection = Arc::new(
+            DecoderProjection::try_new(
+                &projection_exprs,
+                &file_schema,
+                reader_metadata.parquet_schema(),
+                &output_schema,
+                None,
+            )
+            .unwrap(),
+        );
+        let rg_bytes = reader_metadata.metadata().row_group(0).compressed_size() as u64;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let cfg = ParquetSplitConfig {
+            enabled: true,
+            min_row_group_rows: 800,
+            target_slice_rows: 400,
+            ..Default::default()
+        };
+        let split_ctx = Arc::new(SplitContext::new(
+            cfg,
+            Some(Arc::clone(&pool)),
+            metrics.clone(),
+        ));
+        let merging = MergingAllocReader::new(data.clone());
+        let pending = vec![(
+            RowGroupSelection::new(0, None),
+            RgPlanEntry {
+                rg_index: 0,
+                bytes: rg_bytes,
+                fully_matched: false,
+            },
+        )];
+        let readers = BufferedReaders::try_split_plain(SplitPlainBufferedReadersConfig {
+            pending,
+            reader_metadata,
+            projection,
+            batch_size: 64,
+            force_filter_selections: false,
+            enable_page_index: true,
+            arrow_reader_metrics: ArrowReaderMetrics::enabled(),
+            file_name: Arc::from("merging.parquet"),
+            baseline: BaselineMetrics::new(&metrics, 0),
+            byte_progress: ByteProgress::new(
+                rg_bytes,
+                MetricBuilder::new(&metrics).counter("bytes_processed", 0),
+            ),
+            reader: Box::new(merging.clone()),
+            split_context: Arc::clone(&split_ctx),
+        })
+        .unwrap_or_else(|_| panic!("expected row group to split"));
+
+        let mut planner: Box<dyn MorselPlanner> = Box::new(readers);
+        let mut total_rows = 0usize;
+        let mut morsels = 0usize;
+        while let Some(mut step) = planner.plan().unwrap() {
+            for morsel in step.take_morsels() {
+                morsels += 1;
+                // While the slice reader is live, store allocations must not exceed live_bytes.
+                assert!(
+                    merging.live_allocated() <= split_ctx.budget.live_bytes(),
+                    "while slice {morsels} live: allocated {} > budget {}",
+                    merging.live_allocated(),
+                    split_ctx.budget.live_bytes()
+                );
+                let mut stream = morsel.into_stream();
+                while let Some(batch) = stream.next().await {
+                    total_rows += batch.unwrap().num_rows();
+                }
+                drop(stream);
+                // After the slice reader drops, cached dictionary/boundary entries
+                // are detached and MUST NOT keep any merged store allocation alive.
+                assert_eq!(
+                    merging.live_allocated(),
+                    0,
+                    "after slice {morsels} dropped: merged store allocation still pinned"
+                );
+                assert!(
+                    merging.live_allocated() <= split_ctx.budget.live_bytes(),
+                    "after slice {morsels} dropped: allocated {} > budget {}",
+                    merging.live_allocated(),
+                    split_ctx.budget.live_bytes()
+                );
+            }
+            let mut ready = step.take_ready_planners();
+            let pending = step.take_pending_planner();
+            planner = if let Some(io) = pending {
+                io.await.unwrap()
+            } else if let Some(next) = ready.pop() {
+                next
+            } else {
+                break;
+            };
+        }
+
+        assert!(morsels >= 4);
+        assert_eq!(total_rows, n);
+        assert!(
+            merging.merged_calls.load(Ordering::SeqCst) > 0,
+            "test must exercise contiguous range merging in the reader"
+        );
+        assert_eq!(merging.live_allocated(), 0);
+        assert_eq!(split_ctx.budget.live_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn merging_reader_async_range_broker_live_allocations_bounded_by_budget() {
+        // Contiguous byte layout:
+        // [0..375]    shared dictionary (consumed by slices 0 and 1)
+        // [375..2375] private page 0 (slice 0 only)
+        // [2375..4375] private page 1 (slice 0 only)
+        // [4375..4750] shared boundary page (consumed by slices 0 and 1)
+        let data =
+            Bytes::from((0..5000usize).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+        let merging = MergingAllocReader::new(data.clone());
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let split_ctx = Arc::new(SplitContext::new(
+            ParquetSplitConfig {
+                enabled: true,
+                max_coalesced_request_bytes: 2048,
+                ..Default::default()
+            },
+            Some(Arc::clone(&pool)),
+            metrics,
+        ));
+
+        let dict_key = (0u64, 375u64);
+        let bound_key = (4375u64, 4750u64);
+        let counts = HashMap::from([(dict_key, 2usize), (bound_key, 2usize)]);
+        let broker = Arc::new(AsyncRangeBroker::new(counts, Arc::clone(&split_ctx)));
+
+        // Slice 0 fetches all four contiguous ranges in one Phase-1/Phase-2 call;
+        // `MergingAllocReader` merges all 4750 bytes into a single allocation.
+        let mut tracker0 =
+            Phase2SliceTracker::new(Arc::clone(&broker), vec![dict_key, bound_key]);
+        let req0 = vec![0..375, 375..2375, 2375..4375, 4375..4750];
+        let mut admitted0: Option<(Phase2BudgetLease, SplitDecodedLease)> = None;
+        let merging_fetch = merging.clone();
+        let mut views0 = broker
+            .resolve_ranges(
+                &req0,
+                &mut tracker0,
+                RangeAdmission::Phase1 {
+                    phase2_candidates: &[],
+                    decoded_estimate: 1024,
+                    out_leases: &mut admitted0,
+                },
+                "slice0",
+                move |ranges| {
+                    let r = merging_fetch.clone();
+                    async move { Ok(r.fetch_merged(&ranges)) }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            merging.merged_calls.load(Ordering::SeqCst) > 0,
+            "test must merge contiguous ranges into one backing allocation"
+        );
+        assert_eq!(merging.live_allocated(), 4750);
+        // Budget accounts for the full merged call (4750) + detached shared copies (750).
+        assert!(
+            merging.live_allocated() <= split_ctx.budget.live_bytes(),
+            "while slice 0 live: allocated {} > budget {}",
+            merging.live_allocated(),
+            split_ctx.budget.live_bytes()
+        );
+
+        // Drop only the first private view (views0[1]): the second private view
+        // (views0[2]) still pins the merged 4750 B allocation, so the shared
+        // call lease MUST stay alive and keep allocated <= budget.live_bytes().
+        views0[1] = Bytes::new();
+        assert_eq!(merging.live_allocated(), 4750);
+        assert!(
+            merging.live_allocated() <= split_ctx.budget.live_bytes(),
+            "after dropping one private view: allocated {} > budget {}",
+            merging.live_allocated(),
+            split_ctx.budget.live_bytes()
+        );
+
+        // Drop all slice 0 views & leases while dict + boundary remain cached
+        // as `Ready` for slice 1. The merged 4750 B store allocation MUST drop
+        // to 0, leaving only the detached 750 B cached entries accounted.
+        drop(views0);
+        drop(admitted0);
+        drop(tracker0);
+        assert_eq!(
+            merging.live_allocated(),
+            0,
+            "cached Ready entries must not pin merged store allocation"
+        );
+        assert_eq!(split_ctx.budget.live_bytes(), 375 + 375);
+        assert!(merging.live_allocated() <= split_ctx.budget.live_bytes());
+
+        // Slice 1 hits both cached Ready entries with zero storage reads.
+        let mut tracker1 =
+            Phase2SliceTracker::new(Arc::clone(&broker), vec![dict_key, bound_key]);
+        let views1 = broker
+            .resolve_ranges(
+                &[0..375, 4375..4750],
+                &mut tracker1,
+                RangeAdmission::Phase2 { phase2_lease: None },
+                "slice1",
+                |_ranges| async move {
+                    panic!("slice 1 must hit Ready cache without storage I/O")
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(views1[0].as_ref(), &data[0..375]);
+        assert_eq!(views1[1].as_ref(), &data[4375..4750]);
+        assert_eq!(merging.live_allocated(), 0);
+        assert_eq!(split_ctx.budget.live_bytes(), 375 + 375);
+
+        drop(views1);
+        drop(tracker1);
+        assert_eq!(merging.live_allocated(), 0);
         assert_eq!(split_ctx.budget.live_bytes(), 0);
         assert_eq!(pool.reserved(), 0);
         assert!(broker.state.lock().is_empty());

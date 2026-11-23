@@ -1470,7 +1470,9 @@ async fn intra_rg_splitting_enables_all_8_workers_on_4_large_row_groups() -> Res
     // 2 files x 2 large RGs = 4 row groups total across 8 workers.
     let dir = split_fixture(2, 2, 2400, true)?;
 
-    // Control: splitting disabled -> at most 4 workers can claim the 4 RGs.
+    // Control: default ParquetSplitConfig is opt-in (enabled == false), so
+    // even with thresholds below the RG size at most 4 workers claim the 4 RGs.
+    assert!(!ParquetSplitConfig::default().enabled);
     let disabled_metrics = Arc::new(MorselMetrics::default());
     let disabled_ctx = split_context(
         &dir,
@@ -1479,7 +1481,8 @@ async fn intra_rg_splitting_enables_all_8_workers_on_4_large_row_groups() -> Res
         false,
         true,
         Some(ParquetSplitConfig {
-            enabled: false,
+            min_row_group_rows: 800,
+            target_slice_rows: 300,
             ..Default::default()
         }),
         Some(Arc::clone(&disabled_metrics)),
