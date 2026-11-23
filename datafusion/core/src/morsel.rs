@@ -199,7 +199,7 @@ impl MorselQueryPlanner {
                 scan.table_name
             )));
         };
-        let source = if let Some(table) = provider.downcast_ref::<MemTable>() {
+        let mut source = if let Some(table) = provider.downcast_ref::<MemTable>() {
             if !table.sort_order.lock().is_empty() || !scan.filters.is_empty() {
                 return Ok(Lowering::Unsupported(format!(
                     "MemTable scan of {} has advertised ordering or scan filters",
@@ -234,6 +234,16 @@ impl MorselQueryPlanner {
         };
         let (mut operators, mut schema) =
             Self::lower_operators(nodes, Arc::clone(source.schema()), session)?;
+        #[cfg(feature = "parquet")]
+        if let Source::Parquet(ref mut parquet_scan) = source {
+            parquet_scan.pushdown_operators(
+                &mut operators,
+                count.is_some(),
+                &scan.filters,
+                &scan.projected_schema,
+                session,
+            )?;
+        }
         if self.workers == NonZeroUsize::MIN
             && count.is_none()
             && matches!(source, Source::Memory(_))
@@ -1167,6 +1177,12 @@ impl ExecutionPlan for MorselExec {
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
     ) -> Result<TreeNodeRecursion> {
+        #[cfg(feature = "parquet")]
+        if let Source::Parquet(source) = &self.pipeline.source
+            && source.apply_expressions(f)? == TreeNodeRecursion::Stop
+        {
+            return Ok(TreeNodeRecursion::Stop);
+        }
         let result_operators = match &self.pipeline.sink {
             Sink::Result => &[][..],
             Sink::Count {
