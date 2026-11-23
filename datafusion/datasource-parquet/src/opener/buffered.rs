@@ -15,7 +15,9 @@ use datafusion_common::{
     DataFusionError, Result, internal_datafusion_err, resources_datafusion_err,
 };
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner};
-use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
+};
 use datafusion_physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, Gauge, Label, MetricBuilder, Time,
 };
@@ -322,9 +324,11 @@ impl SplitContext {
 
 struct SplitBudgetState {
     cap: usize,
+    pool_limit: Option<usize>,
     live_bytes: usize,
     peak_live_bytes: usize,
     admitted_frontier_bytes: usize,
+    admitted_pool_frontier_bytes: usize,
     active_split_lanes: usize,
     waiting_for_memory: usize,
     in_flight_decode_readers: usize,
@@ -346,13 +350,19 @@ impl SplitBudget {
         memory_pool: Option<Arc<dyn MemoryPool>>,
         metrics: Arc<SplitMetrics>,
     ) -> Self {
+        let pool_limit = memory_pool.as_ref().and_then(|p| match p.memory_limit() {
+            MemoryLimit::Finite(limit) => Some(limit),
+            MemoryLimit::Infinite | MemoryLimit::Unknown => None,
+        });
         let (changed_tx, changed_rx) = watch::channel(0u64);
         Self {
             state: Mutex::new(SplitBudgetState {
                 cap,
+                pool_limit,
                 live_bytes: 0,
                 peak_live_bytes: 0,
                 admitted_frontier_bytes: 0,
+                admitted_pool_frontier_bytes: 0,
                 active_split_lanes: 0,
                 waiting_for_memory: 0,
                 in_flight_decode_readers: 0,
@@ -366,24 +376,50 @@ impl SplitBudget {
         }
     }
 
+    fn pool_limit(&self) -> Option<usize> {
+        self.state.lock().pool_limit
+    }
+
     fn signal_change(&self, state: &mut SplitBudgetState) {
         state.generation = state.generation.wrapping_add(1);
         let _ = self.changed_tx.send(state.generation);
     }
 
+    fn frontier_fits(
+        state: &SplitBudgetState,
+        frontier_bytes: usize,
+        pool_frontier_bytes: usize,
+    ) -> bool {
+        let cap_fits = state.admitted_frontier_bytes.saturating_add(frontier_bytes)
+            <= state.cap
+            || (state.active_split_lanes == 0 && frontier_bytes <= state.cap);
+        let pool_fits = match state.pool_limit {
+            Some(limit) => {
+                state
+                    .admitted_pool_frontier_bytes
+                    .saturating_add(pool_frontier_bytes)
+                    <= limit
+                    || (state.active_split_lanes == 0 && pool_frontier_bytes <= limit)
+            }
+            None => true,
+        };
+        cap_fits && pool_fits
+    }
+
     fn try_acquire_frontier(
         self: &Arc<Self>,
         frontier_bytes: usize,
+        pool_frontier_bytes: usize,
     ) -> Option<FrontierGuard> {
         let mut state = self.state.lock();
-        if state.admitted_frontier_bytes.saturating_add(frontier_bytes) <= state.cap
-            || (state.active_split_lanes == 0 && frontier_bytes <= state.cap)
-        {
+        if Self::frontier_fits(&state, frontier_bytes, pool_frontier_bytes) {
             state.admitted_frontier_bytes += frontier_bytes;
+            state.admitted_pool_frontier_bytes += pool_frontier_bytes;
             state.active_split_lanes += 1;
             Some(FrontierGuard {
                 budget: Arc::clone(self),
                 frontier_bytes,
+                pool_frontier_bytes,
             })
         } else {
             None
@@ -393,6 +429,7 @@ impl SplitBudget {
     async fn acquire_frontier(
         self: &Arc<Self>,
         frontier_bytes: usize,
+        pool_frontier_bytes: usize,
     ) -> Result<FrontierGuard> {
         let mut rx = self.changed_rx.clone();
         let mut wait_start: Option<Instant> = None;
@@ -405,11 +442,16 @@ impl SplitBudget {
                         state.cap
                     ));
                 }
-                if state.admitted_frontier_bytes.saturating_add(frontier_bytes)
-                    <= state.cap
-                    || state.active_split_lanes == 0
+                if let Some(limit) = state.pool_limit
+                    && pool_frontier_bytes > limit
                 {
+                    return Err(resources_datafusion_err!(
+                        "Parquet split pool frontier ({pool_frontier_bytes} bytes) exceeds memory pool limit ({limit} bytes)"
+                    ));
+                }
+                if Self::frontier_fits(&state, frontier_bytes, pool_frontier_bytes) {
                     state.admitted_frontier_bytes += frontier_bytes;
+                    state.admitted_pool_frontier_bytes += pool_frontier_bytes;
                     state.active_split_lanes += 1;
                     if let Some(start) = wait_start {
                         self.metrics.record_reservation_wait(start.elapsed());
@@ -417,6 +459,7 @@ impl SplitBudget {
                     return Ok(FrontierGuard {
                         budget: Arc::clone(self),
                         frontier_bytes,
+                        pool_frontier_bytes,
                     });
                 }
                 state.generation
@@ -534,7 +577,7 @@ impl SplitBudget {
         if compressed_needed == 0 {
             return Ok(self.split_buffer_leases(coalesced_lengths, None));
         }
-        let (covered_bytes, mut covered_res) = match phase2_lease {
+        let (covered_bytes, covered_res) = match phase2_lease {
             Some(lease) => {
                 if let Some(leases) = lease.take_leases(coalesced_lengths) {
                     return Ok(leases);
@@ -547,6 +590,13 @@ impl SplitBudget {
         if overflow == 0 {
             return Ok(self.split_buffer_leases(coalesced_lengths, covered_res));
         }
+        // Keep `covered_bytes` under a drop guard so cancelling or erroring
+        // while waiting on overflow releases `live_bytes` and pool reservation.
+        let mut covered_guard = Phase2BudgetLease {
+            budget: Arc::clone(self),
+            bytes: covered_bytes,
+            reservation: covered_res,
+        };
         // Only reached if Phase-2 needed bytes beyond what admission pre-reserved.
         let mut rx = self.changed_rx.clone();
         let mut wait_start: Option<Instant> = None;
@@ -573,7 +623,8 @@ impl SplitBudget {
                             if let Some(start) = wait_start {
                                 self.metrics.record_reservation_wait(start.elapsed());
                             }
-                            let combined = match (covered_res.take(), overflow_res) {
+                            let (_, covered_res) = covered_guard.take_all();
+                            let combined = match (covered_res, overflow_res) {
                                 (Some(a), Some(b)) => {
                                     let add = b.size();
                                     drop(b);
@@ -594,10 +645,8 @@ impl SplitBudget {
                             let can_progress = state.in_flight_decode_readers > 0
                                 || state.in_flight_filter_planners > 1;
                             if !can_progress {
-                                drop(covered_res);
-                                state.live_bytes =
-                                    state.live_bytes.saturating_sub(covered_bytes);
-                                self.signal_change(&mut state);
+                                drop(state);
+                                drop(covered_guard);
                                 return Err(err);
                             }
                         }
@@ -723,6 +772,7 @@ impl Drop for WaitGuard {
 struct FrontierGuard {
     budget: Arc<SplitBudget>,
     frontier_bytes: usize,
+    pool_frontier_bytes: usize,
 }
 
 impl Drop for FrontierGuard {
@@ -731,6 +781,9 @@ impl Drop for FrontierGuard {
         state.admitted_frontier_bytes = state
             .admitted_frontier_bytes
             .saturating_sub(self.frontier_bytes);
+        state.admitted_pool_frontier_bytes = state
+            .admitted_pool_frontier_bytes
+            .saturating_sub(self.pool_frontier_bytes);
         state.active_split_lanes = state.active_split_lanes.saturating_sub(1);
         self.budget.signal_change(&mut state);
     }
@@ -1134,6 +1187,7 @@ struct RowGroupSplitPlan {
     shared_ranges_per_slice: Vec<Vec<(u64, u64)>>,
     shared_consumer_counts: HashMap<(u64, u64), usize>,
     frontier_bytes: usize,
+    pool_frontier_bytes: usize,
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1146,6 +1200,7 @@ fn plan_row_group_splits(
     config: &ParquetSplitConfig,
     enable_page_index: bool,
     batch_size: usize,
+    pool_limit: Option<usize>,
 ) -> std::result::Result<RowGroupSplitPlan, UnsplitReason> {
     if !config.enabled || config.target_slice_rows == 0 {
         return Err(UnsplitReason::Disabled);
@@ -1185,7 +1240,6 @@ fn plan_row_group_splits(
         dict_range: Option<Range<u64>>,
         cached: bool,
         byte_width: usize,
-        one_page_uncompressed: usize,
     }
     let mut leaf_offsets: Vec<LeafOffsetInfo<'_>> = Vec::with_capacity(read_leaves.len());
     let mut any_cached_leaf = false;
@@ -1217,7 +1271,6 @@ fn plan_row_group_splits(
             dict_range: dictionary_range(chunk_start, locations),
             cached,
             byte_width,
-            one_page_uncompressed,
         });
     }
 
@@ -1255,7 +1308,6 @@ fn plan_row_group_splits(
             return Err(UnsplitReason::DecodedWorkspaceCap);
         }
         slice.decoded_estimate = decoded_estimate;
-        let _ = leaf_offsets.first().map(|i| i.one_page_uncompressed);
 
         let expanded_sel = if any_cached_leaf && batch_size > 0 {
             let exp_lo = (slice.row_range.start / batch_size) * batch_size;
@@ -1322,10 +1374,12 @@ fn plan_row_group_splits(
     }
 
     // Simulate sequential slice progression to compute the exact peak broker
-    // frontier (retained shared pages/dicts + incremental miss bytes for one slice).
+    // frontier (retained shared pages/dicts + incremental miss bytes for one slice)
+    // and peak memory-pool footprint (including that slice's decoded workspace).
     let mut cached: HashMap<(u64, u64), usize> = HashMap::new();
     let mut cached_bytes: usize = 0;
     let mut frontier_bytes: usize = 0;
+    let mut pool_frontier_bytes: usize = 0;
     for (slice_idx, ranges) in per_slice_ranges.iter().enumerate() {
         let mut new_bytes: usize = 0;
         for &key in ranges {
@@ -1333,7 +1387,10 @@ fn plan_row_group_splits(
                 new_bytes = new_bytes.saturating_add((key.1 - key.0) as usize);
             }
         }
-        frontier_bytes = frontier_bytes.max(cached_bytes.saturating_add(new_bytes));
+        let compressed_at_slice = cached_bytes.saturating_add(new_bytes);
+        frontier_bytes = frontier_bytes.max(compressed_at_slice);
+        pool_frontier_bytes = pool_frontier_bytes
+            .max(compressed_at_slice.saturating_add(slices[slice_idx].decoded_estimate));
         for &key in ranges {
             let last = last_consumer[&key];
             if last > slice_idx && !cached.contains_key(&key) {
@@ -1353,6 +1410,9 @@ fn plan_row_group_splits(
     }
     if frontier_bytes > config.split_buffer_cap_bytes {
         return Err(UnsplitReason::BufferCap);
+    }
+    if pool_limit.is_some_and(|limit| pool_frontier_bytes > limit) {
+        return Err(UnsplitReason::MemoryPoolCap);
     }
 
     let shared_consumer_counts: HashMap<(u64, u64), usize> = consumer_counts
@@ -1375,6 +1435,7 @@ fn plan_row_group_splits(
         shared_ranges_per_slice,
         shared_consumer_counts,
         frontier_bytes,
+        pool_frontier_bytes,
     })
 }
 
@@ -2314,6 +2375,7 @@ impl BufferedReaders {
                 &config.split_context.config,
                 config.enable_page_index,
                 config.batch_size,
+                config.split_context.budget.pool_limit(),
             ) {
                 Ok(plan) => {
                     any_split = true;
@@ -2393,6 +2455,7 @@ impl BufferedReaders {
                     &split_ctx.config,
                     config.enable_page_index,
                     config.batch_size,
+                    split_ctx.budget.pool_limit(),
                 ) {
                     Ok(plan) => FilteredRgWork::Split {
                         rg_index: entry.rg_index,
@@ -2573,10 +2636,11 @@ impl SplitPlainBufferedReaders {
                         entry,
                         plan,
                     } => {
-                        let frontier_guard = self
-                            .split_context
-                            .budget
-                            .try_acquire_frontier(plan.frontier_bytes);
+                        let frontier_guard =
+                            self.split_context.budget.try_acquire_frontier(
+                                plan.frontier_bytes,
+                                plan.pool_frontier_bytes,
+                            );
                         self.active =
                             Some(ActivePlainRg::Split(Box::new(ActiveSplitPlainRg {
                                 rg_index,
@@ -2651,12 +2715,16 @@ impl SplitPlainBufferedReaders {
                 ActivePlainRg::Split(mut rg) => {
                     if rg.frontier_guard.is_none() {
                         let frontier_bytes = rg.plan.frontier_bytes;
+                        let pool_frontier_bytes = rg.plan.pool_frontier_bytes;
                         let is_first_slice = rg.slices_published == 0;
                         let budget = Arc::clone(&self.split_context.budget);
                         self.active = Some(ActivePlainRg::Split(rg));
                         return Ok(Some(MorselPlan::new().with_pending_planner(
                             async move {
-                                match budget.acquire_frontier(frontier_bytes).await {
+                                match budget
+                                    .acquire_frontier(frontier_bytes, pool_frontier_bytes)
+                                    .await
+                                {
                                     Ok(guard) => {
                                         if let Some(ActivePlainRg::Split(rg)) =
                                             self.active.as_mut()
@@ -3620,12 +3688,16 @@ impl FilteredBufferedReaders {
             if let Some(mut split_rg) = self.active_split.take() {
                 if split_rg.frontier_guard.is_none() {
                     let frontier_bytes = split_rg.plan.frontier_bytes;
+                    let pool_frontier_bytes = split_rg.plan.pool_frontier_bytes;
                     let is_first_slice = split_rg.slices_published == 0;
                     let budget = Arc::clone(&split_rg.split_context.budget);
                     self.active_split = Some(split_rg);
                     return Ok(Some(MorselPlan::new().with_pending_planner(
                         async move {
-                            match budget.acquire_frontier(frontier_bytes).await {
+                            match budget
+                                .acquire_frontier(frontier_bytes, pool_frontier_bytes)
+                                .await
+                            {
                                 Ok(guard) => {
                                     if let Some(rg) = self.active_split.as_mut() {
                                         rg.frontier_guard = Some(guard);
@@ -3879,9 +3951,10 @@ impl FilteredBufferedReaders {
                             .as_ref()
                             .expect("split work requires split_context"),
                     );
-                    let frontier_guard = split_context
-                        .budget
-                        .try_acquire_frontier(plan.frontier_bytes);
+                    let frontier_guard = split_context.budget.try_acquire_frontier(
+                        plan.frontier_bytes,
+                        plan.pool_frontier_bytes,
+                    );
                     let broker = Arc::new(AsyncRangeBroker::new(
                         plan.shared_consumer_counts.clone(),
                         Arc::clone(&split_context),
@@ -4657,6 +4730,7 @@ mod tests {
                 &cfg,
                 true,
                 64,
+                None,
             )
             .is_ok()
         );
@@ -4674,6 +4748,7 @@ mod tests {
                 &disabled,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::Disabled)
@@ -4690,6 +4765,7 @@ mod tests {
                 &cfg,
                 false,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::PageIndexDisabled)
@@ -4708,6 +4784,7 @@ mod tests {
                 &high_thresh,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::BelowThreshold)
@@ -4724,6 +4801,7 @@ mod tests {
                 &cfg,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::MetadataOnly)
@@ -4741,6 +4819,7 @@ mod tests {
                     &cfg,
                     true,
                     64,
+                    None,
                 )
                 .err(),
                 Some(UnsplitReason::UnsupportedColumnType),
@@ -4759,6 +4838,7 @@ mod tests {
                 &cfg,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::MissingOffsetIndex)
@@ -4777,6 +4857,7 @@ mod tests {
                 &cfg,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::SingleSlice)
@@ -4795,6 +4876,7 @@ mod tests {
                 &tiny_decode,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::DecodedWorkspaceCap)
@@ -4813,9 +4895,27 @@ mod tests {
                 &tiny_slice,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::SliceCompressedCap)
+        );
+
+        // Finite memory pool smaller than pool frontier rejected at planning time
+        assert_eq!(
+            plan_row_group_splits(
+                meta_indexed.metadata(),
+                0,
+                None,
+                |i| i == 0,
+                |_| false,
+                &cfg,
+                true,
+                64,
+                Some(64),
+            )
+            .err(),
+            Some(UnsplitReason::MemoryPoolCap)
         );
 
         // Single giant page rejected by decode amplification heuristic (> 2x)
@@ -4838,6 +4938,7 @@ mod tests {
                 &cfg,
                 true,
                 64,
+                None,
             )
             .err(),
             Some(UnsplitReason::DecodeAmplification)
@@ -5086,6 +5187,7 @@ mod tests {
             &probe_cfg,
             true,
             64,
+            None,
         )
         .unwrap();
         // Set query-wide cap just large enough for ONE lane's frontier, forcing
@@ -5147,13 +5249,15 @@ mod tests {
             ..Default::default()
         };
 
-        // Case 1: Pool too small for slice 0 -> cleanly falls back to unsplit
-        // reader before publishing any slice, returning all rows with zero leak.
-        let tiny_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+        // Case 1: Pool fits pool_frontier statically, then an external consumer
+        // occupies the pool before slice 0 reserves -> cleanly falls back to
+        // unsplit reader before publishing any slice, returning all rows.
+        let pool_cap1 = 1 << 20;
+        let tight_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_cap1));
         let metrics = ExecutionPlanMetricsSet::new();
         let split_ctx = Arc::new(SplitContext::new(
             cfg.clone(),
-            Some(Arc::clone(&tiny_pool)),
+            Some(Arc::clone(&tight_pool)),
             metrics.clone(),
         ));
         let planner = make_split_plain_planner(
@@ -5163,6 +5267,8 @@ mod tests {
             Arc::clone(&split_ctx),
             &metrics,
         );
+        let external_blocker = MemoryConsumer::new("external").register(&tight_pool);
+        external_blocker.try_grow(pool_cap1 - 1).unwrap();
         let (batches, morsels) =
             tokio::time::timeout(Duration::from_secs(5), drive_planner_collect(planner))
                 .await
@@ -5178,7 +5284,8 @@ mod tests {
         );
         assert_eq!(split_ctx.budget.live_bytes(), 0);
         assert_eq!(split_ctx.budget.admitted_frontier_bytes(), 0);
-        assert_eq!(tiny_pool.reserved(), 0);
+        drop(external_blocker);
+        assert_eq!(tight_pool.reserved(), 0);
 
         // Case 2: Pool fits slice 0, then external consumer drains the pool
         // before slice 1 -> MUST return ResourcesExhausted without deadlocking
