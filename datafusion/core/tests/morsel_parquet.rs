@@ -2078,3 +2078,165 @@ async fn intra_rg_splitting_tight_buffer_cap_both_pushdown_modes() -> Result<()>
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn intra_rg_splitting_small_pool_sweep_both_pushdown_modes() -> Result<()> {
+    // 8 files x 1 RG x 4800 rows, id (Int64) + dictionary-encoded a, b, d with
+    // 70-row pages, batch_size=1000, 8 workers: reproduces pool-unaware
+    // multi-lane admission failures in the 6-24 KiB transition band where slice 0
+    // fits individually but pinned dictionaries + later slices exceed the pool.
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Int32, true),
+        Field::new("b", DataType::Int32, true),
+        Field::new("d", DataType::Int32, true),
+    ]));
+    let rows_per_rg = 4800usize;
+    let mut row_start = 0i64;
+    for file in 0..8usize {
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_rg))
+            .set_write_batch_size(35)
+            .set_data_page_row_count_limit(70)
+            .set_data_page_size_limit(256)
+            .set_dictionary_page_size_limit(256)
+            .set_dictionary_enabled(true)
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("part-{file:03}.parquet")))?,
+            Arc::clone(&schema),
+            Some(props),
+        )?;
+        let ids: Vec<i64> = (row_start..row_start + rows_per_rg as i64).collect();
+        let a: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 19 != 0).then_some(((i % 10) * 10) as i32))
+            .collect();
+        let b: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 17 != 0).then_some((i % 11) as i32))
+            .collect();
+        let d: Vec<Option<i32>> = ids
+            .iter()
+            .map(|&i| (i % 23 != 0).then_some((i % 5) as i32))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(Int32Array::from(a)),
+                Arc::new(Int32Array::from(b)),
+                Arc::new(Int32Array::from(d)),
+            ],
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        row_start += rows_per_rg as i64;
+    }
+
+    let split_cfg = ParquetSplitConfig {
+        enabled: true,
+        min_row_group_rows: 800,
+        target_slice_rows: 300,
+        ..Default::default()
+    };
+
+    // Sweep two workloads across 1..=64 KiB in 1 KiB steps:
+    // 1) batch_size=1000, COUNT(*) WHERE a > 50 AND d = 1 (reproduces the exact
+    //    multi-lane 6-8 KiB dictionary-pinning failure on pushdown=false).
+    // 2) batch_size=128, SELECT id, b WHERE a > 50 AND d = 1 (exercises the full
+    //    fallback -> single-lane -> multi-lane transition band for BOTH pushdown
+    //    modes, including Phase-1 + Phase-2 admission).
+    let cases = [
+        (
+            1000usize,
+            "SELECT COUNT(*) AS n FROM t WHERE a > 50 AND d = 1",
+            false,
+        ),
+        (128usize, "SELECT id, b FROM t WHERE a > 50 AND d = 1", true),
+    ];
+
+    for (batch_size, sql, require_split_both_modes) in cases {
+        for pushdown in [false, true] {
+            let mut stock_cfg = SessionConfig::new()
+                .with_target_partitions(8)
+                .with_batch_size(batch_size);
+            stock_cfg.options_mut().execution.parquet.pushdown_filters = pushdown;
+            stock_cfg.options_mut().execution.parquet.enable_page_index = true;
+            stock_cfg.options_mut().execution.collect_statistics = false;
+            let stock = SessionContext::new_with_config(stock_cfg);
+            stock
+                .register_parquet(
+                    "t",
+                    dir.path().to_str().unwrap(),
+                    ParquetReadOptions::default(),
+                )
+                .await?;
+            let expected = stock.sql(sql).await?.collect().await?;
+            let table = stock.table_provider("t").await?;
+
+            let mut saw_unsplit = false;
+            let mut saw_split = false;
+
+            for pool_kib in 1usize..=64 {
+                let repeats = if (6..=24).contains(&pool_kib) { 2 } else { 1 };
+                for round in 0..repeats {
+                    let pool: Arc<dyn MemoryPool> =
+                        Arc::new(GreedyMemoryPool::new(pool_kib << 10));
+                    let mut config = SessionConfig::new()
+                        .with_target_partitions(8)
+                        .with_batch_size(batch_size);
+                    config.options_mut().execution.parquet.pushdown_filters = pushdown;
+                    config.options_mut().execution.parquet.enable_page_index = true;
+                    config.options_mut().execution.collect_statistics = false;
+                    config.set_extension(Arc::new(split_cfg.clone()));
+                    let runtime = RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&pool))
+                        .build_arc()?;
+                    let native = SessionContext::new_with_config_rt(config, runtime);
+                    native.register_table("t", Arc::clone(&table))?;
+                    native
+                        .sql("SET datafusion.execution.morsel_mode = 'required'")
+                        .await?;
+                    let plan = native.sql(sql).await?.create_physical_plan().await?;
+                    let actual = timeout(
+                        Duration::from_secs(15),
+                        collect(Arc::clone(&plan), native.task_ctx()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "timed out at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}"
+                        )
+                    })
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}: {err}"
+                        )
+                    });
+                    assert_eq!(
+                        batches_to_sort_string(&actual),
+                        batches_to_sort_string(&expected),
+                        "row mismatch at pool={pool_kib}KiB batch={batch_size} pushdown={pushdown} round={round}: {sql}"
+                    );
+                    let split_rgs = metric(plan.as_ref(), "parquet_split_row_groups");
+                    if split_rgs == 0 {
+                        saw_unsplit = true;
+                    } else {
+                        saw_split = true;
+                    }
+                    assert_eq!(pool.reserved(), 0);
+                }
+            }
+            if !pushdown || require_split_both_modes {
+                assert!(
+                    saw_unsplit && saw_split,
+                    "expected sweep to cover both fallback and split regimes (batch={batch_size}, pushdown={pushdown}, saw_unsplit={saw_unsplit}, saw_split={saw_split})"
+                );
+            }
+        }
+    }
+    Ok(())
+}
