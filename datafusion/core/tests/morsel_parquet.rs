@@ -17,7 +17,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::common::test_util::batches_to_sort_string;
 use datafusion::error::Result;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility, create_udf,
 };
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -965,5 +965,273 @@ async fn pushdown_filters_handles_worker_errors_and_early_cancellation() -> Resu
     let first = stream.next().await.expect("at least one batch")?;
     assert!(first.num_rows() > 0);
     drop(stream);
+    Ok(())
+}
+
+#[tokio::test]
+async fn parquet_count_star_null_predicates_and_edge_row_groups() -> Result<()> {
+    let dir = TempDir::new()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("gate", DataType::Int32, true),
+        Field::new("delta", DataType::Int32, true),
+    ]));
+
+    // Write 2 files with 4 distinct row groups each:
+    // RG 0: all NULL `gate`
+    // RG 1: mixed NULL, matching (>10), and non-matching
+    // RG 2: all non-matching (values in 0..4, stats-prunable for gate > 10)
+    // RG 3: all matching (values in 20..24)
+    for file in 0..2 {
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join(format!("{file}.parquet")))?,
+            Arc::clone(&schema),
+            Some(properties),
+        )?;
+        let groups: [Vec<Option<i32>>; 4] = [
+            vec![None, None, None, None],
+            vec![Some(15), None, Some(5), Some(25)],
+            vec![Some(0), Some(1), Some(2), Some(3)],
+            vec![Some(20), Some(21), Some(22), Some(23)],
+        ];
+        for (rg, gates) in groups.into_iter().enumerate() {
+            let base = file * 16 + (rg as i32) * 4;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(base..base + 4)),
+                    Arc::new(Int32Array::from(gates)),
+                    Arc::new(Int32Array::from(vec![Some(1), None, Some(2), Some(3)])),
+                ],
+            )?;
+            writer.write(&batch)?;
+            writer.flush()?;
+        }
+        writer.close()?;
+    }
+
+    let empty = TempDir::new()?;
+    let queries = [
+        "SELECT COUNT(*) AS n FROM t WHERE gate > 10",
+        "SELECT COUNT(*) AS n FROM t WHERE NOT (gate > 10)",
+        "SELECT COUNT(*) AS n FROM t WHERE gate IS NULL",
+        "SELECT COUNT(*) AS n FROM t WHERE gate IS NOT NULL",
+        "SELECT COUNT(*) AS n FROM t WHERE gate = gate",
+        "SELECT COUNT(*) AS n FROM t WHERE NULLIF(gate, gate) > 0",
+        "SELECT COUNT(*) AS n FROM t WHERE COALESCE(gate, 0) > 10",
+        "SELECT COUNT(*) AS n FROM t WHERE gate > 10 AND delta IS NULL",
+        "SELECT COUNT(*) AS n FROM t WHERE gate % 100 = 99",
+        "SELECT COUNT(*) + 5 AS n FROM t WHERE gate > 10",
+        "SELECT COUNT(*) AS n FROM empty WHERE gate > 10",
+    ];
+
+    for pushdown in [false, true] {
+        for partitions in [1, 4] {
+            let stock = context(&dir, "off", pushdown).await?;
+            let native = context(&dir, "required", pushdown).await?;
+            for ctx in [&stock, &native] {
+                ctx.sql(&format!(
+                    "SET datafusion.execution.target_partitions = {partitions}"
+                ))
+                .await?;
+                ctx.register_parquet(
+                    "empty",
+                    empty.path().to_str().unwrap(),
+                    ParquetReadOptions::default().schema(schema.as_ref()),
+                )
+                .await?;
+            }
+            for sql in queries {
+                let expected = stock.sql(sql).await?.collect().await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+                assert_eq!(
+                    actual, expected,
+                    "parity mismatch (pushdown={pushdown}, partitions={partitions}): {sql}"
+                );
+                assert_eq!(metric(plan.as_ref(), "count_finalizations"), 1);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parquet_count_star_pushed_residual_errors_and_cancellation() -> Result<()> {
+    let dir = TempDir::new()?;
+    let person_fields = Fields::from(vec![Field::new("name", DataType::Utf8, true)]);
+    let names = Arc::new(StringArray::from(vec![
+        Some("a"),
+        Some("b"),
+        None,
+        Some("d"),
+        Some("e"),
+        Some("f"),
+        Some("g"),
+        Some("h"),
+    ]));
+    let person = StructArray::try_new(
+        person_fields,
+        vec![names],
+        Some(vec![true, false, true, true, true, false, true, true].into()),
+    )?;
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from_iter_values(0..8)) as _),
+        (
+            "gate",
+            Arc::new(Int32Array::from(vec![
+                Some(12),
+                Some(15),
+                None,
+                Some(0),
+                Some(20),
+                Some(18),
+                Some(25),
+                Some(2),
+            ])) as _,
+        ),
+        ("person", Arc::new(person) as _),
+    ])?;
+    let properties = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(4))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.path().join("0.parquet"))?,
+        batch.schema(),
+        Some(properties),
+    )?;
+    writer.write(&batch)?;
+    writer.close()?;
+
+    let fail_on_twenty = create_udf(
+        "fail_on_twenty",
+        vec![DataType::Int32],
+        DataType::Boolean,
+        Volatility::Volatile,
+        Arc::new(|args| {
+            let arr = args[0].clone().into_array(1)?;
+            let ints = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            if ints.iter().any(|v| v == Some(20)) {
+                return datafusion::common::exec_err!("volatile residual failure");
+            }
+            let mask: BooleanArray = ints.iter().map(|v| v.map(|x| x > 10)).collect();
+            Ok(ColumnarValue::Array(Arc::new(mask)))
+        }),
+    );
+
+    for pushdown in [false, true] {
+        let stock = context(&dir, "off", pushdown).await?;
+        let native = context(&dir, "required", pushdown).await?;
+        native.register_udf(fail_on_twenty.clone());
+
+        for sql in [
+            "SELECT COUNT(*) AS n FROM t WHERE gate > 10",
+            "SELECT COUNT(*) AS n FROM t WHERE gate > 10 AND person IS NOT NULL",
+            "SELECT COUNT(*) AS n FROM t WHERE gate > 10 AND random() >= 0.0",
+        ] {
+            let expected = stock.sql(sql).await?.collect().await?;
+            let plan = native.sql(sql).await?.create_physical_plan().await?;
+            let actual = collect(Arc::clone(&plan), native.task_ctx()).await?;
+            assert_eq!(actual, expected, "pushdown={pushdown}: {sql}");
+            assert_eq!(metric(plan.as_ref(), "count_finalizations"), 1);
+        }
+
+        // Division by zero inside direct-mask COUNT(*) (pushdown=false) or RowFilter (pushdown=true).
+        let div_plan = native
+            .sql("SELECT COUNT(*) AS n FROM t WHERE 100 / gate > 1")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let err = collect(Arc::clone(&div_plan), native.task_ctx())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("divide by zero"),
+            "pushdown={pushdown}: {err}"
+        );
+        assert_eq!(metric(div_plan.as_ref(), "count_finalizations"), 0);
+
+        // Volatile residual UDF failure on direct-mask COUNT(*) (stays residual under pushdown=true).
+        let res_plan = native
+            .sql("SELECT COUNT(*) AS n FROM t WHERE gate > 10 AND fail_on_twenty(gate)")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let display = displayable(res_plan.as_ref()).indent(false).to_string();
+        assert!(
+            display.contains("Filter["),
+            "pushdown={pushdown}: {display}"
+        );
+        let err = collect(Arc::clone(&res_plan), native.task_ctx())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("volatile residual failure"),
+            "pushdown={pushdown}: {err}"
+        );
+        assert_eq!(metric(res_plan.as_ref(), "count_finalizations"), 0);
+    }
+
+    // Early stream drop on multi-file Parquet COUNT(*) tears down cleanly.
+    let multi = fixture_with_files(8)?;
+    for pushdown in [false, true] {
+        let native = context(&multi, "required", pushdown).await?;
+        let plan = native
+            .sql("SELECT COUNT(*) AS n FROM t WHERE gate > 10")
+            .await?
+            .create_physical_plan()
+            .await?;
+        let stream = execute_stream(Arc::clone(&plan), native.task_ctx())?;
+        drop(stream);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn parquet_filter_projection_prunes_filter_only_columns() -> Result<()> {
+    let dir = fixture()?;
+    for pushdown in [false, true] {
+        for partitions in [1, 4] {
+            let stock = context(&dir, "off", pushdown).await?;
+            let native = context(&dir, "required", pushdown).await?;
+            for ctx in [&stock, &native] {
+                ctx.sql(&format!(
+                    "SET datafusion.execution.target_partitions = {partitions}"
+                ))
+                .await?;
+            }
+            for (sql, expected_filter_proj) in [
+                ("SELECT payload AS p, id FROM t WHERE gate > 10", "[0, 2]"),
+                ("SELECT 42 AS c FROM t WHERE gate > 10", "[]"),
+            ] {
+                let expected = stock.sql(sql).await?.collect().await?;
+                let plan = native.sql(sql).await?.create_physical_plan().await?;
+                let display = displayable(plan.as_ref()).indent(false).to_string();
+                if !pushdown {
+                    assert!(
+                        display
+                            .contains(&format!(", projection={expected_filter_proj}]")),
+                        "expected filter column pruning for {sql}: {display}"
+                    );
+                } else {
+                    assert!(
+                        !display.contains("Filter["),
+                        "expected pushed predicate for {sql}: {display}"
+                    );
+                }
+                let actual = collect(plan, native.task_ctx()).await?;
+                assert_eq!(
+                    batches_to_sort_string(&actual),
+                    batches_to_sort_string(&expected),
+                    "pushdown={pushdown}, partitions={partitions}: {sql}"
+                );
+            }
+        }
+    }
     Ok(())
 }
