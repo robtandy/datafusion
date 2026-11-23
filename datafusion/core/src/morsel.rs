@@ -244,10 +244,12 @@ impl MorselQueryPlanner {
                 session,
             )?;
         }
-        if self.workers == NonZeroUsize::MIN
-            && count.is_none()
-            && matches!(source, Source::Memory(_))
-        {
+        let prune_filter = match source {
+            Source::Memory(_) => self.workers == NonZeroUsize::MIN,
+            #[cfg(feature = "parquet")]
+            Source::Parquet(_) => true,
+        };
+        if count.is_none() && prune_filter {
             prune_filter_input(&mut operators, source.schema());
         }
         let sink = if let Some((aggregate, expr, result_nodes)) = count {
@@ -543,6 +545,9 @@ fn filter_batch(
     mask: &BooleanArray,
     projection: Option<&[usize]>,
 ) -> Result<RecordBatch> {
+    if batch.num_columns() == 0 {
+        count::validate_mask_length(batch, mask)?;
+    }
     match projection {
         Some(columns) if mask.len() == batch.num_rows() => {
             Ok(filter_record_batch(&batch.project(columns)?, mask)?)
@@ -732,6 +737,13 @@ struct WorkerOutput {
 }
 
 #[derive(Debug)]
+enum CountStrategy<'a> {
+    DirectRows,
+    DirectMask(&'a Arc<dyn PhysicalExpr>),
+    General,
+}
+
+#[derive(Debug)]
 struct Pipeline {
     source: Source,
     operators: Vec<Operator>,
@@ -793,25 +805,38 @@ impl Pipeline {
         )
     }
 
-    fn memory_count_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
-        let [
-            Operator::Filter {
-                predicate,
-                projection: None,
-            },
-            rest @ ..,
-        ] = self.operators.as_slice()
-        else {
-            return None;
-        };
-        match rest {
-            [] => Some(predicate),
+    fn count_strategy(&self) -> CountStrategy<'_> {
+        match self.operators.as_slice() {
+            [] => CountStrategy::DirectRows,
             [Operator::Projection(projector)]
                 if projector.projection().as_ref().is_empty() =>
             {
-                Some(predicate)
+                CountStrategy::DirectRows
             }
-            _ => None,
+            [
+                Operator::Filter {
+                    predicate,
+                    projection: None,
+                },
+            ] => CountStrategy::DirectMask(predicate),
+            [
+                Operator::Filter {
+                    predicate,
+                    projection: None,
+                },
+                Operator::Projection(projector),
+            ] if projector.projection().as_ref().is_empty() => {
+                CountStrategy::DirectMask(predicate)
+            }
+            _ => CountStrategy::General,
+        }
+    }
+
+    #[cfg(test)]
+    fn memory_count_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        match self.count_strategy() {
+            CountStrategy::DirectMask(predicate) => Some(predicate),
+            CountStrategy::DirectRows | CountStrategy::General => None,
         }
     }
 
@@ -835,11 +860,6 @@ impl Pipeline {
     ) -> Result<Option<CountState>> {
         let mut sink = self.worker_sink(output.batch_size);
         let tx = &output.tx;
-        let count_filter = if matches!(sink, WorkerSink::Count(_)) {
-            self.memory_count_filter()
-        } else {
-            None
-        };
         while !tx.is_closed() {
             let start = next.fetch_add(BATCHES_PER_MORSEL, Ordering::Relaxed);
             if start >= source.batches.len() {
@@ -852,20 +872,7 @@ impl Pipeline {
                     return Ok(None);
                 }
                 let batch = worker.process(|| source.read(input))?;
-                if let (WorkerSink::Count(local), Some(predicate)) =
-                    (&mut sink, count_filter)
-                {
-                    worker.process(|| {
-                        with_filter_mask(batch, predicate, |batch, mask| {
-                            let rows = if mask.len() == batch.num_rows() {
-                                mask.true_count()
-                            } else {
-                                filter_record_batch(&batch, mask)?.num_rows()
-                            };
-                            local.add_rows(rows)
-                        })
-                    })?;
-                } else if !self.consume(batch, tx, &mut sink, &mut worker).await? {
+                if !self.consume(batch, tx, &mut sink, &mut worker).await? {
                     return Ok(None);
                 }
                 if index + 1 == end {
@@ -956,7 +963,16 @@ impl Pipeline {
     ) -> Result<bool> {
         match sink {
             WorkerSink::Count(local) => worker.process(|| {
-                local.add_rows(apply_operators(&self.operators, batch)?.num_rows())?;
+                let rows = match self.count_strategy() {
+                    CountStrategy::DirectRows => batch.num_rows(),
+                    CountStrategy::DirectMask(predicate) => {
+                        count::count_filtered_rows(&batch, predicate)?
+                    }
+                    CountStrategy::General => {
+                        apply_operators(&self.operators, batch)?.num_rows()
+                    }
+                };
+                local.add_rows(rows)?;
                 Ok(true)
             }),
             WorkerSink::Result(buffer) => {
@@ -1355,5 +1371,441 @@ impl ExecutionPlan for MorselExec {
             self.schema(),
             stream,
         )))
+    }
+}
+
+#[cfg(test)]
+mod parquet_count_tests {
+    use super::*;
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use ::parquet::arrow::ArrowWriter;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use ::parquet::file::properties::WriterProperties;
+    use arrow::array::RecordBatchOptions;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use arrow::array::{Int32Array, StringArray, StructArray};
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use arrow::datatypes::{Field, FieldRef, Fields};
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use datafusion_common::{ScalarValue, exec_err};
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use datafusion_expr::ColumnarValue;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use datafusion_physical_expr::expressions::Literal;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use std::fs::File;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use std::time::Duration;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use tempfile::TempDir;
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    use tokio::time::timeout;
+
+    #[test]
+    fn zero_column_filter_batch_rejects_oversized_mask() -> Result<()> {
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(2)),
+        )?;
+        let oversized = BooleanArray::from(vec![true, true, true]);
+        let err = filter_batch(&batch, &oversized, None).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "Filter predicate of length 3 is larger than target array of length 2"
+            ),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    enum TestPhysicalExpr {
+        OversizedMask,
+        NonBooleanMask,
+        Error,
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    impl fmt::Display for TestPhysicalExpr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "TestPhysicalExpr({self:?})")
+        }
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    impl PhysicalExpr for TestPhysicalExpr {
+        fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, f)
+        }
+
+        fn return_field(&self, _schema: &Schema) -> Result<FieldRef> {
+            Ok(Arc::new(Field::new("mask", DataType::Boolean, false)))
+        }
+
+        fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+            match self {
+                Self::OversizedMask => Ok(ColumnarValue::Array(Arc::new(
+                    BooleanArray::from(vec![true; batch.num_rows() + 1]),
+                ))),
+                Self::NonBooleanMask => {
+                    Ok(ColumnarValue::Array(Arc::new(Int32Array::from(vec![
+                        1;
+                        batch
+                            .num_rows(
+                            )
+                    ]))))
+                }
+                Self::Error => exec_err!("injected parquet worker error"),
+            }
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            assert!(children.is_empty());
+            Ok(self)
+        }
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    fn parquet_struct_fixture() -> Result<TempDir> {
+        let dir = TempDir::new()?;
+        let person_fields = Fields::from(vec![Field::new("name", DataType::Utf8, true)]);
+        let names = Arc::new(StringArray::from(vec![
+            Some("a"),
+            Some("b"),
+            None,
+            Some("d"),
+            Some("e"),
+            Some("f"),
+            Some("g"),
+            Some("h"),
+        ]));
+        let person = StructArray::try_new(
+            person_fields,
+            vec![names],
+            Some(vec![true, false, true, true, true, false, true, true].into()),
+        )?;
+        let batch = RecordBatch::try_from_iter([
+            ("id", Arc::new(Int32Array::from_iter_values(0..8)) as _),
+            (
+                "gate",
+                Arc::new(Int32Array::from(vec![
+                    Some(12),
+                    Some(15),
+                    None,
+                    Some(20),
+                    Some(3),
+                    Some(18),
+                    Some(25),
+                    Some(2),
+                ])) as _,
+            ),
+            ("person", Arc::new(person) as _),
+        ])?;
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(dir.path().join("0.parquet"))?,
+            batch.schema(),
+            Some(properties),
+        )?;
+        writer.write(&batch)?;
+        writer.close()?;
+        Ok(dir)
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    async fn parquet_context(
+        dir: &TempDir,
+        pushdown: bool,
+    ) -> Result<crate::prelude::SessionContext> {
+        let mut config = crate::prelude::SessionConfig::new().with_target_partitions(4);
+        config.options_mut().execution.parquet.pushdown_filters = pushdown;
+        config.options_mut().execution.collect_statistics = false;
+        let ctx = crate::prelude::SessionContext::new_with_config(config);
+        ctx.register_parquet(
+            "t",
+            dir.path().to_str().unwrap(),
+            crate::prelude::ParquetReadOptions::default(),
+        )
+        .await?;
+        Ok(ctx)
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    async fn lower_parquet(
+        ctx: &crate::prelude::SessionContext,
+        workers: usize,
+        sql: &str,
+    ) -> Result<MorselExec> {
+        let logical = ctx.sql(sql).await?.into_optimized_plan()?;
+        let planner = MorselQueryPlanner::new(NonZeroUsize::new(workers).unwrap());
+        let Lowering::Native(exec) = planner.try_lower(&logical, &ctx.state()).await?
+        else {
+            panic!("expected native morsel plan for {sql}: {logical:?}");
+        };
+        Ok(exec)
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    #[tokio::test]
+    async fn parquet_count_strategy_and_filter_pruning_selection() -> Result<()> {
+        let dir = parquet_struct_fixture()?;
+
+        // pushdown_filters=false -> DirectMask for COUNT(*), filter pruning for Filter -> Projection.
+        let ctx_no_pd = parquet_context(&dir, false).await?;
+        let mut plan =
+            lower_parquet(&ctx_no_pd, 4, "SELECT COUNT(*) FROM t WHERE gate > 10")
+                .await?;
+        assert!(matches!(
+            plan.pipeline.count_strategy(),
+            CountStrategy::DirectMask(_)
+        ));
+        // Inserting a second Filter forces fallback to General.
+        let pipeline = Arc::get_mut(&mut plan.pipeline).unwrap();
+        pipeline.operators.insert(
+            1,
+            Operator::Filter {
+                predicate: Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+                projection: None,
+            },
+        );
+        assert!(matches!(pipeline.count_strategy(), CountStrategy::General));
+
+        let scan_plan =
+            lower_parquet(&ctx_no_pd, 4, "SELECT id FROM t WHERE gate > 10").await?;
+        assert!(
+            matches!(
+                scan_plan.pipeline.operators.as_slice(),
+                [
+                    Operator::Filter {
+                        projection: Some(cols),
+                        ..
+                    },
+                    Operator::Projection(_)
+                ] if cols.as_slice() == [0]
+            ),
+            "expected filter-only column pruning on multi-worker Parquet scan: {:?}",
+            scan_plan.pipeline.operators
+        );
+
+        // pushdown_filters=true:
+        let ctx_pd = parquet_context(&dir, true).await?;
+
+        // 1. Fully pushed COUNT(*) -> DirectRows with zero-column Parquet output.
+        let pushed_count =
+            lower_parquet(&ctx_pd, 4, "SELECT COUNT(*) FROM t WHERE gate > 10").await?;
+        assert!(matches!(
+            pushed_count.pipeline.count_strategy(),
+            CountStrategy::DirectRows
+        ));
+        assert!(pushed_count.pipeline.source.schema().fields().is_empty());
+
+        // 2. Residual struct filter COUNT(*) -> DirectMask on narrowed [person] schema.
+        let residual_count = lower_parquet(
+            &ctx_pd,
+            4,
+            "SELECT COUNT(*) FROM t WHERE gate > 10 AND person IS NOT NULL",
+        )
+        .await?;
+        assert!(matches!(
+            residual_count.pipeline.count_strategy(),
+            CountStrategy::DirectMask(_)
+        ));
+        assert_eq!(residual_count.pipeline.source.schema().fields().len(), 1);
+
+        // 3. Columnless residual volatile filter COUNT(*) -> DirectMask on zero-column output.
+        let zero_col_residual = lower_parquet(
+            &ctx_pd,
+            4,
+            "SELECT COUNT(*) FROM t WHERE gate > 10 AND random() >= 0.0",
+        )
+        .await?;
+        assert!(matches!(
+            zero_col_residual.pipeline.count_strategy(),
+            CountStrategy::DirectMask(_)
+        ));
+        assert!(
+            zero_col_residual
+                .pipeline
+                .source
+                .schema()
+                .fields()
+                .is_empty()
+        );
+
+        // 4. Residual Filter -> Projection prunes filter-only struct column before coalescing.
+        let residual_scan = lower_parquet(
+            &ctx_pd,
+            4,
+            "SELECT id FROM t WHERE gate > 10 AND person IS NOT NULL",
+        )
+        .await?;
+        assert!(
+            matches!(
+                residual_scan.pipeline.operators.as_slice(),
+                [
+                    Operator::Filter {
+                        projection: Some(cols),
+                        ..
+                    },
+                    Operator::Projection(_)
+                ] if cols.as_slice() == [0]
+            ),
+            "expected residual filter column pruning: {:?}",
+            residual_scan.pipeline.operators
+        );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    #[tokio::test]
+    async fn parquet_count_rejects_oversized_and_non_boolean_masks() -> Result<()> {
+        let dir = parquet_struct_fixture()?;
+        let deadline = Duration::from_secs(10);
+
+        // Test both columned (pushdown=false) and zero-column (pushdown=true + columnless residual)
+        // Parquet COUNT(*) pipelines.
+        for (pushdown, sql) in [
+            (false, "SELECT COUNT(*) FROM t WHERE gate > 10"),
+            (
+                true,
+                "SELECT COUNT(*) FROM t WHERE gate > 10 AND random() >= 0.0",
+            ),
+        ] {
+            let ctx = parquet_context(&dir, pushdown).await?;
+            for (expr, expected_err) in [
+                (
+                    TestPhysicalExpr::OversizedMask,
+                    "Filter predicate of length",
+                ),
+                (TestPhysicalExpr::NonBooleanMask, "non-boolean predicates"),
+            ] {
+                let mut exec = lower_parquet(&ctx, 2, sql).await?;
+                let pipeline = Arc::get_mut(&mut exec.pipeline).unwrap();
+                assert_eq!(pipeline.source.schema().fields().is_empty(), pushdown);
+                let Operator::Filter { predicate, .. } = &mut pipeline.operators[0]
+                else {
+                    panic!("expected leading Filter: {:?}", pipeline.operators);
+                };
+                *predicate = Arc::new(expr);
+                assert!(matches!(
+                    pipeline.count_strategy(),
+                    CountStrategy::DirectMask(_)
+                ));
+                let weak = Arc::downgrade(&exec.pipeline);
+                let mut stream = exec.execute(0, ctx.task_ctx())?;
+                let err = timeout(deadline, stream.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(err.to_string().contains(expected_err), "{err}");
+                assert!(timeout(deadline, stream.next()).await.unwrap().is_none());
+                assert_eq!(
+                    exec.metrics()
+                        .and_then(|m| m.sum_by_name("count_finalizations"))
+                        .map_or(0, |v| v.as_usize()),
+                    0
+                );
+                drop(stream);
+                drop(exec);
+                timeout(deadline, async {
+                    while weak.strong_count() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("parquet worker tasks did not stop");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "parquet", feature = "sql"))]
+    #[tokio::test]
+    async fn parquet_count_general_projection_error_and_cancellation_teardown()
+    -> Result<()> {
+        let dir = parquet_struct_fixture()?;
+        let deadline = Duration::from_secs(10);
+
+        // 1. Non-empty projection above Filter uses General strategy and propagates errors.
+        let ctx = parquet_context(&dir, false).await?;
+        let mut exec =
+            lower_parquet(&ctx, 2, "SELECT COUNT(*) FROM t WHERE gate > 10").await?;
+        {
+            let pipeline = Arc::get_mut(&mut exec.pipeline).unwrap();
+            let input_schema = Arc::clone(pipeline.source.schema());
+            let projector = ProjectionExprs::new([ProjectionExpr::new(
+                Arc::new(TestPhysicalExpr::Error),
+                "err",
+            )])
+            .make_projector(&input_schema)?;
+            pipeline.operators[1] = Operator::Projection(projector);
+            assert!(matches!(pipeline.count_strategy(), CountStrategy::General));
+        }
+        let weak = Arc::downgrade(&exec.pipeline);
+        let mut stream = exec.execute(0, ctx.task_ctx())?;
+        let err = timeout(deadline, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected parquet worker error"),
+            "{err}"
+        );
+        assert_eq!(
+            exec.metrics()
+                .and_then(|m| m.sum_by_name("count_finalizations"))
+                .map_or(0, |v| v.as_usize()),
+            0
+        );
+        drop(stream);
+        drop(exec);
+        timeout(deadline, async {
+            while weak.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parquet worker tasks did not stop");
+
+        // 2. Dropping Parquet COUNT(*) stream immediately after starting tears down workers
+        // without finalizing (both DirectMask with pushdown=false and DirectRows with pushdown=true).
+        for pushdown in [false, true] {
+            let ctx = parquet_context(&dir, pushdown).await?;
+            let exec =
+                lower_parquet(&ctx, 2, "SELECT COUNT(*) FROM t WHERE gate > 10").await?;
+            let weak = Arc::downgrade(&exec.pipeline);
+            let mut stream = exec.execute(0, ctx.task_ctx())?;
+            assert!(futures::poll!(stream.next()).is_pending());
+            drop(stream);
+            assert_eq!(
+                exec.metrics()
+                    .and_then(|m| m.sum_by_name("count_finalizations"))
+                    .map_or(0, |v| v.as_usize()),
+                0
+            );
+            drop(exec);
+            timeout(deadline, async {
+                while weak.strong_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("parquet workers did not stop after cancellation");
+        }
+        Ok(())
     }
 }
