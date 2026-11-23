@@ -7,14 +7,14 @@ SPDX-FileContributor: Licensed to the Apache Software Foundation (ASF) under one
 # Intra-row-group Parquet morsel splitting (#167)
 
 Comparison of stock (`morsel_mode = off`), legacy native (`morsel_mode = required`,
-splitting disabled via `ParquetSplitConfig { enabled: false }`), and split native
-(`morsel_mode = required`, default splitting: `min_row_group_rows = 1 Mi`,
-`target_slice_rows = 128 Ki`, page-aligned boundary selection, `256 MiB`
-query-wide compressed split-buffer cap, `16 MiB` per-slice compressed cap,
-slice-sized decoded workspace estimate capped at `128 MiB`, and atomic Phase-2
-budget reservation for row-filter pushdown) on the same files and binary built
-from `benchmarks/morsel_parquet_skew/stream_runner.rs` on `agent/morsel-issue-167`.
-This note does not replace the pinned
+default opt-out `ParquetSplitConfig::default()` with `enabled: false`), and split
+native (`morsel_mode = required`, opted in via `ParquetSplitConfig { enabled: true, ..Default::default() }`:
+`min_row_group_rows = 1 Mi`, `target_slice_rows = 128 Ki`, page-aligned boundary
+selection, `256 MiB` query-wide compressed split-buffer cap, `16 MiB` per-slice
+compressed cap, slice-sized decoded workspace estimate capped at `128 MiB`, and
+atomic Phase-2 budget reservation for row-filter pushdown) on the same files and
+binary built from `benchmarks/morsel_parquet_skew/stream_runner.rs` on
+`agent/morsel-issue-167`. This note does not replace the pinned
 [#156 baseline](README.md#dduck2-warm-cache-baseline) or the pinned
 [#128 baseline](../morsel_parquet/README.md).
 
@@ -189,9 +189,9 @@ MORSEL_PARQUET_RUNNER="$runner" MORSEL_BENCH_REVISION="$rev" \
 "$py" -B benchmarks/morsel_parquet/harness.py generate "$work/uniform-128rg" \
   --files 16 --groups 8 --group-rows 131072
 
-# 1. No-index control
+# 1. No-index control (splitting opted in, falls back cleanly when Offset Index is absent)
 taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-noindex" \
-  --runner "$runner" --revision "$rev" --enable-page-index --warmups 1 --repeats 5 > "$work/lrg-noindex.jsonl"
+  --runner "$runner" --revision "$rev" --enable-page-index --enable-split --warmups 1 --repeats 5 > "$work/lrg-noindex.jsonl"
 
 # 2. Indexed large-row-groups (pushdown_filters = false): stock vs legacy native vs split native
 taskset -c 0-7 "$py" -B "$b/bench.py" ab large-row-groups "$work/large-row-groups-indexed" \

@@ -68,7 +68,7 @@ async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let enable_page_index = env_bool("MORSEL_ENABLE_PAGE_INDEX", false);
     let pushdown_filters = env_bool("MORSEL_PUSHDOWN_FILTERS", false);
-    let split_enabled = env_bool("MORSEL_SPLIT_ENABLED", true);
+    let split_enabled = env_bool("MORSEL_SPLIT_ENABLED", false);
     let split_buffer_cap_bytes = env_usize("MORSEL_SPLIT_BUFFER_CAP_BYTES")?;
     let memory_pool_bytes = env_usize("MORSEL_MEMORY_POOL_BYTES")?;
 
@@ -83,7 +83,7 @@ async fn run(
     execution.parquet.pushdown_filters = pushdown_filters;
     execution.parquet.enable_page_index = enable_page_index;
     execution.parquet.bloom_filter_on_read = false;
-    if !split_enabled || split_buffer_cap_bytes.is_some() {
+    if split_enabled || split_buffer_cap_bytes.is_some() {
         let mut split_cfg = ParquetSplitConfig {
             enabled: split_enabled,
             ..Default::default()

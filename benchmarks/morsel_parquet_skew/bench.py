@@ -206,14 +206,17 @@ def benchmark(args, groups, group_rows):
             ("split", "required", {**base_env, "MORSEL_SPLIT_ENABLED": "1"}),
         )
     else:
-        arm_specs = tuple((mode, mode, base_env) for mode in MODES)
+        native_env = (
+            {**base_env, "MORSEL_SPLIT_ENABLED": "1"} if args.enable_split else base_env
+        )
+        arm_specs = (("off", "off", base_env), ("required", "required", native_env))
     arm_names = tuple(name for name, _, _ in arm_specs)
     arm_modes = {name: mode for name, mode, _ in arm_specs}
     backends = {
         name: EnvStreamRunner(args.runner, args.path, WORKERS, args.timeout, mode, env)
         for name, mode, env in arm_specs
     }
-    allow_split = args.enable_page_index or args.compare_split
+    allow_split = args.enable_split or args.compare_split
 
     # No timings are emitted until all arms pass both the oracle and plan checks.
     matches = verify(backends[arm_names[0]], rows)
@@ -336,6 +339,11 @@ def main():
         "--pushdown-filters",
         action="store_true",
         help="enable Parquet row-filter pushdown in the runner",
+    )
+    ab.add_argument(
+        "--enable-split",
+        action="store_true",
+        help="opt into intra-row-group splitting in the required arm",
     )
     ab.add_argument(
         "--compare-split",
